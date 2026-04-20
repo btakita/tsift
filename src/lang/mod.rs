@@ -1,4 +1,13 @@
-use tree_sitter::Language;
+use anyhow::Result;
+use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Symbol {
+    pub name: String,
+    pub kind: String,
+    pub line: usize,
+    pub end_line: usize,
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -101,6 +110,96 @@ impl Lang {
             #[cfg(feature = "lang-markdown")]
             Self::Markdown => "markdown",
         }
+    }
+
+    pub fn symbol_query(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "lang-rust")]
+            Self::Rust => r#"
+                (function_item name: (identifier) @function.name)
+                (struct_item name: (type_identifier) @struct.name)
+                (enum_item name: (type_identifier) @enum.name)
+                (trait_item name: (type_identifier) @trait.name)
+                (impl_item type: (type_identifier) @impl.name)
+                (mod_item name: (identifier) @mod.name)
+                (type_item name: (type_identifier) @type_alias.name)
+                (const_item name: (identifier) @const.name)
+                (static_item name: (identifier) @static.name)
+            "#,
+            #[cfg(feature = "lang-python")]
+            Self::Python => r#"
+                (function_definition name: (identifier) @function.name)
+                (class_definition name: (identifier) @class.name)
+            "#,
+            #[cfg(feature = "lang-typescript")]
+            Self::TypeScript | Self::Tsx => r#"
+                (function_declaration name: (identifier) @function.name)
+                (class_declaration name: (type_identifier) @class.name)
+                (interface_declaration name: (type_identifier) @interface.name)
+                (type_alias_declaration name: (type_identifier) @type_alias.name)
+                (enum_declaration name: (identifier) @enum.name)
+            "#,
+            #[cfg(feature = "lang-javascript")]
+            Self::JavaScript | Self::Jsx => r#"
+                (function_declaration name: (identifier) @function.name)
+                (class_declaration name: (identifier) @class.name)
+            "#,
+            #[cfg(feature = "lang-kotlin")]
+            Self::Kotlin => r#"
+                (function_declaration (identifier) @function.name)
+                (class_declaration (identifier) @class.name)
+                (object_declaration (identifier) @object.name)
+            "#,
+            #[cfg(feature = "lang-zig")]
+            Self::Zig => r#"
+                (function_declaration (identifier) @function.name)
+                (variable_declaration (identifier) @variable.name)
+            "#,
+            #[cfg(feature = "lang-bash")]
+            Self::Bash => r#"
+                (function_definition name: (word) @function.name)
+            "#,
+            #[cfg(feature = "lang-markdown")]
+            Self::Markdown => r#"
+                (atx_heading (atx_h1_marker) (inline) @heading.name)
+                (atx_heading (atx_h2_marker) (inline) @heading.name)
+                (atx_heading (atx_h3_marker) (inline) @heading.name)
+                (atx_heading (atx_h4_marker) (inline) @heading.name)
+                (atx_heading (atx_h5_marker) (inline) @heading.name)
+                (atx_heading (atx_h6_marker) (inline) @heading.name)
+            "#,
+        }
+    }
+
+    pub fn extract_symbols(&self, source: &[u8]) -> Result<Vec<Symbol>> {
+        let mut parser = Parser::new();
+        let ts_lang = self.tree_sitter_language();
+        parser.set_language(&ts_lang)?;
+        let tree = parser.parse(source, None)
+            .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
+        let query = Query::new(&ts_lang, self.symbol_query())?;
+        let mut cursor = QueryCursor::new();
+        let mut symbols = Vec::new();
+        let capture_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
+
+        let mut matches = cursor.matches(&query, tree.root_node(), source);
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let capture_name = &capture_names[capture.index as usize];
+                if let Some(kind_str) = capture_name.strip_suffix(".name") {
+                    let name = capture.node.utf8_text(source)
+                        .unwrap_or("<invalid utf8>")
+                        .to_string();
+                    symbols.push(Symbol {
+                        name,
+                        kind: kind_str.to_string(),
+                        line: capture.node.start_position().row,
+                        end_line: capture.node.end_position().row,
+                    });
+                }
+            }
+        }
+        Ok(symbols)
     }
 
     pub fn all() -> Vec<Self> {
@@ -289,5 +388,110 @@ mod tests {
             .unwrap();
         assert_eq!(tree.root_node().kind(), "document");
         assert!(!tree.root_node().has_error());
+    }
+
+    #[test]
+    fn test_all_symbol_queries_compile() {
+        for lang in Lang::all() {
+            let ts_lang = lang.tree_sitter_language();
+            tree_sitter::Query::new(&ts_lang, lang.symbol_query())
+                .unwrap_or_else(|e| panic!("query compile failed for {:?}: {}", lang, e));
+        }
+    }
+
+    #[cfg(feature = "lang-rust")]
+    #[test]
+    fn test_extract_rust_symbols() {
+        let source = b"fn main() {}\nstruct Foo;\nenum Bar {}\ntrait Baz {}\nconst X: i32 = 1;\nstatic Y: i32 = 2;\nmod inner {}\ntype Alias = i32;\n";
+        let symbols = Lang::Rust.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"main"), "missing main, got {:?}", names);
+        assert!(names.contains(&"Foo"), "missing Foo, got {:?}", names);
+        assert!(names.contains(&"Bar"), "missing Bar, got {:?}", names);
+        assert!(names.contains(&"Baz"), "missing Baz, got {:?}", names);
+        assert!(names.contains(&"X"), "missing X, got {:?}", names);
+        assert!(names.contains(&"Y"), "missing Y, got {:?}", names);
+        assert!(names.contains(&"inner"), "missing inner, got {:?}", names);
+        assert!(names.contains(&"Alias"), "missing Alias, got {:?}", names);
+        let main_sym = symbols.iter().find(|s| s.name == "main").unwrap();
+        assert_eq!(main_sym.kind, "function");
+        let foo_sym = symbols.iter().find(|s| s.name == "Foo").unwrap();
+        assert_eq!(foo_sym.kind, "struct");
+    }
+
+    #[cfg(feature = "lang-python")]
+    #[test]
+    fn test_extract_python_symbols() {
+        let source = b"def hello():\n    pass\n\nclass MyClass:\n    def method(self):\n        pass\n";
+        let symbols = Lang::Python.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"hello"), "missing hello, got {:?}", names);
+        assert!(names.contains(&"MyClass"), "missing MyClass, got {:?}", names);
+        assert!(names.contains(&"method"), "missing method, got {:?}", names);
+        let cls = symbols.iter().find(|s| s.name == "MyClass").unwrap();
+        assert_eq!(cls.kind, "class");
+    }
+
+    #[cfg(feature = "lang-typescript")]
+    #[test]
+    fn test_extract_typescript_symbols() {
+        let source = b"function greet(name: string): void {}\nclass Foo {}\ninterface Bar {}\ntype Alias = string;\nenum Color { Red, Green }\n";
+        let symbols = Lang::TypeScript.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"greet"), "missing greet, got {:?}", names);
+        assert!(names.contains(&"Foo"), "missing Foo, got {:?}", names);
+        assert!(names.contains(&"Bar"), "missing Bar, got {:?}", names);
+        assert!(names.contains(&"Alias"), "missing Alias, got {:?}", names);
+        assert!(names.contains(&"Color"), "missing Color, got {:?}", names);
+    }
+
+    #[cfg(feature = "lang-javascript")]
+    #[test]
+    fn test_extract_javascript_symbols() {
+        let source = b"function hello() { return 42; }\nclass Widget {}\n";
+        let symbols = Lang::JavaScript.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"hello"), "missing hello, got {:?}", names);
+        assert!(names.contains(&"Widget"), "missing Widget, got {:?}", names);
+    }
+
+    #[cfg(feature = "lang-kotlin")]
+    #[test]
+    fn test_extract_kotlin_symbols() {
+        let source = b"fun main() { println(\"hi\") }\nclass Foo\nobject Bar\n";
+        let symbols = Lang::Kotlin.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"main"), "missing main, got {:?}", names);
+        assert!(names.contains(&"Foo"), "missing Foo, got {:?}", names);
+        assert!(names.contains(&"Bar"), "missing Bar, got {:?}", names);
+    }
+
+    #[cfg(feature = "lang-zig")]
+    #[test]
+    fn test_extract_zig_symbols() {
+        let source = b"pub fn main() void {}\nconst x: i32 = 5;\n";
+        let symbols = Lang::Zig.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"main"), "missing main, got {:?}", names);
+        assert!(names.contains(&"x"), "missing x, got {:?}", names);
+    }
+
+    #[cfg(feature = "lang-bash")]
+    #[test]
+    fn test_extract_bash_symbols() {
+        let source = b"#!/bin/bash\nhello() { echo hi; }\nworld() { echo world; }\n";
+        let symbols = Lang::Bash.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"hello"), "missing hello, got {:?}", names);
+        assert!(names.contains(&"world"), "missing world, got {:?}", names);
+    }
+
+    #[cfg(feature = "lang-markdown")]
+    #[test]
+    fn test_extract_markdown_symbols() {
+        let source = b"# Title\n\n## Section One\n\nSome text.\n\n### Subsection\n";
+        let symbols = Lang::Markdown.extract_symbols(source).unwrap();
+        assert!(!symbols.is_empty(), "expected heading symbols");
+        assert!(symbols.iter().all(|s| s.kind == "heading"), "all should be headings");
     }
 }
