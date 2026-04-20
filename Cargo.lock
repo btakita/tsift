@@ -3095,6 +3095,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ignore",
  "rusqlite",
  "serde",
  "serde_json",

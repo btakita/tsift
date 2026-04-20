@@ -8,6 +8,7 @@ use std::io::Read as _;
 use std::path::PathBuf;
 
 mod lang;
+pub mod walk;
 
 #[derive(Parser)]
 #[command(name = "tsift", version, about = "Token-efficient search for Claude Code")]
