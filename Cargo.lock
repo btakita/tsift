@@ -3183,6 +3183,7 @@ dependencies = [
  "sift",
  "tagpath",
  "tempfile",
+ "toml 0.8.23",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-javascript",
