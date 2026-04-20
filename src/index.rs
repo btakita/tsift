@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tagpath::parser as tagpath_parser;
 
 pub struct IndexDb {
     conn: Connection,
@@ -48,6 +49,20 @@ pub struct StoredSymbol {
     pub end_line: Option<i64>,
     pub parent_module: Option<String>,
     pub visibility: Option<String>,
+    pub tags: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolHit {
+    pub name: String,
+    pub kind: String,
+    pub language: String,
+    pub file: String,
+    pub line: i64,
+    pub end_line: Option<i64>,
+    pub tags: Option<String>,
+    pub score: f64,
+    pub match_type: String,
 }
 
 fn system_time_to_pair(t: SystemTime) -> (i64, u32) {
@@ -88,12 +103,14 @@ impl IndexDb {
                 line INTEGER NOT NULL,
                 end_line INTEGER,
                 parent_module TEXT,
-                visibility TEXT
+                visibility TEXT,
+                tags TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
             CREATE INDEX IF NOT EXISTS idx_symbols_language ON symbols(language);
             CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);"
         )?;
+        let _ = conn.execute("ALTER TABLE symbols ADD COLUMN tags TEXT", []);
         Ok(Self { conn })
     }
 
@@ -179,7 +196,7 @@ impl IndexDb {
         let mut delete_file = self.conn.prepare("DELETE FROM file_state WHERE path = ?1")?;
         let mut delete_symbols = self.conn.prepare("DELETE FROM symbols WHERE file = ?1")?;
         let mut insert_symbol = self.conn.prepare(
-            "INSERT INTO symbols (name, kind, language, signature, file, line, end_line, parent_module, visibility) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+            "INSERT INTO symbols (name, kind, language, signature, file, line, end_line, parent_module, visibility, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
         )?;
 
         for change in &summary.changes {
@@ -207,6 +224,7 @@ impl IndexDb {
                         if let Some(symbols) = symbols {
                             let lang_name = lang.name();
                             for sym in &symbols {
+                                let tags = compute_tags(&sym.name);
                                 insert_symbol.execute(rusqlite::params![
                                     sym.name,
                                     sym.kind,
@@ -217,6 +235,7 @@ impl IndexDb {
                                     sym.end_line as i64,
                                     Option::<String>::None,
                                     Option::<String>::None,
+                                    tags,
                                 ])?;
                             }
                         }
@@ -249,7 +268,7 @@ impl IndexDb {
 
     pub fn symbols_for_file(&self, file: &str) -> Result<Vec<StoredSymbol>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, kind, language, signature, file, line, end_line, parent_module, visibility FROM symbols WHERE file = ?1 ORDER BY line"
+            "SELECT name, kind, language, signature, file, line, end_line, parent_module, visibility, tags FROM symbols WHERE file = ?1 ORDER BY line"
         )?;
         let rows = stmt.query_map(rusqlite::params![file], |row| {
             Ok(StoredSymbol {
@@ -262,10 +281,88 @@ impl IndexDb {
                 end_line: row.get(6)?,
                 parent_module: row.get(7)?,
                 visibility: row.get(8)?,
+                tags: row.get(9)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    pub fn symbol_search(&self, query: &str, limit: usize) -> Result<Vec<SymbolHit>> {
+        let query_tags = compute_tags(query);
+        let query_tag_list: Vec<&str> = query_tags.split(',').collect();
+        let query_lower = query.to_lowercase();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT name, kind, language, file, line, end_line, tags FROM symbols"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+
+        let mut hits: Vec<SymbolHit> = Vec::new();
+        for row in rows {
+            let (name, kind, language, file, line, end_line, tags) = row?;
+            let name_lower = name.to_lowercase();
+
+            if name_lower == query_lower {
+                hits.push(SymbolHit {
+                    name, kind, language, file, line, end_line, tags,
+                    score: 1.0,
+                    match_type: "exact_name".to_string(),
+                });
+                continue;
+            }
+
+            if let Some(ref sym_tags) = tags {
+                let sym_tag_list: Vec<&str> = sym_tags.split(',').collect();
+                let matching: usize = query_tag_list.iter()
+                    .filter(|qt| sym_tag_list.contains(qt))
+                    .count();
+
+                if matching == 0 {
+                    continue;
+                }
+
+                let precision = matching as f64 / query_tag_list.len() as f64;
+                let recall = matching as f64 / sym_tag_list.len() as f64;
+                let f1 = if precision + recall > 0.0 {
+                    2.0 * precision * recall / (precision + recall)
+                } else {
+                    0.0
+                };
+
+                let match_type = if matching == query_tag_list.len() {
+                    "all_tags"
+                } else {
+                    "partial_tags"
+                };
+
+                hits.push(SymbolHit {
+                    name, kind, language, file, line, end_line, tags,
+                    score: f1,
+                    match_type: match_type.to_string(),
+                });
+            }
+        }
+
+        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(limit);
+        Ok(hits)
+    }
+}
+
+fn compute_tags(name: &str) -> String {
+    let convention = tagpath_parser::detect_convention(name);
+    let parsed = tagpath_parser::parse(name, convention);
+    parsed.tags.join(",")
 }
 
 #[cfg(test)]
@@ -463,5 +560,81 @@ mod tests {
         db.apply_changes(dir.path()).unwrap();
         let symbols = db.symbols_for_file("/no/such/file.rs").unwrap();
         assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn symbols_have_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn get_user_name() {}\nstruct UserProfile;").unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let lib_rs = dir.path().join("lib.rs").to_string_lossy().to_string();
+        let symbols = db.symbols_for_file(&lib_rs).unwrap();
+        let get_user = symbols.iter().find(|s| s.name == "get_user_name").unwrap();
+        assert_eq!(get_user.tags.as_deref(), Some("get,user,name"));
+
+        let user_profile = symbols.iter().find(|s| s.name == "UserProfile").unwrap();
+        assert_eq!(user_profile.tags.as_deref(), Some("user,profile"));
+    }
+
+    #[test]
+    fn symbol_search_exact_name() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn main() {}\nfn helper() {}").unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let hits = db.symbol_search("main", 10).unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].name, "main");
+        assert_eq!(hits[0].match_type, "exact_name");
+        assert_eq!(hits[0].score, 1.0);
+    }
+
+    #[test]
+    fn symbol_search_cross_convention() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn get_user_name() {}").unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let hits = db.symbol_search("getUserName", 10).unwrap();
+        assert!(!hits.is_empty(), "should find snake_case via camelCase query");
+        assert_eq!(hits[0].name, "get_user_name");
+        assert_eq!(hits[0].match_type, "all_tags");
+    }
+
+    #[test]
+    fn symbol_search_partial_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn get_user_name() {}\nfn set_user_name() {}").unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let hits = db.symbol_search("user", 10).unwrap();
+        assert_eq!(hits.len(), 2, "should find both functions containing 'user' tag");
+    }
+
+    #[test]
+    fn symbol_search_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn main() {}").unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let hits = db.symbol_search("nonexistent_function", 10).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn symbol_search_respects_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn a_test() {}\nfn b_test() {}\nfn c_test() {}").unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let hits = db.symbol_search("test", 2).unwrap();
+        assert_eq!(hits.len(), 2);
     }
 }

@@ -943,6 +943,15 @@ fn cmd_search(
     json_output: bool,
 ) -> Result<()> {
     let search_path = path.unwrap_or_else(|| PathBuf::from("."));
+
+    let db_path = search_path.join(".tsift/index.db");
+    let symbol_hits = if db_path.exists() {
+        let db = index::IndexDb::open(&db_path)?;
+        db.symbol_search(&query, limit)?
+    } else {
+        Vec::new()
+    };
+
     let engine = Sift::builder().build();
     let mut options = SearchOptions::default().with_limit(limit);
     if let Some(s) = strategy {
@@ -950,9 +959,30 @@ fn cmd_search(
     }
     let input = SearchInput::new(&search_path, &query).with_options(options);
     let response = engine.search(input)?;
+
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&response)?);
+        #[derive(Serialize)]
+        struct CombinedResponse<'a> {
+            symbols: &'a [index::SymbolHit],
+            #[serde(flatten)]
+            sift: &'a serde_json::Value,
+        }
+        let sift_value = serde_json::to_value(&response)?;
+        let combined = CombinedResponse { symbols: &symbol_hits, sift: &sift_value };
+        println!("{}", serde_json::to_string_pretty(&combined)?);
     } else {
+        if !symbol_hits.is_empty() {
+            println!("Symbol matches ({}):", symbol_hits.len());
+            println!();
+            for (i, hit) in symbol_hits.iter().enumerate() {
+                println!(
+                    "  #{} [{}] {} {} ({}:{}) score: {:.4}",
+                    i + 1, hit.match_type, hit.kind, hit.name, hit.file, hit.line, hit.score
+                );
+            }
+            println!();
+        }
+
         println!(
             "Strategy: {} | Indexed: {} | Skipped: {}",
             response.strategy, response.indexed_artifacts, response.skipped_artifacts
@@ -970,7 +1000,7 @@ fn cmd_search(
             }
             println!();
         }
-        if response.hits.is_empty() {
+        if symbol_hits.is_empty() && response.hits.is_empty() {
             println!("  No results.");
         }
     }
