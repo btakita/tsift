@@ -35,6 +35,12 @@ enum Commands {
         /// Search strategy: lexical, vector, hybrid, path-hybrid
         #[arg(short, long)]
         strategy: Option<String>,
+        /// Restrict search to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Search all federated submodule indexes
+        #[arg(long)]
+        federated: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -72,6 +78,12 @@ enum Commands {
         /// Report stale files without updating the index
         #[arg(long)]
         check: bool,
+        /// Index all submodules into per-submodule databases
+        #[arg(long)]
+        workspace: bool,
+        /// Index only this submodule
+        #[arg(long)]
+        submodule: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -89,6 +101,9 @@ enum Commands {
         /// Show callees of the symbol
         #[arg(long)]
         callees: bool,
+        /// Restrict to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -153,13 +168,15 @@ fn main() -> Result<()> {
             path,
             limit,
             strategy,
+            scope,
+            federated,
             json,
-        }) => cmd_search(query, path, limit, strategy, json),
+        }) => cmd_search(query, path, limit, strategy, scope, federated, json),
         Some(Commands::Edit { dry_run, file }) => cmd_edit(dry_run, file),
-        Some(Commands::Index { path, rebuild, check, json }) => cmd_index(&path, rebuild, check, json),
+        Some(Commands::Index { path, rebuild, check, workspace, submodule, json }) => cmd_index(&path, rebuild, check, workspace, submodule.as_deref(), json),
         Some(Commands::Rewrite { command }) => cmd_rewrite(&command),
         Some(Commands::Route { task, id }) => cmd_route(&task, id),
-        Some(Commands::Graph { symbol, path, callers, callees, json }) => cmd_graph(&symbol, &path, callers, callees, json),
+        Some(Commands::Graph { symbol, path, callers, callees, scope, json }) => cmd_graph(&symbol, &path, callers, callees, scope.as_deref(), json),
         Some(Commands::Sql { db, query, table, json }) => cmd_sql(&db, query, table, json),
         None => {
             println!("tsift v{}", env!("CARGO_PKG_VERSION"));
@@ -303,12 +320,61 @@ fn cmd_edit(dry_run: bool, file: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, json_output: bool) -> Result<()> {
+fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, workspace: bool, submodule: Option<&str>, json_output: bool) -> Result<()> {
     let root = path.canonicalize()
         .with_context(|| format!("resolving path: {}", path.display()))?;
+
+    if workspace || submodule.is_some() {
+        let cfg = config::Config::load(&root)?;
+        let targets: Vec<(String, PathBuf)> = if let Some(name) = submodule {
+            let sub_path = config::Config::submodule_dirs(&root)?
+                .into_iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, p)| p)
+                .unwrap_or_else(|| root.join(name));
+            vec![(name.to_string(), sub_path)]
+        } else {
+            config::Config::submodule_dirs(&root)?
+        };
+
+        if targets.is_empty() {
+            bail!("no submodules found in {}", root.display());
+        }
+
+        for (name, sub_path) in &targets {
+            if !sub_path.exists() {
+                eprintln!("  skip {} (not found: {})", name, sub_path.display());
+                continue;
+            }
+            let db_path = cfg.db_path_for(&root, name);
+            let db = index::IndexDb::open(&db_path)?;
+            let summary = if rebuild {
+                db.rebuild(sub_path)?
+            } else if check {
+                db.compute_changes(sub_path)?
+            } else {
+                db.apply_changes(sub_path)?
+            };
+            let tier = cfg.tier_for(name);
+            if json_output {
+                let entry = serde_json::json!({
+                    "submodule": name,
+                    "tier": format!("{:?}", tier).to_lowercase(),
+                    "summary": summary,
+                });
+                println!("{}", serde_json::to_string_pretty(&entry)?);
+            } else {
+                let mode = if rebuild { "rebuild" } else if check { "check" } else { "incremental" };
+                println!("[{}] ({}, {:?}) {} files tracked — new:{} mod:{} del:{} unch:{}",
+                    name, mode, tier, summary.total_tracked,
+                    summary.new, summary.modified, summary.deleted, summary.unchanged);
+            }
+        }
+        return Ok(());
+    }
+
     let db_path = root.join(".tsift/index.db");
     let db = index::IndexDb::open(&db_path)?;
-
     let summary = if rebuild {
         db.rebuild(&root)?
     } else if check {
@@ -340,10 +406,15 @@ fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, json_output: bo
     Ok(())
 }
 
-fn cmd_graph(symbol: &str, path: &std::path::Path, callers: bool, callees: bool, json_output: bool) -> Result<()> {
+fn cmd_graph(symbol: &str, path: &std::path::Path, callers: bool, callees: bool, scope: Option<&str>, json_output: bool) -> Result<()> {
     let root = path.canonicalize()
         .with_context(|| format!("resolving path: {}", path.display()))?;
-    let db_path = root.join(".tsift/index.db");
+    let db_path = if let Some(scope_name) = scope {
+        let cfg = config::Config::load(&root)?;
+        cfg.db_path_for(&root, scope_name)
+    } else {
+        root.join(".tsift/index.db")
+    };
     if !db_path.exists() {
         bail!("no index found at {}. Run `tsift index` first.", db_path.display());
     }
@@ -697,8 +768,91 @@ mod tests {
     #[test]
     fn graph_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_graph("main", dir.path(), false, false, false);
+        let result = cmd_graph("main", dir.path(), false, false, None, false);
         assert!(result.is_err());
+    }
+
+    // --- workspace indexing ---
+
+    fn setup_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".gitmodules"), r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+[submodule "src/beta"]
+	path = src/beta
+	url = https://example.com/beta
+"#).unwrap();
+        let alpha = root.join("src/alpha");
+        let beta = root.join("src/beta");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+        std::fs::write(alpha.join("lib.rs"), "fn alpha_helper() {}\nfn alpha_main() { alpha_helper(); }").unwrap();
+        std::fs::write(beta.join("lib.rs"), "fn beta_func() {}").unwrap();
+        dir
+    }
+
+    #[test]
+    fn workspace_index_creates_per_submodule_dbs() {
+        let dir = setup_workspace();
+        cmd_index(dir.path(), false, false, true, None, false).unwrap();
+        assert!(dir.path().join(".tsift/indexes/alpha/index.db").exists());
+        assert!(dir.path().join(".tsift/indexes/beta/index.db").exists());
+    }
+
+    #[test]
+    fn workspace_index_single_submodule() {
+        let dir = setup_workspace();
+        cmd_index(dir.path(), false, false, false, Some("alpha"), false).unwrap();
+        assert!(dir.path().join(".tsift/indexes/alpha/index.db").exists());
+        assert!(!dir.path().join(".tsift/indexes/beta/index.db").exists());
+    }
+
+    #[test]
+    fn federated_search_across_submodules() {
+        let dir = setup_workspace();
+        cmd_index(dir.path(), false, false, true, None, false).unwrap();
+        let hits = federated_symbol_search(dir.path(), "alpha_helper", 10).unwrap();
+        assert!(!hits.is_empty(), "should find alpha_helper via federated search");
+    }
+
+    #[test]
+    fn federated_search_respects_isolation() {
+        let dir = setup_workspace();
+        let tsift_dir = dir.path().join(".tsift");
+        std::fs::create_dir_all(&tsift_dir).unwrap();
+        std::fs::write(tsift_dir.join("config.toml"), r#"
+[overrides.alpha]
+tier = "isolated"
+"#).unwrap();
+        cmd_index(dir.path(), false, false, true, None, false).unwrap();
+        let hits = federated_symbol_search(dir.path(), "alpha_helper", 10).unwrap();
+        assert!(hits.is_empty(), "isolated submodule should not appear in federated search");
+    }
+
+    #[test]
+    fn scoped_search_finds_submodule_symbols() {
+        let dir = setup_workspace();
+        cmd_index(dir.path(), false, false, true, None, false).unwrap();
+        let cfg = config::Config::load(dir.path()).unwrap();
+        let db_path = cfg.db_path_for(dir.path(), "alpha");
+        let db = index::IndexDb::open(&db_path).unwrap();
+        let hits = db.symbol_search("alpha_main", 10).unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].name, "alpha_main");
+    }
+
+    #[test]
+    fn scoped_graph_query() {
+        let dir = setup_workspace();
+        cmd_index(dir.path(), false, false, true, None, false).unwrap();
+        let cfg = config::Config::load(dir.path()).unwrap();
+        let db_path = cfg.db_path_for(dir.path(), "alpha");
+        let db = index::IndexDb::open(&db_path).unwrap();
+        let callees = db.callees_of("alpha_main").unwrap();
+        let names: Vec<&str> = callees.iter().map(|e| e.callee_name.as_str()).collect();
+        assert!(names.contains(&"alpha_helper"));
     }
 }
 
@@ -1066,21 +1220,59 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
+fn federated_symbol_search(root: &std::path::Path, query: &str, limit: usize) -> Result<Vec<index::SymbolHit>> {
+    let cfg = config::Config::load(root)?;
+    let submodules = config::Config::submodule_dirs(root)?;
+    let mut all_hits: Vec<index::SymbolHit> = Vec::new();
+    for (name, _) in &submodules {
+        if !cfg.federation_for(name) {
+            continue;
+        }
+        let db_path = cfg.db_path_for(root, name);
+        if !db_path.exists() {
+            continue;
+        }
+        let db = index::IndexDb::open(&db_path)?;
+        let mut hits = db.symbol_search(query, limit)?;
+        all_hits.append(&mut hits);
+    }
+    all_hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    all_hits.truncate(limit);
+    Ok(all_hits)
+}
+
 fn cmd_search(
     query: String,
     path: Option<PathBuf>,
     limit: usize,
     strategy: Option<String>,
+    scope: Option<String>,
+    federated: bool,
     json_output: bool,
 ) -> Result<()> {
     let search_path = path.unwrap_or_else(|| PathBuf::from("."));
 
-    let db_path = search_path.join(".tsift/index.db");
-    let symbol_hits = if db_path.exists() {
-        let db = index::IndexDb::open(&db_path)?;
-        db.symbol_search(&query, limit)?
+    let symbol_hits = if let Some(ref scope_name) = scope {
+        let root = search_path.canonicalize().unwrap_or(search_path.clone());
+        let cfg = config::Config::load(&root)?;
+        let db_path = cfg.db_path_for(&root, scope_name);
+        if db_path.exists() {
+            let db = index::IndexDb::open(&db_path)?;
+            db.symbol_search(&query, limit)?
+        } else {
+            Vec::new()
+        }
+    } else if federated {
+        let root = search_path.canonicalize().unwrap_or(search_path.clone());
+        federated_symbol_search(&root, &query, limit)?
     } else {
-        Vec::new()
+        let db_path = search_path.join(".tsift/index.db");
+        if db_path.exists() {
+            let db = index::IndexDb::open(&db_path)?;
+            db.symbol_search(&query, limit)?
+        } else {
+            Vec::new()
+        }
     };
 
     let engine = Sift::builder().build();
