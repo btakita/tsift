@@ -1,10 +1,13 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sift::{SearchInput, SearchOptions, Sift};
 use std::fs;
 use std::io::Read as _;
 use std::path::PathBuf;
+
+mod lang;
 
 #[derive(Parser)]
 #[command(name = "tsift", version, about = "Token-efficient search for Claude Code")]
@@ -48,6 +51,25 @@ enum Commands {
         /// Output only the model ID (for scripting)
         #[arg(long)]
         id: bool,
+    },
+    /// Rewrite a shell command to use tsift (for Claude Code hook integration)
+    Rewrite {
+        /// The shell command to potentially rewrite
+        command: String,
+    },
+    /// Query a SQLite database — show schema or run SQL
+    Sql {
+        /// Path to SQLite database file
+        db: PathBuf,
+        /// SQL query to execute (omit for schema overview)
+        #[arg(short, long)]
+        query: Option<String>,
+        /// Show schema for a specific table
+        #[arg(short, long)]
+        table: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -98,7 +120,9 @@ fn main() -> Result<()> {
             json,
         }) => cmd_search(query, path, limit, strategy, json),
         Some(Commands::Edit { dry_run, file }) => cmd_edit(dry_run, file),
+        Some(Commands::Rewrite { command }) => cmd_rewrite(&command),
         Some(Commands::Route { task, id }) => cmd_route(&task, id),
+        Some(Commands::Sql { db, query, table, json }) => cmd_sql(&db, query, table, json),
         None => {
             println!("tsift v{}", env!("CARGO_PKG_VERSION"));
             println!("Run `tsift --help` for usage.");
@@ -140,7 +164,7 @@ fn cmd_route(task: &str, id_only: bool) -> Result<()> {
 }
 
 /// Apply a single edit operation to file contents. Returns new content.
-pub fn apply_edit_op(content: &str, op: &EditOp) -> Result<(String, usize)> {
+pub(crate) fn apply_edit_op(content: &str, op: &EditOp) -> Result<(String, usize)> {
     if op.old == op.new {
         bail!("old and new strings are identical");
     }
@@ -326,6 +350,533 @@ mod tests {
         let content = "hello";
         let op = make_op("hello", "hello", false);
         assert!(apply_edit_op(content, &op).is_err());
+    }
+
+    // --- SQL introspection ---
+
+    fn setup_test_db() -> (tempfile::NamedTempFile, Connection) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT);
+             INSERT INTO users VALUES (1, 'Alice', 'alice@example.com');
+             INSERT INTO users VALUES (2, 'Bob', NULL);
+             CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, title TEXT NOT NULL, body TEXT,
+                 FOREIGN KEY(user_id) REFERENCES users(id));
+             INSERT INTO posts VALUES (1, 1, 'Hello World', 'First post');
+             INSERT INTO posts VALUES (2, 1, 'Second', NULL);
+             INSERT INTO posts VALUES (3, 2, 'Bob post', 'Content here');"
+        ).unwrap();
+        (tmp, conn)
+    }
+
+    // --- rewrite_command ---
+
+    #[test]
+    fn rewrite_rg_simple_pattern() {
+        let result = rewrite_command("rg authenticate");
+        assert_eq!(result, Some("tsift search \"authenticate\" --strategy lexical".to_string()));
+    }
+
+    #[test]
+    fn rewrite_rg_with_path() {
+        let result = rewrite_command("rg authenticate src/");
+        assert_eq!(result, Some("tsift search \"authenticate\" --strategy lexical --path \"src/\"".to_string()));
+    }
+
+    #[test]
+    fn rewrite_rg_with_flags_ignored() {
+        let result = rewrite_command("rg -i authenticate src/");
+        assert_eq!(result, Some("tsift search \"authenticate\" --strategy lexical --path \"src/\"".to_string()));
+    }
+
+    #[test]
+    fn rewrite_rg_with_type_flag() {
+        // -t rs takes a value, should be skipped; pattern is next positional
+        let result = rewrite_command("rg -t rs authenticate");
+        assert_eq!(result, Some("tsift search \"authenticate\" --strategy lexical".to_string()));
+    }
+
+    #[test]
+    fn rewrite_rg_pipe_passthrough() {
+        // Pipe chains can't be translated — pass through
+        let result = rewrite_command("rg authenticate | head -5");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn rewrite_grep_recursive() {
+        let result = rewrite_command("grep -r authenticate src/");
+        assert_eq!(result, Some("tsift search \"authenticate\" --strategy lexical --path \"src/\"".to_string()));
+    }
+
+    #[test]
+    fn rewrite_grep_non_recursive_passthrough() {
+        let result = rewrite_command("grep authenticate file.txt");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn rewrite_tsift_passthrough() {
+        let result = rewrite_command("tsift search \"foo\"");
+        assert_eq!(result, Some("tsift search \"foo\"".to_string()));
+    }
+
+    #[test]
+    fn rewrite_unrelated_passthrough() {
+        let result = rewrite_command("cargo build");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn rewrite_rg_quoted_pattern() {
+        let result = rewrite_command("rg \"fn main\"");
+        assert_eq!(result, Some("tsift search \"fn main\" --strategy lexical".to_string()));
+    }
+
+    #[test]
+    fn sql_schema_overview_lists_tables() {
+        let (_tmp, conn) = setup_test_db();
+        let tables = schema_overview(&conn).unwrap();
+        let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, &["posts", "users"]);
+    }
+
+    #[test]
+    fn sql_schema_overview_row_counts() {
+        let (_tmp, conn) = setup_test_db();
+        let tables = schema_overview(&conn).unwrap();
+        let users = tables.iter().find(|t| t.name == "users").unwrap();
+        let posts = tables.iter().find(|t| t.name == "posts").unwrap();
+        assert_eq!(users.row_count, 2);
+        assert_eq!(posts.row_count, 3);
+    }
+
+    #[test]
+    fn sql_table_columns_metadata() {
+        let (_tmp, conn) = setup_test_db();
+        let cols = table_columns(&conn, "users").unwrap();
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0].name, "id");
+        assert!(cols[0].pk);
+        assert_eq!(cols[1].name, "name");
+        assert!(cols[1].notnull);
+        assert_eq!(cols[2].name, "email");
+        assert!(!cols[2].notnull);
+    }
+
+    #[test]
+    fn sql_execute_query_returns_rows() {
+        let (_tmp, conn) = setup_test_db();
+        let (columns, rows) = execute_query(&conn, "SELECT name, email FROM users ORDER BY id").unwrap();
+        assert_eq!(columns, &["name", "email"]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], serde_json::json!("Alice"));
+        assert_eq!(rows[0][1], serde_json::json!("alice@example.com"));
+        assert_eq!(rows[1][1], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn sql_execute_query_aggregate() {
+        let (_tmp, conn) = setup_test_db();
+        let (columns, rows) = execute_query(&conn, "SELECT COUNT(*) as cnt FROM posts").unwrap();
+        assert_eq!(columns, &["cnt"]);
+        assert_eq!(rows[0][0], serde_json::json!(3));
+    }
+
+    #[test]
+    fn sql_execute_query_join() {
+        let (_tmp, conn) = setup_test_db();
+        let (_cols, rows) = execute_query(
+            &conn,
+            "SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id ORDER BY p.id"
+        ).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0], serde_json::json!("Alice"));
+        assert_eq!(rows[2][0], serde_json::json!("Bob"));
+    }
+
+    #[test]
+    fn sql_open_db_read_only() {
+        let (tmp, _conn) = setup_test_db();
+        drop(_conn);
+        let ro_conn = open_db(tmp.path()).unwrap();
+        let result = ro_conn.execute("INSERT INTO users VALUES (99, 'Fail', NULL)", []);
+        assert!(result.is_err(), "read-only connection should reject writes");
+    }
+
+    #[test]
+    fn sql_empty_table_schema() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch("CREATE TABLE empty_tbl (id INTEGER PRIMARY KEY, data BLOB)").unwrap();
+        let tables = schema_overview(&conn).unwrap();
+        assert_eq!(tables[0].row_count, 0);
+        assert_eq!(tables[0].columns.len(), 2);
+    }
+}
+
+// --- SQL introspection ---
+
+#[derive(Serialize)]
+struct TableInfo {
+    name: String,
+    columns: Vec<ColumnInfo>,
+    row_count: i64,
+}
+
+#[derive(Serialize)]
+struct ColumnInfo {
+    name: String,
+    #[serde(rename = "type")]
+    col_type: String,
+    notnull: bool,
+    pk: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_value: Option<String>,
+}
+
+/// Open a SQLite connection (read-only).
+pub(crate) fn open_db(path: &std::path::Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening database: {}", path.display()))?;
+    Ok(conn)
+}
+
+/// List all user tables with column metadata and row counts.
+pub(crate) fn schema_overview(conn: &Connection) -> Result<Vec<TableInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let table_names: Vec<String> = stmt.query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut tables = Vec::new();
+    for tbl in table_names {
+        let columns = table_columns(conn, &tbl)?;
+        let row_count: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM \"{}\"", tbl),
+            [],
+            |row| row.get(0),
+        )?;
+        tables.push(TableInfo { name: tbl, columns, row_count });
+    }
+    Ok(tables)
+}
+
+/// Get column metadata for a single table.
+pub(crate) fn table_columns(conn: &Connection, table: &str) -> Result<Vec<ColumnInfo>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{}\")", table))?;
+    let cols = stmt.query_map([], |row| {
+        Ok(ColumnInfo {
+            name: row.get(1)?,
+            col_type: row.get::<_, String>(2).unwrap_or_default(),
+            notnull: row.get::<_, bool>(3).unwrap_or(false),
+            pk: row.get::<_, i32>(5).unwrap_or(0) > 0,
+            default_value: row.get(4)?,
+        })
+    })?.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(cols)
+}
+
+/// Execute an arbitrary SQL query and return rows as JSON values.
+pub(crate) fn execute_query(conn: &Connection, sql: &str) -> Result<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
+    let mut stmt = conn.prepare(sql).context("preparing SQL query")?;
+    let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let col_count = col_names.len();
+
+    let mut rows = Vec::new();
+    let mut query_rows = stmt.query([])?;
+    while let Some(row) = query_rows.next()? {
+        let mut vals = Vec::with_capacity(col_count);
+        for i in 0..col_count {
+            let val = match row.get_ref(i)? {
+                rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                rusqlite::types::ValueRef::Integer(n) => serde_json::json!(n),
+                rusqlite::types::ValueRef::Real(f) => serde_json::json!(f),
+                rusqlite::types::ValueRef::Text(s) => {
+                    serde_json::Value::String(String::from_utf8_lossy(s).into_owned())
+                }
+                rusqlite::types::ValueRef::Blob(b) => {
+                    serde_json::Value::String(format!("<blob {} bytes>", b.len()))
+                }
+            };
+            vals.push(val);
+        }
+        rows.push(vals);
+    }
+    Ok((col_names, rows))
+}
+
+fn cmd_sql(db_path: &std::path::Path, query: Option<String>, table: Option<String>, json_output: bool) -> Result<()> {
+    let conn = open_db(db_path)?;
+
+    match (query, table) {
+        (Some(sql), _) => {
+            let (columns, rows) = execute_query(&conn, &sql)?;
+            if json_output {
+                let json_rows: Vec<serde_json::Value> = rows.iter().map(|row| {
+                    let obj: serde_json::Map<String, serde_json::Value> = columns.iter()
+                        .zip(row.iter())
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    serde_json::Value::Object(obj)
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&json_rows)?);
+            } else {
+                // Tabular output
+                if columns.is_empty() {
+                    println!("Query returned no columns.");
+                    return Ok(());
+                }
+                // Header
+                println!("{}", columns.join(" | "));
+                println!("{}", columns.iter().map(|c| "-".repeat(c.len().max(4))).collect::<Vec<_>>().join("-+-"));
+                for row in &rows {
+                    let cells: Vec<String> = row.iter().map(|v| match v {
+                        serde_json::Value::Null => "NULL".to_string(),
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    }).collect();
+                    println!("{}", cells.join(" | "));
+                }
+                println!("\n{} row(s)", rows.len());
+            }
+        }
+        (None, Some(tbl)) => {
+            let cols = table_columns(&conn, &tbl)?;
+            if cols.is_empty() {
+                bail!("table '{}' not found or has no columns", tbl);
+            }
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&cols)?);
+            } else {
+                println!("Table: {}", tbl);
+                println!("{:<20} {:<12} {:<8} PK", "Column", "Type", "NotNull");
+                println!("{}", "-".repeat(50));
+                for col in &cols {
+                    println!("{:<20} {:<12} {:<8} {}", col.name, col.col_type, col.notnull, if col.pk { "PK" } else { "" });
+                }
+            }
+        }
+        (None, None) => {
+            let tables = schema_overview(&conn)?;
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&tables)?);
+            } else {
+                println!("Database: {}", db_path.display());
+                println!("{} table(s)\n", tables.len());
+                for tbl in &tables {
+                    println!("  {} ({} rows)", tbl.name, tbl.row_count);
+                    for col in &tbl.columns {
+                        let flags = [
+                            if col.pk { "PK" } else { "" },
+                            if col.notnull { "NOT NULL" } else { "" },
+                        ].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(", ");
+                        let suffix = if flags.is_empty() { String::new() } else { format!(" [{}]", flags) };
+                        println!("    {} {}{}", col.name, col.col_type, suffix);
+                    }
+                    println!();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// --- Command rewriting for Claude Code hooks ---
+
+/// Exit codes for `tsift rewrite` (matches rtk protocol):
+///   0 + stdout → rewrite found, auto-allow
+///   1          → no tsift equivalent, pass through
+fn cmd_rewrite(command: &str) -> Result<()> {
+    match rewrite_command(command) {
+        Some(rewritten) => {
+            print!("{}", rewritten);
+            Ok(())
+        }
+        None => {
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Attempt to rewrite a shell command to use tsift.
+/// Returns Some(rewritten) if applicable, None if no match.
+pub(crate) fn rewrite_command(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+
+    // Already a tsift command — pass through (exit 0, identical)
+    if trimmed.starts_with("tsift ") || trimmed == "tsift" {
+        return Some(command.to_string());
+    }
+
+    // rg <pattern> [path] [flags] → tsift search "<pattern>" --strategy lexical [--path <path>]
+    if let Some(rewritten) = rewrite_rg(trimmed) {
+        return Some(rewritten);
+    }
+
+    // grep -r <pattern> [path] → tsift search "<pattern>" --strategy lexical [--path <path>]
+    if let Some(rewritten) = rewrite_grep(trimmed) {
+        return Some(rewritten);
+    }
+
+    None
+}
+
+/// Rewrite `rg` (ripgrep) commands to tsift search.
+fn rewrite_rg(cmd: &str) -> Option<String> {
+    let parts: Vec<&str> = shell_split(cmd);
+    if parts.is_empty() || parts[0] != "rg" {
+        return None;
+    }
+
+    // Skip if rg is used with complex flags we can't translate
+    // (pipe chains, output redirection, --replace, --count, etc.)
+    if cmd.contains('|') || cmd.contains('>') || cmd.contains("--replace")
+        || cmd.contains("--count") || cmd.contains("-c")
+        || cmd.contains("--files-with-matches") || cmd.contains("-l")
+    {
+        return None;
+    }
+
+    // Extract the pattern (first non-flag argument after rg)
+    let mut pattern = None;
+    let mut path = None;
+    let mut skip_next = false;
+
+    for part in &parts[1..] {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        // Flags that take a value
+        if matches!(*part, "-t" | "--type" | "-g" | "--glob" | "-A" | "-B" | "-C"
+            | "--max-count" | "--max-depth" | "-m" | "-e") {
+            skip_next = true;
+            continue;
+        }
+        // Skip standalone flags
+        if part.starts_with('-') {
+            continue;
+        }
+        // First positional = pattern, second = path
+        if pattern.is_none() {
+            pattern = Some(*part);
+        } else if path.is_none() {
+            path = Some(*part);
+        }
+    }
+
+    let pattern = pattern?;
+    let mut result = format!("tsift search {} --strategy lexical", shell_quote(pattern));
+    if let Some(p) = path {
+        result.push_str(&format!(" --path {}", shell_quote(p)));
+    }
+    Some(result)
+}
+
+/// Rewrite `grep -r` commands to tsift search.
+fn rewrite_grep(cmd: &str) -> Option<String> {
+    let parts: Vec<&str> = shell_split(cmd);
+    if parts.is_empty() || parts[0] != "grep" {
+        return None;
+    }
+
+    // Only rewrite recursive grep
+    let has_recursive = parts.iter().any(|p| *p == "-r" || *p == "-R" || *p == "--recursive"
+        || p.contains('r') && p.starts_with('-') && !p.starts_with("--"));
+    if !has_recursive {
+        return None;
+    }
+
+    // Skip pipe chains
+    if cmd.contains('|') || cmd.contains('>') {
+        return None;
+    }
+
+    let mut pattern = None;
+    let mut path = None;
+    let mut skip_next = false;
+
+    for part in &parts[1..] {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(*part, "--include" | "--exclude" | "--exclude-dir" | "-e") {
+            skip_next = true;
+            continue;
+        }
+        if part.starts_with('-') {
+            continue;
+        }
+        if pattern.is_none() {
+            pattern = Some(*part);
+        } else if path.is_none() {
+            path = Some(*part);
+        }
+    }
+
+    let pattern = pattern?;
+    let mut result = format!("tsift search {} --strategy lexical", shell_quote(pattern));
+    if let Some(p) = path {
+        result.push_str(&format!(" --path {}", shell_quote(p)));
+    }
+    Some(result)
+}
+
+/// Simple shell word splitting (handles single and double quotes).
+fn shell_split(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        // Skip whitespace
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let start = i;
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            i += 1;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1; // closing quote
+            }
+        } else {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+        }
+        parts.push(&s[start..i]);
+    }
+    parts
+}
+
+/// Quote a string for shell if it contains special characters.
+fn shell_quote(s: &str) -> String {
+    // Strip existing quotes
+    let unquoted = if (s.starts_with('"') && s.ends_with('"'))
+        || (s.starts_with('\'') && s.ends_with('\''))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    };
+
+    if unquoted.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/') {
+        format!("\"{}\"", unquoted)
+    } else {
+        format!("\"{}\"", unquoted.replace('\\', "\\\\").replace('"', "\\\""))
     }
 }
 
