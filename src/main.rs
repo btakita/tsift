@@ -7,6 +7,7 @@ use std::fs;
 use std::io::Read as _;
 use std::path::PathBuf;
 
+pub mod graph;
 pub mod index;
 mod lang;
 pub mod walk;

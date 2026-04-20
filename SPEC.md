@@ -9,10 +9,13 @@ Extend tsift with tree-sitter AST parsing, dependency graph tracking, and per-su
 ```
 tsift (CLI + MCP plugin)
 ├── sift (BM25 + vector — existing)
-├── tsift-graph (new crate)
-│   ├── tree-sitter parsing (function/type/trait extraction)
-│   ├── dependency graph (call/import relationships)
-│   └── graph-ranked retrieval (PageRank-style symbol ranking)
+├── graph module (internal — src/graph.rs)
+│   ├── call-site extraction via tree-sitter queries
+│   ├── caller→callee edge resolution against symbol table
+│   └── SQLite storage (call_edges table)
+├── lang module (tree-sitter parsing — existing)
+│   ├── symbol extraction (function/type/trait definitions)
+│   └── call queries (function calls, method calls, macro invocations)
 └── rusqlite (storage — existing)
 ```
 
@@ -208,7 +211,7 @@ Dynamic grammars use `tree_sitter::Language::from_path()`. The `Language` enum a
 4. Implement `tsift index --ast` — multi-language symbol extraction to SQLite
 5. Wire AST index into `tsift search` — symbol-match ranking first, BM25 fallback
 6. Add remaining language queries (TypeScript, JavaScript, Kotlin, Zig, Bash, Markdown)
-7. Add `tsift-graph` crate — call graph extraction + traversal
+7. ~~Add `tsift-graph` crate~~ → Internal `graph` module — call graph extraction + edge storage (done)
 8. Per-submodule config + isolation tiers
 
 ## What NOT to build

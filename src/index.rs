@@ -1,3 +1,4 @@
+use crate::graph;
 use crate::lang::Lang;
 use crate::walk::{self, FileEntry};
 use anyhow::{Context, Result};
@@ -50,6 +51,15 @@ pub struct StoredSymbol {
     pub parent_module: Option<String>,
     pub visibility: Option<String>,
     pub tags: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredEdge {
+    pub caller_file: String,
+    pub caller_name: String,
+    pub caller_line: i64,
+    pub callee_name: String,
+    pub call_site_line: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,7 +118,18 @@ impl IndexDb {
             );
             CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
             CREATE INDEX IF NOT EXISTS idx_symbols_language ON symbols(language);
-            CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);"
+            CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
+            CREATE TABLE IF NOT EXISTS call_edges (
+                id INTEGER PRIMARY KEY,
+                caller_file TEXT NOT NULL,
+                caller_name TEXT NOT NULL,
+                caller_line INTEGER NOT NULL,
+                callee_name TEXT NOT NULL,
+                call_site_line INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_call_edges_caller ON call_edges(caller_name);
+            CREATE INDEX IF NOT EXISTS idx_call_edges_callee ON call_edges(callee_name);
+            CREATE INDEX IF NOT EXISTS idx_call_edges_file ON call_edges(caller_file);"
         )?;
         let _ = conn.execute("ALTER TABLE symbols ADD COLUMN tags TEXT", []);
         Ok(Self { conn })
@@ -198,6 +219,10 @@ impl IndexDb {
         let mut insert_symbol = self.conn.prepare(
             "INSERT INTO symbols (name, kind, language, signature, file, line, end_line, parent_module, visibility, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
         )?;
+        let mut delete_edges = self.conn.prepare("DELETE FROM call_edges WHERE caller_file = ?1")?;
+        let mut insert_edge = self.conn.prepare(
+            "INSERT INTO call_edges (caller_file, caller_name, caller_line, callee_name, call_site_line) VALUES (?1, ?2, ?3, ?4, ?5)"
+        )?;
 
         for change in &summary.changes {
             let path_str = change.path.to_string_lossy();
@@ -215,15 +240,16 @@ impl IndexDb {
                     ])?;
 
                     delete_symbols.execute(rusqlite::params![&path_str])?;
+                    delete_edges.execute(rusqlite::params![&path_str])?;
                     let lang = change.path.extension()
                         .and_then(|e| e.to_str())
                         .and_then(Lang::from_extension);
                     if let Some(lang) = lang {
                         let source = std::fs::read(&change.path).ok();
                         let symbols = source.as_ref().and_then(|s| lang.extract_symbols(s).ok());
-                        if let Some(symbols) = symbols {
+                        if let Some(ref symbols) = symbols {
                             let lang_name = lang.name();
-                            for sym in &symbols {
+                            for sym in symbols {
                                 let tags = compute_tags(&sym.name);
                                 insert_symbol.execute(rusqlite::params![
                                     sym.name,
@@ -239,11 +265,27 @@ impl IndexDb {
                                 ])?;
                             }
                         }
+                        if let Some(ref source) = source {
+                            let call_sites = graph::extract_call_sites(lang, source).ok();
+                            if let (Some(sites), Some(symbols)) = (call_sites, &symbols) {
+                                let edges = graph::resolve_edges(symbols, &sites);
+                                for edge in &edges {
+                                    insert_edge.execute(rusqlite::params![
+                                        &path_str,
+                                        edge.caller,
+                                        edge.caller_line as i64,
+                                        edge.callee,
+                                        edge.call_site_line as i64,
+                                    ])?;
+                                }
+                            }
+                        }
                     }
                 }
                 ChangeKind::Deleted => {
                     delete_file.execute(rusqlite::params![&path_str])?;
                     delete_symbols.execute(rusqlite::params![&path_str])?;
+                    delete_edges.execute(rusqlite::params![&path_str])?;
                 }
             }
         }
@@ -253,6 +295,7 @@ impl IndexDb {
     pub fn rebuild(&self, root: &Path) -> Result<IndexSummary> {
         self.conn.execute("DELETE FROM file_state", [])?;
         self.conn.execute("DELETE FROM symbols", [])?;
+        self.conn.execute("DELETE FROM call_edges", [])?;
         self.apply_changes(root)
     }
 
@@ -282,6 +325,43 @@ impl IndexDb {
                 parent_module: row.get(7)?,
                 visibility: row.get(8)?,
                 tags: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn edge_count(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM call_edges", [], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
+    pub fn callers_of(&self, name: &str) -> Result<Vec<StoredEdge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT caller_file, caller_name, caller_line, callee_name, call_site_line FROM call_edges WHERE callee_name = ?1 ORDER BY caller_file, call_site_line"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![name], |row| {
+            Ok(StoredEdge {
+                caller_file: row.get(0)?,
+                caller_name: row.get(1)?,
+                caller_line: row.get(2)?,
+                callee_name: row.get(3)?,
+                call_site_line: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn callees_of(&self, name: &str) -> Result<Vec<StoredEdge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT caller_file, caller_name, caller_line, callee_name, call_site_line FROM call_edges WHERE caller_name = ?1 ORDER BY caller_file, call_site_line"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![name], |row| {
+            Ok(StoredEdge {
+                caller_file: row.get(0)?,
+                caller_name: row.get(1)?,
+                caller_line: row.get(2)?,
+                callee_name: row.get(3)?,
+                call_site_line: row.get(4)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -636,5 +716,85 @@ mod tests {
 
         let hits = db.symbol_search("test", 2).unwrap();
         assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn call_edges_extracted_on_index() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn helper() {}\nfn main() { helper(); }").unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+        assert!(db.edge_count().unwrap() > 0, "expected call edges from indexed files");
+    }
+
+    #[test]
+    fn callers_of_query() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn helper() {}\nfn main() { helper(); }").unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+        let callers = db.callers_of("helper").unwrap();
+        assert!(!callers.is_empty(), "expected callers of helper");
+        assert_eq!(callers[0].caller_name, "main");
+    }
+
+    #[test]
+    fn callees_of_query() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn helper() {}\nfn main() { helper(); Vec::new(); }").unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+        let callees = db.callees_of("main").unwrap();
+        let names: Vec<&str> = callees.iter().map(|e| e.callee_name.as_str()).collect();
+        assert!(names.contains(&"helper"), "expected main to call helper, got: {:?}", names);
+        assert!(names.contains(&"new"), "expected main to call new, got: {:?}", names);
+    }
+
+    #[test]
+    fn edges_deleted_with_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn helper() {}\nfn main() { helper(); }").unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+        let initial = db.edge_count().unwrap();
+        assert!(initial > 0);
+        fs::remove_file(dir.path().join("main.rs")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+        assert_eq!(db.edge_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn rebuild_clears_and_reextracts_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn helper() {}\nfn main() { helper(); }").unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+        let count = db.edge_count().unwrap();
+        db.rebuild(dir.path()).unwrap();
+        assert_eq!(db.edge_count().unwrap(), count);
+    }
+
+    #[test]
+    fn edges_updated_on_modification() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() { foo(); }").unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+        let initial = db.edge_count().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(dir.path().join("main.rs"), "fn main() { foo(); bar(); baz(); }").unwrap();
+        db.apply_changes(dir.path()).unwrap();
+        assert!(db.edge_count().unwrap() > initial);
+    }
+
+    #[test]
+    fn python_edges_extracted() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("app.py"), "def helper(): pass\ndef main(): helper()").unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+        let callers = db.callers_of("helper").unwrap();
+        assert!(!callers.is_empty(), "expected python call edges");
+        assert_eq!(callers[0].caller_name, "main");
     }
 }
