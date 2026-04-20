@@ -75,6 +75,23 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Query the call graph (callers/callees of a symbol)
+    Graph {
+        /// Symbol name to query
+        symbol: String,
+        /// Path to the indexed codebase (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Show callers of the symbol
+        #[arg(long)]
+        callers: bool,
+        /// Show callees of the symbol
+        #[arg(long)]
+        callees: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Query a SQLite database — show schema or run SQL
     Sql {
         /// Path to SQLite database file
@@ -141,6 +158,7 @@ fn main() -> Result<()> {
         Some(Commands::Index { path, rebuild, check, json }) => cmd_index(&path, rebuild, check, json),
         Some(Commands::Rewrite { command }) => cmd_rewrite(&command),
         Some(Commands::Route { task, id }) => cmd_route(&task, id),
+        Some(Commands::Graph { symbol, path, callers, callees, json }) => cmd_graph(&symbol, &path, callers, callees, json),
         Some(Commands::Sql { db, query, table, json }) => cmd_sql(&db, query, table, json),
         None => {
             println!("tsift v{}", env!("CARGO_PKG_VERSION"));
@@ -318,6 +336,70 @@ fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, json_output: bo
             }
         }
     }
+    Ok(())
+}
+
+fn cmd_graph(symbol: &str, path: &std::path::Path, callers: bool, callees: bool, json_output: bool) -> Result<()> {
+    let root = path.canonicalize()
+        .with_context(|| format!("resolving path: {}", path.display()))?;
+    let db_path = root.join(".tsift/index.db");
+    if !db_path.exists() {
+        bail!("no index found at {}. Run `tsift index` first.", db_path.display());
+    }
+    let db = index::IndexDb::open(&db_path)?;
+
+    let show_both = !callers && !callees;
+
+    if callers || show_both {
+        let edges = db.callers_of(symbol)?;
+        if json_output {
+            if !show_both {
+                println!("{}", serde_json::to_string_pretty(&edges)?);
+            }
+        } else {
+            println!("Callers of `{}`:", symbol);
+            if edges.is_empty() {
+                println!("  (none)");
+            } else {
+                for edge in &edges {
+                    println!("  {} ({}:{})", edge.caller_name, edge.caller_file, edge.call_site_line);
+                }
+            }
+        }
+        if show_both && !json_output {
+            println!();
+        }
+    }
+
+    if callees || show_both {
+        let edges = db.callees_of(symbol)?;
+        if json_output {
+            if !show_both {
+                println!("{}", serde_json::to_string_pretty(&edges)?);
+            }
+        } else {
+            println!("Callees of `{}`:", symbol);
+            if edges.is_empty() {
+                println!("  (none)");
+            } else {
+                for edge in &edges {
+                    println!("  {} ({}:{})", edge.callee_name, edge.caller_file, edge.call_site_line);
+                }
+            }
+        }
+    }
+
+    if show_both && json_output {
+        let callers_edges = db.callers_of(symbol)?;
+        let callees_edges = db.callees_of(symbol)?;
+        let combined = serde_json::json!({
+            "symbol": symbol,
+            "callers": callers_edges,
+            "callees": callees_edges,
+        });
+        println!("{}", serde_json::to_string_pretty(&combined)?);
+    }
+
     Ok(())
 }
 
@@ -569,6 +651,53 @@ mod tests {
         let tables = schema_overview(&conn).unwrap();
         assert_eq!(tables[0].row_count, 0);
         assert_eq!(tables[0].columns.len(), 2);
+    }
+
+    // --- graph command ---
+
+    fn setup_graph_index() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() { println!(\"hi\"); }\nfn main() { helper(); Vec::new(); }"
+        ).unwrap();
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn graph_callers_query() {
+        let dir = setup_graph_index();
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let callers = db.callers_of("helper").unwrap();
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].caller_name, "main");
+    }
+
+    #[test]
+    fn graph_callees_query() {
+        let dir = setup_graph_index();
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let callees = db.callees_of("main").unwrap();
+        let names: Vec<&str> = callees.iter().map(|e| e.callee_name.as_str()).collect();
+        assert!(names.contains(&"helper"));
+        assert!(names.contains(&"new"));
+    }
+
+    #[test]
+    fn graph_no_callers_returns_empty() {
+        let dir = setup_graph_index();
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let callers = db.callers_of("nonexistent").unwrap();
+        assert!(callers.is_empty());
+    }
+
+    #[test]
+    fn graph_cmd_no_index_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = cmd_graph("main", dir.path(), false, false, false);
+        assert!(result.is_err());
     }
 }
 
