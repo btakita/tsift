@@ -7,6 +7,7 @@ use std::fs;
 use std::io::Read as _;
 use std::path::PathBuf;
 
+pub mod index;
 mod lang;
 pub mod walk;
 
@@ -57,6 +58,21 @@ enum Commands {
     Rewrite {
         /// The shell command to potentially rewrite
         command: String,
+    },
+    /// Build or update the file index (mtime-based incremental)
+    Index {
+        /// Path to index (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Drop existing state and re-index from scratch
+        #[arg(long)]
+        rebuild: bool,
+        /// Report stale files without updating the index
+        #[arg(long)]
+        check: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Query a SQLite database — show schema or run SQL
     Sql {
@@ -121,6 +137,7 @@ fn main() -> Result<()> {
             json,
         }) => cmd_search(query, path, limit, strategy, json),
         Some(Commands::Edit { dry_run, file }) => cmd_edit(dry_run, file),
+        Some(Commands::Index { path, rebuild, check, json }) => cmd_index(&path, rebuild, check, json),
         Some(Commands::Rewrite { command }) => cmd_rewrite(&command),
         Some(Commands::Route { task, id }) => cmd_route(&task, id),
         Some(Commands::Sql { db, query, table, json }) => cmd_sql(&db, query, table, json),
@@ -262,6 +279,43 @@ fn cmd_edit(dry_run: bool, file: Option<PathBuf>) -> Result<()> {
 
     if err_count > 0 {
         bail!("{} edit(s) failed", err_count);
+    }
+    Ok(())
+}
+
+fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, json_output: bool) -> Result<()> {
+    let root = path.canonicalize()
+        .with_context(|| format!("resolving path: {}", path.display()))?;
+    let db_path = root.join(".tsift/index.db");
+    let db = index::IndexDb::open(&db_path)?;
+
+    let summary = if rebuild {
+        db.rebuild(&root)?
+    } else if check {
+        db.compute_changes(&root)?
+    } else {
+        db.apply_changes(&root)?
+    };
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        let mode = if rebuild { "rebuild" } else if check { "check" } else { "incremental" };
+        println!("Index ({}): {} files tracked", mode, summary.total_tracked);
+        println!("  new: {}  modified: {}  deleted: {}  unchanged: {}",
+            summary.new, summary.modified, summary.deleted, summary.unchanged);
+        if !summary.changes.is_empty() {
+            println!();
+            for change in &summary.changes {
+                let marker = match change.kind {
+                    index::ChangeKind::New => "+",
+                    index::ChangeKind::Modified => "~",
+                    index::ChangeKind::Deleted => "-",
+                };
+                let lang = change.language.as_deref().unwrap_or("");
+                println!("  {} {} [{}]", marker, change.path.display(), lang);
+            }
+        }
     }
     Ok(())
 }
