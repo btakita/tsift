@@ -138,11 +138,13 @@ impl Lang {
                 (interface_declaration name: (type_identifier) @interface.name)
                 (type_alias_declaration name: (type_identifier) @type_alias.name)
                 (enum_declaration name: (identifier) @enum.name)
+                (variable_declarator name: (identifier) @function.name value: (arrow_function))
             "#,
             #[cfg(feature = "lang-javascript")]
             Self::JavaScript | Self::Jsx => r#"
                 (function_declaration name: (identifier) @function.name)
                 (class_declaration name: (identifier) @class.name)
+                (variable_declarator name: (identifier) @function.name value: (arrow_function))
             "#,
             #[cfg(feature = "lang-kotlin")]
             Self::Kotlin => r#"
@@ -496,5 +498,68 @@ mod tests {
         let symbols = Lang::Markdown.extract_symbols(source).unwrap();
         assert!(!symbols.is_empty(), "expected heading symbols");
         assert!(symbols.iter().all(|s| s.kind == "heading"), "all should be headings");
+    }
+
+    #[cfg(feature = "lang-python")]
+    #[test]
+    fn test_python_async_def() {
+        let source = b"async def fetch_data():\n    await get()\n\ndef sync_fn():\n    pass\n";
+        let symbols = Lang::Python.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"fetch_data"), "missing async function, got {:?}", names);
+        assert!(names.contains(&"sync_fn"), "missing sync function, got {:?}", names);
+    }
+
+    #[cfg(feature = "lang-python")]
+    #[test]
+    fn test_python_decorated_function() {
+        let source = b"@staticmethod\ndef helper():\n    pass\n\n@property\ndef name(self):\n    return self._name\n";
+        let symbols = Lang::Python.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"helper"), "missing decorated function, got {:?}", names);
+        assert!(names.contains(&"name"), "missing property function, got {:?}", names);
+    }
+
+    #[cfg(feature = "lang-typescript")]
+    #[test]
+    fn test_typescript_arrow_exports() {
+        let source = b"export const Foo = () => { return 42; };\nexport const Bar = (x: number): number => x + 1;\nconst local = () => {};\nfunction regular() {}\n";
+        let symbols = Lang::TypeScript.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Foo"), "missing arrow export Foo, got {:?}", names);
+        assert!(names.contains(&"Bar"), "missing arrow export Bar, got {:?}", names);
+        assert!(names.contains(&"local"), "missing local arrow, got {:?}", names);
+        assert!(names.contains(&"regular"), "missing regular function, got {:?}", names);
+    }
+
+    #[cfg(feature = "lang-typescript")]
+    #[test]
+    fn test_tsx_arrow_component() {
+        let source = b"export const MyComponent = () => <div>hello</div>;\nfunction Other() { return <span/>; }\n";
+        let symbols = Lang::Tsx.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"MyComponent"), "missing arrow component, got {:?}", names);
+        assert!(names.contains(&"Other"), "missing function component, got {:?}", names);
+    }
+
+    #[cfg(feature = "lang-javascript")]
+    #[test]
+    fn test_javascript_arrow_exports() {
+        let source = b"export const handler = () => { return 'ok'; };\nconst helper = (x) => x * 2;\nfunction regular() {}\n";
+        let symbols = Lang::JavaScript.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"handler"), "missing arrow export, got {:?}", names);
+        assert!(names.contains(&"helper"), "missing local arrow, got {:?}", names);
+        assert!(names.contains(&"regular"), "missing regular function, got {:?}", names);
+    }
+
+    #[cfg(feature = "lang-javascript")]
+    #[test]
+    fn test_jsx_arrow_component() {
+        let source = b"const App = () => <div>hi</div>;\nfunction Page() { return <main/>; }\n";
+        let symbols = Lang::Jsx.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"App"), "missing arrow JSX component, got {:?}", names);
+        assert!(names.contains(&"Page"), "missing function component, got {:?}", names);
     }
 }
