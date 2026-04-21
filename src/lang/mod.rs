@@ -190,11 +190,14 @@ impl Lang {
                     let name = capture.node.utf8_text(source)
                         .unwrap_or("<invalid utf8>")
                         .to_string();
+                    let parent_end = capture.node.parent()
+                        .map(|p| p.end_position().row)
+                        .unwrap_or(capture.node.end_position().row);
                     symbols.push(Symbol {
                         name,
                         kind: kind_str.to_string(),
                         line: capture.node.start_position().row,
-                        end_line: capture.node.end_position().row,
+                        end_line: parent_end,
                     });
                 }
             }
