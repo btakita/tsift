@@ -110,7 +110,7 @@ all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript
 | TSX | `tree-sitter-typescript` | crates.io | `LANGUAGE_TSX` | `.tsx` |
 | JavaScript | `tree-sitter-javascript` | crates.io | `LANGUAGE` | `.js`, `.mjs`, `.cjs` |
 | JSX | `tree-sitter-javascript` | crates.io | `LANGUAGE` | `.jsx` |
-| Kotlin | `tree-sitter-kotlin` | 0.3.8 | `LANGUAGE` | `.kt`, `.kts` |
+| Kotlin | `tree-sitter-kotlin-ng` | 1.1.0 | `LANGUAGE` | `.kt`, `.kts` |
 | Zig | `tree-sitter-zig` | 1.1.2 | `LANGUAGE` | `.zig` |
 | Bash | `tree-sitter-bash` | 0.25.1 | `LANGUAGE` | `.sh`, `.bash`, `.zsh` |
 | Markdown | `tree-sitter-md` | 0.5.3 | `LANGUAGE` + `LANGUAGE_INLINE` | `.md`, `.mdx` |

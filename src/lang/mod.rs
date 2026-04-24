@@ -148,9 +148,14 @@ impl Lang {
             "#,
             #[cfg(feature = "lang-kotlin")]
             Self::Kotlin => r#"
-                (function_declaration (identifier) @function.name)
-                (class_declaration (identifier) @class.name)
-                (object_declaration (identifier) @object.name)
+                (function_declaration name: (identifier) @function.name)
+                (class_declaration "interface" name: (identifier) @interface.name)
+                (class_declaration (modifiers (class_modifier "data")) name: (identifier) @data_class.name)
+                (class_declaration (modifiers (class_modifier "sealed")) name: (identifier) @sealed_class.name)
+                (class_declaration (modifiers (class_modifier "enum")) name: (identifier) @enum_class.name)
+                (class_declaration "class" name: (identifier) @class.name)
+                (object_declaration name: (identifier) @object.name)
+                (companion_object name: (identifier) @companion_object.name)
             "#,
             #[cfg(feature = "lang-zig")]
             Self::Zig => r#"
@@ -204,6 +209,18 @@ impl Lang {
                 }
             }
         }
+        // Deduplicate: when overlapping query patterns capture the same identifier
+        // (e.g. Kotlin "data class Foo" matches both data_class.name and class.name),
+        // keep the more specific kind (longer name).
+        symbols.sort_by(|a, b| a.line.cmp(&b.line).then(a.name.cmp(&b.name)));
+        symbols.dedup_by(|b, a| {
+            a.name == b.name && a.line == b.line && {
+                if b.kind.len() > a.kind.len() {
+                    a.kind.clone_from(&b.kind);
+                }
+                true
+            }
+        });
         Ok(symbols)
     }
 
@@ -463,12 +480,31 @@ mod tests {
     #[cfg(feature = "lang-kotlin")]
     #[test]
     fn test_extract_kotlin_symbols() {
-        let source = b"fun main() { println(\"hi\") }\nclass Foo\nobject Bar\n";
+        let source = b"fun main() { println(\"hi\") }\nclass Foo\ninterface Bar\ndata class Baz(val x: Int)\nsealed class Qux\nenum class Color { RED, GREEN }\nobject Singleton\n";
         let symbols = Lang::Kotlin.extract_symbols(source).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"main"), "missing main, got {:?}", names);
         assert!(names.contains(&"Foo"), "missing Foo, got {:?}", names);
         assert!(names.contains(&"Bar"), "missing Bar, got {:?}", names);
+        assert!(names.contains(&"Baz"), "missing Baz, got {:?}", names);
+        assert!(names.contains(&"Qux"), "missing Qux, got {:?}", names);
+        assert!(names.contains(&"Color"), "missing Color, got {:?}", names);
+        assert!(names.contains(&"Singleton"), "missing Singleton, got {:?}", names);
+        let main_sym = symbols.iter().find(|s| s.name == "main").unwrap();
+        assert_eq!(main_sym.kind, "function");
+        let foo_sym = symbols.iter().find(|s| s.name == "Foo").unwrap();
+        assert_eq!(foo_sym.kind, "class");
+        let bar_sym = symbols.iter().find(|s| s.name == "Bar").unwrap();
+        assert_eq!(bar_sym.kind, "interface");
+        let baz_sym = symbols.iter().find(|s| s.name == "Baz").unwrap();
+        assert_eq!(baz_sym.kind, "data_class");
+        let qux_sym = symbols.iter().find(|s| s.name == "Qux").unwrap();
+        assert_eq!(qux_sym.kind, "sealed_class");
+        let color_sym = symbols.iter().find(|s| s.name == "Color").unwrap();
+        assert_eq!(color_sym.kind, "enum_class");
+        let singleton_sym = symbols.iter().find(|s| s.name == "Singleton").unwrap();
+        assert_eq!(singleton_sym.kind, "object");
+        assert_eq!(symbols.len(), 7, "expected exactly 7 symbols, got {:?}", symbols);
     }
 
     #[cfg(feature = "lang-zig")]
