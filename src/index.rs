@@ -463,6 +463,14 @@ impl IndexDb {
         Ok(count as usize)
     }
 
+    pub fn all_edges(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT caller_name, callee_name FROM call_edges"
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn callers_of(&self, name: &str) -> Result<Vec<StoredEdge>> {
         let mut stmt = self.conn.prepare(
             "SELECT caller_file, caller_name, caller_line, callee_name, call_site_line FROM call_edges WHERE callee_name = ?1 ORDER BY caller_file, call_site_line"
@@ -996,5 +1004,20 @@ mod tests {
         db.rebuild(dir.path()).unwrap();
         let dirs = db.load_dir_state().unwrap();
         assert!(dirs.is_empty(), "dir_state should be cleared after rebuild");
+    }
+
+    #[test]
+    fn all_edges_returns_distinct_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        // main calls helper twice (two call sites) — all_edges should deduplicate
+        fs::write(dir.path().join("main.rs"), "fn helper() {}\nfn main() { helper(); helper(); }").unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+        let edges = db.all_edges().unwrap();
+        assert!(!edges.is_empty());
+        let pairs: Vec<(&str, &str)> = edges.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        assert!(pairs.contains(&("main", "helper")));
+        let count = pairs.iter().filter(|&&(a, b)| a == "main" && b == "helper").count();
+        assert_eq!(count, 1, "all_edges should deduplicate parallel edges");
     }
 }

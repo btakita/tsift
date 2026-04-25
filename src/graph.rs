@@ -1,5 +1,7 @@
 use crate::lang::{Lang, Symbol};
 use anyhow::Result;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +102,172 @@ pub fn resolve_edges(symbols: &[Symbol], call_sites: &[CallSite]) -> Vec<CallEdg
         }
     }
     edges
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Community {
+    pub id: usize,
+    pub members: Vec<String>,
+    pub modularity_contribution: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommunityResult {
+    pub communities: Vec<Community>,
+    pub modularity: f64,
+    pub iterations: usize,
+    pub node_count: usize,
+    pub edge_count: usize,
+}
+
+/// Louvain community detection over an undirected call graph.
+///
+/// Edges are treated as undirected; self-loops and parallel edges are collapsed.
+/// Returns communities sorted largest-first with total modularity Q.
+pub fn detect_communities(edges: &[(String, String)]) -> CommunityResult {
+    if edges.is_empty() {
+        return CommunityResult {
+            communities: Vec::new(),
+            modularity: 0.0,
+            iterations: 0,
+            node_count: 0,
+            edge_count: 0,
+        };
+    }
+
+    // Collect nodes in first-appearance order
+    let mut node_vec: Vec<String> = Vec::new();
+    let mut node_idx: HashMap<String, usize> = HashMap::new();
+    for (a, b) in edges {
+        for name in [a, b] {
+            if !node_idx.contains_key(name) {
+                node_idx.insert(name.clone(), node_vec.len());
+                node_vec.push(name.clone());
+            }
+        }
+    }
+    let n = node_vec.len();
+
+    // Build undirected adjacency (no self-loops, deduplicated)
+    let mut adj: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+    for (a, b) in edges {
+        let ai = node_idx[a];
+        let bi = node_idx[b];
+        if ai != bi {
+            adj[ai].insert(bi);
+            adj[bi].insert(ai);
+        }
+    }
+
+    let degree: Vec<f64> = adj.iter().map(|nb| nb.len() as f64).collect();
+    let m = degree.iter().sum::<f64>() / 2.0;
+
+    if m == 0.0 {
+        let communities = node_vec
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Community {
+                id: i,
+                members: vec![name.clone()],
+                modularity_contribution: 0.0,
+            })
+            .collect();
+        return CommunityResult {
+            communities,
+            modularity: 0.0,
+            iterations: 0,
+            node_count: n,
+            edge_count: 0,
+        };
+    }
+
+    // Phase 1: greedy local modularity optimization
+    // Each node starts in its own community; comm_degree[c] = sum of degrees in c.
+    let mut community: Vec<usize> = (0..n).collect();
+    let mut comm_degree: Vec<f64> = degree.clone();
+
+    let mut iterations = 0;
+    loop {
+        let mut improved = false;
+        iterations += 1;
+
+        for i in 0..n {
+            let cur_c = community[i];
+            let ki = degree[i];
+
+            // Gain of keeping i in cur_c (vs. isolated) — used as baseline for comparison
+            let ki_in_cur = adj[i].iter().filter(|&&nb| community[nb] == cur_c).count() as f64;
+            let cur_gain = ki_in_cur / m - ki * (comm_degree[cur_c] - ki) / (2.0 * m * m);
+
+            let mut best_delta = 0.0f64;
+            let mut best_c = cur_c;
+
+            // Candidates: communities reachable via neighbors (excluding current)
+            let mut seen_comms: HashSet<usize> = HashSet::new();
+            for &nb in &adj[i] {
+                let c = community[nb];
+                if c == cur_c || !seen_comms.insert(c) {
+                    continue;
+                }
+                let ki_in_c = adj[i].iter().filter(|&&nb2| community[nb2] == c).count() as f64;
+                let target_gain = ki_in_c / m - ki * comm_degree[c] / (2.0 * m * m);
+                let delta = target_gain - cur_gain;
+                if delta > best_delta {
+                    best_delta = delta;
+                    best_c = c;
+                }
+            }
+
+            if best_c != cur_c {
+                comm_degree[cur_c] -= ki;
+                comm_degree[best_c] += ki;
+                community[i] = best_c;
+                improved = true;
+            }
+        }
+
+        if !improved || iterations >= 100 {
+            break;
+        }
+    }
+
+    // Collect community members and count internal edges
+    let mut comm_members: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut comm_internal: HashMap<usize, f64> = HashMap::new();
+
+    for (i, &c) in community.iter().enumerate() {
+        comm_members.entry(c).or_default().push(node_vec[i].clone());
+    }
+    for i in 0..n {
+        for &nb in &adj[i] {
+            if nb > i && community[nb] == community[i] {
+                *comm_internal.entry(community[i]).or_insert(0.0) += 1.0;
+            }
+        }
+    }
+
+    let mut total_modularity = 0.0;
+    let mut communities: Vec<Community> = comm_members
+        .into_iter()
+        .map(|(id, mut members)| {
+            members.sort();
+            let lc = comm_internal.get(&id).copied().unwrap_or(0.0);
+            let dc = comm_degree[id];
+            let mod_contrib = lc / m - (dc / (2.0 * m)).powi(2);
+            total_modularity += mod_contrib;
+            Community { id, members, modularity_contribution: mod_contrib }
+        })
+        .collect();
+
+    communities.sort_by(|a, b| b.members.len().cmp(&a.members.len()).then(a.id.cmp(&b.id)));
+
+    CommunityResult {
+        communities,
+        modularity: total_modularity,
+        iterations,
+        node_count: n,
+        edge_count: m as usize,
+    }
 }
 
 #[cfg(test)]
@@ -244,5 +412,83 @@ mod tests {
             .collect();
         assert!(main_calls.contains(&"helper"), "main should call helper, got: {:?}", main_calls);
         assert!(main_calls.contains(&"new"), "main should call new, got: {:?}", main_calls);
+    }
+
+    // --- detect_communities ---
+
+    fn s(a: &str, b: &str) -> (String, String) {
+        (a.to_string(), b.to_string())
+    }
+
+    #[test]
+    fn communities_empty_graph() {
+        let result = detect_communities(&[]);
+        assert_eq!(result.node_count, 0);
+        assert_eq!(result.edge_count, 0);
+        assert!(result.communities.is_empty());
+        assert_eq!(result.iterations, 0);
+    }
+
+    #[test]
+    fn communities_single_edge() {
+        let edges = vec![s("a", "b")];
+        let result = detect_communities(&edges);
+        assert_eq!(result.node_count, 2);
+        assert_eq!(result.edge_count, 1);
+        // Both nodes should be in the same community
+        assert_eq!(result.communities.len(), 1);
+        assert_eq!(result.communities[0].members.len(), 2);
+    }
+
+    #[test]
+    fn communities_self_loop_ignored() {
+        let edges = vec![s("a", "a"), s("a", "b")];
+        let result = detect_communities(&edges);
+        assert_eq!(result.node_count, 2);
+        assert_eq!(result.edge_count, 1); // self-loop excluded
+    }
+
+    #[test]
+    fn communities_duplicate_edges_deduplicated() {
+        // Multiple call sites between the same functions = one undirected edge
+        let edges = vec![s("main", "helper"), s("main", "helper"), s("main", "helper")];
+        let result = detect_communities(&edges);
+        assert_eq!(result.node_count, 2);
+        assert_eq!(result.edge_count, 1);
+    }
+
+    #[test]
+    fn communities_two_cliques_split() {
+        // Two tight cliques with a single bridge: Louvain should split them
+        let edges = vec![
+            s("a", "b"), s("a", "c"), s("b", "c"),      // clique 1
+            s("d", "e"), s("d", "f"), s("e", "f"),      // clique 2
+            s("a", "d"),                                  // bridge
+        ];
+        let result = detect_communities(&edges);
+        assert_eq!(result.node_count, 6);
+        assert_eq!(result.communities.len(), 2, "expected 2 communities, got: {:?}", result.communities.iter().map(|c| &c.members).collect::<Vec<_>>());
+        assert_eq!(result.communities[0].members.len(), 3);
+        assert_eq!(result.communities[1].members.len(), 3);
+        assert!(result.modularity > 0.0);
+    }
+
+    #[test]
+    fn communities_disconnected_components() {
+        let edges = vec![s("a", "b"), s("c", "d")];
+        let result = detect_communities(&edges);
+        assert_eq!(result.node_count, 4);
+        assert_eq!(result.edge_count, 2);
+        assert!(result.modularity >= 0.0);
+    }
+
+    #[test]
+    fn communities_modularity_non_negative_for_clustered() {
+        let edges = vec![
+            s("a", "b"), s("a", "c"), s("b", "c"),
+            s("d", "e"), s("d", "f"), s("e", "f"),
+        ];
+        let result = detect_communities(&edges);
+        assert!(result.modularity >= 0.0, "Q={}", result.modularity);
     }
 }

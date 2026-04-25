@@ -125,6 +125,21 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Detect architectural communities using Louvain clustering over the call graph
+    Communities {
+        /// Path to the indexed codebase (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Restrict to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Show only communities with at least this many members
+        #[arg(long, default_value = "2")]
+        min_size: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Deserialize)]
@@ -181,6 +196,7 @@ fn main() -> Result<()> {
         Some(Commands::Route { task, id }) => cmd_route(&task, id),
         Some(Commands::Graph { symbol, path, callers, callees, scope, json }) => cmd_graph(&symbol, &path, callers, callees, scope.as_deref(), json),
         Some(Commands::Sql { db, query, table, json }) => cmd_sql(&db, query, table, json),
+        Some(Commands::Communities { path, scope, min_size, json }) => cmd_communities(&path, scope.as_deref(), min_size, json),
         None => {
             println!("tsift v{}", env!("CARGO_PKG_VERSION"));
             println!("Run `tsift --help` for usage.");
@@ -487,6 +503,57 @@ fn cmd_graph(symbol: &str, path: &std::path::Path, callers: bool, callees: bool,
         println!("{}", serde_json::to_string_pretty(&combined)?);
     }
 
+    Ok(())
+}
+
+fn cmd_communities(path: &std::path::Path, scope: Option<&str>, min_size: usize, json_output: bool) -> Result<()> {
+    let root = path.canonicalize()
+        .with_context(|| format!("resolving path: {}", path.display()))?;
+    let db_path = if let Some(scope_name) = scope {
+        let cfg = config::Config::load(&root)?;
+        cfg.db_path_for(&root, scope_name)
+    } else {
+        root.join(".tsift/index.db")
+    };
+    if !db_path.exists() {
+        bail!("no index found at {}. Run `tsift index` first.", db_path.display());
+    }
+    let db = index::IndexDb::open(&db_path)?;
+    let edges = db.all_edges()?;
+    let result = graph::detect_communities(&edges);
+
+    let filtered: Vec<&graph::Community> = result.communities.iter()
+        .filter(|c| c.members.len() >= min_size)
+        .collect();
+
+    if json_output {
+        let out = serde_json::json!({
+            "modularity": result.modularity,
+            "iterations": result.iterations,
+            "node_count": result.node_count,
+            "edge_count": result.edge_count,
+            "community_count": filtered.len(),
+            "communities": filtered,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!("Communities ({} nodes, {} edges, {} iterations, Q={:.4})",
+            result.node_count, result.edge_count, result.iterations, result.modularity);
+        if filtered.is_empty() {
+            println!("  (no communities with {} or more members)", min_size);
+        } else {
+            println!();
+            for (i, c) in filtered.iter().enumerate() {
+                println!("  [{}] {} members (Q={:.4}):", i + 1, c.members.len(), c.modularity_contribution);
+                for m in &c.members {
+                    println!("    {}", m);
+                }
+                if i + 1 < filtered.len() {
+                    println!();
+                }
+            }
+        }
+    }
     Ok(())
 }
 

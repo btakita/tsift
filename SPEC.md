@@ -66,9 +66,30 @@ tsift index --prune <path>      # skip unchanged directory subtrees (large repo 
 tsift graph <path>              # build dependency graph → deps.json
 tsift graph --callers <symbol>  # who calls this function?
 tsift graph --callees <symbol>  # what does this function call?
+tsift communities [--path]      # Louvain community detection over call graph
 tsift search <query>            # gains AST-aware ranking when index exists
 tsift search --scope <submod>   # restrict to one submodule's index
 ```
+
+## Community Detection (Louvain)
+
+`tsift communities` clusters the call graph into architectural subsystems using the Louvain method.
+
+```bash
+tsift communities [--path <path>] [--scope <submod>] [--min-size N] [--json]
+```
+
+**Algorithm:** greedy modularity optimization over an undirected, deduplicated call graph.
+1. Each symbol starts in its own community
+2. For each node, compute modularity gain of moving to each neighbor's community
+3. Move to the best community if gain > 0
+4. Repeat until convergence (no improving moves or 100 iterations)
+
+**Output:** communities sorted by size (largest first), total modularity Q ∈ [-0.5, 1.0] (higher = stronger community structure), per-community member list and modularity contribution.
+
+**`--min-size N` (default 2):** filter out singleton communities (external symbols with no definition in the indexed codebase).
+
+**Boundary rule:** `tsift communities` owns deterministic, AST-derived clustering. For LLM-derived semantic groupings (concept clusters, domain labels), use graphify's semantic layer over `tsift graph --json` output.
 
 ## Key Design Decision: Graph > Vector for Code
 
