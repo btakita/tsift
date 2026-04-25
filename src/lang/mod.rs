@@ -160,7 +160,10 @@ impl Lang {
             #[cfg(feature = "lang-zig")]
             Self::Zig => r#"
                 (function_declaration (identifier) @function.name)
-                (variable_declaration (identifier) @variable.name)
+                (variable_declaration (identifier) @struct.name (struct_declaration))
+                (variable_declaration (identifier) @enum.name (enum_declaration))
+                (variable_declaration (identifier) @union.name (union_declaration))
+                (variable_declaration (identifier) @const.name)
             "#,
             #[cfg(feature = "lang-bash")]
             Self::Bash => r#"
@@ -174,6 +177,7 @@ impl Lang {
                 (atx_heading (atx_h4_marker) (inline) @heading.name)
                 (atx_heading (atx_h5_marker) (inline) @heading.name)
                 (atx_heading (atx_h6_marker) (inline) @heading.name)
+                (fenced_code_block (info_string (language) @code_block.name))
             "#,
         }
     }
@@ -209,19 +213,65 @@ impl Lang {
                 }
             }
         }
+
+        #[cfg(feature = "lang-bash")]
+        if *self == Self::Bash {
+            Self::extract_bash_aliases(&tree, source, &mut symbols);
+        }
         // Deduplicate: when overlapping query patterns capture the same identifier
         // (e.g. Kotlin "data class Foo" matches both data_class.name and class.name),
         // keep the more specific kind (longer name).
         symbols.sort_by(|a, b| a.line.cmp(&b.line).then(a.name.cmp(&b.name)));
         symbols.dedup_by(|b, a| {
             a.name == b.name && a.line == b.line && {
-                if b.kind.len() > a.kind.len() {
-                    a.kind.clone_from(&b.kind);
+                let a_generic = matches!(a.kind.as_str(), "variable" | "const");
+                let b_generic = matches!(b.kind.as_str(), "variable" | "const");
+                match (a_generic, b_generic) {
+                    (true, false) => a.kind.clone_from(&b.kind),
+                    (false, true) => {},
+                    _ => if b.kind.len() > a.kind.len() {
+                        a.kind.clone_from(&b.kind);
+                    }
                 }
                 true
             }
         });
         Ok(symbols)
+    }
+
+    #[cfg(feature = "lang-bash")]
+    fn extract_bash_aliases(tree: &tree_sitter::Tree, source: &[u8], symbols: &mut Vec<Symbol>) {
+        let mut tree_cursor = tree.root_node().walk();
+        if !tree_cursor.goto_first_child() { return; }
+        loop {
+            let node = tree_cursor.node();
+            if node.kind() == "command"
+                && let Some(name_node) = node.child_by_field_name("name")
+            {
+                let cmd = name_node.utf8_text(source).unwrap_or("");
+                if cmd == "alias" {
+                    for i in 0..node.named_child_count() {
+                        if let Some(arg) = node.named_child(i)
+                            && (arg.kind() == "concatenation" || arg.kind() == "word")
+                        {
+                            let text = arg.utf8_text(source).unwrap_or("");
+                            if let Some(alias_name) = text.split('=').next()
+                                && !alias_name.is_empty()
+                                && alias_name != cmd
+                            {
+                                symbols.push(Symbol {
+                                    name: alias_name.to_string(),
+                                    kind: "alias".to_string(),
+                                    line: arg.start_position().row,
+                                    end_line: node.end_position().row,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            if !tree_cursor.goto_next_sibling() { break; }
+        }
     }
 
     pub fn all() -> Vec<Self> {
@@ -510,30 +560,54 @@ mod tests {
     #[cfg(feature = "lang-zig")]
     #[test]
     fn test_extract_zig_symbols() {
-        let source = b"pub fn main() void {}\nconst x: i32 = 5;\n";
+        let source = b"const std = @import(\"std\");\npub fn main() !void {}\nconst Point = struct { x: i32, y: i32 };\nconst Color = enum { red, green, blue };\nconst Result = union(enum) { ok: i32, err: []const u8 };\nconst MAX: i32 = 100;\n";
         let symbols = Lang::Zig.extract_symbols(source).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"main"), "missing main, got {:?}", names);
-        assert!(names.contains(&"x"), "missing x, got {:?}", names);
+        assert!(names.contains(&"Point"), "missing Point, got {:?}", names);
+        assert!(names.contains(&"Color"), "missing Color, got {:?}", names);
+        assert!(names.contains(&"Result"), "missing Result, got {:?}", names);
+        assert!(names.contains(&"std"), "missing std, got {:?}", names);
+        assert!(names.contains(&"MAX"), "missing MAX, got {:?}", names);
+        let main_sym = symbols.iter().find(|s| s.name == "main").unwrap();
+        assert_eq!(main_sym.kind, "function");
+        let point_sym = symbols.iter().find(|s| s.name == "Point").unwrap();
+        assert_eq!(point_sym.kind, "struct");
+        let color_sym = symbols.iter().find(|s| s.name == "Color").unwrap();
+        assert_eq!(color_sym.kind, "enum");
+        let result_sym = symbols.iter().find(|s| s.name == "Result").unwrap();
+        assert_eq!(result_sym.kind, "union");
+        let max_sym = symbols.iter().find(|s| s.name == "MAX").unwrap();
+        assert_eq!(max_sym.kind, "const");
     }
 
     #[cfg(feature = "lang-bash")]
     #[test]
     fn test_extract_bash_symbols() {
-        let source = b"#!/bin/bash\nhello() { echo hi; }\nworld() { echo world; }\n";
+        let source = b"#!/bin/bash\nhello() { echo hi; }\nfunction world { echo world; }\nalias ll='ls -la'\nalias grep='grep --color=auto'\n";
         let symbols = Lang::Bash.extract_symbols(source).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"hello"), "missing hello, got {:?}", names);
         assert!(names.contains(&"world"), "missing world, got {:?}", names);
+        assert!(names.contains(&"ll"), "missing alias ll, got {:?}", names);
+        assert!(names.contains(&"grep"), "missing alias grep, got {:?}", names);
+        let hello_sym = symbols.iter().find(|s| s.name == "hello").unwrap();
+        assert_eq!(hello_sym.kind, "function");
+        let ll_sym = symbols.iter().find(|s| s.name == "ll").unwrap();
+        assert_eq!(ll_sym.kind, "alias");
     }
 
     #[cfg(feature = "lang-markdown")]
     #[test]
     fn test_extract_markdown_symbols() {
-        let source = b"# Title\n\n## Section One\n\nSome text.\n\n### Subsection\n";
+        let source = b"# Title\n\n## Section One\n\nSome text.\n\n```rust\nfn main() {}\n```\n\n### Subsection\n\n```python\ndef hello():\n    pass\n```\n";
         let symbols = Lang::Markdown.extract_symbols(source).unwrap();
-        assert!(!symbols.is_empty(), "expected heading symbols");
-        assert!(symbols.iter().all(|s| s.kind == "heading"), "all should be headings");
+        let headings: Vec<&Symbol> = symbols.iter().filter(|s| s.kind == "heading").collect();
+        let code_blocks: Vec<&Symbol> = symbols.iter().filter(|s| s.kind == "code_block").collect();
+        assert_eq!(headings.len(), 3, "expected 3 headings, got {:?}", headings);
+        assert_eq!(code_blocks.len(), 2, "expected 2 code blocks, got {:?}", code_blocks);
+        assert!(code_blocks.iter().any(|s| s.name == "rust"), "missing rust block, got {:?}", code_blocks);
+        assert!(code_blocks.iter().any(|s| s.name == "python"), "missing python block, got {:?}", code_blocks);
     }
 
     #[cfg(feature = "lang-python")]
