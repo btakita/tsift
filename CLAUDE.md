@@ -8,7 +8,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 
 | Command | Purpose |
 |---------|---------|
-| `tsift index` | Build AST symbol index via tree-sitter. Supports `--workspace` (per-submodule) and `--submodule <name>` |
+| `tsift index` | Build AST symbol index via tree-sitter. `--workspace` / `--submodule <name>` / `--prune` (dir mtime pruning for large repos) |
 | `tsift search` | Hybrid BM25 + vector search via sift library. `--federated` / `--scope <name>` for workspace |
 | `tsift graph` | Call-graph queries: `--callers` / `--callees` of a symbol. `--scope <name>` / `--json` |
 | `tsift edit` | Batch file edits from JSON (stdin or `--file`), atomic validate-then-write |
@@ -44,7 +44,7 @@ tsift graph <symbol> --scope sub  # restrict to submodule
 ## Development
 
 ```bash
-make check          # clippy + test (116 tests)
+make check          # clippy + test (131 tests)
 cargo install --path .   # install to ~/.cargo/bin/
 ```
 

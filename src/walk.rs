@@ -1,5 +1,6 @@
 use crate::lang::Lang;
 use anyhow::{Context, Result};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -8,6 +9,21 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub mtime: SystemTime,
     pub lang: Lang,
+}
+
+#[derive(Debug)]
+pub struct WalkResult {
+    pub entries: Vec<FileEntry>,
+    pub dir_mtimes: HashMap<PathBuf, SystemTime>,
+    pub pruned_dirs: HashSet<PathBuf>,
+    pub stats: PruneStats,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct PruneStats {
+    pub dirs_walked: usize,
+    pub dirs_pruned: usize,
+    pub files_pruned: usize,
 }
 
 pub fn walk_files(root: &Path) -> Result<Vec<FileEntry>> {
@@ -45,6 +61,93 @@ pub fn walk_files(root: &Path) -> Result<Vec<FileEntry>> {
         });
     }
     Ok(entries)
+}
+
+pub fn walk_files_pruned(
+    root: &Path,
+    stored_dirs: HashMap<PathBuf, SystemTime>,
+) -> Result<WalkResult> {
+    let mut entries = Vec::new();
+    let mut dir_mtimes = HashMap::new();
+    let mut pruned_dirs = HashSet::new();
+    let mut dirs_pruned = 0usize;
+    let mut dirs_walked = 0usize;
+    let mut files_pruned = 0usize;
+
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+
+    for result in walker {
+        let dir_entry = result.with_context(|| format!("walking {}", root.display()))?;
+        let path = dir_entry.path();
+
+        // Skip files under pruned ancestor directories
+        if pruned_dirs.iter().any(|d: &PathBuf| path.starts_with(d) && path != d) {
+            if dir_entry.file_type().is_some_and(|ft| ft.is_file()) {
+                files_pruned += 1;
+            }
+            continue;
+        }
+
+        if dir_entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            let metadata = dir_entry
+                .metadata()
+                .with_context(|| format!("stat dir {}", path.display()))?;
+            let mtime = metadata
+                .modified()
+                .with_context(|| format!("mtime dir {}", path.display()))?;
+
+            if let Some(stored_mtime) = stored_dirs.get(path) {
+                if mtime == *stored_mtime {
+                    pruned_dirs.insert(path.to_path_buf());
+                    dirs_pruned += 1;
+                    continue;
+                }
+            }
+            dir_mtimes.insert(path.to_path_buf(), mtime);
+            dirs_walked += 1;
+            continue;
+        }
+
+        if !dir_entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+
+        let ext = match path.extension().and_then(|e| e.to_str()) {
+            Some(e) => e,
+            None => continue,
+        };
+        let lang = match Lang::from_extension(ext) {
+            Some(l) => l,
+            None => continue,
+        };
+        let metadata = dir_entry
+            .metadata()
+            .with_context(|| format!("stat {}", path.display()))?;
+        let mtime = metadata
+            .modified()
+            .with_context(|| format!("mtime {}", path.display()))?;
+        entries.push(FileEntry {
+            path: path.to_path_buf(),
+            mtime,
+            lang,
+        });
+    }
+
+    Ok(WalkResult {
+        entries,
+        dir_mtimes,
+        pruned_dirs,
+        stats: PruneStats {
+            dirs_walked,
+            dirs_pruned,
+            files_pruned,
+        },
+    })
 }
 
 pub fn changed_since(entries: &[FileEntry], since: SystemTime) -> Vec<&FileEntry> {
@@ -168,5 +271,57 @@ mod tests {
             .collect();
         assert!(names.contains(&"visible.rs".to_string()));
         assert!(!names.contains(&"secret.rs".to_string()));
+    }
+
+    #[test]
+    fn pruned_walk_no_stored_dirs_walks_everything() {
+        let dir = setup_temp_tree();
+        let result = walk_files_pruned(dir.path(), HashMap::new()).unwrap();
+        assert_eq!(result.entries.len(), 4); // main.rs, lib.py, app.tsx, sub/mod.rs
+        assert!(result.pruned_dirs.is_empty());
+        assert_eq!(result.stats.dirs_pruned, 0);
+    }
+
+    #[test]
+    fn pruned_walk_skips_unchanged_subdir() {
+        let dir = setup_temp_tree();
+        let root = dir.path();
+        let sub_path = root.join("sub");
+        let sub_mtime = fs::metadata(&sub_path).unwrap().modified().unwrap();
+        let mut stored = HashMap::new();
+        stored.insert(sub_path.clone(), sub_mtime);
+
+        let result = walk_files_pruned(root, stored).unwrap();
+        let names: Vec<String> = result.entries.iter()
+            .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(!names.contains(&"mod.rs".to_string()), "sub/mod.rs should be pruned");
+        assert!(names.contains(&"main.rs".to_string()));
+        assert_eq!(result.stats.dirs_pruned, 1);
+        assert!(result.pruned_dirs.contains(&sub_path));
+    }
+
+    #[test]
+    fn pruned_walk_walks_changed_subdir() {
+        let dir = setup_temp_tree();
+        let root = dir.path();
+        let sub_path = root.join("sub");
+        let old_mtime = SystemTime::UNIX_EPOCH;
+        let mut stored = HashMap::new();
+        stored.insert(sub_path, old_mtime);
+
+        let result = walk_files_pruned(root, stored).unwrap();
+        let names: Vec<String> = result.entries.iter()
+            .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"mod.rs".to_string()), "sub/mod.rs should be walked");
+        assert_eq!(result.stats.dirs_pruned, 0);
+    }
+
+    #[test]
+    fn pruned_walk_collects_dir_mtimes() {
+        let dir = setup_temp_tree();
+        let result = walk_files_pruned(dir.path(), HashMap::new()).unwrap();
+        assert!(!result.dir_mtimes.is_empty(), "should collect mtimes for walked directories");
     }
 }

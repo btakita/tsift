@@ -62,6 +62,7 @@ federation = false
 
 ```bash
 tsift index --ast <path>        # tree-sitter AST extraction → symbols.db
+tsift index --prune <path>      # skip unchanged directory subtrees (large repo optimization)
 tsift graph <path>              # build dependency graph → deps.json
 tsift graph --callers <symbol>  # who calls this function?
 tsift graph --callees <symbol>  # what does this function call?
@@ -189,6 +190,30 @@ CREATE TABLE symbols (
 CREATE INDEX idx_symbols_name ON symbols(name);
 CREATE INDEX idx_symbols_language ON symbols(language);
 CREATE INDEX idx_symbols_file ON symbols(file);
+
+CREATE TABLE dir_state (
+    path TEXT PRIMARY KEY,
+    mtime_secs INTEGER NOT NULL,
+    mtime_nanos INTEGER NOT NULL
+);
+```
+
+### Large Repo Optimization: Directory mtime Pruning
+
+For repos with 100K+ files, `tsift index --prune` skips unchanged directory subtrees during the file walk. Directory mtime changes when files are created, deleted, or renamed within it. When a directory's mtime matches stored state, the entire subtree is skipped.
+
+**How it works:**
+1. `dir_state` table stores directory modification times after each index run
+2. On subsequent runs with `--prune`, the walker checks each directory's mtime against stored state
+3. Directories with unchanged mtime are pruned — their files are treated as unchanged
+4. Files in pruned directories are not stat'd or re-parsed
+
+**Tradeoff:** In-place file content modifications do not update directory mtime. The `--prune` flag may miss modified files in unchanged directories. Use periodic `--rebuild` for full accuracy, or omit `--prune` when precision matters.
+
+**Output includes pruning stats:**
+```
+Index (pruned): 50000 files tracked
+  new: 2  modified: 1  deleted: 0  unchanged: 49997 | pruned: 312 dirs (8 walked, 49500 files skipped)
 ```
 
 ### Future Evolution: Dynamic Grammar Loading

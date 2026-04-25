@@ -1,10 +1,10 @@
 use crate::graph;
 use crate::lang::Lang;
-use crate::walk::{self, FileEntry};
+use crate::walk::{self, FileEntry, PruneStats};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tagpath::parser as tagpath_parser;
@@ -37,6 +37,8 @@ pub struct IndexSummary {
     pub deleted: usize,
     pub unchanged: usize,
     pub changes: Vec<FileChange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prune_stats: Option<PruneStats>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -129,20 +131,48 @@ impl IndexDb {
             );
             CREATE INDEX IF NOT EXISTS idx_call_edges_caller ON call_edges(caller_name);
             CREATE INDEX IF NOT EXISTS idx_call_edges_callee ON call_edges(callee_name);
-            CREATE INDEX IF NOT EXISTS idx_call_edges_file ON call_edges(caller_file);"
+            CREATE INDEX IF NOT EXISTS idx_call_edges_file ON call_edges(caller_file);
+            CREATE TABLE IF NOT EXISTS dir_state (
+                path TEXT PRIMARY KEY,
+                mtime_secs INTEGER NOT NULL,
+                mtime_nanos INTEGER NOT NULL
+            );"
         )?;
         let _ = conn.execute("ALTER TABLE symbols ADD COLUMN tags TEXT", []);
         Ok(Self { conn })
     }
 
-    pub fn compute_changes(&self, root: &Path) -> Result<IndexSummary> {
-        let entries = walk::walk_files(root)?;
-        let disk_files: HashMap<PathBuf, &FileEntry> = entries
-            .iter()
-            .map(|e| (e.path.clone(), e))
-            .collect();
+    fn load_dir_state(&self) -> Result<HashMap<PathBuf, SystemTime>> {
+        let mut dirs = HashMap::new();
+        let mut stmt = self.conn.prepare("SELECT path, mtime_secs, mtime_nanos FROM dir_state")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                PathBuf::from(row.get::<_, String>(0)?),
+                row.get::<_, i64>(1)?,
+                row.get::<_, u32>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (path, secs, nanos) = row?;
+            dirs.insert(path, pair_to_system_time(secs, nanos));
+        }
+        Ok(dirs)
+    }
 
-        let mut stored: HashMap<PathBuf, (i64, u32, String)> = HashMap::new();
+    fn save_dir_state(&self, dir_mtimes: &HashMap<PathBuf, SystemTime>) -> Result<()> {
+        self.conn.execute("DELETE FROM dir_state", [])?;
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO dir_state (path, mtime_secs, mtime_nanos) VALUES (?1, ?2, ?3)"
+        )?;
+        for (path, mtime) in dir_mtimes {
+            let (secs, nanos) = system_time_to_pair(*mtime);
+            stmt.execute(rusqlite::params![path.to_string_lossy(), secs, nanos])?;
+        }
+        Ok(())
+    }
+
+    fn load_stored_files(&self) -> Result<HashMap<PathBuf, (i64, u32, String)>> {
+        let mut stored = HashMap::new();
         let mut stmt = self.conn.prepare("SELECT path, mtime_secs, mtime_nanos, language FROM file_state")?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -156,11 +186,19 @@ impl IndexDb {
             let (path, secs, nanos, lang) = row?;
             stored.insert(path, (secs, nanos, lang));
         }
+        Ok(stored)
+    }
 
+    fn diff_entries(
+        entries: &[FileEntry],
+        stored: &HashMap<PathBuf, (i64, u32, String)>,
+        pruned_dirs: &HashSet<PathBuf>,
+    ) -> (Vec<FileChange>, usize) {
+        let disk_files: HashSet<&PathBuf> = entries.iter().map(|e| &e.path).collect();
         let mut changes = Vec::new();
         let mut unchanged = 0usize;
 
-        for entry in &entries {
+        for entry in entries {
             match stored.get(&entry.path) {
                 Some((secs, nanos, _lang)) => {
                     let stored_mtime = pair_to_system_time(*secs, *nanos);
@@ -185,7 +223,13 @@ impl IndexDb {
         }
 
         for stored_path in stored.keys() {
-            if !disk_files.contains_key(stored_path) {
+            if disk_files.contains(stored_path) {
+                continue;
+            }
+            let in_pruned = pruned_dirs.iter().any(|d| stored_path.starts_with(d));
+            if in_pruned {
+                unchanged += 1;
+            } else {
                 changes.push(FileChange {
                     path: stored_path.clone(),
                     kind: ChangeKind::Deleted,
@@ -194,22 +238,91 @@ impl IndexDb {
             }
         }
 
+        (changes, unchanged)
+    }
+
+    pub fn compute_changes(&self, root: &Path) -> Result<IndexSummary> {
+        self.compute_changes_inner(root, false)
+    }
+
+    pub fn compute_changes_pruned(&self, root: &Path) -> Result<IndexSummary> {
+        self.compute_changes_inner(root, true)
+    }
+
+    fn compute_changes_inner(&self, root: &Path, prune: bool) -> Result<IndexSummary> {
+        let stored = self.load_stored_files()?;
+
+        let (entries, pruned_dirs, prune_stats) = if prune {
+            let stored_dirs = self.load_dir_state().unwrap_or_default();
+            let walk_result = walk::walk_files_pruned(root, stored_dirs)?;
+            let mut stats = walk_result.stats;
+            let pruned_file_count = stored.keys()
+                .filter(|p| walk_result.pruned_dirs.iter().any(|d| p.starts_with(d)))
+                .count();
+            stats.files_pruned = pruned_file_count;
+            (walk_result.entries, walk_result.pruned_dirs, Some(stats))
+        } else {
+            let entries = walk::walk_files(root)?;
+            (entries, HashSet::new(), None)
+        };
+
+        let (changes, unchanged) = Self::diff_entries(&entries, &stored, &pruned_dirs);
+
         let new_count = changes.iter().filter(|c| c.kind == ChangeKind::New).count();
         let mod_count = changes.iter().filter(|c| c.kind == ChangeKind::Modified).count();
         let del_count = changes.iter().filter(|c| c.kind == ChangeKind::Deleted).count();
 
         Ok(IndexSummary {
-            total_tracked: entries.len(),
+            total_tracked: entries.len() + prune_stats.as_ref().map_or(0, |s| s.files_pruned),
             new: new_count,
             modified: mod_count,
             deleted: del_count,
             unchanged,
             changes,
+            prune_stats,
         })
     }
 
     pub fn apply_changes(&self, root: &Path) -> Result<IndexSummary> {
-        let summary = self.compute_changes(root)?;
+        self.apply_changes_inner(root, false)
+    }
+
+    pub fn apply_changes_pruned(&self, root: &Path) -> Result<IndexSummary> {
+        self.apply_changes_inner(root, true)
+    }
+
+    fn apply_changes_inner(&self, root: &Path, prune: bool) -> Result<IndexSummary> {
+        let stored = self.load_stored_files()?;
+
+        let (entries, pruned_dirs, dir_mtimes, prune_stats) = if prune {
+            let stored_dirs = self.load_dir_state().unwrap_or_default();
+            let walk_result = walk::walk_files_pruned(root, stored_dirs)?;
+            let mut stats = walk_result.stats;
+            let pruned_file_count = stored.keys()
+                .filter(|p| walk_result.pruned_dirs.iter().any(|d| p.starts_with(d)))
+                .count();
+            stats.files_pruned = pruned_file_count;
+            (walk_result.entries, walk_result.pruned_dirs, Some(walk_result.dir_mtimes), Some(stats))
+        } else {
+            let entries = walk::walk_files(root)?;
+            (entries, HashSet::new(), None, None)
+        };
+
+        let (changes, unchanged) = Self::diff_entries(&entries, &stored, &pruned_dirs);
+
+        let new_count = changes.iter().filter(|c| c.kind == ChangeKind::New).count();
+        let mod_count = changes.iter().filter(|c| c.kind == ChangeKind::Modified).count();
+        let del_count = changes.iter().filter(|c| c.kind == ChangeKind::Deleted).count();
+
+        let summary = IndexSummary {
+            total_tracked: entries.len() + prune_stats.as_ref().map_or(0, |s| s.files_pruned),
+            new: new_count,
+            modified: mod_count,
+            deleted: del_count,
+            unchanged,
+            changes,
+            prune_stats,
+        };
 
         let mut insert_file = self.conn.prepare(
             "INSERT OR REPLACE INTO file_state (path, mtime_secs, mtime_nanos, language) VALUES (?1, ?2, ?3, ?4)"
@@ -289,6 +402,20 @@ impl IndexDb {
                 }
             }
         }
+
+        if let Some(ref dm) = dir_mtimes {
+            let mut all_dirs = dm.clone();
+            // Preserve stored mtimes for pruned dirs (they weren't walked)
+            if let Ok(stored_dirs) = self.load_dir_state() {
+                for (path, mtime) in stored_dirs {
+                    if pruned_dirs.contains(&path) {
+                        all_dirs.insert(path, mtime);
+                    }
+                }
+            }
+            self.save_dir_state(&all_dirs)?;
+        }
+
         Ok(summary)
     }
 
@@ -296,6 +423,7 @@ impl IndexDb {
         self.conn.execute("DELETE FROM file_state", [])?;
         self.conn.execute("DELETE FROM symbols", [])?;
         self.conn.execute("DELETE FROM call_edges", [])?;
+        self.conn.execute("DELETE FROM dir_state", [])?;
         self.apply_changes(root)
     }
 
@@ -796,5 +924,77 @@ mod tests {
         let callers = db.callers_of("helper").unwrap();
         assert!(!callers.is_empty(), "expected python call edges");
         assert_eq!(callers[0].caller_name, "main");
+    }
+
+    #[test]
+    fn pruned_first_index_same_as_regular() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        let summary = db.apply_changes_pruned(dir.path()).unwrap();
+        assert_eq!(summary.new, 3);
+        assert_eq!(summary.modified, 0);
+        assert_eq!(summary.deleted, 0);
+        assert_eq!(summary.total_tracked, 3);
+        assert!(summary.prune_stats.is_some());
+        assert_eq!(summary.prune_stats.as_ref().unwrap().dirs_pruned, 0);
+    }
+
+    #[test]
+    fn pruned_second_index_prunes_unchanged() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes_pruned(dir.path()).unwrap();
+
+        let summary = db.compute_changes_pruned(dir.path()).unwrap();
+        assert_eq!(summary.new, 0);
+        assert_eq!(summary.deleted, 0);
+        let ps = summary.prune_stats.as_ref().unwrap();
+        assert!(ps.dirs_pruned > 0, "expected some dirs to be pruned on second run");
+    }
+
+    #[test]
+    fn pruned_detects_new_file_in_changed_dir() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes_pruned(dir.path()).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(dir.path().join("extra.rs"), "fn extra() {}").unwrap();
+
+        let summary = db.compute_changes_pruned(dir.path()).unwrap();
+        assert_eq!(summary.new, 1);
+        let new_file = summary.changes.iter().find(|c| c.kind == ChangeKind::New).unwrap();
+        assert!(new_file.path.ends_with("extra.rs"));
+    }
+
+    #[test]
+    fn pruned_does_not_report_pruned_files_as_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("sub/lib.rs"), "fn lib() {}").unwrap();
+
+        let db = db_in(root);
+        db.apply_changes_pruned(root).unwrap();
+        assert_eq!(db.file_count().unwrap(), 2);
+
+        let summary = db.compute_changes_pruned(root).unwrap();
+        assert_eq!(summary.deleted, 0, "pruned files should not appear as deleted");
+        assert_eq!(summary.unchanged, 2);
+    }
+
+    #[test]
+    fn rebuild_clears_dir_state() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes_pruned(dir.path()).unwrap();
+
+        let dirs = db.load_dir_state().unwrap();
+        assert!(!dirs.is_empty(), "dir_state should be populated after pruned index");
+
+        db.rebuild(dir.path()).unwrap();
+        let dirs = db.load_dir_state().unwrap();
+        assert!(dirs.is_empty(), "dir_state should be cleared after rebuild");
     }
 }
