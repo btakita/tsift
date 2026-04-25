@@ -18,6 +18,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift communities` | Louvain community detection over call graph. `--min-size N` / `--scope <name>` / `--json` |
 | `tsift path` | BFS shortest path between two symbols. `--scope <name>` / `--json` |
 | `tsift explain` | Full symbol context: definitions, callers, callees, community. `--scope <name>` / `--json` |
+| `tsift audit` | Skill drift detection: scan installed skills, check health, compare against manifest. `--manifest <file>` / `--json` |
 
 ## Graph Module (`src/graph.rs`)
 
@@ -49,7 +50,7 @@ tsift graph <symbol> --scope sub  # restrict to submodule
 ## Development
 
 ```bash
-make check          # clippy + test (153 tests)
+make check          # clippy + test (166 tests)
 cargo install --path .   # install to ~/.cargo/bin/
 ```
 

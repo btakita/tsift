@@ -101,12 +101,12 @@ pub fn walk_files_pruned(
                 .modified()
                 .with_context(|| format!("mtime dir {}", path.display()))?;
 
-            if let Some(stored_mtime) = stored_dirs.get(path) {
-                if mtime == *stored_mtime {
-                    pruned_dirs.insert(path.to_path_buf());
-                    dirs_pruned += 1;
-                    continue;
-                }
+            if let Some(stored_mtime) = stored_dirs.get(path)
+                && mtime == *stored_mtime
+            {
+                pruned_dirs.insert(path.to_path_buf());
+                dirs_pruned += 1;
+                continue;
             }
             dir_mtimes.insert(path.to_path_buf(), mtime);
             dirs_walked += 1;

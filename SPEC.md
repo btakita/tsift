@@ -69,6 +69,8 @@ tsift graph --callees <symbol>  # what does this function call?
 tsift communities [--path]      # Louvain community detection over call graph
 tsift path <from> <to>          # BFS shortest path between symbols
 tsift explain <symbol>          # full symbol context: callers, callees, community
+tsift audit                     # scan installed skills, check health
+tsift audit --manifest <file>   # compare against expected skill list
 tsift search <query>            # gains AST-aware ranking when index exists
 tsift search --scope <submod>   # restrict to one submodule's index
 ```
@@ -118,6 +120,26 @@ tsift explain main --scope sub  # restrict to submodule
 ```
 
 Community membership is computed on-the-fly via Louvain to show which architectural subsystem the symbol belongs to.
+
+## Skill Audit
+
+`tsift audit` scans Claude Code skill directories for health and drift detection.
+
+```bash
+tsift audit                              # scan ~/.claude/skills/
+tsift audit --skills-dir /path/to/skills # custom directory
+tsift audit --manifest skills.txt        # compare against expected list
+tsift audit --json                       # structured output
+```
+
+**Scan checks per skill:**
+- Directory exists and is readable
+- `SKILL.md` present, non-empty, has `description` in frontmatter
+- Symlink target resolves (detects broken symlinks)
+
+**Manifest comparison** (`--manifest`): cross-references installed skills against an expected list (one name per line, `#` comments allowed). Reports:
+- `missing` — listed in manifest but not installed
+- `orphan` — installed but not in manifest
 
 ## Key Design Decision: Graph > Vector for Code
 

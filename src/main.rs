@@ -7,6 +7,7 @@ use std::fs;
 use std::io::Read as _;
 use std::path::PathBuf;
 
+pub mod audit;
 pub mod config;
 pub mod graph;
 pub mod index;
@@ -170,6 +171,18 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Audit installed Claude Code skills — scan directories, check health, compare against manifest
+    Audit {
+        /// Path to the skills directory
+        #[arg(long, default_value = "~/.claude/skills")]
+        skills_dir: String,
+        /// Path to a manifest file listing expected skills (one per line)
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Deserialize)]
@@ -229,6 +242,7 @@ fn main() -> Result<()> {
         Some(Commands::Communities { path, scope, min_size, json }) => cmd_communities(&path, scope.as_deref(), min_size, json),
         Some(Commands::Path { from, to, path, scope, json }) => cmd_path(&from, &to, &path, scope.as_deref(), json),
         Some(Commands::Explain { symbol, path, scope, json }) => cmd_explain(&symbol, &path, scope.as_deref(), json),
+        Some(Commands::Audit { skills_dir, manifest, json }) => cmd_audit(&skills_dir, manifest, json),
         None => {
             println!("tsift v{}", env!("CARGO_PKG_VERSION"));
             println!("Run `tsift --help` for usage.");
@@ -697,6 +711,52 @@ fn cmd_explain(symbol: &str, path: &std::path::Path, scope: Option<&str>, json_o
             for m in &comm.members {
                 let marker = if m == symbol { "→ " } else { "  " };
                 println!("{}{}", marker, m);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_audit(skills_dir: &str, manifest: Option<PathBuf>, json_output: bool) -> Result<()> {
+    let expanded = if let Some(rest) = skills_dir.strip_prefix("~/") {
+        let home = std::env::var("HOME").context("HOME not set")?;
+        std::path::PathBuf::from(format!("{}/{}", home, rest))
+    } else {
+        std::path::PathBuf::from(skills_dir)
+    };
+
+    let mut result = audit::scan_skills(&expanded)?;
+
+    if let Some(manifest_path) = manifest {
+        audit::compare_manifest(&mut result, &manifest_path)?;
+    }
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("Skills directory: {}", result.skills_dir.display());
+        println!("Total: {}  Healthy: {}  Broken: {}", result.total, result.healthy, result.broken);
+        println!();
+        for skill in &result.skills {
+            let status = if skill.issues.is_empty() { "✓" } else { "✗" };
+            let desc = skill.description.as_deref().unwrap_or("-");
+            let link = if skill.is_symlink { " (symlink)" } else { "" };
+            println!("  {} {}{} — {}", status, skill.name, link, desc);
+            for issue in &skill.issues {
+                println!("    ! {}", issue);
+            }
+        }
+        if let Some(diffs) = &result.manifest_diffs
+            && !diffs.is_empty()
+        {
+            println!();
+            println!("Manifest diffs:");
+            for diff in diffs {
+                let label = match diff.kind {
+                    audit::DiffKind::Missing => "missing (expected but not installed)",
+                    audit::DiffKind::Orphan => "orphan (installed but not in manifest)",
+                };
+                println!("  {} — {}", diff.name, label);
             }
         }
     }
