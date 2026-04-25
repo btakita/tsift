@@ -140,6 +140,36 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Find the shortest path between two symbols in the call graph
+    Path {
+        /// Source symbol name
+        from: String,
+        /// Target symbol name
+        to: String,
+        /// Path to the indexed codebase (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Restrict to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show full context for a symbol: callers, callees, and community membership
+    Explain {
+        /// Symbol name to explain
+        symbol: String,
+        /// Path to the indexed codebase (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Restrict to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Deserialize)]
@@ -197,6 +227,8 @@ fn main() -> Result<()> {
         Some(Commands::Graph { symbol, path, callers, callees, scope, json }) => cmd_graph(&symbol, &path, callers, callees, scope.as_deref(), json),
         Some(Commands::Sql { db, query, table, json }) => cmd_sql(&db, query, table, json),
         Some(Commands::Communities { path, scope, min_size, json }) => cmd_communities(&path, scope.as_deref(), min_size, json),
+        Some(Commands::Path { from, to, path, scope, json }) => cmd_path(&from, &to, &path, scope.as_deref(), json),
+        Some(Commands::Explain { symbol, path, scope, json }) => cmd_explain(&symbol, &path, scope.as_deref(), json),
         None => {
             println!("tsift v{}", env!("CARGO_PKG_VERSION"));
             println!("Run `tsift --help` for usage.");
@@ -551,6 +583,120 @@ fn cmd_communities(path: &std::path::Path, scope: Option<&str>, min_size: usize,
                 if i + 1 < filtered.len() {
                     println!();
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::IndexDb> {
+    let root = path.canonicalize()
+        .with_context(|| format!("resolving path: {}", path.display()))?;
+    let db_path = if let Some(scope_name) = scope {
+        let cfg = config::Config::load(&root)?;
+        cfg.db_path_for(&root, scope_name)
+    } else {
+        root.join(".tsift/index.db")
+    };
+    if !db_path.exists() {
+        bail!("no index found at {}. Run `tsift index` first.", db_path.display());
+    }
+    index::IndexDb::open(&db_path)
+}
+
+fn cmd_path(from: &str, to: &str, path: &std::path::Path, scope: Option<&str>, json_output: bool) -> Result<()> {
+    let db = open_index_db(path, scope)?;
+    let edges = db.all_edges()?;
+    match graph::shortest_path(&edges, from, to) {
+        Some(result) => {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("{} → {} ({} hop{})", result.from, result.to, result.hops, if result.hops == 1 { "" } else { "s" });
+                println!();
+                for (i, node) in result.path.iter().enumerate() {
+                    if i > 0 {
+                        println!("  ↓");
+                    }
+                    println!("  {}", node);
+                }
+            }
+        }
+        None => {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "from": from,
+                    "to": to,
+                    "path": null,
+                    "hops": null,
+                }))?);
+            } else {
+                println!("No path found between `{}` and `{}`.", from, to);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_explain(symbol: &str, path: &std::path::Path, scope: Option<&str>, json_output: bool) -> Result<()> {
+    let db = open_index_db(path, scope)?;
+
+    let symbols = db.symbol_info(symbol)?;
+    let callers = db.callers_of(symbol)?;
+    let callees = db.callees_of(symbol)?;
+
+    let edges = db.all_edges()?;
+    let comm_result = graph::detect_communities(&edges);
+    let community = comm_result.communities.iter()
+        .find(|c| c.members.iter().any(|m| m == symbol));
+
+    if json_output {
+        let out = serde_json::json!({
+            "symbol": symbol,
+            "definitions": symbols,
+            "callers": callers,
+            "callees": callees,
+            "community": community,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        if symbols.is_empty() {
+            println!("Symbol `{}` not found in index.", symbol);
+            println!("(Checking call graph for references...)");
+            println!();
+        } else {
+            for sym in &symbols {
+                println!("{} ({}, {})", sym.name, sym.kind, sym.language);
+                println!("  {}:{}", sym.file, sym.line);
+            }
+            println!();
+        }
+
+        println!("Callers ({}):", callers.len());
+        if callers.is_empty() {
+            println!("  (none)");
+        } else {
+            for edge in &callers {
+                println!("  {} ({}:{})", edge.caller_name, edge.caller_file, edge.call_site_line);
+            }
+        }
+        println!();
+
+        println!("Callees ({}):", callees.len());
+        if callees.is_empty() {
+            println!("  (none)");
+        } else {
+            for edge in &callees {
+                println!("  {} ({}:{})", edge.callee_name, edge.caller_file, edge.call_site_line);
+            }
+        }
+
+        if let Some(comm) = community {
+            println!();
+            println!("Community {} ({} members):", comm.id, comm.members.len());
+            for m in &comm.members {
+                let marker = if m == symbol { "→ " } else { "  " };
+                println!("{}{}", marker, m);
             }
         }
     }
@@ -935,6 +1081,72 @@ tier = "isolated"
         let callees = db.callees_of("alpha_main").unwrap();
         let names: Vec<&str> = callees.iter().map(|e| e.callee_name.as_str()).collect();
         assert!(names.contains(&"alpha_helper"));
+    }
+
+    // --- community detection ---
+
+    #[test]
+    fn community_detection_groups_related() {
+        let dir = setup_graph_index();
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let edges = db.all_edges().unwrap();
+        let result = graph::detect_communities(&edges);
+        assert!(result.node_count > 0);
+        assert!(!result.communities.is_empty());
+    }
+
+    #[test]
+    fn community_cmd_no_index_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = cmd_communities(dir.path(), None, 2, false);
+        assert!(result.is_err());
+    }
+
+    // --- path ---
+
+    #[test]
+    fn path_finds_connected_symbols() {
+        let dir = setup_graph_index();
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let edges = db.all_edges().unwrap();
+        let result = graph::shortest_path(&edges, "main", "helper");
+        assert!(result.is_some());
+        let path = result.unwrap();
+        assert_eq!(path.hops, 1);
+    }
+
+    #[test]
+    fn path_returns_none_for_unknown() {
+        let dir = setup_graph_index();
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let edges = db.all_edges().unwrap();
+        assert!(graph::shortest_path(&edges, "main", "nonexistent").is_none());
+    }
+
+    #[test]
+    fn path_cmd_no_index_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = cmd_path("a", "b", dir.path(), None, false);
+        assert!(result.is_err());
+    }
+
+    // --- explain ---
+
+    #[test]
+    fn explain_shows_symbol_info() {
+        let dir = setup_graph_index();
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let symbols = db.symbol_info("main").unwrap();
+        assert!(!symbols.is_empty());
+        assert_eq!(symbols[0].name, "main");
+        assert_eq!(symbols[0].kind, "function");
+    }
+
+    #[test]
+    fn explain_cmd_no_index_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = cmd_explain("main", dir.path(), None, false);
+        assert!(result.is_err());
     }
 }
 

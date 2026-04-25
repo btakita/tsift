@@ -15,6 +15,9 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift route` | Classify task → model tier (haiku/sonnet/opus) |
 | `tsift rewrite` | Shell command → tsift equivalent (for Claude Code hook integration) |
 | `tsift sql` | SQLite introspection: schema overview, table detail, read-only query |
+| `tsift communities` | Louvain community detection over call graph. `--min-size N` / `--scope <name>` / `--json` |
+| `tsift path` | BFS shortest path between two symbols. `--scope <name>` / `--json` |
+| `tsift explain` | Full symbol context: definitions, callers, callees, community. `--scope <name>` / `--json` |
 
 ## Graph Module (`src/graph.rs`)
 
@@ -24,6 +27,8 @@ Call-graph extraction via tree-sitter. Runs during `tsift index` and stores edge
 - `resolve_edges(symbols, call_sites)` — match call sites to enclosing functions (innermost wins)
 - Supported: Rust (direct, method, scoped, macros), Python, TypeScript/TSX, JavaScript/JSX, Kotlin
 - Skipped: Zig, Bash, Markdown (no meaningful call patterns)
+- `detect_communities(edges)` — Louvain phase 1 modularity optimization, returns communities sorted by size
+- `shortest_path(edges, from, to)` — BFS over undirected call graph, returns path + hop count
 
 **Query via CLI:**
 ```bash
@@ -44,7 +49,7 @@ tsift graph <symbol> --scope sub  # restrict to submodule
 ## Development
 
 ```bash
-make check          # clippy + test (131 tests)
+make check          # clippy + test (153 tests)
 cargo install --path .   # install to ~/.cargo/bin/
 ```
 

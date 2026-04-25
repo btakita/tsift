@@ -67,6 +67,8 @@ tsift graph <path>              # build dependency graph → deps.json
 tsift graph --callers <symbol>  # who calls this function?
 tsift graph --callees <symbol>  # what does this function call?
 tsift communities [--path]      # Louvain community detection over call graph
+tsift path <from> <to>          # BFS shortest path between symbols
+tsift explain <symbol>          # full symbol context: callers, callees, community
 tsift search <query>            # gains AST-aware ranking when index exists
 tsift search --scope <submod>   # restrict to one submodule's index
 ```
@@ -90,6 +92,32 @@ tsift communities [--path <path>] [--scope <submod>] [--min-size N] [--json]
 **`--min-size N` (default 2):** filter out singleton communities (external symbols with no definition in the indexed codebase).
 
 **Boundary rule:** `tsift communities` owns deterministic, AST-derived clustering. For LLM-derived semantic groupings (concept clusters, domain labels), use graphify's semantic layer over `tsift graph --json` output.
+
+## Graph Path Queries
+
+### Shortest Path
+
+`tsift path <from> <to>` finds the shortest path between two symbols using BFS over the undirected call graph. Useful for understanding how distant parts of a codebase are connected.
+
+```bash
+tsift path cmd_index apply_changes          # show connection chain
+tsift path cmd_index apply_changes --json   # structured output
+tsift path cmd_index apply_changes --scope sub  # restrict to submodule
+```
+
+The graph is treated as undirected — if A calls B, the path A→B and B→A are both valid hops. Returns null/message when no path exists (disconnected components).
+
+### Symbol Explanation
+
+`tsift explain <symbol>` provides full context for a symbol: definitions, callers, callees, and community membership.
+
+```bash
+tsift explain main              # full context for 'main'
+tsift explain main --json       # structured output
+tsift explain main --scope sub  # restrict to submodule
+```
+
+Community membership is computed on-the-fly via Louvain to show which architectural subsystem the symbol belongs to.
 
 ## Key Design Decision: Graph > Vector for Code
 

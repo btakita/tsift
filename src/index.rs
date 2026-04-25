@@ -471,6 +471,27 @@ impl IndexDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn symbol_info(&self, name: &str) -> Result<Vec<StoredSymbol>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, kind, language, signature, file, line, end_line, parent_module, visibility, tags FROM symbols WHERE name = ?1 ORDER BY file, line"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![name], |row| {
+            Ok(StoredSymbol {
+                name: row.get(0)?,
+                kind: row.get(1)?,
+                language: row.get(2)?,
+                signature: row.get(3)?,
+                file: row.get(4)?,
+                line: row.get(5)?,
+                end_line: row.get(6)?,
+                parent_module: row.get(7)?,
+                visibility: row.get(8)?,
+                tags: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn callers_of(&self, name: &str) -> Result<Vec<StoredEdge>> {
         let mut stmt = self.conn.prepare(
             "SELECT caller_file, caller_name, caller_line, callee_name, call_site_line FROM call_edges WHERE callee_name = ?1 ORDER BY caller_file, call_site_line"

@@ -1,7 +1,7 @@
 use crate::lang::{Lang, Symbol};
 use anyhow::Result;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,6 +270,74 @@ pub fn detect_communities(edges: &[(String, String)]) -> CommunityResult {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PathResult {
+    pub from: String,
+    pub to: String,
+    pub path: Vec<String>,
+    pub hops: usize,
+}
+
+pub fn shortest_path(edges: &[(String, String)], from: &str, to: &str) -> Option<PathResult> {
+    if from == to {
+        return Some(PathResult {
+            from: from.to_string(),
+            to: to.to_string(),
+            path: vec![from.to_string()],
+            hops: 0,
+        });
+    }
+
+    let mut adj: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for (a, b) in edges {
+        if a == b {
+            continue;
+        }
+        adj.entry(a.as_str()).or_default().insert(b.as_str());
+        adj.entry(b.as_str()).or_default().insert(a.as_str());
+    }
+
+    if !adj.contains_key(from) || !adj.contains_key(to) {
+        return None;
+    }
+
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut queue: VecDeque<&str> = VecDeque::new();
+    let mut parent: HashMap<&str, &str> = HashMap::new();
+
+    visited.insert(from);
+    queue.push_back(from);
+
+    while let Some(current) = queue.pop_front() {
+        if let Some(neighbors) = adj.get(current) {
+            for &neighbor in neighbors {
+                if visited.insert(neighbor) {
+                    parent.insert(neighbor, current);
+                    if neighbor == to {
+                        let mut path = vec![to.to_string()];
+                        let mut curr = to;
+                        while let Some(&p) = parent.get(curr) {
+                            path.push(p.to_string());
+                            curr = p;
+                        }
+                        path.reverse();
+                        let hops = path.len() - 1;
+                        return Some(PathResult {
+                            from: from.to_string(),
+                            to: to.to_string(),
+                            path,
+                            hops,
+                        });
+                    }
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +558,58 @@ mod tests {
         ];
         let result = detect_communities(&edges);
         assert!(result.modularity >= 0.0, "Q={}", result.modularity);
+    }
+
+    // --- shortest_path ---
+
+    #[test]
+    fn path_direct_neighbors() {
+        let edges = vec![s("a", "b")];
+        let result = shortest_path(&edges, "a", "b").unwrap();
+        assert_eq!(result.path, vec!["a", "b"]);
+        assert_eq!(result.hops, 1);
+    }
+
+    #[test]
+    fn path_two_hops() {
+        let edges = vec![s("a", "b"), s("b", "c")];
+        let result = shortest_path(&edges, "a", "c").unwrap();
+        assert_eq!(result.hops, 2);
+        assert_eq!(result.path.first().unwrap(), "a");
+        assert_eq!(result.path.last().unwrap(), "c");
+    }
+
+    #[test]
+    fn path_same_node() {
+        let edges = vec![s("a", "b")];
+        let result = shortest_path(&edges, "a", "a").unwrap();
+        assert_eq!(result.path, vec!["a"]);
+        assert_eq!(result.hops, 0);
+    }
+
+    #[test]
+    fn path_no_connection() {
+        let edges = vec![s("a", "b"), s("c", "d")];
+        assert!(shortest_path(&edges, "a", "c").is_none());
+    }
+
+    #[test]
+    fn path_unknown_node() {
+        let edges = vec![s("a", "b")];
+        assert!(shortest_path(&edges, "a", "z").is_none());
+    }
+
+    #[test]
+    fn path_prefers_shorter() {
+        let edges = vec![s("a", "b"), s("b", "c"), s("a", "c")];
+        let result = shortest_path(&edges, "a", "c").unwrap();
+        assert_eq!(result.hops, 1);
+    }
+
+    #[test]
+    fn path_self_loop_ignored() {
+        let edges = vec![s("a", "a"), s("a", "b")];
+        let result = shortest_path(&edges, "a", "b").unwrap();
+        assert_eq!(result.hops, 1);
     }
 }
