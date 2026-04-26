@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize)]
@@ -11,6 +12,21 @@ pub struct SkillEntry {
     pub is_symlink: bool,
     pub description: Option<String>,
     pub issues: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invocation_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillUsage {
+    pub skill: String,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CleanupEntry {
+    pub skill: String,
+    pub reasons: Vec<String>,
+    pub token_estimate: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -24,6 +40,10 @@ pub struct AuditResult {
     pub manifest_diffs: Option<Vec<ManifestDiff>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub similar_pairs: Vec<SimilarPair>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Vec<SkillUsage>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<Vec<CleanupEntry>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,6 +79,8 @@ pub fn scan_skills(skills_dir: &Path) -> Result<AuditResult> {
             skills: Vec::new(),
             manifest_diffs: None,
             similar_pairs: Vec::new(),
+            usage: None,
+            cleanup: None,
         });
     }
 
@@ -122,6 +144,7 @@ pub fn scan_skills(skills_dir: &Path) -> Result<AuditResult> {
             is_symlink,
             description,
             issues,
+            invocation_count: None,
         });
     }
 
@@ -140,6 +163,8 @@ pub fn scan_skills(skills_dir: &Path) -> Result<AuditResult> {
         skills,
         manifest_diffs: None,
         similar_pairs,
+        usage: None,
+        cleanup: None,
     })
 }
 
@@ -234,6 +259,273 @@ pub fn compare_manifest(
 
     audit.manifest_diffs = Some(diffs);
     Ok(())
+}
+
+pub fn track_usage(audit: &mut AuditResult) -> Result<()> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let projects_dir = PathBuf::from(&home).join(".claude/projects");
+    if !projects_dir.exists() {
+        audit.usage = Some(Vec::new());
+        return Ok(());
+    }
+
+    let mut counts: HashMap<String, u32> = HashMap::new();
+
+    for project_entry in std::fs::read_dir(&projects_dir)? {
+        let project_entry = project_entry?;
+        let project_path = project_entry.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+        scan_session_dir(&project_path, &mut counts)?;
+    }
+
+    let installed: HashSet<String> = audit.skills.iter().map(|s| s.name.clone()).collect();
+
+    for skill in &mut audit.skills {
+        let count = counts.get(skill.name.as_str()).copied().unwrap_or(0);
+        skill.invocation_count = Some(count);
+    }
+
+    let mut usage_list: Vec<SkillUsage> = audit
+        .skills
+        .iter()
+        .map(|s| SkillUsage {
+            skill: s.name.clone(),
+            count: s.invocation_count.unwrap_or(0),
+        })
+        .collect();
+
+    for (name, count) in &counts {
+        if !installed.contains(name.as_str()) {
+            usage_list.push(SkillUsage {
+                skill: name.clone(),
+                count: *count,
+            });
+        }
+    }
+
+    usage_list.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.skill.cmp(&b.skill)));
+    audit.usage = Some(usage_list);
+    Ok(())
+}
+
+fn scan_session_dir(dir: &Path, counts: &mut HashMap<String, u32>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "jsonl") {
+            scan_jsonl(&path, counts).ok();
+        } else if path.is_dir() {
+            scan_session_dir(&path, counts).ok();
+        }
+    }
+    Ok(())
+}
+
+fn scan_jsonl(path: &Path, counts: &mut HashMap<String, u32>) -> Result<()> {
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        if !line.contains("\"Skill\"") {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+            extract_skill_names(&val, counts);
+        }
+    }
+    Ok(())
+}
+
+fn extract_skill_names(val: &serde_json::Value, counts: &mut HashMap<String, u32>) {
+    if let Some(content) = val
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        for block in content {
+            if block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                && block.get("name").and_then(|n| n.as_str()) == Some("Skill")
+                && let Some(skill_name) = block
+                    .get("input")
+                    .and_then(|i| i.get("skill"))
+                    .and_then(|s| s.as_str())
+            {
+                let base_name = skill_name.split(':').next().unwrap_or(skill_name);
+                *counts.entry(base_name.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+}
+
+pub fn generate_cleanup(audit: &mut AuditResult) {
+    let mut entries = Vec::new();
+
+    for skill in &audit.skills {
+        let mut reasons = Vec::new();
+
+        if !skill.issues.is_empty() {
+            reasons.push(format!("health: {}", skill.issues.join(", ")));
+        }
+
+        if skill.invocation_count == Some(0) {
+            reasons.push("never used in any session".to_string());
+        }
+
+        let is_duplicate = audit.similar_pairs.iter().any(|p| {
+            (p.skill_a == skill.name || p.skill_b == skill.name) && p.score >= 0.5
+        });
+        if is_duplicate {
+            reasons.push("high similarity with another skill (≥50%)".to_string());
+        }
+
+        if !reasons.is_empty() {
+            let token_estimate = estimate_skill_tokens(&skill.path);
+            entries.push(CleanupEntry {
+                skill: skill.name.clone(),
+                reasons,
+                token_estimate,
+            });
+        }
+    }
+
+    entries.sort_by(|a, b| b.token_estimate.cmp(&a.token_estimate));
+    audit.cleanup = Some(entries);
+}
+
+fn estimate_skill_tokens(skill_dir: &Path) -> usize {
+    let mut total_bytes: u64 = 0;
+    if let Ok(entries) = walkdir(skill_dir) {
+        for path in entries {
+            if let Ok(meta) = std::fs::metadata(&path)
+                && meta.is_file()
+            {
+                total_bytes += meta.len();
+            }
+        }
+    }
+    (total_bytes as usize) / 4
+}
+
+fn walkdir(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if !dir.is_dir() {
+        return Ok(files);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(walkdir(&path)?);
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+pub fn write_report(audit: &AuditResult, path: &Path) -> Result<()> {
+    let mut report = String::new();
+    report.push_str("# Skill Audit Report\n\n");
+    report.push_str(&format!(
+        "**Generated:** {}\n\n",
+        chrono_now()
+    ));
+    report.push_str(&format!(
+        "**Skills directory:** `{}`\n\n",
+        audit.skills_dir.display()
+    ));
+    report.push_str(&format!(
+        "| Metric | Count |\n|--------|-------|\n| Total | {} |\n| Healthy | {} |\n| Broken | {} |\n\n",
+        audit.total, audit.healthy, audit.broken
+    ));
+
+    report.push_str("## Skills\n\n");
+    report.push_str("| Status | Name | Description | Uses |\n|--------|------|-------------|------|\n");
+    for skill in &audit.skills {
+        let status = if skill.issues.is_empty() { "ok" } else { "broken" };
+        let desc = skill.description.as_deref().unwrap_or("-");
+        let uses = skill
+            .invocation_count
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        report.push_str(&format!("| {} | {} | {} | {} |\n", status, skill.name, desc, uses));
+    }
+
+    if !audit.similar_pairs.is_empty() {
+        report.push_str("\n## Possible Duplicates\n\n");
+        report.push_str("| Score | Skill A | Skill B |\n|-------|---------|--------|\n");
+        for pair in &audit.similar_pairs {
+            report.push_str(&format!(
+                "| {:.0}% | {} | {} |\n",
+                pair.score * 100.0,
+                pair.skill_a,
+                pair.skill_b
+            ));
+        }
+    }
+
+    if let Some(diffs) = &audit.manifest_diffs
+        && !diffs.is_empty()
+    {
+        report.push_str("\n## Manifest Diffs\n\n");
+        report.push_str("| Name | Status |\n|------|--------|\n");
+        for diff in diffs {
+            let label = match diff.kind {
+                DiffKind::Missing => "missing",
+                DiffKind::Orphan => "orphan",
+            };
+            report.push_str(&format!("| {} | {} |\n", diff.name, label));
+        }
+    }
+
+    if let Some(cleanup) = &audit.cleanup
+        && !cleanup.is_empty()
+    {
+        report.push_str("\n## Cleanup Recommendations\n\n");
+        report.push_str("| Skill | Token Savings | Reasons |\n|-------|---------------|--------|\n");
+        for entry in cleanup {
+            report.push_str(&format!(
+                "| {} | ~{} | {} |\n",
+                entry.skill,
+                format_tokens(entry.token_estimate),
+                entry.reasons.join("; ")
+            ));
+        }
+        let total: usize = cleanup.iter().map(|e| e.token_estimate).sum();
+        report.push_str(&format!(
+            "\n**Total potential savings:** ~{}\n",
+            format_tokens(total)
+        ));
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, &report)
+        .with_context(|| format!("writing report to {}", path.display()))?;
+    Ok(())
+}
+
+fn chrono_now() -> String {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs();
+    let days = secs / 86400;
+    let year = 1970 + (days * 400 / 146097);
+    format!("{}-xx-xx (epoch {})", year, secs)
+}
+
+fn format_tokens(tokens: usize) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M tokens", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K tokens", tokens as f64 / 1_000.0)
+    } else {
+        format!("{} tokens", tokens)
+    }
 }
 
 fn extract_frontmatter_field(content: &str, field: &str) -> Option<String> {
@@ -462,6 +754,7 @@ mod tests {
             is_symlink: false,
             description: Some(description.to_string()),
             issues: Vec::new(),
+            invocation_count: None,
         }
     }
 
@@ -568,5 +861,238 @@ mod tests {
         assert_eq!(result.similar_pairs.len(), 1);
         assert_eq!(result.similar_pairs[0].skill_a, "search-a");
         assert_eq!(result.similar_pairs[0].skill_b, "search-b");
+    }
+
+    // --- usage tracking ---
+
+    #[test]
+    fn extract_skill_names_from_tool_use() {
+        let json_line = r#"{"message":{"content":[{"type":"tool_use","name":"Skill","input":{"skill":"agent-doc","args":"plan.md"}}]}}"#;
+        let val: serde_json::Value = serde_json::from_str(json_line).unwrap();
+        let mut counts = HashMap::new();
+        extract_skill_names(&val, &mut counts);
+        assert_eq!(counts.get("agent-doc"), Some(&1));
+    }
+
+    #[test]
+    fn extract_skill_names_strips_plugin_prefix() {
+        let json_line = r#"{"message":{"content":[{"type":"tool_use","name":"Skill","input":{"skill":"codex:rescue","args":""}}]}}"#;
+        let val: serde_json::Value = serde_json::from_str(json_line).unwrap();
+        let mut counts = HashMap::new();
+        extract_skill_names(&val, &mut counts);
+        assert_eq!(counts.get("codex"), Some(&1));
+        assert_eq!(counts.get("codex:rescue"), None);
+    }
+
+    #[test]
+    fn extract_skill_names_ignores_non_skill_tools() {
+        let json_line = r#"{"message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#;
+        let val: serde_json::Value = serde_json::from_str(json_line).unwrap();
+        let mut counts = HashMap::new();
+        extract_skill_names(&val, &mut counts);
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn extract_skill_names_multiple_in_one_message() {
+        let json_line = r#"{"message":{"content":[
+            {"type":"tool_use","name":"Skill","input":{"skill":"agent-doc","args":"a.md"}},
+            {"type":"tool_use","name":"Skill","input":{"skill":"tsift","args":"search foo"}}
+        ]}}"#;
+        let val: serde_json::Value = serde_json::from_str(json_line).unwrap();
+        let mut counts = HashMap::new();
+        extract_skill_names(&val, &mut counts);
+        assert_eq!(counts.get("agent-doc"), Some(&1));
+        assert_eq!(counts.get("tsift"), Some(&1));
+    }
+
+    #[test]
+    fn scan_jsonl_counts_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = dir.path().join("session.jsonl");
+        let content = concat!(
+            r#"{"message":{"content":[{"type":"tool_use","name":"Skill","input":{"skill":"agent-doc","args":"a.md"}}]}}"#,
+            "\n",
+            r#"{"message":{"content":[{"type":"tool_use","name":"Skill","input":{"skill":"agent-doc","args":"b.md"}}]}}"#,
+            "\n",
+            r#"{"message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#,
+            "\n",
+        );
+        fs::write(&jsonl, content).unwrap();
+        let mut counts = HashMap::new();
+        scan_jsonl(&jsonl, &mut counts).unwrap();
+        assert_eq!(counts.get("agent-doc"), Some(&2));
+        assert_eq!(counts.len(), 1);
+    }
+
+    // --- cleanup recommendations ---
+
+    #[test]
+    fn generate_cleanup_flags_broken_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("broken")).unwrap();
+        let skill = dir.path().join("ok");
+        fs::create_dir(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\ndescription: fine\n---\n").unwrap();
+
+        let mut result = scan_skills(dir.path()).unwrap();
+        generate_cleanup(&mut result);
+        let cleanup = result.cleanup.unwrap();
+        assert!(cleanup.iter().any(|e| e.skill == "broken"));
+        assert!(!cleanup.iter().any(|e| e.skill == "ok"));
+    }
+
+    #[test]
+    fn generate_cleanup_flags_never_used() {
+        let mut result = AuditResult {
+            skills_dir: PathBuf::from("/tmp"),
+            total: 2,
+            healthy: 2,
+            broken: 0,
+            skills: vec![
+                {
+                    let mut s = make_skill("used", "does things");
+                    s.invocation_count = Some(5);
+                    s
+                },
+                {
+                    let mut s = make_skill("unused", "does other things");
+                    s.invocation_count = Some(0);
+                    s
+                },
+            ],
+            manifest_diffs: None,
+            similar_pairs: Vec::new(),
+            usage: None,
+            cleanup: None,
+        };
+        generate_cleanup(&mut result);
+        let cleanup = result.cleanup.unwrap();
+        assert!(cleanup.iter().any(|e| e.skill == "unused" && e.reasons.iter().any(|r| r.contains("never used"))));
+        assert!(!cleanup.iter().any(|e| e.skill == "used"));
+    }
+
+    #[test]
+    fn generate_cleanup_flags_high_similarity_duplicates() {
+        let mut result = AuditResult {
+            skills_dir: PathBuf::from("/tmp"),
+            total: 2,
+            healthy: 2,
+            broken: 0,
+            skills: vec![
+                make_skill("search-a", "search code"),
+                make_skill("search-b", "search code"),
+            ],
+            manifest_diffs: None,
+            similar_pairs: vec![SimilarPair {
+                skill_a: "search-a".to_string(),
+                skill_b: "search-b".to_string(),
+                score: 0.8,
+                desc_a: "search code".to_string(),
+                desc_b: "search code".to_string(),
+            }],
+            usage: None,
+            cleanup: None,
+        };
+        generate_cleanup(&mut result);
+        let cleanup = result.cleanup.unwrap();
+        assert_eq!(cleanup.len(), 2);
+        assert!(cleanup.iter().all(|e| e.reasons.iter().any(|r| r.contains("similarity"))));
+    }
+
+    #[test]
+    fn generate_cleanup_sorted_by_token_estimate() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small");
+        fs::create_dir(&small).unwrap();
+        fs::write(small.join("SKILL.md"), "x").unwrap();
+
+        let big = dir.path().join("big");
+        fs::create_dir(&big).unwrap();
+        fs::write(big.join("SKILL.md"), "x".repeat(10000)).unwrap();
+
+        let mut result = AuditResult {
+            skills_dir: dir.path().to_path_buf(),
+            total: 2,
+            healthy: 0,
+            broken: 2,
+            skills: vec![
+                SkillEntry {
+                    name: "small".to_string(),
+                    path: small,
+                    has_skill_md: true,
+                    is_symlink: false,
+                    description: None,
+                    issues: vec!["broken".to_string()],
+                    invocation_count: None,
+                },
+                SkillEntry {
+                    name: "big".to_string(),
+                    path: big,
+                    has_skill_md: true,
+                    is_symlink: false,
+                    description: None,
+                    issues: vec!["broken".to_string()],
+                    invocation_count: None,
+                },
+            ],
+            manifest_diffs: None,
+            similar_pairs: Vec::new(),
+            usage: None,
+            cleanup: None,
+        };
+        generate_cleanup(&mut result);
+        let cleanup = result.cleanup.unwrap();
+        assert_eq!(cleanup[0].skill, "big");
+        assert!(cleanup[0].token_estimate > cleanup[1].token_estimate);
+    }
+
+    // --- report ---
+
+    #[test]
+    fn write_report_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("reports/audit.md");
+        let result = AuditResult {
+            skills_dir: PathBuf::from("/test/skills"),
+            total: 2,
+            healthy: 1,
+            broken: 1,
+            skills: vec![
+                {
+                    let mut s = make_skill("good", "a good skill");
+                    s.invocation_count = Some(10);
+                    s
+                },
+                {
+                    let mut s = make_skill("bad", "a bad skill");
+                    s.issues = vec!["SKILL.md missing".to_string()];
+                    s.invocation_count = Some(0);
+                    s
+                },
+            ],
+            manifest_diffs: None,
+            similar_pairs: Vec::new(),
+            usage: None,
+            cleanup: Some(vec![CleanupEntry {
+                skill: "bad".to_string(),
+                reasons: vec!["health: SKILL.md missing".to_string()],
+                token_estimate: 500,
+            }]),
+        };
+        write_report(&result, &report_path).unwrap();
+        let content = fs::read_to_string(&report_path).unwrap();
+        assert!(content.contains("# Skill Audit Report"));
+        assert!(content.contains("good"));
+        assert!(content.contains("bad"));
+        assert!(content.contains("Cleanup Recommendations"));
+        assert!(content.contains("500 tokens"));
+    }
+
+    #[test]
+    fn format_tokens_units() {
+        assert_eq!(format_tokens(500), "500 tokens");
+        assert_eq!(format_tokens(1500), "1.5K tokens");
+        assert_eq!(format_tokens(1_500_000), "1.5M tokens");
     }
 }

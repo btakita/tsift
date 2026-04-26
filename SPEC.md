@@ -147,6 +147,54 @@ tsift audit --json                       # structured output
 - Pairs sorted descending by score
 - Skills without descriptions are skipped
 
+**Usage tracking** (`--usage`): scans Claude Code session history (`.jsonl` files in `~/.claude/projects/*/`) for `Skill` tool invocations. Counts per skill, flags never-used skills. Plugin-namespaced skills (`codex:rescue`) are counted under the base name (`codex`). Output:
+- Per-skill `invocation_count` field
+- JSON: `usage` array sorted descending by count
+- Skills invoked but not installed are included in the usage list
+
+**Cleanup recommendations** (`--cleanup`): combines health, usage, and duplicate data into an actionable prune list. A skill is flagged when any of:
+- Health issues (broken symlink, missing/empty SKILL.md, no description)
+- Zero invocations across all sessions
+- ≥50% Jaccard similarity with another skill
+
+Each recommendation includes estimated token savings (total file bytes / 4). Sorted by token savings descending.
+
+**Report** (`--report <path>`): writes a markdown audit report to the given path. Includes skills table (status, name, description, uses), duplicate pairs, manifest diffs, and cleanup recommendations with total savings estimate. Suitable as a nightly cron target.
+
+```bash
+tsift audit --usage                          # show invocation counts
+tsift audit --cleanup                        # actionable prune list
+tsift audit --report audit.md                # write markdown report
+tsift audit --usage --cleanup --report r.md  # all features
+```
+
+## Markdown Lint
+
+`tsift lint` detects unannotated concepts in markdown files by cross-referencing plain text against known graph entities (symbols from the AST index, headings, bold terms, backtick terms).
+
+```bash
+tsift lint README.md                              # lint with auto-discovered entities
+tsift lint README.md --entities-from SPEC.md      # add entities from another doc
+tsift lint README.md --index .tsift/indexes/tsift # use specific symbol index
+tsift lint README.md --json                       # structured output
+```
+
+**Entity sources:**
+- The file being linted (headings, bold, backtick terms ≥4 chars)
+- `--entities-from <path>` markdown files (same extraction)
+- `--index <dir>` symbol database (`symbols.db`, names ≥4 chars)
+- Default: all symbol databases under `.tsift/indexes/*/symbols.db`
+
+**Detection rules:**
+- Skip code blocks, headings, and HTML comments
+- Skip already-annotated terms (backtick-wrapped, bold-wrapped, link text, inside inline code)
+- Require word boundaries (no partial matches)
+- Classify suggestions: `symbol` → backtick, multi-word capitalized → link, other → bold
+
+**Output:**
+- Human-readable: `file:line:col: text → suggestion`
+- JSON: `annotations` array with `line`, `column`, `text`, `entity`, `kind`, `suggestion`
+
 ## Key Design Decision: Graph > Vector for Code
 
 Aider's repo-map research showed graph-ranked retrieval (PageRank over call/import references) outperforms pure vector similarity for code. The approach: extract symbols via tree-sitter, rank by reference count (centrality), embed only top-ranked. This gives best token efficiency.

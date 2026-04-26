@@ -8,6 +8,7 @@ use std::io::Read as _;
 use std::path::PathBuf;
 
 pub mod audit;
+pub mod lint;
 pub mod config;
 pub mod graph;
 pub mod index;
@@ -179,6 +180,29 @@ enum Commands {
         /// Path to a manifest file listing expected skills (one per line)
         #[arg(long)]
         manifest: Option<PathBuf>,
+        /// Track skill usage from session history
+        #[arg(long)]
+        usage: bool,
+        /// Generate cleanup recommendations
+        #[arg(long)]
+        cleanup: bool,
+        /// Write markdown report to this path
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Lint markdown files — detect unannotated concepts (symbols, headings, bold terms)
+    Lint {
+        /// Markdown file to lint
+        file: String,
+        /// Path to index directory (uses .tsift/ by default for symbol entities)
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Additional markdown files to extract entities from
+        #[arg(long)]
+        entities_from: Vec<PathBuf>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -242,7 +266,8 @@ fn main() -> Result<()> {
         Some(Commands::Communities { path, scope, min_size, json }) => cmd_communities(&path, scope.as_deref(), min_size, json),
         Some(Commands::Path { from, to, path, scope, json }) => cmd_path(&from, &to, &path, scope.as_deref(), json),
         Some(Commands::Explain { symbol, path, scope, json }) => cmd_explain(&symbol, &path, scope.as_deref(), json),
-        Some(Commands::Audit { skills_dir, manifest, json }) => cmd_audit(&skills_dir, manifest, json),
+        Some(Commands::Audit { skills_dir, manifest, usage, cleanup, report, json }) => cmd_audit(&skills_dir, manifest, usage, cleanup, report, json),
+        Some(Commands::Lint { file, index, entities_from, json }) => cmd_lint(&file, index, entities_from, json),
         None => {
             println!("tsift v{}", env!("CARGO_PKG_VERSION"));
             println!("Run `tsift --help` for usage.");
@@ -717,7 +742,7 @@ fn cmd_explain(symbol: &str, path: &std::path::Path, scope: Option<&str>, json_o
     Ok(())
 }
 
-fn cmd_audit(skills_dir: &str, manifest: Option<PathBuf>, json_output: bool) -> Result<()> {
+fn cmd_audit(skills_dir: &str, manifest: Option<PathBuf>, usage: bool, cleanup: bool, report: Option<PathBuf>, json_output: bool) -> Result<()> {
     let expanded = if let Some(rest) = skills_dir.strip_prefix("~/") {
         let home = std::env::var("HOME").context("HOME not set")?;
         std::path::PathBuf::from(format!("{}/{}", home, rest))
@@ -731,6 +756,19 @@ fn cmd_audit(skills_dir: &str, manifest: Option<PathBuf>, json_output: bool) -> 
         audit::compare_manifest(&mut result, &manifest_path)?;
     }
 
+    if usage || cleanup || report.is_some() {
+        audit::track_usage(&mut result)?;
+    }
+
+    if cleanup || report.is_some() {
+        audit::generate_cleanup(&mut result);
+    }
+
+    if let Some(report_path) = &report {
+        audit::write_report(&result, report_path)?;
+        println!("Report written to {}", report_path.display());
+    }
+
     if json_output {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
@@ -741,7 +779,11 @@ fn cmd_audit(skills_dir: &str, manifest: Option<PathBuf>, json_output: bool) -> 
             let status = if skill.issues.is_empty() { "✓" } else { "✗" };
             let desc = skill.description.as_deref().unwrap_or("-");
             let link = if skill.is_symlink { " (symlink)" } else { "" };
-            println!("  {} {}{} — {}", status, skill.name, link, desc);
+            let uses = skill
+                .invocation_count
+                .map(|c| format!(" [{} uses]", c))
+                .unwrap_or_default();
+            println!("  {} {}{} — {}{}", status, skill.name, link, desc, uses);
             for issue in &skill.issues {
                 println!("    ! {}", issue);
             }
@@ -773,7 +815,76 @@ fn cmd_audit(skills_dir: &str, manifest: Option<PathBuf>, json_output: bool) -> 
                 println!("       B: {}", pair.desc_b);
             }
         }
+        if let Some(cleanup_list) = &result.cleanup {
+            if !cleanup_list.is_empty() {
+                println!();
+                println!("Cleanup recommendations:");
+                for entry in cleanup_list {
+                    println!("  {} (~{} tokens)", entry.skill, entry.token_estimate);
+                    for reason in &entry.reasons {
+                        println!("    - {}", reason);
+                    }
+                }
+            }
+        }
     }
+    Ok(())
+}
+
+fn cmd_lint(file: &str, index: Option<PathBuf>, entities_from: Vec<PathBuf>, json_output: bool) -> Result<()> {
+    use std::collections::HashSet;
+
+    let file_path = std::path::Path::new(file);
+    if !file_path.exists() {
+        anyhow::bail!("file not found: {}", file);
+    }
+
+    let mut entities = HashSet::new();
+
+    if let Some(index_dir) = index {
+        let db_path = index_dir.join("symbols.db");
+        if db_path.exists() {
+            entities.extend(lint::collect_entities_from_db(&db_path)?);
+        }
+    } else {
+        let default_db = std::path::Path::new(".tsift/indexes");
+        if default_db.exists() {
+            for entry in std::fs::read_dir(default_db)? {
+                let entry = entry?;
+                let db = entry.path().join("symbols.db");
+                if db.exists() {
+                    entities.extend(lint::collect_entities_from_db(&db)?);
+                }
+            }
+        }
+    }
+
+    for md_path in &entities_from {
+        entities.extend(lint::collect_entities_from_markdown(md_path)?);
+    }
+
+    entities.extend(lint::collect_entities_from_markdown(file_path)?);
+
+    let result = lint::lint_markdown(file_path, &entities)?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        if result.annotations.is_empty() {
+            println!("No unannotated concepts found in {}", file);
+        } else {
+            println!("{}:", result.file);
+            for ann in &result.annotations {
+                println!(
+                    "  {}:{}: {} → {}",
+                    ann.line, ann.column, ann.text, ann.suggestion
+                );
+            }
+            println!();
+            println!("{} unannotated concept(s) found.", result.annotations.len());
+        }
+    }
+
     Ok(())
 }
 
