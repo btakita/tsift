@@ -141,6 +141,12 @@ tsift audit --json                       # structured output
 - `missing` — listed in manifest but not installed
 - `orphan` — installed but not in manifest
 
+**Duplicate detection:** after scanning, `tsift audit` computes pairwise Jaccard similarity over description word sets (stop words filtered) and reports skill pairs with score ≥ 30%. Output:
+- Human-readable: `60%  skill-a / skill-b` followed by both descriptions
+- JSON: `similar_pairs` array with `skill_a`, `skill_b`, `score` (0.0–1.0), `desc_a`, `desc_b`
+- Pairs sorted descending by score
+- Skills without descriptions are skipped
+
 ## Key Design Decision: Graph > Vector for Code
 
 Aider's repo-map research showed graph-ranked retrieval (PageRank over call/import references) outperforms pure vector similarity for code. The approach: extract symbols via tree-sitter, rank by reference count (centrality), embed only top-ranked. This gives best token efficiency.

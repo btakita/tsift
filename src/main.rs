@@ -759,6 +759,20 @@ fn cmd_audit(skills_dir: &str, manifest: Option<PathBuf>, json_output: bool) -> 
                 println!("  {} — {}", diff.name, label);
             }
         }
+        if !result.similar_pairs.is_empty() {
+            println!();
+            println!("Possible duplicates (description similarity >= 30%):");
+            for pair in &result.similar_pairs {
+                println!(
+                    "  {:.0}%  {} / {}",
+                    pair.score * 100.0,
+                    pair.skill_a,
+                    pair.skill_b
+                );
+                println!("       A: {}", pair.desc_a);
+                println!("       B: {}", pair.desc_b);
+            }
+        }
     }
     Ok(())
 }

@@ -22,6 +22,18 @@ pub struct AuditResult {
     pub skills: Vec<SkillEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_diffs: Option<Vec<ManifestDiff>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub similar_pairs: Vec<SimilarPair>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SimilarPair {
+    pub skill_a: String,
+    pub skill_b: String,
+    /// Jaccard similarity of description word sets (0.0–1.0)
+    pub score: f32,
+    pub desc_a: String,
+    pub desc_b: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -46,6 +58,7 @@ pub fn scan_skills(skills_dir: &Path) -> Result<AuditResult> {
             broken: 0,
             skills: Vec::new(),
             manifest_diffs: None,
+            similar_pairs: Vec::new(),
         });
     }
 
@@ -117,6 +130,8 @@ pub fn scan_skills(skills_dir: &Path) -> Result<AuditResult> {
     let total = skills.len();
     let broken = skills.iter().filter(|s| !s.issues.is_empty()).count();
 
+    let similar_pairs = find_similar_pairs(&skills, 0.3);
+
     Ok(AuditResult {
         skills_dir: skills_dir.to_path_buf(),
         total,
@@ -124,7 +139,60 @@ pub fn scan_skills(skills_dir: &Path) -> Result<AuditResult> {
         broken,
         skills,
         manifest_diffs: None,
+        similar_pairs,
     })
+}
+
+/// Compute Jaccard similarity between two description word sets.
+/// Returns pairs with score >= threshold, sorted descending by score.
+pub fn find_similar_pairs(skills: &[SkillEntry], threshold: f32) -> Vec<SimilarPair> {
+    let mut pairs = Vec::new();
+    for i in 0..skills.len() {
+        let a = &skills[i];
+        let Some(desc_a) = &a.description else { continue };
+        let tokens_a = description_tokens(desc_a);
+        if tokens_a.is_empty() {
+            continue;
+        }
+        for j in (i + 1)..skills.len() {
+            let b = &skills[j];
+            let Some(desc_b) = &b.description else { continue };
+            let tokens_b = description_tokens(desc_b);
+            if tokens_b.is_empty() {
+                continue;
+            }
+            let intersection = tokens_a.intersection(&tokens_b).count();
+            let union = tokens_a.union(&tokens_b).count();
+            if union == 0 {
+                continue;
+            }
+            let score = intersection as f32 / union as f32;
+            if score >= threshold {
+                pairs.push(SimilarPair {
+                    skill_a: a.name.clone(),
+                    skill_b: b.name.clone(),
+                    score,
+                    desc_a: desc_a.clone(),
+                    desc_b: desc_b.clone(),
+                });
+            }
+        }
+    }
+    pairs.sort_by(|x, y| y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal));
+    pairs
+}
+
+static STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "by", "do", "for", "from", "has", "have", "in",
+    "is", "it", "its", "not", "of", "on", "or", "the", "to", "use", "used", "via", "with",
+];
+
+fn description_tokens(desc: &str) -> HashSet<String> {
+    let stop: HashSet<&str> = STOP_WORDS.iter().copied().collect();
+    desc.split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.len() >= 2 && !stop.contains(w.as_str()))
+        .collect()
 }
 
 pub fn compare_manifest(
@@ -382,5 +450,123 @@ mod tests {
 
         let result = scan_skills(dir.path()).unwrap();
         assert_eq!(result.total, 0);
+    }
+
+    // --- similar_pairs / duplicate detection ---
+
+    fn make_skill(name: &str, description: &str) -> SkillEntry {
+        SkillEntry {
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            has_skill_md: true,
+            is_symlink: false,
+            description: Some(description.to_string()),
+            issues: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn similar_pairs_identical_descriptions() {
+        let skills = vec![
+            make_skill("skill-a", "search code and files"),
+            make_skill("skill-b", "search code and files"),
+        ];
+        let pairs = find_similar_pairs(&skills, 0.3);
+        assert_eq!(pairs.len(), 1);
+        assert!((pairs[0].score - 1.0).abs() < 0.01);
+        assert_eq!(pairs[0].skill_a, "skill-a");
+        assert_eq!(pairs[0].skill_b, "skill-b");
+    }
+
+    #[test]
+    fn similar_pairs_high_overlap() {
+        let skills = vec![
+            make_skill("search-tool", "fast semantic search over code symbols"),
+            make_skill("code-search", "semantic search over code and symbols"),
+        ];
+        let pairs = find_similar_pairs(&skills, 0.3);
+        assert_eq!(pairs.len(), 1);
+        assert!(pairs[0].score >= 0.3);
+    }
+
+    #[test]
+    fn similar_pairs_no_overlap() {
+        let skills = vec![
+            make_skill("graph-tool", "visualize dependency graph"),
+            make_skill("email-tool", "draft and send emails"),
+        ];
+        let pairs = find_similar_pairs(&skills, 0.3);
+        assert_eq!(pairs.len(), 0);
+    }
+
+    #[test]
+    fn similar_pairs_below_threshold() {
+        let skills = vec![
+            make_skill("skill-a", "search files"),
+            make_skill("skill-b", "analyze graph structure"),
+        ];
+        let pairs = find_similar_pairs(&skills, 0.3);
+        assert_eq!(pairs.len(), 0);
+    }
+
+    #[test]
+    fn similar_pairs_sorted_descending() {
+        let skills = vec![
+            make_skill("a", "search code symbols files index"),
+            make_skill("b", "search code symbols index"),
+            make_skill("c", "search code symbols files index queries"),
+        ];
+        let pairs = find_similar_pairs(&skills, 0.3);
+        // All should have scores, sorted descending
+        for i in 1..pairs.len() {
+            assert!(pairs[i - 1].score >= pairs[i].score);
+        }
+    }
+
+    #[test]
+    fn similar_pairs_skips_no_description() {
+        let mut no_desc = make_skill("no-desc", "");
+        no_desc.description = None;
+        let skills = vec![
+            no_desc,
+            make_skill("skill-a", "search code files"),
+            make_skill("skill-b", "search code files"),
+        ];
+        let pairs = find_similar_pairs(&skills, 0.3);
+        // no-desc is skipped; only a/b pair counted
+        assert_eq!(pairs.len(), 1);
+    }
+
+    #[test]
+    fn similar_pairs_stop_words_excluded() {
+        // "the a and for to" are all stop words — empty token sets → no pair
+        let skills = vec![
+            make_skill("skill-a", "the a and for to"),
+            make_skill("skill-b", "the a and for to in"),
+        ];
+        let pairs = find_similar_pairs(&skills, 0.3);
+        assert_eq!(pairs.len(), 0);
+    }
+
+    #[test]
+    fn scan_detects_similar_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, desc) in &[
+            ("search-a", "search code symbols"),
+            ("search-b", "search code symbols"),
+            ("email", "draft and send emails"),
+        ] {
+            let skill = dir.path().join(name);
+            fs::create_dir(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\ndescription: {desc}\n---\n"),
+            )
+            .unwrap();
+        }
+        let result = scan_skills(dir.path()).unwrap();
+        assert_eq!(result.similar_pairs.len(), 1);
+        assert_eq!(result.similar_pairs[0].skill_a, "search-a");
+        assert_eq!(result.similar_pairs[0].skill_b, "search-b");
     }
 }
