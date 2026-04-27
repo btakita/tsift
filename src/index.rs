@@ -5,12 +5,24 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tagpath::parser as tagpath_parser;
 
 pub struct IndexDb {
     conn: Connection,
+    _write_lock: Option<WriteLockGuard>,
+}
+
+struct WriteLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for WriteLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -98,6 +110,7 @@ impl IndexDb {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating index dir: {}", parent.display()))?;
         }
+        let write_lock = acquire_write_lock(db_path)?;
         let conn = Connection::open(db_path)
             .with_context(|| format!("opening index db: {}", db_path.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
@@ -155,7 +168,10 @@ impl IndexDb {
             );",
         )?;
         let _ = conn.execute("ALTER TABLE symbols ADD COLUMN tags TEXT", []);
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            _write_lock: Some(write_lock),
+        })
     }
 
     pub fn open_read_only(db_path: &Path) -> Result<Self> {
@@ -165,7 +181,10 @@ impl IndexDb {
         )
         .with_context(|| format!("opening index db: {}", db_path.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            _write_lock: None,
+        })
     }
 
     fn load_dir_state(&self) -> Result<HashMap<PathBuf, SystemTime>> {
@@ -674,6 +693,85 @@ impl IndexDb {
         hits.truncate(limit);
         Ok(hits)
     }
+}
+
+fn acquire_write_lock(db_path: &Path) -> Result<WriteLockGuard> {
+    let lock_path = writer_lock_path(db_path);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating lock dir: {}", parent.display()))?;
+    }
+
+    for _ in 0..2 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut lock_file) => {
+                use std::io::Write;
+                writeln!(lock_file, "{}", std::process::id())
+                    .with_context(|| format!("writing {}", lock_path.display()))?;
+                return Ok(WriteLockGuard { path: lock_path });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if clear_stale_lock_if_possible(&lock_path)? {
+                    continue;
+                }
+                let holder = read_lock_pid(&lock_path)
+                    .map(|pid| format!(" (pid {})", pid))
+                    .unwrap_or_default();
+                bail!(
+                    "another tsift index writer is already active for {}{} (lock: {}). \
+                     A concurrent `tsift index` or `tsift search --autoindex` is already updating this index; \
+                     wait for it to finish, or remove the lock file if that writer crashed.",
+                    db_path.display(),
+                    holder,
+                    lock_path.display()
+                );
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("creating {}", lock_path.display()));
+            }
+        }
+    }
+
+    unreachable!("lock acquisition retries are bounded")
+}
+
+fn writer_lock_path(db_path: &Path) -> PathBuf {
+    let stem = db_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("index");
+    db_path.with_file_name(format!("{stem}.lock"))
+}
+
+fn clear_stale_lock_if_possible(lock_path: &Path) -> Result<bool> {
+    let Some(pid) = read_lock_pid(lock_path) else {
+        return Ok(false);
+    };
+    if process_exists(pid) {
+        return Ok(false);
+    }
+    std::fs::remove_file(lock_path)
+        .with_context(|| format!("removing stale lock {}", lock_path.display()))?;
+    Ok(true)
+}
+
+fn read_lock_pid(lock_path: &Path) -> Option<u32> {
+    let content = std::fs::read_to_string(lock_path).ok()?;
+    content.trim().parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn process_exists(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_exists(_pid: u32) -> bool {
+    true
 }
 
 fn compute_tags(name: &str) -> String {
@@ -1339,5 +1437,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(timeout_ms, 5000);
+    }
+
+    #[test]
+    fn open_fails_fast_when_writer_lock_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".tsift/index.lock");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::write(&lock_path, std::process::id().to_string()).unwrap();
+
+        let err = match IndexDb::open(&dir.path().join(".tsift/index.db")) {
+            Ok(_) => panic!("expected writer lock conflict"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("another tsift index writer is already active"));
+        assert!(msg.contains("search --autoindex"));
+    }
+
+    #[test]
+    fn open_removes_stale_writer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".tsift/index.lock");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::write(&lock_path, "999999").unwrap();
+
+        {
+            let _db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+            let contents = fs::read_to_string(&lock_path).unwrap();
+            assert_eq!(contents.trim(), std::process::id().to_string());
+        }
+
+        assert!(!lock_path.exists());
     }
 }

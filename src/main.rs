@@ -1332,18 +1332,21 @@ fn cmd_index(
                 continue;
             }
             let db_path = cfg.db_path_for(&root, name);
-            let db = index::IndexDb::open(&db_path)?;
             let summary = if rebuild {
+                let db = index::IndexDb::open(&db_path)?;
                 db.rebuild(sub_path)?
             } else if check {
+                let db = index::IndexDb::open_read_only(&db_path)?;
                 if prune {
                     db.compute_changes_pruned(sub_path)?
                 } else {
                     db.compute_changes(sub_path)?
                 }
             } else if prune {
+                let db = index::IndexDb::open(&db_path)?;
                 db.apply_changes_pruned(sub_path)?
             } else {
+                let db = index::IndexDb::open(&db_path)?;
                 db.apply_changes(sub_path)?
             };
             if summary.has_changes() {
@@ -1441,18 +1444,21 @@ fn cmd_index(
     }
 
     let db_path = root.join(".tsift/index.db");
-    let db = index::IndexDb::open(&db_path)?;
     let summary = if rebuild {
+        let db = index::IndexDb::open(&db_path)?;
         db.rebuild(&root)?
     } else if check {
+        let db = index::IndexDb::open_read_only(&db_path)?;
         if prune {
             db.compute_changes_pruned(&root)?
         } else {
             db.compute_changes(&root)?
         }
     } else if prune {
+        let db = index::IndexDb::open(&db_path)?;
         db.apply_changes_pruned(&root)?
     } else {
+        let db = index::IndexDb::open(&db_path)?;
         db.apply_changes(&root)?
     };
 

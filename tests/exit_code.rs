@@ -19,7 +19,12 @@ fn check_exit_code_zero_when_fresh() {
 
     // Check with --exit-code should exit 0 (no stale files)
     let status = tsift_bin()
-        .args(["index", "--check", "--exit-code", dir.path().to_str().unwrap()])
+        .args([
+            "index",
+            "--check",
+            "--exit-code",
+            dir.path().to_str().unwrap(),
+        ])
         .status()
         .unwrap();
     assert!(status.success(), "expected exit 0 for fresh index");
@@ -41,7 +46,12 @@ fn check_exit_code_one_when_stale() {
 
     // Check with --exit-code should exit 1 (stale files exist)
     let status = tsift_bin()
-        .args(["index", "--check", "--exit-code", dir.path().to_str().unwrap()])
+        .args([
+            "index",
+            "--check",
+            "--exit-code",
+            dir.path().to_str().unwrap(),
+        ])
         .status()
         .unwrap();
     assert!(!status.success(), "expected exit 1 for stale index");
@@ -66,7 +76,10 @@ fn check_without_exit_code_always_zero() {
         .args(["index", "--check", dir.path().to_str().unwrap()])
         .status()
         .unwrap();
-    assert!(status.success(), "expected exit 0 when --exit-code not specified");
+    assert!(
+        status.success(),
+        "expected exit 0 when --exit-code not specified"
+    );
 }
 
 #[test]
@@ -80,10 +93,19 @@ fn check_exit_code_one_when_modified() {
         .unwrap();
 
     std::thread::sleep(std::time::Duration::from_millis(50));
-    fs::write(dir.path().join("main.rs"), "fn main() { println!(\"hi\"); }").unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn main() { println!(\"hi\"); }",
+    )
+    .unwrap();
 
     let status = tsift_bin()
-        .args(["index", "--check", "--exit-code", dir.path().to_str().unwrap()])
+        .args([
+            "index",
+            "--check",
+            "--exit-code",
+            dir.path().to_str().unwrap(),
+        ])
         .status()
         .unwrap();
     assert!(!status.success(), "expected exit 1 for modified file");
@@ -103,7 +125,12 @@ fn check_exit_code_one_when_deleted() {
     fs::remove_file(dir.path().join("lib.rs")).unwrap();
 
     let status = tsift_bin()
-        .args(["index", "--check", "--exit-code", dir.path().to_str().unwrap()])
+        .args([
+            "index",
+            "--check",
+            "--exit-code",
+            dir.path().to_str().unwrap(),
+        ])
         .status()
         .unwrap();
     assert!(!status.success(), "expected exit 1 for deleted file");
@@ -116,8 +143,85 @@ fn check_exit_code_zero_when_no_index_exists() {
 
     // No prior index — all files are "new", so --check --exit-code should exit 1
     let status = tsift_bin()
-        .args(["index", "--check", "--exit-code", dir.path().to_str().unwrap()])
+        .args([
+            "index",
+            "--check",
+            "--exit-code",
+            dir.path().to_str().unwrap(),
+        ])
         .status()
         .unwrap();
-    assert!(!status.success(), "expected exit 1 when no index exists (all files are new)");
+    assert!(
+        !status.success(),
+        "expected exit 1 when no index exists (all files are new)"
+    );
+}
+
+#[test]
+fn search_autoindex_fails_fast_when_writer_lock_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+    let status = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn helper() {}\nfn main() { helper(); }",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join(".tsift/index.lock"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "search",
+            "--autoindex",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "helper",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("another tsift index writer is already active"));
+    assert!(stderr.contains("search --autoindex"));
+}
+
+#[test]
+fn index_check_stays_read_only_while_writer_lock_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+    let status = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    fs::write(
+        dir.path().join(".tsift/index.lock"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+
+    let status = tsift_bin()
+        .args([
+            "index",
+            "--check",
+            "--exit-code",
+            dir.path().to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "expected check mode to stay read-only");
 }
