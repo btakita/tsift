@@ -142,6 +142,9 @@ enum Commands {
         /// Restrict to a specific submodule
         #[arg(long)]
         scope: Option<String>,
+        /// Max edges per direction (0 = unlimited)
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -171,6 +174,9 @@ enum Commands {
         /// Show only communities with at least this many members
         #[arg(long, default_value = "2")]
         min_size: usize,
+        /// Max communities to display (0 = unlimited)
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -201,6 +207,9 @@ enum Commands {
         /// Restrict to a specific submodule
         #[arg(long)]
         scope: Option<String>,
+        /// Max callers/callees each (0 = unlimited)
+        #[arg(short, long, default_value = "15")]
+        limit: usize,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -369,6 +378,7 @@ fn main() -> Result<()> {
             callers,
             callees,
             scope,
+            limit,
             json,
         }) => cmd_graph(
             &symbol,
@@ -376,6 +386,7 @@ fn main() -> Result<()> {
             callers,
             callees,
             scope.as_deref(),
+            limit,
             json || terse,
             compact,
             pretty,
@@ -392,8 +403,9 @@ fn main() -> Result<()> {
             path,
             scope,
             min_size,
+            limit,
             json,
-        }) => cmd_communities(&path, scope.as_deref(), min_size, json || terse, compact, pretty, terse),
+        }) => cmd_communities(&path, scope.as_deref(), min_size, limit, json || terse, compact, pretty, terse),
         Some(Commands::Path {
             from,
             to,
@@ -405,8 +417,9 @@ fn main() -> Result<()> {
             symbol,
             path,
             scope,
+            limit,
             json,
-        }) => cmd_explain(&symbol, &path, scope.as_deref(), json || terse, compact, pretty, terse, absolute),
+        }) => cmd_explain(&symbol, &path, scope.as_deref(), limit, json || terse, compact, pretty, terse, absolute),
         Some(Commands::Audit {
             skills_dir,
             manifest,
@@ -1222,6 +1235,7 @@ fn cmd_graph(
     callers: bool,
     callees: bool,
     scope: Option<&str>,
+    limit: usize,
     json_output: bool,
     compact: bool,
     pretty: bool,
@@ -1252,12 +1266,22 @@ fn cmd_graph(
         if !absolute {
             relativize_edges(&mut edges, &root);
         }
+        let total = edges.len();
+        let truncated = limit > 0 && total > limit;
+        if truncated {
+            edges.truncate(limit);
+        }
         if json_output {
             if !show_both {
-                println!("{}", to_json(&edges, pretty, terse)?);
+                let out = serde_json::json!({
+                    "callers": edges,
+                    "total": total,
+                    "truncated": truncated,
+                });
+                println!("{}", to_json(&out, pretty, terse)?);
             }
         } else if compact {
-            println!("callers[{}]:", edges.len());
+            println!("callers[{}]:", total);
             if edges.is_empty() {
                 println!("  (none)");
             } else {
@@ -1266,6 +1290,9 @@ fn cmd_graph(
                         "  {} {}:{}",
                         edge.caller_name, edge.caller_file, edge.call_site_line
                     );
+                }
+                if truncated {
+                    println!("  (+{} more)", total - limit);
                 }
             }
         } else {
@@ -1279,6 +1306,9 @@ fn cmd_graph(
                         edge.caller_name, edge.caller_file, edge.call_site_line
                     );
                 }
+                if truncated {
+                    println!("  (+{} more, use --limit 0 to show all)", total - limit);
+                }
             }
         }
         if show_both && !json_output && !compact {
@@ -1291,12 +1321,22 @@ fn cmd_graph(
         if !absolute {
             relativize_edges(&mut edges, &root);
         }
+        let total = edges.len();
+        let truncated = limit > 0 && total > limit;
+        if truncated {
+            edges.truncate(limit);
+        }
         if json_output {
             if !show_both {
-                println!("{}", to_json(&edges, pretty, terse)?);
+                let out = serde_json::json!({
+                    "callees": edges,
+                    "total": total,
+                    "truncated": truncated,
+                });
+                println!("{}", to_json(&out, pretty, terse)?);
             }
         } else if compact {
-            println!("callees[{}]:", edges.len());
+            println!("callees[{}]:", total);
             if edges.is_empty() {
                 println!("  (none)");
             } else {
@@ -1305,6 +1345,9 @@ fn cmd_graph(
                         "  {} {}:{}",
                         edge.callee_name, edge.caller_file, edge.call_site_line
                     );
+                }
+                if truncated {
+                    println!("  (+{} more)", total - limit);
                 }
             }
         } else {
@@ -1318,6 +1361,9 @@ fn cmd_graph(
                         edge.callee_name, edge.caller_file, edge.call_site_line
                     );
                 }
+                if truncated {
+                    println!("  (+{} more, use --limit 0 to show all)", total - limit);
+                }
             }
         }
     }
@@ -1329,10 +1375,24 @@ fn cmd_graph(
             relativize_edges(&mut callers_edges, &root);
             relativize_edges(&mut callees_edges, &root);
         }
+        let callers_total = callers_edges.len();
+        let callees_total = callees_edges.len();
+        let callers_truncated = limit > 0 && callers_total > limit;
+        let callees_truncated = limit > 0 && callees_total > limit;
+        if callers_truncated {
+            callers_edges.truncate(limit);
+        }
+        if callees_truncated {
+            callees_edges.truncate(limit);
+        }
         let combined = serde_json::json!({
             "symbol": symbol,
             "callers": callers_edges,
+            "callers_total": callers_total,
+            "callers_truncated": callers_truncated,
             "callees": callees_edges,
+            "callees_total": callees_total,
+            "callees_truncated": callees_truncated,
         });
         println!("{}", to_json(&combined, pretty, terse)?);
     }
@@ -1344,6 +1404,7 @@ fn cmd_communities(
     path: &std::path::Path,
     scope: Option<&str>,
     min_size: usize,
+    limit: usize,
     json_output: bool,
     compact: bool,
     pretty: bool,
@@ -1374,14 +1435,23 @@ fn cmd_communities(
         .filter(|c| c.members.len() >= min_size)
         .collect();
 
+    let total = filtered.len();
+    let truncated = limit > 0 && total > limit;
+    let display: Vec<&graph::Community> = if truncated {
+        filtered[..limit].to_vec()
+    } else {
+        filtered
+    };
+
     if json_output {
         let out = serde_json::json!({
             "modularity": result.modularity,
             "iterations": result.iterations,
             "node_count": result.node_count,
             "edge_count": result.edge_count,
-            "community_count": filtered.len(),
-            "communities": filtered,
+            "community_count": total,
+            "communities": display,
+            "truncated": truncated,
         });
         println!("{}", to_json(&out, pretty, terse)?);
     } else if compact {
@@ -1391,12 +1461,12 @@ fn cmd_communities(
             result.edge_count,
             result.iterations,
             result.modularity,
-            filtered.len()
+            total
         );
-        if filtered.is_empty() {
+        if display.is_empty() {
             println!("  (none >= {})", min_size);
         } else {
-            for (i, community) in filtered.iter().enumerate() {
+            for (i, community) in display.iter().enumerate() {
                 println!(
                     "  {}. {} members {}",
                     i + 1,
@@ -1404,17 +1474,20 @@ fn cmd_communities(
                     compact_members(&community.members, 5)
                 );
             }
+            if truncated {
+                println!("  (+{} more)", total - limit);
+            }
         }
     } else {
         println!(
             "Communities ({} nodes, {} edges, {} iterations, Q={:.4})",
             result.node_count, result.edge_count, result.iterations, result.modularity
         );
-        if filtered.is_empty() {
+        if display.is_empty() {
             println!("  (no communities with {} or more members)", min_size);
         } else {
             println!();
-            for (i, c) in filtered.iter().enumerate() {
+            for (i, c) in display.iter().enumerate() {
                 println!(
                     "  [{}] {} members (Q={:.4}):",
                     i + 1,
@@ -1424,9 +1497,13 @@ fn cmd_communities(
                 for m in &c.members {
                     println!("    {}", m);
                 }
-                if i + 1 < filtered.len() {
+                if i + 1 < display.len() {
                     println!();
                 }
+            }
+            if truncated {
+                println!();
+                println!("  (+{} more communities, use --limit 0 to show all)", total - limit);
             }
         }
     }
@@ -1517,6 +1594,7 @@ fn cmd_explain(
     symbol: &str,
     path: &std::path::Path,
     scope: Option<&str>,
+    limit: usize,
     json_output: bool,
     compact: bool,
     pretty: bool,
@@ -1537,6 +1615,17 @@ fn cmd_explain(
         relativize_edges(&mut callees, &root);
     }
 
+    let callers_total = callers.len();
+    let callees_total = callees.len();
+    let callers_truncated = limit > 0 && callers_total > limit;
+    let callees_truncated = limit > 0 && callees_total > limit;
+    if callers_truncated {
+        callers.truncate(limit);
+    }
+    if callees_truncated {
+        callees.truncate(limit);
+    }
+
     let edges = db.all_edges()?;
     let comm_result = graph::detect_communities(&edges);
     let community = comm_result
@@ -1549,7 +1638,11 @@ fn cmd_explain(
             "symbol": symbol,
             "definitions": symbols,
             "callers": callers,
+            "callers_total": callers_total,
+            "callers_truncated": callers_truncated,
             "callees": callees,
+            "callees_total": callees_total,
+            "callees_truncated": callees_truncated,
             "community": community,
         });
         println!("{}", to_json(&out, pretty, terse)?);
@@ -1565,21 +1658,27 @@ fn cmd_explain(
             }
         }
 
-        println!("callers[{}]:", callers.len());
+        println!("callers[{}]:", callers_total);
         if callers.is_empty() {
             println!("  (none)");
         } else {
             for line in format_edge_groups(&callers, true) {
                 println!("{line}");
             }
+            if callers_truncated {
+                println!("  (+{} more)", callers_total - limit);
+            }
         }
 
-        println!("callees[{}]:", callees.len());
+        println!("callees[{}]:", callees_total);
         if callees.is_empty() {
             println!("  (none)");
         } else {
             for line in format_edge_groups(&callees, false) {
                 println!("{line}");
+            }
+            if callees_truncated {
+                println!("  (+{} more)", callees_total - limit);
             }
         }
 
@@ -1603,7 +1702,7 @@ fn cmd_explain(
             println!();
         }
 
-        println!("Callers ({}):", callers.len());
+        println!("Callers ({}):", callers_total);
         if callers.is_empty() {
             println!("  (none)");
         } else {
@@ -1613,10 +1712,13 @@ fn cmd_explain(
                     edge.caller_name, edge.caller_file, edge.call_site_line
                 );
             }
+            if callers_truncated {
+                println!("  (+{} more, use --limit 0 to show all)", callers_total - limit);
+            }
         }
         println!();
 
-        println!("Callees ({}):", callees.len());
+        println!("Callees ({}):", callees_total);
         if callees.is_empty() {
             println!("  (none)");
         } else {
@@ -1625,6 +1727,9 @@ fn cmd_explain(
                     "  {} ({}:{})",
                     edge.callee_name, edge.caller_file, edge.call_site_line
                 );
+            }
+            if callees_truncated {
+                println!("  (+{} more, use --limit 0 to show all)", callees_total - limit);
             }
         }
 
@@ -2712,7 +2817,7 @@ mod tests {
     #[test]
     fn graph_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_graph("main", dir.path(), false, false, None, false, false, false, false, false);
+        let result = cmd_graph("main", dir.path(), false, false, None, 20, false, false, false, false, false);
         assert!(result.is_err());
     }
 
@@ -2965,7 +3070,7 @@ tier = "isolated"
     #[test]
     fn community_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_communities(dir.path(), None, 2, false, false, false, false);
+        let result = cmd_communities(dir.path(), None, 2, 10, false, false, false, false);
         assert!(result.is_err());
     }
 
@@ -3012,7 +3117,7 @@ tier = "isolated"
     #[test]
     fn explain_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_explain("main", dir.path(), None, false, false, false, false, false);
+        let result = cmd_explain("main", dir.path(), None, 15, false, false, false, false, false);
         assert!(result.is_err());
     }
 
@@ -3255,6 +3360,85 @@ tier = "isolated"
         assert_eq!(val["path"], "test.rs");
         assert_eq!(val["name"], "/tmp/proj/not-a-path");
         assert_eq!(val["hits"][0]["path"], "nested.rs");
+    }
+
+    // --- limit caps ---
+
+    #[test]
+    fn cli_graph_accepts_limit_flag() {
+        let cli = Cli::parse_from(["tsift", "graph", "main", "--limit", "5"]);
+        match cli.command {
+            Some(Commands::Graph { limit, .. }) => assert_eq!(limit, 5),
+            _ => panic!("expected Graph command"),
+        }
+    }
+
+    #[test]
+    fn cli_graph_default_limit_is_20() {
+        let cli = Cli::parse_from(["tsift", "graph", "main"]);
+        match cli.command {
+            Some(Commands::Graph { limit, .. }) => assert_eq!(limit, 20),
+            _ => panic!("expected Graph command"),
+        }
+    }
+
+    #[test]
+    fn cli_communities_accepts_limit_flag() {
+        let cli = Cli::parse_from(["tsift", "communities", "--limit", "3"]);
+        match cli.command {
+            Some(Commands::Communities { limit, .. }) => assert_eq!(limit, 3),
+            _ => panic!("expected Communities command"),
+        }
+    }
+
+    #[test]
+    fn cli_communities_default_limit_is_10() {
+        let cli = Cli::parse_from(["tsift", "communities"]);
+        match cli.command {
+            Some(Commands::Communities { limit, .. }) => assert_eq!(limit, 10),
+            _ => panic!("expected Communities command"),
+        }
+    }
+
+    #[test]
+    fn cli_explain_accepts_limit_flag() {
+        let cli = Cli::parse_from(["tsift", "explain", "main", "--limit", "7"]);
+        match cli.command {
+            Some(Commands::Explain { limit, .. }) => assert_eq!(limit, 7),
+            _ => panic!("expected Explain command"),
+        }
+    }
+
+    #[test]
+    fn cli_explain_default_limit_is_15() {
+        let cli = Cli::parse_from(["tsift", "explain", "main"]);
+        match cli.command {
+            Some(Commands::Explain { limit, .. }) => assert_eq!(limit, 15),
+            _ => panic!("expected Explain command"),
+        }
+    }
+
+    #[test]
+    fn cli_limit_zero_means_unlimited() {
+        let cli = Cli::parse_from(["tsift", "graph", "main", "--limit", "0"]);
+        match cli.command {
+            Some(Commands::Graph { limit, .. }) => assert_eq!(limit, 0),
+            _ => panic!("expected Graph command"),
+        }
+    }
+
+    #[test]
+    fn graph_cmd_limit_runs_ok() {
+        let dir = setup_graph_index();
+        let result = cmd_graph("main", dir.path(), false, false, None, 1, false, false, false, false, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn graph_cmd_unlimited_runs_ok() {
+        let dir = setup_graph_index();
+        let result = cmd_graph("main", dir.path(), false, false, None, 0, false, false, false, false, false);
+        assert!(result.is_ok());
     }
 }
 

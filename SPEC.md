@@ -176,6 +176,26 @@ tsift --absolute graph main --callers      # full paths in output
 
 **Database storage:** paths remain absolute in SQLite. Stripping happens at output time only, so `--absolute` is a display toggle, not a data migration.
 
+## Output Caps (`--limit N`)
+
+Per-command output limits prevent large codebases from flooding agent context windows.
+
+| Command | Flag | Default | What it caps |
+|---------|------|---------|-------------|
+| `graph` | `--limit N` | 20 | Edges per direction (callers, callees) |
+| `communities` | `--limit N` | 10 | Number of communities displayed |
+| `explain` | `--limit N` | 15 | Callers and callees each |
+
+`--limit 0` disables the cap (show everything). When output is truncated, a `(+N more)` suffix appears in text mode and `truncated: true` + `*_total` fields appear in JSON.
+
+```bash
+tsift graph main --limit 5            # max 5 callers + 5 callees
+tsift explain main --limit 0          # show all callers/callees
+tsift communities --limit 3           # top 3 communities only
+```
+
+**JSON truncation fields:** `total` (or `callers_total`/`callees_total` for graph/explain) gives the full count before truncation. `truncated` (or `callers_truncated`/`callees_truncated`) is a boolean.
+
 ## Community Detection (Louvain)
 
 `tsift communities` clusters the call graph into architectural subsystems using the Louvain method.

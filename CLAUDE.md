@@ -10,14 +10,14 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 |---------|---------|
 | `tsift index` | Build AST symbol index via tree-sitter. `--workspace` / `--submodule <name>` / `--prune` / `--check` (dry-run) / `--exit-code` (exit 1 if stale, for hooks) |
 | `tsift search` | Hybrid BM25 + vector search via sift library. `--federated` / `--scope <name>` for workspace |
-| `tsift graph` | Call-graph queries: `--callers` / `--callees` of a symbol. `--scope <name>` / `--json` |
+| `tsift graph` | Call-graph queries: `--callers` / `--callees` of a symbol. `--limit N` (default 20, 0=unlimited) / `--scope <name>` / `--json` |
 | `tsift edit` | Batch file edits from JSON (stdin or `--file`), atomic validate-then-write |
 | `tsift route` | Classify task → model tier (haiku/sonnet/opus) |
 | `tsift rewrite` | Shell command → tsift equivalent (for Claude Code hook integration) |
 | `tsift sql` | SQLite introspection: schema overview, table detail, read-only query |
-| `tsift communities` | Louvain community detection over call graph. `--min-size N` / `--scope <name>` / `--json` |
+| `tsift communities` | Louvain community detection over call graph. `--min-size N` / `--limit N` (default 10, 0=unlimited) / `--scope <name>` / `--json` |
 | `tsift path` | BFS shortest path between two symbols. `--scope <name>` / `--json` |
-| `tsift explain` | Full symbol context: definitions, callers, callees, community. `--scope <name>` / `--json` |
+| `tsift explain` | Full symbol context: definitions, callers, callees, community. `--limit N` (default 15, 0=unlimited) / `--scope <name>` / `--json` |
 | `tsift audit` | Skill drift detection: scan installed skills, check health, compare against manifest, detect duplicates via Jaccard similarity. `--manifest <file>` / `--usage` / `--cleanup` / `--report <path>` / `--json` |
 | `tsift summarize` | Cached LLM analysis: pre-computed summaries, entities, relationships. `--extract <path>` / `--extract --diff` / `--file <path>` / `--stats` / `--json` |
 | `tsift lint` | Markdown lint: detect unannotated concepts (symbols, headings, bold terms) cross-referenced against graph entities. `--index <dir>` / `--entities-from <file>` / `--json` |
