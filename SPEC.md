@@ -107,10 +107,42 @@ In JSON mode, `--quiet` also omits the `changes` array and uses compact (non-pre
 
 `tsift --compact` is a global flag for human-readable output. It keeps the underlying command behavior the same, but trims verbose formatting across commands:
 
-- `search` drops metadata banners, keeps one-line snippets, and reduces score precision
-- `explain` groups callers/callees by file instead of repeating the same path per edge; drops language annotation from symbol definitions (file extension already implies it)
-- `communities` shows top members per cluster with `(+N more)` instead of full dumps; drops per-community Q scores (overall Q retained in header)
+- `search` drops metadata banners, keeps one-line snippets, reduces score precision, abbreviates kind/match_type labels, uses `syms[N]:` header
+- `explain` groups callers/callees by file instead of repeating the same path per edge; abbreviates kind labels; uses `sym:`, `crs[N]:`, `ces[N]:`, `comm[N]:` headers
+- `graph` uses `crs[N]:` / `ces[N]:` headers
+- `communities` shows top members per cluster with `(+N more)` instead of full dumps; uses `comms n:N e:N iter:N q:Q cnt:N` header with `mbrs` label
 - `path`, `status`, `audit`, `summarize`, `lint`, `sql`, and `index` switch to denser summary-oriented layouts
+
+### Compact Abbreviation Conventions
+
+In `--compact` mode, common labels are shortened:
+
+| Full | Abbreviated | Context |
+|------|------------|---------|
+| `function` | `fn` | symbol kind |
+| `method` | `meth` | symbol kind |
+| `class` | `cls` | symbol kind |
+| `interface` | `iface` | symbol kind |
+| `type_alias` | `type` | symbol kind |
+| `data_class` | `data_cls` | symbol kind |
+| `sealed_class` | `sealed_cls` | symbol kind |
+| `enum_class` | `enum_cls` | symbol kind |
+| `companion_object` | `comp_obj` | symbol kind |
+| `object` | `obj` | symbol kind |
+| `heading` | `h` | symbol kind |
+| `code_block` | `code` | symbol kind |
+| `exact_name` | `exact` | match type |
+| `partial_tags` | `partial` | match type |
+| `symbols` | `syms` | section header |
+| `callers` | `crs` | section header |
+| `callees` | `ces` | section header |
+| `community` | `comm` | section header |
+| `communities` | `comms` | section header |
+| `members` | `mbrs` | section header |
+| `symbol` | `sym` | section header |
+| `definitions` | `defs` | section header |
+
+Short kinds (`struct`, `trait`, `enum`, `const`, `static`, `mod`, `impl`, `alias`, `union`) pass through unchanged.
 
 `--compact` does not change `--json` formatting. Use `--pretty` for indented JSON.
 

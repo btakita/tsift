@@ -833,6 +833,38 @@ fn compact_members(members: &[String], limit: usize) -> String {
     )
 }
 
+fn abbreviate_kind(kind: &str) -> &str {
+    match kind {
+        "function" => "fn",
+        "method" => "meth",
+        "module" | "mod" => "mod",
+        "struct" => "struct",
+        "trait" => "trait",
+        "impl" => "impl",
+        "class" => "cls",
+        "interface" => "iface",
+        "type_alias" => "type",
+        "data_class" => "data_cls",
+        "sealed_class" => "sealed_cls",
+        "enum_class" => "enum_cls",
+        "companion_object" => "comp_obj",
+        "object" => "obj",
+        "heading" => "h",
+        "code_block" => "code",
+        "alias" => "alias",
+        other => other,
+    }
+}
+
+fn abbreviate_match_type(mt: &str) -> &str {
+    match mt {
+        "exact_name" => "exact",
+        "all_tags" => "all_tags",
+        "partial_tags" => "partial",
+        other => other,
+    }
+}
+
 fn symbol_path_summary(path: &[String]) -> String {
     path.join(" -> ")
 }
@@ -1299,7 +1331,7 @@ fn cmd_graph(
                 println!("# (+{} more)", total - limit);
             }
         } else if compact {
-            println!("callers[{}]:", total);
+            println!("crs[{}]:", total);
             if edges.is_empty() {
                 println!("  (none)");
             } else {
@@ -1364,7 +1396,7 @@ fn cmd_graph(
                 println!("# (+{} more)", total - limit);
             }
         } else if compact {
-            println!("callees[{}]:", total);
+            println!("ces[{}]:", total);
             if edges.is_empty() {
                 println!("  (none)");
             } else {
@@ -1493,7 +1525,7 @@ fn cmd_communities(
         }
     } else if compact {
         println!(
-            "communities nodes:{} edges:{} iterations:{} q:{:.4} count:{}",
+            "comms n:{} e:{} iter:{} q:{:.4} cnt:{}",
             result.node_count,
             result.edge_count,
             result.iterations,
@@ -1505,7 +1537,7 @@ fn cmd_communities(
         } else {
             for (i, community) in display.iter().enumerate() {
                 println!(
-                    "  {}. {} members {}",
+                    "  {}. {} mbrs {}",
                     i + 1,
                     community.members.len(),
                     compact_members(&community.members, 5)
@@ -1715,17 +1747,17 @@ fn cmd_explain(
         }
     } else if compact {
         if symbols.is_empty() {
-            println!("symbol: {} (definitions: none)", symbol);
+            println!("sym: {} (defs: none)", symbol);
         } else {
             for sym in &symbols {
                 println!(
-                    "symbol: {} ({}) {}:{}",
-                    sym.name, sym.kind, sym.file, sym.line
+                    "sym: {} ({}) {}:{}",
+                    sym.name, abbreviate_kind(&sym.kind), sym.file, sym.line
                 );
             }
         }
 
-        println!("callers[{}]:", callers_total);
+        println!("crs[{}]:", callers_total);
         if callers.is_empty() {
             println!("  (none)");
         } else {
@@ -1737,7 +1769,7 @@ fn cmd_explain(
             }
         }
 
-        println!("callees[{}]:", callees_total);
+        println!("ces[{}]:", callees_total);
         if callees.is_empty() {
             println!("  (none)");
         } else {
@@ -1751,7 +1783,7 @@ fn cmd_explain(
 
         if let Some(comm) = community {
             println!(
-                "community[{}]: {}",
+                "comm[{}]: {}",
                 comm.members.len(),
                 compact_members(&comm.members, 5)
             );
@@ -2350,13 +2382,13 @@ fn cmd_search(
         }
     } else if compact {
         if !symbol_hits.is_empty() {
-            println!("symbols[{}]:", symbol_hits.len());
+            println!("syms[{}]:", symbol_hits.len());
             for (i, hit) in symbol_hits.iter().enumerate() {
                 println!(
                     "  {}. [{}] {} {} {}:{} {}",
                     i + 1,
-                    hit.match_type,
-                    hit.kind,
+                    abbreviate_match_type(&hit.match_type),
+                    abbreviate_kind(&hit.kind),
                     hit.name,
                     hit.file,
                     hit.line,
@@ -2948,6 +2980,36 @@ mod tests {
             "f".to_string(),
         ];
         assert_eq!(compact_members(&members, 5), "a, b, c, d, e (+1 more)");
+    }
+
+    #[test]
+    fn abbreviate_kind_maps_common_kinds() {
+        assert_eq!(abbreviate_kind("function"), "fn");
+        assert_eq!(abbreviate_kind("method"), "meth");
+        assert_eq!(abbreviate_kind("class"), "cls");
+        assert_eq!(abbreviate_kind("interface"), "iface");
+        assert_eq!(abbreviate_kind("type_alias"), "type");
+        assert_eq!(abbreviate_kind("data_class"), "data_cls");
+        assert_eq!(abbreviate_kind("sealed_class"), "sealed_cls");
+        assert_eq!(abbreviate_kind("enum_class"), "enum_cls");
+        assert_eq!(abbreviate_kind("companion_object"), "comp_obj");
+        assert_eq!(abbreviate_kind("object"), "obj");
+        assert_eq!(abbreviate_kind("heading"), "h");
+        assert_eq!(abbreviate_kind("code_block"), "code");
+        // short kinds pass through
+        assert_eq!(abbreviate_kind("struct"), "struct");
+        assert_eq!(abbreviate_kind("trait"), "trait");
+        assert_eq!(abbreviate_kind("enum"), "enum");
+        assert_eq!(abbreviate_kind("const"), "const");
+        assert_eq!(abbreviate_kind("unknown_kind"), "unknown_kind");
+    }
+
+    #[test]
+    fn abbreviate_match_type_maps_search_types() {
+        assert_eq!(abbreviate_match_type("exact_name"), "exact");
+        assert_eq!(abbreviate_match_type("partial_tags"), "partial");
+        assert_eq!(abbreviate_match_type("all_tags"), "all_tags");
+        assert_eq!(abbreviate_match_type("other_type"), "other_type");
     }
 
     #[test]
