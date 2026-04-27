@@ -126,6 +126,37 @@ tsift --pretty search "main" --json       # pretty-printed JSON
 tsift --pretty explain main --json        # pretty-printed JSON
 ```
 
+## Terse JSON Mode
+
+`tsift --terse` is a global flag that outputs JSON with abbreviated field names and an inline schema header. It implies `--json` for any command that supports it.
+
+Output format: `{"_s": {<short→long mapping>}, "d": <data with short keys>}`. The `_s` schema only includes keys that appear in the current response.
+
+```bash
+tsift --terse search "main"               # terse JSON (implies --json)
+tsift --terse explain main                 # terse JSON
+tsift --terse --pretty status .            # terse + pretty-printed
+```
+
+**Key mappings** (subset — full list in source):
+
+| Long | Short | Long | Short |
+|------|-------|------|-------|
+| `caller_file` | `cf` | `caller_name` | `cn` |
+| `callee_name` | `en` | `call_site_line` | `csl` |
+| `name` | `n` | `kind` | `k` |
+| `file` | `f` | `line` | `l` |
+| `language` | `la` | `score` | `sc` |
+| `end_line` | `el` | `match_type` | `mt` |
+| `symbol` | `s` | `symbols` | `sy` |
+| `callers` | `crs` | `callees` | `ces` |
+| `community` | `cm` | `communities` | `cms` |
+| `modularity` | `q` | `members` | `m` |
+| `hits` | `h` | `snippet` | `sn` |
+| `path` | `p` | `definitions` | `df` |
+
+Unknown keys pass through unchanged.
+
 ## Community Detection (Louvain)
 
 `tsift communities` clusters the call graph into architectural subsystems using the Louvain method.
