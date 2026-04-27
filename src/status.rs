@@ -409,7 +409,7 @@ mod tests {
     fn status_json_roundtrip() {
         let dir = TempDir::new().unwrap();
         let report = check_status(dir.path()).unwrap();
-        let json = serde_json::to_string_pretty(&report).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"state\""));
         assert!(json.contains("\"missing\""));
     }

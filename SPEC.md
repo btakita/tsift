@@ -112,7 +112,19 @@ In JSON mode, `--quiet` also omits the `changes` array and uses compact (non-pre
 - `communities` shows top members per cluster with `(+N more)` instead of full dumps
 - `path`, `status`, `audit`, `summarize`, `lint`, `sql`, and `index` switch to denser summary-oriented layouts
 
-`--compact` does not change standard `--json` formatting. Compact JSON remains a separate concern.
+`--compact` does not change `--json` formatting. Use `--pretty` for indented JSON.
+
+## Compact JSON Default
+
+All `--json` output uses compact (single-line) serialization by default. This saves 30-50% of tokens compared to pretty-printed JSON.
+
+`tsift --pretty` is a global flag that switches JSON output to indented (pretty-printed) format for human readability. Without `--pretty`, JSON is compact.
+
+```bash
+tsift search "main" --json                # compact JSON (default)
+tsift --pretty search "main" --json       # pretty-printed JSON
+tsift --pretty explain main --json        # pretty-printed JSON
+```
 
 ## Community Detection (Louvain)
 
