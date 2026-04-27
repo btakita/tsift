@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Search a codebase using hybrid BM25 + vector search
+    /// Search a codebase (lexical by default; hybrid/vector available)
     Search {
         /// Query string
         query: String,
@@ -2063,37 +2063,44 @@ fn cmd_search(
     federated: bool,
     json_output: bool,
 ) -> Result<()> {
-    let search_path = path.unwrap_or_else(|| PathBuf::from("."));
+    let base_path = path.unwrap_or_else(|| PathBuf::from("."));
 
-    let symbol_hits = if let Some(ref scope_name) = scope {
-        let root = search_path.canonicalize().unwrap_or(search_path.clone());
+    let (symbol_hits, sift_path) = if let Some(ref scope_name) = scope {
+        let root = base_path.canonicalize().unwrap_or(base_path.clone());
         let cfg = config::Config::load(&root)?;
         let db_path = cfg.db_path_for(&root, scope_name);
-        if db_path.exists() {
+        let hits = if db_path.exists() {
             let db = index::IndexDb::open(&db_path)?;
             db.symbol_search(&query, limit)?
         } else {
             Vec::new()
-        }
+        };
+        let sub_path = config::Config::submodule_dirs(&root)?
+            .into_iter()
+            .find(|(name, _)| name == scope_name)
+            .map(|(_, p)| p)
+            .unwrap_or(base_path.clone());
+        (hits, sub_path)
     } else if federated {
-        let root = search_path.canonicalize().unwrap_or(search_path.clone());
-        federated_symbol_search(&root, &query, limit)?
+        let root = base_path.canonicalize().unwrap_or(base_path.clone());
+        (federated_symbol_search(&root, &query, limit)?, base_path.clone())
     } else {
-        let db_path = search_path.join(".tsift/index.db");
-        if db_path.exists() {
+        let db_path = base_path.join(".tsift/index.db");
+        let hits = if db_path.exists() {
             let db = index::IndexDb::open(&db_path)?;
             db.symbol_search(&query, limit)?
         } else {
             Vec::new()
-        }
+        };
+        (hits, base_path.clone())
     };
 
     let engine = Sift::builder().build();
-    let mut options = SearchOptions::default().with_limit(limit);
-    if let Some(s) = strategy {
-        options = options.with_strategy(s);
-    }
-    let input = SearchInput::new(&search_path, &query).with_options(options);
+    let effective_strategy = strategy.unwrap_or_else(|| "lexical".to_string());
+    let options = SearchOptions::default()
+        .with_limit(limit)
+        .with_strategy(effective_strategy);
+    let input = SearchInput::new(&sift_path, &query).with_options(options);
     let response = engine.search(input)?;
 
     if json_output {

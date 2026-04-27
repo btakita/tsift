@@ -76,8 +76,9 @@ tsift audit --manifest <file>   # compare against expected skill list
 tsift summarize <symbol>        # cached LLM summary for a symbol
 tsift summarize --extract <path>  # batch LLM extraction (one-time)
 tsift summarize --extract --diff  # re-extract only git-changed files
-tsift search <query>            # gains AST-aware ranking when index exists
-tsift search --scope <submod>   # restrict to one submodule's index
+tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
+tsift search --scope <submod>   # restrict to one submodule's index + sift path
+tsift search --strategy hybrid  # opt-in to slower hybrid BM25 + vector search
 ```
 
 ## Community Detection (Louvain)
