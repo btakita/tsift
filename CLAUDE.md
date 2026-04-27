@@ -72,6 +72,7 @@ cargo install --path .   # install to ~/.cargo/bin/
 
 - **Auto-reindex** (`UserPromptSubmit`): `examples/hooks/tsift-autoindex.sh` runs `tsift index --check --exit-code .` on every prompt, auto-reindexes when stale. Install via `.claude/settings.json`.
 - **Search rewrite** (`PreToolUse`): `~/.claude/hooks/tsift-rewrite.sh` rewrites `rg`/`grep -r` to `tsift search --strategy lexical`.
+- **RTK output filtering** (`PreToolUse`): same hook routes verbose commands (`communities`, `explain`, `graph`, `index`, `search`) through RTK when installed. TOML filters at `~/.config/rtk/filters.toml` cap output lines.
 
 ## Repo
 

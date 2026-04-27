@@ -626,6 +626,24 @@ For workspace mode, replace `. ` with `--workspace` in the hook.
 
 The existing `tsift-rewrite.sh` hook intercepts `rg`/`grep -r` Bash calls and silently rewrites them to `tsift search --strategy lexical`. See `~/.claude/hooks/tsift-rewrite.sh`.
 
+### RTK Output Filtering (`PreToolUse`)
+
+The `tsift-rewrite.sh` hook (phase 2) routes verbose tsift commands through RTK for output capping when RTK is installed. Commands routed: `communities`, `explain`, `graph`, `index`, `search`. Non-verbose commands (`status`, `init`, `route`, `sql`) pass through unchanged.
+
+RTK TOML filters at `~/.config/rtk/filters.toml` define per-command caps:
+
+| Command | Filter | Effect |
+|---------|--------|--------|
+| `tsift communities` | `max_lines: 80` | Caps member lists (raw: 600+ lines) |
+| `tsift explain` | `max_lines: 40` | Caps callee/caller lists |
+| `tsift graph` | `max_lines: 50` | Caps edge lists |
+| `tsift index` | `max_lines: 30` | Caps file change lists (raw: up to 14K+ lines) |
+| `tsift search` | `strip "Strategy:" line, max_lines: 50` | Strips metadata, caps results |
+
+All filters also strip ANSI codes and blank lines. The `--compact` and `--pretty` global flag variants are matched.
+
+**Interaction with `--quiet`:** the `index` filter is a safety net for unqualified `tsift index` calls. When `--quiet` or `--exit-code` is passed, the binary already suppresses verbose output, making the RTK filter a no-op.
+
 ## What NOT to build
 
 - Visualization (Mermaid, HTML) — leave to graphify
