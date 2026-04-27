@@ -157,6 +157,25 @@ tsift --terse --pretty status .            # terse + pretty-printed
 
 Unknown keys pass through unchanged.
 
+## Relative Paths (Default)
+
+All file paths in output are project-relative by default. The project root is detected via `path.canonicalize()` in each command. Relative paths are shorter and save tokens — tsift's core mission.
+
+`tsift --absolute` is a global flag that switches output to absolute paths for cases where the full filesystem path is needed (e.g., piping to external tools).
+
+```bash
+tsift search "main"                        # paths: src/main.rs
+tsift --absolute search "main"             # paths: /home/user/project/src/main.rs
+tsift explain main                         # file: src/main.rs, caller_file: src/lib.rs
+tsift --absolute graph main --callers      # full paths in output
+```
+
+**Scope:** applies to all commands that emit file paths — `search`, `graph`, `explain`, `index`, `summarize`, `lint`. Commands that only emit symbol names (`communities`, `path`) are unaffected.
+
+**JSON output:** path-bearing keys (`file`, `path`, `caller_file`, `file_path`) are stripped in both regular and terse JSON. Non-path string values are never modified.
+
+**Database storage:** paths remain absolute in SQLite. Stripping happens at output time only, so `--absolute` is a display toggle, not a data migration.
+
 ## Community Detection (Louvain)
 
 `tsift communities` clusters the call graph into architectural subsystems using the Louvain method.

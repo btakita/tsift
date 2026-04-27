@@ -38,6 +38,10 @@ struct Cli {
     #[arg(long, global = true)]
     terse: bool,
 
+    /// Show absolute paths instead of project-relative
+    #[arg(long, global = true)]
+    absolute: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -317,6 +321,7 @@ fn main() -> Result<()> {
     let compact = cli.compact;
     let pretty = cli.pretty;
     let terse = cli.terse;
+    let absolute = cli.absolute;
     match cli.command {
         Some(Commands::Search {
             query,
@@ -328,7 +333,7 @@ fn main() -> Result<()> {
             json,
             timeout,
         }) => cmd_search(
-            query, path, limit, strategy, scope, federated, json || terse, timeout, compact, pretty, terse,
+            query, path, limit, strategy, scope, federated, json || terse, timeout, compact, pretty, terse, absolute,
         ),
         Some(Commands::Edit { dry_run, file }) => cmd_edit(dry_run, file, compact, pretty, terse),
         Some(Commands::Index {
@@ -354,6 +359,7 @@ fn main() -> Result<()> {
             compact,
             pretty,
             terse,
+            absolute,
         ),
         Some(Commands::Rewrite { command }) => cmd_rewrite(&command),
         Some(Commands::Route { task, id }) => cmd_route(&task, id),
@@ -374,6 +380,7 @@ fn main() -> Result<()> {
             compact,
             pretty,
             terse,
+            absolute,
         ),
         Some(Commands::Sql {
             db,
@@ -399,7 +406,7 @@ fn main() -> Result<()> {
             path,
             scope,
             json,
-        }) => cmd_explain(&symbol, &path, scope.as_deref(), json || terse, compact, pretty, terse),
+        }) => cmd_explain(&symbol, &path, scope.as_deref(), json || terse, compact, pretty, terse, absolute),
         Some(Commands::Audit {
             skills_dir,
             manifest,
@@ -707,6 +714,67 @@ const TERSE_PAIRS: &[(&str, &str)] = &[
     ("default_value", "dv"), ("replace_all", "ra"),
 ];
 
+fn relativize(path: &str, root: &std::path::Path) -> String {
+    let root_str = root.to_string_lossy();
+    let prefix = format!("{}/", root_str.trim_end_matches('/'));
+    path.strip_prefix(&prefix).unwrap_or(path).to_string()
+}
+
+fn relativize_pathbuf(path: &std::path::Path, root: &std::path::Path) -> PathBuf {
+    path.strip_prefix(root)
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn relativize_edges(edges: &mut [index::StoredEdge], root: &std::path::Path) {
+    for edge in edges {
+        edge.caller_file = relativize(&edge.caller_file, root);
+    }
+}
+
+fn relativize_symbols(symbols: &mut [index::StoredSymbol], root: &std::path::Path) {
+    for sym in symbols {
+        sym.file = relativize(&sym.file, root);
+    }
+}
+
+fn relativize_symbol_hits(hits: &mut [index::SymbolHit], root: &std::path::Path) {
+    for hit in hits {
+        hit.file = relativize(&hit.file, root);
+    }
+}
+
+const JSON_PATH_KEYS: &[&str] = &["file", "path", "caller_file", "file_path"];
+
+fn relativize_json_paths(val: &mut serde_json::Value, root: &std::path::Path) {
+    let root_str = root.to_string_lossy();
+    let prefix = format!("{}/", root_str.trim_end_matches('/'));
+    relativize_json_inner(val, &prefix);
+}
+
+fn relativize_json_inner(val: &mut serde_json::Value, prefix: &str) {
+    match val {
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                relativize_json_inner(v, prefix);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if JSON_PATH_KEYS.contains(&k.as_str()) {
+                    if let serde_json::Value::String(s) = v {
+                        if let Some(rest) = s.strip_prefix(prefix) {
+                            *s = rest.to_string();
+                        }
+                    }
+                }
+                relativize_json_inner(v, prefix);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn format_score(score: f64, compact: bool) -> String {
     if compact {
         format!("{score:.2}")
@@ -905,6 +973,7 @@ fn cmd_index(
     compact: bool,
     pretty: bool,
     terse: bool,
+    absolute: bool,
 ) -> Result<()> {
     let quiet = quiet || exit_code;
     let root = path
@@ -1059,6 +1128,13 @@ fn cmd_index(
         db.apply_changes(&root)?
     };
 
+    let mut summary = summary;
+    if !absolute {
+        for change in &mut summary.changes {
+            change.path = relativize_pathbuf(&change.path, &root);
+        }
+    }
+
     if json_output {
         if quiet {
             let compact = serde_json::json!({
@@ -1150,6 +1226,7 @@ fn cmd_graph(
     compact: bool,
     pretty: bool,
     terse: bool,
+    absolute: bool,
 ) -> Result<()> {
     let root = path
         .canonicalize()
@@ -1171,7 +1248,10 @@ fn cmd_graph(
     let show_both = !callers && !callees;
 
     if callers || show_both {
-        let edges = db.callers_of(symbol)?;
+        let mut edges = db.callers_of(symbol)?;
+        if !absolute {
+            relativize_edges(&mut edges, &root);
+        }
         if json_output {
             if !show_both {
                 println!("{}", to_json(&edges, pretty, terse)?);
@@ -1207,7 +1287,10 @@ fn cmd_graph(
     }
 
     if callees || show_both {
-        let edges = db.callees_of(symbol)?;
+        let mut edges = db.callees_of(symbol)?;
+        if !absolute {
+            relativize_edges(&mut edges, &root);
+        }
         if json_output {
             if !show_both {
                 println!("{}", to_json(&edges, pretty, terse)?);
@@ -1240,8 +1323,12 @@ fn cmd_graph(
     }
 
     if show_both && json_output {
-        let callers_edges = db.callers_of(symbol)?;
-        let callees_edges = db.callees_of(symbol)?;
+        let mut callers_edges = db.callers_of(symbol)?;
+        let mut callees_edges = db.callees_of(symbol)?;
+        if !absolute {
+            relativize_edges(&mut callers_edges, &root);
+            relativize_edges(&mut callees_edges, &root);
+        }
         let combined = serde_json::json!({
             "symbol": symbol,
             "callers": callers_edges,
@@ -1434,12 +1521,21 @@ fn cmd_explain(
     compact: bool,
     pretty: bool,
     terse: bool,
+    absolute: bool,
 ) -> Result<()> {
+    let root = path
+        .canonicalize()
+        .with_context(|| format!("resolving path: {}", path.display()))?;
     let db = open_index_db(path, scope)?;
 
-    let symbols = db.symbol_info(symbol)?;
-    let callers = db.callers_of(symbol)?;
-    let callees = db.callees_of(symbol)?;
+    let mut symbols = db.symbol_info(symbol)?;
+    let mut callers = db.callers_of(symbol)?;
+    let mut callees = db.callees_of(symbol)?;
+    if !absolute {
+        relativize_symbols(&mut symbols, &root);
+        relativize_edges(&mut callers, &root);
+        relativize_edges(&mut callees, &root);
+    }
 
     let edges = db.all_edges()?;
     let comm_result = graph::detect_communities(&edges);
@@ -1985,6 +2081,7 @@ fn cmd_search(
     compact: bool,
     pretty: bool,
     terse: bool,
+    absolute: bool,
 ) -> Result<()> {
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
 
@@ -2021,6 +2118,12 @@ fn cmd_search(
         (hits, base_path.clone())
     };
 
+    let root = base_path.canonicalize().unwrap_or(base_path.clone());
+    let mut symbol_hits = symbol_hits;
+    if !absolute {
+        relativize_symbol_hits(&mut symbol_hits, &root);
+    }
+
     let engine = Sift::builder().build();
     let effective_strategy = strategy.unwrap_or_else(|| "lexical".to_string());
     let options = SearchOptions::default()
@@ -2036,7 +2139,10 @@ fn cmd_search(
             #[serde(flatten)]
             sift: &'a serde_json::Value,
         }
-        let sift_value = serde_json::to_value(&response)?;
+        let mut sift_value = serde_json::to_value(&response)?;
+        if !absolute {
+            relativize_json_paths(&mut sift_value, &root);
+        }
         let combined = CombinedResponse {
             symbols: &symbol_hits,
             sift: &sift_value,
@@ -2061,12 +2167,13 @@ fn cmd_search(
 
         println!("hits[{}]:", response.hits.len());
         for hit in &response.hits {
+            let hp = if absolute { hit.path.clone() } else { relativize(&hit.path, &root) };
             let snippet = compact_snippet(&hit.snippet).unwrap_or_default();
             if snippet.is_empty() {
                 println!(
                     "  {}. {} [{:?} {}]",
                     hit.rank,
-                    hit.path,
+                    hp,
                     hit.confidence,
                     format_score(hit.score, true)
                 );
@@ -2074,7 +2181,7 @@ fn cmd_search(
                 println!(
                     "  {}. {} [{:?} {}] {}",
                     hit.rank,
-                    hit.path,
+                    hp,
                     hit.confidence,
                     format_score(hit.score, true),
                     snippet
@@ -2109,9 +2216,10 @@ fn cmd_search(
         );
         println!();
         for hit in &response.hits {
+            let hp = if absolute { hit.path.clone() } else { relativize(&hit.path, &root) };
             println!(
                 "  #{} [{:?}] {} (score: {:.4})",
-                hit.rank, hit.confidence, hit.path, hit.score
+                hit.rank, hit.confidence, hp, hit.score
             );
             if !hit.snippet.is_empty() {
                 for line in hit.snippet.lines().take(3) {
@@ -2604,7 +2712,7 @@ mod tests {
     #[test]
     fn graph_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_graph("main", dir.path(), false, false, None, false, false, false, false);
+        let result = cmd_graph("main", dir.path(), false, false, None, false, false, false, false, false);
         assert!(result.is_err());
     }
 
@@ -2696,6 +2804,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .unwrap();
         assert!(dir.path().join(".tsift/indexes/alpha/index.db").exists());
@@ -2718,6 +2827,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .unwrap();
         assert!(dir.path().join(".tsift/indexes/alpha/index.db").exists());
@@ -2736,6 +2846,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
             false,
             false,
@@ -2775,6 +2886,7 @@ tier = "isolated"
             false,
             false,
             false,
+            false,
         )
         .unwrap();
         let hits = federated_symbol_search(dir.path(), "alpha_helper", 10).unwrap();
@@ -2796,6 +2908,7 @@ tier = "isolated"
             false,
             true,
             None,
+            false,
             false,
             false,
             false,
@@ -2822,6 +2935,7 @@ tier = "isolated"
             false,
             true,
             None,
+            false,
             false,
             false,
             false,
@@ -2898,7 +3012,7 @@ tier = "isolated"
     #[test]
     fn explain_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_explain("main", dir.path(), None, false, false, false, false);
+        let result = cmd_explain("main", dir.path(), None, false, false, false, false, false);
         assert!(result.is_err());
     }
 
@@ -2963,6 +3077,7 @@ tier = "isolated"
             false,
             false,
             false,
+            false,
         );
         assert!(result.is_ok());
     }
@@ -2979,6 +3094,7 @@ tier = "isolated"
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -3000,6 +3116,7 @@ tier = "isolated"
             false,
             None,
             true,
+            false,
             false,
             false,
             false,
@@ -3074,6 +3191,70 @@ tier = "isolated"
         let d = &parsed["d"];
         assert_eq!(d["custom_field"], "value");
         assert_eq!(d["n"], "test");
+    }
+
+    // --- relativize paths ---
+
+    #[test]
+    fn cli_accepts_global_absolute_flag() {
+        let cli = Cli::parse_from(["tsift", "--absolute", "status"]);
+        assert!(cli.absolute);
+        assert!(matches!(cli.command, Some(Commands::Status { .. })));
+    }
+
+    #[test]
+    fn relativize_strips_root_prefix() {
+        let root = std::path::Path::new("/home/user/project");
+        assert_eq!(relativize("/home/user/project/src/main.rs", root), "src/main.rs");
+    }
+
+    #[test]
+    fn relativize_leaves_non_matching_path() {
+        let root = std::path::Path::new("/home/user/project");
+        assert_eq!(relativize("/other/path/file.rs", root), "/other/path/file.rs");
+    }
+
+    #[test]
+    fn relativize_leaves_already_relative() {
+        let root = std::path::Path::new("/home/user/project");
+        assert_eq!(relativize("src/main.rs", root), "src/main.rs");
+    }
+
+    #[test]
+    fn relativize_pathbuf_strips_prefix() {
+        let root = std::path::Path::new("/home/user/project");
+        let path = std::path::Path::new("/home/user/project/src/lib.rs");
+        assert_eq!(relativize_pathbuf(path, root), PathBuf::from("src/lib.rs"));
+    }
+
+    #[test]
+    fn relativize_edges_strips_caller_file() {
+        let root = std::path::Path::new("/tmp/proj");
+        let mut edges = vec![index::StoredEdge {
+            caller_file: "/tmp/proj/src/main.rs".to_string(),
+            caller_name: "main".to_string(),
+            caller_line: 1,
+            callee_name: "helper".to_string(),
+            call_site_line: 5,
+        }];
+        relativize_edges(&mut edges, root);
+        assert_eq!(edges[0].caller_file, "src/main.rs");
+    }
+
+    #[test]
+    fn relativize_json_paths_strips_known_keys() {
+        let root = std::path::Path::new("/tmp/proj");
+        let mut val = serde_json::json!({
+            "file": "/tmp/proj/src/main.rs",
+            "path": "/tmp/proj/test.rs",
+            "name": "/tmp/proj/not-a-path",
+            "hits": [{"path": "/tmp/proj/nested.rs", "score": 1.0}]
+        });
+        relativize_json_paths(&mut val, root);
+        assert_eq!(val["file"], "src/main.rs");
+        assert_eq!(val["path"], "test.rs");
+        assert_eq!(val["name"], "/tmp/proj/not-a-path");
+        assert_eq!(val["hits"][0]["path"], "nested.rs");
     }
 }
 
