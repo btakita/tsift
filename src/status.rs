@@ -82,7 +82,7 @@ fn check_index(db_path: &Path, root: &Path) -> Result<IndexStatus> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let db = IndexDb::open(db_path)?;
+    let db = IndexDb::open_read_only(db_path)?;
     let total_files = db.file_count()?;
     let summary = db.compute_changes(root)?;
     let stale_files = summary.new + summary.modified + summary.deleted;
@@ -114,7 +114,7 @@ fn check_summaries(db_path: &Path, index: &IndexStatus) -> Result<SummaryStatus>
         return Ok(SummaryStatus::None);
     }
 
-    let db = SummaryDb::open(db_path)?;
+    let db = SummaryDb::open_read_only(db_path)?;
     let stats = db.stats()?;
     let cached_files = stats.total_files;
 

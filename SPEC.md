@@ -113,6 +113,14 @@ If the sift engine itself still times out, search exits with a non-zero code and
 tsift search timed out after 30s (strategy: lexical). The index may be stale — run `tsift index .` to rebuild, or use `--timeout 0` to disable the timeout.
 ```
 
+## SQLite Concurrency
+
+tsift treats query/status paths and writer paths differently so a live index rebuild does not unnecessarily block readers.
+
+- writable opens (`index`, `summarize`) set a 5-second SQLite busy timeout and require `PRAGMA journal_mode=WAL`; if SQLite refuses WAL, tsift fails closed instead of continuing in rollback-journal mode
+- read/query paths (`search`, `graph`, `communities`, `path`, `explain`, `status`, and summary status checks) use read-only SQLite handles with the same busy timeout
+- this is a concurrency hardening step, not a filesystem-stall fix: if the host itself wedges a write in kernel `D` state, tsift now surfaces the bad journal mode early rather than silently proceeding with a lock-prone writer
+
 `--timeout 0` disables the timeout for cases where a long search is expected.
 
 ## Index Quiet Mode

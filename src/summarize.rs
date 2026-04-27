@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub struct SummaryDb {
     conn: Connection,
@@ -97,6 +98,16 @@ impl SummaryDb {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("opening summaries db: {}", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if mode.to_lowercase() != "wal" {
+            bail!(
+                "summaries db {} requires WAL mode for concurrent reads, got {}",
+                path.display(),
+                mode
+            );
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS summaries (
                 id INTEGER PRIMARY KEY,
@@ -119,15 +130,25 @@ impl SummaryDb {
         Ok(Self { conn })
     }
 
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening summaries db: {}", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self { conn })
+    }
+
     pub fn get_by_symbol(&self, name: &str) -> Result<Vec<Summary>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, symbol_name, file_path, content_hash, summary, entities, relationships,
                     concept_labels, extracted_at, model, tokens_input, tokens_output
              FROM summaries WHERE symbol_name = ?1 ORDER BY extracted_at DESC",
         )?;
-        let rows = stmt.query_map([name], |row| {
-            Ok(row_to_summary(row))
-        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let rows = stmt
+            .query_map([name], |row| Ok(row_to_summary(row)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -137,9 +158,9 @@ impl SummaryDb {
                     concept_labels, extracted_at, model, tokens_input, tokens_output
              FROM summaries WHERE file_path = ?1 ORDER BY symbol_name",
         )?;
-        let rows = stmt.query_map([path], |row| {
-            Ok(row_to_summary(row))
-        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let rows = stmt
+            .query_map([path], |row| Ok(row_to_summary(row)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -154,9 +175,18 @@ impl SummaryDb {
                 summary.file_path,
                 summary.content_hash,
                 summary.summary,
-                summary.entities.as_ref().map(|e| serde_json::to_string(e).unwrap_or_default()),
-                summary.relationships.as_ref().map(|r| serde_json::to_string(r).unwrap_or_default()),
-                summary.concept_labels.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default()),
+                summary
+                    .entities
+                    .as_ref()
+                    .map(|e| serde_json::to_string(e).unwrap_or_default()),
+                summary
+                    .relationships
+                    .as_ref()
+                    .map(|r| serde_json::to_string(r).unwrap_or_default()),
+                summary
+                    .concept_labels
+                    .as_ref()
+                    .map(|c| serde_json::to_string(c).unwrap_or_default()),
                 summary.extracted_at,
                 summary.model,
                 summary.tokens_input,
@@ -176,17 +206,23 @@ impl SummaryDb {
     }
 
     pub fn stats(&self) -> Result<SummaryStats> {
-        let total_summaries: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM summaries", [], |row| row.get(0),
-        )?;
+        let total_summaries: usize =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM summaries", [], |row| row.get(0))?;
         let total_files: usize = self.conn.query_row(
-            "SELECT COUNT(DISTINCT file_path) FROM summaries", [], |row| row.get(0),
+            "SELECT COUNT(DISTINCT file_path) FROM summaries",
+            [],
+            |row| row.get(0),
         )?;
         let total_tokens_input: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(tokens_input), 0) FROM summaries", [], |row| row.get(0),
+            "SELECT COALESCE(SUM(tokens_input), 0) FROM summaries",
+            [],
+            |row| row.get(0),
         )?;
         let total_tokens_output: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(tokens_output), 0) FROM summaries", [], |row| row.get(0),
+            "SELECT COALESCE(SUM(tokens_output), 0) FROM summaries",
+            [],
+            |row| row.get(0),
         )?;
         // Estimated tokens saved: each summary replaces ~2000 tokens of source reading
         // with ~75 tokens of cached summary. Net savings per summary = ~1925 tokens.
@@ -202,9 +238,9 @@ impl SummaryDb {
     }
 
     pub fn delete_by_file(&self, file_path: &str) -> Result<usize> {
-        let count = self.conn.execute(
-            "DELETE FROM summaries WHERE file_path = ?1", [file_path],
-        )?;
+        let count = self
+            .conn
+            .execute("DELETE FROM summaries WHERE file_path = ?1", [file_path])?;
         Ok(count)
     }
 }
@@ -272,12 +308,8 @@ pub fn extract_for_file(
     let (response_text, tokens_in, tokens_out) =
         call_anthropic_api(&api_key, &config.model, &prompt)?;
 
-    let parsed: ExtractionResponse = serde_json::from_str(&response_text).with_context(|| {
-        format!(
-            "parsing extraction response for {}",
-            file_path.display()
-        )
-    })?;
+    let parsed: ExtractionResponse = serde_json::from_str(&response_text)
+        .with_context(|| format!("parsing extraction response for {}", file_path.display()))?;
 
     let now = chrono_now();
     let mut summaries = Vec::new();
@@ -342,15 +374,11 @@ fn load_symbols_for_file(db_path: &Path, file_path: &str) -> Result<Vec<(String,
     if !table_exists {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
-        "SELECT name, kind FROM symbols WHERE file LIKE '%' || ?1 ORDER BY line",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT name, kind FROM symbols WHERE file LIKE '%' || ?1 ORDER BY line")?;
     let rows = stmt
         .query_map([file_path], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
@@ -385,11 +413,7 @@ fn build_extraction_prompt(file_path: &str, source: &str, symbols: &[(String, St
     prompt
 }
 
-fn call_anthropic_api(
-    api_key: &str,
-    model: &str,
-    prompt: &str,
-) -> Result<(String, i64, i64)> {
+fn call_anthropic_api(api_key: &str, model: &str, prompt: &str) -> Result<(String, i64, i64)> {
     let body = serde_json::json!({
         "model": model,
         "max_tokens": 4096,
@@ -517,9 +541,12 @@ mod tests {
     #[test]
     fn db_get_by_file() {
         let (_tmp, db) = test_db();
-        db.insert(&make_summary("fn_a", "src/lib.rs", "hash1")).unwrap();
-        db.insert(&make_summary("fn_b", "src/lib.rs", "hash1")).unwrap();
-        db.insert(&make_summary("fn_c", "src/other.rs", "hash2")).unwrap();
+        db.insert(&make_summary("fn_a", "src/lib.rs", "hash1"))
+            .unwrap();
+        db.insert(&make_summary("fn_b", "src/lib.rs", "hash1"))
+            .unwrap();
+        db.insert(&make_summary("fn_c", "src/other.rs", "hash2"))
+            .unwrap();
         let results = db.get_by_file("src/lib.rs").unwrap();
         assert_eq!(results.len(), 2);
     }
@@ -527,7 +554,8 @@ mod tests {
     #[test]
     fn db_is_current() {
         let (_tmp, db) = test_db();
-        db.insert(&make_summary("main", "src/main.rs", "hash_v1")).unwrap();
+        db.insert(&make_summary("main", "src/main.rs", "hash_v1"))
+            .unwrap();
         assert!(db.is_current("src/main.rs", "hash_v1").unwrap());
         assert!(!db.is_current("src/main.rs", "hash_v2").unwrap());
     }
@@ -542,7 +570,7 @@ mod tests {
         assert_eq!(stats.total_summaries, 3);
         assert_eq!(stats.total_files, 2);
         assert_eq!(stats.total_tokens_input, 1500); // 3 * 500
-        assert_eq!(stats.total_tokens_output, 600);  // 3 * 200
+        assert_eq!(stats.total_tokens_output, 600); // 3 * 200
     }
 
     #[test]
@@ -555,6 +583,35 @@ mod tests {
         assert_eq!(deleted, 2);
         assert!(db.get_by_file("f1.rs").unwrap().is_empty());
         assert_eq!(db.get_by_file("f2.rs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn db_open_configures_sqlite_for_concurrent_access() {
+        let (_tmp, db) = test_db();
+
+        let mode: String = db
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let timeout_ms: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(mode.to_lowercase(), "wal");
+        assert_eq!(timeout_ms, 5000);
+    }
+
+    #[test]
+    fn db_open_read_only_uses_busy_timeout() {
+        let (tmp, _db) = test_db();
+        let db = SummaryDb::open_read_only(tmp.path()).unwrap();
+        let timeout_ms: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(timeout_ms, 5000);
     }
 
     #[test]
@@ -626,7 +683,12 @@ mod tests {
         };
         let result = extract_for_file(&big_file, None, &config);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exceeds max_file_tokens"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds max_file_tokens")
+        );
     }
 
     #[test]

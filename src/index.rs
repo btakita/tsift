@@ -1,8 +1,8 @@
 use crate::graph;
 use crate::lang::Lang;
 use crate::walk::{self, FileEntry, PruneStats};
-use anyhow::{Context, Result};
-use rusqlite::Connection;
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -100,6 +100,16 @@ impl IndexDb {
         }
         let conn = Connection::open(db_path)
             .with_context(|| format!("opening index db: {}", db_path.display()))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if mode.to_lowercase() != "wal" {
+            bail!(
+                "index db {} requires WAL mode for concurrent reads, got {}",
+                db_path.display(),
+                mode
+            );
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS file_state (
                 path TEXT PRIMARY KEY,
@@ -142,15 +152,27 @@ impl IndexDb {
                 path TEXT PRIMARY KEY,
                 mtime_secs INTEGER NOT NULL,
                 mtime_nanos INTEGER NOT NULL
-            );"
+            );",
         )?;
         let _ = conn.execute("ALTER TABLE symbols ADD COLUMN tags TEXT", []);
         Ok(Self { conn })
     }
 
+    pub fn open_read_only(db_path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening index db: {}", db_path.display()))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self { conn })
+    }
+
     fn load_dir_state(&self) -> Result<HashMap<PathBuf, SystemTime>> {
         let mut dirs = HashMap::new();
-        let mut stmt = self.conn.prepare("SELECT path, mtime_secs, mtime_nanos FROM dir_state")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, mtime_secs, mtime_nanos FROM dir_state")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 PathBuf::from(row.get::<_, String>(0)?),
@@ -167,9 +189,9 @@ impl IndexDb {
 
     fn save_dir_state(&self, dir_mtimes: &HashMap<PathBuf, SystemTime>) -> Result<()> {
         self.conn.execute("DELETE FROM dir_state", [])?;
-        let mut stmt = self.conn.prepare(
-            "INSERT INTO dir_state (path, mtime_secs, mtime_nanos) VALUES (?1, ?2, ?3)"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("INSERT INTO dir_state (path, mtime_secs, mtime_nanos) VALUES (?1, ?2, ?3)")?;
         for (path, mtime) in dir_mtimes {
             let (secs, nanos) = system_time_to_pair(*mtime);
             stmt.execute(rusqlite::params![path.to_string_lossy(), secs, nanos])?;
@@ -179,7 +201,9 @@ impl IndexDb {
 
     fn load_stored_files(&self) -> Result<HashMap<PathBuf, (i64, u32, String)>> {
         let mut stored = HashMap::new();
-        let mut stmt = self.conn.prepare("SELECT path, mtime_secs, mtime_nanos, language FROM file_state")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, mtime_secs, mtime_nanos, language FROM file_state")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 PathBuf::from(row.get::<_, String>(0)?),
@@ -262,7 +286,8 @@ impl IndexDb {
             let stored_dirs = self.load_dir_state().unwrap_or_default();
             let walk_result = walk::walk_files_pruned(root, stored_dirs)?;
             let mut stats = walk_result.stats;
-            let pruned_file_count = stored.keys()
+            let pruned_file_count = stored
+                .keys()
                 .filter(|p| walk_result.pruned_dirs.iter().any(|d| p.starts_with(d)))
                 .count();
             stats.files_pruned = pruned_file_count;
@@ -275,8 +300,14 @@ impl IndexDb {
         let (changes, unchanged) = Self::diff_entries(&entries, &stored, &pruned_dirs);
 
         let new_count = changes.iter().filter(|c| c.kind == ChangeKind::New).count();
-        let mod_count = changes.iter().filter(|c| c.kind == ChangeKind::Modified).count();
-        let del_count = changes.iter().filter(|c| c.kind == ChangeKind::Deleted).count();
+        let mod_count = changes
+            .iter()
+            .filter(|c| c.kind == ChangeKind::Modified)
+            .count();
+        let del_count = changes
+            .iter()
+            .filter(|c| c.kind == ChangeKind::Deleted)
+            .count();
 
         Ok(IndexSummary {
             total_tracked: entries.len() + prune_stats.as_ref().map_or(0, |s| s.files_pruned),
@@ -304,11 +335,17 @@ impl IndexDb {
             let stored_dirs = self.load_dir_state().unwrap_or_default();
             let walk_result = walk::walk_files_pruned(root, stored_dirs)?;
             let mut stats = walk_result.stats;
-            let pruned_file_count = stored.keys()
+            let pruned_file_count = stored
+                .keys()
                 .filter(|p| walk_result.pruned_dirs.iter().any(|d| p.starts_with(d)))
                 .count();
             stats.files_pruned = pruned_file_count;
-            (walk_result.entries, walk_result.pruned_dirs, Some(walk_result.dir_mtimes), Some(stats))
+            (
+                walk_result.entries,
+                walk_result.pruned_dirs,
+                Some(walk_result.dir_mtimes),
+                Some(stats),
+            )
         } else {
             let entries = walk::walk_files(root)?;
             (entries, HashSet::new(), None, None)
@@ -317,8 +354,14 @@ impl IndexDb {
         let (changes, unchanged) = Self::diff_entries(&entries, &stored, &pruned_dirs);
 
         let new_count = changes.iter().filter(|c| c.kind == ChangeKind::New).count();
-        let mod_count = changes.iter().filter(|c| c.kind == ChangeKind::Modified).count();
-        let del_count = changes.iter().filter(|c| c.kind == ChangeKind::Deleted).count();
+        let mod_count = changes
+            .iter()
+            .filter(|c| c.kind == ChangeKind::Modified)
+            .count();
+        let del_count = changes
+            .iter()
+            .filter(|c| c.kind == ChangeKind::Deleted)
+            .count();
 
         let summary = IndexSummary {
             total_tracked: entries.len() + prune_stats.as_ref().map_or(0, |s| s.files_pruned),
@@ -333,12 +376,16 @@ impl IndexDb {
         let mut insert_file = self.conn.prepare(
             "INSERT OR REPLACE INTO file_state (path, mtime_secs, mtime_nanos, language) VALUES (?1, ?2, ?3, ?4)"
         )?;
-        let mut delete_file = self.conn.prepare("DELETE FROM file_state WHERE path = ?1")?;
+        let mut delete_file = self
+            .conn
+            .prepare("DELETE FROM file_state WHERE path = ?1")?;
         let mut delete_symbols = self.conn.prepare("DELETE FROM symbols WHERE file = ?1")?;
         let mut insert_symbol = self.conn.prepare(
             "INSERT INTO symbols (name, kind, language, signature, file, line, end_line, parent_module, visibility, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
         )?;
-        let mut delete_edges = self.conn.prepare("DELETE FROM call_edges WHERE caller_file = ?1")?;
+        let mut delete_edges = self
+            .conn
+            .prepare("DELETE FROM call_edges WHERE caller_file = ?1")?;
         let mut insert_edge = self.conn.prepare(
             "INSERT INTO call_edges (caller_file, caller_name, caller_line, callee_name, call_site_line) VALUES (?1, ?2, ?3, ?4, ?5)"
         )?;
@@ -360,7 +407,9 @@ impl IndexDb {
 
                     delete_symbols.execute(rusqlite::params![&path_str])?;
                     delete_edges.execute(rusqlite::params![&path_str])?;
-                    let lang = change.path.extension()
+                    let lang = change
+                        .path
+                        .extension()
                         .and_then(|e| e.to_str())
                         .and_then(Lang::from_extension);
                     if let Some(lang) = lang {
@@ -434,12 +483,16 @@ impl IndexDb {
     }
 
     pub fn file_count(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM file_state", [], |row| row.get(0))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM file_state", [], |row| row.get(0))?;
         Ok(count as usize)
     }
 
     pub fn symbol_count(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
         Ok(count as usize)
     }
 
@@ -465,15 +518,19 @@ impl IndexDb {
     }
 
     pub fn edge_count(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM call_edges", [], |row| row.get(0))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM call_edges", [], |row| row.get(0))?;
         Ok(count as usize)
     }
 
     pub fn all_edges(&self) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT caller_name, callee_name FROM call_edges"
-        )?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT caller_name, callee_name FROM call_edges")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -535,9 +592,9 @@ impl IndexDb {
         let query_tag_list: Vec<&str> = query_tags.split(',').collect();
         let query_lower = query.to_lowercase();
 
-        let mut stmt = self.conn.prepare(
-            "SELECT name, kind, language, file, line, end_line, tags FROM symbols"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, kind, language, file, line, end_line, tags FROM symbols")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -557,7 +614,13 @@ impl IndexDb {
 
             if name_lower == query_lower {
                 hits.push(SymbolHit {
-                    name, kind, language, file, line, end_line, tags,
+                    name,
+                    kind,
+                    language,
+                    file,
+                    line,
+                    end_line,
+                    tags,
                     score: 1.0,
                     match_type: "exact_name".to_string(),
                 });
@@ -566,7 +629,8 @@ impl IndexDb {
 
             if let Some(ref sym_tags) = tags {
                 let sym_tag_list: Vec<&str> = sym_tags.split(',').collect();
-                let matching: usize = query_tag_list.iter()
+                let matching: usize = query_tag_list
+                    .iter()
                     .filter(|qt| sym_tag_list.contains(qt))
                     .count();
 
@@ -589,14 +653,24 @@ impl IndexDb {
                 };
 
                 hits.push(SymbolHit {
-                    name, kind, language, file, line, end_line, tags,
+                    name,
+                    kind,
+                    language,
+                    file,
+                    line,
+                    end_line,
+                    tags,
                     score: f1,
                     match_type: match_type.to_string(),
                 });
             }
         }
 
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         hits.truncate(limit);
         Ok(hits)
     }
@@ -657,11 +731,19 @@ mod tests {
         let db = db_in(dir.path());
         db.apply_changes(dir.path()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
-        fs::write(dir.path().join("main.rs"), "fn main() { println!(\"hi\"); }").unwrap();
+        fs::write(
+            dir.path().join("main.rs"),
+            "fn main() { println!(\"hi\"); }",
+        )
+        .unwrap();
         let summary = db.compute_changes(dir.path()).unwrap();
         assert_eq!(summary.modified, 1);
         assert_eq!(summary.unchanged, 2);
-        let modified = summary.changes.iter().find(|c| c.kind == ChangeKind::Modified).unwrap();
+        let modified = summary
+            .changes
+            .iter()
+            .find(|c| c.kind == ChangeKind::Modified)
+            .unwrap();
         assert!(modified.path.ends_with("main.rs"));
     }
 
@@ -674,7 +756,11 @@ mod tests {
         let summary = db.compute_changes(dir.path()).unwrap();
         assert_eq!(summary.new, 1);
         assert_eq!(summary.unchanged, 3);
-        let new = summary.changes.iter().find(|c| c.kind == ChangeKind::New).unwrap();
+        let new = summary
+            .changes
+            .iter()
+            .find(|c| c.kind == ChangeKind::New)
+            .unwrap();
         assert!(new.path.ends_with("extra.rs"));
     }
 
@@ -687,7 +773,11 @@ mod tests {
         let summary = db.compute_changes(dir.path()).unwrap();
         assert_eq!(summary.deleted, 1);
         assert_eq!(summary.unchanged, 2);
-        let deleted = summary.changes.iter().find(|c| c.kind == ChangeKind::Deleted).unwrap();
+        let deleted = summary
+            .changes
+            .iter()
+            .find(|c| c.kind == ChangeKind::Deleted)
+            .unwrap();
         assert!(deleted.path.ends_with("lib.py"));
     }
 
@@ -707,7 +797,9 @@ mod tests {
         let dir = setup_tree();
         let db = db_in(dir.path());
         let summary = db.apply_changes(dir.path()).unwrap();
-        let paths: Vec<String> = summary.changes.iter()
+        let paths: Vec<String> = summary
+            .changes
+            .iter()
             .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert!(!paths.contains(&"readme.txt".to_string()));
@@ -739,7 +831,10 @@ mod tests {
         let dir = setup_tree();
         let db = db_in(dir.path());
         db.apply_changes(dir.path()).unwrap();
-        assert!(db.symbol_count().unwrap() > 0, "expected symbols from indexed files");
+        assert!(
+            db.symbol_count().unwrap() > 0,
+            "expected symbols from indexed files"
+        );
     }
 
     #[test]
@@ -766,9 +861,16 @@ mod tests {
         let initial = db.symbol_count().unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(50));
-        fs::write(dir.path().join("main.rs"), "fn main() {}\nfn extra() {}\nfn another() {}").unwrap();
+        fs::write(
+            dir.path().join("main.rs"),
+            "fn main() {}\nfn extra() {}\nfn another() {}",
+        )
+        .unwrap();
         db.apply_changes(dir.path()).unwrap();
-        assert!(db.symbol_count().unwrap() > initial, "expected more symbols after adding functions");
+        assert!(
+            db.symbol_count().unwrap() > initial,
+            "expected more symbols after adding functions"
+        );
     }
 
     #[test]
@@ -781,7 +883,10 @@ mod tests {
 
         fs::remove_file(dir.path().join("main.rs")).unwrap();
         db.apply_changes(dir.path()).unwrap();
-        assert!(db.symbol_count().unwrap() < initial, "expected fewer symbols after deleting file");
+        assert!(
+            db.symbol_count().unwrap() < initial,
+            "expected fewer symbols after deleting file"
+        );
     }
 
     #[test]
@@ -793,7 +898,11 @@ mod tests {
         assert!(count > 0);
 
         db.rebuild(dir.path()).unwrap();
-        assert_eq!(db.symbol_count().unwrap(), count, "rebuild should produce same symbol count");
+        assert_eq!(
+            db.symbol_count().unwrap(),
+            count,
+            "rebuild should produce same symbol count"
+        );
     }
 
     #[test]
@@ -808,7 +917,11 @@ mod tests {
     #[test]
     fn symbols_have_tags() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("lib.rs"), "fn get_user_name() {}\nstruct UserProfile;").unwrap();
+        fs::write(
+            dir.path().join("lib.rs"),
+            "fn get_user_name() {}\nstruct UserProfile;",
+        )
+        .unwrap();
         let db = db_in(dir.path());
         db.apply_changes(dir.path()).unwrap();
 
@@ -843,7 +956,10 @@ mod tests {
         db.apply_changes(dir.path()).unwrap();
 
         let hits = db.symbol_search("getUserName", 10).unwrap();
-        assert!(!hits.is_empty(), "should find snake_case via camelCase query");
+        assert!(
+            !hits.is_empty(),
+            "should find snake_case via camelCase query"
+        );
         assert_eq!(hits[0].name, "get_user_name");
         assert_eq!(hits[0].match_type, "all_tags");
     }
@@ -851,12 +967,20 @@ mod tests {
     #[test]
     fn symbol_search_partial_tags() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("lib.rs"), "fn get_user_name() {}\nfn set_user_name() {}").unwrap();
+        fs::write(
+            dir.path().join("lib.rs"),
+            "fn get_user_name() {}\nfn set_user_name() {}",
+        )
+        .unwrap();
         let db = db_in(dir.path());
         db.apply_changes(dir.path()).unwrap();
 
         let hits = db.symbol_search("user", 10).unwrap();
-        assert_eq!(hits.len(), 2, "should find both functions containing 'user' tag");
+        assert_eq!(
+            hits.len(),
+            2,
+            "should find both functions containing 'user' tag"
+        );
     }
 
     #[test]
@@ -873,7 +997,11 @@ mod tests {
     #[test]
     fn symbol_search_respects_limit() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("lib.rs"), "fn a_test() {}\nfn b_test() {}\nfn c_test() {}").unwrap();
+        fs::write(
+            dir.path().join("lib.rs"),
+            "fn a_test() {}\nfn b_test() {}\nfn c_test() {}",
+        )
+        .unwrap();
         let db = db_in(dir.path());
         db.apply_changes(dir.path()).unwrap();
 
@@ -884,16 +1012,27 @@ mod tests {
     #[test]
     fn call_edges_extracted_on_index() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("main.rs"), "fn helper() {}\nfn main() { helper(); }").unwrap();
+        fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() {}\nfn main() { helper(); }",
+        )
+        .unwrap();
         let db = db_in(dir.path());
         db.apply_changes(dir.path()).unwrap();
-        assert!(db.edge_count().unwrap() > 0, "expected call edges from indexed files");
+        assert!(
+            db.edge_count().unwrap() > 0,
+            "expected call edges from indexed files"
+        );
     }
 
     #[test]
     fn callers_of_query() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("main.rs"), "fn helper() {}\nfn main() { helper(); }").unwrap();
+        fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() {}\nfn main() { helper(); }",
+        )
+        .unwrap();
         let db = db_in(dir.path());
         db.apply_changes(dir.path()).unwrap();
         let callers = db.callers_of("helper").unwrap();
@@ -904,19 +1043,35 @@ mod tests {
     #[test]
     fn callees_of_query() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("main.rs"), "fn helper() {}\nfn main() { helper(); Vec::new(); }").unwrap();
+        fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() {}\nfn main() { helper(); Vec::new(); }",
+        )
+        .unwrap();
         let db = db_in(dir.path());
         db.apply_changes(dir.path()).unwrap();
         let callees = db.callees_of("main").unwrap();
         let names: Vec<&str> = callees.iter().map(|e| e.callee_name.as_str()).collect();
-        assert!(names.contains(&"helper"), "expected main to call helper, got: {:?}", names);
-        assert!(names.contains(&"new"), "expected main to call new, got: {:?}", names);
+        assert!(
+            names.contains(&"helper"),
+            "expected main to call helper, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"new"),
+            "expected main to call new, got: {:?}",
+            names
+        );
     }
 
     #[test]
     fn edges_deleted_with_file() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("main.rs"), "fn helper() {}\nfn main() { helper(); }").unwrap();
+        fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() {}\nfn main() { helper(); }",
+        )
+        .unwrap();
         let db = db_in(dir.path());
         db.apply_changes(dir.path()).unwrap();
         let initial = db.edge_count().unwrap();
@@ -929,7 +1084,11 @@ mod tests {
     #[test]
     fn rebuild_clears_and_reextracts_edges() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("main.rs"), "fn helper() {}\nfn main() { helper(); }").unwrap();
+        fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() {}\nfn main() { helper(); }",
+        )
+        .unwrap();
         let db = db_in(dir.path());
         db.apply_changes(dir.path()).unwrap();
         let count = db.edge_count().unwrap();
@@ -945,7 +1104,11 @@ mod tests {
         db.apply_changes(dir.path()).unwrap();
         let initial = db.edge_count().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
-        fs::write(dir.path().join("main.rs"), "fn main() { foo(); bar(); baz(); }").unwrap();
+        fs::write(
+            dir.path().join("main.rs"),
+            "fn main() { foo(); bar(); baz(); }",
+        )
+        .unwrap();
         db.apply_changes(dir.path()).unwrap();
         assert!(db.edge_count().unwrap() > initial);
     }
@@ -953,7 +1116,11 @@ mod tests {
     #[test]
     fn python_edges_extracted() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("app.py"), "def helper(): pass\ndef main(): helper()").unwrap();
+        fs::write(
+            dir.path().join("app.py"),
+            "def helper(): pass\ndef main(): helper()",
+        )
+        .unwrap();
         let db = db_in(dir.path());
         db.apply_changes(dir.path()).unwrap();
         let callers = db.callers_of("helper").unwrap();
@@ -984,7 +1151,10 @@ mod tests {
         assert_eq!(summary.new, 0);
         assert_eq!(summary.deleted, 0);
         let ps = summary.prune_stats.as_ref().unwrap();
-        assert!(ps.dirs_pruned > 0, "expected some dirs to be pruned on second run");
+        assert!(
+            ps.dirs_pruned > 0,
+            "expected some dirs to be pruned on second run"
+        );
     }
 
     #[test]
@@ -998,7 +1168,11 @@ mod tests {
 
         let summary = db.compute_changes_pruned(dir.path()).unwrap();
         assert_eq!(summary.new, 1);
-        let new_file = summary.changes.iter().find(|c| c.kind == ChangeKind::New).unwrap();
+        let new_file = summary
+            .changes
+            .iter()
+            .find(|c| c.kind == ChangeKind::New)
+            .unwrap();
         assert!(new_file.path.ends_with("extra.rs"));
     }
 
@@ -1015,7 +1189,10 @@ mod tests {
         assert_eq!(db.file_count().unwrap(), 2);
 
         let summary = db.compute_changes_pruned(root).unwrap();
-        assert_eq!(summary.deleted, 0, "pruned files should not appear as deleted");
+        assert_eq!(
+            summary.deleted, 0,
+            "pruned files should not appear as deleted"
+        );
         assert_eq!(summary.unchanged, 2);
     }
 
@@ -1026,7 +1203,10 @@ mod tests {
         db.apply_changes_pruned(dir.path()).unwrap();
 
         let dirs = db.load_dir_state().unwrap();
-        assert!(!dirs.is_empty(), "dir_state should be populated after pruned index");
+        assert!(
+            !dirs.is_empty(),
+            "dir_state should be populated after pruned index"
+        );
 
         db.rebuild(dir.path()).unwrap();
         let dirs = db.load_dir_state().unwrap();
@@ -1037,44 +1217,127 @@ mod tests {
     fn all_edges_returns_distinct_pairs() {
         let dir = tempfile::tempdir().unwrap();
         // main calls helper twice (two call sites) — all_edges should deduplicate
-        fs::write(dir.path().join("main.rs"), "fn helper() {}\nfn main() { helper(); helper(); }").unwrap();
+        fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() {}\nfn main() { helper(); helper(); }",
+        )
+        .unwrap();
         let db = db_in(dir.path());
         db.apply_changes(dir.path()).unwrap();
         let edges = db.all_edges().unwrap();
         assert!(!edges.is_empty());
-        let pairs: Vec<(&str, &str)> = edges.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let pairs: Vec<(&str, &str)> = edges
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
         assert!(pairs.contains(&("main", "helper")));
-        let count = pairs.iter().filter(|&&(a, b)| a == "main" && b == "helper").count();
+        let count = pairs
+            .iter()
+            .filter(|&&(a, b)| a == "main" && b == "helper")
+            .count();
         assert_eq!(count, 1, "all_edges should deduplicate parallel edges");
     }
 
     #[test]
     fn has_changes_true_when_new() {
-        let s = IndexSummary { total_tracked: 1, new: 1, modified: 0, deleted: 0, unchanged: 0, changes: vec![], prune_stats: None };
+        let s = IndexSummary {
+            total_tracked: 1,
+            new: 1,
+            modified: 0,
+            deleted: 0,
+            unchanged: 0,
+            changes: vec![],
+            prune_stats: None,
+        };
         assert!(s.has_changes());
     }
 
     #[test]
     fn has_changes_true_when_modified() {
-        let s = IndexSummary { total_tracked: 1, new: 0, modified: 1, deleted: 0, unchanged: 0, changes: vec![], prune_stats: None };
+        let s = IndexSummary {
+            total_tracked: 1,
+            new: 0,
+            modified: 1,
+            deleted: 0,
+            unchanged: 0,
+            changes: vec![],
+            prune_stats: None,
+        };
         assert!(s.has_changes());
     }
 
     #[test]
     fn has_changes_true_when_deleted() {
-        let s = IndexSummary { total_tracked: 0, new: 0, modified: 0, deleted: 1, unchanged: 0, changes: vec![], prune_stats: None };
+        let s = IndexSummary {
+            total_tracked: 0,
+            new: 0,
+            modified: 0,
+            deleted: 1,
+            unchanged: 0,
+            changes: vec![],
+            prune_stats: None,
+        };
         assert!(s.has_changes());
     }
 
     #[test]
     fn has_changes_false_when_unchanged() {
-        let s = IndexSummary { total_tracked: 3, new: 0, modified: 0, deleted: 0, unchanged: 3, changes: vec![], prune_stats: None };
+        let s = IndexSummary {
+            total_tracked: 3,
+            new: 0,
+            modified: 0,
+            deleted: 0,
+            unchanged: 3,
+            changes: vec![],
+            prune_stats: None,
+        };
         assert!(!s.has_changes());
     }
 
     #[test]
     fn has_changes_false_when_empty() {
-        let s = IndexSummary { total_tracked: 0, new: 0, modified: 0, deleted: 0, unchanged: 0, changes: vec![], prune_stats: None };
+        let s = IndexSummary {
+            total_tracked: 0,
+            new: 0,
+            modified: 0,
+            deleted: 0,
+            unchanged: 0,
+            changes: vec![],
+            prune_stats: None,
+        };
         assert!(!s.has_changes());
+    }
+
+    #[test]
+    fn open_configures_sqlite_for_concurrent_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+
+        let mode: String = db
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let timeout_ms: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(mode.to_lowercase(), "wal");
+        assert_eq!(timeout_ms, 5000);
+    }
+
+    #[test]
+    fn open_read_only_uses_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(".tsift/index.db");
+        let _ = IndexDb::open(&db_path).unwrap();
+
+        let db = IndexDb::open_read_only(&db_path).unwrap();
+        let timeout_ms: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(timeout_ms, 5000);
     }
 }

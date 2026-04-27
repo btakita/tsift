@@ -1575,7 +1575,7 @@ fn cmd_graph(
             db_path.display()
         );
     }
-    let db = index::IndexDb::open(&db_path)?;
+    let db = index::IndexDb::open_read_only(&db_path)?;
 
     let show_both = !callers && !callees;
 
@@ -1883,7 +1883,7 @@ fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::I
             db_path.display()
         );
     }
-    index::IndexDb::open(&db_path)
+    index::IndexDb::open_read_only(&db_path)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2673,7 +2673,7 @@ fn inspect_search_index(target: &SearchIndexTarget) -> Result<SearchIndexState> 
         return Ok(SearchIndexState::Missing);
     }
 
-    let db = index::IndexDb::open(&target.db_path)?;
+    let db = index::IndexDb::open_read_only(&target.db_path)?;
     let summary = db.compute_changes(&target.source_root)?;
     let stale_files = summary.new + summary.modified + summary.deleted;
     if stale_files == 0 {
@@ -2783,7 +2783,7 @@ fn cmd_search(
         let cfg = config::Config::load(&root)?;
         let db_path = cfg.db_path_for(&root, scope_name);
         let hits = if db_path.exists() {
-            let db = index::IndexDb::open(&db_path)?;
+            let db = index::IndexDb::open_read_only(&db_path)?;
             db.symbol_search(&query, limit)?
         } else {
             Vec::new()
@@ -2795,7 +2795,7 @@ fn cmd_search(
     } else {
         let db_path = root.join(".tsift/index.db");
         let hits = if db_path.exists() {
-            let db = index::IndexDb::open(&db_path)?;
+            let db = index::IndexDb::open_read_only(&db_path)?;
             db.symbol_search(&query, limit)?
         } else {
             Vec::new()
@@ -3844,6 +3844,39 @@ tier = "isolated"
         assert!(result.is_err());
     }
 
+    fn hold_write_lock(db_path: &std::path::Path) -> Connection {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        conn
+    }
+
+    #[test]
+    fn search_cmd_succeeds_while_writer_lock_is_held() {
+        let dir = setup_graph_index();
+        let db_path = dir.path().join(".tsift/index.db");
+        let _lock = hold_write_lock(&db_path);
+
+        let result = cmd_search(
+            "main".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            None,
+            false,
+            false,
+            false,
+            30,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+    }
+
     #[test]
     fn search_cmd_fails_fast_when_index_is_stale() {
         let dir = setup_graph_index();
@@ -3907,7 +3940,7 @@ tier = "isolated"
 
         assert!(result.is_ok());
 
-        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
         let summary = db.compute_changes(dir.path()).unwrap();
         assert_eq!(summary.new + summary.modified + summary.deleted, 0);
     }
@@ -3962,9 +3995,34 @@ tier = "isolated"
         assert!(result.is_ok());
 
         let cfg = config::Config::load(dir.path()).unwrap();
-        let db = index::IndexDb::open(&cfg.db_path_for(dir.path(), "alpha")).unwrap();
+        let db = index::IndexDb::open_read_only(&cfg.db_path_for(dir.path(), "alpha")).unwrap();
         let summary = db.compute_changes(&dir.path().join("src/alpha")).unwrap();
         assert_eq!(summary.new + summary.modified + summary.deleted, 0);
+    }
+
+    #[test]
+    fn graph_cmd_succeeds_while_writer_lock_is_held() {
+        let dir = setup_graph_index();
+        let db_path = dir.path().join(".tsift/index.db");
+        let _lock = hold_write_lock(&db_path);
+
+        let result = cmd_graph(
+            "main",
+            dir.path(),
+            false,
+            false,
+            None,
+            20,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
     }
 
     // --- search timeout ---
@@ -4973,7 +5031,7 @@ fn federated_symbol_search(
         if !db_path.exists() {
             continue;
         }
-        let db = index::IndexDb::open(&db_path)?;
+        let db = index::IndexDb::open_read_only(&db_path)?;
         let mut hits = db.symbol_search(query, limit)?;
         all_hits.append(&mut hits);
     }
