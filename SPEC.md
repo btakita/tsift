@@ -108,8 +108,8 @@ In JSON mode, `--quiet` also omits the `changes` array and uses compact (non-pre
 `tsift --compact` is a global flag for human-readable output. It keeps the underlying command behavior the same, but trims verbose formatting across commands:
 
 - `search` drops metadata banners, keeps one-line snippets, and reduces score precision
-- `explain` groups callers/callees by file instead of repeating the same path per edge
-- `communities` shows top members per cluster with `(+N more)` instead of full dumps
+- `explain` groups callers/callees by file instead of repeating the same path per edge; drops language annotation from symbol definitions (file extension already implies it)
+- `communities` shows top members per cluster with `(+N more)` instead of full dumps; drops per-community Q scores (overall Q retained in header)
 - `path`, `status`, `audit`, `summarize`, `lint`, `sql`, and `index` switch to denser summary-oriented layouts
 
 `--compact` does not change `--json` formatting. Use `--pretty` for indented JSON.

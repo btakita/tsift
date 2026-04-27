@@ -1091,10 +1091,9 @@ fn cmd_communities(
         } else {
             for (i, community) in filtered.iter().enumerate() {
                 println!(
-                    "  {}. {} members q:{:.4} {}",
+                    "  {}. {} members {}",
                     i + 1,
                     community.members.len(),
-                    community.modularity_contribution,
                     compact_members(&community.members, 5)
                 );
             }
@@ -1242,8 +1241,8 @@ fn cmd_explain(
         } else {
             for sym in &symbols {
                 println!(
-                    "symbol: {} ({}, {}) {}:{}",
-                    sym.name, sym.kind, sym.language, sym.file, sym.line
+                    "symbol: {} ({}) {}:{}",
+                    sym.name, sym.kind, sym.file, sym.line
                 );
             }
         }
