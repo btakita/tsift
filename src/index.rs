@@ -41,6 +41,12 @@ pub struct IndexSummary {
     pub prune_stats: Option<PruneStats>,
 }
 
+impl IndexSummary {
+    pub fn has_changes(&self) -> bool {
+        self.new > 0 || self.modified > 0 || self.deleted > 0
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StoredSymbol {
     pub name: String,
@@ -1040,5 +1046,35 @@ mod tests {
         assert!(pairs.contains(&("main", "helper")));
         let count = pairs.iter().filter(|&&(a, b)| a == "main" && b == "helper").count();
         assert_eq!(count, 1, "all_edges should deduplicate parallel edges");
+    }
+
+    #[test]
+    fn has_changes_true_when_new() {
+        let s = IndexSummary { total_tracked: 1, new: 1, modified: 0, deleted: 0, unchanged: 0, changes: vec![], prune_stats: None };
+        assert!(s.has_changes());
+    }
+
+    #[test]
+    fn has_changes_true_when_modified() {
+        let s = IndexSummary { total_tracked: 1, new: 0, modified: 1, deleted: 0, unchanged: 0, changes: vec![], prune_stats: None };
+        assert!(s.has_changes());
+    }
+
+    #[test]
+    fn has_changes_true_when_deleted() {
+        let s = IndexSummary { total_tracked: 0, new: 0, modified: 0, deleted: 1, unchanged: 0, changes: vec![], prune_stats: None };
+        assert!(s.has_changes());
+    }
+
+    #[test]
+    fn has_changes_false_when_unchanged() {
+        let s = IndexSummary { total_tracked: 3, new: 0, modified: 0, deleted: 0, unchanged: 3, changes: vec![], prune_stats: None };
+        assert!(!s.has_changes());
+    }
+
+    #[test]
+    fn has_changes_false_when_empty() {
+        let s = IndexSummary { total_tracked: 0, new: 0, modified: 0, deleted: 0, unchanged: 0, changes: vec![], prune_stats: None };
+        assert!(!s.has_changes());
     }
 }

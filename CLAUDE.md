@@ -8,7 +8,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 
 | Command | Purpose |
 |---------|---------|
-| `tsift index` | Build AST symbol index via tree-sitter. `--workspace` / `--submodule <name>` / `--prune` (dir mtime pruning for large repos) |
+| `tsift index` | Build AST symbol index via tree-sitter. `--workspace` / `--submodule <name>` / `--prune` / `--check` (dry-run) / `--exit-code` (exit 1 if stale, for hooks) |
 | `tsift search` | Hybrid BM25 + vector search via sift library. `--federated` / `--scope <name>` for workspace |
 | `tsift graph` | Call-graph queries: `--callers` / `--callees` of a symbol. `--scope <name>` / `--json` |
 | `tsift edit` | Batch file edits from JSON (stdin or `--file`), atomic validate-then-write |
@@ -66,7 +66,8 @@ cargo install --path .   # install to ~/.cargo/bin/
 
 ## Hook Integration
 
-`tsift rewrite` is wired as a Claude Code PreToolUse hook via `~/.claude/hooks/tsift-rewrite.sh`. Rewrites `rg`/`grep -r` commands to `tsift search --strategy lexical`.
+- **Auto-reindex** (`UserPromptSubmit`): `examples/hooks/tsift-autoindex.sh` runs `tsift index --check --exit-code .` on every prompt, auto-reindexes when stale. Install via `.claude/settings.json`.
+- **Search rewrite** (`PreToolUse`): `~/.claude/hooks/tsift-rewrite.sh` rewrites `rg`/`grep -r` to `tsift search --strategy lexical`.
 
 ## Repo
 

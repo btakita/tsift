@@ -62,6 +62,8 @@ federation = false
 
 ```bash
 tsift index --ast <path>        # tree-sitter AST extraction → symbols.db
+tsift index --check <path>      # report stale files without updating the index
+tsift index --check --exit-code # exit 1 if stale files found (for scripting/hooks)
 tsift index --prune <path>      # skip unchanged directory subtrees (large repo optimization)
 tsift graph <path>              # build dependency graph → deps.json
 tsift graph --callers <symbol>  # who calls this function?
@@ -71,6 +73,9 @@ tsift path <from> <to>          # BFS shortest path between symbols
 tsift explain <symbol>          # full symbol context: callers, callees, community
 tsift audit                     # scan installed skills, check health
 tsift audit --manifest <file>   # compare against expected skill list
+tsift summarize <symbol>        # cached LLM summary for a symbol
+tsift summarize --extract <path>  # batch LLM extraction (one-time)
+tsift summarize --extract --diff  # re-extract only git-changed files
 tsift search <query>            # gains AST-aware ranking when index exists
 tsift search --scope <submod>   # restrict to one submodule's index
 ```
@@ -364,9 +369,123 @@ Dynamic grammars use `tree_sitter::Language::from_path()`. The `Language` enum a
 7. ~~Add `tsift-graph` crate~~ → Internal `graph` module — call graph extraction + edge storage (done)
 8. Per-submodule config + isolation tiers
 
+## Summarize (Cached LLM Analysis)
+
+`tsift summarize` provides token-efficient access to pre-computed LLM analysis. Pay once for extraction, query free thereafter.
+
+```bash
+tsift summarize <symbol>            # show cached summary for a symbol
+tsift summarize --file <path>       # show cached summary for a file/module
+tsift summarize --extract <path>    # run LLM extraction on path (batch)
+tsift summarize --extract --diff    # re-extract only git-changed files
+tsift summarize --stats             # cache hit rate, staleness, token savings
+tsift summarize --json              # structured output
+```
+
+### Architecture
+
+```
+tsift summarize
+├── extract (one-time, per file content hash)
+│   ├── reads source + AST symbols from symbols.db
+│   ├── calls Anthropic batch API (haiku for cost)
+│   └── stores: entities, relationships, summaries → summaries.db
+├── query (instant, local SQLite)
+│   ├── by symbol name → summary + relationships + community context
+│   ├── by file path → module-level summary + exported entities
+│   └── by concept → cross-file entity matches
+└── invalidation
+    ├── cache key: blake3(file_content) + symbol_name
+    ├── --diff mode: only re-extracts files changed since last extraction
+    └── stale entries kept readable, marked for re-extraction
+```
+
+### Storage Schema (summaries.db)
+
+```sql
+CREATE TABLE summaries (
+    id INTEGER PRIMARY KEY,
+    symbol_name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,      -- blake3 of source file at extraction time
+    summary TEXT NOT NULL,           -- 1-3 sentence description
+    entities TEXT,                   -- JSON array of extracted entities
+    relationships TEXT,              -- JSON array of {from, to, kind}
+    concept_labels TEXT,             -- JSON array of domain concepts
+    extracted_at TEXT NOT NULL,      -- ISO timestamp
+    model TEXT NOT NULL,             -- model used for extraction
+    tokens_input INTEGER,           -- tokens consumed during extraction
+    tokens_output INTEGER
+);
+CREATE INDEX idx_summaries_symbol ON summaries(symbol_name);
+CREATE INDEX idx_summaries_file ON summaries(file_path);
+CREATE INDEX idx_summaries_hash ON summaries(content_hash);
+```
+
+### Extraction Protocol
+
+1. Collect target files (from path arg or `--diff` against `git diff --name-only`)
+2. For each file, load source + symbols from `symbols.db`
+3. Build extraction prompt: source snippet + symbol list + "extract entities, relationships, 2-sentence summary"
+4. Submit via Anthropic batch API (haiku-class model, 50% cost vs synchronous)
+5. On batch completion, parse responses and insert/update `summaries.db`
+6. Report: files processed, entities found, tokens spent, estimated savings
+
+### Token Savings Model
+
+Without summarize: reading a 500-line file costs ~2000 tokens per context load.
+With summarize: loading the cached summary costs ~50-100 tokens. Savings compound across repeated queries in a session.
+
+`--stats` reports: total extractions, cache hits vs misses, estimated tokens saved across sessions.
+
+### Boundary Rule
+
+`tsift summarize` owns cached, pre-computed analysis that's deterministic after extraction. It does NOT:
+- Run live LLM calls at query time (extraction is batch-only)
+- Generate new analysis on cache miss (returns "not extracted" + suggests `--extract`)
+- Own visualization or graph rendering (leave to graphify)
+
+### Configuration
+
+```toml
+# .tsift/config.toml
+[summarize]
+model = "claude-haiku-4-5-20251001"  # extraction model
+batch = true                          # use batch API (50% savings)
+max_file_tokens = 8000               # skip files larger than this
+api_key_env = "ANTHROPIC_API_KEY"    # env var for API key
+```
+
+## Hook Integration
+
+### Auto-Reindex (`UserPromptSubmit`)
+
+`tsift index --check --exit-code` enables scripted freshness checks. The `--exit-code` flag makes `--check` exit 1 when stale files exist (new, modified, or deleted since last index) and exit 0 when fresh. Without `--exit-code`, `--check` always exits 0.
+
+**Claude Code hook** (`.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "matcher": "", "command": "examples/hooks/tsift-autoindex.sh" }
+    ]
+  }
+}
+```
+
+The hook runs `tsift index --check --exit-code .` silently on every prompt. If the index is stale, it runs `tsift index .` to rebuild incrementally. When the index is fresh, the check completes in ~50ms with no side effects.
+
+For workspace mode, replace `. ` with `--workspace` in the hook.
+
+### Search Rewrite (`PreToolUse`)
+
+The existing `tsift-rewrite.sh` hook intercepts `rg`/`grep -r` Bash calls and silently rewrites them to `tsift search --strategy lexical`. See `~/.claude/hooks/tsift-rewrite.sh`.
+
 ## What NOT to build
 
 - Visualization (Mermaid, HTML) — leave to graphify
 - Full LSP-level type inference — diminishing returns
 - Embedding model hosting — use external API or lightweight local model (all-MiniLM-L6-v2)
 - Dynamic grammar loading (until binary size exceeds ~50MB)
+- Live LLM calls at query time in `tsift summarize` — extraction is batch-only

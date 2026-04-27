@@ -81,6 +81,9 @@ enum Commands {
         /// Report stale files without updating the index
         #[arg(long)]
         check: bool,
+        /// Exit with code 1 when --check finds stale files (for scripting/hooks)
+        #[arg(long)]
+        exit_code: bool,
         /// Skip unchanged directory subtrees (directory mtime pruning for large repos)
         #[arg(long)]
         prune: bool,
@@ -282,7 +285,7 @@ fn main() -> Result<()> {
             json,
         }) => cmd_search(query, path, limit, strategy, scope, federated, json),
         Some(Commands::Edit { dry_run, file }) => cmd_edit(dry_run, file),
-        Some(Commands::Index { path, rebuild, check, prune, workspace, submodule, json }) => cmd_index(&path, rebuild, check, prune, workspace, submodule.as_deref(), json),
+        Some(Commands::Index { path, rebuild, check, exit_code, prune, workspace, submodule, json }) => cmd_index(&path, rebuild, check, exit_code, prune, workspace, submodule.as_deref(), json),
         Some(Commands::Rewrite { command }) => cmd_rewrite(&command),
         Some(Commands::Route { task, id }) => cmd_route(&task, id),
         Some(Commands::Graph { symbol, path, callers, callees, scope, json }) => cmd_graph(&symbol, &path, callers, callees, scope.as_deref(), json),
@@ -435,7 +438,7 @@ fn cmd_edit(dry_run: bool, file: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, prune: bool, workspace: bool, submodule: Option<&str>, json_output: bool) -> Result<()> {
+fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, exit_code: bool, prune: bool, workspace: bool, submodule: Option<&str>, json_output: bool) -> Result<()> {
     let root = path.canonicalize()
         .with_context(|| format!("resolving path: {}", path.display()))?;
 
@@ -456,6 +459,7 @@ fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, prune: bool, wo
             bail!("no submodules found in {}", root.display());
         }
 
+        let mut any_stale = false;
         for (name, sub_path) in &targets {
             if !sub_path.exists() {
                 eprintln!("  skip {} (not found: {})", name, sub_path.display());
@@ -472,6 +476,9 @@ fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, prune: bool, wo
             } else {
                 db.apply_changes(sub_path)?
             };
+            if summary.has_changes() {
+                any_stale = true;
+            }
             let tier = cfg.tier_for(name);
             if json_output {
                 let entry = serde_json::json!({
@@ -490,6 +497,9 @@ fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, prune: bool, wo
                 }
                 println!();
             }
+        }
+        if exit_code && check && any_stale {
+            std::process::exit(1);
         }
         return Ok(());
     }
@@ -529,6 +539,9 @@ fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, prune: bool, wo
                 println!("  {} {} [{}]", marker, change.path.display(), lang);
             }
         }
+    }
+    if exit_code && check && summary.has_changes() {
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -1488,7 +1501,7 @@ mod tests {
     #[test]
     fn workspace_index_creates_per_submodule_dbs() {
         let dir = setup_workspace();
-        cmd_index(dir.path(), false, false, false, true, None, false).unwrap();
+        cmd_index(dir.path(), false, false, false, false, true, None, false).unwrap();
         assert!(dir.path().join(".tsift/indexes/alpha/index.db").exists());
         assert!(dir.path().join(".tsift/indexes/beta/index.db").exists());
     }
@@ -1496,7 +1509,7 @@ mod tests {
     #[test]
     fn workspace_index_single_submodule() {
         let dir = setup_workspace();
-        cmd_index(dir.path(), false, false, false, false, Some("alpha"), false).unwrap();
+        cmd_index(dir.path(), false, false, false, false, false, Some("alpha"), false).unwrap();
         assert!(dir.path().join(".tsift/indexes/alpha/index.db").exists());
         assert!(!dir.path().join(".tsift/indexes/beta/index.db").exists());
     }
@@ -1504,7 +1517,7 @@ mod tests {
     #[test]
     fn federated_search_across_submodules() {
         let dir = setup_workspace();
-        cmd_index(dir.path(), false, false, false, true, None, false).unwrap();
+        cmd_index(dir.path(), false, false, false, false, true, None, false).unwrap();
         let hits = federated_symbol_search(dir.path(), "alpha_helper", 10).unwrap();
         assert!(!hits.is_empty(), "should find alpha_helper via federated search");
     }
@@ -1518,7 +1531,7 @@ mod tests {
 [overrides.alpha]
 tier = "isolated"
 "#).unwrap();
-        cmd_index(dir.path(), false, false, false, true, None, false).unwrap();
+        cmd_index(dir.path(), false, false, false, false, true, None, false).unwrap();
         let hits = federated_symbol_search(dir.path(), "alpha_helper", 10).unwrap();
         assert!(hits.is_empty(), "isolated submodule should not appear in federated search");
     }
@@ -1526,7 +1539,7 @@ tier = "isolated"
     #[test]
     fn scoped_search_finds_submodule_symbols() {
         let dir = setup_workspace();
-        cmd_index(dir.path(), false, false, false, true, None, false).unwrap();
+        cmd_index(dir.path(), false, false, false, false, true, None, false).unwrap();
         let cfg = config::Config::load(dir.path()).unwrap();
         let db_path = cfg.db_path_for(dir.path(), "alpha");
         let db = index::IndexDb::open(&db_path).unwrap();
@@ -1538,7 +1551,7 @@ tier = "isolated"
     #[test]
     fn scoped_graph_query() {
         let dir = setup_workspace();
-        cmd_index(dir.path(), false, false, false, true, None, false).unwrap();
+        cmd_index(dir.path(), false, false, false, false, true, None, false).unwrap();
         let cfg = config::Config::load(dir.path()).unwrap();
         let db_path = cfg.db_path_for(dir.path(), "alpha");
         let db = index::IndexDb::open(&db_path).unwrap();
