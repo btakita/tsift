@@ -52,7 +52,7 @@ tsift graph <symbol> --scope sub  # restrict to submodule
 ## Development
 
 ```bash
-make check          # clippy + test (211 tests)
+make check          # clippy + test (222 tests)
 cargo install --path .   # install to ~/.cargo/bin/
 ```
 
