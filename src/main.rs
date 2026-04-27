@@ -46,6 +46,10 @@ struct Cli {
     #[arg(long, global = true)]
     tabular: bool,
 
+    /// Schema-then-values: headers once, rows as arrays (implies --json)
+    #[arg(long, global = true)]
+    schema: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -339,6 +343,7 @@ fn main() -> Result<()> {
     let terse = cli.terse;
     let absolute = cli.absolute;
     let tabular = cli.tabular;
+    let schema = cli.schema;
     match cli.command {
         Some(Commands::Search {
             query,
@@ -350,9 +355,9 @@ fn main() -> Result<()> {
             json,
             timeout,
         }) => cmd_search(
-            query, path, limit, strategy, scope, federated, json || terse, timeout, compact, pretty, terse, absolute, tabular,
+            query, path, limit, strategy, scope, federated, json || terse || schema, timeout, compact, pretty, terse, absolute, tabular, schema,
         ),
-        Some(Commands::Edit { dry_run, file }) => cmd_edit(dry_run, file, compact, pretty, terse),
+        Some(Commands::Edit { dry_run, file }) => cmd_edit(dry_run, file, compact, pretty, terse, schema),
         Some(Commands::Index {
             path,
             rebuild,
@@ -372,11 +377,12 @@ fn main() -> Result<()> {
             quiet,
             workspace,
             submodule.as_deref(),
-            json || terse,
+            json || terse || schema,
             compact,
             pretty,
             terse,
             absolute,
+            schema,
         ),
         Some(Commands::Rewrite { command }) => cmd_rewrite(&command),
         Some(Commands::Route { task, id }) => cmd_route(&task, id),
@@ -395,40 +401,41 @@ fn main() -> Result<()> {
             callees,
             scope.as_deref(),
             limit,
-            json || terse,
+            json || terse || schema,
             compact,
             pretty,
             terse,
             absolute,
             tabular,
+            schema,
         ),
         Some(Commands::Sql {
             db,
             query,
             table,
             json,
-        }) => cmd_sql(&db, query, table, json || terse, compact, pretty, terse),
+        }) => cmd_sql(&db, query, table, json || terse || schema, compact, pretty, terse, schema),
         Some(Commands::Communities {
             path,
             scope,
             min_size,
             limit,
             json,
-        }) => cmd_communities(&path, scope.as_deref(), min_size, limit, json || terse, compact, pretty, terse, tabular),
+        }) => cmd_communities(&path, scope.as_deref(), min_size, limit, json || terse || schema, compact, pretty, terse, tabular, schema),
         Some(Commands::Path {
             from,
             to,
             path,
             scope,
             json,
-        }) => cmd_path(&from, &to, &path, scope.as_deref(), json || terse, compact, pretty, terse),
+        }) => cmd_path(&from, &to, &path, scope.as_deref(), json || terse || schema, compact, pretty, terse, schema),
         Some(Commands::Explain {
             symbol,
             path,
             scope,
             limit,
             json,
-        }) => cmd_explain(&symbol, &path, scope.as_deref(), limit, json || terse, compact, pretty, terse, absolute, tabular),
+        }) => cmd_explain(&symbol, &path, scope.as_deref(), limit, json || terse || schema, compact, pretty, terse, absolute, tabular, schema),
         Some(Commands::Audit {
             skills_dir,
             manifest,
@@ -436,14 +443,14 @@ fn main() -> Result<()> {
             cleanup,
             report,
             json,
-        }) => cmd_audit(&skills_dir, manifest, usage, cleanup, report, json || terse, compact, pretty, terse),
+        }) => cmd_audit(&skills_dir, manifest, usage, cleanup, report, json || terse || schema, compact, pretty, terse, schema),
         Some(Commands::Init { path, codex }) => cmd_init(&path, codex),
         Some(Commands::Lint {
             file,
             index,
             entities_from,
             json,
-        }) => cmd_lint(&file, index, entities_from, json || terse, compact, pretty, terse),
+        }) => cmd_lint(&file, index, entities_from, json || terse || schema, compact, pretty, terse, schema),
         Some(Commands::Summarize {
             symbol,
             file,
@@ -452,8 +459,8 @@ fn main() -> Result<()> {
             stats,
             path,
             json,
-        }) => cmd_summarize(symbol, file, extract, diff, stats, &path, json || terse, compact, pretty, terse),
-        Some(Commands::Status { path, json }) => cmd_status(&path, json || terse, compact, pretty, terse),
+        }) => cmd_summarize(symbol, file, extract, diff, stats, &path, json || terse || schema, compact, pretty, terse, schema),
+        Some(Commands::Status { path, json }) => cmd_status(&path, json || terse || schema, compact, pretty, terse, schema),
         None => {
             println!("tsift v{}", env!("CARGO_PKG_VERSION"));
             println!("Run `tsift --help` for usage.");
@@ -518,16 +525,30 @@ fn cmd_route(task: &str, id_only: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn to_json<T: serde::Serialize>(val: &T, pretty: bool, terse: bool) -> anyhow::Result<String> {
-    if terse {
+    to_json_schema(val, pretty, terse, false)
+}
+
+fn to_json_schema<T: serde::Serialize>(val: &T, pretty: bool, terse: bool, schema: bool) -> anyhow::Result<String> {
+    if terse || schema {
         let value = serde_json::to_value(val)?;
-        let transformed = terse_transform(value);
-        let schema = terse_schema_for(&transformed);
-        let wrapped = serde_json::json!({"_s": schema, "d": transformed});
-        if pretty {
-            Ok(serde_json::to_string_pretty(&wrapped)?)
+        let mut transformed = if terse { terse_transform(value) } else { value };
+        if schema {
+            transformed = schema_transform(transformed);
+        }
+        if terse {
+            let terse_schema = terse_schema_for(&transformed);
+            let wrapped = serde_json::json!({"_s": terse_schema, "d": transformed});
+            if pretty {
+                Ok(serde_json::to_string_pretty(&wrapped)?)
+            } else {
+                Ok(serde_json::to_string(&wrapped)?)
+            }
+        } else if pretty {
+            Ok(serde_json::to_string_pretty(&transformed)?)
         } else {
-            Ok(serde_json::to_string(&wrapped)?)
+            Ok(serde_json::to_string(&transformed)?)
         }
     } else if pretty {
         Ok(serde_json::to_string_pretty(val)?)
@@ -696,6 +717,62 @@ fn collect_terse_keys(val: &serde_json::Value, keys: &mut HashSet<String>) {
         }
         _ => {}
     }
+}
+
+fn schema_transform(val: serde_json::Value) -> serde_json::Value {
+    match val {
+        serde_json::Value::Array(arr) if arr.len() >= 2 => {
+            if let Some(cols) = homogeneous_keys(&arr) {
+                let rows: Vec<serde_json::Value> = arr
+                    .into_iter()
+                    .map(|item| {
+                        if let serde_json::Value::Object(map) = item {
+                            let vals: Vec<serde_json::Value> = cols
+                                .iter()
+                                .map(|c| map.get(c).cloned().unwrap_or(serde_json::Value::Null))
+                                .collect();
+                            serde_json::Value::Array(vals)
+                        } else {
+                            item
+                        }
+                    })
+                    .collect();
+                let col_vals: Vec<serde_json::Value> =
+                    cols.into_iter().map(serde_json::Value::String).collect();
+                serde_json::json!({"_c": col_vals, "_r": rows})
+            } else {
+                serde_json::Value::Array(arr.into_iter().map(schema_transform).collect())
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(schema_transform).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let new_map: serde_json::Map<String, serde_json::Value> = map
+                .into_iter()
+                .map(|(k, v)| (k, schema_transform(v)))
+                .collect();
+            serde_json::Value::Object(new_map)
+        }
+        other => other,
+    }
+}
+
+fn homogeneous_keys(arr: &[serde_json::Value]) -> Option<Vec<String>> {
+    let first = arr.first()?.as_object()?;
+    let keys: Vec<String> = first.keys().cloned().collect();
+    for item in &arr[1..] {
+        let obj = item.as_object()?;
+        if obj.len() != keys.len() {
+            return None;
+        }
+        for k in &keys {
+            if !obj.contains_key(k) {
+                return None;
+            }
+        }
+    }
+    Some(keys)
 }
 
 const TERSE_PAIRS: &[(&str, &str)] = &[
@@ -913,7 +990,7 @@ pub(crate) fn apply_edit_op(content: &str, op: &EditOp) -> Result<(String, usize
     Ok((replaced, count))
 }
 
-fn cmd_edit(dry_run: bool, file: Option<PathBuf>, compact: bool, pretty: bool, terse: bool) -> Result<()> {
+fn cmd_edit(dry_run: bool, file: Option<PathBuf>, compact: bool, pretty: bool, terse: bool, schema: bool) -> Result<()> {
     let input = match file {
         Some(path) => fs::read_to_string(&path)
             .with_context(|| format!("reading edit file: {}", path.display()))?,
@@ -998,12 +1075,12 @@ fn cmd_edit(dry_run: bool, file: Option<PathBuf>, compact: bool, pretty: bool, t
     } else {
         println!(
             "{}",
-            to_json(&serde_json::json!({
+            to_json_schema(&serde_json::json!({
                 "applied": ok_count,
                 "skipped": skip_count,
                 "errors": err_count,
                 "results": results,
-            }), pretty, terse)?
+            }), pretty, terse, schema)?
         );
     }
 
@@ -1028,6 +1105,7 @@ fn cmd_index(
     pretty: bool,
     terse: bool,
     absolute: bool,
+    schema: bool,
 ) -> Result<()> {
     let quiet = quiet || exit_code;
     let root = path
@@ -1099,7 +1177,7 @@ fn cmd_index(
                     if quiet {
                         serde_json::to_string(&entry)?
                     } else {
-                        to_json(&entry, pretty, terse)?
+                        to_json_schema(&entry, pretty, terse, schema)?
                     }
                 );
             } else if compact {
@@ -1201,7 +1279,7 @@ fn cmd_index(
             });
             println!("{}", serde_json::to_string(&compact)?);
         } else {
-            println!("{}", to_json(&summary, pretty, terse)?);
+            println!("{}", to_json_schema(&summary, pretty, terse, schema)?);
         }
     } else if compact {
         let mode = if rebuild {
@@ -1283,6 +1361,7 @@ fn cmd_graph(
     terse: bool,
     absolute: bool,
     tabular: bool,
+    schema: bool,
 ) -> Result<()> {
     let root = path
         .canonicalize()
@@ -1320,7 +1399,7 @@ fn cmd_graph(
                     "total": total,
                     "truncated": truncated,
                 });
-                println!("{}", to_json(&out, pretty, terse)?);
+                println!("{}", to_json_schema(&out, pretty, terse, schema)?);
             }
         } else if tabular {
             println!("direction\tname\tfile\tline");
@@ -1383,7 +1462,7 @@ fn cmd_graph(
                     "total": total,
                     "truncated": truncated,
                 });
-                println!("{}", to_json(&out, pretty, terse)?);
+                println!("{}", to_json_schema(&out, pretty, terse, schema)?);
             }
         } else if tabular {
             if !show_both {
@@ -1454,7 +1533,7 @@ fn cmd_graph(
             "callees_total": callees_total,
             "callees_truncated": callees_truncated,
         });
-        println!("{}", to_json(&combined, pretty, terse)?);
+        println!("{}", to_json_schema(&combined, pretty, terse, schema)?);
     }
 
     Ok(())
@@ -1470,6 +1549,7 @@ fn cmd_communities(
     pretty: bool,
     terse: bool,
     tabular: bool,
+    schema: bool,
 ) -> Result<()> {
     let root = path
         .canonicalize()
@@ -1514,7 +1594,7 @@ fn cmd_communities(
             "communities": display,
             "truncated": truncated,
         });
-        println!("{}", to_json(&out, pretty, terse)?);
+        println!("{}", to_json_schema(&out, pretty, terse, schema)?);
     } else if tabular {
         println!("id\tsize\tmembers");
         for (i, community) in display.iter().enumerate() {
@@ -1607,13 +1687,14 @@ fn cmd_path(
     compact: bool,
     pretty: bool,
     terse: bool,
+    schema: bool,
 ) -> Result<()> {
     let db = open_index_db(path, scope)?;
     let edges = db.all_edges()?;
     match graph::shortest_path(&edges, from, to) {
         Some(result) => {
             if json_output {
-                println!("{}", to_json(&result, pretty, terse)?);
+                println!("{}", to_json_schema(&result, pretty, terse, schema)?);
             } else if compact {
                 println!(
                     "{} ({} hop{})",
@@ -1642,12 +1723,12 @@ fn cmd_path(
             if json_output {
                 println!(
                     "{}",
-                    to_json(&serde_json::json!({
+                    to_json_schema(&serde_json::json!({
                         "from": from,
                         "to": to,
                         "path": null,
                         "hops": null,
-                    }), pretty, terse)?
+                    }), pretty, terse, schema)?
                 );
             } else if compact {
                 println!("no path {} -> {}", from, to);
@@ -1670,6 +1751,7 @@ fn cmd_explain(
     terse: bool,
     absolute: bool,
     tabular: bool,
+    schema: bool,
 ) -> Result<()> {
     let root = path
         .canonicalize()
@@ -1715,7 +1797,7 @@ fn cmd_explain(
             "callees_truncated": callees_truncated,
             "community": community,
         });
-        println!("{}", to_json(&out, pretty, terse)?);
+        println!("{}", to_json_schema(&out, pretty, terse, schema)?);
     } else if tabular {
         if !symbols.is_empty() {
             println!("section\tkind\tname\tfile\tline");
@@ -1854,6 +1936,7 @@ fn cmd_audit(
     compact: bool,
     pretty: bool,
     terse: bool,
+    schema: bool,
 ) -> Result<()> {
     let expanded = if let Some(rest) = skills_dir.strip_prefix("~/") {
         let home = std::env::var("HOME").context("HOME not set")?;
@@ -1882,7 +1965,7 @@ fn cmd_audit(
     }
 
     if json_output {
-        println!("{}", to_json(&result, pretty, terse)?);
+        println!("{}", to_json_schema(&result, pretty, terse, schema)?);
     } else if compact {
         println!(
             "skills:{} healthy:{} broken:{}",
@@ -1991,6 +2074,7 @@ fn cmd_summarize(
     compact: bool,
     pretty: bool,
     terse: bool,
+    schema: bool,
 ) -> Result<()> {
     let root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let db_path = root.join(".tsift/summaries.db");
@@ -2073,7 +2157,7 @@ fn cmd_summarize(
         }
 
         if json_output {
-            println!("{}", to_json(&report, pretty, terse)?);
+            println!("{}", to_json_schema(&report, pretty, terse, schema)?);
         } else if compact {
             println!(
                 "extract files:{} symbols:{} tokens_in:{} tokens_out:{} errors:{}",
@@ -2103,7 +2187,7 @@ fn cmd_summarize(
         let summary_db = summarize::SummaryDb::open(&db_path)?;
         let s = summary_db.stats()?;
         if json_output {
-            println!("{}", to_json(&s, pretty, terse)?);
+            println!("{}", to_json_schema(&s, pretty, terse, schema)?);
         } else if compact {
             println!(
                 "summaries:{} files:{} in:{} out:{} saved:{}",
@@ -2138,7 +2222,7 @@ fn cmd_summarize(
             return Ok(());
         }
         if json_output {
-            println!("{}", to_json(&results, pretty, terse)?);
+            println!("{}", to_json_schema(&results, pretty, terse, schema)?);
         } else if compact {
             for summary in &results {
                 println!(
@@ -2168,7 +2252,7 @@ fn cmd_summarize(
             return Ok(());
         }
         if json_output {
-            println!("{}", to_json(&results, pretty, terse)?);
+            println!("{}", to_json_schema(&results, pretty, terse, schema)?);
         } else if compact {
             for summary in &results {
                 println!(
@@ -2211,13 +2295,13 @@ fn cmd_summarize(
     bail!("specify a symbol, --file, --extract, or --stats");
 }
 
-fn cmd_status(path: &std::path::Path, json_output: bool, compact: bool, pretty: bool, terse: bool) -> Result<()> {
+fn cmd_status(path: &std::path::Path, json_output: bool, compact: bool, pretty: bool, terse: bool, schema: bool) -> Result<()> {
     let root = path
         .canonicalize()
         .with_context(|| format!("resolving path: {}", path.display()))?;
     let report = status::check_status(&root)?;
     if json_output {
-        println!("{}", to_json(&report, pretty, terse)?);
+        println!("{}", to_json_schema(&report, pretty, terse, schema)?);
     } else {
         print!("{}", status::format_human(&report, compact));
     }
@@ -2287,6 +2371,7 @@ fn cmd_search(
     terse: bool,
     absolute: bool,
     tabular: bool,
+    schema: bool,
 ) -> Result<()> {
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
 
@@ -2352,7 +2437,7 @@ fn cmd_search(
             symbols: &symbol_hits,
             sift: &sift_value,
         };
-        println!("{}", to_json(&combined, pretty, terse)?);
+        println!("{}", to_json_schema(&combined, pretty, terse, schema)?);
     } else if tabular {
         if !symbol_hits.is_empty() {
             println!("match_type\tkind\tname\tfile\tline\tscore");
@@ -2550,6 +2635,7 @@ fn cmd_lint(
     compact: bool,
     pretty: bool,
     terse: bool,
+    schema: bool,
 ) -> Result<()> {
     use std::collections::HashSet;
 
@@ -2587,7 +2673,7 @@ fn cmd_lint(
     let result = lint::lint_markdown(file_path, &entities)?;
 
     if json_output {
-        println!("{}", to_json(&result, pretty, terse)?);
+        println!("{}", to_json_schema(&result, pretty, terse, schema)?);
     } else if compact {
         if result.annotations.is_empty() {
             println!("ok {}", file);
@@ -2957,7 +3043,7 @@ mod tests {
     #[test]
     fn graph_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_graph("main", dir.path(), false, false, None, 20, false, false, false, false, false, false);
+        let result = cmd_graph("main", dir.path(), false, false, None, 20, false, false, false, false, false, false, false);
         assert!(result.is_err());
     }
 
@@ -3080,6 +3166,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .unwrap();
         assert!(dir.path().join(".tsift/indexes/alpha/index.db").exists());
@@ -3103,6 +3190,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .unwrap();
         assert!(dir.path().join(".tsift/indexes/alpha/index.db").exists());
@@ -3121,6 +3209,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
             false,
             false,
@@ -3162,6 +3251,7 @@ tier = "isolated"
             false,
             false,
             false,
+            false,
         )
         .unwrap();
         let hits = federated_symbol_search(dir.path(), "alpha_helper", 10).unwrap();
@@ -3183,6 +3273,7 @@ tier = "isolated"
             false,
             true,
             None,
+            false,
             false,
             false,
             false,
@@ -3215,6 +3306,7 @@ tier = "isolated"
             false,
             false,
             false,
+            false,
         )
         .unwrap();
         let cfg = config::Config::load(dir.path()).unwrap();
@@ -3240,7 +3332,7 @@ tier = "isolated"
     #[test]
     fn community_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_communities(dir.path(), None, 2, 10, false, false, false, false, false);
+        let result = cmd_communities(dir.path(), None, 2, 10, false, false, false, false, false, false);
         assert!(result.is_err());
     }
 
@@ -3268,7 +3360,7 @@ tier = "isolated"
     #[test]
     fn path_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_path("a", "b", dir.path(), None, false, false, false, false);
+        let result = cmd_path("a", "b", dir.path(), None, false, false, false, false, false);
         assert!(result.is_err());
     }
 
@@ -3287,7 +3379,7 @@ tier = "isolated"
     #[test]
     fn explain_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_explain("main", dir.path(), None, 15, false, false, false, false, false, false);
+        let result = cmd_explain("main", dir.path(), None, 15, false, false, false, false, false, false, false);
         assert!(result.is_err());
     }
 
@@ -3353,6 +3445,7 @@ tier = "isolated"
             false,
             false,
             false,
+            false,
         );
         assert!(result.is_ok());
     }
@@ -3369,6 +3462,7 @@ tier = "isolated"
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -3391,6 +3485,7 @@ tier = "isolated"
             false,
             None,
             true,
+            false,
             false,
             false,
             false,
@@ -3466,6 +3561,73 @@ tier = "isolated"
         let d = &parsed["d"];
         assert_eq!(d["custom_field"], "value");
         assert_eq!(d["n"], "test");
+    }
+
+    // --- schema-then-values ---
+
+    #[test]
+    fn schema_converts_homogeneous_arrays() {
+        let val = serde_json::json!({"symbols": [
+            {"name": "foo", "kind": "fn", "line": 10},
+            {"name": "bar", "kind": "fn", "line": 20}
+        ]});
+        let result = to_json_schema(&val, false, false, true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let syms = &parsed["symbols"];
+        // serde_json uses BTreeMap — keys sorted alphabetically
+        assert_eq!(syms["_c"], serde_json::json!(["kind", "line", "name"]));
+        assert_eq!(syms["_r"][0], serde_json::json!(["fn", 10, "foo"]));
+        assert_eq!(syms["_r"][1], serde_json::json!(["fn", 20, "bar"]));
+    }
+
+    #[test]
+    fn schema_skips_short_arrays() {
+        let val = serde_json::json!({"items": [{"name": "only"}]});
+        let result = to_json_schema(&val, false, false, true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["items"].is_array());
+        assert_eq!(parsed["items"][0]["name"], "only");
+    }
+
+    #[test]
+    fn schema_skips_heterogeneous_arrays() {
+        let val = serde_json::json!({"items": [{"a": 1}, {"b": 2}]});
+        let result = to_json_schema(&val, false, false, true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["items"].is_array());
+        assert_eq!(parsed["items"][0]["a"], 1);
+    }
+
+    #[test]
+    fn schema_with_terse_combines() {
+        let val = serde_json::json!({"callers": [
+            {"caller_name": "a", "caller_file": "x.rs"},
+            {"caller_name": "b", "caller_file": "y.rs"}
+        ]});
+        let result = to_json_schema(&val, false, true, true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["_s"].is_object());
+        let d = &parsed["d"];
+        let crs = &d["crs"];
+        assert!(crs["_c"].is_array());
+        assert!(crs["_r"].is_array());
+        // terse: caller_file→cf, caller_name→cn; BTreeMap sorts: cf < cn
+        assert_eq!(crs["_r"][0], serde_json::json!(["x.rs", "a"]));
+    }
+
+    #[test]
+    fn schema_preserves_non_object_arrays() {
+        let val = serde_json::json!({"tags": ["a", "b", "c"]});
+        let result = to_json_schema(&val, false, false, true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["tags"], serde_json::json!(["a", "b", "c"]));
+    }
+
+    #[test]
+    fn cli_accepts_global_schema_flag() {
+        let cli = Cli::parse_from(["tsift", "--schema", "search", "test"]);
+        assert!(cli.schema);
+        assert!(matches!(cli.command, Some(Commands::Search { .. })));
     }
 
     // --- relativize paths ---
@@ -3628,35 +3790,35 @@ tier = "isolated"
     #[test]
     fn graph_cmd_limit_runs_ok() {
         let dir = setup_graph_index();
-        let result = cmd_graph("main", dir.path(), false, false, None, 1, false, false, false, false, false, false);
+        let result = cmd_graph("main", dir.path(), false, false, None, 1, false, false, false, false, false, false, false);
         assert!(result.is_ok());
     }
 
     #[test]
     fn graph_cmd_unlimited_runs_ok() {
         let dir = setup_graph_index();
-        let result = cmd_graph("main", dir.path(), false, false, None, 0, false, false, false, false, false, false);
+        let result = cmd_graph("main", dir.path(), false, false, None, 0, false, false, false, false, false, false, false);
         assert!(result.is_ok());
     }
 
     #[test]
     fn graph_cmd_tabular_runs_ok() {
         let dir = setup_graph_index();
-        let result = cmd_graph("main", dir.path(), false, false, None, 20, false, false, false, false, false, true);
+        let result = cmd_graph("main", dir.path(), false, false, None, 20, false, false, false, false, false, true, false);
         assert!(result.is_ok());
     }
 
     #[test]
     fn communities_cmd_tabular_runs_ok() {
         let dir = setup_graph_index();
-        let result = cmd_communities(dir.path(), None, 1, 10, false, false, false, false, true);
+        let result = cmd_communities(dir.path(), None, 1, 10, false, false, false, false, true, false);
         assert!(result.is_ok());
     }
 
     #[test]
     fn explain_cmd_tabular_runs_ok() {
         let dir = setup_graph_index();
-        let result = cmd_explain("main", dir.path(), None, 15, false, false, false, false, false, true);
+        let result = cmd_explain("main", dir.path(), None, 15, false, false, false, false, false, true, false);
         assert!(result.is_ok());
     }
 }
@@ -3773,6 +3935,7 @@ fn cmd_sql(
     compact: bool,
     pretty: bool,
     terse: bool,
+    schema: bool,
 ) -> Result<()> {
     let conn = open_db(db_path)?;
 
@@ -3791,7 +3954,7 @@ fn cmd_sql(
                         serde_json::Value::Object(obj)
                     })
                     .collect();
-                println!("{}", to_json(&json_rows, pretty, terse)?);
+                println!("{}", to_json_schema(&json_rows, pretty, terse, schema)?);
             } else if compact {
                 println!("rows:{} cols:{}", rows.len(), columns.len());
                 for row in &rows {
@@ -3841,7 +4004,7 @@ fn cmd_sql(
                 bail!("table '{}' not found or has no columns", tbl);
             }
             if json_output {
-                println!("{}", to_json(&cols, pretty, terse)?);
+                println!("{}", to_json_schema(&cols, pretty, terse, schema)?);
             } else if compact {
                 println!("table:{} columns:{}", tbl, cols.len());
                 for col in &cols {
@@ -3865,7 +4028,7 @@ fn cmd_sql(
         (None, None) => {
             let tables = schema_overview(&conn)?;
             if json_output {
-                println!("{}", to_json(&tables, pretty, terse)?);
+                println!("{}", to_json_schema(&tables, pretty, terse, schema)?);
             } else if compact {
                 println!("tables:{}", tables.len());
                 for tbl in &tables {

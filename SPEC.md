@@ -208,6 +208,35 @@ tsift --tabular communities --limit 5      # one TSV table: id size members
 tsift --tabular explain main               # definition + edges + community
 ```
 
+## Schema-Then-Values Mode
+
+`tsift --schema` is a global flag that converts arrays of same-structured objects into a columnar format: column names once, then rows as value arrays. Implies `--json`.
+
+Output format: for an array of objects with keys `[k1, k2, k3]`, produces `{"_c": [k1, k2, k3], "_r": [[v1, v2, v3], ...]}`.
+
+**Rules:**
+- Arrays of 2+ objects with identical key sets are converted
+- Arrays with 1 element, heterogeneous keys, or non-object elements pass through unchanged
+- Applied recursively to nested objects
+- Combines with `--terse`: abbreviated field names in `_c`, plus `_s` schema mapping
+- Combines with `--pretty` for indented output
+
+```bash
+tsift --schema search "main"               # schema-then-values JSON
+tsift --schema --terse search "main"       # abbreviated keys + columnar
+tsift --schema --pretty explain main       # indented columnar JSON
+```
+
+**Example output (`--schema`):**
+```json
+{"symbols":{"_c":["kind","line","name"],"_r":[["fn",10,"main"],["fn",20,"helper"]]}}
+```
+
+**Example output (`--schema --terse`):**
+```json
+{"_s":{"k":"kind","l":"line","n":"name"},"d":{"sy":{"_c":["k","l","n"],"_r":[["fn",10,"main"],["fn",20,"helper"]]}}}
+```
+
 ## Relative Paths (Default)
 
 All file paths in output are project-relative by default. The project root is detected via `path.canonicalize()` in each command. Relative paths are shorter and save tokens — tsift's core mission.
