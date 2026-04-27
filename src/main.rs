@@ -13,6 +13,7 @@ pub mod config;
 pub mod graph;
 pub mod index;
 mod lang;
+pub mod summarize;
 pub mod walk;
 
 #[derive(Parser)]
@@ -207,6 +208,29 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Cached LLM analysis — pre-computed summaries, entities, relationships
+    Summarize {
+        /// Symbol name to look up
+        symbol: Option<String>,
+        /// Show cached summary for a file/module
+        #[arg(long)]
+        file: Option<String>,
+        /// Run LLM extraction on the given path
+        #[arg(long)]
+        extract: Option<PathBuf>,
+        /// Only re-extract git-changed files (use with --extract)
+        #[arg(long)]
+        diff: bool,
+        /// Show cache statistics
+        #[arg(long)]
+        stats: bool,
+        /// Path to the indexed codebase (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Deserialize)]
@@ -268,6 +292,7 @@ fn main() -> Result<()> {
         Some(Commands::Explain { symbol, path, scope, json }) => cmd_explain(&symbol, &path, scope.as_deref(), json),
         Some(Commands::Audit { skills_dir, manifest, usage, cleanup, report, json }) => cmd_audit(&skills_dir, manifest, usage, cleanup, report, json),
         Some(Commands::Lint { file, index, entities_from, json }) => cmd_lint(&file, index, entities_from, json),
+        Some(Commands::Summarize { symbol, file, extract, diff, stats, path, json }) => cmd_summarize(symbol, file, extract, diff, stats, &path, json),
         None => {
             println!("tsift v{}", env!("CARGO_PKG_VERSION"));
             println!("Run `tsift --help` for usage.");
@@ -829,6 +854,260 @@ fn cmd_audit(skills_dir: &str, manifest: Option<PathBuf>, usage: bool, cleanup: 
         }
     }
     Ok(())
+}
+
+fn cmd_summarize(
+    symbol: Option<String>,
+    file: Option<String>,
+    extract: Option<PathBuf>,
+    diff: bool,
+    stats: bool,
+    path: &std::path::Path,
+    json_output: bool,
+) -> Result<()> {
+    let root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let db_path = root.join(".tsift/summaries.db");
+
+    // --extract mode: run LLM extraction
+    if let Some(extract_path) = extract {
+        let cfg = load_summarize_config(&root);
+        let symbols_db = find_symbols_db(&root);
+        let summary_db = summarize::SummaryDb::open(&db_path)?;
+
+        let files_to_extract = if diff {
+            let changed = summarize::git_changed_files(&root)?;
+            changed.into_iter()
+                .filter(|f| f.starts_with(&extract_path) || extract_path.starts_with(f.parent().unwrap_or(f)))
+                .collect::<Vec<_>>()
+        } else {
+            collect_source_files(&extract_path)?
+        };
+
+        if files_to_extract.is_empty() {
+            println!("No files to extract.");
+            return Ok(());
+        }
+
+        let mut report = summarize::ExtractionReport {
+            files_processed: 0,
+            symbols_extracted: 0,
+            tokens_input: 0,
+            tokens_output: 0,
+            errors: Vec::new(),
+        };
+
+        for file_path in &files_to_extract {
+            let content = match std::fs::read(file_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    report.errors.push(format!("{}: {}", file_path.display(), e));
+                    continue;
+                }
+            };
+            let hash = summarize::content_hash(&content);
+            let rel_path = file_path.strip_prefix(&root).unwrap_or(file_path).to_string_lossy().to_string();
+
+            if summary_db.is_current(&rel_path, &hash)? {
+                continue; // already extracted for this version
+            }
+
+            match summarize::extract_for_file(file_path, symbols_db.as_deref(), &cfg) {
+                Ok(summaries) => {
+                    summary_db.delete_by_file(&rel_path)?;
+                    for mut s in summaries {
+                        s.file_path = rel_path.clone();
+                        report.symbols_extracted += 1;
+                        report.tokens_input += s.tokens_input.unwrap_or(0);
+                        report.tokens_output += s.tokens_output.unwrap_or(0);
+                        summary_db.insert(&s)?;
+                    }
+                    report.files_processed += 1;
+                    if !json_output {
+                        println!("  extracted: {}", rel_path);
+                    }
+                }
+                Err(e) => {
+                    report.errors.push(format!("{}: {}", rel_path, e));
+                    if !json_output {
+                        eprintln!("  error: {}: {}", rel_path, e);
+                    }
+                }
+            }
+        }
+
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!("\nExtraction complete:");
+            println!("  files: {}", report.files_processed);
+            println!("  symbols: {}", report.symbols_extracted);
+            println!("  tokens: {} in / {} out", report.tokens_input, report.tokens_output);
+            if !report.errors.is_empty() {
+                println!("  errors: {}", report.errors.len());
+            }
+        }
+        return Ok(());
+    }
+
+    // --stats mode
+    if stats {
+        let summary_db = summarize::SummaryDb::open(&db_path)?;
+        let s = summary_db.stats()?;
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&s)?);
+        } else {
+            println!("Summary cache statistics:");
+            println!("  summaries:       {}", s.total_summaries);
+            println!("  files:           {}", s.total_files);
+            println!("  tokens input:    {}", s.total_tokens_input);
+            println!("  tokens output:   {}", s.total_tokens_output);
+            println!("  est. savings:    {} tokens", s.estimated_tokens_saved);
+        }
+        return Ok(());
+    }
+
+    // Query mode: --file or positional symbol
+    if !db_path.exists() {
+        bail!("no summaries.db found — run `tsift summarize --extract <path>` first");
+    }
+    let summary_db = summarize::SummaryDb::open(&db_path)?;
+
+    if let Some(file_query) = file {
+        let results = summary_db.get_by_file(&file_query)?;
+        if results.is_empty() {
+            println!("No cached summary for file: {}", file_query);
+            println!("Run: tsift summarize --extract <path>");
+            return Ok(());
+        }
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        } else {
+            for s in &results {
+                println!("[{}] {}", s.symbol_name, s.summary);
+                if let Some(ref labels) = s.concept_labels {
+                    if !labels.is_empty() {
+                        println!("  concepts: {}", labels.join(", "));
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(sym) = symbol {
+        let results = summary_db.get_by_symbol(&sym)?;
+        if results.is_empty() {
+            println!("No cached summary for symbol: {}", sym);
+            println!("Run: tsift summarize --extract <path>");
+            return Ok(());
+        }
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&results)?);
+        } else {
+            for s in &results {
+                println!("{} ({})", s.symbol_name, s.file_path);
+                println!("  {}", s.summary);
+                if let Some(ref entities) = s.entities {
+                    if !entities.is_empty() {
+                        println!("  entities:");
+                        for e in entities {
+                            println!("    {} ({}): {}", e.name, e.kind, e.description);
+                        }
+                    }
+                }
+                if let Some(ref rels) = s.relationships {
+                    if !rels.is_empty() {
+                        println!("  relationships:");
+                        for r in rels {
+                            println!("    {} --{}-> {}", r.from, r.kind, r.to);
+                        }
+                    }
+                }
+                if let Some(ref labels) = s.concept_labels {
+                    if !labels.is_empty() {
+                        println!("  concepts: {}", labels.join(", "));
+                    }
+                }
+                println!();
+            }
+        }
+        return Ok(());
+    }
+
+    bail!("specify a symbol, --file, --extract, or --stats");
+}
+
+fn load_summarize_config(root: &std::path::Path) -> summarize::SummarizeConfig {
+    let config_path = root.join(".tsift/config.toml");
+    if !config_path.exists() {
+        return summarize::SummarizeConfig::default();
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct RawConfig {
+        #[serde(default)]
+        summarize: Option<RawSummarize>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RawSummarize {
+        model: Option<String>,
+        max_file_tokens: Option<usize>,
+        api_key_env: Option<String>,
+    }
+    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let raw: RawConfig = toml::from_str(&content).unwrap_or_default();
+    let defaults = summarize::SummarizeConfig::default();
+    match raw.summarize {
+        Some(s) => summarize::SummarizeConfig {
+            model: s.model.unwrap_or(defaults.model),
+            max_file_tokens: s.max_file_tokens.unwrap_or(defaults.max_file_tokens),
+            api_key_env: s.api_key_env.unwrap_or(defaults.api_key_env),
+        },
+        None => defaults,
+    }
+}
+
+fn find_symbols_db(root: &std::path::Path) -> Option<PathBuf> {
+    let single = root.join(".tsift/index.db");
+    if single.exists() {
+        return Some(single);
+    }
+    let indexes = root.join(".tsift/indexes");
+    if indexes.exists() {
+        if let Ok(entries) = std::fs::read_dir(&indexes) {
+            for entry in entries.flatten() {
+                let db = entry.path().join("index.db");
+                if db.exists() {
+                    return Some(db);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if path.is_file() {
+        files.push(path.to_path_buf());
+        return Ok(files);
+    }
+    let walker = ignore::WalkBuilder::new(path)
+        .hidden(true)
+        .git_ignore(true)
+        .build();
+    for entry in walker {
+        let entry = entry?;
+        if entry.file_type().is_some_and(|ft| ft.is_file()) {
+            let p = entry.path();
+            if let Some(ext) = p.extension() {
+                let ext = ext.to_string_lossy();
+                if matches!(ext.as_ref(), "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "kt" | "kts" | "zig" | "sh" | "bash" | "zsh") {
+                    files.push(p.to_path_buf());
+                }
+            }
+        }
+    }
+    Ok(files)
 }
 
 fn cmd_lint(file: &str, index: Option<PathBuf>, entities_from: Vec<PathBuf>, json_output: bool) -> Result<()> {

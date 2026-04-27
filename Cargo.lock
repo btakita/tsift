@@ -3175,6 +3175,7 @@ name = "tsift"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "ignore",
  "rusqlite",
@@ -3193,6 +3194,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "tree-sitter-zig",
+ "ureq",
 ]
 
 [[package]]

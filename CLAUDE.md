@@ -19,6 +19,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift path` | BFS shortest path between two symbols. `--scope <name>` / `--json` |
 | `tsift explain` | Full symbol context: definitions, callers, callees, community. `--scope <name>` / `--json` |
 | `tsift audit` | Skill drift detection: scan installed skills, check health, compare against manifest, detect duplicates via Jaccard similarity. `--manifest <file>` / `--usage` / `--cleanup` / `--report <path>` / `--json` |
+| `tsift summarize` | Cached LLM analysis: pre-computed summaries, entities, relationships. `--extract <path>` / `--extract --diff` / `--file <path>` / `--stats` / `--json` |
 | `tsift lint` | Markdown lint: detect unannotated concepts (symbols, headings, bold terms) cross-referenced against graph entities. `--index <dir>` / `--entities-from <file>` / `--json` |
 
 ## Graph Module (`src/graph.rs`)
@@ -51,7 +52,7 @@ tsift graph <symbol> --scope sub  # restrict to submodule
 ## Development
 
 ```bash
-make check          # clippy + test (197 tests)
+make check          # clippy + test (211 tests)
 cargo install --path .   # install to ~/.cargo/bin/
 ```
 

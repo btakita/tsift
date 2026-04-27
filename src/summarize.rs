@@ -1,0 +1,660 @@
+use anyhow::{Context, Result, bail};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+pub struct SummaryDb {
+    conn: Connection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Summary {
+    pub id: i64,
+    pub symbol_name: String,
+    pub file_path: String,
+    pub content_hash: String,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entities: Option<Vec<Entity>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationships: Option<Vec<Relationship>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concept_labels: Option<Vec<String>>,
+    pub extracted_at: String,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_input: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_output: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Entity {
+    pub name: String,
+    pub kind: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Relationship {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SummaryStats {
+    pub total_summaries: usize,
+    pub total_files: usize,
+    pub stale_count: usize,
+    pub total_tokens_input: i64,
+    pub total_tokens_output: i64,
+    pub estimated_tokens_saved: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtractionResponse {
+    summary: String,
+    #[serde(default)]
+    entities: Vec<Entity>,
+    #[serde(default)]
+    relationships: Vec<Relationship>,
+    #[serde(default)]
+    concept_labels: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExtractionReport {
+    pub files_processed: usize,
+    pub symbols_extracted: usize,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SummarizeConfig {
+    pub model: String,
+    pub max_file_tokens: usize,
+    pub api_key_env: String,
+}
+
+impl Default for SummarizeConfig {
+    fn default() -> Self {
+        Self {
+            model: "claude-haiku-4-5-20251001".to_string(),
+            max_file_tokens: 8000,
+            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+        }
+    }
+}
+
+impl SummaryDb {
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating directory for {}", path.display()))?;
+        }
+        let conn = Connection::open(path)
+            .with_context(|| format!("opening summaries db: {}", path.display()))?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS summaries (
+                id INTEGER PRIMARY KEY,
+                symbol_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                entities TEXT,
+                relationships TEXT,
+                concept_labels TEXT,
+                extracted_at TEXT NOT NULL,
+                model TEXT NOT NULL,
+                tokens_input INTEGER,
+                tokens_output INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_summaries_symbol ON summaries(symbol_name);
+            CREATE INDEX IF NOT EXISTS idx_summaries_file ON summaries(file_path);
+            CREATE INDEX IF NOT EXISTS idx_summaries_hash ON summaries(content_hash);",
+        )?;
+        Ok(Self { conn })
+    }
+
+    pub fn get_by_symbol(&self, name: &str) -> Result<Vec<Summary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, symbol_name, file_path, content_hash, summary, entities, relationships,
+                    concept_labels, extracted_at, model, tokens_input, tokens_output
+             FROM summaries WHERE symbol_name = ?1 ORDER BY extracted_at DESC",
+        )?;
+        let rows = stmt.query_map([name], |row| {
+            Ok(row_to_summary(row))
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_by_file(&self, path: &str) -> Result<Vec<Summary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, symbol_name, file_path, content_hash, summary, entities, relationships,
+                    concept_labels, extracted_at, model, tokens_input, tokens_output
+             FROM summaries WHERE file_path = ?1 ORDER BY symbol_name",
+        )?;
+        let rows = stmt.query_map([path], |row| {
+            Ok(row_to_summary(row))
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn insert(&self, summary: &Summary) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO summaries
+             (symbol_name, file_path, content_hash, summary, entities, relationships,
+              concept_labels, extracted_at, model, tokens_input, tokens_output)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                summary.symbol_name,
+                summary.file_path,
+                summary.content_hash,
+                summary.summary,
+                summary.entities.as_ref().map(|e| serde_json::to_string(e).unwrap_or_default()),
+                summary.relationships.as_ref().map(|r| serde_json::to_string(r).unwrap_or_default()),
+                summary.concept_labels.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default()),
+                summary.extracted_at,
+                summary.model,
+                summary.tokens_input,
+                summary.tokens_output,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_current(&self, file_path: &str, content_hash: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM summaries WHERE file_path = ?1 AND content_hash = ?2",
+            [file_path, content_hash],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn stats(&self) -> Result<SummaryStats> {
+        let total_summaries: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM summaries", [], |row| row.get(0),
+        )?;
+        let total_files: usize = self.conn.query_row(
+            "SELECT COUNT(DISTINCT file_path) FROM summaries", [], |row| row.get(0),
+        )?;
+        let total_tokens_input: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(tokens_input), 0) FROM summaries", [], |row| row.get(0),
+        )?;
+        let total_tokens_output: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(tokens_output), 0) FROM summaries", [], |row| row.get(0),
+        )?;
+        // Estimated tokens saved: each summary replaces ~2000 tokens of source reading
+        // with ~75 tokens of cached summary. Net savings per summary = ~1925 tokens.
+        let estimated_tokens_saved = (total_summaries as i64) * 1925;
+        Ok(SummaryStats {
+            total_summaries,
+            total_files,
+            stale_count: 0, // computed externally when file hashes are available
+            total_tokens_input,
+            total_tokens_output,
+            estimated_tokens_saved,
+        })
+    }
+
+    pub fn delete_by_file(&self, file_path: &str) -> Result<usize> {
+        let count = self.conn.execute(
+            "DELETE FROM summaries WHERE file_path = ?1", [file_path],
+        )?;
+        Ok(count)
+    }
+}
+
+fn row_to_summary(row: &rusqlite::Row) -> Summary {
+    let entities_json: Option<String> = row.get(5).unwrap_or(None);
+    let relationships_json: Option<String> = row.get(6).unwrap_or(None);
+    let labels_json: Option<String> = row.get(7).unwrap_or(None);
+    Summary {
+        id: row.get(0).unwrap_or(0),
+        symbol_name: row.get(1).unwrap_or_default(),
+        file_path: row.get(2).unwrap_or_default(),
+        content_hash: row.get(3).unwrap_or_default(),
+        summary: row.get(4).unwrap_or_default(),
+        entities: entities_json.and_then(|j| serde_json::from_str(&j).ok()),
+        relationships: relationships_json.and_then(|j| serde_json::from_str(&j).ok()),
+        concept_labels: labels_json.and_then(|j| serde_json::from_str(&j).ok()),
+        extracted_at: row.get(8).unwrap_or_default(),
+        model: row.get(9).unwrap_or_default(),
+        tokens_input: row.get(10).unwrap_or(None),
+        tokens_output: row.get(11).unwrap_or(None),
+    }
+}
+
+pub fn content_hash(content: &[u8]) -> String {
+    blake3::hash(content).to_hex().to_string()
+}
+
+pub fn extract_for_file(
+    file_path: &Path,
+    symbols_db_path: Option<&Path>,
+    config: &SummarizeConfig,
+) -> Result<Vec<Summary>> {
+    let source = std::fs::read_to_string(file_path)
+        .with_context(|| format!("reading {}", file_path.display()))?;
+
+    let token_estimate = source.len() / 4;
+    if token_estimate > config.max_file_tokens {
+        bail!(
+            "file {} exceeds max_file_tokens ({} > {})",
+            file_path.display(),
+            token_estimate,
+            config.max_file_tokens
+        );
+    }
+
+    let hash = content_hash(source.as_bytes());
+    let file_str = file_path.to_string_lossy().to_string();
+
+    let symbols = if let Some(db_path) = symbols_db_path {
+        load_symbols_for_file(db_path, &file_str)?
+    } else {
+        Vec::new()
+    };
+
+    let api_key = std::env::var(&config.api_key_env).with_context(|| {
+        format!(
+            "missing API key: set {} environment variable",
+            config.api_key_env
+        )
+    })?;
+
+    let prompt = build_extraction_prompt(&file_str, &source, &symbols);
+
+    let (response_text, tokens_in, tokens_out) =
+        call_anthropic_api(&api_key, &config.model, &prompt)?;
+
+    let parsed: ExtractionResponse = serde_json::from_str(&response_text).with_context(|| {
+        format!(
+            "parsing extraction response for {}",
+            file_path.display()
+        )
+    })?;
+
+    let now = chrono_now();
+    let mut summaries = Vec::new();
+
+    // File-level summary (symbol_name = filename)
+    let file_name = file_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_str.clone());
+    summaries.push(Summary {
+        id: 0,
+        symbol_name: file_name,
+        file_path: file_str.clone(),
+        content_hash: hash.clone(),
+        summary: parsed.summary.clone(),
+        entities: Some(parsed.entities.clone()),
+        relationships: Some(parsed.relationships.clone()),
+        concept_labels: Some(parsed.concept_labels.clone()),
+        extracted_at: now.clone(),
+        model: config.model.clone(),
+        tokens_input: Some(tokens_in),
+        tokens_output: Some(tokens_out),
+    });
+
+    // Per-entity summaries
+    for entity in &parsed.entities {
+        summaries.push(Summary {
+            id: 0,
+            symbol_name: entity.name.clone(),
+            file_path: file_str.clone(),
+            content_hash: hash.clone(),
+            summary: entity.description.clone(),
+            entities: None,
+            relationships: None,
+            concept_labels: None,
+            extracted_at: now.clone(),
+            model: config.model.clone(),
+            tokens_input: None,
+            tokens_output: None,
+        });
+    }
+
+    Ok(summaries)
+}
+
+fn load_symbols_for_file(db_path: &Path, file_path: &str) -> Result<Vec<(String, String)>> {
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    // Check if symbols table exists
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='symbols'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT name, kind FROM symbols WHERE file LIKE '%' || ?1 ORDER BY line",
+    )?;
+    let rows = stmt
+        .query_map([file_path], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn build_extraction_prompt(file_path: &str, source: &str, symbols: &[(String, String)]) -> String {
+    let mut prompt = format!(
+        "Analyze this source file and extract structured information.\n\n\
+         File: {}\n",
+        file_path
+    );
+
+    if !symbols.is_empty() {
+        prompt.push_str("\nKnown symbols:\n");
+        for (name, kind) in symbols {
+            prompt.push_str(&format!("- {} ({})\n", name, kind));
+        }
+    }
+
+    prompt.push_str(&format!(
+        "\nSource:\n```\n{}\n```\n\n\
+         Respond with ONLY a JSON object (no markdown fences):\n\
+         {{\n\
+           \"summary\": \"1-3 sentence description of the file/module purpose\",\n\
+           \"entities\": [{{\"name\": \"...\", \"kind\": \"function|class|type|trait|module\", \"description\": \"1 sentence\"}}],\n\
+           \"relationships\": [{{\"from\": \"...\", \"to\": \"...\", \"kind\": \"calls|implements|uses|extends\"}}],\n\
+           \"concept_labels\": [\"domain concept 1\", \"domain concept 2\"]\n\
+         }}",
+        source
+    ));
+
+    prompt
+}
+
+fn call_anthropic_api(
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<(String, i64, i64)> {
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 4096,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ]
+    });
+
+    let response: serde_json::Value = ureq::post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .send_json(&body)
+        .with_context(|| "calling Anthropic API")?
+        .body_mut()
+        .read_json()
+        .with_context(|| "reading Anthropic API response")?;
+
+    let content = response["content"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|block| block["text"].as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let tokens_in = response["usage"]["input_tokens"].as_i64().unwrap_or(0);
+    let tokens_out = response["usage"]["output_tokens"].as_i64().unwrap_or(0);
+
+    if content.is_empty() {
+        bail!("empty response from Anthropic API");
+    }
+
+    // Strip markdown code fences if the model wrapped the response
+    let cleaned = content
+        .trim()
+        .strip_prefix("```json")
+        .or_else(|| content.trim().strip_prefix("```"))
+        .unwrap_or(content.trim());
+    let cleaned = cleaned
+        .strip_suffix("```")
+        .unwrap_or(cleaned)
+        .trim()
+        .to_string();
+
+    Ok((cleaned, tokens_in, tokens_out))
+}
+
+pub fn git_changed_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let output = std::process::Command::new("git")
+        .args(["diff", "--name-only", "HEAD"])
+        .current_dir(root)
+        .output()
+        .context("running git diff")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git diff failed: {}", stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let files = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| root.join(l))
+        .collect();
+    Ok(files)
+}
+
+fn chrono_now() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Simple ISO-ish timestamp without chrono dependency
+    format!("{}", now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> (NamedTempFile, SummaryDb) {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = SummaryDb::open(tmp.path()).unwrap();
+        (tmp, db)
+    }
+
+    fn make_summary(symbol: &str, file: &str, hash: &str) -> Summary {
+        Summary {
+            id: 0,
+            symbol_name: symbol.to_string(),
+            file_path: file.to_string(),
+            content_hash: hash.to_string(),
+            summary: format!("Summary for {}", symbol),
+            entities: Some(vec![Entity {
+                name: "helper".to_string(),
+                kind: "function".to_string(),
+                description: "A helper function".to_string(),
+            }]),
+            relationships: Some(vec![Relationship {
+                from: "main".to_string(),
+                to: "helper".to_string(),
+                kind: "calls".to_string(),
+            }]),
+            concept_labels: Some(vec!["cli".to_string(), "parsing".to_string()]),
+            extracted_at: "1700000000".to_string(),
+            model: "claude-haiku-4-5-20251001".to_string(),
+            tokens_input: Some(500),
+            tokens_output: Some(200),
+        }
+    }
+
+    #[test]
+    fn db_create_and_insert() {
+        let (_tmp, db) = test_db();
+        let s = make_summary("main", "src/main.rs", "abc123");
+        db.insert(&s).unwrap();
+        let results = db.get_by_symbol("main").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].symbol_name, "main");
+        assert_eq!(results[0].summary, "Summary for main");
+    }
+
+    #[test]
+    fn db_get_by_file() {
+        let (_tmp, db) = test_db();
+        db.insert(&make_summary("fn_a", "src/lib.rs", "hash1")).unwrap();
+        db.insert(&make_summary("fn_b", "src/lib.rs", "hash1")).unwrap();
+        db.insert(&make_summary("fn_c", "src/other.rs", "hash2")).unwrap();
+        let results = db.get_by_file("src/lib.rs").unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn db_is_current() {
+        let (_tmp, db) = test_db();
+        db.insert(&make_summary("main", "src/main.rs", "hash_v1")).unwrap();
+        assert!(db.is_current("src/main.rs", "hash_v1").unwrap());
+        assert!(!db.is_current("src/main.rs", "hash_v2").unwrap());
+    }
+
+    #[test]
+    fn db_stats() {
+        let (_tmp, db) = test_db();
+        db.insert(&make_summary("a", "f1.rs", "h1")).unwrap();
+        db.insert(&make_summary("b", "f1.rs", "h1")).unwrap();
+        db.insert(&make_summary("c", "f2.rs", "h2")).unwrap();
+        let stats = db.stats().unwrap();
+        assert_eq!(stats.total_summaries, 3);
+        assert_eq!(stats.total_files, 2);
+        assert_eq!(stats.total_tokens_input, 1500); // 3 * 500
+        assert_eq!(stats.total_tokens_output, 600);  // 3 * 200
+    }
+
+    #[test]
+    fn db_delete_by_file() {
+        let (_tmp, db) = test_db();
+        db.insert(&make_summary("a", "f1.rs", "h1")).unwrap();
+        db.insert(&make_summary("b", "f1.rs", "h1")).unwrap();
+        db.insert(&make_summary("c", "f2.rs", "h2")).unwrap();
+        let deleted = db.delete_by_file("f1.rs").unwrap();
+        assert_eq!(deleted, 2);
+        assert!(db.get_by_file("f1.rs").unwrap().is_empty());
+        assert_eq!(db.get_by_file("f2.rs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn db_entities_roundtrip() {
+        let (_tmp, db) = test_db();
+        let s = make_summary("main", "src/main.rs", "abc");
+        db.insert(&s).unwrap();
+        let results = db.get_by_symbol("main").unwrap();
+        let entities = results[0].entities.as_ref().unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "helper");
+        let rels = results[0].relationships.as_ref().unwrap();
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0].from, "main");
+        assert_eq!(rels[0].to, "helper");
+        let labels = results[0].concept_labels.as_ref().unwrap();
+        assert_eq!(labels, &["cli", "parsing"]);
+    }
+
+    #[test]
+    fn db_no_results_returns_empty() {
+        let (_tmp, db) = test_db();
+        assert!(db.get_by_symbol("nonexistent").unwrap().is_empty());
+        assert!(db.get_by_file("no/such/file.rs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn content_hash_deterministic() {
+        let h1 = content_hash(b"hello world");
+        let h2 = content_hash(b"hello world");
+        assert_eq!(h1, h2);
+        let h3 = content_hash(b"hello world!");
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn content_hash_is_blake3() {
+        let h = content_hash(b"test");
+        assert_eq!(h.len(), 64); // blake3 hex is 64 chars
+    }
+
+    #[test]
+    fn build_prompt_includes_file_and_source() {
+        let prompt = build_extraction_prompt("src/lib.rs", "fn main() {}", &[]);
+        assert!(prompt.contains("src/lib.rs"));
+        assert!(prompt.contains("fn main() {}"));
+        assert!(prompt.contains("JSON"));
+    }
+
+    #[test]
+    fn build_prompt_includes_symbols() {
+        let symbols = vec![
+            ("main".to_string(), "function".to_string()),
+            ("Config".to_string(), "struct".to_string()),
+        ];
+        let prompt = build_extraction_prompt("src/lib.rs", "code", &symbols);
+        assert!(prompt.contains("- main (function)"));
+        assert!(prompt.contains("- Config (struct)"));
+    }
+
+    #[test]
+    fn extract_skips_large_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let big_file = dir.path().join("big.rs");
+        std::fs::write(&big_file, "x".repeat(100_000)).unwrap();
+        let config = SummarizeConfig {
+            max_file_tokens: 8000,
+            ..Default::default()
+        };
+        let result = extract_for_file(&big_file, None, &config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds max_file_tokens"));
+    }
+
+    #[test]
+    fn extract_requires_api_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("small.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let config = SummarizeConfig {
+            api_key_env: "TSIFT_TEST_NONEXISTENT_KEY".to_string(),
+            ..Default::default()
+        };
+        let result = extract_for_file(&file, None, &config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("missing API key"));
+    }
+
+    #[test]
+    fn db_insert_replaces_on_conflict() {
+        let (_tmp, db) = test_db();
+        let mut s = make_summary("main", "src/main.rs", "v1");
+        s.summary = "version 1".to_string();
+        db.insert(&s).unwrap();
+
+        let mut s2 = make_summary("main", "src/main.rs", "v2");
+        s2.summary = "version 2".to_string();
+        db.insert(&s2).unwrap();
+
+        let results = db.get_by_symbol("main").unwrap();
+        assert_eq!(results.len(), 2);
+    }
+}
