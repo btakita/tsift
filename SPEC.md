@@ -64,6 +64,7 @@ federation = false
 tsift index --ast <path>        # tree-sitter AST extraction → symbols.db
 tsift index --check <path>      # report stale files without updating the index
 tsift index --check --exit-code # exit 1 if stale files found (for scripting/hooks)
+tsift index --check --quiet     # summary only — omit per-file change list
 tsift index --prune <path>      # skip unchanged directory subtrees (large repo optimization)
 tsift graph <path>              # build dependency graph → deps.json
 tsift graph --callers <symbol>  # who calls this function?
@@ -92,6 +93,14 @@ tsift search timed out after 30s (strategy: lexical). The index may be stale —
 ```
 
 `--timeout 0` disables the timeout for cases where a long search is expected.
+
+## Index Quiet Mode
+
+`tsift index --quiet` (or `-q`) suppresses the per-file change list, printing only the summary line. `--exit-code` implies `--quiet`.
+
+Without `--quiet`, `tsift index --check` on a large repo with 14K+ stale files outputs every file path (1.7MB / 433K tokens in human mode, 2.6MB in JSON). With `--quiet`, output is a single summary line (~80 bytes human, ~120 bytes JSON).
+
+In JSON mode, `--quiet` also omits the `changes` array and uses compact (non-pretty) serialization.
 
 ## Community Detection (Louvain)
 
