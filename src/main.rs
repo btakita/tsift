@@ -1155,7 +1155,11 @@ fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf>> {
 }
 
 fn cmd_init(path: &std::path::Path) -> Result<()> {
-    let result = init::init(path)?;
+    let resolved = init::resolve_project_dir(path)?;
+    if resolved != path {
+        println!("resolved: {} → {}", path.display(), resolved.display());
+    }
+    let result = init::init(&resolved)?;
     println!("{}: {} ({})", result.file.display(), result.action,
         match result.action {
             init::InitAction::Created => "tsift Code Navigation section added",

@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const SECTION_MARKER: &str = "<!-- tsift:code-navigation -->";
 const SECTION_END_MARKER: &str = "<!-- /tsift:code-navigation -->";
@@ -70,6 +71,28 @@ fn ensure_gitignore(dir: &Path) -> Result<bool> {
         std::fs::write(&gitignore, format!("{}\n", GITIGNORE_ENTRY))?;
     }
     Ok(true)
+}
+
+pub fn resolve_project_dir(path: &Path) -> Result<PathBuf> {
+    let dir = if path.is_file() {
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine parent of {}", path.display()))?
+            .to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+
+    let output = Command::new("git")
+        .args(["-C", &dir.to_string_lossy(), "rev-parse", "--show-toplevel"])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let root = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            Ok(PathBuf::from(root))
+        }
+        _ => Ok(dir),
+    }
 }
 
 pub fn init(dir: &Path) -> Result<InitResult> {
@@ -243,6 +266,59 @@ mod tests {
         assert!(!result.gitignore_added);
         let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         assert_eq!(content.matches(".tsift/").count(), 1);
+    }
+
+    #[test]
+    fn resolve_project_dir_returns_dir_for_directory() {
+        let dir = TempDir::new().unwrap();
+        let resolved = resolve_project_dir(dir.path()).unwrap();
+        // No git repo, so falls back to the directory itself
+        assert_eq!(resolved, dir.path());
+    }
+
+    #[test]
+    fn resolve_project_dir_returns_parent_for_file() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("test.md");
+        std::fs::write(&file, "content").unwrap();
+        let resolved = resolve_project_dir(&file).unwrap();
+        // No git repo, falls back to parent dir
+        assert_eq!(resolved, dir.path());
+    }
+
+    #[test]
+    fn resolve_project_dir_finds_git_root() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub").join("deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Init a git repo at the top
+        Command::new("git")
+            .args(["init", &dir.path().to_string_lossy()])
+            .output()
+            .unwrap();
+        let resolved = resolve_project_dir(&sub).unwrap();
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_project_dir_finds_git_root_from_file() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("tasks");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("plan.md");
+        std::fs::write(&file, "content").unwrap();
+        Command::new("git")
+            .args(["init", &dir.path().to_string_lossy()])
+            .output()
+            .unwrap();
+        let resolved = resolve_project_dir(&file).unwrap();
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
     }
 
     #[test]

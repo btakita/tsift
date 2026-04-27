@@ -375,9 +375,20 @@ Dynamic grammars use `tree_sitter::Language::from_path()`. The `Language` enum a
 `tsift init` injects a Code Navigation section into the project's AGENTS.md (or CLAUDE.md), so every Claude Code session automatically prefers tsift over raw file reads.
 
 ```bash
-tsift init              # inject into AGENTS.md/CLAUDE.md in current directory
-tsift init <path>       # inject into AGENTS.md/CLAUDE.md at <path>
+tsift init                              # inject into AGENTS.md/CLAUDE.md in current directory
+tsift init <path>                       # inject at <path> (dir or file)
+tsift init src/sub/tasks/plan.md        # resolves to submodule root src/sub/
 ```
+
+### Path Resolution
+
+`tsift init` resolves the target directory before operating:
+
+1. If `<path>` is a file, use its parent directory
+2. Run `git rev-parse --show-toplevel` from that directory to find the git root (handles submodules)
+3. Fall back to the directory itself if not in a git repo
+
+This means `tsift init src/session-share/tasks/claudescore-3.md` resolves to `src/session-share/` — the submodule root — and initializes there. When the resolved path differs from the input, a `resolved: <input> → <target>` line is printed.
 
 ### Behavior
 
