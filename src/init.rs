@@ -16,9 +16,12 @@ Run `tsift status` at session start. Use the commands listed in its `use:` outpu
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->"#;
 
+const GITIGNORE_ENTRY: &str = ".tsift/";
+
 pub struct InitResult {
     pub file: PathBuf,
     pub action: InitAction,
+    pub gitignore_added: bool,
 }
 
 pub enum InitAction {
@@ -49,7 +52,29 @@ pub fn find_instruction_file(dir: &Path) -> Option<PathBuf> {
     None
 }
 
+fn ensure_gitignore(dir: &Path) -> Result<bool> {
+    let gitignore = dir.join(".gitignore");
+    if gitignore.exists() {
+        let content = std::fs::read_to_string(&gitignore)?;
+        if content.lines().any(|line| line.trim() == GITIGNORE_ENTRY) {
+            return Ok(false);
+        }
+        let mut new_content = content;
+        if !new_content.ends_with('\n') && !new_content.is_empty() {
+            new_content.push('\n');
+        }
+        new_content.push_str(GITIGNORE_ENTRY);
+        new_content.push('\n');
+        std::fs::write(&gitignore, new_content)?;
+    } else {
+        std::fs::write(&gitignore, format!("{}\n", GITIGNORE_ENTRY))?;
+    }
+    Ok(true)
+}
+
 pub fn init(dir: &Path) -> Result<InitResult> {
+    let gitignore_added = ensure_gitignore(dir)?;
+
     let file = match find_instruction_file(dir) {
         Some(f) => f,
         None => {
@@ -58,6 +83,7 @@ pub fn init(dir: &Path) -> Result<InitResult> {
             return Ok(InitResult {
                 file: agents,
                 action: InitAction::Created,
+                gitignore_added,
             });
         }
     };
@@ -75,12 +101,14 @@ pub fn init(dir: &Path) -> Result<InitResult> {
                 return Ok(InitResult {
                     file,
                     action: InitAction::AlreadyPresent,
+                    gitignore_added,
                 });
             }
             std::fs::write(&file, new_content)?;
             return Ok(InitResult {
                 file,
                 action: InitAction::Updated,
+                gitignore_added,
             });
         } else {
             bail!(
@@ -104,6 +132,7 @@ pub fn init(dir: &Path) -> Result<InitResult> {
     Ok(InitResult {
         file,
         action: InitAction::Created,
+        gitignore_added,
     })
 }
 
@@ -184,6 +213,36 @@ mod tests {
         assert!(content.contains("tsift search"));
         assert!(!content.contains("Old content here."));
         assert_eq!(content.matches(SECTION_MARKER).count(), 1);
+    }
+
+    #[test]
+    fn init_creates_gitignore_with_tsift_entry() {
+        let dir = TempDir::new().unwrap();
+        let result = init(dir.path()).unwrap();
+        assert!(result.gitignore_added);
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains(".tsift/"));
+    }
+
+    #[test]
+    fn init_appends_to_existing_gitignore() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "/target\n").unwrap();
+        let result = init(dir.path()).unwrap();
+        assert!(result.gitignore_added);
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains("/target"));
+        assert!(content.contains(".tsift/"));
+    }
+
+    #[test]
+    fn init_skips_gitignore_when_already_present() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "/target\n.tsift/\n").unwrap();
+        let result = init(dir.path()).unwrap();
+        assert!(!result.gitignore_added);
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert_eq!(content.matches(".tsift/").count(), 1);
     }
 
     #[test]

@@ -381,10 +381,11 @@ tsift init <path>       # inject into AGENTS.md/CLAUDE.md at <path>
 
 ### Behavior
 
-1. Looks for `AGENTS.md` first (canonical per convention), falls back to `CLAUDE.md`
-2. If neither exists, creates `AGENTS.md` with the section
-3. If the section already exists (detected by `<!-- tsift:code-navigation -->` markers), updates it in place
-4. Idempotent — running twice produces no changes on the second run
+1. Adds `.tsift/` to `.gitignore` (creates the file if needed, appends if entry missing, skips if already present)
+2. Looks for `AGENTS.md` first (canonical per convention), falls back to `CLAUDE.md`
+3. If neither exists, creates `AGENTS.md` with the section
+4. If the section already exists (detected by `<!-- tsift:code-navigation -->` markers), updates it in place
+5. Idempotent — running twice produces no changes on the second run
 
 ### Injected Section
 

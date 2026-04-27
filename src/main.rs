@@ -1162,6 +1162,9 @@ fn cmd_init(path: &std::path::Path) -> Result<()> {
             init::InitAction::Updated => "tsift Code Navigation section updated to latest",
             init::InitAction::AlreadyPresent => "no changes needed",
         });
+    if result.gitignore_added {
+        println!(".gitignore: added .tsift/");
+    }
     Ok(())
 }
 
