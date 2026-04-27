@@ -79,7 +79,19 @@ tsift summarize --extract --diff  # re-extract only git-changed files
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
 tsift search --scope <submod>   # restrict to one submodule's index + sift path
 tsift search --strategy hybrid  # opt-in to slower hybrid BM25 + vector search
+tsift search --timeout 60       # custom timeout in seconds (default: 30, 0 = no timeout)
 ```
+
+## Search Timeout
+
+`tsift search` wraps the sift engine call in a 30-second timeout (configurable via `--timeout`). On stale indexes with many files, the sift engine can block indefinitely — the timeout prevents agent sessions from hanging silently, especially when the rewrite hook transparently converts `rg`/`grep` to `tsift search`.
+
+On timeout, search exits with a non-zero code and prints:
+```
+tsift search timed out after 30s (strategy: lexical). The index may be stale — run `tsift index .` to rebuild, or use `--timeout 0` to disable the timeout.
+```
+
+`--timeout 0` disables the timeout for cases where a long search is expected.
 
 ## Community Detection (Louvain)
 

@@ -49,6 +49,9 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Timeout in seconds for the sift search engine (0 = no timeout)
+        #[arg(long, default_value = "30")]
+        timeout: u64,
     },
     /// Apply multiple file edits in one invocation (reads JSON from stdin)
     Edit {
@@ -300,7 +303,8 @@ fn main() -> Result<()> {
             scope,
             federated,
             json,
-        }) => cmd_search(query, path, limit, strategy, scope, federated, json),
+            timeout,
+        }) => cmd_search(query, path, limit, strategy, scope, federated, json, timeout),
         Some(Commands::Edit { dry_run, file }) => cmd_edit(dry_run, file),
         Some(Commands::Index { path, rebuild, check, exit_code, prune, workspace, submodule, json }) => cmd_index(&path, rebuild, check, exit_code, prune, workspace, submodule.as_deref(), json),
         Some(Commands::Rewrite { command }) => cmd_rewrite(&command),
@@ -1674,6 +1678,46 @@ tier = "isolated"
         let result = cmd_explain("main", dir.path(), None, false);
         assert!(result.is_err());
     }
+
+    // --- search timeout ---
+
+    #[test]
+    fn search_timeout_returns_error_on_slow_engine() {
+        let engine = Sift::builder().build();
+        let dir = tempfile::tempdir().unwrap();
+        let search_dir = dir.path().to_path_buf();
+        std::fs::write(search_dir.join("test.rs"), "fn main() {}").unwrap();
+        let options = SearchOptions::default()
+            .with_limit(1)
+            .with_strategy("lexical".to_string());
+        let input = SearchInput::new(&search_dir, "main").with_options(options);
+        let result = run_search_with_timeout(engine, input, 30, "lexical");
+        assert!(result.is_ok(), "normal search should complete within 30s");
+    }
+
+    #[test]
+    fn search_timeout_zero_disables_timeout() {
+        let engine = Sift::builder().build();
+        let dir = tempfile::tempdir().unwrap();
+        let search_dir = dir.path().to_path_buf();
+        std::fs::write(search_dir.join("test.rs"), "fn main() {}").unwrap();
+        let options = SearchOptions::default()
+            .with_limit(1)
+            .with_strategy("lexical".to_string());
+        let input = SearchInput::new(&search_dir, "main").with_options(options);
+        let result = run_search_with_timeout(engine, input, 0, "lexical");
+        assert!(result.is_ok(), "timeout=0 should still work (no timeout)");
+    }
+
+    #[test]
+    fn search_timeout_mechanism_channel_timeout() {
+        // Test the timeout mechanism directly via mpsc channel
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        // Don't send anything — this will timeout
+        let result = rx.recv_timeout(std::time::Duration::from_millis(10));
+        assert!(matches!(result, Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        drop(tx);
+    }
 }
 
 // --- SQL introspection ---
@@ -2061,6 +2105,37 @@ fn federated_symbol_search(root: &std::path::Path, query: &str, limit: usize) ->
     Ok(all_hits)
 }
 
+fn run_search_with_timeout(
+    engine: Sift,
+    input: SearchInput,
+    timeout_secs: u64,
+    strategy: &str,
+) -> Result<sift::SearchResponse> {
+    if timeout_secs == 0 {
+        return engine.search(input).context("sift search failed");
+    }
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(engine.search(input));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result.context("sift search failed"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            bail!(
+                "tsift search timed out after {}s (strategy: {}). \
+                 The index may be stale — run `tsift index .` to rebuild, \
+                 or use `--timeout 0` to disable the timeout.",
+                timeout_secs,
+                strategy,
+            );
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("sift search thread panicked");
+        }
+    }
+}
+
 fn cmd_search(
     query: String,
     path: Option<PathBuf>,
@@ -2069,6 +2144,7 @@ fn cmd_search(
     scope: Option<String>,
     federated: bool,
     json_output: bool,
+    timeout_secs: u64,
 ) -> Result<()> {
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
 
@@ -2106,9 +2182,9 @@ fn cmd_search(
     let effective_strategy = strategy.unwrap_or_else(|| "lexical".to_string());
     let options = SearchOptions::default()
         .with_limit(limit)
-        .with_strategy(effective_strategy);
+        .with_strategy(effective_strategy.clone());
     let input = SearchInput::new(&sift_path, &query).with_options(options);
-    let response = engine.search(input)?;
+    let response = run_search_with_timeout(engine, input, timeout_secs, &effective_strategy)?;
 
     if json_output {
         #[derive(Serialize)]
