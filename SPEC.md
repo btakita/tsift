@@ -369,6 +369,40 @@ Dynamic grammars use `tree_sitter::Language::from_path()`. The `Language` enum a
 7. ~~Add `tsift-graph` crate~~ → Internal `graph` module — call graph extraction + edge storage (done)
 8. Per-submodule config + isolation tiers
 
+## Init (Project Setup)
+
+`tsift init` injects a Code Navigation section into the project's AGENTS.md (or CLAUDE.md), so every Claude Code session automatically prefers tsift over raw file reads.
+
+```bash
+tsift init              # inject into AGENTS.md/CLAUDE.md in current directory
+tsift init <path>       # inject into AGENTS.md/CLAUDE.md at <path>
+```
+
+### Behavior
+
+1. Looks for `AGENTS.md` first (canonical per convention), falls back to `CLAUDE.md`
+2. If neither exists, creates `AGENTS.md` with the section
+3. If the section already exists (detected by `<!-- tsift:code-navigation -->` markers), updates it in place
+4. Idempotent — running twice produces no changes on the second run
+
+### Injected Section
+
+```markdown
+<!-- tsift:code-navigation -->
+## Code Navigation
+
+Before reading source files for understanding, check tsift:
+- `tsift search <query>` — AST-aware hybrid search (prefer over grep/rg)
+- `tsift summarize <symbol>` — cached summary (~50 tokens vs ~2000 for file read)
+- `tsift explain <symbol>` — callers, callees, community context
+- `tsift graph <symbol> --callers` / `--callees` — call graph navigation
+
+Only read full source files when tsift results are insufficient.
+<!-- /tsift:code-navigation -->
+```
+
+The HTML comment markers enable idempotent updates without parsing markdown structure.
+
 ## Summarize (Cached LLM Analysis)
 
 `tsift summarize` provides token-efficient access to pre-computed LLM analysis. Pay once for extraction, query free thereafter.

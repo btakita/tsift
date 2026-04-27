@@ -8,6 +8,7 @@ use std::io::Read as _;
 use std::path::PathBuf;
 
 pub mod audit;
+pub mod init;
 pub mod lint;
 pub mod config;
 pub mod graph;
@@ -211,6 +212,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Initialize tsift in a project — inject Code Navigation section into AGENTS.md/CLAUDE.md
+    Init {
+        /// Path to the project directory (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Cached LLM analysis — pre-computed summaries, entities, relationships
     Summarize {
         /// Symbol name to look up
@@ -294,6 +301,7 @@ fn main() -> Result<()> {
         Some(Commands::Path { from, to, path, scope, json }) => cmd_path(&from, &to, &path, scope.as_deref(), json),
         Some(Commands::Explain { symbol, path, scope, json }) => cmd_explain(&symbol, &path, scope.as_deref(), json),
         Some(Commands::Audit { skills_dir, manifest, usage, cleanup, report, json }) => cmd_audit(&skills_dir, manifest, usage, cleanup, report, json),
+        Some(Commands::Init { path }) => cmd_init(&path),
         Some(Commands::Lint { file, index, entities_from, json }) => cmd_lint(&file, index, entities_from, json),
         Some(Commands::Summarize { symbol, file, extract, diff, stats, path, json }) => cmd_summarize(symbol, file, extract, diff, stats, &path, json),
         None => {
@@ -1121,6 +1129,17 @@ fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(files)
+}
+
+fn cmd_init(path: &std::path::Path) -> Result<()> {
+    let result = init::init(path)?;
+    println!("{}: {} ({})", result.file.display(), result.action,
+        match result.action {
+            init::InitAction::Created => "tsift Code Navigation section added",
+            init::InitAction::Updated => "tsift Code Navigation section updated to latest",
+            init::InitAction::AlreadyPresent => "no changes needed",
+        });
+    Ok(())
 }
 
 fn cmd_lint(file: &str, index: Option<PathBuf>, entities_from: Vec<PathBuf>, json_output: bool) -> Result<()> {
