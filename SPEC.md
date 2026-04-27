@@ -391,17 +391,69 @@ tsift init <path>       # inject into AGENTS.md/CLAUDE.md at <path>
 <!-- tsift:code-navigation -->
 ## Code Navigation
 
-Before reading source files for understanding, check tsift:
+Run `tsift status` at session start. Use the commands listed in its `use:` output:
 - `tsift search <query>` — AST-aware hybrid search (prefer over grep/rg)
-- `tsift summarize <symbol>` — cached summary (~50 tokens vs ~2000 for file read)
 - `tsift explain <symbol>` — callers, callees, community context
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
+- `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->
 ```
 
 The HTML comment markers enable idempotent updates without parsing markdown structure.
+
+## Status (Session Health Check)
+
+`tsift status` reports index freshness, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session.
+
+```bash
+tsift status            # human-readable output
+tsift status --json     # structured JSON output
+tsift status <path>     # check a specific codebase directory
+```
+
+### Output
+
+Three sections: index state, summary cache state, recommendations.
+
+When everything is available:
+```
+index: fresh (last indexed 2m ago, 200 files tracked)
+summaries: 142/200 files cached (71%)
+recommendations:
+  use: search, explain, graph, summarize
+  run: tsift summarize --extract src/  (58 uncached files)
+```
+
+When no index exists:
+```
+index: missing
+summaries: unavailable (no index)
+recommendations:
+  use: (none — run tsift index first)
+  run: tsift index .
+```
+
+### JSON Schema
+
+```json
+{
+  "index": { "state": "fresh|stale|missing", "total_files": N, "stale_files": N, "last_indexed_secs_ago": N },
+  "summaries": { "state": "available|none|unavailable", "cached_files": N, "total_indexed_files": N, "coverage_pct": N },
+  "recommendations": { "use": ["search", "explain", ...], "run": "tsift index ." }
+}
+```
+
+### Recommendation Logic
+
+| Index | Summaries | `use:` | `run:` |
+|-------|-----------|--------|--------|
+| missing | — | (none) | `tsift index .` |
+| stale | — | search, explain, graph | `tsift index .` |
+| fresh | none | search, explain, graph | `tsift summarize --extract src/` |
+| fresh | partial | search, explain, graph, summarize | `tsift summarize --extract src/` |
+| fresh | complete | search, explain, graph, summarize | (none) |
 
 ## Summarize (Cached LLM Analysis)
 

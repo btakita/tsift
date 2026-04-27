@@ -14,6 +14,7 @@ pub mod config;
 pub mod graph;
 pub mod index;
 mod lang;
+pub mod status;
 pub mod summarize;
 pub mod walk;
 
@@ -241,6 +242,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Report index + summary status and recommended commands for this session
+    Status {
+        /// Path to the codebase (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Deserialize)]
@@ -304,6 +314,7 @@ fn main() -> Result<()> {
         Some(Commands::Init { path }) => cmd_init(&path),
         Some(Commands::Lint { file, index, entities_from, json }) => cmd_lint(&file, index, entities_from, json),
         Some(Commands::Summarize { symbol, file, extract, diff, stats, path, json }) => cmd_summarize(symbol, file, extract, diff, stats, &path, json),
+        Some(Commands::Status { path, json }) => cmd_status(&path, json),
         None => {
             println!("tsift v{}", env!("CARGO_PKG_VERSION"));
             println!("Run `tsift --help` for usage.");
@@ -1056,6 +1067,18 @@ fn cmd_summarize(
     }
 
     bail!("specify a symbol, --file, --extract, or --stats");
+}
+
+fn cmd_status(path: &std::path::Path, json_output: bool) -> Result<()> {
+    let root = path.canonicalize()
+        .with_context(|| format!("resolving path: {}", path.display()))?;
+    let report = status::check_status(&root)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", status::format_human(&report));
+    }
+    Ok(())
 }
 
 fn load_summarize_config(root: &std::path::Path) -> summarize::SummarizeConfig {
