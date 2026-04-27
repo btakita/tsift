@@ -9,7 +9,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | Command | Purpose |
 |---------|---------|
 | `tsift index` | Build AST symbol index via tree-sitter. `--workspace` / `--submodule <name>` / `--prune` / `--check` (dry-run) / `--exit-code` (exit 1 if stale, for hooks) |
-| `tsift search` | Hybrid BM25 + vector search via sift library. `--federated` / `--scope <name>` for workspace |
+| `tsift search` | Hybrid BM25 + vector search via sift library. Built-in stale precheck + optional `--autoindex`. `--federated` / `--scope <name>` for workspace |
 | `tsift graph` | Call-graph queries: `--callers` / `--callees` of a symbol. `--limit N` (default 20, 0=unlimited) / `--scope <name>` / `--json` |
 | `tsift edit` | Batch file edits from JSON (stdin or `--file`), atomic validate-then-write |
 | `tsift route` | Classify task → model tier (haiku/sonnet/opus) |
@@ -71,6 +71,7 @@ cargo install --path .   # install to ~/.cargo/bin/
 ## Hook Integration
 
 - **Auto-reindex** (`UserPromptSubmit`): `examples/hooks/tsift-autoindex.sh` runs `tsift index --check --exit-code .` on every prompt, auto-reindexes when stale. Install via `.claude/settings.json`.
+- **Unhooked fallback**: `tsift search` now fails fast when an existing index is stale. Use `tsift search --autoindex ...` to mirror the hook behavior in a one-off session.
 - **Search rewrite** (`PreToolUse`): `~/.claude/hooks/tsift-rewrite.sh` rewrites `rg`/`grep -r` to `tsift search --strategy lexical`.
 - **RTK output filtering** (`PreToolUse`): same hook routes verbose commands (`communities`, `explain`, `graph`, `index`, `search`) through RTK when installed. TOML filters at `~/.config/rtk/filters.toml` cap output lines.
 
@@ -86,6 +87,8 @@ Run `tsift status` at session start. Use the commands listed in its `use:` outpu
 - `tsift explain <symbol>` — callers, callees, community context
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
+
+If `tsift status` reports a stale index, either run `tsift index .` first or use `tsift search --autoindex ...`. If `tsift search` still times out after that, narrow the path/query or retry with a larger `--timeout`.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->

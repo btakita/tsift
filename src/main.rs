@@ -6,7 +6,7 @@ use sift::{SearchInput, SearchOptions, Sift};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub mod audit;
 pub mod config;
@@ -78,6 +78,9 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Rebuild the local tsift index first when it is missing or stale
+        #[arg(long)]
+        autoindex: bool,
         /// Timeout in seconds for the sift search engine (0 = no timeout)
         #[arg(long, default_value = "30")]
         timeout: u64,
@@ -353,11 +356,28 @@ fn main() -> Result<()> {
             scope,
             federated,
             json,
+            autoindex,
             timeout,
         }) => cmd_search(
-            query, path, limit, strategy, scope, federated, json || terse || schema, timeout, compact, pretty, terse, absolute, tabular, schema,
+            query,
+            path,
+            limit,
+            strategy,
+            scope,
+            federated,
+            json || terse || schema,
+            autoindex,
+            timeout,
+            compact,
+            pretty,
+            terse,
+            absolute,
+            tabular,
+            schema,
         ),
-        Some(Commands::Edit { dry_run, file }) => cmd_edit(dry_run, file, compact, pretty, terse, schema),
+        Some(Commands::Edit { dry_run, file }) => {
+            cmd_edit(dry_run, file, compact, pretty, terse, schema)
+        }
         Some(Commands::Index {
             path,
             rebuild,
@@ -414,28 +434,70 @@ fn main() -> Result<()> {
             query,
             table,
             json,
-        }) => cmd_sql(&db, query, table, json || terse || schema, compact, pretty, terse, schema),
+        }) => cmd_sql(
+            &db,
+            query,
+            table,
+            json || terse || schema,
+            compact,
+            pretty,
+            terse,
+            schema,
+        ),
         Some(Commands::Communities {
             path,
             scope,
             min_size,
             limit,
             json,
-        }) => cmd_communities(&path, scope.as_deref(), min_size, limit, json || terse || schema, compact, pretty, terse, tabular, schema),
+        }) => cmd_communities(
+            &path,
+            scope.as_deref(),
+            min_size,
+            limit,
+            json || terse || schema,
+            compact,
+            pretty,
+            terse,
+            tabular,
+            schema,
+        ),
         Some(Commands::Path {
             from,
             to,
             path,
             scope,
             json,
-        }) => cmd_path(&from, &to, &path, scope.as_deref(), json || terse || schema, compact, pretty, terse, schema),
+        }) => cmd_path(
+            &from,
+            &to,
+            &path,
+            scope.as_deref(),
+            json || terse || schema,
+            compact,
+            pretty,
+            terse,
+            schema,
+        ),
         Some(Commands::Explain {
             symbol,
             path,
             scope,
             limit,
             json,
-        }) => cmd_explain(&symbol, &path, scope.as_deref(), limit, json || terse || schema, compact, pretty, terse, absolute, tabular, schema),
+        }) => cmd_explain(
+            &symbol,
+            &path,
+            scope.as_deref(),
+            limit,
+            json || terse || schema,
+            compact,
+            pretty,
+            terse,
+            absolute,
+            tabular,
+            schema,
+        ),
         Some(Commands::Audit {
             skills_dir,
             manifest,
@@ -443,14 +505,34 @@ fn main() -> Result<()> {
             cleanup,
             report,
             json,
-        }) => cmd_audit(&skills_dir, manifest, usage, cleanup, report, json || terse || schema, compact, pretty, terse, schema),
+        }) => cmd_audit(
+            &skills_dir,
+            manifest,
+            usage,
+            cleanup,
+            report,
+            json || terse || schema,
+            compact,
+            pretty,
+            terse,
+            schema,
+        ),
         Some(Commands::Init { path, codex }) => cmd_init(&path, codex),
         Some(Commands::Lint {
             file,
             index,
             entities_from,
             json,
-        }) => cmd_lint(&file, index, entities_from, json || terse || schema, compact, pretty, terse, schema),
+        }) => cmd_lint(
+            &file,
+            index,
+            entities_from,
+            json || terse || schema,
+            compact,
+            pretty,
+            terse,
+            schema,
+        ),
         Some(Commands::Summarize {
             symbol,
             file,
@@ -459,8 +541,27 @@ fn main() -> Result<()> {
             stats,
             path,
             json,
-        }) => cmd_summarize(symbol, file, extract, diff, stats, &path, json || terse || schema, compact, pretty, terse, schema),
-        Some(Commands::Status { path, json }) => cmd_status(&path, json || terse || schema, compact, pretty, terse, schema),
+        }) => cmd_summarize(
+            symbol,
+            file,
+            extract,
+            diff,
+            stats,
+            &path,
+            json || terse || schema,
+            compact,
+            pretty,
+            terse,
+            schema,
+        ),
+        Some(Commands::Status { path, json }) => cmd_status(
+            &path,
+            json || terse || schema,
+            compact,
+            pretty,
+            terse,
+            schema,
+        ),
         None => {
             println!("tsift v{}", env!("CARGO_PKG_VERSION"));
             println!("Run `tsift --help` for usage.");
@@ -530,7 +631,12 @@ fn to_json<T: serde::Serialize>(val: &T, pretty: bool, terse: bool) -> anyhow::R
     to_json_schema(val, pretty, terse, false)
 }
 
-fn to_json_schema<T: serde::Serialize>(val: &T, pretty: bool, terse: bool, schema: bool) -> anyhow::Result<String> {
+fn to_json_schema<T: serde::Serialize>(
+    val: &T,
+    pretty: bool,
+    terse: bool,
+    schema: bool,
+) -> anyhow::Result<String> {
     if terse || schema {
         let value = serde_json::to_value(val)?;
         let mut transformed = if terse { terse_transform(value) } else { value };
@@ -696,7 +802,10 @@ fn terse_schema_for(val: &serde_json::Value) -> serde_json::Value {
     let mut schema = serde_json::Map::new();
     for (long, short) in TERSE_PAIRS {
         if keys.contains(*short) {
-            schema.insert(short.to_string(), serde_json::Value::String(long.to_string()));
+            schema.insert(
+                short.to_string(),
+                serde_json::Value::String(long.to_string()),
+            );
         }
     }
     serde_json::Value::Object(schema)
@@ -776,41 +885,117 @@ fn homogeneous_keys(arr: &[serde_json::Value]) -> Option<Vec<String>> {
 }
 
 const TERSE_PAIRS: &[(&str, &str)] = &[
-    ("name", "n"), ("kind", "k"), ("file", "f"), ("line", "l"), ("path", "p"),
-    ("from", "fr"), ("type", "ty"), ("text", "tx"), ("new", "nw"), ("run", "r"),
-    ("use", "u"), ("score", "sc"), ("language", "la"), ("status", "st"),
-    ("state", "stt"), ("error", "err"), ("errors", "ers"), ("hops", "hp"),
-    ("tags", "tg"), ("model", "ml"), ("skill", "sk"), ("count", "ct"),
-    ("total", "tot"), ("column", "col"), ("description", "dsc"),
-    ("end_line", "el"), ("signature", "sig"), ("parent_module", "pm"),
-    ("visibility", "vis"), ("match_type", "mt"), ("caller_file", "cf"),
-    ("caller_name", "cn"), ("caller_line", "cl"), ("callee_name", "en"),
-    ("call_site_line", "csl"), ("members", "m"), ("modularity", "q"),
-    ("modularity_contribution", "mc"), ("iterations", "it"), ("node_count", "nc"),
-    ("edge_count", "ec"), ("community_count", "cc"), ("communities", "cms"),
-    ("community", "cm"), ("symbol", "s"), ("symbols", "sy"),
-    ("definitions", "df"), ("callers", "crs"), ("callees", "ces"),
-    ("total_tracked", "tt"), ("modified", "md"), ("deleted", "dl"),
-    ("unchanged", "uc"), ("changes", "ch"), ("prune_stats", "ps"),
-    ("hits", "h"), ("rank", "rk"), ("snippet", "sn"), ("confidence", "co"),
-    ("index", "ix"), ("summaries", "sms"), ("recommendations", "rec"),
-    ("total_files", "tf"), ("stale_files", "sf"), ("last_indexed_secs_ago", "age"),
-    ("cached_files", "caf"), ("total_indexed_files", "tif"), ("coverage_pct", "cov"),
-    ("symbol_name", "syn"), ("file_path", "fp"), ("content_hash", "hsh"),
-    ("summary", "sum"), ("entities", "ent"), ("relationships", "rel"),
-    ("concept_labels", "cls"), ("extracted_at", "at"), ("tokens_input", "ti"),
-    ("tokens_output", "tout"), ("total_summaries", "ts"), ("stale_count", "stc"),
-    ("total_tokens_input", "tti"), ("total_tokens_output", "tto"),
-    ("estimated_tokens_saved", "ets"), ("files_processed", "fps"),
-    ("symbols_extracted", "se"), ("skills_dir", "sd"), ("healthy", "ok"),
-    ("broken", "brk"), ("skills", "sks"), ("manifest_diffs", "mdf"),
-    ("similar_pairs", "sim"), ("usage", "usg"), ("cleanup", "cln"),
-    ("has_skill_md", "hsm"), ("is_symlink", "isl"), ("issues", "iss"),
-    ("invocation_count", "inv"), ("reasons", "rsn"), ("token_estimate", "te"),
-    ("skill_a", "sa"), ("skill_b", "sb"), ("desc_a", "da"), ("desc_b", "db"),
-    ("annotations", "ann"), ("entity", "ety"), ("suggestion", "sug"),
-    ("columns", "cols"), ("row_count", "rc"), ("notnull", "nn"),
-    ("default_value", "dv"), ("replace_all", "ra"),
+    ("name", "n"),
+    ("kind", "k"),
+    ("file", "f"),
+    ("line", "l"),
+    ("path", "p"),
+    ("from", "fr"),
+    ("type", "ty"),
+    ("text", "tx"),
+    ("new", "nw"),
+    ("run", "r"),
+    ("use", "u"),
+    ("score", "sc"),
+    ("language", "la"),
+    ("status", "st"),
+    ("state", "stt"),
+    ("error", "err"),
+    ("errors", "ers"),
+    ("hops", "hp"),
+    ("tags", "tg"),
+    ("model", "ml"),
+    ("skill", "sk"),
+    ("count", "ct"),
+    ("total", "tot"),
+    ("column", "col"),
+    ("description", "dsc"),
+    ("end_line", "el"),
+    ("signature", "sig"),
+    ("parent_module", "pm"),
+    ("visibility", "vis"),
+    ("match_type", "mt"),
+    ("caller_file", "cf"),
+    ("caller_name", "cn"),
+    ("caller_line", "cl"),
+    ("callee_name", "en"),
+    ("call_site_line", "csl"),
+    ("members", "m"),
+    ("modularity", "q"),
+    ("modularity_contribution", "mc"),
+    ("iterations", "it"),
+    ("node_count", "nc"),
+    ("edge_count", "ec"),
+    ("community_count", "cc"),
+    ("communities", "cms"),
+    ("community", "cm"),
+    ("symbol", "s"),
+    ("symbols", "sy"),
+    ("definitions", "df"),
+    ("callers", "crs"),
+    ("callees", "ces"),
+    ("total_tracked", "tt"),
+    ("modified", "md"),
+    ("deleted", "dl"),
+    ("unchanged", "uc"),
+    ("changes", "ch"),
+    ("prune_stats", "ps"),
+    ("hits", "h"),
+    ("rank", "rk"),
+    ("snippet", "sn"),
+    ("confidence", "co"),
+    ("index", "ix"),
+    ("summaries", "sms"),
+    ("recommendations", "rec"),
+    ("total_files", "tf"),
+    ("stale_files", "sf"),
+    ("last_indexed_secs_ago", "age"),
+    ("cached_files", "caf"),
+    ("total_indexed_files", "tif"),
+    ("coverage_pct", "cov"),
+    ("symbol_name", "syn"),
+    ("file_path", "fp"),
+    ("content_hash", "hsh"),
+    ("summary", "sum"),
+    ("entities", "ent"),
+    ("relationships", "rel"),
+    ("concept_labels", "cls"),
+    ("extracted_at", "at"),
+    ("tokens_input", "ti"),
+    ("tokens_output", "tout"),
+    ("total_summaries", "ts"),
+    ("stale_count", "stc"),
+    ("total_tokens_input", "tti"),
+    ("total_tokens_output", "tto"),
+    ("estimated_tokens_saved", "ets"),
+    ("files_processed", "fps"),
+    ("symbols_extracted", "se"),
+    ("skills_dir", "sd"),
+    ("healthy", "ok"),
+    ("broken", "brk"),
+    ("skills", "sks"),
+    ("manifest_diffs", "mdf"),
+    ("similar_pairs", "sim"),
+    ("usage", "usg"),
+    ("cleanup", "cln"),
+    ("has_skill_md", "hsm"),
+    ("is_symlink", "isl"),
+    ("issues", "iss"),
+    ("invocation_count", "inv"),
+    ("reasons", "rsn"),
+    ("token_estimate", "te"),
+    ("skill_a", "sa"),
+    ("skill_b", "sb"),
+    ("desc_a", "da"),
+    ("desc_b", "db"),
+    ("annotations", "ann"),
+    ("entity", "ety"),
+    ("suggestion", "sug"),
+    ("columns", "cols"),
+    ("row_count", "rc"),
+    ("notnull", "nn"),
+    ("default_value", "dv"),
+    ("replace_all", "ra"),
 ];
 
 fn relativize(path: &str, root: &std::path::Path) -> String {
@@ -860,12 +1045,11 @@ fn relativize_json_inner(val: &mut serde_json::Value, prefix: &str) {
         }
         serde_json::Value::Object(map) => {
             for (k, v) in map.iter_mut() {
-                if JSON_PATH_KEYS.contains(&k.as_str()) {
-                    if let serde_json::Value::String(s) = v {
-                        if let Some(rest) = s.strip_prefix(prefix) {
-                            *s = rest.to_string();
-                        }
-                    }
+                if JSON_PATH_KEYS.contains(&k.as_str())
+                    && let serde_json::Value::String(s) = v
+                    && let Some(rest) = s.strip_prefix(prefix)
+                {
+                    *s = rest.to_string();
                 }
                 relativize_json_inner(v, prefix);
             }
@@ -990,7 +1174,14 @@ pub(crate) fn apply_edit_op(content: &str, op: &EditOp) -> Result<(String, usize
     Ok((replaced, count))
 }
 
-fn cmd_edit(dry_run: bool, file: Option<PathBuf>, compact: bool, pretty: bool, terse: bool, schema: bool) -> Result<()> {
+fn cmd_edit(
+    dry_run: bool,
+    file: Option<PathBuf>,
+    compact: bool,
+    pretty: bool,
+    terse: bool,
+    schema: bool,
+) -> Result<()> {
     let input = match file {
         Some(path) => fs::read_to_string(&path)
             .with_context(|| format!("reading edit file: {}", path.display()))?,
@@ -1075,12 +1266,17 @@ fn cmd_edit(dry_run: bool, file: Option<PathBuf>, compact: bool, pretty: bool, t
     } else {
         println!(
             "{}",
-            to_json_schema(&serde_json::json!({
-                "applied": ok_count,
-                "skipped": skip_count,
-                "errors": err_count,
-                "results": results,
-            }), pretty, terse, schema)?
+            to_json_schema(
+                &serde_json::json!({
+                    "applied": ok_count,
+                    "skipped": skip_count,
+                    "errors": err_count,
+                    "results": results,
+                }),
+                pretty,
+                terse,
+                schema
+            )?
         );
     }
 
@@ -1348,6 +1544,7 @@ fn cmd_index(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_graph(
     symbol: &str,
     path: &std::path::Path,
@@ -1404,7 +1601,10 @@ fn cmd_graph(
         } else if tabular {
             println!("direction\tname\tfile\tline");
             for edge in &edges {
-                println!("caller\t{}\t{}\t{}", edge.caller_name, edge.caller_file, edge.call_site_line);
+                println!(
+                    "caller\t{}\t{}\t{}",
+                    edge.caller_name, edge.caller_file, edge.call_site_line
+                );
             }
             if truncated {
                 println!("# (+{} more)", total - limit);
@@ -1469,7 +1669,10 @@ fn cmd_graph(
                 println!("direction\tname\tfile\tline");
             }
             for edge in &edges {
-                println!("callee\t{}\t{}\t{}", edge.callee_name, edge.caller_file, edge.call_site_line);
+                println!(
+                    "callee\t{}\t{}\t{}",
+                    edge.callee_name, edge.caller_file, edge.call_site_line
+                );
             }
             if truncated {
                 println!("# (+{} more)", total - limit);
@@ -1539,6 +1742,7 @@ fn cmd_graph(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_communities(
     path: &std::path::Path,
     scope: Option<&str>,
@@ -1598,7 +1802,12 @@ fn cmd_communities(
     } else if tabular {
         println!("id\tsize\tmembers");
         for (i, community) in display.iter().enumerate() {
-            println!("{}\t{}\t{}", i + 1, community.members.len(), community.members.join(","));
+            println!(
+                "{}\t{}\t{}",
+                i + 1,
+                community.members.len(),
+                community.members.join(",")
+            );
         }
         if truncated {
             println!("# (+{} more)", total - limit);
@@ -1606,11 +1815,7 @@ fn cmd_communities(
     } else if compact {
         println!(
             "comms n:{} e:{} iter:{} q:{:.4} cnt:{}",
-            result.node_count,
-            result.edge_count,
-            result.iterations,
-            result.modularity,
-            total
+            result.node_count, result.edge_count, result.iterations, result.modularity, total
         );
         if display.is_empty() {
             println!("  (none >= {})", min_size);
@@ -1652,7 +1857,10 @@ fn cmd_communities(
             }
             if truncated {
                 println!();
-                println!("  (+{} more communities, use --limit 0 to show all)", total - limit);
+                println!(
+                    "  (+{} more communities, use --limit 0 to show all)",
+                    total - limit
+                );
             }
         }
     }
@@ -1678,6 +1886,7 @@ fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::I
     index::IndexDb::open(&db_path)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_path(
     from: &str,
     to: &str,
@@ -1723,12 +1932,17 @@ fn cmd_path(
             if json_output {
                 println!(
                     "{}",
-                    to_json_schema(&serde_json::json!({
-                        "from": from,
-                        "to": to,
-                        "path": null,
-                        "hops": null,
-                    }), pretty, terse, schema)?
+                    to_json_schema(
+                        &serde_json::json!({
+                            "from": from,
+                            "to": to,
+                            "path": null,
+                            "hops": null,
+                        }),
+                        pretty,
+                        terse,
+                        schema
+                    )?
                 );
             } else if compact {
                 println!("no path {} -> {}", from, to);
@@ -1740,6 +1954,7 @@ fn cmd_path(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_explain(
     symbol: &str,
     path: &std::path::Path,
@@ -1802,14 +2017,22 @@ fn cmd_explain(
         if !symbols.is_empty() {
             println!("section\tkind\tname\tfile\tline");
             for sym in &symbols {
-                println!("def\t{}\t{}\t{}\t{}", sym.kind, sym.name, sym.file, sym.line);
+                println!(
+                    "def\t{}\t{}\t{}\t{}",
+                    sym.kind, sym.name, sym.file, sym.line
+                );
             }
         }
         if !callers.is_empty() {
-            if !symbols.is_empty() { println!(); }
+            if !symbols.is_empty() {
+                println!();
+            }
             println!("direction\tname\tfile\tline");
             for edge in &callers {
-                println!("caller\t{}\t{}\t{}", edge.caller_name, edge.caller_file, edge.call_site_line);
+                println!(
+                    "caller\t{}\t{}\t{}",
+                    edge.caller_name, edge.caller_file, edge.call_site_line
+                );
             }
             if callers_truncated {
                 println!("# (+{} more callers)", callers_total - limit);
@@ -1817,7 +2040,10 @@ fn cmd_explain(
         }
         if !callees.is_empty() {
             for edge in &callees {
-                println!("callee\t{}\t{}\t{}", edge.callee_name, edge.caller_file, edge.call_site_line);
+                println!(
+                    "callee\t{}\t{}\t{}",
+                    edge.callee_name, edge.caller_file, edge.call_site_line
+                );
             }
             if callees_truncated {
                 println!("# (+{} more callees)", callees_total - limit);
@@ -1825,7 +2051,11 @@ fn cmd_explain(
         }
         if let Some(comm) = community {
             println!();
-            println!("community\t{}\t{}", comm.members.len(), comm.members.join(","));
+            println!(
+                "community\t{}\t{}",
+                comm.members.len(),
+                comm.members.join(",")
+            );
         }
     } else if compact {
         if symbols.is_empty() {
@@ -1834,7 +2064,10 @@ fn cmd_explain(
             for sym in &symbols {
                 println!(
                     "sym: {} ({}) {}:{}",
-                    sym.name, abbreviate_kind(&sym.kind), sym.file, sym.line
+                    sym.name,
+                    abbreviate_kind(&sym.kind),
+                    sym.file,
+                    sym.line
                 );
             }
         }
@@ -1894,7 +2127,10 @@ fn cmd_explain(
                 );
             }
             if callers_truncated {
-                println!("  (+{} more, use --limit 0 to show all)", callers_total - limit);
+                println!(
+                    "  (+{} more, use --limit 0 to show all)",
+                    callers_total - limit
+                );
             }
         }
         println!();
@@ -1910,7 +2146,10 @@ fn cmd_explain(
                 );
             }
             if callees_truncated {
-                println!("  (+{} more, use --limit 0 to show all)", callees_total - limit);
+                println!(
+                    "  (+{} more, use --limit 0 to show all)",
+                    callees_total - limit
+                );
             }
         }
 
@@ -1926,6 +2165,7 @@ fn cmd_explain(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_audit(
     skills_dir: &str,
     manifest: Option<PathBuf>,
@@ -2295,7 +2535,14 @@ fn cmd_summarize(
     bail!("specify a symbol, --file, --extract, or --stats");
 }
 
-fn cmd_status(path: &std::path::Path, json_output: bool, compact: bool, pretty: bool, terse: bool, schema: bool) -> Result<()> {
+fn cmd_status(
+    path: &std::path::Path,
+    json_output: bool,
+    compact: bool,
+    pretty: bool,
+    terse: bool,
+    schema: bool,
+) -> Result<()> {
     let root = path
         .canonicalize()
         .with_context(|| format!("resolving path: {}", path.display()))?;
@@ -2356,6 +2603,158 @@ fn find_symbols_db(root: &std::path::Path) -> Option<PathBuf> {
     None
 }
 
+#[derive(Debug, Clone)]
+struct SearchIndexTarget {
+    label: String,
+    db_path: PathBuf,
+    source_root: PathBuf,
+    reindex_cmd: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchIndexState {
+    Missing,
+    Fresh,
+    Stale { stale_files: usize },
+}
+
+fn find_scoped_search_path(root: &Path, scope_name: &str) -> Result<Option<PathBuf>> {
+    Ok(config::Config::submodule_dirs(root)?
+        .into_iter()
+        .find(|(name, _)| name == scope_name)
+        .map(|(_, path)| path))
+}
+
+fn resolve_search_index_targets(
+    root: &Path,
+    scope: Option<&str>,
+    federated: bool,
+) -> Result<Vec<SearchIndexTarget>> {
+    if let Some(scope_name) = scope {
+        let Some(source_root) = find_scoped_search_path(root, scope_name)? else {
+            return Ok(Vec::new());
+        };
+        let cfg = config::Config::load(root)?;
+        return Ok(vec![SearchIndexTarget {
+            label: format!("submodule `{}` index", scope_name),
+            db_path: cfg.db_path_for(root, scope_name),
+            source_root,
+            reindex_cmd: format!("tsift index --submodule {} {}", scope_name, root.display()),
+        }]);
+    }
+
+    if federated {
+        let cfg = config::Config::load(root)?;
+        let mut targets = Vec::new();
+        for (name, source_root) in config::Config::submodule_dirs(root)? {
+            if !cfg.federation_for(&name) {
+                continue;
+            }
+            targets.push(SearchIndexTarget {
+                label: format!("submodule `{}` index", name),
+                db_path: cfg.db_path_for(root, &name),
+                source_root,
+                reindex_cmd: format!("tsift index --workspace {}", root.display()),
+            });
+        }
+        return Ok(targets);
+    }
+
+    Ok(vec![SearchIndexTarget {
+        label: "index".to_string(),
+        db_path: root.join(".tsift/index.db"),
+        source_root: root.to_path_buf(),
+        reindex_cmd: format!("tsift index {}", root.display()),
+    }])
+}
+
+fn inspect_search_index(target: &SearchIndexTarget) -> Result<SearchIndexState> {
+    if !target.source_root.exists() || !target.db_path.exists() {
+        return Ok(SearchIndexState::Missing);
+    }
+
+    let db = index::IndexDb::open(&target.db_path)?;
+    let summary = db.compute_changes(&target.source_root)?;
+    let stale_files = summary.new + summary.modified + summary.deleted;
+    if stale_files == 0 {
+        Ok(SearchIndexState::Fresh)
+    } else {
+        Ok(SearchIndexState::Stale { stale_files })
+    }
+}
+
+fn apply_search_index_update(target: &SearchIndexTarget) -> Result<()> {
+    let db = index::IndexDb::open(&target.db_path)?;
+    db.apply_changes(&target.source_root)?;
+    Ok(())
+}
+
+fn precheck_search_indexes(
+    root: &Path,
+    scope: Option<&str>,
+    federated: bool,
+    autoindex: bool,
+) -> Result<()> {
+    let targets = resolve_search_index_targets(root, scope, federated)?;
+    let mut stale_targets: Vec<(String, usize, String)> = Vec::new();
+
+    for target in targets {
+        match inspect_search_index(&target)? {
+            SearchIndexState::Missing => {
+                if autoindex {
+                    apply_search_index_update(&target)
+                        .with_context(|| format!("autoindexing {}", target.label))?;
+                }
+            }
+            SearchIndexState::Fresh => {}
+            SearchIndexState::Stale { stale_files } => {
+                if autoindex {
+                    apply_search_index_update(&target)
+                        .with_context(|| format!("autoindexing {}", target.label))?;
+                } else {
+                    stale_targets.push((target.label, stale_files, target.reindex_cmd));
+                }
+            }
+        }
+    }
+
+    if stale_targets.is_empty() {
+        return Ok(());
+    }
+
+    if stale_targets.len() == 1 {
+        let (label, stale_files, reindex_cmd) = &stale_targets[0];
+        let file_suffix = if *stale_files == 1 { "" } else { "s" };
+        bail!(
+            "tsift search aborted: {} is stale ({} file{}). \
+             Run `{}` or re-run with `--autoindex`.",
+            label,
+            stale_files,
+            file_suffix,
+            reindex_cmd,
+        );
+    }
+
+    let summary: Vec<String> = stale_targets
+        .iter()
+        .take(3)
+        .map(|(label, stale_files, _)| format!("{} ({})", label, stale_files))
+        .collect();
+    let overflow = stale_targets.len().saturating_sub(summary.len());
+    let mut details = summary.join(", ");
+    if overflow > 0 {
+        details.push_str(&format!(", +{} more", overflow));
+    }
+    let reindex_cmd = format!("tsift index --workspace {}", root.display());
+    bail!(
+        "tsift search aborted: {} indexes are stale: {}. \
+         Run `{}` or re-run with `--autoindex`.",
+        stale_targets.len(),
+        details,
+        reindex_cmd,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_search(
     query: String,
@@ -2365,6 +2764,7 @@ fn cmd_search(
     scope: Option<String>,
     federated: bool,
     json_output: bool,
+    autoindex: bool,
     timeout_secs: u64,
     compact: bool,
     pretty: bool,
@@ -2374,9 +2774,12 @@ fn cmd_search(
     schema: bool,
 ) -> Result<()> {
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
+    let root = base_path
+        .canonicalize()
+        .with_context(|| format!("resolving path: {}", base_path.display()))?;
+    precheck_search_indexes(&root, scope.as_deref(), federated, autoindex)?;
 
     let (symbol_hits, sift_path) = if let Some(ref scope_name) = scope {
-        let root = base_path.canonicalize().unwrap_or(base_path.clone());
         let cfg = config::Config::load(&root)?;
         let db_path = cfg.db_path_for(&root, scope_name);
         let hits = if db_path.exists() {
@@ -2385,30 +2788,21 @@ fn cmd_search(
         } else {
             Vec::new()
         };
-        let sub_path = config::Config::submodule_dirs(&root)?
-            .into_iter()
-            .find(|(name, _)| name == scope_name)
-            .map(|(_, p)| p)
-            .unwrap_or(base_path.clone());
+        let sub_path = find_scoped_search_path(&root, scope_name)?.unwrap_or_else(|| root.clone());
         (hits, sub_path)
     } else if federated {
-        let root = base_path.canonicalize().unwrap_or(base_path.clone());
-        (
-            federated_symbol_search(&root, &query, limit)?,
-            base_path.clone(),
-        )
+        (federated_symbol_search(&root, &query, limit)?, root.clone())
     } else {
-        let db_path = base_path.join(".tsift/index.db");
+        let db_path = root.join(".tsift/index.db");
         let hits = if db_path.exists() {
             let db = index::IndexDb::open(&db_path)?;
             db.symbol_search(&query, limit)?
         } else {
             Vec::new()
         };
-        (hits, base_path.clone())
+        (hits, root.clone())
     };
 
-    let root = base_path.canonicalize().unwrap_or(base_path.clone());
     let mut symbol_hits = symbol_hits;
     if !absolute {
         relativize_symbol_hits(&mut symbol_hits, &root);
@@ -2444,7 +2838,11 @@ fn cmd_search(
             for hit in &symbol_hits {
                 println!(
                     "{}\t{}\t{}\t{}\t{}\t{}",
-                    hit.match_type, hit.kind, hit.name, hit.file, hit.line,
+                    hit.match_type,
+                    hit.kind,
+                    hit.name,
+                    hit.file,
+                    hit.line,
                     format_score(hit.score, true)
                 );
             }
@@ -2455,10 +2853,17 @@ fn cmd_search(
             }
             println!("rank\tpath\tconfidence\tscore");
             for hit in &response.hits {
-                let hp = if absolute { hit.path.clone() } else { relativize(&hit.path, &root) };
+                let hp = if absolute {
+                    hit.path.clone()
+                } else {
+                    relativize(&hit.path, &root)
+                };
                 println!(
                     "{}\t{}\t{:?}\t{}",
-                    hit.rank, hp, hit.confidence, format_score(hit.score, true)
+                    hit.rank,
+                    hp,
+                    hit.confidence,
+                    format_score(hit.score, true)
                 );
             }
         }
@@ -2484,7 +2889,11 @@ fn cmd_search(
 
         println!("hits[{}]:", response.hits.len());
         for hit in &response.hits {
-            let hp = if absolute { hit.path.clone() } else { relativize(&hit.path, &root) };
+            let hp = if absolute {
+                hit.path.clone()
+            } else {
+                relativize(&hit.path, &root)
+            };
             let snippet = compact_snippet(&hit.snippet).unwrap_or_default();
             if snippet.is_empty() {
                 println!(
@@ -2533,7 +2942,11 @@ fn cmd_search(
         );
         println!();
         for hit in &response.hits {
-            let hp = if absolute { hit.path.clone() } else { relativize(&hit.path, &root) };
+            let hp = if absolute {
+                hit.path.clone()
+            } else {
+                relativize(&hit.path, &root)
+            };
             println!(
                 "  #{} [{:?}] {} (score: {:.4})",
                 hit.rank, hit.confidence, hp, hit.score
@@ -2627,6 +3040,7 @@ fn cmd_init(path: &std::path::Path, codex: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_lint(
     file: &str,
     index: Option<PathBuf>,
@@ -3043,7 +3457,21 @@ mod tests {
     #[test]
     fn graph_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_graph("main", dir.path(), false, false, None, 20, false, false, false, false, false, false, false);
+        let result = cmd_graph(
+            "main",
+            dir.path(),
+            false,
+            false,
+            None,
+            20,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(result.is_err());
     }
 
@@ -3332,7 +3760,18 @@ tier = "isolated"
     #[test]
     fn community_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_communities(dir.path(), None, 2, 10, false, false, false, false, false, false);
+        let result = cmd_communities(
+            dir.path(),
+            None,
+            2,
+            10,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(result.is_err());
     }
 
@@ -3360,7 +3799,17 @@ tier = "isolated"
     #[test]
     fn path_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_path("a", "b", dir.path(), None, false, false, false, false, false);
+        let result = cmd_path(
+            "a",
+            "b",
+            dir.path(),
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(result.is_err());
     }
 
@@ -3379,8 +3828,143 @@ tier = "isolated"
     #[test]
     fn explain_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_explain("main", dir.path(), None, 15, false, false, false, false, false, false, false);
+        let result = cmd_explain(
+            "main",
+            dir.path(),
+            None,
+            15,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn search_cmd_fails_fast_when_index_is_stale() {
+        let dir = setup_graph_index();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() { println!(\"updated\"); }\nfn main() { helper(); Vec::new(); }",
+        )
+        .unwrap();
+
+        let err = cmd_search(
+            "helper".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            None,
+            false,
+            false,
+            false,
+            30,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("search aborted"));
+        assert!(err.to_string().contains("index is stale"));
+    }
+
+    #[test]
+    fn search_cmd_autoindexes_stale_index() {
+        let dir = setup_graph_index();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() { println!(\"updated\"); }\nfn main() { helper(); Vec::new(); }",
+        )
+        .unwrap();
+
+        let result = cmd_search(
+            "helper".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            None,
+            false,
+            false,
+            true,
+            30,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let summary = db.compute_changes(dir.path()).unwrap();
+        assert_eq!(summary.new + summary.modified + summary.deleted, 0);
+    }
+
+    #[test]
+    fn scoped_search_cmd_autoindexes_stale_submodule_index() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let alpha = dir.path().join("src/alpha/lib.rs");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            &alpha,
+            "fn alpha_helper() { println!(\"updated\"); }\nfn alpha_main() { alpha_helper(); }",
+        )
+        .unwrap();
+
+        let result = cmd_search(
+            "alpha_helper".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            Some("alpha".to_string()),
+            false,
+            false,
+            true,
+            30,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+
+        let cfg = config::Config::load(dir.path()).unwrap();
+        let db = index::IndexDb::open(&cfg.db_path_for(dir.path(), "alpha")).unwrap();
+        let summary = db.compute_changes(&dir.path().join("src/alpha")).unwrap();
+        assert_eq!(summary.new + summary.modified + summary.deleted, 0);
     }
 
     // --- search timeout ---
@@ -3501,7 +4085,11 @@ tier = "isolated"
         let val = serde_json::json!({"a": 1, "b": [2, 3]});
         let compact = to_json(&val, false, false).unwrap();
         assert!(!compact.contains('\n'));
-        assert!(compact.contains("\"a\":1") || compact.contains("\"a\": 1") || compact.contains("\"a\":"));
+        assert!(
+            compact.contains("\"a\":1")
+                || compact.contains("\"a\": 1")
+                || compact.contains("\"a\":")
+        );
     }
 
     #[test]
@@ -3514,7 +4102,8 @@ tier = "isolated"
 
     #[test]
     fn to_json_compact_is_shorter() {
-        let val = serde_json::json!({"name": "test", "items": [1, 2, 3], "nested": {"key": "value"}});
+        let val =
+            serde_json::json!({"name": "test", "items": [1, 2, 3], "nested": {"key": "value"}});
         let compact = to_json(&val, false, false).unwrap();
         let pretty = to_json(&val, true, false).unwrap();
         assert!(compact.len() < pretty.len());
@@ -3522,7 +4111,8 @@ tier = "isolated"
 
     #[test]
     fn terse_renames_keys() {
-        let val = serde_json::json!({"caller_file": "a.rs", "caller_name": "main", "call_site_line": 10});
+        let val =
+            serde_json::json!({"caller_file": "a.rs", "caller_name": "main", "call_site_line": 10});
         let result = to_json(&val, false, true).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["_s"].is_object());
@@ -3630,6 +4220,15 @@ tier = "isolated"
         assert!(matches!(cli.command, Some(Commands::Search { .. })));
     }
 
+    #[test]
+    fn cli_search_accepts_autoindex_flag() {
+        let cli = Cli::parse_from(["tsift", "search", "test", "--autoindex"]);
+        match cli.command {
+            Some(Commands::Search { autoindex, .. }) => assert!(autoindex),
+            _ => panic!("expected Search command"),
+        }
+    }
+
     // --- relativize paths ---
 
     #[test]
@@ -3670,13 +4269,19 @@ tier = "isolated"
     #[test]
     fn relativize_strips_root_prefix() {
         let root = std::path::Path::new("/home/user/project");
-        assert_eq!(relativize("/home/user/project/src/main.rs", root), "src/main.rs");
+        assert_eq!(
+            relativize("/home/user/project/src/main.rs", root),
+            "src/main.rs"
+        );
     }
 
     #[test]
     fn relativize_leaves_non_matching_path() {
         let root = std::path::Path::new("/home/user/project");
-        assert_eq!(relativize("/other/path/file.rs", root), "/other/path/file.rs");
+        assert_eq!(
+            relativize("/other/path/file.rs", root),
+            "/other/path/file.rs"
+        );
     }
 
     #[test]
@@ -3790,35 +4395,100 @@ tier = "isolated"
     #[test]
     fn graph_cmd_limit_runs_ok() {
         let dir = setup_graph_index();
-        let result = cmd_graph("main", dir.path(), false, false, None, 1, false, false, false, false, false, false, false);
+        let result = cmd_graph(
+            "main",
+            dir.path(),
+            false,
+            false,
+            None,
+            1,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(result.is_ok());
     }
 
     #[test]
     fn graph_cmd_unlimited_runs_ok() {
         let dir = setup_graph_index();
-        let result = cmd_graph("main", dir.path(), false, false, None, 0, false, false, false, false, false, false, false);
+        let result = cmd_graph(
+            "main",
+            dir.path(),
+            false,
+            false,
+            None,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(result.is_ok());
     }
 
     #[test]
     fn graph_cmd_tabular_runs_ok() {
         let dir = setup_graph_index();
-        let result = cmd_graph("main", dir.path(), false, false, None, 20, false, false, false, false, false, true, false);
+        let result = cmd_graph(
+            "main",
+            dir.path(),
+            false,
+            false,
+            None,
+            20,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
         assert!(result.is_ok());
     }
 
     #[test]
     fn communities_cmd_tabular_runs_ok() {
         let dir = setup_graph_index();
-        let result = cmd_communities(dir.path(), None, 1, 10, false, false, false, false, true, false);
+        let result = cmd_communities(
+            dir.path(),
+            None,
+            1,
+            10,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
         assert!(result.is_ok());
     }
 
     #[test]
     fn explain_cmd_tabular_runs_ok() {
         let dir = setup_graph_index();
-        let result = cmd_explain("main", dir.path(), None, 15, false, false, false, false, false, true, false);
+        let result = cmd_explain(
+            "main",
+            dir.path(),
+            None,
+            15,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
         assert!(result.is_ok());
     }
 }
@@ -3927,6 +4597,7 @@ pub(crate) fn execute_query(
     Ok((col_names, rows))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_sql(
     db_path: &std::path::Path,
     query: Option<String>,
