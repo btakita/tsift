@@ -141,9 +141,7 @@ fn build_recommendations(index: &IndexStatus, summaries: &SummaryStatus) -> Reco
             use_commands: vec![],
             run: Some("tsift index .".to_string()),
         },
-        IndexStatus::Stale {
-            stale_files, ..
-        } => {
+        IndexStatus::Stale { stale_files, .. } => {
             let mut use_cmds = vec![
                 "search".to_string(),
                 "explain".to_string(),
@@ -185,9 +183,7 @@ fn build_recommendations(index: &IndexStatus, summaries: &SummaryStatus) -> Reco
                         None
                     }
                 }
-                SummaryStatus::None => {
-                    Some("tsift summarize --extract src/".to_string())
-                }
+                SummaryStatus::None => Some("tsift summarize --extract src/".to_string()),
                 SummaryStatus::Unavailable => None,
             };
             Recommendations {
@@ -210,7 +206,7 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
-pub fn format_human(report: &StatusReport) -> String {
+pub fn format_human(report: &StatusReport, compact: bool) -> String {
     let mut out = String::new();
 
     match &report.index {
@@ -222,23 +218,40 @@ pub fn format_human(report: &StatusReport) -> String {
             last_indexed_secs_ago,
             ..
         } => {
-            out.push_str(&format!(
-                "index: fresh (last indexed {}, {} files tracked)\n",
-                format_duration(*last_indexed_secs_ago),
-                total_files
-            ));
+            if compact {
+                out.push_str(&format!(
+                    "index: fresh tracked:{} age:{}\n",
+                    total_files,
+                    format_duration(*last_indexed_secs_ago)
+                ));
+            } else {
+                out.push_str(&format!(
+                    "index: fresh (last indexed {}, {} files tracked)\n",
+                    format_duration(*last_indexed_secs_ago),
+                    total_files
+                ));
+            }
         }
         IndexStatus::Stale {
             total_files,
             stale_files,
             last_indexed_secs_ago,
         } => {
-            out.push_str(&format!(
-                "index: stale (last indexed {}, {} files tracked, {} stale)\n",
-                format_duration(*last_indexed_secs_ago),
-                total_files,
-                stale_files
-            ));
+            if compact {
+                out.push_str(&format!(
+                    "index: stale tracked:{} stale:{} age:{}\n",
+                    total_files,
+                    stale_files,
+                    format_duration(*last_indexed_secs_ago)
+                ));
+            } else {
+                out.push_str(&format!(
+                    "index: stale (last indexed {}, {} files tracked, {} stale)\n",
+                    format_duration(*last_indexed_secs_ago),
+                    total_files,
+                    stale_files
+                ));
+            }
         }
     }
 
@@ -248,10 +261,17 @@ pub fn format_human(report: &StatusReport) -> String {
             total_indexed_files,
             coverage_pct,
         } => {
-            out.push_str(&format!(
-                "summaries: {}/{} files cached ({}%)\n",
-                cached_files, total_indexed_files, coverage_pct
-            ));
+            if compact {
+                out.push_str(&format!(
+                    "summaries: {}/{} ({}%)\n",
+                    cached_files, total_indexed_files, coverage_pct
+                ));
+            } else {
+                out.push_str(&format!(
+                    "summaries: {}/{} files cached ({}%)\n",
+                    cached_files, total_indexed_files, coverage_pct
+                ));
+            }
         }
         SummaryStatus::None => {
             out.push_str("summaries: none\n");
@@ -261,17 +281,31 @@ pub fn format_human(report: &StatusReport) -> String {
         }
     }
 
-    out.push_str("recommendations:\n");
-    if report.recommendations.use_commands.is_empty() {
-        out.push_str("  use: (none — run tsift index first)\n");
+    if compact {
+        if report.recommendations.use_commands.is_empty() {
+            out.push_str("use: none\n");
+        } else {
+            out.push_str(&format!(
+                "use: {}\n",
+                report.recommendations.use_commands.join(", ")
+            ));
+        }
+        if let Some(run) = &report.recommendations.run {
+            out.push_str(&format!("run: {}\n", run));
+        }
     } else {
-        out.push_str(&format!(
-            "  use: {}\n",
-            report.recommendations.use_commands.join(", ")
-        ));
-    }
-    if let Some(run) = &report.recommendations.run {
-        out.push_str(&format!("  run: {}\n", run));
+        out.push_str("recommendations:\n");
+        if report.recommendations.use_commands.is_empty() {
+            out.push_str("  use: (none — run tsift index first)\n");
+        } else {
+            out.push_str(&format!(
+                "  use: {}\n",
+                report.recommendations.use_commands.join(", ")
+            ));
+        }
+        if let Some(run) = &report.recommendations.run {
+            out.push_str(&format!("  run: {}\n", run));
+        }
     }
 
     out
@@ -289,10 +323,7 @@ mod tests {
         assert!(matches!(report.index, IndexStatus::Missing));
         assert!(matches!(report.summaries, SummaryStatus::Unavailable));
         assert!(report.recommendations.use_commands.is_empty());
-        assert_eq!(
-            report.recommendations.run.as_deref(),
-            Some("tsift index .")
-        );
+        assert_eq!(report.recommendations.run.as_deref(), Some("tsift index ."));
     }
 
     #[test]
@@ -305,10 +336,7 @@ mod tests {
         let report = check_status(dir.path()).unwrap();
         assert!(matches!(
             report.index,
-            IndexStatus::Fresh {
-                stale_files: 0,
-                ..
-            }
+            IndexStatus::Fresh { stale_files: 0, .. }
         ));
         assert!(matches!(report.summaries, SummaryStatus::None));
         let cmds = &report.recommendations.use_commands;
@@ -328,8 +356,18 @@ mod tests {
         std::fs::write(dir.path().join("lib.rs"), "fn helper() {}").unwrap();
 
         let report = check_status(dir.path()).unwrap();
-        assert!(matches!(report.index, IndexStatus::Stale { stale_files: 1, .. }));
-        assert!(report.recommendations.run.as_deref().unwrap().contains("tsift index"));
+        assert!(matches!(
+            report.index,
+            IndexStatus::Stale { stale_files: 1, .. }
+        ));
+        assert!(
+            report
+                .recommendations
+                .run
+                .as_deref()
+                .unwrap()
+                .contains("tsift index")
+        );
     }
 
     #[test]
@@ -353,12 +391,18 @@ mod tests {
             model: "test".to_string(),
             tokens_input: Some(100),
             tokens_output: Some(50),
-        }).unwrap();
+        })
+        .unwrap();
 
         let report = check_status(dir.path()).unwrap();
         assert!(matches!(report.index, IndexStatus::Fresh { .. }));
         assert!(matches!(report.summaries, SummaryStatus::Available { .. }));
-        assert!(report.recommendations.use_commands.contains(&"summarize".to_string()));
+        assert!(
+            report
+                .recommendations
+                .use_commands
+                .contains(&"summarize".to_string())
+        );
     }
 
     #[test]
@@ -380,7 +424,7 @@ mod tests {
                 run: Some("tsift index .".to_string()),
             },
         };
-        let output = format_human(&report);
+        let output = format_human(&report, false);
         assert!(output.contains("index: missing"));
         assert!(output.contains("summaries: unavailable"));
         assert!(output.contains("use: (none"));
@@ -410,10 +454,34 @@ mod tests {
                 run: None,
             },
         };
-        let output = format_human(&report);
+        let output = format_human(&report, false);
         assert!(output.contains("index: fresh"));
         assert!(output.contains("42 files"));
         assert!(output.contains("30/42 files cached (71%)"));
         assert!(output.contains("use: search, explain, graph, summarize"));
+    }
+
+    #[test]
+    fn status_human_format_compact() {
+        let report = StatusReport {
+            index: IndexStatus::Stale {
+                total_files: 42,
+                stale_files: 3,
+                last_indexed_secs_ago: 120,
+            },
+            summaries: SummaryStatus::None,
+            recommendations: Recommendations {
+                use_commands: vec![
+                    "search".to_string(),
+                    "explain".to_string(),
+                    "graph".to_string(),
+                ],
+                run: Some("tsift index .".to_string()),
+            },
+        };
+        let output = format_human(&report, true);
+        assert!(output.contains("index: stale tracked:42 stale:3"));
+        assert!(output.contains("use: search, explain, graph"));
+        assert!(!output.contains("recommendations:"));
     }
 }

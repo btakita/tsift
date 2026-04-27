@@ -1,6 +1,6 @@
 # tsift
 
-Token-efficient CLI plugin for Claude Code — AST-aware search, call-graph queries, batch editing, SQL introspection, and model routing.
+Token-efficient CLI for code agents — AST-aware search, call-graph queries, batch editing, SQL introspection, and model routing.
 
 ## Architecture
 
@@ -22,7 +22,9 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift summarize` | Cached LLM analysis: pre-computed summaries, entities, relationships. `--extract <path>` / `--extract --diff` / `--file <path>` / `--stats` / `--json` |
 | `tsift lint` | Markdown lint: detect unannotated concepts (symbols, headings, bold terms) cross-referenced against graph entities. `--index <dir>` / `--entities-from <file>` / `--json` |
 | `tsift status` | Session health check: index freshness, summary cache, recommended commands. `--json` for structured output |
-| `tsift init` | Project setup: inject Code Navigation section into AGENTS.md/CLAUDE.md. Idempotent — safe to re-run after upgrades. |
+| `tsift init` | Project setup: ensure Code Navigation section in AGENTS.md and mirror it into CLAUDE.md when present. Idempotent — safe to re-run after upgrades. |
+
+Global human-output flag: `--compact` works across commands to reduce prose, blank lines, and verbose lists. It does not change normal `--json` formatting.
 
 ## Graph Module (`src/graph.rs`)
 
@@ -74,3 +76,15 @@ cargo install --path .   # install to ~/.cargo/bin/
 ## Repo
 
 Private: `github.com/btakita/tsift`. Submodule at `src/tsift` in agent-loop.
+
+<!-- tsift:code-navigation -->
+## Code Navigation
+
+Run `tsift status` at session start. Use the commands listed in its `use:` output:
+- `tsift search <query>` — AST-aware hybrid search (prefer over grep/rg)
+- `tsift explain <symbol>` — callers, callees, community context
+- `tsift graph <symbol> --callers` / `--callees` — call graph navigation
+- `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
+
+Only read full source files when tsift results are insufficient.
+<!-- /tsift:code-navigation -->

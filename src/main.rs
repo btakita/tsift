@@ -3,24 +3,33 @@ use clap::{Parser, Subcommand};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sift::{SearchInput, SearchOptions, Sift};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read as _;
 use std::path::PathBuf;
 
 pub mod audit;
-pub mod init;
-pub mod lint;
 pub mod config;
 pub mod graph;
 pub mod index;
+pub mod init;
 mod lang;
+pub mod lint;
 pub mod status;
 pub mod summarize;
 pub mod walk;
 
 #[derive(Parser)]
-#[command(name = "tsift", version, about = "Token-efficient search for Claude Code")]
+#[command(
+    name = "tsift",
+    version,
+    about = "Token-efficient search for Claude Code"
+)]
 struct Cli {
+    /// Reduce human-readable output volume across commands
+    #[arg(long, global = true)]
+    compact: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -219,7 +228,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Initialize tsift in a project — inject Code Navigation section into AGENTS.md/CLAUDE.md
+    /// Initialize tsift in a project — ensure Code Navigation in AGENTS.md and CLAUDE.md
     Init {
         /// Path to the project directory (defaults to current directory)
         #[arg(default_value = ".")]
@@ -297,6 +306,7 @@ enum EditStatus {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let compact = cli.compact;
     match cli.command {
         Some(Commands::Search {
             query,
@@ -307,21 +317,100 @@ fn main() -> Result<()> {
             federated,
             json,
             timeout,
-        }) => cmd_search(query, path, limit, strategy, scope, federated, json, timeout),
-        Some(Commands::Edit { dry_run, file }) => cmd_edit(dry_run, file),
-        Some(Commands::Index { path, rebuild, check, exit_code, prune, quiet, workspace, submodule, json }) => cmd_index(&path, rebuild, check, exit_code, prune, quiet, workspace, submodule.as_deref(), json),
+        }) => cmd_search(
+            query, path, limit, strategy, scope, federated, json, timeout, compact,
+        ),
+        Some(Commands::Edit { dry_run, file }) => cmd_edit(dry_run, file, compact),
+        Some(Commands::Index {
+            path,
+            rebuild,
+            check,
+            exit_code,
+            prune,
+            quiet,
+            workspace,
+            submodule,
+            json,
+        }) => cmd_index(
+            &path,
+            rebuild,
+            check,
+            exit_code,
+            prune,
+            quiet,
+            workspace,
+            submodule.as_deref(),
+            json,
+            compact,
+        ),
         Some(Commands::Rewrite { command }) => cmd_rewrite(&command),
         Some(Commands::Route { task, id }) => cmd_route(&task, id),
-        Some(Commands::Graph { symbol, path, callers, callees, scope, json }) => cmd_graph(&symbol, &path, callers, callees, scope.as_deref(), json),
-        Some(Commands::Sql { db, query, table, json }) => cmd_sql(&db, query, table, json),
-        Some(Commands::Communities { path, scope, min_size, json }) => cmd_communities(&path, scope.as_deref(), min_size, json),
-        Some(Commands::Path { from, to, path, scope, json }) => cmd_path(&from, &to, &path, scope.as_deref(), json),
-        Some(Commands::Explain { symbol, path, scope, json }) => cmd_explain(&symbol, &path, scope.as_deref(), json),
-        Some(Commands::Audit { skills_dir, manifest, usage, cleanup, report, json }) => cmd_audit(&skills_dir, manifest, usage, cleanup, report, json),
+        Some(Commands::Graph {
+            symbol,
+            path,
+            callers,
+            callees,
+            scope,
+            json,
+        }) => cmd_graph(
+            &symbol,
+            &path,
+            callers,
+            callees,
+            scope.as_deref(),
+            json,
+            compact,
+        ),
+        Some(Commands::Sql {
+            db,
+            query,
+            table,
+            json,
+        }) => cmd_sql(&db, query, table, json, compact),
+        Some(Commands::Communities {
+            path,
+            scope,
+            min_size,
+            json,
+        }) => cmd_communities(&path, scope.as_deref(), min_size, json, compact),
+        Some(Commands::Path {
+            from,
+            to,
+            path,
+            scope,
+            json,
+        }) => cmd_path(&from, &to, &path, scope.as_deref(), json, compact),
+        Some(Commands::Explain {
+            symbol,
+            path,
+            scope,
+            json,
+        }) => cmd_explain(&symbol, &path, scope.as_deref(), json, compact),
+        Some(Commands::Audit {
+            skills_dir,
+            manifest,
+            usage,
+            cleanup,
+            report,
+            json,
+        }) => cmd_audit(&skills_dir, manifest, usage, cleanup, report, json, compact),
         Some(Commands::Init { path }) => cmd_init(&path),
-        Some(Commands::Lint { file, index, entities_from, json }) => cmd_lint(&file, index, entities_from, json),
-        Some(Commands::Summarize { symbol, file, extract, diff, stats, path, json }) => cmd_summarize(symbol, file, extract, diff, stats, &path, json),
-        Some(Commands::Status { path, json }) => cmd_status(&path, json),
+        Some(Commands::Lint {
+            file,
+            index,
+            entities_from,
+            json,
+        }) => cmd_lint(&file, index, entities_from, json, compact),
+        Some(Commands::Summarize {
+            symbol,
+            file,
+            extract,
+            diff,
+            stats,
+            path,
+            json,
+        }) => cmd_summarize(symbol, file, extract, diff, stats, &path, json, compact),
+        Some(Commands::Status { path, json }) => cmd_status(&path, json, compact),
         None => {
             println!("tsift v{}", env!("CARGO_PKG_VERSION"));
             println!("Run `tsift --help` for usage.");
@@ -335,13 +424,37 @@ fn main() -> Result<()> {
 pub fn classify_task(task: &str) -> (&'static str, &'static str) {
     let lower = task.to_lowercase();
     // Architecture/design signals → opus
-    for signal in &["architect", "architecture", "design", "plan", "strateg", "analy", "review", "evaluate", "assess"] {
+    for signal in &[
+        "architect",
+        "architecture",
+        "design",
+        "plan",
+        "strateg",
+        "analy",
+        "review",
+        "evaluate",
+        "assess",
+    ] {
         if lower.contains(signal) {
             return ("opus", "claude-opus-4-6");
         }
     }
     // Edit/write signals → sonnet
-    for signal in &["edit", "write", "fix", "change", "update", "create", "add ", "remove", "delete", "modify", "refactor", "implement", "build"] {
+    for signal in &[
+        "edit",
+        "write",
+        "fix",
+        "change",
+        "update",
+        "create",
+        "add ",
+        "remove",
+        "delete",
+        "modify",
+        "refactor",
+        "implement",
+        "build",
+    ] {
         if lower.contains(signal) {
             return ("sonnet", "claude-sonnet-4-6");
         }
@@ -362,6 +475,67 @@ fn cmd_route(task: &str, id_only: bool) -> Result<()> {
     Ok(())
 }
 
+fn format_score(score: f64, compact: bool) -> String {
+    if compact {
+        format!("{score:.2}")
+    } else {
+        format!("{score:.4}")
+    }
+}
+
+fn truncate_for_compact(input: &str, max_chars: usize) -> String {
+    let trimmed = input.trim();
+    let count = trimmed.chars().count();
+    if count <= max_chars {
+        return trimmed.to_string();
+    }
+    let prefix: String = trimmed.chars().take(max_chars.saturating_sub(3)).collect();
+    format!("{prefix}...")
+}
+
+fn compact_snippet(snippet: &str) -> Option<String> {
+    snippet
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| truncate_for_compact(line, 100))
+}
+
+fn compact_members(members: &[String], limit: usize) -> String {
+    if members.len() <= limit {
+        return members.join(", ");
+    }
+    format!(
+        "{} (+{} more)",
+        members[..limit].join(", "),
+        members.len() - limit
+    )
+}
+
+fn symbol_path_summary(path: &[String]) -> String {
+    path.join(" -> ")
+}
+
+fn format_edge_groups(edges: &[index::StoredEdge], use_callers: bool) -> Vec<String> {
+    let mut grouped: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for edge in edges {
+        let key = edge.caller_file.as_str();
+        let name = if use_callers {
+            edge.caller_name.as_str()
+        } else {
+            edge.callee_name.as_str()
+        };
+        let names = grouped.entry(key).or_default();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+
+    grouped
+        .into_iter()
+        .map(|(file, names)| format!("  {}: {}", file, names.join(", ")))
+        .collect()
+}
+
 /// Apply a single edit operation to file contents. Returns new content.
 pub(crate) fn apply_edit_op(content: &str, op: &EditOp) -> Result<(String, usize)> {
     if op.old == op.new {
@@ -372,7 +546,10 @@ pub(crate) fn apply_edit_op(content: &str, op: &EditOp) -> Result<(String, usize
         bail!("old_string not found");
     }
     if count > 1 && !op.replace_all {
-        bail!("old_string matches {} times (use replace_all or provide more context)", count);
+        bail!(
+            "old_string matches {} times (use replace_all or provide more context)",
+            count
+        );
     }
     let replaced = if op.replace_all {
         content.replace(op.old.as_str(), &op.new)
@@ -382,7 +559,7 @@ pub(crate) fn apply_edit_op(content: &str, op: &EditOp) -> Result<(String, usize
     Ok((replaced, count))
 }
 
-fn cmd_edit(dry_run: bool, file: Option<PathBuf>) -> Result<()> {
+fn cmd_edit(dry_run: bool, file: Option<PathBuf>, compact: bool) -> Result<()> {
     let input = match file {
         Some(path) => fs::read_to_string(&path)
             .with_context(|| format!("reading edit file: {}", path.display()))?,
@@ -394,8 +571,7 @@ fn cmd_edit(dry_run: bool, file: Option<PathBuf>) -> Result<()> {
             buf
         }
     };
-    let batch: EditBatch =
-        serde_json::from_str(&input).context("parsing edit JSON")?;
+    let batch: EditBatch = serde_json::from_str(&input).context("parsing edit JSON")?;
 
     if batch.edits.is_empty() {
         println!("No edits provided.");
@@ -447,16 +623,35 @@ fn cmd_edit(dry_run: bool, file: Option<PathBuf>) -> Result<()> {
     }
 
     // Summary output
-    let ok_count = results.iter().filter(|r| matches!(r.status, EditStatus::Ok)).count();
-    let skip_count = results.iter().filter(|r| matches!(r.status, EditStatus::Skipped)).count();
-    let err_count = results.iter().filter(|r| matches!(r.status, EditStatus::Error)).count();
+    let ok_count = results
+        .iter()
+        .filter(|r| matches!(r.status, EditStatus::Ok))
+        .count();
+    let skip_count = results
+        .iter()
+        .filter(|r| matches!(r.status, EditStatus::Skipped))
+        .count();
+    let err_count = results
+        .iter()
+        .filter(|r| matches!(r.status, EditStatus::Error))
+        .count();
 
-    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-        "applied": ok_count,
-        "skipped": skip_count,
-        "errors": err_count,
-        "results": results,
-    }))?);
+    if compact {
+        println!(
+            "applied:{} skipped:{} errors:{}",
+            ok_count, skip_count, err_count
+        );
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "applied": ok_count,
+                "skipped": skip_count,
+                "errors": err_count,
+                "results": results,
+            }))?
+        );
+    }
 
     if err_count > 0 {
         bail!("{} edit(s) failed", err_count);
@@ -464,9 +659,22 @@ fn cmd_edit(dry_run: bool, file: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, exit_code: bool, prune: bool, quiet: bool, workspace: bool, submodule: Option<&str>, json_output: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn cmd_index(
+    path: &std::path::Path,
+    rebuild: bool,
+    check: bool,
+    exit_code: bool,
+    prune: bool,
+    quiet: bool,
+    workspace: bool,
+    submodule: Option<&str>,
+    json_output: bool,
+    compact: bool,
+) -> Result<()> {
     let quiet = quiet || exit_code;
-    let root = path.canonicalize()
+    let root = path
+        .canonicalize()
         .with_context(|| format!("resolving path: {}", path.display()))?;
 
     if workspace || submodule.is_some() {
@@ -497,7 +705,11 @@ fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, exit_code: bool
             let summary = if rebuild {
                 db.rebuild(sub_path)?
             } else if check {
-                if prune { db.compute_changes_pruned(sub_path)? } else { db.compute_changes(sub_path)? }
+                if prune {
+                    db.compute_changes_pruned(sub_path)?
+                } else {
+                    db.compute_changes(sub_path)?
+                }
             } else if prune {
                 db.apply_changes_pruned(sub_path)?
             } else {
@@ -525,14 +737,68 @@ fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, exit_code: bool
                         "summary": summary,
                     })
                 };
-                println!("{}", if quiet { serde_json::to_string(&entry)? } else { serde_json::to_string_pretty(&entry)? });
-            } else {
-                let mode = if rebuild { "rebuild" } else if check { "check" } else if prune { "pruned" } else { "incremental" };
-                print!("[{}] ({}, {:?}) {} files tracked — new:{} mod:{} del:{} unch:{}",
-                    name, mode, tier, summary.total_tracked,
-                    summary.new, summary.modified, summary.deleted, summary.unchanged);
+                println!(
+                    "{}",
+                    if quiet {
+                        serde_json::to_string(&entry)?
+                    } else {
+                        serde_json::to_string_pretty(&entry)?
+                    }
+                );
+            } else if compact {
+                let mode = if rebuild {
+                    "rebuild"
+                } else if check {
+                    "check"
+                } else if prune {
+                    "pruned"
+                } else {
+                    "incremental"
+                };
+                print!(
+                    "[{}] {} {:?} tracked:{} new:{} mod:{} del:{} unch:{}",
+                    name,
+                    mode,
+                    tier,
+                    summary.total_tracked,
+                    summary.new,
+                    summary.modified,
+                    summary.deleted,
+                    summary.unchanged
+                );
                 if let Some(ref ps) = summary.prune_stats {
-                    print!(" | pruned:{} dirs ({}d walked, {} files skipped)", ps.dirs_pruned, ps.dirs_walked, ps.files_pruned);
+                    print!(
+                        " pruned:{} walked:{} skipped:{}",
+                        ps.dirs_pruned, ps.dirs_walked, ps.files_pruned
+                    );
+                }
+                println!();
+            } else {
+                let mode = if rebuild {
+                    "rebuild"
+                } else if check {
+                    "check"
+                } else if prune {
+                    "pruned"
+                } else {
+                    "incremental"
+                };
+                print!(
+                    "[{}] ({}, {:?}) {} files tracked — new:{} mod:{} del:{} unch:{}",
+                    name,
+                    mode,
+                    tier,
+                    summary.total_tracked,
+                    summary.new,
+                    summary.modified,
+                    summary.deleted,
+                    summary.unchanged
+                );
+                if let Some(ref ps) = summary.prune_stats {
+                    print!(
+                        " | pruned:{} dirs ({}d walked, {} files skipped)",
+                        ps.dirs_pruned, ps.dirs_walked, ps.files_pruned
+                    );
                 }
                 println!();
             }
@@ -548,7 +814,11 @@ fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, exit_code: bool
     let summary = if rebuild {
         db.rebuild(&root)?
     } else if check {
-        if prune { db.compute_changes_pruned(&root)? } else { db.compute_changes(&root)? }
+        if prune {
+            db.compute_changes_pruned(&root)?
+        } else {
+            db.compute_changes(&root)?
+        }
     } else if prune {
         db.apply_changes_pruned(&root)?
     } else {
@@ -569,13 +839,52 @@ fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, exit_code: bool
         } else {
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
-    } else {
-        let mode = if rebuild { "rebuild" } else if check { "check" } else if prune { "pruned" } else { "incremental" };
-        println!("Index ({}): {} files tracked", mode, summary.total_tracked);
-        print!("  new: {}  modified: {}  deleted: {}  unchanged: {}",
-            summary.new, summary.modified, summary.deleted, summary.unchanged);
+    } else if compact {
+        let mode = if rebuild {
+            "rebuild"
+        } else if check {
+            "check"
+        } else if prune {
+            "pruned"
+        } else {
+            "incremental"
+        };
+        print!(
+            "index {} tracked:{} new:{} mod:{} del:{} unch:{}",
+            mode,
+            summary.total_tracked,
+            summary.new,
+            summary.modified,
+            summary.deleted,
+            summary.unchanged
+        );
         if let Some(ref ps) = summary.prune_stats {
-            print!(" | pruned: {} dirs ({} walked, {} files skipped)", ps.dirs_pruned, ps.dirs_walked, ps.files_pruned);
+            print!(
+                " pruned:{} walked:{} skipped:{}",
+                ps.dirs_pruned, ps.dirs_walked, ps.files_pruned
+            );
+        }
+        println!();
+    } else {
+        let mode = if rebuild {
+            "rebuild"
+        } else if check {
+            "check"
+        } else if prune {
+            "pruned"
+        } else {
+            "incremental"
+        };
+        println!("Index ({}): {} files tracked", mode, summary.total_tracked);
+        print!(
+            "  new: {}  modified: {}  deleted: {}  unchanged: {}",
+            summary.new, summary.modified, summary.deleted, summary.unchanged
+        );
+        if let Some(ref ps) = summary.prune_stats {
+            print!(
+                " | pruned: {} dirs ({} walked, {} files skipped)",
+                ps.dirs_pruned, ps.dirs_walked, ps.files_pruned
+            );
         }
         println!();
         if !quiet && !summary.changes.is_empty() {
@@ -597,8 +906,17 @@ fn cmd_index(path: &std::path::Path, rebuild: bool, check: bool, exit_code: bool
     Ok(())
 }
 
-fn cmd_graph(symbol: &str, path: &std::path::Path, callers: bool, callees: bool, scope: Option<&str>, json_output: bool) -> Result<()> {
-    let root = path.canonicalize()
+fn cmd_graph(
+    symbol: &str,
+    path: &std::path::Path,
+    callers: bool,
+    callees: bool,
+    scope: Option<&str>,
+    json_output: bool,
+    compact: bool,
+) -> Result<()> {
+    let root = path
+        .canonicalize()
         .with_context(|| format!("resolving path: {}", path.display()))?;
     let db_path = if let Some(scope_name) = scope {
         let cfg = config::Config::load(&root)?;
@@ -607,7 +925,10 @@ fn cmd_graph(symbol: &str, path: &std::path::Path, callers: bool, callees: bool,
         root.join(".tsift/index.db")
     };
     if !db_path.exists() {
-        bail!("no index found at {}. Run `tsift index` first.", db_path.display());
+        bail!(
+            "no index found at {}. Run `tsift index` first.",
+            db_path.display()
+        );
     }
     let db = index::IndexDb::open(&db_path)?;
 
@@ -619,17 +940,32 @@ fn cmd_graph(symbol: &str, path: &std::path::Path, callers: bool, callees: bool,
             if !show_both {
                 println!("{}", serde_json::to_string_pretty(&edges)?);
             }
+        } else if compact {
+            println!("callers[{}]:", edges.len());
+            if edges.is_empty() {
+                println!("  (none)");
+            } else {
+                for edge in &edges {
+                    println!(
+                        "  {} {}:{}",
+                        edge.caller_name, edge.caller_file, edge.call_site_line
+                    );
+                }
+            }
         } else {
             println!("Callers of `{}`:", symbol);
             if edges.is_empty() {
                 println!("  (none)");
             } else {
                 for edge in &edges {
-                    println!("  {} ({}:{})", edge.caller_name, edge.caller_file, edge.call_site_line);
+                    println!(
+                        "  {} ({}:{})",
+                        edge.caller_name, edge.caller_file, edge.call_site_line
+                    );
                 }
             }
         }
-        if show_both && !json_output {
+        if show_both && !json_output && !compact {
             println!();
         }
     }
@@ -640,13 +976,28 @@ fn cmd_graph(symbol: &str, path: &std::path::Path, callers: bool, callees: bool,
             if !show_both {
                 println!("{}", serde_json::to_string_pretty(&edges)?);
             }
+        } else if compact {
+            println!("callees[{}]:", edges.len());
+            if edges.is_empty() {
+                println!("  (none)");
+            } else {
+                for edge in &edges {
+                    println!(
+                        "  {} {}:{}",
+                        edge.callee_name, edge.caller_file, edge.call_site_line
+                    );
+                }
+            }
         } else {
             println!("Callees of `{}`:", symbol);
             if edges.is_empty() {
                 println!("  (none)");
             } else {
                 for edge in &edges {
-                    println!("  {} ({}:{})", edge.callee_name, edge.caller_file, edge.call_site_line);
+                    println!(
+                        "  {} ({}:{})",
+                        edge.callee_name, edge.caller_file, edge.call_site_line
+                    );
                 }
             }
         }
@@ -666,8 +1017,15 @@ fn cmd_graph(symbol: &str, path: &std::path::Path, callers: bool, callees: bool,
     Ok(())
 }
 
-fn cmd_communities(path: &std::path::Path, scope: Option<&str>, min_size: usize, json_output: bool) -> Result<()> {
-    let root = path.canonicalize()
+fn cmd_communities(
+    path: &std::path::Path,
+    scope: Option<&str>,
+    min_size: usize,
+    json_output: bool,
+    compact: bool,
+) -> Result<()> {
+    let root = path
+        .canonicalize()
         .with_context(|| format!("resolving path: {}", path.display()))?;
     let db_path = if let Some(scope_name) = scope {
         let cfg = config::Config::load(&root)?;
@@ -676,13 +1034,18 @@ fn cmd_communities(path: &std::path::Path, scope: Option<&str>, min_size: usize,
         root.join(".tsift/index.db")
     };
     if !db_path.exists() {
-        bail!("no index found at {}. Run `tsift index` first.", db_path.display());
+        bail!(
+            "no index found at {}. Run `tsift index` first.",
+            db_path.display()
+        );
     }
     let db = index::IndexDb::open(&db_path)?;
     let edges = db.all_edges()?;
     let result = graph::detect_communities(&edges);
 
-    let filtered: Vec<&graph::Community> = result.communities.iter()
+    let filtered: Vec<&graph::Community> = result
+        .communities
+        .iter()
         .filter(|c| c.members.len() >= min_size)
         .collect();
 
@@ -696,15 +1059,44 @@ fn cmd_communities(path: &std::path::Path, scope: Option<&str>, min_size: usize,
             "communities": filtered,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
+    } else if compact {
+        println!(
+            "communities nodes:{} edges:{} iterations:{} q:{:.4} count:{}",
+            result.node_count,
+            result.edge_count,
+            result.iterations,
+            result.modularity,
+            filtered.len()
+        );
+        if filtered.is_empty() {
+            println!("  (none >= {})", min_size);
+        } else {
+            for (i, community) in filtered.iter().enumerate() {
+                println!(
+                    "  {}. {} members q:{:.4} {}",
+                    i + 1,
+                    community.members.len(),
+                    community.modularity_contribution,
+                    compact_members(&community.members, 5)
+                );
+            }
+        }
     } else {
-        println!("Communities ({} nodes, {} edges, {} iterations, Q={:.4})",
-            result.node_count, result.edge_count, result.iterations, result.modularity);
+        println!(
+            "Communities ({} nodes, {} edges, {} iterations, Q={:.4})",
+            result.node_count, result.edge_count, result.iterations, result.modularity
+        );
         if filtered.is_empty() {
             println!("  (no communities with {} or more members)", min_size);
         } else {
             println!();
             for (i, c) in filtered.iter().enumerate() {
-                println!("  [{}] {} members (Q={:.4}):", i + 1, c.members.len(), c.modularity_contribution);
+                println!(
+                    "  [{}] {} members (Q={:.4}):",
+                    i + 1,
+                    c.members.len(),
+                    c.modularity_contribution
+                );
                 for m in &c.members {
                     println!("    {}", m);
                 }
@@ -718,7 +1110,8 @@ fn cmd_communities(path: &std::path::Path, scope: Option<&str>, min_size: usize,
 }
 
 fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::IndexDb> {
-    let root = path.canonicalize()
+    let root = path
+        .canonicalize()
         .with_context(|| format!("resolving path: {}", path.display()))?;
     let db_path = if let Some(scope_name) = scope {
         let cfg = config::Config::load(&root)?;
@@ -727,20 +1120,43 @@ fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::I
         root.join(".tsift/index.db")
     };
     if !db_path.exists() {
-        bail!("no index found at {}. Run `tsift index` first.", db_path.display());
+        bail!(
+            "no index found at {}. Run `tsift index` first.",
+            db_path.display()
+        );
     }
     index::IndexDb::open(&db_path)
 }
 
-fn cmd_path(from: &str, to: &str, path: &std::path::Path, scope: Option<&str>, json_output: bool) -> Result<()> {
+fn cmd_path(
+    from: &str,
+    to: &str,
+    path: &std::path::Path,
+    scope: Option<&str>,
+    json_output: bool,
+    compact: bool,
+) -> Result<()> {
     let db = open_index_db(path, scope)?;
     let edges = db.all_edges()?;
     match graph::shortest_path(&edges, from, to) {
         Some(result) => {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&result)?);
+            } else if compact {
+                println!(
+                    "{} ({} hop{})",
+                    symbol_path_summary(&result.path),
+                    result.hops,
+                    if result.hops == 1 { "" } else { "s" }
+                );
             } else {
-                println!("{} → {} ({} hop{})", result.from, result.to, result.hops, if result.hops == 1 { "" } else { "s" });
+                println!(
+                    "{} → {} ({} hop{})",
+                    result.from,
+                    result.to,
+                    result.hops,
+                    if result.hops == 1 { "" } else { "s" }
+                );
                 println!();
                 for (i, node) in result.path.iter().enumerate() {
                     if i > 0 {
@@ -752,12 +1168,17 @@ fn cmd_path(from: &str, to: &str, path: &std::path::Path, scope: Option<&str>, j
         }
         None => {
             if json_output {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "from": from,
-                    "to": to,
-                    "path": null,
-                    "hops": null,
-                }))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "from": from,
+                        "to": to,
+                        "path": null,
+                        "hops": null,
+                    }))?
+                );
+            } else if compact {
+                println!("no path {} -> {}", from, to);
             } else {
                 println!("No path found between `{}` and `{}`.", from, to);
             }
@@ -766,7 +1187,13 @@ fn cmd_path(from: &str, to: &str, path: &std::path::Path, scope: Option<&str>, j
     Ok(())
 }
 
-fn cmd_explain(symbol: &str, path: &std::path::Path, scope: Option<&str>, json_output: bool) -> Result<()> {
+fn cmd_explain(
+    symbol: &str,
+    path: &std::path::Path,
+    scope: Option<&str>,
+    json_output: bool,
+    compact: bool,
+) -> Result<()> {
     let db = open_index_db(path, scope)?;
 
     let symbols = db.symbol_info(symbol)?;
@@ -775,7 +1202,9 @@ fn cmd_explain(symbol: &str, path: &std::path::Path, scope: Option<&str>, json_o
 
     let edges = db.all_edges()?;
     let comm_result = graph::detect_communities(&edges);
-    let community = comm_result.communities.iter()
+    let community = comm_result
+        .communities
+        .iter()
         .find(|c| c.members.iter().any(|m| m == symbol));
 
     if json_output {
@@ -787,6 +1216,43 @@ fn cmd_explain(symbol: &str, path: &std::path::Path, scope: Option<&str>, json_o
             "community": community,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
+    } else if compact {
+        if symbols.is_empty() {
+            println!("symbol: {} (definitions: none)", symbol);
+        } else {
+            for sym in &symbols {
+                println!(
+                    "symbol: {} ({}, {}) {}:{}",
+                    sym.name, sym.kind, sym.language, sym.file, sym.line
+                );
+            }
+        }
+
+        println!("callers[{}]:", callers.len());
+        if callers.is_empty() {
+            println!("  (none)");
+        } else {
+            for line in format_edge_groups(&callers, true) {
+                println!("{line}");
+            }
+        }
+
+        println!("callees[{}]:", callees.len());
+        if callees.is_empty() {
+            println!("  (none)");
+        } else {
+            for line in format_edge_groups(&callees, false) {
+                println!("{line}");
+            }
+        }
+
+        if let Some(comm) = community {
+            println!(
+                "community[{}]: {}",
+                comm.members.len(),
+                compact_members(&comm.members, 5)
+            );
+        }
     } else {
         if symbols.is_empty() {
             println!("Symbol `{}` not found in index.", symbol);
@@ -805,7 +1271,10 @@ fn cmd_explain(symbol: &str, path: &std::path::Path, scope: Option<&str>, json_o
             println!("  (none)");
         } else {
             for edge in &callers {
-                println!("  {} ({}:{})", edge.caller_name, edge.caller_file, edge.call_site_line);
+                println!(
+                    "  {} ({}:{})",
+                    edge.caller_name, edge.caller_file, edge.call_site_line
+                );
             }
         }
         println!();
@@ -815,7 +1284,10 @@ fn cmd_explain(symbol: &str, path: &std::path::Path, scope: Option<&str>, json_o
             println!("  (none)");
         } else {
             for edge in &callees {
-                println!("  {} ({}:{})", edge.callee_name, edge.caller_file, edge.call_site_line);
+                println!(
+                    "  {} ({}:{})",
+                    edge.callee_name, edge.caller_file, edge.call_site_line
+                );
             }
         }
 
@@ -831,7 +1303,15 @@ fn cmd_explain(symbol: &str, path: &std::path::Path, scope: Option<&str>, json_o
     Ok(())
 }
 
-fn cmd_audit(skills_dir: &str, manifest: Option<PathBuf>, usage: bool, cleanup: bool, report: Option<PathBuf>, json_output: bool) -> Result<()> {
+fn cmd_audit(
+    skills_dir: &str,
+    manifest: Option<PathBuf>,
+    usage: bool,
+    cleanup: bool,
+    report: Option<PathBuf>,
+    json_output: bool,
+    compact: bool,
+) -> Result<()> {
     let expanded = if let Some(rest) = skills_dir.strip_prefix("~/") {
         let home = std::env::var("HOME").context("HOME not set")?;
         std::path::PathBuf::from(format!("{}/{}", home, rest))
@@ -860,12 +1340,48 @@ fn cmd_audit(skills_dir: &str, manifest: Option<PathBuf>, usage: bool, cleanup: 
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if compact {
+        println!(
+            "skills:{} healthy:{} broken:{}",
+            result.total, result.healthy, result.broken
+        );
+        for skill in &result.skills {
+            let status = if skill.issues.is_empty() { "ok" } else { "bad" };
+            let uses = skill
+                .invocation_count
+                .map(|count| format!(" uses:{count}"))
+                .unwrap_or_default();
+            println!("  {} {}{}", status, skill.name, uses);
+            for issue in &skill.issues {
+                println!("    ! {}", issue);
+            }
+        }
+        if let Some(diffs) = &result.manifest_diffs
+            && !diffs.is_empty()
+        {
+            println!("manifest_diffs:{}", diffs.len());
+        }
+        if !result.similar_pairs.is_empty() {
+            println!("similar_pairs:{}", result.similar_pairs.len());
+        }
+        if let Some(cleanup_list) = &result.cleanup
+            && !cleanup_list.is_empty()
+        {
+            println!("cleanup:{}", cleanup_list.len());
+        }
     } else {
         println!("Skills directory: {}", result.skills_dir.display());
-        println!("Total: {}  Healthy: {}  Broken: {}", result.total, result.healthy, result.broken);
+        println!(
+            "Total: {}  Healthy: {}  Broken: {}",
+            result.total, result.healthy, result.broken
+        );
         println!();
         for skill in &result.skills {
-            let status = if skill.issues.is_empty() { "✓" } else { "✗" };
+            let status = if skill.issues.is_empty() {
+                "✓"
+            } else {
+                "✗"
+            };
             let desc = skill.description.as_deref().unwrap_or("-");
             let link = if skill.is_symlink { " (symlink)" } else { "" };
             let uses = skill
@@ -904,15 +1420,15 @@ fn cmd_audit(skills_dir: &str, manifest: Option<PathBuf>, usage: bool, cleanup: 
                 println!("       B: {}", pair.desc_b);
             }
         }
-        if let Some(cleanup_list) = &result.cleanup {
-            if !cleanup_list.is_empty() {
-                println!();
-                println!("Cleanup recommendations:");
-                for entry in cleanup_list {
-                    println!("  {} (~{} tokens)", entry.skill, entry.token_estimate);
-                    for reason in &entry.reasons {
-                        println!("    - {}", reason);
-                    }
+        if let Some(cleanup_list) = &result.cleanup
+            && !cleanup_list.is_empty()
+        {
+            println!();
+            println!("Cleanup recommendations:");
+            for entry in cleanup_list {
+                println!("  {} (~{} tokens)", entry.skill, entry.token_estimate);
+                for reason in &entry.reasons {
+                    println!("    - {}", reason);
                 }
             }
         }
@@ -920,6 +1436,7 @@ fn cmd_audit(skills_dir: &str, manifest: Option<PathBuf>, usage: bool, cleanup: 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_summarize(
     symbol: Option<String>,
     file: Option<String>,
@@ -928,6 +1445,7 @@ fn cmd_summarize(
     stats: bool,
     path: &std::path::Path,
     json_output: bool,
+    compact: bool,
 ) -> Result<()> {
     let root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let db_path = root.join(".tsift/summaries.db");
@@ -940,8 +1458,12 @@ fn cmd_summarize(
 
         let files_to_extract = if diff {
             let changed = summarize::git_changed_files(&root)?;
-            changed.into_iter()
-                .filter(|f| f.starts_with(&extract_path) || extract_path.starts_with(f.parent().unwrap_or(f)))
+            changed
+                .into_iter()
+                .filter(|f| {
+                    f.starts_with(&extract_path)
+                        || extract_path.starts_with(f.parent().unwrap_or(f))
+                })
                 .collect::<Vec<_>>()
         } else {
             collect_source_files(&extract_path)?
@@ -964,12 +1486,18 @@ fn cmd_summarize(
             let content = match std::fs::read(file_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    report.errors.push(format!("{}: {}", file_path.display(), e));
+                    report
+                        .errors
+                        .push(format!("{}: {}", file_path.display(), e));
                     continue;
                 }
             };
             let hash = summarize::content_hash(&content);
-            let rel_path = file_path.strip_prefix(&root).unwrap_or(file_path).to_string_lossy().to_string();
+            let rel_path = file_path
+                .strip_prefix(&root)
+                .unwrap_or(file_path)
+                .to_string_lossy()
+                .to_string();
 
             if summary_db.is_current(&rel_path, &hash)? {
                 continue; // already extracted for this version
@@ -986,7 +1514,7 @@ fn cmd_summarize(
                         summary_db.insert(&s)?;
                     }
                     report.files_processed += 1;
-                    if !json_output {
+                    if !json_output && !compact {
                         println!("  extracted: {}", rel_path);
                     }
                 }
@@ -1001,11 +1529,23 @@ fn cmd_summarize(
 
         if json_output {
             println!("{}", serde_json::to_string_pretty(&report)?);
+        } else if compact {
+            println!(
+                "extract files:{} symbols:{} tokens_in:{} tokens_out:{} errors:{}",
+                report.files_processed,
+                report.symbols_extracted,
+                report.tokens_input,
+                report.tokens_output,
+                report.errors.len()
+            );
         } else {
             println!("\nExtraction complete:");
             println!("  files: {}", report.files_processed);
             println!("  symbols: {}", report.symbols_extracted);
-            println!("  tokens: {} in / {} out", report.tokens_input, report.tokens_output);
+            println!(
+                "  tokens: {} in / {} out",
+                report.tokens_input, report.tokens_output
+            );
             if !report.errors.is_empty() {
                 println!("  errors: {}", report.errors.len());
             }
@@ -1019,6 +1559,15 @@ fn cmd_summarize(
         let s = summary_db.stats()?;
         if json_output {
             println!("{}", serde_json::to_string_pretty(&s)?);
+        } else if compact {
+            println!(
+                "summaries:{} files:{} in:{} out:{} saved:{}",
+                s.total_summaries,
+                s.total_files,
+                s.total_tokens_input,
+                s.total_tokens_output,
+                s.estimated_tokens_saved
+            );
         } else {
             println!("Summary cache statistics:");
             println!("  summaries:       {}", s.total_summaries);
@@ -1045,13 +1594,21 @@ fn cmd_summarize(
         }
         if json_output {
             println!("{}", serde_json::to_string_pretty(&results)?);
+        } else if compact {
+            for summary in &results {
+                println!(
+                    "[{}] {}",
+                    summary.symbol_name,
+                    truncate_for_compact(&summary.summary, 120)
+                );
+            }
         } else {
             for s in &results {
                 println!("[{}] {}", s.symbol_name, s.summary);
-                if let Some(ref labels) = s.concept_labels {
-                    if !labels.is_empty() {
-                        println!("  concepts: {}", labels.join(", "));
-                    }
+                if let Some(ref labels) = s.concept_labels
+                    && !labels.is_empty()
+                {
+                    println!("  concepts: {}", labels.join(", "));
                 }
             }
         }
@@ -1067,30 +1624,38 @@ fn cmd_summarize(
         }
         if json_output {
             println!("{}", serde_json::to_string_pretty(&results)?);
+        } else if compact {
+            for summary in &results {
+                println!(
+                    "{} {}",
+                    summary.symbol_name,
+                    truncate_for_compact(&summary.summary, 120)
+                );
+            }
         } else {
             for s in &results {
                 println!("{} ({})", s.symbol_name, s.file_path);
                 println!("  {}", s.summary);
-                if let Some(ref entities) = s.entities {
-                    if !entities.is_empty() {
-                        println!("  entities:");
-                        for e in entities {
-                            println!("    {} ({}): {}", e.name, e.kind, e.description);
-                        }
+                if let Some(ref entities) = s.entities
+                    && !entities.is_empty()
+                {
+                    println!("  entities:");
+                    for e in entities {
+                        println!("    {} ({}): {}", e.name, e.kind, e.description);
                     }
                 }
-                if let Some(ref rels) = s.relationships {
-                    if !rels.is_empty() {
-                        println!("  relationships:");
-                        for r in rels {
-                            println!("    {} --{}-> {}", r.from, r.kind, r.to);
-                        }
+                if let Some(ref rels) = s.relationships
+                    && !rels.is_empty()
+                {
+                    println!("  relationships:");
+                    for r in rels {
+                        println!("    {} --{}-> {}", r.from, r.kind, r.to);
                     }
                 }
-                if let Some(ref labels) = s.concept_labels {
-                    if !labels.is_empty() {
-                        println!("  concepts: {}", labels.join(", "));
-                    }
+                if let Some(ref labels) = s.concept_labels
+                    && !labels.is_empty()
+                {
+                    println!("  concepts: {}", labels.join(", "));
                 }
                 println!();
             }
@@ -1101,14 +1666,15 @@ fn cmd_summarize(
     bail!("specify a symbol, --file, --extract, or --stats");
 }
 
-fn cmd_status(path: &std::path::Path, json_output: bool) -> Result<()> {
-    let root = path.canonicalize()
+fn cmd_status(path: &std::path::Path, json_output: bool, compact: bool) -> Result<()> {
+    let root = path
+        .canonicalize()
         .with_context(|| format!("resolving path: {}", path.display()))?;
     let report = status::check_status(&root)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print!("{}", status::format_human(&report));
+        print!("{}", status::format_human(&report, compact));
     }
     Ok(())
 }
@@ -1148,17 +1714,170 @@ fn find_symbols_db(root: &std::path::Path) -> Option<PathBuf> {
         return Some(single);
     }
     let indexes = root.join(".tsift/indexes");
-    if indexes.exists() {
-        if let Ok(entries) = std::fs::read_dir(&indexes) {
-            for entry in entries.flatten() {
-                let db = entry.path().join("index.db");
-                if db.exists() {
-                    return Some(db);
-                }
+    if indexes.exists()
+        && let Ok(entries) = std::fs::read_dir(&indexes)
+    {
+        for entry in entries.flatten() {
+            let db = entry.path().join("index.db");
+            if db.exists() {
+                return Some(db);
             }
         }
     }
     None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_search(
+    query: String,
+    path: Option<PathBuf>,
+    limit: usize,
+    strategy: Option<String>,
+    scope: Option<String>,
+    federated: bool,
+    json_output: bool,
+    timeout_secs: u64,
+    compact: bool,
+) -> Result<()> {
+    let base_path = path.unwrap_or_else(|| PathBuf::from("."));
+
+    let (symbol_hits, sift_path) = if let Some(ref scope_name) = scope {
+        let root = base_path.canonicalize().unwrap_or(base_path.clone());
+        let cfg = config::Config::load(&root)?;
+        let db_path = cfg.db_path_for(&root, scope_name);
+        let hits = if db_path.exists() {
+            let db = index::IndexDb::open(&db_path)?;
+            db.symbol_search(&query, limit)?
+        } else {
+            Vec::new()
+        };
+        let sub_path = config::Config::submodule_dirs(&root)?
+            .into_iter()
+            .find(|(name, _)| name == scope_name)
+            .map(|(_, p)| p)
+            .unwrap_or(base_path.clone());
+        (hits, sub_path)
+    } else if federated {
+        let root = base_path.canonicalize().unwrap_or(base_path.clone());
+        (
+            federated_symbol_search(&root, &query, limit)?,
+            base_path.clone(),
+        )
+    } else {
+        let db_path = base_path.join(".tsift/index.db");
+        let hits = if db_path.exists() {
+            let db = index::IndexDb::open(&db_path)?;
+            db.symbol_search(&query, limit)?
+        } else {
+            Vec::new()
+        };
+        (hits, base_path.clone())
+    };
+
+    let engine = Sift::builder().build();
+    let effective_strategy = strategy.unwrap_or_else(|| "lexical".to_string());
+    let options = SearchOptions::default()
+        .with_limit(limit)
+        .with_strategy(effective_strategy.clone());
+    let input = SearchInput::new(&sift_path, &query).with_options(options);
+    let response = run_search_with_timeout(engine, input, timeout_secs, &effective_strategy)?;
+
+    if json_output {
+        #[derive(Serialize)]
+        struct CombinedResponse<'a> {
+            symbols: &'a [index::SymbolHit],
+            #[serde(flatten)]
+            sift: &'a serde_json::Value,
+        }
+        let sift_value = serde_json::to_value(&response)?;
+        let combined = CombinedResponse {
+            symbols: &symbol_hits,
+            sift: &sift_value,
+        };
+        println!("{}", serde_json::to_string_pretty(&combined)?);
+    } else if compact {
+        if !symbol_hits.is_empty() {
+            println!("symbols[{}]:", symbol_hits.len());
+            for (i, hit) in symbol_hits.iter().enumerate() {
+                println!(
+                    "  {}. [{}] {} {} {}:{} {}",
+                    i + 1,
+                    hit.match_type,
+                    hit.kind,
+                    hit.name,
+                    hit.file,
+                    hit.line,
+                    format_score(hit.score, true)
+                );
+            }
+        }
+
+        println!("hits[{}]:", response.hits.len());
+        for hit in &response.hits {
+            let snippet = compact_snippet(&hit.snippet).unwrap_or_default();
+            if snippet.is_empty() {
+                println!(
+                    "  {}. {} [{:?} {}]",
+                    hit.rank,
+                    hit.path,
+                    hit.confidence,
+                    format_score(hit.score, true)
+                );
+            } else {
+                println!(
+                    "  {}. {} [{:?} {}] {}",
+                    hit.rank,
+                    hit.path,
+                    hit.confidence,
+                    format_score(hit.score, true),
+                    snippet
+                );
+            }
+        }
+        if symbol_hits.is_empty() && response.hits.is_empty() {
+            println!("  (none)");
+        }
+    } else {
+        if !symbol_hits.is_empty() {
+            println!("Symbol matches ({}):", symbol_hits.len());
+            println!();
+            for (i, hit) in symbol_hits.iter().enumerate() {
+                println!(
+                    "  #{} [{}] {} {} ({}:{}) score: {:.4}",
+                    i + 1,
+                    hit.match_type,
+                    hit.kind,
+                    hit.name,
+                    hit.file,
+                    hit.line,
+                    hit.score
+                );
+            }
+            println!();
+        }
+
+        println!(
+            "Strategy: {} | Indexed: {} | Skipped: {}",
+            response.strategy, response.indexed_artifacts, response.skipped_artifacts
+        );
+        println!();
+        for hit in &response.hits {
+            println!(
+                "  #{} [{:?}] {} (score: {:.4})",
+                hit.rank, hit.confidence, hit.path, hit.score
+            );
+            if !hit.snippet.is_empty() {
+                for line in hit.snippet.lines().take(3) {
+                    println!("    {}", line);
+                }
+            }
+            println!();
+        }
+        if symbol_hits.is_empty() && response.hits.is_empty() {
+            println!("  No results.");
+        }
+    }
+    Ok(())
 }
 
 fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf>> {
@@ -1177,7 +1896,20 @@ fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf>> {
             let p = entry.path();
             if let Some(ext) = p.extension() {
                 let ext = ext.to_string_lossy();
-                if matches!(ext.as_ref(), "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "kt" | "kts" | "zig" | "sh" | "bash" | "zsh") {
+                if matches!(
+                    ext.as_ref(),
+                    "rs" | "py"
+                        | "ts"
+                        | "tsx"
+                        | "js"
+                        | "jsx"
+                        | "kt"
+                        | "kts"
+                        | "zig"
+                        | "sh"
+                        | "bash"
+                        | "zsh"
+                ) {
                     files.push(p.to_path_buf());
                 }
             }
@@ -1192,19 +1924,31 @@ fn cmd_init(path: &std::path::Path) -> Result<()> {
         println!("resolved: {} → {}", path.display(), resolved.display());
     }
     let result = init::init(&resolved)?;
-    println!("{}: {} ({})", result.file.display(), result.action,
-        match result.action {
-            init::InitAction::Created => "tsift Code Navigation section added",
-            init::InitAction::Updated => "tsift Code Navigation section updated to latest",
-            init::InitAction::AlreadyPresent => "no changes needed",
-        });
+    for update in result.updates {
+        println!(
+            "{}: {} ({})",
+            update.file.display(),
+            update.action,
+            match update.action {
+                init::InitAction::Created => "tsift Code Navigation section added",
+                init::InitAction::Updated => "tsift Code Navigation section updated to latest",
+                init::InitAction::AlreadyPresent => "no changes needed",
+            }
+        );
+    }
     if result.gitignore_added {
         println!(".gitignore: added .tsift/");
     }
     Ok(())
 }
 
-fn cmd_lint(file: &str, index: Option<PathBuf>, entities_from: Vec<PathBuf>, json_output: bool) -> Result<()> {
+fn cmd_lint(
+    file: &str,
+    index: Option<PathBuf>,
+    entities_from: Vec<PathBuf>,
+    json_output: bool,
+    compact: bool,
+) -> Result<()> {
     use std::collections::HashSet;
 
     let file_path = std::path::Path::new(file);
@@ -1242,6 +1986,18 @@ fn cmd_lint(file: &str, index: Option<PathBuf>, entities_from: Vec<PathBuf>, jso
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if compact {
+        if result.annotations.is_empty() {
+            println!("ok {}", file);
+        } else {
+            println!("{} annotations:{}", result.file, result.annotations.len());
+            for ann in &result.annotations {
+                println!(
+                    "  {}:{} {} -> {}",
+                    ann.line, ann.column, ann.text, ann.suggestion
+                );
+            }
+        }
     } else {
         if result.annotations.is_empty() {
             println!("No unannotated concepts found in {}", file);
@@ -1271,12 +2027,22 @@ mod tests {
     fn route_search_defaults_to_haiku() {
         let (tier, model) = classify_task("find all uses of authenticate");
         assert_eq!(tier, "haiku");
-        assert!(model.contains("haiku"), "expected haiku model, got {}", model);
+        assert!(
+            model.contains("haiku"),
+            "expected haiku model, got {}",
+            model
+        );
     }
 
     #[test]
     fn route_edit_keywords_to_sonnet() {
-        for kw in &["edit the file", "fix the bug", "update the config", "remove dead code", "create a new module"] {
+        for kw in &[
+            "edit the file",
+            "fix the bug",
+            "update the config",
+            "remove dead code",
+            "create a new module",
+        ] {
             let (tier, _) = classify_task(kw);
             assert_eq!(tier, "sonnet", "expected sonnet for {:?}", kw);
         }
@@ -1284,7 +2050,13 @@ mod tests {
 
     #[test]
     fn route_architecture_keywords_to_opus() {
-        for kw in &["design the API", "architecture review", "plan the migration", "analyze the system", "evaluate trade-offs"] {
+        for kw in &[
+            "design the API",
+            "architecture review",
+            "plan the migration",
+            "analyze the system",
+            "evaluate trade-offs",
+        ] {
             let (tier, _) = classify_task(kw);
             assert_eq!(tier, "opus", "expected opus for {:?}", kw);
         }
@@ -1295,6 +2067,13 @@ mod tests {
         // "design and implement" — architecture signal wins (checked first)
         let (tier, _) = classify_task("design and implement the new auth service");
         assert_eq!(tier, "opus");
+    }
+
+    #[test]
+    fn cli_accepts_global_compact_flag() {
+        let cli = Cli::parse_from(["tsift", "--compact", "status"]);
+        assert!(cli.compact);
+        assert!(matches!(cli.command, Some(Commands::Status { .. })));
     }
 
     // --- apply_edit_op ---
@@ -1371,26 +2150,38 @@ mod tests {
     #[test]
     fn rewrite_rg_simple_pattern() {
         let result = rewrite_command("rg authenticate");
-        assert_eq!(result, Some("tsift search \"authenticate\" --strategy lexical".to_string()));
+        assert_eq!(
+            result,
+            Some("tsift search \"authenticate\" --strategy lexical".to_string())
+        );
     }
 
     #[test]
     fn rewrite_rg_with_path() {
         let result = rewrite_command("rg authenticate src/");
-        assert_eq!(result, Some("tsift search \"authenticate\" --strategy lexical --path \"src/\"".to_string()));
+        assert_eq!(
+            result,
+            Some("tsift search \"authenticate\" --strategy lexical --path \"src/\"".to_string())
+        );
     }
 
     #[test]
     fn rewrite_rg_with_flags_ignored() {
         let result = rewrite_command("rg -i authenticate src/");
-        assert_eq!(result, Some("tsift search \"authenticate\" --strategy lexical --path \"src/\"".to_string()));
+        assert_eq!(
+            result,
+            Some("tsift search \"authenticate\" --strategy lexical --path \"src/\"".to_string())
+        );
     }
 
     #[test]
     fn rewrite_rg_with_type_flag() {
         // -t rs takes a value, should be skipped; pattern is next positional
         let result = rewrite_command("rg -t rs authenticate");
-        assert_eq!(result, Some("tsift search \"authenticate\" --strategy lexical".to_string()));
+        assert_eq!(
+            result,
+            Some("tsift search \"authenticate\" --strategy lexical".to_string())
+        );
     }
 
     #[test]
@@ -1403,7 +2194,10 @@ mod tests {
     #[test]
     fn rewrite_grep_recursive() {
         let result = rewrite_command("grep -r authenticate src/");
-        assert_eq!(result, Some("tsift search \"authenticate\" --strategy lexical --path \"src/\"".to_string()));
+        assert_eq!(
+            result,
+            Some("tsift search \"authenticate\" --strategy lexical --path \"src/\"".to_string())
+        );
     }
 
     #[test]
@@ -1427,7 +2221,10 @@ mod tests {
     #[test]
     fn rewrite_rg_quoted_pattern() {
         let result = rewrite_command("rg \"fn main\"");
-        assert_eq!(result, Some("tsift search \"fn main\" --strategy lexical".to_string()));
+        assert_eq!(
+            result,
+            Some("tsift search \"fn main\" --strategy lexical".to_string())
+        );
     }
 
     #[test]
@@ -1464,7 +2261,8 @@ mod tests {
     #[test]
     fn sql_execute_query_returns_rows() {
         let (_tmp, conn) = setup_test_db();
-        let (columns, rows) = execute_query(&conn, "SELECT name, email FROM users ORDER BY id").unwrap();
+        let (columns, rows) =
+            execute_query(&conn, "SELECT name, email FROM users ORDER BY id").unwrap();
         assert_eq!(columns, &["name", "email"]);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], serde_json::json!("Alice"));
@@ -1485,8 +2283,9 @@ mod tests {
         let (_tmp, conn) = setup_test_db();
         let (_cols, rows) = execute_query(
             &conn,
-            "SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id ORDER BY p.id"
-        ).unwrap();
+            "SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id ORDER BY p.id",
+        )
+        .unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0][0], serde_json::json!("Alice"));
         assert_eq!(rows[2][0], serde_json::json!("Bob"));
@@ -1505,7 +2304,8 @@ mod tests {
     fn sql_empty_table_schema() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let conn = Connection::open(tmp.path()).unwrap();
-        conn.execute_batch("CREATE TABLE empty_tbl (id INTEGER PRIMARY KEY, data BLOB)").unwrap();
+        conn.execute_batch("CREATE TABLE empty_tbl (id INTEGER PRIMARY KEY, data BLOB)")
+            .unwrap();
         let tables = schema_overview(&conn).unwrap();
         assert_eq!(tables[0].row_count, 0);
         assert_eq!(tables[0].columns.len(), 2);
@@ -1517,8 +2317,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("main.rs"),
-            "fn helper() { println!(\"hi\"); }\nfn main() { helper(); Vec::new(); }"
-        ).unwrap();
+            "fn helper() { println!(\"hi\"); }\nfn main() { helper(); Vec::new(); }",
+        )
+        .unwrap();
         let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
         db.apply_changes(dir.path()).unwrap();
         dir
@@ -1554,8 +2355,51 @@ mod tests {
     #[test]
     fn graph_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_graph("main", dir.path(), false, false, None, false);
+        let result = cmd_graph("main", dir.path(), false, false, None, false, false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn compact_helpers_trim_scores_and_snippets() {
+        assert_eq!(format_score(0.12345, true), "0.12");
+        assert_eq!(format_score(0.12345, false), "0.1235");
+        let snippet = compact_snippet("    first line with useful context\nsecond");
+        assert_eq!(snippet.as_deref(), Some("first line with useful context"));
+    }
+
+    #[test]
+    fn compact_members_caps_list() {
+        let members = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+            "e".to_string(),
+            "f".to_string(),
+        ];
+        assert_eq!(compact_members(&members, 5), "a, b, c, d, e (+1 more)");
+    }
+
+    #[test]
+    fn explain_compact_groups_edges_by_file() {
+        let edges = vec![
+            index::StoredEdge {
+                caller_file: "src/main.rs".to_string(),
+                caller_name: "main".to_string(),
+                caller_line: 1,
+                callee_name: "helper".to_string(),
+                call_site_line: 2,
+            },
+            index::StoredEdge {
+                caller_file: "src/main.rs".to_string(),
+                caller_name: "main".to_string(),
+                caller_line: 1,
+                callee_name: "render".to_string(),
+                call_site_line: 3,
+            },
+        ];
+        let lines = format_edge_groups(&edges, false);
+        assert_eq!(lines, vec!["  src/main.rs: helper, render"]);
     }
 
     // --- workspace indexing ---
@@ -1563,18 +2407,26 @@ mod tests {
     fn setup_workspace() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::write(root.join(".gitmodules"), r#"[submodule "src/alpha"]
+        std::fs::write(
+            root.join(".gitmodules"),
+            r#"[submodule "src/alpha"]
 	path = src/alpha
 	url = https://example.com/alpha
 [submodule "src/beta"]
 	path = src/beta
 	url = https://example.com/beta
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let alpha = root.join("src/alpha");
         let beta = root.join("src/beta");
         std::fs::create_dir_all(&alpha).unwrap();
         std::fs::create_dir_all(&beta).unwrap();
-        std::fs::write(alpha.join("lib.rs"), "fn alpha_helper() {}\nfn alpha_main() { alpha_helper(); }").unwrap();
+        std::fs::write(
+            alpha.join("lib.rs"),
+            "fn alpha_helper() {}\nfn alpha_main() { alpha_helper(); }",
+        )
+        .unwrap();
         std::fs::write(beta.join("lib.rs"), "fn beta_func() {}").unwrap();
         dir
     }
@@ -1582,7 +2434,19 @@ mod tests {
     #[test]
     fn workspace_index_creates_per_submodule_dbs() {
         let dir = setup_workspace();
-        cmd_index(dir.path(), false, false, false, false, false, true, None, false).unwrap();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
         assert!(dir.path().join(".tsift/indexes/alpha/index.db").exists());
         assert!(dir.path().join(".tsift/indexes/beta/index.db").exists());
     }
@@ -1590,7 +2454,19 @@ mod tests {
     #[test]
     fn workspace_index_single_submodule() {
         let dir = setup_workspace();
-        cmd_index(dir.path(), false, false, false, false, false, false, Some("alpha"), false).unwrap();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some("alpha"),
+            false,
+            false,
+        )
+        .unwrap();
         assert!(dir.path().join(".tsift/indexes/alpha/index.db").exists());
         assert!(!dir.path().join(".tsift/indexes/beta/index.db").exists());
     }
@@ -1598,9 +2474,24 @@ mod tests {
     #[test]
     fn federated_search_across_submodules() {
         let dir = setup_workspace();
-        cmd_index(dir.path(), false, false, false, false, false, true, None, false).unwrap();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
         let hits = federated_symbol_search(dir.path(), "alpha_helper", 10).unwrap();
-        assert!(!hits.is_empty(), "should find alpha_helper via federated search");
+        assert!(
+            !hits.is_empty(),
+            "should find alpha_helper via federated search"
+        );
     }
 
     #[test]
@@ -1608,19 +2499,50 @@ mod tests {
         let dir = setup_workspace();
         let tsift_dir = dir.path().join(".tsift");
         std::fs::create_dir_all(&tsift_dir).unwrap();
-        std::fs::write(tsift_dir.join("config.toml"), r#"
+        std::fs::write(
+            tsift_dir.join("config.toml"),
+            r#"
 [overrides.alpha]
 tier = "isolated"
-"#).unwrap();
-        cmd_index(dir.path(), false, false, false, false, false, true, None, false).unwrap();
+"#,
+        )
+        .unwrap();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
         let hits = federated_symbol_search(dir.path(), "alpha_helper", 10).unwrap();
-        assert!(hits.is_empty(), "isolated submodule should not appear in federated search");
+        assert!(
+            hits.is_empty(),
+            "isolated submodule should not appear in federated search"
+        );
     }
 
     #[test]
     fn scoped_search_finds_submodule_symbols() {
         let dir = setup_workspace();
-        cmd_index(dir.path(), false, false, false, false, false, true, None, false).unwrap();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
         let cfg = config::Config::load(dir.path()).unwrap();
         let db_path = cfg.db_path_for(dir.path(), "alpha");
         let db = index::IndexDb::open(&db_path).unwrap();
@@ -1632,7 +2554,19 @@ tier = "isolated"
     #[test]
     fn scoped_graph_query() {
         let dir = setup_workspace();
-        cmd_index(dir.path(), false, false, false, false, false, true, None, false).unwrap();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
         let cfg = config::Config::load(dir.path()).unwrap();
         let db_path = cfg.db_path_for(dir.path(), "alpha");
         let db = index::IndexDb::open(&db_path).unwrap();
@@ -1656,7 +2590,7 @@ tier = "isolated"
     #[test]
     fn community_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_communities(dir.path(), None, 2, false);
+        let result = cmd_communities(dir.path(), None, 2, false, false);
         assert!(result.is_err());
     }
 
@@ -1684,7 +2618,7 @@ tier = "isolated"
     #[test]
     fn path_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_path("a", "b", dir.path(), None, false);
+        let result = cmd_path("a", "b", dir.path(), None, false, false);
         assert!(result.is_err());
     }
 
@@ -1703,7 +2637,7 @@ tier = "isolated"
     #[test]
     fn explain_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_explain("main", dir.path(), None, false);
+        let result = cmd_explain("main", dir.path(), None, false, false);
         assert!(result.is_err());
     }
 
@@ -1743,7 +2677,10 @@ tier = "isolated"
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         // Don't send anything — this will timeout
         let result = rx.recv_timeout(std::time::Duration::from_millis(10));
-        assert!(matches!(result, Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        assert!(matches!(
+            result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
         drop(tx);
     }
 
@@ -1752,21 +2689,54 @@ tier = "isolated"
     #[test]
     fn index_quiet_suppresses_file_list() {
         let dir = setup_graph_index();
-        let result = cmd_index(dir.path(), false, true, false, false, true, false, None, false);
+        let result = cmd_index(
+            dir.path(),
+            false,
+            true,
+            false,
+            false,
+            true,
+            false,
+            None,
+            false,
+            false,
+        );
         assert!(result.is_ok());
     }
 
     #[test]
     fn index_exit_code_implies_quiet() {
         let dir = setup_graph_index();
-        let result = cmd_index(dir.path(), false, true, false, false, false, false, None, false);
+        let result = cmd_index(
+            dir.path(),
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+        );
         assert!(result.is_ok());
     }
 
     #[test]
     fn index_quiet_json_omits_changes() {
         let dir = setup_graph_index();
-        let result = cmd_index(dir.path(), false, true, false, false, true, false, None, true);
+        let result = cmd_index(
+            dir.path(),
+            false,
+            true,
+            false,
+            false,
+            true,
+            false,
+            None,
+            true,
+            false,
+        );
         assert!(result.is_ok());
     }
 }
@@ -1806,18 +2776,22 @@ pub(crate) fn schema_overview(conn: &Connection) -> Result<Vec<TableInfo>> {
     let mut stmt = conn.prepare(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     )?;
-    let table_names: Vec<String> = stmt.query_map([], |row| row.get(0))?
+    let table_names: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut tables = Vec::new();
     for tbl in table_names {
         let columns = table_columns(conn, &tbl)?;
-        let row_count: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM \"{}\"", tbl),
-            [],
-            |row| row.get(0),
-        )?;
-        tables.push(TableInfo { name: tbl, columns, row_count });
+        let row_count: i64 =
+            conn.query_row(&format!("SELECT COUNT(*) FROM \"{}\"", tbl), [], |row| {
+                row.get(0)
+            })?;
+        tables.push(TableInfo {
+            name: tbl,
+            columns,
+            row_count,
+        });
     }
     Ok(tables)
 }
@@ -1825,20 +2799,25 @@ pub(crate) fn schema_overview(conn: &Connection) -> Result<Vec<TableInfo>> {
 /// Get column metadata for a single table.
 pub(crate) fn table_columns(conn: &Connection, table: &str) -> Result<Vec<ColumnInfo>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{}\")", table))?;
-    let cols = stmt.query_map([], |row| {
-        Ok(ColumnInfo {
-            name: row.get(1)?,
-            col_type: row.get::<_, String>(2).unwrap_or_default(),
-            notnull: row.get::<_, bool>(3).unwrap_or(false),
-            pk: row.get::<_, i32>(5).unwrap_or(0) > 0,
-            default_value: row.get(4)?,
-        })
-    })?.collect::<std::result::Result<Vec<_>, _>>()?;
+    let cols = stmt
+        .query_map([], |row| {
+            Ok(ColumnInfo {
+                name: row.get(1)?,
+                col_type: row.get::<_, String>(2).unwrap_or_default(),
+                notnull: row.get::<_, bool>(3).unwrap_or(false),
+                pk: row.get::<_, i32>(5).unwrap_or(0) > 0,
+                default_value: row.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(cols)
 }
 
 /// Execute an arbitrary SQL query and return rows as JSON values.
-pub(crate) fn execute_query(conn: &Connection, sql: &str) -> Result<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
+pub(crate) fn execute_query(
+    conn: &Connection,
+    sql: &str,
+) -> Result<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
     let mut stmt = conn.prepare(sql).context("preparing SQL query")?;
     let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let col_count = col_names.len();
@@ -1866,21 +2845,44 @@ pub(crate) fn execute_query(conn: &Connection, sql: &str) -> Result<(Vec<String>
     Ok((col_names, rows))
 }
 
-fn cmd_sql(db_path: &std::path::Path, query: Option<String>, table: Option<String>, json_output: bool) -> Result<()> {
+fn cmd_sql(
+    db_path: &std::path::Path,
+    query: Option<String>,
+    table: Option<String>,
+    json_output: bool,
+    compact: bool,
+) -> Result<()> {
     let conn = open_db(db_path)?;
 
     match (query, table) {
         (Some(sql), _) => {
             let (columns, rows) = execute_query(&conn, &sql)?;
             if json_output {
-                let json_rows: Vec<serde_json::Value> = rows.iter().map(|row| {
-                    let obj: serde_json::Map<String, serde_json::Value> = columns.iter()
-                        .zip(row.iter())
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-                    serde_json::Value::Object(obj)
-                }).collect();
+                let json_rows: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|row| {
+                        let obj: serde_json::Map<String, serde_json::Value> = columns
+                            .iter()
+                            .zip(row.iter())
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        serde_json::Value::Object(obj)
+                    })
+                    .collect();
                 println!("{}", serde_json::to_string_pretty(&json_rows)?);
+            } else if compact {
+                println!("rows:{} cols:{}", rows.len(), columns.len());
+                for row in &rows {
+                    let cells: Vec<String> = row
+                        .iter()
+                        .map(|v| match v {
+                            serde_json::Value::Null => "NULL".to_string(),
+                            serde_json::Value::String(s) => truncate_for_compact(s, 40),
+                            other => other.to_string(),
+                        })
+                        .collect();
+                    println!("  {}", cells.join(" | "));
+                }
             } else {
                 // Tabular output
                 if columns.is_empty() {
@@ -1889,13 +2891,23 @@ fn cmd_sql(db_path: &std::path::Path, query: Option<String>, table: Option<Strin
                 }
                 // Header
                 println!("{}", columns.join(" | "));
-                println!("{}", columns.iter().map(|c| "-".repeat(c.len().max(4))).collect::<Vec<_>>().join("-+-"));
+                println!(
+                    "{}",
+                    columns
+                        .iter()
+                        .map(|c| "-".repeat(c.len().max(4)))
+                        .collect::<Vec<_>>()
+                        .join("-+-")
+                );
                 for row in &rows {
-                    let cells: Vec<String> = row.iter().map(|v| match v {
-                        serde_json::Value::Null => "NULL".to_string(),
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    }).collect();
+                    let cells: Vec<String> = row
+                        .iter()
+                        .map(|v| match v {
+                            serde_json::Value::Null => "NULL".to_string(),
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .collect();
                     println!("{}", cells.join(" | "));
                 }
                 println!("\n{} row(s)", rows.len());
@@ -1908,12 +2920,23 @@ fn cmd_sql(db_path: &std::path::Path, query: Option<String>, table: Option<Strin
             }
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&cols)?);
+            } else if compact {
+                println!("table:{} columns:{}", tbl, cols.len());
+                for col in &cols {
+                    println!("  {} {}", col.name, col.col_type);
+                }
             } else {
                 println!("Table: {}", tbl);
                 println!("{:<20} {:<12} {:<8} PK", "Column", "Type", "NotNull");
                 println!("{}", "-".repeat(50));
                 for col in &cols {
-                    println!("{:<20} {:<12} {:<8} {}", col.name, col.col_type, col.notnull, if col.pk { "PK" } else { "" });
+                    println!(
+                        "{:<20} {:<12} {:<8} {}",
+                        col.name,
+                        col.col_type,
+                        col.notnull,
+                        if col.pk { "PK" } else { "" }
+                    );
                 }
             }
         }
@@ -1921,6 +2944,16 @@ fn cmd_sql(db_path: &std::path::Path, query: Option<String>, table: Option<Strin
             let tables = schema_overview(&conn)?;
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&tables)?);
+            } else if compact {
+                println!("tables:{}", tables.len());
+                for tbl in &tables {
+                    println!(
+                        "  {} rows:{} cols:{}",
+                        tbl.name,
+                        tbl.row_count,
+                        tbl.columns.len()
+                    );
+                }
             } else {
                 println!("Database: {}", db_path.display());
                 println!("{} table(s)\n", tables.len());
@@ -1930,8 +2963,17 @@ fn cmd_sql(db_path: &std::path::Path, query: Option<String>, table: Option<Strin
                         let flags = [
                             if col.pk { "PK" } else { "" },
                             if col.notnull { "NOT NULL" } else { "" },
-                        ].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(", ");
-                        let suffix = if flags.is_empty() { String::new() } else { format!(" [{}]", flags) };
+                        ]
+                        .iter()
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                        let suffix = if flags.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", flags)
+                        };
                         println!("    {} {}{}", col.name, col.col_type, suffix);
                     }
                     println!();
@@ -1991,9 +3033,13 @@ fn rewrite_rg(cmd: &str) -> Option<String> {
 
     // Skip if rg is used with complex flags we can't translate
     // (pipe chains, output redirection, --replace, --count, etc.)
-    if cmd.contains('|') || cmd.contains('>') || cmd.contains("--replace")
-        || cmd.contains("--count") || cmd.contains("-c")
-        || cmd.contains("--files-with-matches") || cmd.contains("-l")
+    if cmd.contains('|')
+        || cmd.contains('>')
+        || cmd.contains("--replace")
+        || cmd.contains("--count")
+        || cmd.contains("-c")
+        || cmd.contains("--files-with-matches")
+        || cmd.contains("-l")
     {
         return None;
     }
@@ -2009,8 +3055,19 @@ fn rewrite_rg(cmd: &str) -> Option<String> {
             continue;
         }
         // Flags that take a value
-        if matches!(*part, "-t" | "--type" | "-g" | "--glob" | "-A" | "-B" | "-C"
-            | "--max-count" | "--max-depth" | "-m" | "-e") {
+        if matches!(
+            *part,
+            "-t" | "--type"
+                | "-g"
+                | "--glob"
+                | "-A"
+                | "-B"
+                | "-C"
+                | "--max-count"
+                | "--max-depth"
+                | "-m"
+                | "-e"
+        ) {
             skip_next = true;
             continue;
         }
@@ -2042,8 +3099,12 @@ fn rewrite_grep(cmd: &str) -> Option<String> {
     }
 
     // Only rewrite recursive grep
-    let has_recursive = parts.iter().any(|p| *p == "-r" || *p == "-R" || *p == "--recursive"
-        || p.contains('r') && p.starts_with('-') && !p.starts_with("--"));
+    let has_recursive = parts.iter().any(|p| {
+        *p == "-r"
+            || *p == "-R"
+            || *p == "--recursive"
+            || p.contains('r') && p.starts_with('-') && !p.starts_with("--")
+    });
     if !has_recursive {
         return None;
     }
@@ -2120,22 +3181,31 @@ fn shell_split(s: &str) -> Vec<&str> {
 /// Quote a string for shell if it contains special characters.
 fn shell_quote(s: &str) -> String {
     // Strip existing quotes
-    let unquoted = if (s.starts_with('"') && s.ends_with('"'))
-        || (s.starts_with('\'') && s.ends_with('\''))
-    {
-        &s[1..s.len() - 1]
-    } else {
-        s
-    };
+    let unquoted =
+        if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+            &s[1..s.len() - 1]
+        } else {
+            s
+        };
 
-    if unquoted.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/') {
+    if unquoted
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/')
+    {
         format!("\"{}\"", unquoted)
     } else {
-        format!("\"{}\"", unquoted.replace('\\', "\\\\").replace('"', "\\\""))
+        format!(
+            "\"{}\"",
+            unquoted.replace('\\', "\\\\").replace('"', "\\\"")
+        )
     }
 }
 
-fn federated_symbol_search(root: &std::path::Path, query: &str, limit: usize) -> Result<Vec<index::SymbolHit>> {
+fn federated_symbol_search(
+    root: &std::path::Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<index::SymbolHit>> {
     let cfg = config::Config::load(root)?;
     let submodules = config::Config::submodule_dirs(root)?;
     let mut all_hits: Vec<index::SymbolHit> = Vec::new();
@@ -2151,7 +3221,11 @@ fn federated_symbol_search(root: &std::path::Path, query: &str, limit: usize) ->
         let mut hits = db.symbol_search(query, limit)?;
         all_hits.append(&mut hits);
     }
-    all_hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    all_hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     all_hits.truncate(limit);
     Ok(all_hits)
 }
@@ -2185,101 +3259,4 @@ fn run_search_with_timeout(
             bail!("sift search thread panicked");
         }
     }
-}
-
-fn cmd_search(
-    query: String,
-    path: Option<PathBuf>,
-    limit: usize,
-    strategy: Option<String>,
-    scope: Option<String>,
-    federated: bool,
-    json_output: bool,
-    timeout_secs: u64,
-) -> Result<()> {
-    let base_path = path.unwrap_or_else(|| PathBuf::from("."));
-
-    let (symbol_hits, sift_path) = if let Some(ref scope_name) = scope {
-        let root = base_path.canonicalize().unwrap_or(base_path.clone());
-        let cfg = config::Config::load(&root)?;
-        let db_path = cfg.db_path_for(&root, scope_name);
-        let hits = if db_path.exists() {
-            let db = index::IndexDb::open(&db_path)?;
-            db.symbol_search(&query, limit)?
-        } else {
-            Vec::new()
-        };
-        let sub_path = config::Config::submodule_dirs(&root)?
-            .into_iter()
-            .find(|(name, _)| name == scope_name)
-            .map(|(_, p)| p)
-            .unwrap_or(base_path.clone());
-        (hits, sub_path)
-    } else if federated {
-        let root = base_path.canonicalize().unwrap_or(base_path.clone());
-        (federated_symbol_search(&root, &query, limit)?, base_path.clone())
-    } else {
-        let db_path = base_path.join(".tsift/index.db");
-        let hits = if db_path.exists() {
-            let db = index::IndexDb::open(&db_path)?;
-            db.symbol_search(&query, limit)?
-        } else {
-            Vec::new()
-        };
-        (hits, base_path.clone())
-    };
-
-    let engine = Sift::builder().build();
-    let effective_strategy = strategy.unwrap_or_else(|| "lexical".to_string());
-    let options = SearchOptions::default()
-        .with_limit(limit)
-        .with_strategy(effective_strategy.clone());
-    let input = SearchInput::new(&sift_path, &query).with_options(options);
-    let response = run_search_with_timeout(engine, input, timeout_secs, &effective_strategy)?;
-
-    if json_output {
-        #[derive(Serialize)]
-        struct CombinedResponse<'a> {
-            symbols: &'a [index::SymbolHit],
-            #[serde(flatten)]
-            sift: &'a serde_json::Value,
-        }
-        let sift_value = serde_json::to_value(&response)?;
-        let combined = CombinedResponse { symbols: &symbol_hits, sift: &sift_value };
-        println!("{}", serde_json::to_string_pretty(&combined)?);
-    } else {
-        if !symbol_hits.is_empty() {
-            println!("Symbol matches ({}):", symbol_hits.len());
-            println!();
-            for (i, hit) in symbol_hits.iter().enumerate() {
-                println!(
-                    "  #{} [{}] {} {} ({}:{}) score: {:.4}",
-                    i + 1, hit.match_type, hit.kind, hit.name, hit.file, hit.line, hit.score
-                );
-            }
-            println!();
-        }
-
-        println!(
-            "Strategy: {} | Indexed: {} | Skipped: {}",
-            response.strategy, response.indexed_artifacts, response.skipped_artifacts
-        );
-        println!();
-        for hit in &response.hits {
-            println!(
-                "  #{} [{:?}] {} (score: {:.4})",
-                hit.rank, hit.confidence, hit.path, hit.score
-            );
-            if !hit.snippet.is_empty() {
-                for line in hit.snippet.lines().take(3) {
-                    println!("    {}", line);
-                }
-            }
-            println!();
-        }
-        if symbol_hits.is_empty() && response.hits.is_empty() {
-            println!("  No results.");
-        }
-    }
-    Ok(())
 }

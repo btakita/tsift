@@ -174,14 +174,17 @@ pub fn find_similar_pairs(skills: &[SkillEntry], threshold: f32) -> Vec<SimilarP
     let mut pairs = Vec::new();
     for i in 0..skills.len() {
         let a = &skills[i];
-        let Some(desc_a) = &a.description else { continue };
+        let Some(desc_a) = &a.description else {
+            continue;
+        };
         let tokens_a = description_tokens(desc_a);
         if tokens_a.is_empty() {
             continue;
         }
-        for j in (i + 1)..skills.len() {
-            let b = &skills[j];
-            let Some(desc_b) = &b.description else { continue };
+        for b in skills.iter().skip(i + 1) {
+            let Some(desc_b) = &b.description else {
+                continue;
+            };
             let tokens_b = description_tokens(desc_b);
             if tokens_b.is_empty() {
                 continue;
@@ -203,7 +206,11 @@ pub fn find_similar_pairs(skills: &[SkillEntry], threshold: f32) -> Vec<SimilarP
             }
         }
     }
-    pairs.sort_by(|x, y| y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal));
+    pairs.sort_by(|x, y| {
+        y.score
+            .partial_cmp(&x.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     pairs
 }
 
@@ -220,10 +227,7 @@ fn description_tokens(desc: &str) -> HashSet<String> {
         .collect()
 }
 
-pub fn compare_manifest(
-    audit: &mut AuditResult,
-    manifest_path: &Path,
-) -> Result<()> {
+pub fn compare_manifest(audit: &mut AuditResult, manifest_path: &Path) -> Result<()> {
     let content = std::fs::read_to_string(manifest_path)
         .with_context(|| format!("reading manifest: {}", manifest_path.display()))?;
 
@@ -373,9 +377,10 @@ pub fn generate_cleanup(audit: &mut AuditResult) {
             reasons.push("never used in any session".to_string());
         }
 
-        let is_duplicate = audit.similar_pairs.iter().any(|p| {
-            (p.skill_a == skill.name || p.skill_b == skill.name) && p.score >= 0.5
-        });
+        let is_duplicate = audit
+            .similar_pairs
+            .iter()
+            .any(|p| (p.skill_a == skill.name || p.skill_b == skill.name) && p.score >= 0.5);
         if is_duplicate {
             reasons.push("high similarity with another skill (≥50%)".to_string());
         }
@@ -428,10 +433,7 @@ fn walkdir(dir: &Path) -> Result<Vec<PathBuf>> {
 pub fn write_report(audit: &AuditResult, path: &Path) -> Result<()> {
     let mut report = String::new();
     report.push_str("# Skill Audit Report\n\n");
-    report.push_str(&format!(
-        "**Generated:** {}\n\n",
-        chrono_now()
-    ));
+    report.push_str(&format!("**Generated:** {}\n\n", chrono_now()));
     report.push_str(&format!(
         "**Skills directory:** `{}`\n\n",
         audit.skills_dir.display()
@@ -442,15 +444,24 @@ pub fn write_report(audit: &AuditResult, path: &Path) -> Result<()> {
     ));
 
     report.push_str("## Skills\n\n");
-    report.push_str("| Status | Name | Description | Uses |\n|--------|------|-------------|------|\n");
+    report.push_str(
+        "| Status | Name | Description | Uses |\n|--------|------|-------------|------|\n",
+    );
     for skill in &audit.skills {
-        let status = if skill.issues.is_empty() { "ok" } else { "broken" };
+        let status = if skill.issues.is_empty() {
+            "ok"
+        } else {
+            "broken"
+        };
         let desc = skill.description.as_deref().unwrap_or("-");
         let uses = skill
             .invocation_count
             .map(|c| c.to_string())
             .unwrap_or_else(|| "-".to_string());
-        report.push_str(&format!("| {} | {} | {} | {} |\n", status, skill.name, desc, uses));
+        report.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            status, skill.name, desc, uses
+        ));
     }
 
     if !audit.similar_pairs.is_empty() {
@@ -484,7 +495,8 @@ pub fn write_report(audit: &AuditResult, path: &Path) -> Result<()> {
         && !cleanup.is_empty()
     {
         report.push_str("\n## Cleanup Recommendations\n\n");
-        report.push_str("| Skill | Token Savings | Reasons |\n|-------|---------------|--------|\n");
+        report
+            .push_str("| Skill | Token Savings | Reasons |\n|-------|---------------|--------|\n");
         for entry in cleanup {
             report.push_str(&format!(
                 "| {} | ~{} | {} |\n",
@@ -610,7 +622,11 @@ mod tests {
         let result = scan_skills(dir.path()).unwrap();
         assert_eq!(result.total, 1);
         assert_eq!(result.broken, 1);
-        assert!(result.skills[0].issues.contains(&"SKILL.md missing".to_string()));
+        assert!(
+            result.skills[0]
+                .issues
+                .contains(&"SKILL.md missing".to_string())
+        );
     }
 
     #[test]
@@ -622,9 +638,11 @@ mod tests {
 
         let result = scan_skills(dir.path()).unwrap();
         assert_eq!(result.broken, 1);
-        assert!(result.skills[0]
-            .issues
-            .contains(&"SKILL.md is empty".to_string()));
+        assert!(
+            result.skills[0]
+                .issues
+                .contains(&"SKILL.md is empty".to_string())
+        );
     }
 
     #[test]
@@ -632,14 +650,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let skill = dir.path().join("no-desc");
         fs::create_dir(&skill).unwrap();
-        fs::write(skill.join("SKILL.md"), "---\nname: no-desc\n---\n# no-desc\n").unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: no-desc\n---\n# no-desc\n",
+        )
+        .unwrap();
 
         let result = scan_skills(dir.path()).unwrap();
         assert_eq!(result.broken, 1);
-        assert!(result.skills[0]
-            .issues
-            .iter()
-            .any(|i| i.contains("no description")));
+        assert!(
+            result.skills[0]
+                .issues
+                .iter()
+                .any(|i| i.contains("no description"))
+        );
     }
 
     #[test]
@@ -667,11 +691,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let skill = dir.path().join("installed");
         fs::create_dir(&skill).unwrap();
-        fs::write(
-            skill.join("SKILL.md"),
-            "---\ndescription: installed\n---\n",
-        )
-        .unwrap();
+        fs::write(skill.join("SKILL.md"), "---\ndescription: installed\n---\n").unwrap();
 
         let manifest = dir.path().join("manifest.txt");
         fs::write(&manifest, "installed\nexpected-but-missing\n").unwrap();
@@ -968,7 +988,11 @@ mod tests {
         };
         generate_cleanup(&mut result);
         let cleanup = result.cleanup.unwrap();
-        assert!(cleanup.iter().any(|e| e.skill == "unused" && e.reasons.iter().any(|r| r.contains("never used"))));
+        assert!(
+            cleanup
+                .iter()
+                .any(|e| e.skill == "unused" && e.reasons.iter().any(|r| r.contains("never used")))
+        );
         assert!(!cleanup.iter().any(|e| e.skill == "used"));
     }
 
@@ -997,7 +1021,11 @@ mod tests {
         generate_cleanup(&mut result);
         let cleanup = result.cleanup.unwrap();
         assert_eq!(cleanup.len(), 2);
-        assert!(cleanup.iter().all(|e| e.reasons.iter().any(|r| r.contains("similarity"))));
+        assert!(
+            cleanup
+                .iter()
+                .all(|e| e.reasons.iter().any(|r| r.contains("similarity")))
+        );
     }
 
     #[test]

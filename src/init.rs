@@ -20,11 +20,16 @@ Only read full source files when tsift results are insufficient.
 const GITIGNORE_ENTRY: &str = ".tsift/";
 
 pub struct InitResult {
-    pub file: PathBuf,
-    pub action: InitAction,
+    pub updates: Vec<InstructionUpdate>,
     pub gitignore_added: bool,
 }
 
+pub struct InstructionUpdate {
+    pub file: PathBuf,
+    pub action: InitAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InitAction {
     Created,
     Updated,
@@ -39,18 +44,6 @@ impl std::fmt::Display for InitAction {
             InitAction::AlreadyPresent => write!(f, "already present"),
         }
     }
-}
-
-pub fn find_instruction_file(dir: &Path) -> Option<PathBuf> {
-    let agents = dir.join("AGENTS.md");
-    if agents.exists() {
-        return Some(agents);
-    }
-    let claude = dir.join("CLAUDE.md");
-    if claude.exists() {
-        return Some(claude);
-    }
-    None
 }
 
 fn ensure_gitignore(dir: &Path) -> Result<bool> {
@@ -97,21 +90,35 @@ pub fn resolve_project_dir(path: &Path) -> Result<PathBuf> {
 
 pub fn init(dir: &Path) -> Result<InitResult> {
     let gitignore_added = ensure_gitignore(dir)?;
+    let mut updates = Vec::new();
 
-    let file = match find_instruction_file(dir) {
-        Some(f) => f,
-        None => {
-            let agents = dir.join("AGENTS.md");
-            std::fs::write(&agents, format!("{}\n", DEFAULT_SECTION))?;
-            return Ok(InitResult {
-                file: agents,
-                action: InitAction::Created,
-                gitignore_added,
-            });
-        }
-    };
+    let agents = dir.join("AGENTS.md");
+    updates.push(InstructionUpdate {
+        file: agents.clone(),
+        action: ensure_instruction_file(&agents)?,
+    });
 
-    let content = std::fs::read_to_string(&file)?;
+    let claude = dir.join("CLAUDE.md");
+    if claude.exists() {
+        updates.push(InstructionUpdate {
+            file: claude.clone(),
+            action: ensure_instruction_file(&claude)?,
+        });
+    }
+
+    Ok(InitResult {
+        updates,
+        gitignore_added,
+    })
+}
+
+fn ensure_instruction_file(file: &Path) -> Result<InitAction> {
+    if !file.exists() {
+        std::fs::write(file, format!("{}\n", DEFAULT_SECTION))?;
+        return Ok(InitAction::Created);
+    }
+
+    let content = std::fs::read_to_string(file)?;
 
     if content.contains(SECTION_MARKER) {
         let start = content.find(SECTION_MARKER).unwrap();
@@ -121,18 +128,10 @@ pub fn init(dir: &Path) -> Result<InitResult> {
             let after = &content[end..];
             let new_content = format!("{}{}{}", before, DEFAULT_SECTION, after);
             if new_content == content {
-                return Ok(InitResult {
-                    file,
-                    action: InitAction::AlreadyPresent,
-                    gitignore_added,
-                });
+                return Ok(InitAction::AlreadyPresent);
             }
-            std::fs::write(&file, new_content)?;
-            return Ok(InitResult {
-                file,
-                action: InitAction::Updated,
-                gitignore_added,
-            });
+            std::fs::write(file, new_content)?;
+            return Ok(InitAction::Updated);
         } else {
             bail!(
                 "Found {} in {} but no matching {} — fix manually",
@@ -143,20 +142,16 @@ pub fn init(dir: &Path) -> Result<InitResult> {
         }
     }
 
-    let mut new_content = content.clone();
+    let mut new_content = content;
     if !new_content.ends_with('\n') {
         new_content.push('\n');
     }
     new_content.push('\n');
     new_content.push_str(DEFAULT_SECTION);
     new_content.push('\n');
-    std::fs::write(&file, new_content)?;
+    std::fs::write(file, new_content)?;
 
-    Ok(InitResult {
-        file,
-        action: InitAction::Created,
-        gitignore_added,
-    })
+    Ok(InitAction::Created)
 }
 
 #[cfg(test)]
@@ -168,9 +163,10 @@ mod tests {
     fn init_creates_agents_md_when_none_exists() {
         let dir = TempDir::new().unwrap();
         let result = init(dir.path()).unwrap();
-        assert!(matches!(result.action, InitAction::Created));
-        assert_eq!(result.file.file_name().unwrap(), "AGENTS.md");
-        let content = std::fs::read_to_string(&result.file).unwrap();
+        assert_eq!(result.updates.len(), 1);
+        assert!(matches!(result.updates[0].action, InitAction::Created));
+        assert_eq!(result.updates[0].file.file_name().unwrap(), "AGENTS.md");
+        let content = std::fs::read_to_string(&result.updates[0].file).unwrap();
         assert!(content.contains(SECTION_MARKER));
         assert!(content.contains("tsift search"));
     }
@@ -181,27 +177,50 @@ mod tests {
         let agents = dir.path().join("AGENTS.md");
         std::fs::write(&agents, "# My Project\n\nSome instructions.\n").unwrap();
         let result = init(dir.path()).unwrap();
-        assert!(matches!(result.action, InitAction::Created));
+        assert_eq!(result.updates.len(), 1);
+        assert!(matches!(result.updates[0].action, InitAction::Created));
         let content = std::fs::read_to_string(&agents).unwrap();
         assert!(content.starts_with("# My Project"));
         assert!(content.contains(SECTION_MARKER));
     }
 
     #[test]
-    fn init_prefers_agents_md_over_claude_md() {
+    fn init_updates_agents_and_claude_when_both_exist() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "# Agents\n").unwrap();
         std::fs::write(dir.path().join("CLAUDE.md"), "# Claude\n").unwrap();
         let result = init(dir.path()).unwrap();
-        assert_eq!(result.file.file_name().unwrap(), "AGENTS.md");
+        assert_eq!(result.updates.len(), 2);
+        assert_eq!(result.updates[0].file.file_name().unwrap(), "AGENTS.md");
+        assert_eq!(result.updates[1].file.file_name().unwrap(), "CLAUDE.md");
+        assert!(
+            std::fs::read_to_string(dir.path().join("AGENTS.md"))
+                .unwrap()
+                .contains(SECTION_MARKER)
+        );
+        assert!(
+            std::fs::read_to_string(dir.path().join("CLAUDE.md"))
+                .unwrap()
+                .contains(SECTION_MARKER)
+        );
     }
 
     #[test]
-    fn init_uses_claude_md_when_no_agents_md() {
+    fn init_creates_agents_and_updates_claude_when_only_claude_exists() {
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("CLAUDE.md"), "# Claude\n").unwrap();
+        let claude = dir.path().join("CLAUDE.md");
+        std::fs::write(&claude, "# Claude\n").unwrap();
         let result = init(dir.path()).unwrap();
-        assert_eq!(result.file.file_name().unwrap(), "CLAUDE.md");
+        assert_eq!(result.updates.len(), 2);
+        assert_eq!(result.updates[0].file.file_name().unwrap(), "AGENTS.md");
+        assert!(dir.path().join("AGENTS.md").exists());
+        assert!(matches!(result.updates[0].action, InitAction::Created));
+        assert!(matches!(result.updates[1].action, InitAction::Created));
+        assert!(
+            std::fs::read_to_string(claude)
+                .unwrap()
+                .contains(SECTION_MARKER)
+        );
     }
 
     #[test]
@@ -211,11 +230,11 @@ mod tests {
         std::fs::write(&agents, "# Project\n").unwrap();
 
         let r1 = init(dir.path()).unwrap();
-        assert!(matches!(r1.action, InitAction::Created));
+        assert!(matches!(r1.updates[0].action, InitAction::Created));
         let content_after_first = std::fs::read_to_string(&agents).unwrap();
 
         let r2 = init(dir.path()).unwrap();
-        assert!(matches!(r2.action, InitAction::AlreadyPresent));
+        assert!(matches!(r2.updates[0].action, InitAction::AlreadyPresent));
         let content_after_second = std::fs::read_to_string(&agents).unwrap();
         assert_eq!(content_after_first, content_after_second);
     }
@@ -231,7 +250,7 @@ mod tests {
         std::fs::write(&agents, format!("# Project\n\n{}\n", old_section)).unwrap();
 
         let result = init(dir.path()).unwrap();
-        assert!(matches!(result.action, InitAction::Updated));
+        assert!(matches!(result.updates[0].action, InitAction::Updated));
         let content = std::fs::read_to_string(&agents).unwrap();
         assert!(content.contains("tsift search"));
         assert!(!content.contains("Old content here."));
@@ -325,7 +344,11 @@ mod tests {
     fn init_preserves_surrounding_content() {
         let dir = TempDir::new().unwrap();
         let agents = dir.path().join("AGENTS.md");
-        std::fs::write(&agents, "# Header\n\nBefore content.\n\n## Footer\n\nAfter content.\n").unwrap();
+        std::fs::write(
+            &agents,
+            "# Header\n\nBefore content.\n\n## Footer\n\nAfter content.\n",
+        )
+        .unwrap();
         init(dir.path()).unwrap();
         let content = std::fs::read_to_string(&agents).unwrap();
         assert!(content.contains("# Header"));

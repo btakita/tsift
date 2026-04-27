@@ -81,6 +81,7 @@ tsift search <query>            # lexical by default; gains AST-aware ranking wh
 tsift search --scope <submod>   # restrict to one submodule's index + sift path
 tsift search --strategy hybrid  # opt-in to slower hybrid BM25 + vector search
 tsift search --timeout 60       # custom timeout in seconds (default: 30, 0 = no timeout)
+tsift --compact search <query>  # terse human output across commands
 ```
 
 ## Search Timeout
@@ -101,6 +102,17 @@ tsift search timed out after 30s (strategy: lexical). The index may be stale —
 Without `--quiet`, `tsift index --check` on a large repo with 14K+ stale files outputs every file path (1.7MB / 433K tokens in human mode, 2.6MB in JSON). With `--quiet`, output is a single summary line (~80 bytes human, ~120 bytes JSON).
 
 In JSON mode, `--quiet` also omits the `changes` array and uses compact (non-pretty) serialization.
+
+## Global Compact Output
+
+`tsift --compact` is a global flag for human-readable output. It keeps the underlying command behavior the same, but trims verbose formatting across commands:
+
+- `search` drops metadata banners, keeps one-line snippets, and reduces score precision
+- `explain` groups callers/callees by file instead of repeating the same path per edge
+- `communities` shows top members per cluster with `(+N more)` instead of full dumps
+- `path`, `status`, `audit`, `summarize`, `lint`, `sql`, and `index` switch to denser summary-oriented layouts
+
+`--compact` does not change standard `--json` formatting. Compact JSON remains a separate concern.
 
 ## Community Detection (Louvain)
 
@@ -393,10 +405,10 @@ Dynamic grammars use `tree_sitter::Language::from_path()`. The `Language` enum a
 
 ## Init (Project Setup)
 
-`tsift init` injects a Code Navigation section into the project's AGENTS.md (or CLAUDE.md), so every Claude Code session automatically prefers tsift over raw file reads.
+`tsift init` ensures the Code Navigation section is present in `AGENTS.md` for Codex-style harnesses and mirrors it into `CLAUDE.md` when that file exists, so local agent sessions prefer tsift over raw file reads.
 
 ```bash
-tsift init                              # inject into AGENTS.md/CLAUDE.md in current directory
+tsift init                              # ensure AGENTS.md (and CLAUDE.md if present) in current directory
 tsift init <path>                       # inject at <path> (dir or file)
 tsift init src/sub/tasks/plan.md        # resolves to submodule root src/sub/
 ```
@@ -414,8 +426,8 @@ This means `tsift init src/session-share/tasks/claudescore-3.md` resolves to `sr
 ### Behavior
 
 1. Adds `.tsift/` to `.gitignore` (creates the file if needed, appends if entry missing, skips if already present)
-2. Looks for `AGENTS.md` first (canonical per convention), falls back to `CLAUDE.md`
-3. If neither exists, creates `AGENTS.md` with the section
+2. Ensures `AGENTS.md` exists with the section (creates it if needed)
+3. If `CLAUDE.md` exists, updates or appends the same section there too
 4. If the section already exists (detected by `<!-- tsift:code-navigation -->` markers), updates it in place
 5. Idempotent — running twice produces no changes on the second run
 
