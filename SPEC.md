@@ -493,6 +493,7 @@ Dynamic grammars use `tree_sitter::Language::from_path()`. The `Language` enum a
 tsift init                              # ensure AGENTS.md (and CLAUDE.md if present) in current directory
 tsift init <path>                       # inject at <path> (dir or file)
 tsift init src/sub/tasks/plan.md        # resolves to submodule root src/sub/
+tsift init --codex                      # also inject auto-reindex hook into .codex/hooks.json
 ```
 
 ### Path Resolution
@@ -512,6 +513,7 @@ This means `tsift init src/session-share/tasks/claudescore-3.md` resolves to `sr
 3. If `CLAUDE.md` exists, updates or appends the same section there too
 4. If the section already exists (detected by `<!-- tsift:code-navigation -->` markers), updates it in place
 5. Idempotent — running twice produces no changes on the second run
+6. With `--codex`: merges a `UserPromptSubmit` auto-reindex hook into `.codex/hooks.json` (creates the file and directory if needed, appends to existing hooks, idempotent)
 
 ### Injected Section
 

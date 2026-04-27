@@ -254,6 +254,9 @@ enum Commands {
         /// Path to the project directory (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Also inject auto-reindex hook into .codex/hooks.json
+        #[arg(long)]
+        codex: bool,
     },
     /// Cached LLM analysis — pre-computed summaries, entities, relationships
     Summarize {
@@ -428,7 +431,7 @@ fn main() -> Result<()> {
             report,
             json,
         }) => cmd_audit(&skills_dir, manifest, usage, cleanup, report, json || terse, compact, pretty, terse),
-        Some(Commands::Init { path }) => cmd_init(&path),
+        Some(Commands::Init { path, codex }) => cmd_init(&path, codex),
         Some(Commands::Lint {
             file,
             index,
@@ -2378,12 +2381,12 @@ fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn cmd_init(path: &std::path::Path) -> Result<()> {
+fn cmd_init(path: &std::path::Path, codex: bool) -> Result<()> {
     let resolved = init::resolve_project_dir(path)?;
     if resolved != path {
         println!("resolved: {} → {}", path.display(), resolved.display());
     }
-    let result = init::init(&resolved)?;
+    let result = init::init(&resolved, codex)?;
     for update in result.updates {
         println!(
             "{}: {} ({})",
@@ -2398,6 +2401,19 @@ fn cmd_init(path: &std::path::Path) -> Result<()> {
     }
     if result.gitignore_added {
         println!(".gitignore: added .tsift/");
+    }
+    if let Some(codex_result) = &result.codex_hooks {
+        match codex_result {
+            init::CodexHooksResult::Added => {
+                println!(".codex/hooks.json: tsift auto-reindex hook added");
+            }
+            init::CodexHooksResult::AlreadyPresent => {
+                println!(".codex/hooks.json: tsift hook already present");
+            }
+            init::CodexHooksResult::Created => {
+                println!(".codex/hooks.json: created with tsift auto-reindex hook");
+            }
+        }
     }
     Ok(())
 }
