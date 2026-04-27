@@ -42,6 +42,10 @@ struct Cli {
     #[arg(long, global = true)]
     absolute: bool,
 
+    /// Output repeated structures as TSV with header row
+    #[arg(long, global = true)]
+    tabular: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -334,6 +338,7 @@ fn main() -> Result<()> {
     let pretty = cli.pretty;
     let terse = cli.terse;
     let absolute = cli.absolute;
+    let tabular = cli.tabular;
     match cli.command {
         Some(Commands::Search {
             query,
@@ -345,7 +350,7 @@ fn main() -> Result<()> {
             json,
             timeout,
         }) => cmd_search(
-            query, path, limit, strategy, scope, federated, json || terse, timeout, compact, pretty, terse, absolute,
+            query, path, limit, strategy, scope, federated, json || terse, timeout, compact, pretty, terse, absolute, tabular,
         ),
         Some(Commands::Edit { dry_run, file }) => cmd_edit(dry_run, file, compact, pretty, terse),
         Some(Commands::Index {
@@ -395,6 +400,7 @@ fn main() -> Result<()> {
             pretty,
             terse,
             absolute,
+            tabular,
         ),
         Some(Commands::Sql {
             db,
@@ -408,7 +414,7 @@ fn main() -> Result<()> {
             min_size,
             limit,
             json,
-        }) => cmd_communities(&path, scope.as_deref(), min_size, limit, json || terse, compact, pretty, terse),
+        }) => cmd_communities(&path, scope.as_deref(), min_size, limit, json || terse, compact, pretty, terse, tabular),
         Some(Commands::Path {
             from,
             to,
@@ -422,7 +428,7 @@ fn main() -> Result<()> {
             scope,
             limit,
             json,
-        }) => cmd_explain(&symbol, &path, scope.as_deref(), limit, json || terse, compact, pretty, terse, absolute),
+        }) => cmd_explain(&symbol, &path, scope.as_deref(), limit, json || terse, compact, pretty, terse, absolute, tabular),
         Some(Commands::Audit {
             skills_dir,
             manifest,
@@ -1244,6 +1250,7 @@ fn cmd_graph(
     pretty: bool,
     terse: bool,
     absolute: bool,
+    tabular: bool,
 ) -> Result<()> {
     let root = path
         .canonicalize()
@@ -1283,6 +1290,14 @@ fn cmd_graph(
                 });
                 println!("{}", to_json(&out, pretty, terse)?);
             }
+        } else if tabular {
+            println!("direction\tname\tfile\tline");
+            for edge in &edges {
+                println!("caller\t{}\t{}\t{}", edge.caller_name, edge.caller_file, edge.call_site_line);
+            }
+            if truncated {
+                println!("# (+{} more)", total - limit);
+            }
         } else if compact {
             println!("callers[{}]:", total);
             if edges.is_empty() {
@@ -1314,7 +1329,7 @@ fn cmd_graph(
                 }
             }
         }
-        if show_both && !json_output && !compact {
+        if show_both && !json_output && !compact && !tabular {
             println!();
         }
     }
@@ -1337,6 +1352,16 @@ fn cmd_graph(
                     "truncated": truncated,
                 });
                 println!("{}", to_json(&out, pretty, terse)?);
+            }
+        } else if tabular {
+            if !show_both {
+                println!("direction\tname\tfile\tline");
+            }
+            for edge in &edges {
+                println!("callee\t{}\t{}\t{}", edge.callee_name, edge.caller_file, edge.call_site_line);
+            }
+            if truncated {
+                println!("# (+{} more)", total - limit);
             }
         } else if compact {
             println!("callees[{}]:", total);
@@ -1412,6 +1437,7 @@ fn cmd_communities(
     compact: bool,
     pretty: bool,
     terse: bool,
+    tabular: bool,
 ) -> Result<()> {
     let root = path
         .canonicalize()
@@ -1457,6 +1483,14 @@ fn cmd_communities(
             "truncated": truncated,
         });
         println!("{}", to_json(&out, pretty, terse)?);
+    } else if tabular {
+        println!("id\tsize\tmembers");
+        for (i, community) in display.iter().enumerate() {
+            println!("{}\t{}\t{}", i + 1, community.members.len(), community.members.join(","));
+        }
+        if truncated {
+            println!("# (+{} more)", total - limit);
+        }
     } else if compact {
         println!(
             "communities nodes:{} edges:{} iterations:{} q:{:.4} count:{}",
@@ -1603,6 +1637,7 @@ fn cmd_explain(
     pretty: bool,
     terse: bool,
     absolute: bool,
+    tabular: bool,
 ) -> Result<()> {
     let root = path
         .canonicalize()
@@ -1649,6 +1684,35 @@ fn cmd_explain(
             "community": community,
         });
         println!("{}", to_json(&out, pretty, terse)?);
+    } else if tabular {
+        if !symbols.is_empty() {
+            println!("section\tkind\tname\tfile\tline");
+            for sym in &symbols {
+                println!("def\t{}\t{}\t{}\t{}", sym.kind, sym.name, sym.file, sym.line);
+            }
+        }
+        if !callers.is_empty() {
+            if !symbols.is_empty() { println!(); }
+            println!("direction\tname\tfile\tline");
+            for edge in &callers {
+                println!("caller\t{}\t{}\t{}", edge.caller_name, edge.caller_file, edge.call_site_line);
+            }
+            if callers_truncated {
+                println!("# (+{} more callers)", callers_total - limit);
+            }
+        }
+        if !callees.is_empty() {
+            for edge in &callees {
+                println!("callee\t{}\t{}\t{}", edge.callee_name, edge.caller_file, edge.call_site_line);
+            }
+            if callees_truncated {
+                println!("# (+{} more callees)", callees_total - limit);
+            }
+        }
+        if let Some(comm) = community {
+            println!();
+            println!("community\t{}\t{}", comm.members.len(), comm.members.join(","));
+        }
     } else if compact {
         if symbols.is_empty() {
             println!("symbol: {} (definitions: none)", symbol);
@@ -2190,6 +2254,7 @@ fn cmd_search(
     pretty: bool,
     terse: bool,
     absolute: bool,
+    tabular: bool,
 ) -> Result<()> {
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
 
@@ -2256,6 +2321,33 @@ fn cmd_search(
             sift: &sift_value,
         };
         println!("{}", to_json(&combined, pretty, terse)?);
+    } else if tabular {
+        if !symbol_hits.is_empty() {
+            println!("match_type\tkind\tname\tfile\tline\tscore");
+            for hit in &symbol_hits {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    hit.match_type, hit.kind, hit.name, hit.file, hit.line,
+                    format_score(hit.score, true)
+                );
+            }
+        }
+        if !response.hits.is_empty() {
+            if !symbol_hits.is_empty() {
+                println!();
+            }
+            println!("rank\tpath\tconfidence\tscore");
+            for hit in &response.hits {
+                let hp = if absolute { hit.path.clone() } else { relativize(&hit.path, &root) };
+                println!(
+                    "{}\t{}\t{:?}\t{}",
+                    hit.rank, hp, hit.confidence, format_score(hit.score, true)
+                );
+            }
+        }
+        if symbol_hits.is_empty() && response.hits.is_empty() {
+            println!("(none)");
+        }
     } else if compact {
         if !symbol_hits.is_empty() {
             println!("symbols[{}]:", symbol_hits.len());
@@ -2833,7 +2925,7 @@ mod tests {
     #[test]
     fn graph_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_graph("main", dir.path(), false, false, None, 20, false, false, false, false, false);
+        let result = cmd_graph("main", dir.path(), false, false, None, 20, false, false, false, false, false, false);
         assert!(result.is_err());
     }
 
@@ -3086,7 +3178,7 @@ tier = "isolated"
     #[test]
     fn community_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_communities(dir.path(), None, 2, 10, false, false, false, false);
+        let result = cmd_communities(dir.path(), None, 2, 10, false, false, false, false, false);
         assert!(result.is_err());
     }
 
@@ -3133,7 +3225,7 @@ tier = "isolated"
     #[test]
     fn explain_cmd_no_index_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let result = cmd_explain("main", dir.path(), None, 15, false, false, false, false, false);
+        let result = cmd_explain("main", dir.path(), None, 15, false, false, false, false, false, false);
         assert!(result.is_err());
     }
 
@@ -3324,6 +3416,34 @@ tier = "isolated"
     }
 
     #[test]
+    fn cli_accepts_global_tabular_flag() {
+        let cli = Cli::parse_from(["tsift", "--tabular", "search", "test"]);
+        assert!(cli.tabular);
+        assert!(matches!(cli.command, Some(Commands::Search { .. })));
+    }
+
+    #[test]
+    fn cli_tabular_with_graph() {
+        let cli = Cli::parse_from(["tsift", "--tabular", "graph", "main"]);
+        assert!(cli.tabular);
+        assert!(matches!(cli.command, Some(Commands::Graph { .. })));
+    }
+
+    #[test]
+    fn cli_tabular_with_communities() {
+        let cli = Cli::parse_from(["tsift", "--tabular", "communities"]);
+        assert!(cli.tabular);
+        assert!(matches!(cli.command, Some(Commands::Communities { .. })));
+    }
+
+    #[test]
+    fn cli_tabular_with_explain() {
+        let cli = Cli::parse_from(["tsift", "--tabular", "explain", "main"]);
+        assert!(cli.tabular);
+        assert!(matches!(cli.command, Some(Commands::Explain { .. })));
+    }
+
+    #[test]
     fn relativize_strips_root_prefix() {
         let root = std::path::Path::new("/home/user/project");
         assert_eq!(relativize("/home/user/project/src/main.rs", root), "src/main.rs");
@@ -3446,14 +3566,35 @@ tier = "isolated"
     #[test]
     fn graph_cmd_limit_runs_ok() {
         let dir = setup_graph_index();
-        let result = cmd_graph("main", dir.path(), false, false, None, 1, false, false, false, false, false);
+        let result = cmd_graph("main", dir.path(), false, false, None, 1, false, false, false, false, false, false);
         assert!(result.is_ok());
     }
 
     #[test]
     fn graph_cmd_unlimited_runs_ok() {
         let dir = setup_graph_index();
-        let result = cmd_graph("main", dir.path(), false, false, None, 0, false, false, false, false, false);
+        let result = cmd_graph("main", dir.path(), false, false, None, 0, false, false, false, false, false, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn graph_cmd_tabular_runs_ok() {
+        let dir = setup_graph_index();
+        let result = cmd_graph("main", dir.path(), false, false, None, 20, false, false, false, false, false, true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn communities_cmd_tabular_runs_ok() {
+        let dir = setup_graph_index();
+        let result = cmd_communities(dir.path(), None, 1, 10, false, false, false, false, true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn explain_cmd_tabular_runs_ok() {
+        let dir = setup_graph_index();
+        let result = cmd_explain("main", dir.path(), None, 15, false, false, false, false, false, true);
         assert!(result.is_ok());
     }
 }

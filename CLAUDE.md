@@ -24,7 +24,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift status` | Session health check: index freshness, summary cache, recommended commands. `--json` for structured output |
 | `tsift init` | Project setup: ensure Code Navigation section in AGENTS.md and mirror it into CLAUDE.md when present. Idempotent — safe to re-run after upgrades. |
 
-Global flags: `--compact` reduces human-readable output volume. `--pretty` switches JSON output from compact (default) to indented format. `--terse` outputs JSON with abbreviated field names and inline schema (implies `--json`). `--absolute` shows full filesystem paths instead of project-relative (relative is default for token savings).
+Global flags: `--compact` reduces human-readable output volume. `--pretty` switches JSON output from compact (default) to indented format. `--terse` outputs JSON with abbreviated field names and inline schema (implies `--json`). `--absolute` shows full filesystem paths instead of project-relative (relative is default for token savings). `--tabular` outputs repeated structures as TSV with header row (search, graph, communities, explain).
 
 ## Graph Module (`src/graph.rs`)
 

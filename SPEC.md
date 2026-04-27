@@ -157,6 +157,25 @@ tsift --terse --pretty status .            # terse + pretty-printed
 
 Unknown keys pass through unchanged.
 
+## Tabular Output
+
+`tsift --tabular` is a global flag that outputs repeated structures as TSV (tab-separated values) with a header row. Designed for structured, token-efficient display that agents and scripts can parse without JSON overhead.
+
+**Supported commands:**
+- `search` — symbols table (`match_type`, `kind`, `name`, `file`, `line`, `score`) then hits table (`rank`, `path`, `confidence`, `score`)
+- `graph` — edges table (`direction`, `name`, `file`, `line`) with `caller`/`callee` in the direction column
+- `communities` — table (`id`, `size`, `members`) where members are comma-separated
+- `explain` — definition table (`section`, `kind`, `name`, `file`, `line`) then edges table, then community summary
+
+Truncation is indicated by `# (+N more)` comment lines. Sections are separated by blank lines.
+
+```bash
+tsift --tabular search "main"              # two TSV tables: symbols + hits
+tsift --tabular graph main --callers       # one TSV table: direction name file line
+tsift --tabular communities --limit 5      # one TSV table: id size members
+tsift --tabular explain main               # definition + edges + community
+```
+
 ## Relative Paths (Default)
 
 All file paths in output are project-relative by default. The project root is detected via `path.canonicalize()` in each command. Relative paths are shorter and save tokens — tsift's core mission.
