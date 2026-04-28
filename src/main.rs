@@ -1364,23 +1364,27 @@ fn cmd_index(
 
     if workspace || submodule.is_some() {
         let cfg = config::Config::load(&root)?;
-        let targets: Vec<(String, PathBuf)> = if let Some(name) = submodule {
-            let sub_path = config::Config::submodule_dirs(&root)?
-                .into_iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, p)| p)
-                .unwrap_or_else(|| root.join(name));
-            vec![(name.to_string(), sub_path)]
-        } else {
-            config::Config::submodule_dirs(&root)?
-        };
+        let targets: Vec<(String, PathBuf, Option<config::WorkspaceScope>)> =
+            if let Some(name) = submodule {
+                match config::Config::find_submodule(&root, name)? {
+                    Some(scope) => {
+                        vec![(scope.id.clone(), scope.source_root.clone(), Some(scope))]
+                    }
+                    None => vec![(name.to_string(), root.join(name), None)],
+                }
+            } else {
+                config::Config::submodule_dirs(&root)?
+                    .into_iter()
+                    .map(|scope| (scope.id.clone(), scope.source_root.clone(), Some(scope)))
+                    .collect()
+            };
 
         if targets.is_empty() {
             bail!("no submodules found in {}", root.display());
         }
 
         let mut any_stale = false;
-        for (name, sub_path) in &targets {
+        for (name, sub_path, scope) in &targets {
             if !sub_path.exists() {
                 eprintln!("  skip {} (not found: {})", name, sub_path.display());
                 continue;
@@ -1425,7 +1429,10 @@ fn cmd_index(
             if summary.has_changes() {
                 any_stale = true;
             }
-            let tier = cfg.tier_for(name);
+            let tier = scope
+                .as_ref()
+                .map(|scope| cfg.tier_for_scope(scope))
+                .unwrap_or_else(|| cfg.tier_for(name));
             if json_output {
                 let entry = if quiet {
                     serde_json::json!({
@@ -1658,7 +1665,8 @@ fn cmd_graph(
         .with_context(|| format!("resolving path: {}", path.display()))?;
     let db_path = if let Some(scope_name) = scope {
         let cfg = config::Config::load(&root)?;
-        cfg.db_path_for(&root, scope_name)
+        let scope = config::Config::resolve_submodule(&root, scope_name)?;
+        cfg.db_path_for(&root, &scope.id)
     } else {
         root.join(".tsift/index.db")
     };
@@ -1951,7 +1959,8 @@ fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::I
         .with_context(|| format!("resolving path: {}", path.display()))?;
     let db_path = if let Some(scope_name) = scope {
         let cfg = config::Config::load(&root)?;
-        cfg.db_path_for(&root, scope_name)
+        let scope = config::Config::resolve_submodule(&root, scope_name)?;
+        cfg.db_path_for(&root, &scope.id)
     } else {
         root.join(".tsift/index.db")
     };
@@ -2802,22 +2811,23 @@ struct ExtractSymbolContext {
 fn find_symbols_db_for_file(root: &Path, file_path: &Path) -> Result<Option<ExtractSymbolContext>> {
     let cfg = config::Config::load(root)?;
     let mut submodules = config::Config::submodule_dirs(root)?;
-    submodules.sort_by(|(_, left_path), (_, right_path)| {
-        right_path
+    submodules.sort_by(|left, right| {
+        right
+            .source_root
             .components()
             .count()
-            .cmp(&left_path.components().count())
+            .cmp(&left.source_root.components().count())
     });
 
-    for (name, source_root) in submodules {
-        if !file_path.starts_with(&source_root) {
+    for scope in submodules {
+        if !file_path.starts_with(&scope.source_root) {
             continue;
         }
-        let db_path = cfg.db_path_for(root, &name);
+        let db_path = cfg.db_path_for(root, &scope.id);
         if db_path.exists() {
             return Ok(Some(ExtractSymbolContext {
                 db_path,
-                source_root,
+                source_root: scope.source_root,
             }));
         }
     }
@@ -2861,66 +2871,35 @@ enum SearchIndexState {
     Stale { stale_files: usize },
 }
 
-fn find_scoped_search_path(root: &Path, scope_name: &str) -> Result<Option<PathBuf>> {
-    Ok(config::Config::submodule_dirs(root)?
-        .into_iter()
-        .find(|(name, _)| name == scope_name)
-        .map(|(_, path)| path))
-}
-
-fn resolve_scoped_search_path(root: &Path, scope_name: &str) -> Result<PathBuf> {
-    if let Some(path) = find_scoped_search_path(root, scope_name)? {
-        return Ok(path);
-    }
-
-    let available_scopes: Vec<String> = config::Config::submodule_dirs(root)?
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    if available_scopes.is_empty() {
-        bail!(
-            "unknown scope `{}`. Workspace {} has no configured submodules.",
-            scope_name,
-            root.display()
-        );
-    }
-
-    bail!(
-        "unknown scope `{}`. Available scopes: {}",
-        scope_name,
-        available_scopes.join(", ")
-    );
-}
-
 fn resolve_search_index_targets(
     root: &Path,
     scope: Option<&str>,
     federated: bool,
 ) -> Result<Vec<SearchIndexTarget>> {
     if let Some(scope_name) = scope {
-        let source_root = resolve_scoped_search_path(root, scope_name)?;
+        let scope = config::Config::resolve_submodule(root, scope_name)?;
         let cfg = config::Config::load(root)?;
         return Ok(vec![SearchIndexTarget {
-            label: format!("submodule `{}` index", scope_name),
-            db_path: cfg.db_path_for(root, scope_name),
-            source_root,
-            scope_name: Some(scope_name.to_string()),
-            reindex_cmd: format!("tsift index --submodule {} {}", scope_name, root.display()),
+            label: format!("submodule `{}` index", scope.id),
+            db_path: cfg.db_path_for(root, &scope.id),
+            source_root: scope.source_root.clone(),
+            scope_name: Some(scope.id.clone()),
+            reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
         }]);
     }
 
     if federated {
         let cfg = config::Config::load(root)?;
         let mut targets = Vec::new();
-        for (name, source_root) in config::Config::submodule_dirs(root)? {
-            if !cfg.federation_for(&name) {
+        for scope in config::Config::submodule_dirs(root)? {
+            if !cfg.federation_for_scope(&scope) {
                 continue;
             }
             targets.push(SearchIndexTarget {
-                label: format!("submodule `{}` index", name),
-                db_path: cfg.db_path_for(root, &name),
-                source_root,
-                scope_name: Some(name.clone()),
+                label: format!("submodule `{}` index", scope.id),
+                db_path: cfg.db_path_for(root, &scope.id),
+                source_root: scope.source_root.clone(),
+                scope_name: Some(scope.id.clone()),
                 reindex_cmd: format!("tsift index --workspace {}", root.display()),
             });
         }
@@ -3055,15 +3034,15 @@ fn cmd_search(
 
     let (symbol_hits, sift_path) = if let Some(ref scope_name) = scope {
         let cfg = config::Config::load(&root)?;
-        let db_path = cfg.db_path_for(&root, scope_name);
+        let scope = config::Config::resolve_submodule(&root, scope_name)?;
+        let db_path = cfg.db_path_for(&root, &scope.id);
         let hits = if db_path.exists() {
             let db = index::IndexDb::open_read_only(&db_path)?;
             db.symbol_search(&query, limit)?
         } else {
             Vec::new()
         };
-        let sub_path = resolve_scoped_search_path(&root, scope_name)?;
-        (hits, sub_path)
+        (hits, scope.source_root)
     } else if federated {
         (federated_symbol_search(&root, &query, limit)?, root.clone())
     } else {
@@ -3990,6 +3969,37 @@ mod tests {
         dir
     }
 
+    fn setup_workspace_with_duplicate_leaf_names() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join(".gitmodules"),
+            r#"[submodule "pkg/app/foo"]
+	path = pkg/app/foo
+	url = https://example.com/pkg-app-foo
+[submodule "vendor/foo"]
+	path = vendor/foo
+	url = https://example.com/vendor-foo
+"#,
+        )
+        .unwrap();
+        let pkg_foo = root.join("pkg/app/foo");
+        let vendor_foo = root.join("vendor/foo");
+        std::fs::create_dir_all(&pkg_foo).unwrap();
+        std::fs::create_dir_all(&vendor_foo).unwrap();
+        std::fs::write(
+            pkg_foo.join("lib.rs"),
+            "fn pkg_only() {}\nfn shared_name() { pkg_only(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vendor_foo.join("lib.rs"),
+            "fn vendor_only() {}\nfn shared_name() { vendor_only(); }\n",
+        )
+        .unwrap();
+        dir
+    }
+
     #[test]
     fn workspace_index_creates_per_submodule_dbs() {
         let dir = setup_workspace();
@@ -4036,6 +4046,39 @@ mod tests {
         .unwrap();
         assert!(dir.path().join(".tsift/indexes/alpha/index.db").exists());
         assert!(!dir.path().join(".tsift/indexes/beta/index.db").exists());
+    }
+
+    #[test]
+    fn workspace_index_uses_unique_scope_ids_when_leaf_names_collide() {
+        let dir = setup_workspace_with_duplicate_leaf_names();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            dir.path()
+                .join(".tsift/indexes/pkg/app/foo/index.db")
+                .exists()
+        );
+        assert!(
+            dir.path()
+                .join(".tsift/indexes/vendor/foo/index.db")
+                .exists()
+        );
     }
 
     #[test]
@@ -4156,6 +4199,52 @@ tier = "isolated"
         let msg = err.to_string();
         assert!(msg.contains("unknown scope `missing`"));
         assert!(msg.contains("Available scopes: alpha, beta"));
+    }
+
+    #[test]
+    fn scoped_search_cmd_errors_on_ambiguous_legacy_scope_name() {
+        let dir = setup_workspace_with_duplicate_leaf_names();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let err = cmd_search(
+            "vendor_only".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            Some("foo".to_string()),
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous scope `foo`"));
+        assert!(msg.contains("pkg/app/foo"));
+        assert!(msg.contains("vendor/foo"));
     }
 
     #[test]
@@ -5837,11 +5926,11 @@ fn federated_symbol_search(
     let cfg = config::Config::load(root)?;
     let submodules = config::Config::submodule_dirs(root)?;
     let mut all_hits: Vec<index::SymbolHit> = Vec::new();
-    for (name, _) in &submodules {
-        if !cfg.federation_for(name) {
+    for scope in &submodules {
+        if !cfg.federation_for_scope(scope) {
             continue;
         }
-        let db_path = cfg.db_path_for(root, name);
+        let db_path = cfg.db_path_for(root, &scope.id);
         if !db_path.exists() {
             continue;
         }

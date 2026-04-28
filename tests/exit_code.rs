@@ -675,6 +675,68 @@ fn search_scope_fails_on_unknown_submodule_name() {
 }
 
 #[test]
+fn search_scope_errors_on_ambiguous_duplicate_leaf_name() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        r#"[submodule "pkg/app/foo"]
+	path = pkg/app/foo
+	url = https://example.com/pkg-app-foo
+[submodule "vendor/foo"]
+	path = vendor/foo
+	url = https://example.com/vendor-foo
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("pkg/app/foo")).unwrap();
+    fs::create_dir_all(dir.path().join("vendor/foo")).unwrap();
+    fs::write(
+        dir.path().join("pkg/app/foo/lib.rs"),
+        "fn pkg_only() {}\nfn shared_name() { pkg_only(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("vendor/foo/lib.rs"),
+        "fn vendor_only() {}\nfn shared_name() { vendor_only(); }\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = tsift_bin()
+        .args([
+            "search",
+            "--scope",
+            "foo",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "vendor_only",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "ambiguous scope should fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ambiguous scope `foo`"),
+        "stderr was: {stderr}"
+    );
+    assert!(stderr.contains("pkg/app/foo"), "stderr was: {stderr}");
+    assert!(stderr.contains("vendor/foo"), "stderr was: {stderr}");
+}
+
+#[test]
 fn index_check_stays_read_only_while_writer_lock_exists() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();

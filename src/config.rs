@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -45,11 +45,32 @@ pub struct SubmoduleOverride {
     pub tier: Option<IsolationTier>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceScope {
+    pub id: String,
+    pub legacy_name: String,
+    pub relative_path: String,
+    pub source_root: PathBuf,
+}
+
+impl WorkspaceScope {
+    pub fn matches_selector(&self, selector: &str) -> bool {
+        self.id == selector || self.relative_path == selector
+    }
+}
+
 fn default_true() -> bool {
     true
 }
 
 impl Config {
+    fn override_for_scope(&self, scope: &WorkspaceScope) -> Option<&SubmoduleOverride> {
+        self.overrides
+            .get(&scope.id)
+            .or_else(|| self.overrides.get(&scope.relative_path))
+            .or_else(|| self.overrides.get(&scope.legacy_name))
+    }
+
     pub fn load(root: &Path) -> Result<Self> {
         let path = root.join(".tsift/config.toml");
         if !path.exists() {
@@ -63,6 +84,12 @@ impl Config {
     pub fn tier_for(&self, submodule: &str) -> IsolationTier {
         self.overrides
             .get(submodule)
+            .and_then(|o| o.tier)
+            .unwrap_or(self.defaults.tier)
+    }
+
+    pub fn tier_for_scope(&self, scope: &WorkspaceScope) -> IsolationTier {
+        self.override_for_scope(scope)
             .and_then(|o| o.tier)
             .unwrap_or(self.defaults.tier)
     }
@@ -81,28 +108,120 @@ impl Config {
         self.defaults.federation
     }
 
+    pub fn federation_for_scope(&self, scope: &WorkspaceScope) -> bool {
+        if let Some(ovr) = self.override_for_scope(scope) {
+            if let Some(tier) = ovr.tier
+                && (tier == IsolationTier::Isolated || tier == IsolationTier::Private)
+            {
+                return false;
+            }
+            if let Some(fed) = ovr.federation {
+                return fed;
+            }
+        }
+        self.defaults.federation
+    }
+
     pub fn db_path_for(&self, root: &Path, submodule: &str) -> PathBuf {
         root.join(".tsift/indexes").join(submodule).join("index.db")
     }
 
-    pub fn submodule_dirs(root: &Path) -> Result<Vec<(String, PathBuf)>> {
+    pub fn available_scope_names(root: &Path) -> Result<Vec<String>> {
+        Ok(Self::submodule_dirs(root)?
+            .into_iter()
+            .map(|scope| scope.id)
+            .collect())
+    }
+
+    pub fn find_submodule(root: &Path, selector: &str) -> Result<Option<WorkspaceScope>> {
+        let scopes = Self::submodule_dirs(root)?;
+        if let Some(scope) = scopes
+            .iter()
+            .find(|scope| scope.matches_selector(selector))
+            .cloned()
+        {
+            return Ok(Some(scope));
+        }
+
+        let alias_matches: Vec<WorkspaceScope> = scopes
+            .into_iter()
+            .filter(|scope| scope.legacy_name == selector)
+            .collect();
+        match alias_matches.len() {
+            0 => Ok(None),
+            1 => Ok(alias_matches.into_iter().next()),
+            _ => {
+                let options = alias_matches
+                    .iter()
+                    .map(|scope| scope.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!("ambiguous scope `{}`. Use one of: {}", selector, options);
+            }
+        }
+    }
+
+    pub fn resolve_submodule(root: &Path, selector: &str) -> Result<WorkspaceScope> {
+        if let Some(scope) = Self::find_submodule(root, selector)? {
+            return Ok(scope);
+        }
+
+        let available_scopes = Self::available_scope_names(root)?;
+        if available_scopes.is_empty() {
+            bail!(
+                "unknown scope `{}`. Workspace {} has no configured submodules.",
+                selector,
+                root.display()
+            );
+        }
+
+        bail!(
+            "unknown scope `{}`. Available scopes: {}",
+            selector,
+            available_scopes.join(", ")
+        );
+    }
+
+    pub fn submodule_dirs(root: &Path) -> Result<Vec<WorkspaceScope>> {
         let gitmodules = root.join(".gitmodules");
         if !gitmodules.exists() {
             return Ok(Vec::new());
         }
         let content =
             std::fs::read_to_string(&gitmodules).with_context(|| "reading .gitmodules")?;
-        let mut result = Vec::new();
+        let mut paths = Vec::new();
         for line in content.lines() {
             let trimmed = line.trim();
             if let Some(path_val) = trimmed.strip_prefix("path = ") {
-                let path_val = path_val.trim();
-                let name = Path::new(path_val)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| path_val.to_string());
-                result.push((name, root.join(path_val)));
+                paths.push(path_val.trim().to_string());
             }
+        }
+        let mut alias_counts: HashMap<String, usize> = HashMap::new();
+        for path_val in &paths {
+            let legacy_name = Path::new(path_val)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path_val.to_string());
+            *alias_counts.entry(legacy_name).or_default() += 1;
+        }
+
+        let mut result = Vec::new();
+        for path_val in paths {
+            let legacy_name = Path::new(&path_val)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path_val.clone());
+            let id = if alias_counts.get(&legacy_name).copied().unwrap_or(0) > 1 {
+                path_val.clone()
+            } else {
+                legacy_name.clone()
+            };
+            result.push(WorkspaceScope {
+                id,
+                legacy_name,
+                relative_path: path_val.clone(),
+                source_root: root.join(&path_val),
+            });
         }
         Ok(result)
     }
@@ -248,7 +367,53 @@ federation = false
         .unwrap();
         let dirs = Config::submodule_dirs(dir.path()).unwrap();
         assert_eq!(dirs.len(), 2);
-        assert_eq!(dirs[0].0, "agent-doc");
-        assert_eq!(dirs[1].0, "corky");
+        assert_eq!(dirs[0].id, "agent-doc");
+        assert_eq!(dirs[0].relative_path, "src/agent-doc");
+        assert_eq!(dirs[1].id, "corky");
+        assert_eq!(dirs[1].relative_path, "src/corky");
+    }
+
+    #[test]
+    fn submodule_dirs_use_full_path_when_leaf_names_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".gitmodules"),
+            r#"[submodule "pkg/app/foo"]
+	path = pkg/app/foo
+	url = https://example.com/pkg-app-foo
+[submodule "vendor/foo"]
+	path = vendor/foo
+	url = https://example.com/vendor-foo
+"#,
+        )
+        .unwrap();
+
+        let dirs = Config::submodule_dirs(dir.path()).unwrap();
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0].id, "pkg/app/foo");
+        assert_eq!(dirs[0].legacy_name, "foo");
+        assert_eq!(dirs[1].id, "vendor/foo");
+        assert_eq!(dirs[1].legacy_name, "foo");
+    }
+
+    #[test]
+    fn find_submodule_errors_on_ambiguous_legacy_name() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".gitmodules"),
+            r#"[submodule "pkg/app/foo"]
+	path = pkg/app/foo
+	url = https://example.com/pkg-app-foo
+[submodule "vendor/foo"]
+	path = vendor/foo
+	url = https://example.com/vendor-foo
+"#,
+        )
+        .unwrap();
+
+        let err = Config::find_submodule(dir.path(), "foo").unwrap_err();
+        assert!(err.to_string().contains("ambiguous scope `foo`"));
+        assert!(err.to_string().contains("pkg/app/foo"));
+        assert!(err.to_string().contains("vendor/foo"));
     }
 }

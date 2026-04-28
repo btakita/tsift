@@ -5,7 +5,7 @@ use crate::index::{
 };
 use crate::init::{self, InstructionStatus};
 use crate::summarize::SummaryDb;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -303,22 +303,12 @@ fn resolve_lock_target(
 ) -> Result<(String, PathBuf, PathBuf, String)> {
     if let Some(scope_name) = scope {
         let cfg = config::Config::load(root)?;
-        let Some(source_root) = config::Config::submodule_dirs(root)?
-            .into_iter()
-            .find(|(name, _)| name == scope_name)
-            .map(|(_, path)| path)
-        else {
-            bail!(
-                "no submodule named `{}` found under {}",
-                scope_name,
-                root.display()
-            );
-        };
+        let scope = config::Config::resolve_submodule(root, scope_name)?;
         Ok((
-            format!("submodule `{}` index", scope_name),
-            source_root,
-            cfg.db_path_for(root, scope_name),
-            format!("tsift index --submodule {} {}", scope_name, root.display()),
+            format!("submodule `{}` index", scope.id),
+            scope.source_root.clone(),
+            cfg.db_path_for(root, &scope.id),
+            format!("tsift index --submodule {} {}", scope.id, root.display()),
         ))
     } else {
         Ok((
