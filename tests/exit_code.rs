@@ -737,6 +737,68 @@ fn search_scope_errors_on_ambiguous_duplicate_leaf_name() {
 }
 
 #[test]
+fn status_reports_workspace_scoped_indexes_in_json() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+[submodule "src/beta"]
+	path = src/beta
+	url = https://example.com/beta
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("src/alpha")).unwrap();
+    fs::create_dir_all(dir.path().join("src/beta")).unwrap();
+    fs::write(dir.path().join("src/alpha/lib.rs"), "fn alpha() {}\n").unwrap();
+    fs::write(dir.path().join("src/beta/lib.rs"), "fn beta() {}\n").unwrap();
+
+    let output = tsift_bin()
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = tsift_bin()
+        .args(["status", "--json", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"state\":\"fresh\""),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"workspace_scopes\""),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"scope\":\"alpha\""),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"scope\":\"beta\""),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"index\":{\"state\":\"missing\""),
+        "stdout was: {stdout}"
+    );
+}
+
+#[test]
 fn index_check_stays_read_only_while_writer_lock_exists() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();

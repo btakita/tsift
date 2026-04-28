@@ -28,6 +28,8 @@ pub enum IndexStatus {
         last_indexed_secs_ago: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         recovery: Option<ReadOnlyRecovery>,
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        workspace_scopes: Vec<WorkspaceScopeStatus>,
     },
     #[serde(rename = "stale")]
     Stale {
@@ -36,9 +38,22 @@ pub enum IndexStatus {
         last_indexed_secs_ago: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         recovery: Option<ReadOnlyRecovery>,
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        workspace_scopes: Vec<WorkspaceScopeStatus>,
     },
     #[serde(rename = "missing")]
     Missing,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct WorkspaceScopeStatus {
+    pub scope: String,
+    pub db_path: PathBuf,
+    pub total_files: usize,
+    pub stale_files: usize,
+    pub last_indexed_secs_ago: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ReadOnlyRecovery>,
 }
 
 #[derive(Debug, Serialize)]
@@ -91,13 +106,13 @@ pub struct RollbackJournalStatus {
 }
 
 pub fn check_status(root: &Path) -> Result<StatusReport> {
-    let index_db_path = root.join(".tsift/index.db");
+    let workspace = !config::Config::submodule_dirs(root)?.is_empty();
     let summaries_db_path = root.join(".tsift/summaries.db");
 
-    let index = check_index(&index_db_path, root)?;
+    let index = check_index(root)?;
     let summaries = check_summaries(&summaries_db_path, &index)?;
     let instructions = init::check_instruction_version(root);
-    let recommendations = build_recommendations(&index, &summaries, &instructions);
+    let recommendations = build_recommendations(&index, &summaries, &instructions, workspace);
 
     Ok(StatusReport {
         index,
@@ -107,9 +122,10 @@ pub fn check_status(root: &Path) -> Result<StatusReport> {
     })
 }
 
-fn check_index(db_path: &Path, root: &Path) -> Result<IndexStatus> {
+fn check_index(root: &Path) -> Result<IndexStatus> {
+    let db_path = root.join(".tsift/index.db");
     if !db_path.exists() {
-        return Ok(IndexStatus::Missing);
+        return check_workspace_index(root);
     }
 
     let last_indexed_secs_ago = db_path
@@ -120,7 +136,7 @@ fn check_index(db_path: &Path, root: &Path) -> Result<IndexStatus> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let inspection = IndexDb::inspect_read_only(db_path, root, false)?;
+    let inspection = IndexDb::inspect_read_only(&db_path, root, false)?;
     let stale_files =
         inspection.summary.new + inspection.summary.modified + inspection.summary.deleted;
 
@@ -130,6 +146,7 @@ fn check_index(db_path: &Path, root: &Path) -> Result<IndexStatus> {
             stale_files,
             last_indexed_secs_ago,
             recovery: inspection.recovery,
+            workspace_scopes: Vec::new(),
         })
     } else {
         Ok(IndexStatus::Fresh {
@@ -137,6 +154,69 @@ fn check_index(db_path: &Path, root: &Path) -> Result<IndexStatus> {
             stale_files: 0,
             last_indexed_secs_ago,
             recovery: inspection.recovery,
+            workspace_scopes: Vec::new(),
+        })
+    }
+}
+
+fn check_workspace_index(root: &Path) -> Result<IndexStatus> {
+    let cfg = config::Config::load(root)?;
+    let mut scopes = Vec::new();
+    for scope in config::Config::submodule_dirs(root)? {
+        let db_path = cfg.db_path_for(root, &scope.id);
+        if !scope.source_root.exists() || !db_path.exists() {
+            continue;
+        }
+
+        let last_indexed_secs_ago = db_path
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let inspection = IndexDb::inspect_read_only(&db_path, &scope.source_root, false)?;
+        let stale_files =
+            inspection.summary.new + inspection.summary.modified + inspection.summary.deleted;
+        scopes.push(WorkspaceScopeStatus {
+            scope: scope.id,
+            db_path,
+            total_files: inspection.total_files,
+            stale_files,
+            last_indexed_secs_ago,
+            recovery: inspection.recovery,
+        });
+    }
+
+    if scopes.is_empty() {
+        return Ok(IndexStatus::Missing);
+    }
+
+    scopes.sort_by(|left, right| left.scope.cmp(&right.scope));
+    let total_files = scopes.iter().map(|scope| scope.total_files).sum();
+    let stale_files = scopes.iter().map(|scope| scope.stale_files).sum();
+    let last_indexed_secs_ago = scopes
+        .iter()
+        .map(|scope| scope.last_indexed_secs_ago)
+        .min()
+        .unwrap_or(0);
+    let recovery = scopes.iter().find_map(|scope| scope.recovery);
+
+    if stale_files > 0 {
+        Ok(IndexStatus::Stale {
+            total_files,
+            stale_files,
+            last_indexed_secs_ago,
+            recovery,
+            workspace_scopes: scopes,
+        })
+    } else {
+        Ok(IndexStatus::Fresh {
+            total_files,
+            stale_files: 0,
+            last_indexed_secs_ago,
+            recovery,
+            workspace_scopes: scopes,
         })
     }
 }
@@ -205,16 +285,27 @@ fn build_recommendations(
     index: &IndexStatus,
     summaries: &SummaryStatus,
     instructions: &InstructionStatus,
+    workspace: bool,
 ) -> Recommendations {
     let refresh = !matches!(instructions, InstructionStatus::Current { .. });
+    let index_cmd = if workspace {
+        "tsift index --workspace ."
+    } else {
+        "tsift index ."
+    };
+    let init_cmd = if workspace {
+        "tsift init --workspace"
+    } else {
+        "tsift init"
+    };
 
     match index {
         IndexStatus::Missing => Recommendations {
             use_commands: vec![],
             run: if refresh {
-                Some("tsift init && tsift index .".to_string())
+                Some(format!("{init_cmd} && {index_cmd}"))
             } else {
-                Some("tsift index .".to_string())
+                Some(index_cmd.to_string())
             },
         },
         IndexStatus::Stale { stale_files, .. } => {
@@ -228,13 +319,16 @@ fn build_recommendations(
             }
             let run_msg = if refresh {
                 format!(
-                    "tsift init && tsift index .  ({} stale file{})",
+                    "{} && {}  ({} stale file{})",
+                    init_cmd,
+                    index_cmd,
                     stale_files,
                     if *stale_files == 1 { "" } else { "s" }
                 )
             } else {
                 format!(
-                    "tsift index .  ({} stale file{})",
+                    "{}  ({} stale file{})",
+                    index_cmd,
                     stale_files,
                     if *stale_files == 1 { "" } else { "s" }
                 )
@@ -273,8 +367,8 @@ fn build_recommendations(
             };
             if refresh {
                 run = Some(match run {
-                    Some(existing) => format!("tsift init && {}", existing),
-                    None => "tsift init".to_string(),
+                    Some(existing) => format!("{init_cmd} && {existing}"),
+                    None => init_cmd.to_string(),
                 });
             }
             Recommendations {
@@ -373,6 +467,51 @@ fn index_recovery(index: &IndexStatus) -> Option<ReadOnlyRecovery> {
     }
 }
 
+fn workspace_scopes(index: &IndexStatus) -> &[WorkspaceScopeStatus] {
+    match index {
+        IndexStatus::Fresh {
+            workspace_scopes, ..
+        }
+        | IndexStatus::Stale {
+            workspace_scopes, ..
+        } => workspace_scopes.as_slice(),
+        IndexStatus::Missing => &[],
+    }
+}
+
+fn format_workspace_scope_line(scope: &WorkspaceScopeStatus, compact: bool) -> String {
+    let state = if scope.stale_files > 0 {
+        "stale"
+    } else {
+        "fresh"
+    };
+    if compact {
+        format!(
+            "scope:{} state:{} tracked:{} stale:{} age:{}\n",
+            scope.scope,
+            state,
+            scope.total_files,
+            scope.stale_files,
+            format_duration(scope.last_indexed_secs_ago)
+        )
+    } else if scope.stale_files > 0 {
+        format!(
+            "  scope {}: stale (last indexed {}, {} files tracked, {} stale)\n",
+            scope.scope,
+            format_duration(scope.last_indexed_secs_ago),
+            scope.total_files,
+            scope.stale_files
+        )
+    } else {
+        format!(
+            "  scope {}: fresh (last indexed {}, {} files tracked)\n",
+            scope.scope,
+            format_duration(scope.last_indexed_secs_ago),
+            scope.total_files
+        )
+    }
+}
+
 pub fn format_human(report: &StatusReport, compact: bool) -> String {
     let mut out = String::new();
 
@@ -383,44 +522,88 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
         IndexStatus::Fresh {
             total_files,
             last_indexed_secs_ago,
+            workspace_scopes,
             ..
         } => {
             if compact {
-                out.push_str(&format!(
-                    "index: fresh tracked:{} age:{}\n",
-                    total_files,
-                    format_duration(*last_indexed_secs_ago)
-                ));
+                if workspace_scopes.is_empty() {
+                    out.push_str(&format!(
+                        "index: fresh tracked:{} age:{}\n",
+                        total_files,
+                        format_duration(*last_indexed_secs_ago)
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "index: fresh workspace:{} tracked:{} age:{}\n",
+                        workspace_scopes.len(),
+                        total_files,
+                        format_duration(*last_indexed_secs_ago)
+                    ));
+                }
             } else {
-                out.push_str(&format!(
-                    "index: fresh (last indexed {}, {} files tracked)\n",
-                    format_duration(*last_indexed_secs_ago),
-                    total_files
-                ));
+                if workspace_scopes.is_empty() {
+                    out.push_str(&format!(
+                        "index: fresh (last indexed {}, {} files tracked)\n",
+                        format_duration(*last_indexed_secs_ago),
+                        total_files
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "index: fresh (workspace, {} scopes, last indexed {}, {} files tracked)\n",
+                        workspace_scopes.len(),
+                        format_duration(*last_indexed_secs_ago),
+                        total_files
+                    ));
+                }
             }
         }
         IndexStatus::Stale {
             total_files,
             stale_files,
             last_indexed_secs_ago,
+            workspace_scopes,
             ..
         } => {
             if compact {
-                out.push_str(&format!(
-                    "index: stale tracked:{} stale:{} age:{}\n",
-                    total_files,
-                    stale_files,
-                    format_duration(*last_indexed_secs_ago)
-                ));
+                if workspace_scopes.is_empty() {
+                    out.push_str(&format!(
+                        "index: stale tracked:{} stale:{} age:{}\n",
+                        total_files,
+                        stale_files,
+                        format_duration(*last_indexed_secs_ago)
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "index: stale workspace:{} tracked:{} stale:{} age:{}\n",
+                        workspace_scopes.len(),
+                        total_files,
+                        stale_files,
+                        format_duration(*last_indexed_secs_ago)
+                    ));
+                }
             } else {
-                out.push_str(&format!(
-                    "index: stale (last indexed {}, {} files tracked, {} stale)\n",
-                    format_duration(*last_indexed_secs_ago),
-                    total_files,
-                    stale_files
-                ));
+                if workspace_scopes.is_empty() {
+                    out.push_str(&format!(
+                        "index: stale (last indexed {}, {} files tracked, {} stale)\n",
+                        format_duration(*last_indexed_secs_ago),
+                        total_files,
+                        stale_files
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "index: stale (workspace, {} scopes, last indexed {}, {} files tracked, {} stale)\n",
+                        workspace_scopes.len(),
+                        format_duration(*last_indexed_secs_ago),
+                        total_files,
+                        stale_files
+                    ));
+                }
             }
         }
+    }
+
+    for scope in workspace_scopes(&report.index) {
+        out.push_str(&format_workspace_scope_line(scope, compact));
     }
 
     if let Some(recovery) = index_recovery(&report.index) {
@@ -579,9 +762,34 @@ pub fn format_locks_human(report: &LockReport, compact: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use fs4::fs_std::FileExt;
     use std::fs::OpenOptions;
     use tempfile::TempDir;
+
+    fn setup_workspace() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".gitmodules"),
+            r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+[submodule "src/beta"]
+	path = src/beta
+	url = https://example.com/beta
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src/alpha")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/beta")).unwrap();
+        std::fs::write(
+            dir.path().join("src/alpha/lib.rs"),
+            "fn alpha_helper() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/beta/lib.rs"), "fn beta_helper() {}\n").unwrap();
+        dir
+    }
 
     #[test]
     fn status_no_index() {
@@ -615,6 +823,86 @@ mod tests {
         assert!(cmds.contains(&"explain".to_string()));
         assert!(cmds.contains(&"graph".to_string()));
         assert!(!cmds.contains(&"summarize".to_string()));
+    }
+
+    #[test]
+    fn status_workspace_scoped_indexes_report_fresh() {
+        let dir = setup_workspace();
+        let cfg = Config::load(dir.path()).unwrap();
+        for scope in Config::submodule_dirs(dir.path()).unwrap() {
+            let db = IndexDb::open(&cfg.db_path_for(dir.path(), &scope.id)).unwrap();
+            db.apply_changes(&scope.source_root).unwrap();
+        }
+
+        let report = check_status(dir.path()).unwrap();
+        match &report.index {
+            IndexStatus::Fresh {
+                total_files,
+                workspace_scopes,
+                ..
+            } => {
+                assert_eq!(*total_files, 2);
+                assert_eq!(workspace_scopes.len(), 2);
+                assert_eq!(workspace_scopes[0].scope, "alpha");
+                assert_eq!(workspace_scopes[1].scope, "beta");
+            }
+            other => panic!("expected fresh workspace status, got {other:?}"),
+        }
+        assert!(matches!(report.summaries, SummaryStatus::None));
+        assert_eq!(
+            report.recommendations.run.as_deref(),
+            Some("tsift init --workspace && tsift summarize --extract src/")
+        );
+    }
+
+    #[test]
+    fn status_workspace_missing_recommends_workspace_index() {
+        let dir = setup_workspace();
+
+        let report = check_status(dir.path()).unwrap();
+        assert!(matches!(report.index, IndexStatus::Missing));
+        assert_eq!(
+            report.recommendations.run.as_deref(),
+            Some("tsift init --workspace && tsift index --workspace .")
+        );
+    }
+
+    #[test]
+    fn status_workspace_scoped_indexes_report_stale() {
+        let dir = setup_workspace();
+        let cfg = Config::load(dir.path()).unwrap();
+        for scope in Config::submodule_dirs(dir.path()).unwrap() {
+            let db = IndexDb::open(&cfg.db_path_for(dir.path(), &scope.id)).unwrap();
+            db.apply_changes(&scope.source_root).unwrap();
+        }
+        std::fs::write(dir.path().join("src/beta/new.rs"), "fn late() {}\n").unwrap();
+
+        let report = check_status(dir.path()).unwrap();
+        match &report.index {
+            IndexStatus::Stale {
+                total_files,
+                stale_files,
+                workspace_scopes,
+                ..
+            } => {
+                assert_eq!(*total_files, 2);
+                assert_eq!(*stale_files, 1);
+                assert_eq!(workspace_scopes.len(), 2);
+                assert_eq!(
+                    workspace_scopes
+                        .iter()
+                        .find(|scope| scope.scope == "beta")
+                        .unwrap()
+                        .stale_files,
+                    1
+                );
+            }
+            other => panic!("expected stale workspace status, got {other:?}"),
+        }
+        assert_eq!(
+            report.recommendations.run.as_deref(),
+            Some("tsift init --workspace && tsift index --workspace .  (1 stale file)")
+        );
     }
 
     #[test]
@@ -711,6 +999,7 @@ mod tests {
                 stale_files: 0,
                 last_indexed_secs_ago: 120,
                 recovery: None,
+                workspace_scopes: Vec::new(),
             },
             summaries: SummaryStatus::Available {
                 cached_files: 30,
@@ -746,6 +1035,7 @@ mod tests {
                 stale_files: 3,
                 last_indexed_secs_ago: 120,
                 recovery: None,
+                workspace_scopes: Vec::new(),
             },
             summaries: SummaryStatus::None,
             instructions: InstructionStatus::Stale {
@@ -776,6 +1066,7 @@ mod tests {
                 stale_files: 0,
                 last_indexed_secs_ago: 5,
                 recovery: Some(ReadOnlyRecovery::SnapshotFallback),
+                workspace_scopes: Vec::new(),
             },
             summaries: SummaryStatus::None,
             instructions: InstructionStatus::Current {
@@ -798,6 +1089,7 @@ mod tests {
                 stale_files: 0,
                 last_indexed_secs_ago: 1,
                 recovery: Some(ReadOnlyRecovery::SnapshotFallback),
+                workspace_scopes: Vec::new(),
             },
             summaries: SummaryStatus::None,
             instructions: InstructionStatus::Current {

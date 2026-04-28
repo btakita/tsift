@@ -686,7 +686,7 @@ This ensures agent sessions always use instructions matching the installed binar
 
 ## Status (Session Health Check)
 
-`tsift status` reports index freshness, instruction version, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session.
+`tsift status` reports index freshness, instruction version, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session. On workspace roots, it detects scoped indexes under `.tsift/indexes/<scope>/index.db`, aggregates them into the top-level index state, and reports the contributing scopes explicitly.
 
 ```bash
 tsift status            # human-readable output
@@ -718,11 +718,37 @@ recommendations:
   run: tsift init && tsift index .
 ```
 
+When a workspace is indexed through scoped DBs only:
+```
+index: fresh (workspace, 2 scopes, last indexed 2m ago, 200 files tracked)
+  scope alpha: fresh (last indexed 2m ago, 120 files tracked)
+  scope beta: fresh (last indexed 1m ago, 80 files tracked)
+instructions: current (v0.1.0)
+summaries: none
+recommendations:
+  use: search, explain, graph
+  run: tsift summarize --extract src/
+```
+
 ### JSON Schema
 
 ```json
 {
-  "index": { "state": "fresh|stale|missing", "total_files": N, "stale_files": N, "last_indexed_secs_ago": N },
+  "index": {
+    "state": "fresh|stale|missing",
+    "total_files": N,
+    "stale_files": N,
+    "last_indexed_secs_ago": N,
+    "workspace_scopes": [
+      {
+        "scope": "alpha",
+        "db_path": "/repo/.tsift/indexes/alpha/index.db",
+        "total_files": N,
+        "stale_files": N,
+        "last_indexed_secs_ago": N
+      }
+    ]
+  },
   "instructions": { "state": "current|stale|missing", "version": "0.1.0", "found": "0.0.1", "expected": "0.1.0" },
   "summaries": { "state": "available|none|unavailable", "cached_files": N, "total_indexed_files": N, "coverage_pct": N },
   "recommendations": { "use": ["search", "explain", ...], "run": "tsift index ." }
@@ -731,7 +757,7 @@ recommendations:
 
 ### Recommendation Logic
 
-When instructions are stale or missing, `tsift init` is prepended to the `run:` recommendation.
+When instructions are stale or missing, `tsift init` is prepended to the `run:` recommendation. Workspace roots use `tsift init --workspace` and `tsift index --workspace .` for their rebuild path.
 
 | Index | Summaries | `use:` | `run:` |
 |-------|-----------|--------|--------|

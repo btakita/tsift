@@ -21,7 +21,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift audit` | Skill drift detection: scan installed skills, check health, compare against manifest, detect duplicates via Jaccard similarity. `--manifest <file>` / `--usage` / `--cleanup` / `--report <path>` / `--json` |
 | `tsift summarize` | Cached LLM analysis: pre-computed summaries, entities, relationships. `--extract <path>` / `--extract --diff` (relative extract paths resolve against `--path`; extraction stays scoped to the requested file/dir; workspace extraction loads symbols from the matching scoped `index.db`; per-file cache rewrite is transactional; non-2xx Anthropic responses fail closed with status + API message) / `--file <path>` / `--stats` / `--json`. Read-only lookup paths fail closed when `summaries.db` is missing and never create the cache as a side effect. |
 | `tsift lint` | Markdown lint: detect unannotated concepts (symbols, headings, bold terms) cross-referenced against graph entities. Auto-discovers live `index.db` files from the nearest `.tsift` root by default, and `--index` accepts a project root, `.tsift`, direct `index.db`, or `.tsift/indexes`. `--index <dir>` / `--entities-from <file>` / `--json` |
-| `tsift status` | Session health check: index freshness, instruction version, summary cache, recommended commands. `--json` for structured output |
+| `tsift status` | Session health check: index freshness, instruction version, summary cache, recommended commands. Workspace roots detect scoped indexes under `.tsift/indexes/<scope>/index.db` and recommend `--workspace` rebuilds. `--json` includes per-scope workspace status |
 | `tsift locks` | Diagnose the OS-backed `index.lock` sidecar and `index.db-journal` state, and recommend the next recovery step. Stale sidecar metadata is reused automatically. `--scope <name>` / `--json` |
 | `tsift init` | Project setup: ensure versioned Code Navigation section (`v=X.Y.Z`) in AGENTS.md and mirror it into CLAUDE.md when present. `--codex` injects or updates a repo-aware autoindex hook; `--workspace` resolves to the parent workspace root. Detects and refreshes stale/pre-versioned markers on re-run. |
 
@@ -113,7 +113,7 @@ Run `tsift status` at session start. Use the commands listed in its `use:` outpu
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
 
-If `tsift status` reports a stale index, either run `tsift index .` first or use `tsift search --autoindex ...`. If `tsift search` still times out after that, tsift now kills the timed-out helper search worker before returning; narrow the path/query or retry with a larger `--timeout`.
+If `tsift status` reports a stale index, run the exact rebuild command from its `run:` line first (`tsift index .` for single-project roots, `tsift index --workspace .` for workspace roots) or use `tsift search --autoindex ...`. If `tsift search` still times out after that, tsift now kills the timed-out helper search worker before returning; narrow the path/query or retry with a larger `--timeout`.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->
