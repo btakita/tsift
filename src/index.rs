@@ -805,14 +805,62 @@ impl IndexDb {
     }
 
     pub fn symbol_search(&self, query: &str, limit: usize) -> Result<Vec<SymbolHit>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
         let query_tags = compute_tags(query);
-        let query_tag_list: Vec<&str> = query_tags.split(',').collect();
+        let query_tag_list: Vec<&str> =
+            query_tags.split(',').filter(|tag| !tag.is_empty()).collect();
         let query_lower = query.to_lowercase();
 
-        let mut stmt = self
-            .conn
-            .prepare("SELECT name, kind, language, file, line, end_line, tags FROM symbols")?;
-        let rows = stmt.query_map([], |row| {
+        let exact_match_expr = "name = ?1 COLLATE NOCASE";
+        let mut where_clauses = vec![exact_match_expr.to_string()];
+        let mut match_count_terms = Vec::new();
+        let mut params = vec![rusqlite::types::Value::from(query.to_string())];
+
+        for tag in &query_tag_list {
+            let param_idx = params.len() + 1;
+            let placeholder = format!("?{param_idx}");
+            match_count_terms.push(format!(
+                "CASE WHEN instr(',' || COALESCE(tags, '') || ',', {placeholder}) > 0 THEN 1 ELSE 0 END"
+            ));
+            where_clauses.push(format!(
+                "instr(',' || COALESCE(tags, '') || ',', {placeholder}) > 0"
+            ));
+            params.push(rusqlite::types::Value::from(format!(",{tag},")));
+        }
+
+        // Keep the SQL candidate ordering aligned with the Rust-side F1 ranking so the
+        // bounded query still yields the same top hits without scanning the full table.
+        let match_count_expr = if match_count_terms.is_empty() {
+            "0".to_string()
+        } else {
+            match_count_terms.join(" + ")
+        };
+        let tag_count_expr =
+            "CASE WHEN tags IS NULL OR tags = '' THEN 0 ELSE LENGTH(tags) - LENGTH(REPLACE(tags, ',', '')) + 1 END";
+        let limit_param_idx = params.len() + 1;
+        let sql = format!(
+            "SELECT name, kind, language, file, line, end_line, tags, {match_count_expr} AS match_count, {tag_count_expr} AS tag_count \
+             FROM symbols \
+             WHERE {} \
+             ORDER BY \
+                 CASE WHEN {exact_match_expr} THEN 1 ELSE 0 END DESC, \
+                 match_count DESC, \
+                 tag_count ASC, \
+                 name COLLATE NOCASE ASC, \
+                 file ASC, \
+                 line ASC \
+             LIMIT ?{limit_param_idx}",
+            where_clauses.join(" OR ")
+        );
+        params.push(rusqlite::types::Value::from(
+            i64::try_from(limit).unwrap_or(i64::MAX),
+        ));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1400,6 +1448,36 @@ mod tests {
 
         let hits = db.symbol_search("test", 2).unwrap();
         assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn symbol_search_limit_keeps_best_tag_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lib.rs"),
+            "fn get_user_name() {}\n\
+             fn get_cached_user_name() {}\n\
+             fn set_user_name() {}\n\
+             fn user_id() {}\n",
+        )
+        .unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let hits = db.symbol_search("user_name", 2).unwrap();
+        let names: Vec<&str> = hits.iter().map(|hit| hit.name.as_str()).collect();
+        assert_eq!(names, vec!["get_user_name", "set_user_name"]);
+    }
+
+    #[test]
+    fn symbol_search_zero_limit_returns_no_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn get_user_name() {}").unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let hits = db.symbol_search("get_user_name", 0).unwrap();
+        assert!(hits.is_empty());
     }
 
     #[test]

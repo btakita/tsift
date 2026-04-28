@@ -104,6 +104,8 @@ Opt-in recovery:
 
 `tsift search` still wraps the sift engine call in a 30-second timeout (configurable via `--timeout`). The timeout remains a backstop for genuinely slow lexical searches or for sessions that reach search without a usable index.
 
+When an index is present, the AST symbol-ranking prepass is now bounded: SQLite only pulls exact-name rows and overlapping-tag candidates, orders them by exact/tag overlap, and caps that candidate scan to the requested search `--limit` instead of loading the full `symbols` table into memory first.
+
 On stale existing indexes, search exits early with a message like:
 ```
 tsift search aborted: index is stale (51 files). Run `tsift index .` or re-run with `--autoindex`.
