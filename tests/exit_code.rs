@@ -158,6 +158,70 @@ fn check_exit_code_zero_when_no_index_exists() {
 }
 
 #[test]
+fn search_autoindexes_stale_index_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+    let status = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn helper() {}\nfn main() { helper(); }",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["search", "--path", dir.path().to_str().unwrap(), "helper"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "expected default search to autoindex"
+    );
+}
+
+#[test]
+fn search_no_autoindex_fails_fast_when_index_is_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+    let status = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn helper() {}\nfn main() { helper(); }",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "search",
+            "--no-autoindex",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "helper",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("index is stale"));
+    assert!(stderr.contains("--no-autoindex"));
+}
+
+#[test]
 fn search_autoindex_fails_fast_when_writer_lock_exists() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();

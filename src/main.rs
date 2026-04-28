@@ -78,9 +78,12 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
-        /// Rebuild the local tsift index first when it is missing or stale
+        /// Explicitly enable autoindexing before search (default behavior; kept for compatibility)
         #[arg(long)]
         autoindex: bool,
+        /// Skip the default autoindexing pass and fail fast if an existing index is stale
+        #[arg(long, conflicts_with = "autoindex")]
+        no_autoindex: bool,
         /// Timeout in seconds for the sift search engine (0 = no timeout)
         #[arg(long, default_value = "30")]
         timeout: u64,
@@ -357,6 +360,7 @@ fn main() -> Result<()> {
             federated,
             json,
             autoindex,
+            no_autoindex,
             timeout,
         }) => cmd_search(
             query,
@@ -366,7 +370,7 @@ fn main() -> Result<()> {
             scope,
             federated,
             json || terse || schema,
-            autoindex,
+            autoindex || !no_autoindex,
             timeout,
             compact,
             pretty,
@@ -2733,7 +2737,7 @@ fn precheck_search_indexes(
         let file_suffix = if *stale_files == 1 { "" } else { "s" };
         bail!(
             "tsift search aborted: {} is stale ({} file{}). \
-             Run `{}` or re-run with `--autoindex`.",
+             Run `{}` or re-run without `--no-autoindex`.",
             label,
             stale_files,
             file_suffix,
@@ -2754,7 +2758,7 @@ fn precheck_search_indexes(
     let reindex_cmd = format!("tsift index --workspace {}", root.display());
     bail!(
         "tsift search aborted: {} indexes are stale: {}. \
-         Run `{}` or re-run with `--autoindex`.",
+         Run `{}` or re-run without `--no-autoindex`.",
         stale_targets.len(),
         details,
         reindex_cmd,
@@ -3884,7 +3888,7 @@ tier = "isolated"
     }
 
     #[test]
-    fn search_cmd_fails_fast_when_index_is_stale() {
+    fn search_cmd_fails_fast_when_autoindex_disabled_and_index_is_stale() {
         let dir = setup_graph_index();
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(
@@ -3914,10 +3918,11 @@ tier = "isolated"
 
         assert!(err.to_string().contains("search aborted"));
         assert!(err.to_string().contains("index is stale"));
+        assert!(err.to_string().contains("--no-autoindex"));
     }
 
     #[test]
-    fn search_cmd_autoindexes_stale_index() {
+    fn search_cmd_autoindexes_stale_index_by_default() {
         let dir = setup_graph_index();
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(
@@ -3952,7 +3957,7 @@ tier = "isolated"
     }
 
     #[test]
-    fn scoped_search_cmd_autoindexes_stale_submodule_index() {
+    fn scoped_search_cmd_autoindexes_stale_submodule_index_by_default() {
         let dir = setup_workspace();
         cmd_index(
             dir.path(),
@@ -3987,6 +3992,61 @@ tier = "isolated"
             Some("lexical".to_string()),
             Some("alpha".to_string()),
             false,
+            false,
+            true,
+            30,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+
+        let cfg = config::Config::load(dir.path()).unwrap();
+        let db = index::IndexDb::open_read_only(&cfg.db_path_for(dir.path(), "alpha")).unwrap();
+        let summary = db.compute_changes(&dir.path().join("src/alpha")).unwrap();
+        assert_eq!(summary.new + summary.modified + summary.deleted, 0);
+    }
+
+    #[test]
+    fn federated_search_cmd_autoindexes_stale_indexes_by_default() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let alpha = dir.path().join("src/alpha/lib.rs");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            &alpha,
+            "fn alpha_helper() { println!(\"updated\"); }\nfn alpha_main() { alpha_helper(); }",
+        )
+        .unwrap();
+
+        let result = cmd_search(
+            "alpha_helper".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            None,
+            true,
             false,
             true,
             30,
@@ -4288,9 +4348,56 @@ tier = "isolated"
     fn cli_search_accepts_autoindex_flag() {
         let cli = Cli::parse_from(["tsift", "search", "test", "--autoindex"]);
         match cli.command {
-            Some(Commands::Search { autoindex, .. }) => assert!(autoindex),
+            Some(Commands::Search {
+                autoindex,
+                no_autoindex,
+                ..
+            }) => {
+                assert!(autoindex);
+                assert!(!no_autoindex);
+            }
             _ => panic!("expected Search command"),
         }
+    }
+
+    #[test]
+    fn cli_search_autoindexes_by_default() {
+        let cli = Cli::parse_from(["tsift", "search", "test"]);
+        match cli.command {
+            Some(Commands::Search {
+                autoindex,
+                no_autoindex,
+                ..
+            }) => {
+                assert!(!autoindex);
+                assert!(!no_autoindex);
+                assert!(autoindex || !no_autoindex);
+            }
+            _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn cli_search_accepts_no_autoindex_flag() {
+        let cli = Cli::parse_from(["tsift", "search", "test", "--no-autoindex"]);
+        match cli.command {
+            Some(Commands::Search {
+                autoindex,
+                no_autoindex,
+                ..
+            }) => {
+                assert!(!autoindex);
+                assert!(no_autoindex);
+                assert!(!(autoindex || !no_autoindex));
+            }
+            _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn cli_search_rejects_conflicting_autoindex_flags() {
+        let cli = Cli::try_parse_from(["tsift", "search", "test", "--autoindex", "--no-autoindex"]);
+        assert!(cli.is_err());
     }
 
     // --- relativize paths ---

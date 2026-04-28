@@ -77,8 +77,8 @@ tsift audit --manifest <file>   # compare against expected skill list
 tsift summarize <symbol>        # cached LLM summary for a symbol
 tsift summarize --extract <path>  # batch LLM extraction (one-time)
 tsift summarize --extract --diff  # re-extract only git-changed files
-tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
-tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
+tsift search <query>            # lexical by default; autoindexes missing/stale indexes before search
+tsift search --no-autoindex <query> # opt-out: fail fast on stale indexes instead of rebuilding
 tsift search --scope <submod>   # restrict to one submodule's index + sift path
 tsift search --strategy hybrid  # opt-in to slower hybrid BM25 + vector search
 tsift search --timeout 60       # custom timeout in seconds (default: 30, 0 = no timeout)
@@ -87,26 +87,26 @@ tsift --compact search <query>  # terse human output across commands
 
 ## Search Stale Precheck + Timeout
 
-`tsift search` now performs a cheap freshness precheck before it calls the sift engine. If an existing local index is stale, search fails fast instead of spending up to 30 seconds in the lexical engine first.
+`tsift search` now performs a cheap freshness precheck before it calls the sift engine. By default it incrementally rebuilds missing or stale indexes first, so ordinary searches stay on the fast path without a separate `index` step.
 
 Default behavior:
 
 - fresh index: search proceeds normally
-- stale index: search exits non-zero immediately and tells the user to run `tsift index ...`
-- missing index: search still proceeds, but symbol ranking stays unavailable until the project is indexed
+- stale index: search incrementally rebuilds it, then continues
+- missing index: search creates the index first, then continues
 
-Opt-in recovery:
+Opt-out recovery:
 
-- `tsift search --autoindex ...` mirrors the hook behavior for unhooked sessions: if the local or scoped index is missing or stale, tsift incrementally builds it before searching
-- `tsift search --scope <submod> --autoindex ...` rebuilds only that submodule's index
-- `tsift search --federated --autoindex ...` rebuilds stale/missing federated submodule indexes before aggregating symbol hits
+- `tsift search --no-autoindex ...` skips the rebuild and fails fast when an existing local or scoped index is stale
+- `tsift search --scope <submod> --no-autoindex ...` preserves that fail-fast behavior for a single submodule
+- `tsift search --federated --no-autoindex ...` fails fast when any targeted federated submodule index is stale
 - writable index updates now claim a sibling `index.lock` sidecar first, so concurrent `tsift index` / `tsift search --autoindex` writers fail fast with a tsift-owned error instead of surfacing raw SQLite lock contention
 
 `tsift search` still wraps the sift engine call in a 30-second timeout (configurable via `--timeout`). The timeout remains a backstop for genuinely slow lexical searches or for sessions that reach search without a usable index.
 
-On stale existing indexes, search exits early with a message like:
+With `--no-autoindex`, stale existing indexes exit early with a message like:
 ```
-tsift search aborted: index is stale (51 files). Run `tsift index .` or re-run with `--autoindex`.
+tsift search aborted: index is stale (51 files). Run `tsift index .` or re-run without `--no-autoindex`.
 ```
 
 If the sift engine itself still times out, search exits with a non-zero code and prints:
