@@ -418,13 +418,14 @@ tsift audit --usage --cleanup --report r.md  # all features
 tsift lint README.md                              # lint with auto-discovered entities
 tsift lint README.md --entities-from SPEC.md      # add entities from another doc
 tsift lint README.md --index .tsift               # use a specific project index root
+tsift lint README.md --index .tsift/indexes       # use a scoped-index directory directly
 tsift lint README.md --json                       # structured output
 ```
 
 **Entity sources:**
 - The file being linted (headings, bold, backtick terms ≥4 chars)
 - `--entities-from <path>` markdown files (same extraction)
-- `--index <dir>` live symbol index discovery (`index.db`, names ≥4 chars) from a project root, `.tsift` directory, scope directory, or direct `index.db` path
+- `--index <dir>` live symbol index discovery (`index.db`, names ≥4 chars) from a project root, `.tsift` directory, `.tsift/indexes`, scope directory, or direct `index.db` path
 - Default: the nearest ancestor project root with `.tsift/index.db`, plus any scoped indexes under `.tsift/indexes/*/index.db`
 
 **Locking:**

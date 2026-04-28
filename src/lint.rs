@@ -206,6 +206,12 @@ fn discover_index_dbs(index_path: &Path) -> Result<Vec<PathBuf>> {
         dbs.insert(index_path.to_path_buf());
     }
 
+    if index_path.is_dir()
+        && index_path.file_name().and_then(|name| name.to_str()) == Some("indexes")
+    {
+        collect_child_index_dbs(&mut dbs, index_path)?;
+    }
+
     push_if_exists(&mut dbs, &index_path.join("index.db"));
     push_if_exists(&mut dbs, &index_path.join(".tsift/index.db"));
     collect_child_index_dbs(&mut dbs, &index_path.join("indexes"))?;
@@ -473,6 +479,25 @@ mod tests {
         );
 
         let entities = collect_entities_from_index_path(dir.path()).unwrap();
+
+        assert!(entities.contains("alpha_helper"));
+        assert!(entities.contains("beta_helper"));
+    }
+
+    #[test]
+    fn collect_entities_from_explicit_indexes_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        create_symbol_index(
+            &dir.path().join(".tsift/indexes/alpha/index.db"),
+            &["alpha_helper"],
+        );
+        create_symbol_index(
+            &dir.path().join(".tsift/indexes/beta/index.db"),
+            &["beta_helper"],
+        );
+
+        let entities =
+            collect_entities_from_index_path(&dir.path().join(".tsift/indexes")).unwrap();
 
         assert!(entities.contains("alpha_helper"));
         assert!(entities.contains("beta_helper"));
