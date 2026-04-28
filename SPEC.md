@@ -82,6 +82,7 @@ tsift summarize --extract --diff  # re-extract only git-changed files within the
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
 tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
 tsift search --scope <submod>   # restrict to one submodule's index + sift path
+tsift index --submodule <submod> # unknown/ambiguous workspace scopes fail closed
 tsift search --strategy hybrid  # opt-in to slower hybrid BM25 + vector search
 tsift search --timeout 60       # custom timeout in seconds (default: 30, 0 = no timeout)
 tsift --compact search <query>  # terse human output across commands
@@ -105,6 +106,7 @@ Opt-in recovery:
 - `tsift search --scope <submod> --autoindex ...` rebuilds only that submodule's index
 - `tsift search --federated --autoindex ...` rebuilds stale/missing federated submodule indexes before aggregating symbol hits
 - `tsift search --scope <submod> ...` now fails closed when the named submodule does not exist, and reports the available scope ids instead of silently searching the workspace root
+- `tsift index --submodule <submod> ...` now fails closed on that same unknown or ambiguous selector set, instead of indexing `root/<submod>` into an unreachable scoped DB
 - when duplicate submodules share the same trailing directory name, leaf-name selectors fail closed as ambiguous and the full `.gitmodules` path becomes the required scope id
 - writable index updates now claim an OS-backed exclusive lock on the sibling `index.lock` sidecar first, so concurrent `tsift index` / `tsift search --autoindex` writers fail fast with a tsift-owned error instead of surfacing raw SQLite lock contention or PID-recycling false positives
 - read-only graph queries (`graph`, `communities`, `path`, `explain`) open `index.db` without taking that writer-side `index.lock`, so diagnostic and graph traversal commands keep working while an index writer is active

@@ -675,6 +675,51 @@ fn search_scope_fails_on_unknown_submodule_name() {
 }
 
 #[test]
+fn index_submodule_fails_on_unknown_submodule_name() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+[submodule "src/beta"]
+	path = src/beta
+	url = https://example.com/beta
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("src/alpha")).unwrap();
+    fs::create_dir_all(dir.path().join("src/beta")).unwrap();
+    fs::write(dir.path().join("src/alpha/lib.rs"), "fn alpha_helper() {}\n").unwrap();
+    fs::write(dir.path().join("src/beta/lib.rs"), "fn beta_func() {}\n").unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "index",
+            "--submodule",
+            "missing",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "unknown submodule should fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown scope `missing`"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("Available scopes: alpha, beta"),
+        "stderr was: {stderr}"
+    );
+    assert!(!dir.path().join(".tsift/indexes/missing/index.db").exists());
+}
+
+#[test]
 fn search_scope_errors_on_ambiguous_duplicate_leaf_name() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(

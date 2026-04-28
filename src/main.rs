@@ -1366,12 +1366,8 @@ fn cmd_index(
         let cfg = config::Config::load(&root)?;
         let targets: Vec<(String, PathBuf, Option<config::WorkspaceScope>)> =
             if let Some(name) = submodule {
-                match config::Config::find_submodule(&root, name)? {
-                    Some(scope) => {
-                        vec![(scope.id.clone(), scope.source_root.clone(), Some(scope))]
-                    }
-                    None => vec![(name.to_string(), root.join(name), None)],
-                }
+                let scope = config::Config::resolve_submodule(&root, name)?;
+                vec![(scope.id.clone(), scope.source_root.clone(), Some(scope))]
             } else {
                 config::Config::submodule_dirs(&root)?
                     .into_iter()
@@ -4046,6 +4042,34 @@ mod tests {
         .unwrap();
         assert!(dir.path().join(".tsift/indexes/alpha/index.db").exists());
         assert!(!dir.path().join(".tsift/indexes/beta/index.db").exists());
+    }
+
+    #[test]
+    fn workspace_index_single_submodule_errors_on_unknown_scope() {
+        let dir = setup_workspace();
+
+        let err = cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some("missing"),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("unknown scope `missing`"));
+        assert!(msg.contains("Available scopes: alpha, beta"));
+        assert!(!dir.path().join(".tsift/indexes/missing/index.db").exists());
     }
 
     #[test]
