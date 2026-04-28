@@ -1848,22 +1848,7 @@ fn cmd_communities(
     tabular: bool,
     schema: bool,
 ) -> Result<()> {
-    let root = path
-        .canonicalize()
-        .with_context(|| format!("resolving path: {}", path.display()))?;
-    let db_path = if let Some(scope_name) = scope {
-        let cfg = config::Config::load(&root)?;
-        cfg.db_path_for(&root, scope_name)
-    } else {
-        root.join(".tsift/index.db")
-    };
-    if !db_path.exists() {
-        bail!(
-            "no index found at {}. Run `tsift index` first.",
-            db_path.display()
-        );
-    }
-    let db = index::IndexDb::open(&db_path)?;
+    let db = open_index_db(path, scope)?;
     let edges = db.all_edges()?;
     let result = graph::detect_communities(&edges);
 
@@ -4161,6 +4146,22 @@ tier = "isolated"
         conn
     }
 
+    fn hold_writer_lock(lock_path: &std::path::Path) -> std::fs::File {
+        use fs4::fs_std::FileExt;
+        use std::io::Write;
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        assert!(file.try_lock_exclusive().unwrap());
+        writeln!(file, "{}", std::process::id()).unwrap();
+        file
+    }
+
     fn hold_rollback_journal_lock(db_path: &std::path::Path) -> Connection {
         let conn = Connection::open(db_path).unwrap();
         conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
@@ -4574,6 +4575,27 @@ tier = "isolated"
             20,
             false,
             true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn communities_cmd_succeeds_while_writer_lock_is_held() {
+        let dir = setup_graph_index();
+        let _lock = hold_writer_lock(&dir.path().join(".tsift/index.lock"));
+
+        let result = cmd_communities(
+            dir.path(),
+            None,
+            1,
+            10,
+            false,
             false,
             false,
             false,

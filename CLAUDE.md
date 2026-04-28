@@ -72,6 +72,7 @@ If copied skill instructions lag behind the installed binary, treat this file, `
 ## Conventions
 
 - **Read-only SQL**: `open_db()` uses `SQLITE_OPEN_READ_ONLY` — never mutates user databases.
+- **Read-only graph queries**: `graph`, `communities`, `path`, and `explain` all open `index.db` through the shared read-only path, so they do not contend on the writer-side `index.lock`.
 - **Transactional index updates**: `apply_changes` and `rebuild` wrap SQLite mutations in nested savepoints, so a failed reindex rolls back instead of leaving partial symbols/edges behind.
 - **Explicit WAL checkpoint budget**: writable `index.db` opens set and verify `PRAGMA wal_autocheckpoint=256` so normal write traffic checkpoints the WAL before it grows without a tsift-owned bound.
 - **Best-effort indexing is still visible**: unreadable files and symbol/call extraction failures stay non-fatal, but `IndexSummary.warnings` records them and shared index-update paths log them on stderr instead of silently dropping them.

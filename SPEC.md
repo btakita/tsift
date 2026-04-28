@@ -101,6 +101,7 @@ Opt-in recovery:
 - `tsift search --scope <submod> --autoindex ...` rebuilds only that submodule's index
 - `tsift search --federated --autoindex ...` rebuilds stale/missing federated submodule indexes before aggregating symbol hits
 - writable index updates now claim an OS-backed exclusive lock on the sibling `index.lock` sidecar first, so concurrent `tsift index` / `tsift search --autoindex` writers fail fast with a tsift-owned error instead of surfacing raw SQLite lock contention or PID-recycling false positives
+- read-only graph queries (`graph`, `communities`, `path`, `explain`) open `index.db` without taking that writer-side `index.lock`, so diagnostic and graph traversal commands keep working while an index writer is active
 - writable `index.db` opens also set `PRAGMA wal_autocheckpoint=256`, so normal tsift write traffic checkpoints the WAL on an explicit budget instead of leaving it entirely to SQLite defaults
 - non-fatal source-read / symbol-extraction / call-extraction failures now emit warnings instead of being silently swallowed, and those warnings are carried in `IndexSummary` for JSON consumers
 
@@ -318,6 +319,8 @@ tsift communities [--path <path>] [--scope <submod>] [--min-size N] [--json]
 **Output:** communities sorted by size (largest first), total modularity Q ∈ [-0.5, 1.0] (higher = stronger community structure), per-community member list and modularity contribution.
 
 **`--min-size N` (default 2):** filter out singleton communities (external symbols with no definition in the indexed codebase).
+
+**Locking:** `tsift communities` is a read-only graph query. It opens the existing `index.db` without acquiring the writer-side `index.lock`, so it can still run while another process owns the indexing lock.
 
 **Boundary rule:** `tsift communities` owns deterministic, AST-derived clustering. For LLM-derived semantic groupings (concept clusters, domain labels), use graphify's semantic layer over `tsift graph --json` output.
 

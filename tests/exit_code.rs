@@ -588,6 +588,29 @@ fn index_check_stays_read_only_while_writer_lock_exists() {
 }
 
 #[test]
+fn communities_stays_read_only_while_writer_lock_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    build_cli_fixture(dir.path());
+
+    let status = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let _lock = hold_writer_lock(&dir.path().join(".tsift/index.lock"));
+
+    let status = tsift_bin()
+        .args(["communities", dir.path().to_str().unwrap(), "--json"])
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "expected communities to stay read-only while a writer lock exists"
+    );
+}
+
+#[test]
 fn index_reports_lock_diagnostics_when_rollback_journal_blocks_writer() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
