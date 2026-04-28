@@ -2838,15 +2838,37 @@ fn find_scoped_search_path(root: &Path, scope_name: &str) -> Result<Option<PathB
         .map(|(_, path)| path))
 }
 
+fn resolve_scoped_search_path(root: &Path, scope_name: &str) -> Result<PathBuf> {
+    if let Some(path) = find_scoped_search_path(root, scope_name)? {
+        return Ok(path);
+    }
+
+    let available_scopes: Vec<String> = config::Config::submodule_dirs(root)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    if available_scopes.is_empty() {
+        bail!(
+            "unknown scope `{}`. Workspace {} has no configured submodules.",
+            scope_name,
+            root.display()
+        );
+    }
+
+    bail!(
+        "unknown scope `{}`. Available scopes: {}",
+        scope_name,
+        available_scopes.join(", ")
+    );
+}
+
 fn resolve_search_index_targets(
     root: &Path,
     scope: Option<&str>,
     federated: bool,
 ) -> Result<Vec<SearchIndexTarget>> {
     if let Some(scope_name) = scope {
-        let Some(source_root) = find_scoped_search_path(root, scope_name)? else {
-            return Ok(Vec::new());
-        };
+        let source_root = resolve_scoped_search_path(root, scope_name)?;
         let cfg = config::Config::load(root)?;
         return Ok(vec![SearchIndexTarget {
             label: format!("submodule `{}` index", scope_name),
@@ -3010,7 +3032,7 @@ fn cmd_search(
         } else {
             Vec::new()
         };
-        let sub_path = find_scoped_search_path(&root, scope_name)?.unwrap_or_else(|| root.clone());
+        let sub_path = resolve_scoped_search_path(&root, scope_name)?;
         (hits, sub_path)
     } else if federated {
         (federated_symbol_search(&root, &query, limit)?, root.clone())
@@ -4011,6 +4033,34 @@ tier = "isolated"
         let hits = db.symbol_search("alpha_main", 10).unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].name, "alpha_main");
+    }
+
+    #[test]
+    fn scoped_search_cmd_errors_on_unknown_scope() {
+        let dir = setup_workspace();
+
+        let err = cmd_search(
+            "alpha_main".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            Some("missing".to_string()),
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("unknown scope `missing`"));
+        assert!(msg.contains("Available scopes: alpha, beta"));
     }
 
     #[test]
