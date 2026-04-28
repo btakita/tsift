@@ -403,9 +403,7 @@ pub fn check_instruction_version(dir: &Path) -> InstructionStatus {
         return InstructionStatus::Missing;
     }
     match extract_instruction_version(&content) {
-        Some(v) if v == TSIFT_VERSION => InstructionStatus::Current {
-            version: v,
-        },
+        Some(v) if v == TSIFT_VERSION => InstructionStatus::Current { version: v },
         Some(v) => InstructionStatus::Stale {
             found: Some(v),
             expected: TSIFT_VERSION.to_string(),
@@ -966,7 +964,8 @@ mod tests {
 
     #[test]
     fn extract_version_returns_none_for_old_format() {
-        let content = "<!-- tsift:code-navigation -->\n## Code Navigation\n<!-- /tsift:code-navigation -->\n";
+        let content =
+            "<!-- tsift:code-navigation -->\n## Code Navigation\n<!-- /tsift:code-navigation -->\n";
         assert_eq!(extract_instruction_version(content), None);
     }
 
