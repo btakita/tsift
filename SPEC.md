@@ -427,6 +427,9 @@ tsift lint README.md --json                       # structured output
 - `--index <dir>` live symbol index discovery (`index.db`, names ≥4 chars) from a project root, `.tsift` directory, scope directory, or direct `index.db` path
 - Default: the nearest ancestor project root with `.tsift/index.db`, plus any scoped indexes under `.tsift/indexes/*/index.db`
 
+**Locking:**
+- `tsift lint` opens discovered `index.db` files through the shared read-only path with rollback-journal snapshot fallback, so lint stays available while a live writer has the index locked.
+
 **Detection rules:**
 - Skip code blocks, headings, and HTML comments
 - Skip already-annotated terms (backtick-wrapped, bold-wrapped, link text, inside inline code)

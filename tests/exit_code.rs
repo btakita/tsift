@@ -700,6 +700,50 @@ fn lint_auto_discovers_root_index_db() {
 }
 
 #[test]
+fn lint_stays_read_only_while_rollback_journal_lock_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn alpha_helper() {}\n").unwrap();
+    fs::write(
+        dir.path().join("README.md"),
+        "alpha_helper should be backticked.\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _lock = hold_rollback_journal_lock(&dir.path().join(".tsift/index.db"));
+
+    let output = tsift_bin()
+        .current_dir(dir.path())
+        .args(["lint", "README.md", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "lint stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let annotations = json["annotations"].as_array().unwrap();
+    assert!(
+        annotations
+            .iter()
+            .any(|ann| ann["text"].as_str() == Some("alpha_helper")),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn index_reports_lock_diagnostics_when_rollback_journal_blocks_writer() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();

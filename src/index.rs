@@ -343,6 +343,17 @@ impl IndexDb {
         })
     }
 
+    pub fn symbol_names_read_only_min_len(db_path: &Path, min_len: usize) -> Result<Vec<String>> {
+        match Self::open_read_only(db_path).and_then(|db| db.symbol_names_min_len(min_len)) {
+            Ok(names) => Ok(names),
+            Err(err) if should_retry_read_only_with_snapshot(db_path, &err) => {
+                let db = Self::open_read_only_snapshot(db_path)?;
+                db.symbol_names_min_len(min_len)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn inspect_read_only(
         db_path: &Path,
         root: &Path,
@@ -795,6 +806,14 @@ impl IndexDb {
             .conn
             .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
         Ok(count as usize)
+    }
+
+    pub fn symbol_names_min_len(&self, min_len: usize) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT name FROM symbols WHERE length(name) >= ?1")?;
+        let rows = stmt.query_map(rusqlite::params![min_len as i64], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn symbols_for_file(&self, file: &str) -> Result<Vec<StoredSymbol>> {

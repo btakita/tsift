@@ -6,6 +6,11 @@ Canonical binary version source: `Cargo.toml` `package.version`. The CLI exposes
 
 Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
+## 0.1.8
+
+- `tsift lint` now opens discovered `index.db` files through the shared read-only path with rollback-journal snapshot fallback, so markdown linting stays available while a live writer holds the database lock.
+- Regression coverage now locks this behavior in both the helper-level entity-loading path and the compiled CLI lint surface.
+
 ## 0.1.7
 
 - `tsift lint` now auto-discovers live `index.db` files from the nearest ancestor `.tsift` root, including scoped `.tsift/indexes/*/index.db` layouts, instead of probing the retired `symbols.db` paths.

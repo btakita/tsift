@@ -1,3 +1,4 @@
+use crate::index::IndexDb;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
@@ -181,18 +182,9 @@ pub fn find_project_root_for_path(path: &Path) -> Result<Option<PathBuf>> {
 }
 
 pub fn collect_entities_from_db(db_path: &Path) -> Result<HashSet<String>> {
-    let conn =
-        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-
-    let mut entities = HashSet::new();
-
-    let mut stmt = conn.prepare("SELECT DISTINCT name FROM symbols WHERE length(name) >= 4")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    for name in rows.flatten() {
-        entities.insert(name);
-    }
-
-    Ok(entities)
+    Ok(IndexDb::symbol_names_read_only_min_len(db_path, 4)?
+        .into_iter()
+        .collect())
 }
 
 pub fn collect_entities_from_index_path(index_path: &Path) -> Result<HashSet<String>> {
@@ -484,5 +476,21 @@ mod tests {
 
         assert!(entities.contains("alpha_helper"));
         assert!(entities.contains("beta_helper"));
+    }
+
+    #[test]
+    fn collect_entities_uses_snapshot_fallback_when_rollback_journal_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(".tsift/index.db");
+        create_symbol_index(&db_path, &["alpha_helper"]);
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        fs::write(format!("{}-journal", db_path.display()), "locked").unwrap();
+
+        let entities = collect_entities_from_db(&db_path).unwrap();
+
+        assert!(entities.contains("alpha_helper"));
     }
 }
