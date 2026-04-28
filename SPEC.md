@@ -731,6 +731,7 @@ tsift summarize
 ├── extract (one-time, per file content hash)
 │   ├── reads source + AST symbols from symbols.db
 │   ├── calls Anthropic batch API (haiku for cost)
+│   ├── replaces each file's cached rows in one SQLite transaction
 │   └── stores: entities, relationships, summaries → summaries.db
 ├── query (instant, local SQLite)
 │   ├── by symbol name → summary + relationships + community context

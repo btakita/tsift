@@ -2441,15 +2441,23 @@ fn cmd_summarize(
             }
 
             match summarize::extract_for_file(file_path, symbols_db.as_deref(), &cfg) {
-                Ok(summaries) => {
-                    summary_db.delete_by_file(&rel_path)?;
-                    for mut s in summaries {
-                        s.file_path = rel_path.clone();
-                        report.symbols_extracted += 1;
-                        report.tokens_input += s.tokens_input.unwrap_or(0);
-                        report.tokens_output += s.tokens_output.unwrap_or(0);
-                        summary_db.insert(&s)?;
+                Ok(mut summaries) => {
+                    for summary in &mut summaries {
+                        summary.file_path = rel_path.clone();
                     }
+                    let extracted_count = summaries.len();
+                    let tokens_input = summaries
+                        .iter()
+                        .map(|summary| summary.tokens_input.unwrap_or(0))
+                        .sum::<i64>();
+                    let tokens_output = summaries
+                        .iter()
+                        .map(|summary| summary.tokens_output.unwrap_or(0))
+                        .sum::<i64>();
+                    summary_db.replace_file(&rel_path, &summaries)?;
+                    report.symbols_extracted += extracted_count;
+                    report.tokens_input += tokens_input;
+                    report.tokens_output += tokens_output;
                     report.files_processed += 1;
                     if !json_output && !compact {
                         println!("  extracted: {}", rel_path);

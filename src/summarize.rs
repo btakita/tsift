@@ -80,6 +80,8 @@ pub struct SummarizeConfig {
     pub api_key_env: String,
 }
 
+const REPLACE_FILE_SAVEPOINT: &str = "tsift_summary_replace";
+
 impl Default for SummarizeConfig {
     fn default() -> Self {
         Self {
@@ -165,35 +167,11 @@ impl SummaryDb {
     }
 
     pub fn insert(&self, summary: &Summary) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO summaries
-             (symbol_name, file_path, content_hash, summary, entities, relationships,
-              concept_labels, extracted_at, model, tokens_input, tokens_output)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            rusqlite::params![
-                summary.symbol_name,
-                summary.file_path,
-                summary.content_hash,
-                summary.summary,
-                summary
-                    .entities
-                    .as_ref()
-                    .map(|e| serde_json::to_string(e).unwrap_or_default()),
-                summary
-                    .relationships
-                    .as_ref()
-                    .map(|r| serde_json::to_string(r).unwrap_or_default()),
-                summary
-                    .concept_labels
-                    .as_ref()
-                    .map(|c| serde_json::to_string(c).unwrap_or_default()),
-                summary.extracted_at,
-                summary.model,
-                summary.tokens_input,
-                summary.tokens_output,
-            ],
-        )?;
-        Ok(())
+        insert_summary(&self.conn, summary)
+    }
+
+    pub fn replace_file(&self, file_path: &str, summaries: &[Summary]) -> Result<()> {
+        self.replace_file_with_hook(file_path, summaries, |_| Ok(()))
     }
 
     pub fn is_current(&self, file_path: &str, content_hash: &str) -> Result<bool> {
@@ -243,6 +221,81 @@ impl SummaryDb {
             .execute("DELETE FROM summaries WHERE file_path = ?1", [file_path])?;
         Ok(count)
     }
+
+    fn replace_file_with_hook<F>(
+        &self,
+        file_path: &str,
+        summaries: &[Summary],
+        mut after_insert: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize) -> Result<()>,
+    {
+        self.conn
+            .execute_batch(&format!("SAVEPOINT {REPLACE_FILE_SAVEPOINT}"))
+            .context("starting summary replacement transaction")?;
+
+        let result = (|| -> Result<()> {
+            self.conn
+                .execute("DELETE FROM summaries WHERE file_path = ?1", [file_path])?;
+            for (idx, summary) in summaries.iter().enumerate() {
+                insert_summary(&self.conn, summary)?;
+                after_insert(idx)?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn
+                    .execute_batch(&format!("RELEASE {REPLACE_FILE_SAVEPOINT}"))
+                    .context("committing summary replacement transaction")?;
+                Ok(())
+            }
+            Err(err) => {
+                if let Err(rollback_err) = self.conn.execute_batch(&format!(
+                    "ROLLBACK TO {REPLACE_FILE_SAVEPOINT}; RELEASE {REPLACE_FILE_SAVEPOINT};"
+                )) {
+                    return Err(err.context(format!(
+                        "rollback failed for summary replacement transaction: {rollback_err}"
+                    )));
+                }
+                Err(err)
+            }
+        }
+    }
+}
+
+fn insert_summary(conn: &Connection, summary: &Summary) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO summaries
+         (symbol_name, file_path, content_hash, summary, entities, relationships,
+          concept_labels, extracted_at, model, tokens_input, tokens_output)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![
+            summary.symbol_name,
+            summary.file_path,
+            summary.content_hash,
+            summary.summary,
+            summary
+                .entities
+                .as_ref()
+                .map(|e| serde_json::to_string(e).unwrap_or_default()),
+            summary
+                .relationships
+                .as_ref()
+                .map(|r| serde_json::to_string(r).unwrap_or_default()),
+            summary
+                .concept_labels
+                .as_ref()
+                .map(|c| serde_json::to_string(c).unwrap_or_default()),
+            summary.extracted_at,
+            summary.model,
+            summary.tokens_input,
+            summary.tokens_output,
+        ],
+    )?;
+    Ok(())
 }
 
 fn row_to_summary(row: &rusqlite::Row) -> Summary {
@@ -583,6 +636,42 @@ mod tests {
         assert_eq!(deleted, 2);
         assert!(db.get_by_file("f1.rs").unwrap().is_empty());
         assert_eq!(db.get_by_file("f2.rs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn db_replace_file_rolls_back_on_failure() {
+        let (_tmp, db) = test_db();
+        db.insert(&make_summary("alpha", "f1.rs", "old_hash"))
+            .unwrap();
+        db.insert(&make_summary("beta", "f1.rs", "old_hash"))
+            .unwrap();
+
+        let replacements = vec![
+            make_summary("gamma", "f1.rs", "new_hash"),
+            make_summary("delta", "f1.rs", "new_hash"),
+        ];
+
+        let err = db
+            .replace_file_with_hook("f1.rs", &replacements, |idx| {
+                if idx == 0 {
+                    bail!("injected summary replace failure");
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("injected summary replace failure"));
+
+        let remaining = db.get_by_file("f1.rs").unwrap();
+        let remaining_symbols = remaining
+            .iter()
+            .map(|summary| summary.symbol_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining_symbols, vec!["alpha", "beta"]);
+        assert!(
+            remaining
+                .iter()
+                .all(|summary| summary.content_hash == "old_hash")
+        );
     }
 
     #[test]
