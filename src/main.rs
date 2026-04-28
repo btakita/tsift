@@ -1340,12 +1340,8 @@ fn cmd_index(
                 let db = index::IndexDb::open(&db_path)?;
                 db.rebuild(sub_path)?
             } else if check {
-                let db = index::IndexDb::open_read_only(&db_path)?;
-                if prune {
-                    db.compute_changes_pruned(sub_path)?
-                } else {
-                    db.compute_changes(sub_path)?
-                }
+                let (_, summary) = index::IndexDb::inspect_read_only(&db_path, sub_path, prune)?;
+                summary
             } else if prune {
                 let db = index::IndexDb::open(&db_path)?;
                 db.apply_changes_pruned(sub_path)?
@@ -1452,12 +1448,8 @@ fn cmd_index(
         let db = index::IndexDb::open(&db_path)?;
         db.rebuild(&root)?
     } else if check {
-        let db = index::IndexDb::open_read_only(&db_path)?;
-        if prune {
-            db.compute_changes_pruned(&root)?
-        } else {
-            db.compute_changes(&root)?
-        }
+        let (_, summary) = index::IndexDb::inspect_read_only(&db_path, &root, prune)?;
+        summary
     } else if prune {
         let db = index::IndexDb::open(&db_path)?;
         db.apply_changes_pruned(&root)?

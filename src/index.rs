@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,6 +14,7 @@ use tagpath::parser as tagpath_parser;
 pub struct IndexDb {
     conn: Connection,
     _write_lock: Option<WriteLockGuard>,
+    _snapshot_copy: Option<SnapshotCopyGuard>,
 }
 
 struct WriteLockGuard {
@@ -20,6 +22,16 @@ struct WriteLockGuard {
 }
 
 impl Drop for WriteLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+struct SnapshotCopyGuard {
+    path: PathBuf,
+}
+
+impl Drop for SnapshotCopyGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
@@ -171,6 +183,7 @@ impl IndexDb {
         Ok(Self {
             conn,
             _write_lock: Some(write_lock),
+            _snapshot_copy: None,
         })
     }
 
@@ -184,6 +197,67 @@ impl IndexDb {
         Ok(Self {
             conn,
             _write_lock: None,
+            _snapshot_copy: None,
+        })
+    }
+
+    pub fn inspect_read_only(
+        db_path: &Path,
+        root: &Path,
+        prune: bool,
+    ) -> Result<(usize, IndexSummary)> {
+        match Self::inspect_read_only_once(db_path, root, prune) {
+            Ok(result) => Ok(result),
+            Err(err) if should_retry_read_only_with_snapshot(db_path, &err) => {
+                let db = Self::open_read_only_snapshot(db_path)?;
+                let total_files = db.file_count()?;
+                let summary = if prune {
+                    db.compute_changes_pruned(root)?
+                } else {
+                    db.compute_changes(root)?
+                };
+                Ok((total_files, summary))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn inspect_read_only_once(
+        db_path: &Path,
+        root: &Path,
+        prune: bool,
+    ) -> Result<(usize, IndexSummary)> {
+        let db = Self::open_read_only(db_path)?;
+        let total_files = db.file_count()?;
+        let summary = if prune {
+            db.compute_changes_pruned(root)?
+        } else {
+            db.compute_changes(root)?
+        };
+        Ok((total_files, summary))
+    }
+
+    fn open_read_only_snapshot(db_path: &Path) -> Result<Self> {
+        let snapshot_path = snapshot_copy_path(db_path);
+        std::fs::copy(db_path, &snapshot_path).with_context(|| {
+            format!(
+                "copying locked index db {} to snapshot {}",
+                db_path.display(),
+                snapshot_path.display()
+            )
+        })?;
+        let conn = Connection::open_with_flags(
+            &snapshot_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening index snapshot {}", snapshot_path.display()))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self {
+            conn,
+            _write_lock: None,
+            _snapshot_copy: Some(SnapshotCopyGuard {
+                path: snapshot_path,
+            }),
         })
     }
 
@@ -757,6 +831,35 @@ fn clear_stale_lock_if_possible(lock_path: &Path) -> Result<bool> {
     std::fs::remove_file(lock_path)
         .with_context(|| format!("removing stale lock {}", lock_path.display()))?;
     Ok(true)
+}
+
+fn should_retry_read_only_with_snapshot(db_path: &Path, err: &anyhow::Error) -> bool {
+    rollback_journal_path(db_path).exists() && error_mentions_locked_db(err)
+}
+
+fn rollback_journal_path(db_path: &Path) -> PathBuf {
+    let mut journal = db_path.as_os_str().to_os_string();
+    journal.push("-journal");
+    PathBuf::from(journal)
+}
+
+fn snapshot_copy_path(db_path: &Path) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos();
+    let stem = db_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("index");
+    let mut file_name = OsString::from(format!("tsift-{stem}-{}-{nanos}", std::process::id()));
+    file_name.push(".db");
+    std::env::temp_dir().join(file_name)
+}
+
+fn error_mentions_locked_db(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains("database is locked"))
 }
 
 fn read_lock_pid(lock_path: &Path) -> Option<u32> {
@@ -1437,6 +1540,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(timeout_ms, 5000);
+    }
+
+    #[test]
+    fn inspect_read_only_uses_snapshot_when_rollback_journal_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(".tsift/index.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+
+        let source = dir.path().join("main.rs");
+        std::fs::write(&source, "fn main() {}\n").unwrap();
+        let modified = std::fs::metadata(&source).unwrap().modified().unwrap();
+        let (secs, nanos) = system_time_to_pair(modified);
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             CREATE TABLE file_state (
+                 path TEXT PRIMARY KEY,
+                 mtime_secs INTEGER NOT NULL,
+                 mtime_nanos INTEGER NOT NULL,
+                 language TEXT NOT NULL
+             );
+             CREATE TABLE dir_state (
+                 path TEXT PRIMARY KEY,
+                 mtime_secs INTEGER NOT NULL,
+                 mtime_nanos INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_state (path, mtime_secs, mtime_nanos, language) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![source.to_string_lossy(), secs, nanos, "rust"],
+        )
+        .unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        std::fs::write(rollback_journal_path(&db_path), "locked").unwrap();
+
+        let (total_files, summary) =
+            IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
+        assert_eq!(total_files, 1);
+        assert_eq!(summary.new, 0);
+        assert_eq!(summary.modified, 0);
+        assert_eq!(summary.deleted, 0);
     }
 
     #[test]

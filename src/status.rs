@@ -82,9 +82,7 @@ fn check_index(db_path: &Path, root: &Path) -> Result<IndexStatus> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let db = IndexDb::open_read_only(db_path)?;
-    let total_files = db.file_count()?;
-    let summary = db.compute_changes(root)?;
+    let (total_files, summary) = IndexDb::inspect_read_only(db_path, root, false)?;
     let stale_files = summary.new + summary.modified + summary.deleted;
 
     if stale_files > 0 {

@@ -90,5 +90,7 @@ Run `tsift status` at session start. Use the commands listed in its `use:` outpu
 
 If `tsift status` reports a stale index, `tsift search` will usually repair it automatically. Use `tsift search --no-autoindex ...` only when you explicitly want a non-mutating stale check. If `tsift search` still times out after indexing, narrow the path/query or retry with a larger `--timeout`.
 
+If `tsift status` or `tsift index --check` hits a rollback-journal lock, tsift now retries the freshness read against a temporary snapshot of the DB. That recovers the health check, but it does not kill a live writer or delete the journal for you.
+
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->

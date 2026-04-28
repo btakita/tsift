@@ -120,6 +120,7 @@ tsift treats query/status paths and writer paths differently so a live index reb
 
 - writable opens (`index`, `summarize`) set a 5-second SQLite busy timeout and require `PRAGMA journal_mode=WAL`; if SQLite refuses WAL, tsift fails closed instead of continuing in rollback-journal mode
 - read/query paths (`search`, `graph`, `communities`, `path`, `explain`, `status`, and summary status checks) use read-only SQLite handles with the same busy timeout
+- `status` and `index --check` add one extra recovery step: if a rollback-journal writer has left the live DB locked, tsift copies the DB file to a temporary snapshot and runs the freshness check against that copy instead of failing with raw SQLite lock output
 - this is a concurrency hardening step, not a filesystem-stall fix: if the host itself wedges a write in kernel `D` state, tsift now surfaces the bad journal mode early rather than silently proceeding with a lock-prone writer
 
 `--timeout 0` disables the timeout for cases where a long search is expected.
@@ -655,6 +656,8 @@ tsift status <path>     # check a specific codebase directory
 ### Output
 
 Three sections: index state, summary cache state, recommendations.
+
+If the live index is stuck behind a rollback-journal writer lock, `tsift status` now retries the freshness check against a temporary snapshot of `.tsift/index.db`. That auto-recovers the session health check without deleting the live journal or killing the writer process; subsequent mutating work still needs a real `tsift index ...` once the writer issue is resolved.
 
 When everything is available:
 ```
