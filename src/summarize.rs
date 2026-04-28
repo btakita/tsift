@@ -466,24 +466,28 @@ fn build_extraction_prompt(file_path: &str, source: &str, symbols: &[(String, St
     prompt
 }
 
-fn call_anthropic_api(api_key: &str, model: &str, prompt: &str) -> Result<(String, i64, i64)> {
-    let body = serde_json::json!({
-        "model": model,
-        "max_tokens": 4096,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
-    });
+fn parse_anthropic_api_response(
+    status: u16,
+    response: serde_json::Value,
+) -> Result<(String, i64, i64)> {
+    if !(200..300).contains(&status) {
+        let message = response["error"]["message"]
+            .as_str()
+            .or_else(|| response["message"].as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| response.to_string());
+        let error_type = response["error"]["type"].as_str();
 
-    let response: serde_json::Value = ureq::post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .send_json(&body)
-        .with_context(|| "calling Anthropic API")?
-        .body_mut()
-        .read_json()
-        .with_context(|| "reading Anthropic API response")?;
+        match error_type {
+            Some(error_type) => bail!(
+                "Anthropic API returned HTTP {} ({}): {}",
+                status,
+                error_type,
+                message
+            ),
+            None => bail!("Anthropic API returned HTTP {}: {}", status, message),
+        }
+    }
 
     let content = response["content"]
         .as_array()
@@ -512,6 +516,37 @@ fn call_anthropic_api(api_key: &str, model: &str, prompt: &str) -> Result<(Strin
         .to_string();
 
     Ok((cleaned, tokens_in, tokens_out))
+}
+
+fn call_anthropic_api(api_key: &str, model: &str, prompt: &str) -> Result<(String, i64, i64)> {
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 4096,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ]
+    });
+
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let mut response = agent
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .send_json(&body)
+        .with_context(|| "calling Anthropic API")?;
+    let status = response.status();
+    let response_body = response
+        .body_mut()
+        .read_to_string()
+        .with_context(|| format!("reading Anthropic API response body (HTTP {})", status))?;
+    let response_json: serde_json::Value = serde_json::from_str(&response_body)
+        .with_context(|| format!("parsing Anthropic API response JSON (HTTP {})", status))?;
+
+    parse_anthropic_api_response(status.as_u16(), response_json)
 }
 
 pub fn git_changed_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -547,6 +582,7 @@ fn chrono_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::NamedTempFile;
 
     fn test_db() -> (NamedTempFile, SummaryDb) {
@@ -759,6 +795,58 @@ mod tests {
         let prompt = build_extraction_prompt("src/lib.rs", "code", &symbols);
         assert!(prompt.contains("- main (function)"));
         assert!(prompt.contains("- Config (struct)"));
+    }
+
+    #[test]
+    fn anthropic_api_response_rejects_http_errors() {
+        let err = parse_anthropic_api_response(
+            429,
+            json!({
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": "too many requests"
+                }
+            }),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("HTTP 429"));
+        assert!(message.contains("rate_limit_error"));
+        assert!(message.contains("too many requests"));
+    }
+
+    #[test]
+    fn anthropic_api_response_reports_raw_body_when_error_message_missing() {
+        let response = json!({"unexpected": "shape"});
+        let err = parse_anthropic_api_response(502, response.clone()).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("HTTP 502"));
+        assert!(message.contains(&response.to_string()));
+    }
+
+    #[test]
+    fn anthropic_api_response_extracts_content_and_usage() {
+        let (content, tokens_in, tokens_out) = parse_anthropic_api_response(
+            200,
+            json!({
+                "content": [
+                    {
+                        "text": "```json\n{\"summary\":\"ok\"}\n```"
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 34
+                }
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(content, "{\"summary\":\"ok\"}");
+        assert_eq!(tokens_in, 12);
+        assert_eq!(tokens_out, 34);
     }
 
     #[test]

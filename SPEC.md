@@ -730,7 +730,7 @@ tsift summarize --json              # structured output
 tsift summarize
 ├── extract (one-time, per file content hash)
 │   ├── reads source + AST symbols from symbols.db
-│   ├── calls Anthropic batch API (haiku for cost)
+│   ├── calls Anthropic batch API (haiku for cost; non-2xx responses fail closed before content parsing)
 │   ├── replaces each file's cached rows in one SQLite transaction
 │   └── stores: entities, relationships, summaries → summaries.db
 ├── query (instant, local SQLite)
