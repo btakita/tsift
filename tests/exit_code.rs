@@ -2,6 +2,8 @@ use fs4::fs_std::FileExt;
 use rusqlite::Connection;
 use std::fs;
 use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -233,6 +235,34 @@ fn search_autoindexes_stale_index_by_default() {
         output.status.success(),
         "expected default search to autoindex"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn index_logs_warning_when_file_read_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("main.rs");
+    fs::write(&main_path, "fn main() {}\n").unwrap();
+
+    let original_mode = fs::metadata(&main_path).unwrap().permissions().mode();
+    let mut unreadable = fs::metadata(&main_path).unwrap().permissions();
+    unreadable.set_mode(0o000);
+    fs::set_permissions(&main_path, unreadable).unwrap();
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    let mut restored = fs::metadata(&main_path).unwrap().permissions();
+    restored.set_mode(original_mode);
+    fs::set_permissions(&main_path, restored).unwrap();
+
+    assert!(output.status.success(), "index should still succeed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("warning:"), "stderr was: {stderr}");
+    assert!(stderr.contains("read failed"), "stderr was: {stderr}");
+    assert!(stderr.contains("main.rs"), "stderr was: {stderr}");
 }
 
 #[test]

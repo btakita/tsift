@@ -127,6 +127,23 @@ pub struct FileChange {
     pub language: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexWarningStage {
+    ReadSource,
+    ExtractSymbols,
+    ExtractCallSites,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IndexWarning {
+    pub path: PathBuf,
+    pub stage: IndexWarningStage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    pub message: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct IndexSummary {
     pub total_tracked: usize,
@@ -135,6 +152,8 @@ pub struct IndexSummary {
     pub deleted: usize,
     pub unchanged: usize,
     pub changes: Vec<FileChange>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<IndexWarning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prune_stats: Option<PruneStats>,
 }
@@ -201,6 +220,27 @@ fn system_time_to_pair(t: SystemTime) -> (i64, u32) {
 
 fn pair_to_system_time(secs: i64, nanos: u32) -> SystemTime {
     UNIX_EPOCH + Duration::new(secs as u64, nanos)
+}
+
+fn warning_on_error<T>(
+    result: Result<T>,
+    warnings: &mut Vec<IndexWarning>,
+    path: &Path,
+    language: Option<&str>,
+    stage: IndexWarningStage,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(err) => {
+            warnings.push(IndexWarning {
+                path: path.to_path_buf(),
+                stage,
+                language: language.map(str::to_string),
+                message: format!("{err:#}"),
+            });
+            None
+        }
+    }
 }
 
 impl IndexDb {
@@ -519,6 +559,7 @@ impl IndexDb {
             deleted: del_count,
             unchanged,
             changes,
+            warnings: Vec::new(),
             prune_stats,
         })
     }
@@ -573,11 +614,12 @@ impl IndexDb {
             deleted: del_count,
             unchanged,
             changes,
+            warnings: Vec::new(),
             prune_stats,
         };
 
         self.conn.execute_batch("SAVEPOINT sp_apply")?;
-        let apply_result: Result<()> = (|| {
+        let apply_result: Result<Vec<IndexWarning>> = (|| {
             let mut insert_file = self.conn.prepare(
                 "INSERT OR REPLACE INTO file_state (path, mtime_secs, mtime_nanos, language) VALUES (?1, ?2, ?3, ?4)"
             )?;
@@ -594,6 +636,7 @@ impl IndexDb {
             let mut insert_edge = self.conn.prepare(
                 "INSERT INTO call_edges (caller_file, caller_name, caller_line, callee_name, call_site_line) VALUES (?1, ?2, ?3, ?4, ?5)"
             )?;
+            let mut warnings = Vec::new();
 
             for change in &summary.changes {
                 let path_str = change.path.to_string_lossy();
@@ -618,11 +661,25 @@ impl IndexDb {
                             .and_then(|e| e.to_str())
                             .and_then(Lang::from_extension);
                         if let Some(lang) = lang {
-                            let source = std::fs::read(&change.path).ok();
-                            let symbols =
-                                source.as_ref().and_then(|s| lang.extract_symbols(s).ok());
+                            let lang_name = lang.name();
+                            let source = warning_on_error(
+                                std::fs::read(&change.path)
+                                    .with_context(|| format!("reading {}", change.path.display())),
+                                &mut warnings,
+                                &change.path,
+                                Some(lang_name),
+                                IndexWarningStage::ReadSource,
+                            );
+                            let symbols = source.as_ref().and_then(|source| {
+                                warning_on_error(
+                                    lang.extract_symbols(source),
+                                    &mut warnings,
+                                    &change.path,
+                                    Some(lang_name),
+                                    IndexWarningStage::ExtractSymbols,
+                                )
+                            });
                             if let Some(ref symbols) = symbols {
-                                let lang_name = lang.name();
                                 for sym in symbols {
                                     let tags = compute_tags(&sym.name);
                                     insert_symbol.execute(rusqlite::params![
@@ -640,7 +697,13 @@ impl IndexDb {
                                 }
                             }
                             if let Some(ref source) = source {
-                                let call_sites = graph::extract_call_sites(lang, source).ok();
+                                let call_sites = warning_on_error(
+                                    graph::extract_call_sites(lang, source),
+                                    &mut warnings,
+                                    &change.path,
+                                    Some(lang_name),
+                                    IndexWarningStage::ExtractCallSites,
+                                );
                                 if let (Some(sites), Some(symbols)) = (call_sites, &symbols) {
                                     let edges = graph::resolve_edges(symbols, &sites);
                                     for edge in &edges {
@@ -679,10 +742,14 @@ impl IndexDb {
                 self.save_dir_state(&all_dirs)?;
             }
 
-            Ok(())
+            Ok(warnings)
         })();
+        let mut summary = summary;
         match apply_result {
-            Ok(()) => self.conn.execute_batch("RELEASE sp_apply")?,
+            Ok(warnings) => {
+                self.conn.execute_batch("RELEASE sp_apply")?;
+                summary.warnings = warnings;
+            }
             Err(err) => {
                 let _ = self.conn.execute_batch("ROLLBACK TO sp_apply");
                 let _ = self.conn.execute_batch("RELEASE sp_apply");
@@ -1145,6 +1212,8 @@ fn compute_tags(name: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn setup_tree() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -1262,6 +1331,35 @@ mod tests {
             .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert!(!paths.contains(&"readme.txt".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_changes_warns_on_unreadable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.rs");
+        fs::write(&main_path, "fn main() {}\n").unwrap();
+
+        let original_mode = fs::metadata(&main_path).unwrap().permissions().mode();
+        let mut unreadable = fs::metadata(&main_path).unwrap().permissions();
+        unreadable.set_mode(0o000);
+        fs::set_permissions(&main_path, unreadable).unwrap();
+
+        let db = db_in(dir.path());
+        let summary = db.apply_changes(dir.path()).unwrap();
+
+        let mut restored = fs::metadata(&main_path).unwrap().permissions();
+        restored.set_mode(original_mode);
+        fs::set_permissions(&main_path, restored).unwrap();
+
+        assert_eq!(summary.warnings.len(), 1);
+        let warning = &summary.warnings[0];
+        assert_eq!(warning.path, main_path);
+        assert_eq!(warning.stage, IndexWarningStage::ReadSource);
+        assert_eq!(warning.language.as_deref(), Some("rust"));
+        assert!(warning.message.contains("reading"));
+        assert_eq!(db.symbol_count().unwrap(), 0);
+        assert_eq!(db.edge_count().unwrap(), 0);
     }
 
     #[test]
@@ -1821,6 +1919,7 @@ mod tests {
             deleted: 0,
             unchanged: 0,
             changes: vec![],
+            warnings: vec![],
             prune_stats: None,
         };
         assert!(s.has_changes());
@@ -1835,6 +1934,7 @@ mod tests {
             deleted: 0,
             unchanged: 0,
             changes: vec![],
+            warnings: vec![],
             prune_stats: None,
         };
         assert!(s.has_changes());
@@ -1849,6 +1949,7 @@ mod tests {
             deleted: 1,
             unchanged: 0,
             changes: vec![],
+            warnings: vec![],
             prune_stats: None,
         };
         assert!(s.has_changes());
@@ -1863,6 +1964,7 @@ mod tests {
             deleted: 0,
             unchanged: 3,
             changes: vec![],
+            warnings: vec![],
             prune_stats: None,
         };
         assert!(!s.has_changes());
@@ -1877,6 +1979,7 @@ mod tests {
             deleted: 0,
             unchanged: 0,
             changes: vec![],
+            warnings: vec![],
             prune_stats: None,
         };
         assert!(!s.has_changes());

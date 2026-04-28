@@ -1386,7 +1386,7 @@ fn cmd_index(
                 continue;
             }
             let db_path = cfg.db_path_for(&root, name);
-            let summary = if rebuild {
+            let mut summary = if rebuild {
                 run_index_update(
                     &db_path,
                     sub_path,
@@ -1419,6 +1419,9 @@ fn cmd_index(
                     false,
                 )?
             };
+            if !absolute {
+                relativize_index_summary(&mut summary, sub_path);
+            }
             if summary.has_changes() {
                 any_stale = true;
             }
@@ -1550,9 +1553,7 @@ fn cmd_index(
 
     let mut summary = summary;
     if !absolute {
-        for change in &mut summary.changes {
-            change.path = relativize_pathbuf(&change.path, &root);
-        }
+        relativize_index_summary(&mut summary, &root);
     }
 
     if json_output {
@@ -2730,7 +2731,43 @@ fn run_index_update(
         }
     })();
 
-    result.map_err(|err| add_write_lock_context(err, action, root, scope))
+    let summary = result.map_err(|err| add_write_lock_context(err, action, root, scope))?;
+    emit_index_warnings(&summary, source_root, scope);
+    Ok(summary)
+}
+
+fn relativize_index_summary(summary: &mut index::IndexSummary, root: &Path) {
+    for change in &mut summary.changes {
+        change.path = relativize_pathbuf(&change.path, root);
+    }
+    for warning in &mut summary.warnings {
+        warning.path = relativize_pathbuf(&warning.path, root);
+    }
+}
+
+fn emit_index_warnings(summary: &index::IndexSummary, root: &Path, scope: Option<&str>) {
+    for warning in &summary.warnings {
+        let rel_path = relativize_pathbuf(&warning.path, root);
+        let stage = match warning.stage {
+            index::IndexWarningStage::ReadSource => "read failed",
+            index::IndexWarningStage::ExtractSymbols => "symbol extraction failed",
+            index::IndexWarningStage::ExtractCallSites => "call extraction failed",
+        };
+        let scope_prefix = scope.map(|name| format!("[{}] ", name)).unwrap_or_default();
+        let lang_suffix = warning
+            .language
+            .as_deref()
+            .map(|lang| format!(" [{}]", lang))
+            .unwrap_or_default();
+        eprintln!(
+            "warning: {}{}{}: {}: {}",
+            scope_prefix,
+            rel_path.display(),
+            lang_suffix,
+            stage,
+            warning.message
+        );
+    }
 }
 
 fn load_summarize_config(root: &std::path::Path) -> summarize::SummarizeConfig {
