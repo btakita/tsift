@@ -101,6 +101,7 @@ Opt-in recovery:
 - `tsift search --scope <submod> --autoindex ...` rebuilds only that submodule's index
 - `tsift search --federated --autoindex ...` rebuilds stale/missing federated submodule indexes before aggregating symbol hits
 - writable index updates now claim an OS-backed exclusive lock on the sibling `index.lock` sidecar first, so concurrent `tsift index` / `tsift search --autoindex` writers fail fast with a tsift-owned error instead of surfacing raw SQLite lock contention or PID-recycling false positives
+- writable `index.db` opens also set `PRAGMA wal_autocheckpoint=256`, so normal tsift write traffic checkpoints the WAL on an explicit budget instead of leaving it entirely to SQLite defaults
 
 `tsift search` still wraps the sift engine call in a 30-second timeout (configurable via `--timeout`). Timed searches now run in an internal helper process so a timeout kills the underlying sift work instead of leaving a detached worker thread behind. The timeout remains a backstop for genuinely slow lexical searches or for sessions that reach search without a usable index.
 

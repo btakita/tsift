@@ -73,6 +73,7 @@ If copied skill instructions lag behind the installed binary, treat this file, `
 
 - **Read-only SQL**: `open_db()` uses `SQLITE_OPEN_READ_ONLY` — never mutates user databases.
 - **Transactional index updates**: `apply_changes` and `rebuild` wrap SQLite mutations in nested savepoints, so a failed reindex rolls back instead of leaving partial symbols/edges behind.
+- **Explicit WAL checkpoint budget**: writable `index.db` opens set and verify `PRAGMA wal_autocheckpoint=256` so normal write traffic checkpoints the WAL before it grows without a tsift-owned bound.
 - **Bounded symbol ranking**: `symbol_search()` only asks SQLite for exact-name rows and overlapping-tag candidates, ordered by match strength and capped to the requested limit, instead of loading the full `symbols` table into memory.
 - **Atomic batch edits**: `cmd_edit` validates ALL edits before writing ANY (two-phase).
 - **Rewrite protocol**: exit 0 + stdout = rewrite, exit 1 = pass through (matches rtk convention).

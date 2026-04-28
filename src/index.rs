@@ -42,6 +42,8 @@ impl Drop for SnapshotCopyGuard {
     }
 }
 
+const INDEX_DB_WAL_AUTOCHECKPOINT_PAGES: i64 = 256;
+
 #[cfg(test)]
 thread_local! {
     static FAIL_APPLY_CHANGES_AFTER_FILE_MUTATIONS: Cell<bool> = const { Cell::new(false) };
@@ -218,6 +220,21 @@ impl IndexDb {
                 "index db {} requires WAL mode for concurrent reads, got {}",
                 db_path.display(),
                 mode
+            );
+        }
+        conn.pragma_update(
+            None,
+            "wal_autocheckpoint",
+            INDEX_DB_WAL_AUTOCHECKPOINT_PAGES,
+        )?;
+        let checkpoint_pages: i64 =
+            conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?;
+        if checkpoint_pages != INDEX_DB_WAL_AUTOCHECKPOINT_PAGES {
+            bail!(
+                "index db {} requires wal_autocheckpoint={}, got {}",
+                db_path.display(),
+                INDEX_DB_WAL_AUTOCHECKPOINT_PAGES,
+                checkpoint_pages
             );
         }
         conn.execute_batch(
@@ -810,8 +827,10 @@ impl IndexDb {
         }
 
         let query_tags = compute_tags(query);
-        let query_tag_list: Vec<&str> =
-            query_tags.split(',').filter(|tag| !tag.is_empty()).collect();
+        let query_tag_list: Vec<&str> = query_tags
+            .split(',')
+            .filter(|tag| !tag.is_empty())
+            .collect();
         let query_lower = query.to_lowercase();
 
         let exact_match_expr = "name = ?1 COLLATE NOCASE";
@@ -838,8 +857,7 @@ impl IndexDb {
         } else {
             match_count_terms.join(" + ")
         };
-        let tag_count_expr =
-            "CASE WHEN tags IS NULL OR tags = '' THEN 0 ELSE LENGTH(tags) - LENGTH(REPLACE(tags, ',', '')) + 1 END";
+        let tag_count_expr = "CASE WHEN tags IS NULL OR tags = '' THEN 0 ELSE LENGTH(tags) - LENGTH(REPLACE(tags, ',', '')) + 1 END";
         let limit_param_idx = params.len() + 1;
         let sql = format!(
             "SELECT name, kind, language, file, line, end_line, tags, {match_count_expr} AS match_count, {tag_count_expr} AS tag_count \
@@ -1873,12 +1891,17 @@ mod tests {
             .conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
+        let checkpoint_pages: i64 = db
+            .conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .unwrap();
         let timeout_ms: i64 = db
             .conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
 
         assert_eq!(mode.to_lowercase(), "wal");
+        assert_eq!(checkpoint_pages, INDEX_DB_WAL_AUTOCHECKPOINT_PAGES);
         assert_eq!(timeout_ms, 5000);
     }
 
