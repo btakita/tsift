@@ -139,7 +139,7 @@ enum Commands {
         /// Exit with code 1 when --check finds stale files (for scripting/hooks)
         #[arg(long)]
         exit_code: bool,
-        /// Skip unchanged directory subtrees (directory mtime pruning for large repos)
+        /// Conservative full scan for correctness; reserves the --prune surface for a future sound optimization
         #[arg(long)]
         prune: bool,
         /// Summary only — omit per-file change list (implied by --exit-code)
@@ -1458,7 +1458,7 @@ fn cmd_index(
                 } else if check {
                     "check"
                 } else if prune {
-                    "pruned"
+                    "prune-safe"
                 } else {
                     "incremental"
                 };
@@ -1486,7 +1486,7 @@ fn cmd_index(
                 } else if check {
                     "check"
                 } else if prune {
-                    "pruned"
+                    "prune-safe"
                 } else {
                     "incremental"
                 };
@@ -1533,7 +1533,7 @@ fn cmd_index(
         run_index_update(
             &db_path,
             &root,
-            "pruning index".to_string(),
+            "scanning index (--prune safety mode)".to_string(),
             &root,
             None,
             false,
@@ -1576,7 +1576,7 @@ fn cmd_index(
         } else if check {
             "check"
         } else if prune {
-            "pruned"
+            "prune-safe"
         } else {
             "incremental"
         };
@@ -1602,7 +1602,7 @@ fn cmd_index(
         } else if check {
             "check"
         } else if prune {
-            "pruned"
+            "prune-safe"
         } else {
             "incremental"
         };

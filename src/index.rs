@@ -1729,19 +1729,48 @@ mod tests {
     }
 
     #[test]
-    fn pruned_second_index_prunes_unchanged() {
+    fn pruned_second_index_keeps_full_scan_correctness() {
         let dir = setup_tree();
         let db = db_in(dir.path());
         db.apply_changes_pruned(dir.path()).unwrap();
 
         let summary = db.compute_changes_pruned(dir.path()).unwrap();
         assert_eq!(summary.new, 0);
+        assert_eq!(summary.modified, 0);
         assert_eq!(summary.deleted, 0);
         let ps = summary.prune_stats.as_ref().unwrap();
-        assert!(
-            ps.dirs_pruned > 0,
-            "expected some dirs to be pruned on second run"
+        assert_eq!(ps.dirs_pruned, 0);
+    }
+
+    #[test]
+    fn pruned_detects_modified_file_even_if_dir_state_matches_current_dir_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sub_path = root.join("sub");
+        fs::create_dir_all(&sub_path).unwrap();
+        fs::write(sub_path.join("lib.rs"), "fn helper() -> i32 { 1 }\n").unwrap();
+
+        let db = db_in(root);
+        db.apply_changes_pruned(root).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(sub_path.join("lib.rs"), "fn helper() -> i32 { 2 }\n").unwrap();
+
+        let mut dir_state = db.load_dir_state().unwrap();
+        dir_state.insert(
+            sub_path.clone(),
+            fs::metadata(&sub_path).unwrap().modified().unwrap(),
         );
+        db.save_dir_state(&dir_state).unwrap();
+
+        let summary = db.compute_changes_pruned(root).unwrap();
+        assert_eq!(summary.modified, 1);
+        let modified = summary
+            .changes
+            .iter()
+            .find(|c| c.kind == ChangeKind::Modified)
+            .unwrap();
+        assert!(modified.path.ends_with("sub/lib.rs"));
     }
 
     #[test]

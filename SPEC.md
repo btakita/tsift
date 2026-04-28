@@ -65,7 +65,7 @@ tsift index --ast <path>        # tree-sitter AST extraction → symbols.db
 tsift index --check <path>      # report stale files without updating the index
 tsift index --check --exit-code # exit 1 if stale files found (for scripting/hooks)
 tsift index --check --quiet     # summary only — omit per-file change list
-tsift index --prune <path>      # skip unchanged directory subtrees (large repo optimization)
+tsift index --prune <path>      # conservative full scan; reserved prune surface until subtree invalidation is sound
 tsift graph <path>              # build dependency graph → deps.json
 tsift graph --callers <symbol>  # who calls this function?
 tsift graph --callees <symbol>  # what does this function call?
@@ -567,22 +567,23 @@ CREATE TABLE dir_state (
 
 `rebuild` nests its own SAVEPOINT around the inner `apply_changes` SAVEPOINT. If a rebuild fails after the bulk DELETEs but before the re-index finishes, both layers are rolled back and the prior index contents are preserved.
 
-### Large Repo Optimization: Directory mtime Pruning
+### Large Repo Optimization: Prune Surface Held in Safe Mode
 
-For repos with 100K+ files, `tsift index --prune` skips unchanged directory subtrees during the file walk. Directory mtime changes when files are created, deleted, or renamed within it. When a directory's mtime matches stored state, the entire subtree is skipped.
+`tsift index --prune` still exists as the compatibility surface for future large-repo optimizations, but it no longer skips subtrees based on directory mtimes.
 
-**How it works:**
-1. `dir_state` table stores directory modification times after each index run
-2. On subsequent runs with `--prune`, the walker checks each directory's mtime against stored state
-3. Directories with unchanged mtime are pruned — their files are treated as unchanged
-4. Files in pruned directories are not stat'd or re-parsed
+Directory mtimes are not a sound invalidation signal for in-place file edits: modifying `src/foo.rs` usually changes the file's mtime without changing the parent directory's mtime. The previous subtree-pruning shortcut could therefore miss real source edits and leave the symbol index stale.
 
-**Tradeoff:** In-place file content modifications do not update directory mtime. The `--prune` flag may miss modified files in unchanged directories. Use periodic `--rebuild` for full accuracy, or omit `--prune` when precision matters.
+**Current behavior:**
+1. `dir_state` still records directory mtimes so the persistence surface remains stable
+2. `--prune` runs the same full file-mtime walk as normal incremental indexing
+3. `prune_stats` remain populated, but active subtree skipping stays at zero until a sound invalidation model exists
+
+**Contract:** correctness wins over speculative skipping. Re-enable subtree pruning only when tsift can prove a directory fingerprint that detects in-place file edits, not just creates/deletes/renames.
 
 **Output includes pruning stats:**
 ```
-Index (pruned): 50000 files tracked
-  new: 2  modified: 1  deleted: 0  unchanged: 49997 | pruned: 312 dirs (8 walked, 49500 files skipped)
+Index (prune-safe): 50000 files tracked
+  new: 2  modified: 1  deleted: 0  unchanged: 49997 | pruned: 0 dirs (312 walked, 0 files skipped)
 ```
 
 ### Future Evolution: Dynamic Grammar Loading

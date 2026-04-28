@@ -65,14 +65,14 @@ pub fn walk_files(root: &Path) -> Result<Vec<FileEntry>> {
 
 pub fn walk_files_pruned(
     root: &Path,
-    stored_dirs: HashMap<PathBuf, SystemTime>,
+    _stored_dirs: HashMap<PathBuf, SystemTime>,
 ) -> Result<WalkResult> {
     let mut entries = Vec::new();
     let mut dir_mtimes = HashMap::new();
-    let mut pruned_dirs = HashSet::new();
-    let mut dirs_pruned = 0usize;
+    let pruned_dirs = HashSet::new();
+    let dirs_pruned = 0usize;
     let mut dirs_walked = 0usize;
-    let mut files_pruned = 0usize;
+    let files_pruned = 0usize;
 
     let walker = ignore::WalkBuilder::new(root)
         .hidden(true)
@@ -85,17 +85,6 @@ pub fn walk_files_pruned(
         let dir_entry = result.with_context(|| format!("walking {}", root.display()))?;
         let path = dir_entry.path();
 
-        // Skip files under pruned ancestor directories
-        if pruned_dirs
-            .iter()
-            .any(|d: &PathBuf| path.starts_with(d) && path != d)
-        {
-            if dir_entry.file_type().is_some_and(|ft| ft.is_file()) {
-                files_pruned += 1;
-            }
-            continue;
-        }
-
         if dir_entry.file_type().is_some_and(|ft| ft.is_dir()) {
             let metadata = dir_entry
                 .metadata()
@@ -103,14 +92,6 @@ pub fn walk_files_pruned(
             let mtime = metadata
                 .modified()
                 .with_context(|| format!("mtime dir {}", path.display()))?;
-
-            if let Some(stored_mtime) = stored_dirs.get(path)
-                && mtime == *stored_mtime
-            {
-                pruned_dirs.insert(path.to_path_buf());
-                dirs_pruned += 1;
-                continue;
-            }
             dir_mtimes.insert(path.to_path_buf(), mtime);
             dirs_walked += 1;
             continue;
@@ -296,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn pruned_walk_skips_unchanged_subdir() {
+    fn pruned_walk_still_visits_files_when_dir_mtime_matches() {
         let dir = setup_temp_tree();
         let root = dir.path();
         let sub_path = root.join("sub");
@@ -311,12 +292,12 @@ mod tests {
             .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert!(
-            !names.contains(&"mod.rs".to_string()),
-            "sub/mod.rs should be pruned"
+            names.contains(&"mod.rs".to_string()),
+            "sub/mod.rs should still be visited for correctness"
         );
         assert!(names.contains(&"main.rs".to_string()));
-        assert_eq!(result.stats.dirs_pruned, 1);
-        assert!(result.pruned_dirs.contains(&sub_path));
+        assert_eq!(result.stats.dirs_pruned, 0);
+        assert!(!result.pruned_dirs.contains(&sub_path));
     }
 
     #[test]
