@@ -2391,6 +2391,7 @@ fn cmd_summarize(
 
     // --extract mode: run LLM extraction
     if let Some(extract_path) = extract {
+        let extract_scope = resolve_extract_scope(&root, &extract_path);
         let cfg = load_summarize_config(&root);
         let symbols_db = find_symbols_db(&root);
         let summary_db = summarize::SummaryDb::open(&db_path)?;
@@ -2399,10 +2400,7 @@ fn cmd_summarize(
             let changed = summarize::git_changed_files(&root)?;
             changed
                 .into_iter()
-                .filter(|f| {
-                    f.starts_with(&extract_path)
-                        || extract_path.starts_with(f.parent().unwrap_or(f))
-                })
+                .filter(|f| summarize_diff_matches_scope(f, &extract_scope))
                 .collect::<Vec<_>>()
         } else {
             collect_source_files(&extract_path)?
@@ -2751,6 +2749,18 @@ fn find_symbols_db(root: &std::path::Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn resolve_extract_scope(root: &Path, extract_path: &Path) -> PathBuf {
+    if extract_path.is_absolute() {
+        extract_path.to_path_buf()
+    } else {
+        root.join(extract_path)
+    }
+}
+
+fn summarize_diff_matches_scope(changed_path: &Path, extract_scope: &Path) -> bool {
+    changed_path.starts_with(extract_scope)
 }
 
 #[derive(Debug, Clone)]
@@ -3360,6 +3370,36 @@ mod tests {
         let cli = Cli::parse_from(["tsift", "--compact", "status"]);
         assert!(cli.compact);
         assert!(matches!(cli.command, Some(Commands::Status { .. })));
+    }
+
+    #[test]
+    fn summarize_diff_scope_matches_relative_directory() {
+        let root = Path::new("/repo");
+        let extract_scope = resolve_extract_scope(root, Path::new("src/feature"));
+
+        assert!(summarize_diff_matches_scope(
+            Path::new("/repo/src/feature/main.rs"),
+            &extract_scope
+        ));
+        assert!(!summarize_diff_matches_scope(
+            Path::new("/repo/src/other/main.rs"),
+            &extract_scope
+        ));
+    }
+
+    #[test]
+    fn summarize_diff_scope_matches_relative_file() {
+        let root = Path::new("/repo");
+        let extract_scope = resolve_extract_scope(root, Path::new("src/feature/main.rs"));
+
+        assert!(summarize_diff_matches_scope(
+            Path::new("/repo/src/feature/main.rs"),
+            &extract_scope
+        ));
+        assert!(!summarize_diff_matches_scope(
+            Path::new("/repo/src/feature/lib.rs"),
+            &extract_scope
+        ));
     }
 
     // --- apply_edit_op ---
