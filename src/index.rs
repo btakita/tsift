@@ -878,7 +878,7 @@ fn snapshot_copy_path(db_path: &Path) -> PathBuf {
     std::env::temp_dir().join(file_name)
 }
 
-fn error_mentions_locked_db(err: &anyhow::Error) -> bool {
+pub(crate) fn error_mentions_locked_db(err: &anyhow::Error) -> bool {
     err.chain()
         .any(|cause| cause.to_string().contains("database is locked"))
 }

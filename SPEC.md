@@ -104,6 +104,7 @@ Opt-out recovery:
 - `tsift search --federated --no-autoindex ...` fails fast when any targeted federated submodule index is stale
 - those stale prechecks now reuse the same rollback-journal snapshot fallback as `status` / `index --check`, so locked live DBs still resolve to stale/missing/fresh instead of surfacing raw SQLite lock errors
 - writable index updates now claim a sibling `index.lock` sidecar first, so concurrent `tsift index` / `tsift search --autoindex` writers fail fast with a tsift-owned error instead of surfacing raw SQLite lock contention
+- when a mutating write still fails on lock contention, `tsift search` autoindex and `tsift index` now inline the same lock diagnostics (`lock`, `journal`, exact reindex command, recommended next step) directly in stderr instead of forcing a follow-up `tsift locks`
 
 `tsift search` still wraps the sift engine call in a 30-second timeout (configurable via `--timeout`). The timeout remains a backstop for genuinely slow lexical searches or for sessions that reach search without a usable index.
 

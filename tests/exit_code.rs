@@ -1,8 +1,17 @@
+use rusqlite::Connection;
 use std::fs;
 use std::process::Command;
 
 fn tsift_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tsift"))
+}
+
+fn hold_rollback_journal_lock(db_path: &std::path::Path) -> Connection {
+    let conn = Connection::open(db_path).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+        .unwrap();
+    fs::write(format!("{}-journal", db_path.display()), "locked").unwrap();
+    conn
 }
 
 #[test]
@@ -258,6 +267,10 @@ fn search_autoindex_fails_fast_when_writer_lock_exists() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("another tsift index writer is already active"));
+    assert!(stderr.contains("lock diagnostics:"));
+    assert!(stderr.contains("lock: live pid:"));
+    assert!(stderr.contains("journal: absent"));
+    assert!(stderr.contains("next: wait for the active tsift writer"));
     assert!(stderr.contains("search --autoindex"));
 }
 
@@ -288,4 +301,30 @@ fn index_check_stays_read_only_while_writer_lock_exists() {
         .status()
         .unwrap();
     assert!(status.success(), "expected check mode to stay read-only");
+}
+
+#[test]
+fn index_reports_lock_diagnostics_when_rollback_journal_blocks_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+    let status = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let _lock = hold_rollback_journal_lock(&dir.path().join(".tsift/index.db"));
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("lock diagnostics:"));
+    assert!(stderr.contains("journal: present"));
+    assert!(stderr.contains("run: tsift index"));
+    assert!(stderr.contains("next: inspect the host for a wedged writer"));
 }

@@ -74,6 +74,7 @@ cargo install --path .   # install to ~/.cargo/bin/
 - **Auto-reindex** (`UserPromptSubmit`): `examples/hooks/tsift-autoindex.sh` runs `tsift index --check --exit-code .` on every prompt, auto-reindexes when stale. Install via `.claude/settings.json`.
 - **Unhooked fallback**: `tsift search` now autoindexes missing or stale indexes by default. Use `--no-autoindex` when you want the old fail-fast stale check instead of a write.
 - **Locked freshness prechecks**: search stale checks now use the same rollback-journal snapshot fallback as `tsift status` / `tsift index --check`, so `--scope`, `--federated`, and `--no-autoindex` do not regress back to raw `database is locked` failures.
+- **Inline lock diagnostics**: if `tsift search` autoindex or `tsift index` still loses a write race, stderr now includes the live `lock` / `journal` state, the exact reindex command, and the recommended next step without requiring a separate `tsift locks`.
 - **Search rewrite** (`PreToolUse`): `~/.claude/hooks/tsift-rewrite.sh` rewrites `rg`/`grep -r` to `tsift search --strategy lexical`.
 - **RTK output filtering** (`PreToolUse`): same hook routes verbose commands (`communities`, `explain`, `graph`, `index`, `search`) through RTK when installed. TOML filters at `~/.config/rtk/filters.toml` cap output lines.
 

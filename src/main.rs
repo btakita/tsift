@@ -1358,16 +1358,37 @@ fn cmd_index(
             }
             let db_path = cfg.db_path_for(&root, name);
             let summary = if rebuild {
-                let db = index::IndexDb::open(&db_path)?;
-                db.rebuild(sub_path)?
+                run_index_update(
+                    &db_path,
+                    sub_path,
+                    format!("rebuilding submodule `{}` index", name),
+                    &root,
+                    Some(name.as_str()),
+                    true,
+                    false,
+                )?
             } else if check {
                 index::IndexDb::inspect_read_only(&db_path, sub_path, prune)?.summary
             } else if prune {
-                let db = index::IndexDb::open(&db_path)?;
-                db.apply_changes_pruned(sub_path)?
+                run_index_update(
+                    &db_path,
+                    sub_path,
+                    format!("pruning submodule `{}` index", name),
+                    &root,
+                    Some(name.as_str()),
+                    false,
+                    true,
+                )?
             } else {
-                let db = index::IndexDb::open(&db_path)?;
-                db.apply_changes(sub_path)?
+                run_index_update(
+                    &db_path,
+                    sub_path,
+                    format!("indexing submodule `{}`", name),
+                    &root,
+                    Some(name.as_str()),
+                    false,
+                    false,
+                )?
             };
             if summary.has_changes() {
                 any_stale = true;
@@ -1465,16 +1486,37 @@ fn cmd_index(
 
     let db_path = root.join(".tsift/index.db");
     let summary = if rebuild {
-        let db = index::IndexDb::open(&db_path)?;
-        db.rebuild(&root)?
+        run_index_update(
+            &db_path,
+            &root,
+            "rebuilding index".to_string(),
+            &root,
+            None,
+            true,
+            false,
+        )?
     } else if check {
         index::IndexDb::inspect_read_only(&db_path, &root, prune)?.summary
     } else if prune {
-        let db = index::IndexDb::open(&db_path)?;
-        db.apply_changes_pruned(&root)?
+        run_index_update(
+            &db_path,
+            &root,
+            "pruning index".to_string(),
+            &root,
+            None,
+            false,
+            true,
+        )?
     } else {
-        let db = index::IndexDb::open(&db_path)?;
-        db.apply_changes(&root)?
+        run_index_update(
+            &db_path,
+            &root,
+            "indexing index".to_string(),
+            &root,
+            None,
+            false,
+            false,
+        )?
     };
 
     let mut summary = summary;
@@ -2597,6 +2639,65 @@ fn cmd_locks(
     Ok(())
 }
 
+fn contextualize_error(err: anyhow::Error, context: String) -> anyhow::Error {
+    Result::<(), anyhow::Error>::Err(err)
+        .context(context)
+        .unwrap_err()
+}
+
+fn should_attach_lock_diagnostics(err: &anyhow::Error) -> bool {
+    let message = err.to_string();
+    message.contains("another tsift index writer is already active")
+        || index::error_mentions_locked_db(err)
+}
+
+fn add_write_lock_context(
+    err: anyhow::Error,
+    action: String,
+    root: &std::path::Path,
+    scope: Option<&str>,
+) -> anyhow::Error {
+    if !should_attach_lock_diagnostics(&err) {
+        return contextualize_error(err, action);
+    }
+
+    let Ok(report) = status::check_locks(root, scope) else {
+        return contextualize_error(err, action);
+    };
+
+    contextualize_error(
+        err,
+        format!(
+            "{}\n\nlock diagnostics:\n{}",
+            action,
+            status::format_locks_human(&report, false).trim_end()
+        ),
+    )
+}
+
+fn run_index_update(
+    db_path: &std::path::Path,
+    source_root: &std::path::Path,
+    action: String,
+    root: &std::path::Path,
+    scope: Option<&str>,
+    rebuild: bool,
+    prune: bool,
+) -> Result<index::IndexSummary> {
+    let result = (|| {
+        let db = index::IndexDb::open(db_path)?;
+        if rebuild {
+            db.rebuild(source_root)
+        } else if prune {
+            db.apply_changes_pruned(source_root)
+        } else {
+            db.apply_changes(source_root)
+        }
+    })();
+
+    result.map_err(|err| add_write_lock_context(err, action, root, scope))
+}
+
 fn load_summarize_config(root: &std::path::Path) -> summarize::SummarizeConfig {
     let config_path = root.join(".tsift/config.toml");
     if !config_path.exists() {
@@ -2650,6 +2751,7 @@ struct SearchIndexTarget {
     label: String,
     db_path: PathBuf,
     source_root: PathBuf,
+    scope_name: Option<String>,
     reindex_cmd: String,
 }
 
@@ -2681,6 +2783,7 @@ fn resolve_search_index_targets(
             label: format!("submodule `{}` index", scope_name),
             db_path: cfg.db_path_for(root, scope_name),
             source_root,
+            scope_name: Some(scope_name.to_string()),
             reindex_cmd: format!("tsift index --submodule {} {}", scope_name, root.display()),
         }]);
     }
@@ -2696,6 +2799,7 @@ fn resolve_search_index_targets(
                 label: format!("submodule `{}` index", name),
                 db_path: cfg.db_path_for(root, &name),
                 source_root,
+                scope_name: Some(name.clone()),
                 reindex_cmd: format!("tsift index --workspace {}", root.display()),
             });
         }
@@ -2706,6 +2810,7 @@ fn resolve_search_index_targets(
         label: "index".to_string(),
         db_path: root.join(".tsift/index.db"),
         source_root: root.to_path_buf(),
+        scope_name: None,
         reindex_cmd: format!("tsift index {}", root.display()),
     }])
 }
@@ -2726,9 +2831,16 @@ fn inspect_search_index(target: &SearchIndexTarget) -> Result<SearchIndexState> 
     }
 }
 
-fn apply_search_index_update(target: &SearchIndexTarget) -> Result<()> {
-    let db = index::IndexDb::open(&target.db_path)?;
-    db.apply_changes(&target.source_root)?;
+fn apply_search_index_update(root: &Path, target: &SearchIndexTarget) -> Result<()> {
+    run_index_update(
+        &target.db_path,
+        &target.source_root,
+        format!("autoindexing {}", target.label),
+        root,
+        target.scope_name.as_deref(),
+        false,
+        false,
+    )?;
     Ok(())
 }
 
@@ -2745,15 +2857,13 @@ fn precheck_search_indexes(
         match inspect_search_index(&target)? {
             SearchIndexState::Missing => {
                 if autoindex {
-                    apply_search_index_update(&target)
-                        .with_context(|| format!("autoindexing {}", target.label))?;
+                    apply_search_index_update(root, &target)?;
                 }
             }
             SearchIndexState::Fresh => {}
             SearchIndexState::Stale { stale_files } => {
                 if autoindex {
-                    apply_search_index_update(&target)
-                        .with_context(|| format!("autoindexing {}", target.label))?;
+                    apply_search_index_update(root, &target)?;
                 } else {
                     stale_targets.push((target.label, stale_files, target.reindex_cmd));
                 }
@@ -4030,6 +4140,43 @@ tier = "isolated"
         let db = index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
         let summary = db.compute_changes(dir.path()).unwrap();
         assert_eq!(summary.new + summary.modified + summary.deleted, 0);
+    }
+
+    #[test]
+    fn search_cmd_autoindex_reports_lock_diagnostics_when_root_writer_is_blocked() {
+        let dir = setup_graph_index();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() { println!(\"updated\"); }\nfn main() { helper(); Vec::new(); }",
+        )
+        .unwrap();
+        let _lock = hold_rollback_journal_lock(&dir.path().join(".tsift/index.db"));
+
+        let err = cmd_search(
+            "helper".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            None,
+            false,
+            false,
+            true,
+            30,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("autoindexing index"));
+        assert!(msg.contains("lock diagnostics:"));
+        assert!(msg.contains("journal: present"));
+        assert!(msg.contains("next: inspect the host for a wedged writer"));
     }
 
     #[test]
