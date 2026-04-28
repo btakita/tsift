@@ -347,6 +347,18 @@ tsift explain main --scope sub  # restrict to submodule
 
 Community membership is computed on-the-fly via Louvain to show which architectural subsystem the symbol belongs to.
 
+## Graph CLI End-to-End Coverage
+
+The graph-oriented CLI surface should stay covered through the compiled binary, not just unit helpers. `tests/exit_code.rs` owns a real temp-project fixture that runs:
+
+- `tsift search --json`
+- `tsift graph --json`
+- `tsift communities --json`
+- `tsift path --json`
+- `tsift explain --json`
+
+Keep that fixture aligned with the command output contracts so changes in indexing, graph extraction, or JSON rendering fail in one integration layer before release.
+
 ## Skill Audit
 
 `tsift audit` scans Claude Code skill directories for health and drift detection.

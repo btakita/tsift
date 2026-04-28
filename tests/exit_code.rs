@@ -4,6 +4,7 @@ use std::fs;
 use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -54,6 +55,68 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(25));
     }
     !process_exists(pid)
+}
+
+fn build_cli_fixture(dir: &Path) {
+    fs::write(
+        dir.join("main.rs"),
+        r#"fn main() {
+    alpha();
+    bridge();
+}
+
+fn alpha() {
+    beta();
+    gamma();
+}
+
+fn beta() {
+    alpha();
+    gamma();
+}
+
+fn gamma() {
+    alpha();
+    beta();
+}
+
+fn bridge() {
+    shared();
+}
+
+fn shared() {
+    helper();
+}
+
+fn helper() {}
+
+fn delta() {
+    epsilon();
+}
+
+fn epsilon() {
+    delta();
+}
+"#,
+    )
+    .unwrap();
+}
+
+fn indexed_cli_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    build_cli_fixture(dir.path());
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
 }
 
 #[test]
@@ -235,6 +298,165 @@ fn search_autoindexes_stale_index_by_default() {
         output.status.success(),
         "expected default search to autoindex"
     );
+}
+
+#[test]
+fn search_json_reports_symbol_and_content_hits() {
+    let dir = indexed_cli_fixture();
+
+    let output = tsift_bin()
+        .args([
+            "search",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "alpha",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "search should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let symbols = json["symbols"].as_array().unwrap();
+    assert!(
+        symbols.iter().any(|sym| sym["name"] == "alpha"),
+        "expected alpha in symbol hits: {json}"
+    );
+
+    let hits = json["hits"].as_array().unwrap();
+    assert!(
+        !hits.is_empty(),
+        "expected lexical content hits for alpha: {json}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit["path"].as_str().is_some_and(|path| path == "main.rs")),
+        "expected main.rs in lexical hits: {json}"
+    );
+}
+
+#[test]
+fn graph_json_reports_callers_and_callees() {
+    let dir = indexed_cli_fixture();
+
+    let output = tsift_bin()
+        .args(["graph", "alpha", dir.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "graph should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(json["symbol"], "alpha");
+    assert_eq!(json["callers_total"].as_u64(), Some(3));
+    assert_eq!(json["callees_total"].as_u64(), Some(2));
+
+    let callers = json["callers"].as_array().unwrap();
+    assert!(
+        callers
+            .iter()
+            .any(|edge| edge["caller_name"] == "main" && edge["caller_file"] == "main.rs")
+    );
+    let callees = json["callees"].as_array().unwrap();
+    assert!(callees.iter().any(|edge| edge["callee_name"] == "beta"));
+    assert!(callees.iter().any(|edge| edge["callee_name"] == "gamma"));
+}
+
+#[test]
+fn communities_json_reports_disconnected_clusters() {
+    let dir = indexed_cli_fixture();
+
+    let output = tsift_bin()
+        .args(["communities", dir.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "communities should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert!(
+        json["community_count"].as_u64().unwrap_or(0) >= 2,
+        "expected at least two communities: {json}"
+    );
+
+    let communities = json["communities"].as_array().unwrap();
+    assert!(
+        communities.iter().any(|community| {
+            let members = community["members"].as_array().unwrap();
+            members.iter().any(|m| m == "alpha")
+                && members.iter().any(|m| m == "beta")
+                && members.iter().any(|m| m == "gamma")
+        }),
+        "expected alpha/beta/gamma community: {json}"
+    );
+    assert!(
+        communities.iter().any(|community| {
+            let members = community["members"].as_array().unwrap();
+            members.iter().any(|m| m == "delta") && members.iter().any(|m| m == "epsilon")
+        }),
+        "expected delta/epsilon community: {json}"
+    );
+}
+
+#[test]
+fn path_json_reports_shortest_symbol_chain() {
+    let dir = indexed_cli_fixture();
+
+    let output = tsift_bin()
+        .args([
+            "path",
+            "main",
+            "helper",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "path should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(json["from"], "main");
+    assert_eq!(json["to"], "helper");
+    assert_eq!(json["hops"].as_u64(), Some(3));
+    assert_eq!(
+        json["path"],
+        serde_json::json!(["main", "bridge", "shared", "helper"])
+    );
+}
+
+#[test]
+fn explain_json_combines_definition_edges_and_community() {
+    let dir = indexed_cli_fixture();
+
+    let output = tsift_bin()
+        .args(["explain", "alpha", dir.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "explain should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let definitions = json["definitions"].as_array().unwrap();
+    assert!(
+        definitions
+            .iter()
+            .any(|definition| definition["name"] == "alpha" && definition["file"] == "main.rs")
+    );
+
+    let callers = json["callers"].as_array().unwrap();
+    assert!(callers.iter().any(|edge| edge["caller_name"] == "main"));
+    assert!(callers.iter().any(|edge| edge["caller_name"] == "beta"));
+
+    let callees = json["callees"].as_array().unwrap();
+    assert!(callees.iter().any(|edge| edge["callee_name"] == "beta"));
+    assert!(callees.iter().any(|edge| edge["callee_name"] == "gamma"));
+
+    let community_members = json["community"]["members"].as_array().unwrap();
+    assert!(community_members.iter().any(|member| member == "alpha"));
+    assert!(community_members.iter().any(|member| member == "beta"));
+    assert!(community_members.iter().any(|member| member == "gamma"));
 }
 
 #[cfg(unix)]

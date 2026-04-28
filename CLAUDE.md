@@ -57,7 +57,7 @@ tsift graph <symbol> --scope sub  # restrict to submodule
 ## Development
 
 ```bash
-make check          # clippy + test (236 tests)
+make check          # clippy + full test suite
 cargo install --path .   # install to ~/.cargo/bin/
 ```
 
@@ -76,6 +76,7 @@ If copied skill instructions lag behind the installed binary, treat this file, `
 - **Explicit WAL checkpoint budget**: writable `index.db` opens set and verify `PRAGMA wal_autocheckpoint=256` so normal write traffic checkpoints the WAL before it grows without a tsift-owned bound.
 - **Best-effort indexing is still visible**: unreadable files and symbol/call extraction failures stay non-fatal, but `IndexSummary.warnings` records them and shared index-update paths log them on stderr instead of silently dropping them.
 - **Bounded symbol ranking**: `symbol_search()` only asks SQLite for exact-name rows and overlapping-tag candidates, ordered by match strength and capped to the requested limit, instead of loading the full `symbols` table into memory.
+- **Graph CLI stays integration-tested**: `tests/exit_code.rs` drives the compiled binary against an indexed temp project for `search`, `graph`, `communities`, `path`, and `explain`, so graph/query regressions fail above the unit-test layer.
 - **Atomic batch edits**: `cmd_edit` validates ALL edits before writing ANY (two-phase).
 - **Rewrite protocol**: exit 0 + stdout = rewrite, exit 1 = pass through (matches rtk convention).
 - **Search strategy default**: `lexical` for instant results. `hybrid`/`vector` require model download on first run.
