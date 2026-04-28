@@ -86,7 +86,10 @@ pub fn walk_files_pruned(
         let path = dir_entry.path();
 
         // Skip files under pruned ancestor directories
-        if pruned_dirs.iter().any(|d: &PathBuf| path.starts_with(d) && path != d) {
+        if pruned_dirs
+            .iter()
+            .any(|d: &PathBuf| path.starts_with(d) && path != d)
+        {
             if dir_entry.file_type().is_some_and(|ft| ft.is_file()) {
                 files_pruned += 1;
             }
@@ -192,11 +195,17 @@ mod tests {
     fn walk_assigns_correct_language() {
         let dir = setup_temp_tree();
         let entries = walk_files(dir.path()).unwrap();
-        let rs = entries.iter().find(|e| e.path.ends_with("main.rs")).unwrap();
+        let rs = entries
+            .iter()
+            .find(|e| e.path.ends_with("main.rs"))
+            .unwrap();
         assert_eq!(rs.lang.name(), "rust");
         let py = entries.iter().find(|e| e.path.ends_with("lib.py")).unwrap();
         assert_eq!(py.lang.name(), "python");
-        let tsx = entries.iter().find(|e| e.path.ends_with("app.tsx")).unwrap();
+        let tsx = entries
+            .iter()
+            .find(|e| e.path.ends_with("app.tsx"))
+            .unwrap();
         assert_eq!(tsx.lang.name(), "tsx");
     }
 
@@ -247,7 +256,11 @@ mod tests {
         assert!(changed.is_empty(), "no files should be newer than future");
         let past = SystemTime::UNIX_EPOCH;
         let changed = changed_since(&entries, past);
-        assert_eq!(changed.len(), entries.len(), "all files should be newer than epoch");
+        assert_eq!(
+            changed.len(),
+            entries.len(),
+            "all files should be newer than epoch"
+        );
     }
 
     #[test]
@@ -292,10 +305,15 @@ mod tests {
         stored.insert(sub_path.clone(), sub_mtime);
 
         let result = walk_files_pruned(root, stored).unwrap();
-        let names: Vec<String> = result.entries.iter()
+        let names: Vec<String> = result
+            .entries
+            .iter()
             .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert!(!names.contains(&"mod.rs".to_string()), "sub/mod.rs should be pruned");
+        assert!(
+            !names.contains(&"mod.rs".to_string()),
+            "sub/mod.rs should be pruned"
+        );
         assert!(names.contains(&"main.rs".to_string()));
         assert_eq!(result.stats.dirs_pruned, 1);
         assert!(result.pruned_dirs.contains(&sub_path));
@@ -311,10 +329,15 @@ mod tests {
         stored.insert(sub_path, old_mtime);
 
         let result = walk_files_pruned(root, stored).unwrap();
-        let names: Vec<String> = result.entries.iter()
+        let names: Vec<String> = result
+            .entries
+            .iter()
             .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert!(names.contains(&"mod.rs".to_string()), "sub/mod.rs should be walked");
+        assert!(
+            names.contains(&"mod.rs".to_string()),
+            "sub/mod.rs should be walked"
+        );
         assert_eq!(result.stats.dirs_pruned, 0);
     }
 
@@ -322,6 +345,9 @@ mod tests {
     fn pruned_walk_collects_dir_mtimes() {
         let dir = setup_temp_tree();
         let result = walk_files_pruned(dir.path(), HashMap::new()).unwrap();
-        assert!(!result.dir_mtimes.is_empty(), "should collect mtimes for walked directories");
+        assert!(
+            !result.dir_mtimes.is_empty(),
+            "should collect mtimes for walked directories"
+        );
     }
 }

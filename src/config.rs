@@ -57,12 +57,12 @@ impl Config {
         }
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&content)
-            .with_context(|| format!("parsing {}", path.display()))
+        toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))
     }
 
     pub fn tier_for(&self, submodule: &str) -> IsolationTier {
-        self.overrides.get(submodule)
+        self.overrides
+            .get(submodule)
             .and_then(|o| o.tier)
             .unwrap_or(self.defaults.tier)
     }
@@ -90,8 +90,8 @@ impl Config {
         if !gitmodules.exists() {
             return Ok(Vec::new());
         }
-        let content = std::fs::read_to_string(&gitmodules)
-            .with_context(|| "reading .gitmodules")?;
+        let content =
+            std::fs::read_to_string(&gitmodules).with_context(|| "reading .gitmodules")?;
         let mut result = Vec::new();
         for line in content.lines() {
             let trimmed = line.trim();
@@ -107,7 +107,6 @@ impl Config {
         Ok(result)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -136,7 +135,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tsift_dir = dir.path().join(".tsift");
         fs::create_dir_all(&tsift_dir).unwrap();
-        fs::write(tsift_dir.join("config.toml"), r#"
+        fs::write(
+            tsift_dir.join("config.toml"),
+            r#"
 [defaults]
 federation = true
 tier = "shared"
@@ -150,7 +151,9 @@ tier = "isolated"
 
 [overrides.agent-doc]
 federation = true
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let cfg = Config::load(dir.path()).unwrap();
         assert_eq!(cfg.tier_for("mail"), IsolationTier::Private);
@@ -168,10 +171,14 @@ federation = true
         let dir = tempfile::tempdir().unwrap();
         let tsift_dir = dir.path().join(".tsift");
         fs::create_dir_all(&tsift_dir).unwrap();
-        fs::write(tsift_dir.join("config.toml"), r#"
+        fs::write(
+            tsift_dir.join("config.toml"),
+            r#"
 [overrides.secret]
 tier = "private"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let cfg = Config::load(dir.path()).unwrap();
         assert!(!cfg.federation_for("secret"));
@@ -182,7 +189,10 @@ tier = "private"
         let cfg = Config::default();
         let root = Path::new("/workspace");
         let path = cfg.db_path_for(root, "agent-doc");
-        assert_eq!(path, PathBuf::from("/workspace/.tsift/indexes/agent-doc/index.db"));
+        assert_eq!(
+            path,
+            PathBuf::from("/workspace/.tsift/indexes/agent-doc/index.db")
+        );
     }
 
     #[test]
@@ -201,10 +211,14 @@ tier = "private"
         let dir = tempfile::tempdir().unwrap();
         let tsift_dir = dir.path().join(".tsift");
         fs::create_dir_all(&tsift_dir).unwrap();
-        fs::write(tsift_dir.join("config.toml"), r#"
+        fs::write(
+            tsift_dir.join("config.toml"),
+            r#"
 [overrides.special]
 federation = false
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let cfg = Config::load(dir.path()).unwrap();
         assert!(!cfg.federation_for("special"));
@@ -221,13 +235,17 @@ federation = false
     #[test]
     fn submodule_dirs_parses_gitmodules() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(".gitmodules"), r#"[submodule "src/agent-doc"]
+        fs::write(
+            dir.path().join(".gitmodules"),
+            r#"[submodule "src/agent-doc"]
 	path = src/agent-doc
 	url = https://github.com/btakita/agent-doc
 [submodule "src/corky"]
 	path = src/corky
 	url = https://github.com/btakita/corky
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let dirs = Config::submodule_dirs(dir.path()).unwrap();
         assert_eq!(dirs.len(), 2);
         assert_eq!(dirs[0].0, "agent-doc");

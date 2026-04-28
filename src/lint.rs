@@ -28,8 +28,8 @@ pub enum AnnotationKind {
 }
 
 pub fn lint_markdown(path: &Path, entities: &HashSet<String>) -> Result<LintResult> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     let mut annotations = Vec::new();
     let mut in_code_block = false;
@@ -81,7 +81,9 @@ fn find_unannotated(
             let suggestion = match kind {
                 AnnotationKind::Symbol => format!("`{}`", entity),
                 AnnotationKind::Bold => format!("**{}**", entity),
-                AnnotationKind::Heading => format!("[{}](#{})", entity, entity.to_lowercase().replace(' ', "-")),
+                AnnotationKind::Heading => {
+                    format!("[{}](#{})", entity, entity.to_lowercase().replace(' ', "-"))
+                }
             };
 
             annotations.push(Annotation {
@@ -130,19 +132,24 @@ fn is_already_annotated(line: &str, pos: usize, len: usize) -> bool {
 
 fn is_word_boundary(line: &str, pos: usize, len: usize) -> bool {
     let before_ok = pos == 0
-        || line.as_bytes().get(pos - 1).is_none_or(|&b| {
-            !b.is_ascii_alphanumeric() && b != b'_'
-        });
+        || line
+            .as_bytes()
+            .get(pos - 1)
+            .is_none_or(|&b| !b.is_ascii_alphanumeric() && b != b'_');
     let after_end = pos + len;
     let after_ok = after_end >= line.len()
-        || line.as_bytes().get(after_end).is_none_or(|&b| {
-            !b.is_ascii_alphanumeric() && b != b'_'
-        });
+        || line
+            .as_bytes()
+            .get(after_end)
+            .is_none_or(|&b| !b.is_ascii_alphanumeric() && b != b'_');
     before_ok && after_ok
 }
 
 fn guess_annotation_kind(entity: &str) -> AnnotationKind {
-    if entity.contains('_') || entity.contains("::") || entity.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+    if entity.contains('_')
+        || entity.contains("::")
+        || entity.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+    {
         AnnotationKind::Symbol
     } else if entity.chars().next().is_some_and(|c| c.is_uppercase()) && entity.contains(' ') {
         AnnotationKind::Heading
@@ -152,10 +159,8 @@ fn guess_annotation_kind(entity: &str) -> AnnotationKind {
 }
 
 pub fn collect_entities_from_db(db_path: &Path) -> Result<HashSet<String>> {
-    let conn = rusqlite::Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 
     let mut entities = HashSet::new();
 
@@ -169,8 +174,8 @@ pub fn collect_entities_from_db(db_path: &Path) -> Result<HashSet<String>> {
 }
 
 pub fn collect_entities_from_markdown(path: &Path) -> Result<HashSet<String>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     let mut entities = HashSet::new();
 
@@ -213,7 +218,12 @@ mod tests {
     fn find_unannotated_plain_text() {
         let entities: HashSet<String> = ["scan_skills".to_string()].into();
         let mut annotations = Vec::new();
-        find_unannotated("The scan_skills function works.", 1, &entities, &mut annotations);
+        find_unannotated(
+            "The scan_skills function works.",
+            1,
+            &entities,
+            &mut annotations,
+        );
         assert_eq!(annotations.len(), 1);
         assert_eq!(annotations[0].text, "scan_skills");
         assert_eq!(annotations[0].column, 5);
@@ -224,7 +234,12 @@ mod tests {
     fn skip_already_backtick_wrapped() {
         let entities: HashSet<String> = ["scan_skills".to_string()].into();
         let mut annotations = Vec::new();
-        find_unannotated("The `scan_skills` function works.", 1, &entities, &mut annotations);
+        find_unannotated(
+            "The `scan_skills` function works.",
+            1,
+            &entities,
+            &mut annotations,
+        );
         assert!(annotations.is_empty());
     }
 
@@ -232,7 +247,12 @@ mod tests {
     fn skip_already_bold_wrapped() {
         let entities: HashSet<String> = ["AuditResult".to_string()].into();
         let mut annotations = Vec::new();
-        find_unannotated("The **AuditResult** struct.", 1, &entities, &mut annotations);
+        find_unannotated(
+            "The **AuditResult** struct.",
+            1,
+            &entities,
+            &mut annotations,
+        );
         assert!(annotations.is_empty());
     }
 
@@ -240,7 +260,12 @@ mod tests {
     fn skip_link_text() {
         let entities: HashSet<String> = ["SPEC".to_string()].into();
         let mut annotations = Vec::new();
-        find_unannotated("See [SPEC](spec.md) for details.", 1, &entities, &mut annotations);
+        find_unannotated(
+            "See [SPEC](spec.md) for details.",
+            1,
+            &entities,
+            &mut annotations,
+        );
         assert!(annotations.is_empty());
     }
 
@@ -256,7 +281,12 @@ mod tests {
     fn multiple_occurrences_on_same_line() {
         let entities: HashSet<String> = ["test".to_string()].into();
         let mut annotations = Vec::new();
-        find_unannotated("Run test then check test output.", 1, &entities, &mut annotations);
+        find_unannotated(
+            "Run test then check test output.",
+            1,
+            &entities,
+            &mut annotations,
+        );
         assert_eq!(annotations.len(), 2);
     }
 
@@ -307,17 +337,29 @@ mod tests {
 
     #[test]
     fn guess_annotation_kind_symbols() {
-        assert!(matches!(guess_annotation_kind("scan_skills"), AnnotationKind::Symbol));
-        assert!(matches!(guess_annotation_kind("std::path"), AnnotationKind::Symbol));
+        assert!(matches!(
+            guess_annotation_kind("scan_skills"),
+            AnnotationKind::Symbol
+        ));
+        assert!(matches!(
+            guess_annotation_kind("std::path"),
+            AnnotationKind::Symbol
+        ));
     }
 
     #[test]
     fn guess_annotation_kind_headings() {
-        assert!(matches!(guess_annotation_kind("Audit Result"), AnnotationKind::Heading));
+        assert!(matches!(
+            guess_annotation_kind("Audit Result"),
+            AnnotationKind::Heading
+        ));
     }
 
     #[test]
     fn guess_annotation_kind_bold() {
-        assert!(matches!(guess_annotation_kind("AuditResult"), AnnotationKind::Bold));
+        assert!(matches!(
+            guess_annotation_kind("AuditResult"),
+            AnnotationKind::Bold
+        ));
     }
 }

@@ -115,7 +115,8 @@ impl Lang {
     pub fn symbol_query(&self) -> &'static str {
         match self {
             #[cfg(feature = "lang-rust")]
-            Self::Rust => r#"
+            Self::Rust => {
+                r#"
                 (function_item name: (identifier) @function.name)
                 (struct_item name: (type_identifier) @struct.name)
                 (enum_item name: (type_identifier) @enum.name)
@@ -125,29 +126,37 @@ impl Lang {
                 (type_item name: (type_identifier) @type_alias.name)
                 (const_item name: (identifier) @const.name)
                 (static_item name: (identifier) @static.name)
-            "#,
+            "#
+            }
             #[cfg(feature = "lang-python")]
-            Self::Python => r#"
+            Self::Python => {
+                r#"
                 (function_definition name: (identifier) @function.name)
                 (class_definition name: (identifier) @class.name)
-            "#,
+            "#
+            }
             #[cfg(feature = "lang-typescript")]
-            Self::TypeScript | Self::Tsx => r#"
+            Self::TypeScript | Self::Tsx => {
+                r#"
                 (function_declaration name: (identifier) @function.name)
                 (class_declaration name: (type_identifier) @class.name)
                 (interface_declaration name: (type_identifier) @interface.name)
                 (type_alias_declaration name: (type_identifier) @type_alias.name)
                 (enum_declaration name: (identifier) @enum.name)
                 (variable_declarator name: (identifier) @function.name value: (arrow_function))
-            "#,
+            "#
+            }
             #[cfg(feature = "lang-javascript")]
-            Self::JavaScript | Self::Jsx => r#"
+            Self::JavaScript | Self::Jsx => {
+                r#"
                 (function_declaration name: (identifier) @function.name)
                 (class_declaration name: (identifier) @class.name)
                 (variable_declarator name: (identifier) @function.name value: (arrow_function))
-            "#,
+            "#
+            }
             #[cfg(feature = "lang-kotlin")]
-            Self::Kotlin => r#"
+            Self::Kotlin => {
+                r#"
                 (function_declaration name: (identifier) @function.name)
                 (class_declaration "interface" name: (identifier) @interface.name)
                 (class_declaration (modifiers (class_modifier "data")) name: (identifier) @data_class.name)
@@ -156,21 +165,27 @@ impl Lang {
                 (class_declaration "class" name: (identifier) @class.name)
                 (object_declaration name: (identifier) @object.name)
                 (companion_object name: (identifier) @companion_object.name)
-            "#,
+            "#
+            }
             #[cfg(feature = "lang-zig")]
-            Self::Zig => r#"
+            Self::Zig => {
+                r#"
                 (function_declaration (identifier) @function.name)
                 (variable_declaration (identifier) @struct.name (struct_declaration))
                 (variable_declaration (identifier) @enum.name (enum_declaration))
                 (variable_declaration (identifier) @union.name (union_declaration))
                 (variable_declaration (identifier) @const.name)
-            "#,
+            "#
+            }
             #[cfg(feature = "lang-bash")]
-            Self::Bash => r#"
+            Self::Bash => {
+                r#"
                 (function_definition name: (word) @function.name)
-            "#,
+            "#
+            }
             #[cfg(feature = "lang-markdown")]
-            Self::Markdown => r#"
+            Self::Markdown => {
+                r#"
                 (atx_heading (atx_h1_marker) (inline) @heading.name)
                 (atx_heading (atx_h2_marker) (inline) @heading.name)
                 (atx_heading (atx_h3_marker) (inline) @heading.name)
@@ -178,7 +193,8 @@ impl Lang {
                 (atx_heading (atx_h5_marker) (inline) @heading.name)
                 (atx_heading (atx_h6_marker) (inline) @heading.name)
                 (fenced_code_block (info_string (language) @code_block.name))
-            "#,
+            "#
+            }
         }
     }
 
@@ -186,22 +202,31 @@ impl Lang {
         let mut parser = Parser::new();
         let ts_lang = self.tree_sitter_language();
         parser.set_language(&ts_lang)?;
-        let tree = parser.parse(source, None)
+        let tree = parser
+            .parse(source, None)
             .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
         let query = Query::new(&ts_lang, self.symbol_query())?;
         let mut cursor = QueryCursor::new();
         let mut symbols = Vec::new();
-        let capture_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
+        let capture_names: Vec<String> = query
+            .capture_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         let mut matches = cursor.matches(&query, tree.root_node(), source);
         while let Some(m) = matches.next() {
             for capture in m.captures {
                 let capture_name = &capture_names[capture.index as usize];
                 if let Some(kind_str) = capture_name.strip_suffix(".name") {
-                    let name = capture.node.utf8_text(source)
+                    let name = capture
+                        .node
+                        .utf8_text(source)
                         .unwrap_or("<invalid utf8>")
                         .to_string();
-                    let parent_end = capture.node.parent()
+                    let parent_end = capture
+                        .node
+                        .parent()
                         .map(|p| p.end_position().row)
                         .unwrap_or(capture.node.end_position().row);
                     symbols.push(Symbol {
@@ -228,9 +253,11 @@ impl Lang {
                 let b_generic = matches!(b.kind.as_str(), "variable" | "const");
                 match (a_generic, b_generic) {
                     (true, false) => a.kind.clone_from(&b.kind),
-                    (false, true) => {},
-                    _ => if b.kind.len() > a.kind.len() {
-                        a.kind.clone_from(&b.kind);
+                    (false, true) => {}
+                    _ => {
+                        if b.kind.len() > a.kind.len() {
+                            a.kind.clone_from(&b.kind);
+                        }
                     }
                 }
                 true
@@ -242,7 +269,9 @@ impl Lang {
     #[cfg(feature = "lang-bash")]
     fn extract_bash_aliases(tree: &tree_sitter::Tree, source: &[u8], symbols: &mut Vec<Symbol>) {
         let mut tree_cursor = tree.root_node().walk();
-        if !tree_cursor.goto_first_child() { return; }
+        if !tree_cursor.goto_first_child() {
+            return;
+        }
         loop {
             let node = tree_cursor.node();
             if node.kind() == "command"
@@ -270,7 +299,9 @@ impl Lang {
                     }
                 }
             }
-            if !tree_cursor.goto_next_sibling() { break; }
+            if !tree_cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 
@@ -430,9 +461,7 @@ mod tests {
         let lang = Lang::Zig;
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&lang.tree_sitter_language()).unwrap();
-        let tree = parser
-            .parse("pub fn main() !void {}", None)
-            .unwrap();
+        let tree = parser.parse("pub fn main() !void {}", None).unwrap();
         assert_eq!(tree.root_node().kind(), "source_file");
     }
 
@@ -455,9 +484,7 @@ mod tests {
         let lang = Lang::Markdown;
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&lang.tree_sitter_language()).unwrap();
-        let tree = parser
-            .parse("# Hello\n\nSome text.\n", None)
-            .unwrap();
+        let tree = parser.parse("# Hello\n\nSome text.\n", None).unwrap();
         assert_eq!(tree.root_node().kind(), "document");
         assert!(!tree.root_node().has_error());
     }
@@ -494,11 +521,16 @@ mod tests {
     #[cfg(feature = "lang-python")]
     #[test]
     fn test_extract_python_symbols() {
-        let source = b"def hello():\n    pass\n\nclass MyClass:\n    def method(self):\n        pass\n";
+        let source =
+            b"def hello():\n    pass\n\nclass MyClass:\n    def method(self):\n        pass\n";
         let symbols = Lang::Python.extract_symbols(source).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"hello"), "missing hello, got {:?}", names);
-        assert!(names.contains(&"MyClass"), "missing MyClass, got {:?}", names);
+        assert!(
+            names.contains(&"MyClass"),
+            "missing MyClass, got {:?}",
+            names
+        );
         assert!(names.contains(&"method"), "missing method, got {:?}", names);
         let cls = symbols.iter().find(|s| s.name == "MyClass").unwrap();
         assert_eq!(cls.kind, "class");
@@ -539,7 +571,11 @@ mod tests {
         assert!(names.contains(&"Baz"), "missing Baz, got {:?}", names);
         assert!(names.contains(&"Qux"), "missing Qux, got {:?}", names);
         assert!(names.contains(&"Color"), "missing Color, got {:?}", names);
-        assert!(names.contains(&"Singleton"), "missing Singleton, got {:?}", names);
+        assert!(
+            names.contains(&"Singleton"),
+            "missing Singleton, got {:?}",
+            names
+        );
         let main_sym = symbols.iter().find(|s| s.name == "main").unwrap();
         assert_eq!(main_sym.kind, "function");
         let foo_sym = symbols.iter().find(|s| s.name == "Foo").unwrap();
@@ -554,7 +590,12 @@ mod tests {
         assert_eq!(color_sym.kind, "enum_class");
         let singleton_sym = symbols.iter().find(|s| s.name == "Singleton").unwrap();
         assert_eq!(singleton_sym.kind, "object");
-        assert_eq!(symbols.len(), 7, "expected exactly 7 symbols, got {:?}", symbols);
+        assert_eq!(
+            symbols.len(),
+            7,
+            "expected exactly 7 symbols, got {:?}",
+            symbols
+        );
     }
 
     #[cfg(feature = "lang-zig")]
@@ -590,7 +631,11 @@ mod tests {
         assert!(names.contains(&"hello"), "missing hello, got {:?}", names);
         assert!(names.contains(&"world"), "missing world, got {:?}", names);
         assert!(names.contains(&"ll"), "missing alias ll, got {:?}", names);
-        assert!(names.contains(&"grep"), "missing alias grep, got {:?}", names);
+        assert!(
+            names.contains(&"grep"),
+            "missing alias grep, got {:?}",
+            names
+        );
         let hello_sym = symbols.iter().find(|s| s.name == "hello").unwrap();
         assert_eq!(hello_sym.kind, "function");
         let ll_sym = symbols.iter().find(|s| s.name == "ll").unwrap();
@@ -605,9 +650,22 @@ mod tests {
         let headings: Vec<&Symbol> = symbols.iter().filter(|s| s.kind == "heading").collect();
         let code_blocks: Vec<&Symbol> = symbols.iter().filter(|s| s.kind == "code_block").collect();
         assert_eq!(headings.len(), 3, "expected 3 headings, got {:?}", headings);
-        assert_eq!(code_blocks.len(), 2, "expected 2 code blocks, got {:?}", code_blocks);
-        assert!(code_blocks.iter().any(|s| s.name == "rust"), "missing rust block, got {:?}", code_blocks);
-        assert!(code_blocks.iter().any(|s| s.name == "python"), "missing python block, got {:?}", code_blocks);
+        assert_eq!(
+            code_blocks.len(),
+            2,
+            "expected 2 code blocks, got {:?}",
+            code_blocks
+        );
+        assert!(
+            code_blocks.iter().any(|s| s.name == "rust"),
+            "missing rust block, got {:?}",
+            code_blocks
+        );
+        assert!(
+            code_blocks.iter().any(|s| s.name == "python"),
+            "missing python block, got {:?}",
+            code_blocks
+        );
     }
 
     #[cfg(feature = "lang-python")]
@@ -616,8 +674,16 @@ mod tests {
         let source = b"async def fetch_data():\n    await get()\n\ndef sync_fn():\n    pass\n";
         let symbols = Lang::Python.extract_symbols(source).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"fetch_data"), "missing async function, got {:?}", names);
-        assert!(names.contains(&"sync_fn"), "missing sync function, got {:?}", names);
+        assert!(
+            names.contains(&"fetch_data"),
+            "missing async function, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"sync_fn"),
+            "missing sync function, got {:?}",
+            names
+        );
     }
 
     #[cfg(feature = "lang-python")]
@@ -626,8 +692,16 @@ mod tests {
         let source = b"@staticmethod\ndef helper():\n    pass\n\n@property\ndef name(self):\n    return self._name\n";
         let symbols = Lang::Python.extract_symbols(source).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"helper"), "missing decorated function, got {:?}", names);
-        assert!(names.contains(&"name"), "missing property function, got {:?}", names);
+        assert!(
+            names.contains(&"helper"),
+            "missing decorated function, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"name"),
+            "missing property function, got {:?}",
+            names
+        );
     }
 
     #[cfg(feature = "lang-typescript")]
@@ -636,10 +710,26 @@ mod tests {
         let source = b"export const Foo = () => { return 42; };\nexport const Bar = (x: number): number => x + 1;\nconst local = () => {};\nfunction regular() {}\n";
         let symbols = Lang::TypeScript.extract_symbols(source).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"Foo"), "missing arrow export Foo, got {:?}", names);
-        assert!(names.contains(&"Bar"), "missing arrow export Bar, got {:?}", names);
-        assert!(names.contains(&"local"), "missing local arrow, got {:?}", names);
-        assert!(names.contains(&"regular"), "missing regular function, got {:?}", names);
+        assert!(
+            names.contains(&"Foo"),
+            "missing arrow export Foo, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Bar"),
+            "missing arrow export Bar, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"local"),
+            "missing local arrow, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"regular"),
+            "missing regular function, got {:?}",
+            names
+        );
     }
 
     #[cfg(feature = "lang-typescript")]
@@ -648,8 +738,16 @@ mod tests {
         let source = b"export const MyComponent = () => <div>hello</div>;\nfunction Other() { return <span/>; }\n";
         let symbols = Lang::Tsx.extract_symbols(source).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"MyComponent"), "missing arrow component, got {:?}", names);
-        assert!(names.contains(&"Other"), "missing function component, got {:?}", names);
+        assert!(
+            names.contains(&"MyComponent"),
+            "missing arrow component, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Other"),
+            "missing function component, got {:?}",
+            names
+        );
     }
 
     #[cfg(feature = "lang-javascript")]
@@ -658,9 +756,21 @@ mod tests {
         let source = b"export const handler = () => { return 'ok'; };\nconst helper = (x) => x * 2;\nfunction regular() {}\n";
         let symbols = Lang::JavaScript.extract_symbols(source).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"handler"), "missing arrow export, got {:?}", names);
-        assert!(names.contains(&"helper"), "missing local arrow, got {:?}", names);
-        assert!(names.contains(&"regular"), "missing regular function, got {:?}", names);
+        assert!(
+            names.contains(&"handler"),
+            "missing arrow export, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"helper"),
+            "missing local arrow, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"regular"),
+            "missing regular function, got {:?}",
+            names
+        );
     }
 
     #[cfg(feature = "lang-javascript")]
@@ -669,7 +779,15 @@ mod tests {
         let source = b"const App = () => <div>hi</div>;\nfunction Page() { return <main/>; }\n";
         let symbols = Lang::Jsx.extract_symbols(source).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"App"), "missing arrow JSX component, got {:?}", names);
-        assert!(names.contains(&"Page"), "missing function component, got {:?}", names);
+        assert!(
+            names.contains(&"App"),
+            "missing arrow JSX component, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Page"),
+            "missing function component, got {:?}",
+            names
+        );
     }
 }
