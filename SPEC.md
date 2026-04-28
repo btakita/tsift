@@ -49,7 +49,7 @@ federation = false
 .tsift/
   indexes/
     agent-doc/
-      symbols.db      # SQLite: function signatures, types, locations
+      index.db        # SQLite: function signatures, types, locations
       embeddings.lance # LanceDB: vector embeddings of signatures
       deps.json        # call graph + import graph
       meta.json        # last indexed commit, language stats
@@ -61,7 +61,7 @@ federation = false
 ## New Subcommands
 
 ```bash
-tsift index --ast <path>        # tree-sitter AST extraction → symbols.db
+tsift index --ast <path>        # tree-sitter AST extraction → index.db
 tsift index --check <path>      # report stale files without updating the index
 tsift index --check --exit-code # exit 1 if stale files found (for scripting/hooks)
 tsift index --check --quiet     # summary only — omit per-file change list
@@ -417,15 +417,15 @@ tsift audit --usage --cleanup --report r.md  # all features
 ```bash
 tsift lint README.md                              # lint with auto-discovered entities
 tsift lint README.md --entities-from SPEC.md      # add entities from another doc
-tsift lint README.md --index .tsift/indexes/tsift # use specific symbol index
+tsift lint README.md --index .tsift               # use a specific project index root
 tsift lint README.md --json                       # structured output
 ```
 
 **Entity sources:**
 - The file being linted (headings, bold, backtick terms ≥4 chars)
 - `--entities-from <path>` markdown files (same extraction)
-- `--index <dir>` symbol database (`symbols.db`, names ≥4 chars)
-- Default: all symbol databases under `.tsift/indexes/*/symbols.db`
+- `--index <dir>` live symbol index discovery (`index.db`, names ≥4 chars) from a project root, `.tsift` directory, scope directory, or direct `index.db` path
+- Default: the nearest ancestor project root with `.tsift/index.db`, plus any scoped indexes under `.tsift/indexes/*/index.db`
 
 **Detection rules:**
 - Skip code blocks, headings, and HTML comments
@@ -750,7 +750,7 @@ tsift summarize --json              # structured output
 ```
 tsift summarize
 ├── extract (one-time, per file content hash)
-│   ├── reads source + AST symbols from symbols.db
+│   ├── reads source + AST symbols from index.db
 │   ├── calls Anthropic batch API (haiku for cost; non-2xx responses fail closed before content parsing)
 │   ├── replaces each file's cached rows in one SQLite transaction
 │   └── stores: entities, relationships, summaries → summaries.db
@@ -789,7 +789,7 @@ CREATE INDEX idx_summaries_hash ON summaries(content_hash);
 ### Extraction Protocol
 
 1. Collect target files (from path arg or `--diff` against `git diff --name-only`)
-2. For each file, load source + symbols from `symbols.db`
+2. For each file, load source + symbols from `index.db`
 3. Build extraction prompt: source snippet + symbol list + "extract entities, relationships, 2-sentence summary"
 4. Submit via Anthropic batch API (haiku-class model, 50% cost vs synchronous)
 5. On batch completion, parse responses and insert/update `summaries.db`

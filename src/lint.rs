@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LintResult {
@@ -158,6 +158,28 @@ fn guess_annotation_kind(entity: &str) -> AnnotationKind {
     }
 }
 
+pub fn find_project_root_for_path(path: &Path) -> Result<Option<PathBuf>> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", path.display()))?;
+    let start = if canonical.is_dir() {
+        canonical
+    } else {
+        canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or(canonical)
+    };
+
+    for ancestor in start.ancestors() {
+        if ancestor.join(".tsift").is_dir() {
+            return Ok(Some(ancestor.to_path_buf()));
+        }
+    }
+
+    Ok(None)
+}
+
 pub fn collect_entities_from_db(db_path: &Path) -> Result<HashSet<String>> {
     let conn =
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -171,6 +193,52 @@ pub fn collect_entities_from_db(db_path: &Path) -> Result<HashSet<String>> {
     }
 
     Ok(entities)
+}
+
+pub fn collect_entities_from_index_path(index_path: &Path) -> Result<HashSet<String>> {
+    let mut entities = HashSet::new();
+
+    for db_path in discover_index_dbs(index_path)? {
+        entities.extend(collect_entities_from_db(&db_path)?);
+    }
+
+    Ok(entities)
+}
+
+fn discover_index_dbs(index_path: &Path) -> Result<Vec<PathBuf>> {
+    let mut dbs = BTreeSet::new();
+
+    if index_path.is_file()
+        && index_path.file_name().and_then(|name| name.to_str()) == Some("index.db")
+    {
+        dbs.insert(index_path.to_path_buf());
+    }
+
+    push_if_exists(&mut dbs, &index_path.join("index.db"));
+    push_if_exists(&mut dbs, &index_path.join(".tsift/index.db"));
+    collect_child_index_dbs(&mut dbs, &index_path.join("indexes"))?;
+    collect_child_index_dbs(&mut dbs, &index_path.join(".tsift/indexes"))?;
+
+    Ok(dbs.into_iter().collect())
+}
+
+fn push_if_exists(dbs: &mut BTreeSet<PathBuf>, db_path: &Path) {
+    if db_path.is_file() {
+        dbs.insert(db_path.to_path_buf());
+    }
+}
+
+fn collect_child_index_dbs(dbs: &mut BTreeSet<PathBuf>, indexes_dir: &Path) -> Result<()> {
+    if !indexes_dir.is_dir() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(indexes_dir)? {
+        let entry = entry?;
+        push_if_exists(dbs, &entry.path().join("index.db"));
+    }
+
+    Ok(())
 }
 
 pub fn collect_entities_from_markdown(path: &Path) -> Result<HashSet<String>> {
@@ -213,6 +281,20 @@ pub fn collect_entities_from_markdown(path: &Path) -> Result<HashSet<String>> {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn create_symbol_index(db_path: &Path, names: &[&str]) {
+        if let Some(parent) = db_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute_batch("CREATE TABLE symbols (name TEXT NOT NULL);")
+            .unwrap();
+        for name in names {
+            conn.execute("INSERT INTO symbols (name) VALUES (?1)", [name])
+                .unwrap();
+        }
+    }
 
     #[test]
     fn find_unannotated_plain_text() {
@@ -361,5 +443,46 @@ mod tests {
             guess_annotation_kind("AuditResult"),
             AnnotationKind::Bold
         ));
+    }
+
+    #[test]
+    fn find_project_root_uses_markdown_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".tsift")).unwrap();
+        let file = dir.path().join("docs/README.md");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "alpha_helper should be annotated.\n").unwrap();
+
+        let root = find_project_root_for_path(&file).unwrap();
+
+        assert_eq!(root.unwrap(), dir.path());
+    }
+
+    #[test]
+    fn collect_entities_from_project_root_index_db() {
+        let dir = tempfile::tempdir().unwrap();
+        create_symbol_index(&dir.path().join(".tsift/index.db"), &["alpha_helper"]);
+
+        let entities = collect_entities_from_index_path(dir.path()).unwrap();
+
+        assert!(entities.contains("alpha_helper"));
+    }
+
+    #[test]
+    fn collect_entities_from_scoped_index_dbs() {
+        let dir = tempfile::tempdir().unwrap();
+        create_symbol_index(
+            &dir.path().join(".tsift/indexes/alpha/index.db"),
+            &["alpha_helper"],
+        );
+        create_symbol_index(
+            &dir.path().join(".tsift/indexes/beta/index.db"),
+            &["beta_helper"],
+        );
+
+        let entities = collect_entities_from_index_path(dir.path()).unwrap();
+
+        assert!(entities.contains("alpha_helper"));
+        assert!(entities.contains("beta_helper"));
     }
 }

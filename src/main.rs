@@ -3325,21 +3325,9 @@ fn cmd_lint(
     let mut entities = HashSet::new();
 
     if let Some(index_dir) = index {
-        let db_path = index_dir.join("symbols.db");
-        if db_path.exists() {
-            entities.extend(lint::collect_entities_from_db(&db_path)?);
-        }
-    } else {
-        let default_db = std::path::Path::new(".tsift/indexes");
-        if default_db.exists() {
-            for entry in std::fs::read_dir(default_db)? {
-                let entry = entry?;
-                let db = entry.path().join("symbols.db");
-                if db.exists() {
-                    entities.extend(lint::collect_entities_from_db(&db)?);
-                }
-            }
-        }
+        entities.extend(lint::collect_entities_from_index_path(&index_dir)?);
+    } else if let Some(root) = lint::find_project_root_for_path(file_path)? {
+        entities.extend(lint::collect_entities_from_index_path(&root)?);
     }
 
     for md_path in &entities_from {
@@ -4654,6 +4642,47 @@ tier = "isolated"
         );
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn lint_finds_entities_from_project_root_index_db() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn alpha_helper() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            "alpha_helper should be backticked.\n",
+        )
+        .unwrap();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let root = lint::find_project_root_for_path(&dir.path().join("README.md"))
+            .unwrap()
+            .unwrap();
+        let entities = lint::collect_entities_from_index_path(&root).unwrap();
+        let result = lint::lint_markdown(&dir.path().join("README.md"), &entities).unwrap();
+
+        assert!(
+            result
+                .annotations
+                .iter()
+                .any(|ann| ann.text == "alpha_helper")
+        );
     }
 
     // --- search timeout ---
