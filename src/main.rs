@@ -5,8 +5,10 @@ use serde::{Deserialize, Serialize};
 use sift::{SearchInput, SearchOptions, Sift};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod audit;
 pub mod config;
@@ -87,6 +89,19 @@ enum Commands {
         /// Timeout in seconds for the sift search engine (0 = no timeout)
         #[arg(long, default_value = "30")]
         timeout: u64,
+    },
+    #[command(hide = true, name = "__search-worker")]
+    SearchWorker {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        limit: usize,
+        #[arg(long)]
+        strategy: String,
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Apply multiple file edits in one invocation (reads JSON from stdin)
     Edit {
@@ -394,6 +409,13 @@ fn main() -> Result<()> {
             tabular,
             schema,
         ),
+        Some(Commands::SearchWorker {
+            path,
+            query,
+            limit,
+            strategy,
+            output,
+        }) => cmd_search_worker(&path, &query, limit, &strategy, &output),
         Some(Commands::Edit { dry_run, file }) => {
             cmd_edit(dry_run, file, compact, pretty, terse, schema)
         }
@@ -2986,13 +3008,9 @@ fn cmd_search(
         relativize_symbol_hits(&mut symbol_hits, &root);
     }
 
-    let engine = Sift::builder().build();
     let effective_strategy = strategy.unwrap_or_else(|| "lexical".to_string());
-    let options = SearchOptions::default()
-        .with_limit(limit)
-        .with_strategy(effective_strategy.clone());
-    let input = SearchInput::new(&sift_path, &query).with_options(options);
-    let response = run_search_with_timeout(engine, input, timeout_secs, &effective_strategy)?;
+    let response =
+        run_search_with_timeout(&sift_path, &query, limit, timeout_secs, &effective_strategy)?;
 
     if json_output {
         #[derive(Serialize)]
@@ -3318,6 +3336,30 @@ fn cmd_lint(
         }
     }
 
+    Ok(())
+}
+
+fn cmd_search_worker(
+    path: &Path,
+    query: &str,
+    limit: usize,
+    strategy: &str,
+    output: &Path,
+) -> Result<()> {
+    maybe_apply_search_worker_test_hooks()?;
+    let response = run_sift_search(path, query, limit, strategy)?;
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .with_context(|| format!("creating search worker output: {}", output.display()))?;
+    serde_json::to_writer(&mut file, &response)
+        .with_context(|| format!("writing search worker output: {}", output.display()))?;
+    file.flush()
+        .with_context(|| format!("flushing search worker output: {}", output.display()))?;
     Ok(())
 }
 
@@ -4105,7 +4147,7 @@ tier = "isolated"
             false,
             false,
             false,
-            30,
+            0,
             true,
             false,
             false,
@@ -4136,7 +4178,7 @@ tier = "isolated"
             false,
             false,
             false,
-            30,
+            0,
             false,
             false,
             false,
@@ -4171,7 +4213,7 @@ tier = "isolated"
             false,
             false,
             false,
-            30,
+            0,
             false,
             false,
             false,
@@ -4205,7 +4247,7 @@ tier = "isolated"
             false,
             false,
             true,
-            30,
+            0,
             false,
             false,
             false,
@@ -4241,7 +4283,7 @@ tier = "isolated"
             false,
             false,
             true,
-            30,
+            0,
             false,
             false,
             false,
@@ -4296,7 +4338,7 @@ tier = "isolated"
             false,
             false,
             true,
-            30,
+            0,
             false,
             false,
             false,
@@ -4354,7 +4396,7 @@ tier = "isolated"
             false,
             false,
             false,
-            30,
+            0,
             false,
             false,
             false,
@@ -4407,7 +4449,7 @@ tier = "isolated"
             true,
             false,
             true,
-            30,
+            0,
             false,
             false,
             false,
@@ -4508,44 +4550,27 @@ tier = "isolated"
     // --- search timeout ---
 
     #[test]
-    fn search_timeout_returns_error_on_slow_engine() {
-        let engine = Sift::builder().build();
+    fn search_direct_runs_ok() {
         let dir = tempfile::tempdir().unwrap();
         let search_dir = dir.path().to_path_buf();
         std::fs::write(search_dir.join("test.rs"), "fn main() {}").unwrap();
-        let options = SearchOptions::default()
-            .with_limit(1)
-            .with_strategy("lexical".to_string());
-        let input = SearchInput::new(&search_dir, "main").with_options(options);
-        let result = run_search_with_timeout(engine, input, 30, "lexical");
-        assert!(result.is_ok(), "normal search should complete within 30s");
+        let result = run_sift_search(&search_dir, "main", 1, "lexical");
+        assert!(result.is_ok(), "direct search should succeed");
     }
 
     #[test]
     fn search_timeout_zero_disables_timeout() {
-        let engine = Sift::builder().build();
         let dir = tempfile::tempdir().unwrap();
         let search_dir = dir.path().to_path_buf();
         std::fs::write(search_dir.join("test.rs"), "fn main() {}").unwrap();
-        let options = SearchOptions::default()
-            .with_limit(1)
-            .with_strategy("lexical".to_string());
-        let input = SearchInput::new(&search_dir, "main").with_options(options);
-        let result = run_search_with_timeout(engine, input, 0, "lexical");
+        let result = run_search_with_timeout(&search_dir, "main", 1, 0, "lexical");
         assert!(result.is_ok(), "timeout=0 should still work (no timeout)");
     }
 
     #[test]
-    fn search_timeout_mechanism_channel_timeout() {
-        // Test the timeout mechanism directly via mpsc channel
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        // Don't send anything — this will timeout
-        let result = rx.recv_timeout(std::time::Duration::from_millis(10));
-        assert!(matches!(
-            result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ));
-        drop(tx);
+    fn search_worker_output_path_uses_json_suffix() {
+        let path = next_search_worker_output_path();
+        assert!(path.extension().is_some_and(|ext| ext == "json"));
     }
 
     // --- index quiet mode ---
@@ -5588,33 +5613,133 @@ fn federated_symbol_search(
     Ok(all_hits)
 }
 
+fn run_sift_search(
+    search_path: &Path,
+    query: &str,
+    limit: usize,
+    strategy: &str,
+) -> Result<sift::SearchResponse> {
+    let engine = Sift::builder().build();
+    let options = SearchOptions::default()
+        .with_limit(limit)
+        .with_strategy(strategy.to_string());
+    let input = SearchInput::new(search_path, query).with_options(options);
+    engine.search(input).context("sift search failed")
+}
+
 fn run_search_with_timeout(
-    engine: Sift,
-    input: SearchInput,
+    search_path: &Path,
+    query: &str,
+    limit: usize,
     timeout_secs: u64,
     strategy: &str,
 ) -> Result<sift::SearchResponse> {
     if timeout_secs == 0 {
-        return engine.search(input).context("sift search failed");
+        return run_sift_search(search_path, query, limit, strategy);
     }
-    let timeout = std::time::Duration::from_secs(timeout_secs);
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(engine.search(input));
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result.context("sift search failed"),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            bail!(
-                "tsift search timed out after {}s (strategy: {}). \
-                 The index may be stale — run `tsift index .` to rebuild, \
-                 or use `--timeout 0` to disable the timeout.",
-                timeout_secs,
-                strategy,
-            );
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            bail!("sift search thread panicked");
-        }
+
+    let output_path = next_search_worker_output_path();
+    let mut child = Command::new(
+        std::env::current_exe().context("resolving tsift executable for timed search")?,
+    )
+    .arg("__search-worker")
+    .arg("--path")
+    .arg(search_path)
+    .arg("--query")
+    .arg(query)
+    .arg("--limit")
+    .arg(limit.to_string())
+    .arg("--strategy")
+    .arg(strategy)
+    .arg("--output")
+    .arg(&output_path)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .context("spawning timed sift search worker")?;
+
+    let timeout = Duration::from_secs(timeout_secs);
+    let status =
+        wait_for_child_exit(&mut child, timeout).context("waiting for timed sift search worker")?;
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_file(&output_path);
+        bail!(
+            "tsift search timed out after {}s (strategy: {}). \
+             The index may be stale — run `tsift index .` to rebuild, \
+             or use `--timeout 0` to disable the timeout.",
+            timeout_secs,
+            strategy,
+        );
     }
+
+    let status = status.unwrap();
+    let stderr = read_child_stderr(&mut child)?;
+    if !status.success() {
+        let _ = fs::remove_file(&output_path);
+        let message = stderr.trim();
+        if message.is_empty() {
+            bail!("sift search worker exited with status {}", status);
+        }
+        bail!("{}", message);
+    }
+
+    let raw = fs::read_to_string(&output_path)
+        .with_context(|| format!("reading search worker output: {}", output_path.display()))?;
+    let _ = fs::remove_file(&output_path);
+    serde_json::from_str(&raw).context("parsing search worker output")
+}
+
+fn next_search_worker_output_path() -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "tsift-search-{}-{}.json",
+        std::process::id(),
+        stamp
+    ))
+}
+
+fn wait_for_child_exit(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<Option<std::process::ExitStatus>> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if started.elapsed() >= timeout {
+            return Ok(None);
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+fn read_child_stderr(child: &mut std::process::Child) -> Result<String> {
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr)
+            .context("reading search worker stderr")?;
+    }
+    Ok(stderr)
+}
+
+fn maybe_apply_search_worker_test_hooks() -> Result<()> {
+    if let Ok(path) = std::env::var("TSIFT_TEST_SEARCH_WORKER_PID_FILE") {
+        fs::write(&path, std::process::id().to_string())
+            .with_context(|| format!("writing search worker pid file: {path}"))?;
+    }
+    if let Ok(ms) = std::env::var("TSIFT_TEST_SEARCH_WORKER_SLEEP_MS") {
+        let delay_ms = ms
+            .parse::<u64>()
+            .with_context(|| format!("parsing TSIFT_TEST_SEARCH_WORKER_SLEEP_MS={ms}"))?;
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    }
+    Ok(())
 }

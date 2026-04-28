@@ -102,7 +102,7 @@ Run `tsift status` at session start. Use the commands listed in its `use:` outpu
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
 
-If `tsift status` reports a stale index, either run `tsift index .` first or use `tsift search --autoindex ...`. If `tsift search` still times out after that, narrow the path/query or retry with a larger `--timeout`.
+If `tsift status` reports a stale index, either run `tsift index .` first or use `tsift search --autoindex ...`. If `tsift search` still times out after that, tsift now kills the timed-out helper search worker before returning; narrow the path/query or retry with a larger `--timeout`.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->

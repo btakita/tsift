@@ -6,6 +6,11 @@ Canonical binary version source: `Cargo.toml` `package.version`. The CLI exposes
 
 Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
+## 0.1.1
+
+- `tsift search --timeout` now runs the bounded sift search in an internal helper process and kills that worker on timeout, so timed-out searches no longer keep burning CPU in detached threads.
+- `--timeout 0` still keeps search in-process for long-running sessions that explicitly opt out of the timeout.
+
 ## 0.1.0
 
 - Initial private versioned release surface for the tsift CLI.

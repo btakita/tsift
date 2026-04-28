@@ -3,6 +3,7 @@ use rusqlite::Connection;
 use std::fs;
 use std::fs::OpenOptions;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 fn tsift_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tsift"))
@@ -28,6 +29,29 @@ fn hold_writer_lock(lock_path: &std::path::Path) -> std::fs::File {
     use std::io::Write;
     writeln!(file, "{}", std::process::id()).unwrap();
     file
+}
+
+fn process_exists(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if !process_exists(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    !process_exists(pid)
 }
 
 #[test]
@@ -335,4 +359,75 @@ fn index_reports_lock_diagnostics_when_rollback_journal_blocks_writer() {
     assert!(stderr.contains("journal: present"));
     assert!(stderr.contains("run: tsift index"));
     assert!(stderr.contains("next: inspect the host for a wedged writer"));
+}
+
+#[test]
+fn search_timeout_kills_worker_process() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+    let pid_file = dir.path().join("worker.pid");
+
+    let started = Instant::now();
+    let output = tsift_bin()
+        .env("TSIFT_TEST_SEARCH_WORKER_SLEEP_MS", "5000")
+        .env("TSIFT_TEST_SEARCH_WORKER_PID_FILE", &pid_file)
+        .args([
+            "search",
+            "--timeout",
+            "1",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "main",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "expected timeout failure");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "timeout should return promptly"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out after 1s"));
+
+    let pid = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    assert!(
+        wait_for_process_exit(pid, Duration::from_secs(2)),
+        "timed-out worker process {pid} should be gone"
+    );
+}
+
+#[test]
+fn search_timeout_zero_keeps_search_in_process() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+    let pid_file = dir.path().join("worker.pid");
+
+    let output = tsift_bin()
+        .env("TSIFT_TEST_SEARCH_WORKER_SLEEP_MS", "5000")
+        .env("TSIFT_TEST_SEARCH_WORKER_PID_FILE", &pid_file)
+        .args([
+            "search",
+            "--timeout",
+            "0",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "main",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "timeout=0 should bypass worker timeout path"
+    );
+    assert!(
+        !pid_file.exists(),
+        "timeout=0 should not spawn the hidden search worker"
+    );
 }
