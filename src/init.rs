@@ -1,12 +1,16 @@
 use crate::config;
 use anyhow::{Result, bail};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SECTION_MARKER: &str = "<!-- tsift:code-navigation -->";
+const SECTION_MARKER_PREFIX: &str = "<!-- tsift:code-navigation";
 const SECTION_END_MARKER: &str = "<!-- /tsift:code-navigation -->";
+pub const TSIFT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const DEFAULT_SECTION: &str = r#"<!-- tsift:code-navigation -->
+fn versioned_section() -> String {
+    format!(
+        r#"<!-- tsift:code-navigation v={version} -->
 ## Code Navigation
 
 Run `tsift status` at session start. Use the commands listed in its `use:` output:
@@ -16,7 +20,24 @@ Run `tsift status` at session start. Use the commands listed in its `use:` outpu
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
 
 Only read full source files when tsift results are insufficient.
-<!-- /tsift:code-navigation -->"#;
+<!-- /tsift:code-navigation -->"#,
+        version = TSIFT_VERSION
+    )
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "state")]
+pub enum InstructionStatus {
+    #[serde(rename = "current")]
+    Current { version: String },
+    #[serde(rename = "stale")]
+    Stale {
+        found: Option<String>,
+        expected: String,
+    },
+    #[serde(rename = "missing")]
+    Missing,
+}
 
 const GITIGNORE_ENTRY: &str = ".tsift/";
 const CODEX_HOOK_STATUS: &str = "tsift auto-reindex";
@@ -174,20 +195,21 @@ pub fn init(dir: &Path, codex: bool, codex_workspace: bool) -> Result<InitResult
 }
 
 fn ensure_instruction_file(file: &Path) -> Result<InitAction> {
+    let section = versioned_section();
     if !file.exists() {
-        std::fs::write(file, format!("{}\n", DEFAULT_SECTION))?;
+        std::fs::write(file, format!("{}\n", section))?;
         return Ok(InitAction::Created);
     }
 
     let content = std::fs::read_to_string(file)?;
 
-    if content.contains(SECTION_MARKER) {
-        let start = content.find(SECTION_MARKER).unwrap();
+    if content.contains(SECTION_MARKER_PREFIX) {
+        let start = content.find(SECTION_MARKER_PREFIX).unwrap();
         if let Some(end_rel) = content[start..].find(SECTION_END_MARKER) {
             let end = start + end_rel + SECTION_END_MARKER.len();
             let before = &content[..start];
             let after = &content[end..];
-            let new_content = format!("{}{}{}", before, DEFAULT_SECTION, after);
+            let new_content = format!("{}{}{}", before, section, after);
             if new_content == content {
                 return Ok(InitAction::AlreadyPresent);
             }
@@ -196,7 +218,7 @@ fn ensure_instruction_file(file: &Path) -> Result<InitAction> {
         } else {
             bail!(
                 "Found {} in {} but no matching {} — fix manually",
-                SECTION_MARKER,
+                SECTION_MARKER_PREFIX,
                 file.display(),
                 SECTION_END_MARKER
             );
@@ -208,7 +230,7 @@ fn ensure_instruction_file(file: &Path) -> Result<InitAction> {
         new_content.push('\n');
     }
     new_content.push('\n');
-    new_content.push_str(DEFAULT_SECTION);
+    new_content.push_str(&section);
     new_content.push('\n');
     std::fs::write(file, new_content)?;
 
@@ -353,6 +375,48 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
+pub fn extract_instruction_version(content: &str) -> Option<String> {
+    let start = content.find(SECTION_MARKER_PREFIX)?;
+    let rest = &content[start + SECTION_MARKER_PREFIX.len()..];
+    let close = rest.find("-->")?;
+    let tag_content = rest[..close].trim();
+    tag_content.strip_prefix("v=").map(|v| v.to_string())
+}
+
+pub fn check_instruction_version(dir: &Path) -> InstructionStatus {
+    let agents = dir.join("AGENTS.md");
+    let file = if agents.exists() {
+        agents
+    } else {
+        let claude = dir.join("CLAUDE.md");
+        if claude.exists() {
+            claude
+        } else {
+            return InstructionStatus::Missing;
+        }
+    };
+    let content = match std::fs::read_to_string(&file) {
+        Ok(c) => c,
+        Err(_) => return InstructionStatus::Missing,
+    };
+    if !content.contains(SECTION_MARKER_PREFIX) {
+        return InstructionStatus::Missing;
+    }
+    match extract_instruction_version(&content) {
+        Some(v) if v == TSIFT_VERSION => InstructionStatus::Current {
+            version: v,
+        },
+        Some(v) => InstructionStatus::Stale {
+            found: Some(v),
+            expected: TSIFT_VERSION.to_string(),
+        },
+        None => InstructionStatus::Stale {
+            found: None,
+            expected: TSIFT_VERSION.to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,7 +430,7 @@ mod tests {
         assert!(matches!(result.updates[0].action, InitAction::Created));
         assert_eq!(result.updates[0].file.file_name().unwrap(), "AGENTS.md");
         let content = std::fs::read_to_string(&result.updates[0].file).unwrap();
-        assert!(content.contains(SECTION_MARKER));
+        assert!(content.contains(SECTION_MARKER_PREFIX));
         assert!(content.contains("tsift search"));
     }
 
@@ -380,7 +444,7 @@ mod tests {
         assert!(matches!(result.updates[0].action, InitAction::Created));
         let content = std::fs::read_to_string(&agents).unwrap();
         assert!(content.starts_with("# My Project"));
-        assert!(content.contains(SECTION_MARKER));
+        assert!(content.contains(SECTION_MARKER_PREFIX));
     }
 
     #[test]
@@ -395,12 +459,12 @@ mod tests {
         assert!(
             std::fs::read_to_string(dir.path().join("AGENTS.md"))
                 .unwrap()
-                .contains(SECTION_MARKER)
+                .contains(SECTION_MARKER_PREFIX)
         );
         assert!(
             std::fs::read_to_string(dir.path().join("CLAUDE.md"))
                 .unwrap()
-                .contains(SECTION_MARKER)
+                .contains(SECTION_MARKER_PREFIX)
         );
     }
 
@@ -418,7 +482,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(claude)
                 .unwrap()
-                .contains(SECTION_MARKER)
+                .contains(SECTION_MARKER_PREFIX)
         );
     }
 
@@ -444,7 +508,7 @@ mod tests {
         let agents = dir.path().join("AGENTS.md");
         let old_section = format!(
             "{}\n## Code Navigation\n\nOld content here.\n{}",
-            SECTION_MARKER, SECTION_END_MARKER
+            "<!-- tsift:code-navigation v=0.0.1 -->", SECTION_END_MARKER
         );
         std::fs::write(&agents, format!("# Project\n\n{}\n", old_section)).unwrap();
 
@@ -453,7 +517,7 @@ mod tests {
         let content = std::fs::read_to_string(&agents).unwrap();
         assert!(content.contains("tsift search"));
         assert!(!content.contains("Old content here."));
-        assert_eq!(content.matches(SECTION_MARKER).count(), 1);
+        assert_eq!(content.matches(SECTION_MARKER_PREFIX).count(), 1);
     }
 
     #[test]
@@ -576,7 +640,7 @@ mod tests {
         assert!(content.contains("Before content."));
         assert!(content.contains("## Footer"));
         assert!(content.contains("After content."));
-        assert!(content.contains(SECTION_MARKER));
+        assert!(content.contains(SECTION_MARKER_PREFIX));
     }
 
     #[test]
@@ -880,5 +944,136 @@ mod tests {
         let result = init(dir.path(), false, false).unwrap();
         assert!(result.codex_hooks.is_none());
         assert!(!dir.path().join(".codex/hooks.json").exists());
+    }
+
+    #[test]
+    fn init_embeds_version_in_marker() {
+        let dir = TempDir::new().unwrap();
+        init(dir.path(), false, false).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        let expected_marker = format!("<!-- tsift:code-navigation v={} -->", TSIFT_VERSION);
+        assert!(content.contains(&expected_marker));
+    }
+
+    #[test]
+    fn extract_version_from_versioned_marker() {
+        let content = "# Project\n\n<!-- tsift:code-navigation v=1.2.3 -->\n## Code Navigation\n<!-- /tsift:code-navigation -->\n";
+        assert_eq!(
+            extract_instruction_version(content),
+            Some("1.2.3".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_version_returns_none_for_old_format() {
+        let content = "<!-- tsift:code-navigation -->\n## Code Navigation\n<!-- /tsift:code-navigation -->\n";
+        assert_eq!(extract_instruction_version(content), None);
+    }
+
+    #[test]
+    fn extract_version_returns_none_when_no_section() {
+        let content = "# Just a project\n\nNo tsift here.\n";
+        assert_eq!(extract_instruction_version(content), None);
+    }
+
+    #[test]
+    fn check_version_current_after_init() {
+        let dir = TempDir::new().unwrap();
+        init(dir.path(), false, false).unwrap();
+        let status = check_instruction_version(dir.path());
+        assert_eq!(
+            status,
+            InstructionStatus::Current {
+                version: TSIFT_VERSION.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn check_version_stale_for_older_version() {
+        let dir = TempDir::new().unwrap();
+        let agents = dir.path().join("AGENTS.md");
+        std::fs::write(
+            &agents,
+            "<!-- tsift:code-navigation v=0.0.1 -->\n## Code Navigation\nOld.\n<!-- /tsift:code-navigation -->\n",
+        )
+        .unwrap();
+        let status = check_instruction_version(dir.path());
+        assert_eq!(
+            status,
+            InstructionStatus::Stale {
+                found: Some("0.0.1".to_string()),
+                expected: TSIFT_VERSION.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn check_version_stale_for_pre_versioned() {
+        let dir = TempDir::new().unwrap();
+        let agents = dir.path().join("AGENTS.md");
+        std::fs::write(
+            &agents,
+            "<!-- tsift:code-navigation -->\n## Code Navigation\nOld.\n<!-- /tsift:code-navigation -->\n",
+        )
+        .unwrap();
+        let status = check_instruction_version(dir.path());
+        assert_eq!(
+            status,
+            InstructionStatus::Stale {
+                found: None,
+                expected: TSIFT_VERSION.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn check_version_missing_when_no_files() {
+        let dir = TempDir::new().unwrap();
+        let status = check_instruction_version(dir.path());
+        assert_eq!(status, InstructionStatus::Missing);
+    }
+
+    #[test]
+    fn check_version_missing_when_no_section() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "# Project\n").unwrap();
+        let status = check_instruction_version(dir.path());
+        assert_eq!(status, InstructionStatus::Missing);
+    }
+
+    #[test]
+    fn init_upgrades_pre_versioned_section() {
+        let dir = TempDir::new().unwrap();
+        let agents = dir.path().join("AGENTS.md");
+        std::fs::write(
+            &agents,
+            "# Project\n\n<!-- tsift:code-navigation -->\n## Code Navigation\n\nOld content.\n<!-- /tsift:code-navigation -->\n",
+        )
+        .unwrap();
+        let result = init(dir.path(), false, false).unwrap();
+        assert!(matches!(result.updates[0].action, InitAction::Updated));
+        let content = std::fs::read_to_string(&agents).unwrap();
+        let expected_marker = format!("<!-- tsift:code-navigation v={} -->", TSIFT_VERSION);
+        assert!(content.contains(&expected_marker));
+        assert!(!content.contains("Old content."));
+    }
+
+    #[test]
+    fn check_version_prefers_agents_over_claude() {
+        let dir = TempDir::new().unwrap();
+        init(dir.path(), false, false).unwrap();
+        std::fs::write(
+            dir.path().join("CLAUDE.md"),
+            "<!-- tsift:code-navigation v=0.0.1 -->\n## Code Navigation\nOld.\n<!-- /tsift:code-navigation -->\n",
+        )
+        .unwrap();
+        let status = check_instruction_version(dir.path());
+        assert_eq!(
+            status,
+            InstructionStatus::Current {
+                version: TSIFT_VERSION.to_string()
+            }
+        );
     }
 }

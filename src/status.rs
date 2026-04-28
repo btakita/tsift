@@ -3,6 +3,7 @@ use crate::index::{
     IndexDb, ReadOnlyRecovery, process_exists, read_lock_pid, rollback_journal_path,
     writer_lock_path,
 };
+use crate::init::{self, InstructionStatus};
 use crate::summarize::SummaryDb;
 use anyhow::{Result, bail};
 use serde::Serialize;
@@ -13,6 +14,7 @@ use std::time::SystemTime;
 pub struct StatusReport {
     pub index: IndexStatus,
     pub summaries: SummaryStatus,
+    pub instructions: InstructionStatus,
     pub recommendations: Recommendations,
 }
 
@@ -94,11 +96,13 @@ pub fn check_status(root: &Path) -> Result<StatusReport> {
 
     let index = check_index(&index_db_path, root)?;
     let summaries = check_summaries(&summaries_db_path, &index)?;
-    let recommendations = build_recommendations(&index, &summaries);
+    let instructions = init::check_instruction_version(root);
+    let recommendations = build_recommendations(&index, &summaries, &instructions);
 
     Ok(StatusReport {
         index,
         summaries,
+        instructions,
         recommendations,
     })
 }
@@ -206,11 +210,21 @@ fn check_summaries(db_path: &Path, index: &IndexStatus) -> Result<SummaryStatus>
     })
 }
 
-fn build_recommendations(index: &IndexStatus, summaries: &SummaryStatus) -> Recommendations {
+fn build_recommendations(
+    index: &IndexStatus,
+    summaries: &SummaryStatus,
+    instructions: &InstructionStatus,
+) -> Recommendations {
+    let refresh = !matches!(instructions, InstructionStatus::Current { .. });
+
     match index {
         IndexStatus::Missing => Recommendations {
             use_commands: vec![],
-            run: Some("tsift index .".to_string()),
+            run: if refresh {
+                Some("tsift init && tsift index .".to_string())
+            } else {
+                Some("tsift index .".to_string())
+            },
         },
         IndexStatus::Stale { stale_files, .. } => {
             let mut use_cmds = vec![
@@ -221,13 +235,22 @@ fn build_recommendations(index: &IndexStatus, summaries: &SummaryStatus) -> Reco
             if matches!(summaries, SummaryStatus::Available { .. }) {
                 use_cmds.push("summarize".to_string());
             }
-            Recommendations {
-                use_commands: use_cmds,
-                run: Some(format!(
+            let run_msg = if refresh {
+                format!(
+                    "tsift init && tsift index .  ({} stale file{})",
+                    stale_files,
+                    if *stale_files == 1 { "" } else { "s" }
+                )
+            } else {
+                format!(
                     "tsift index .  ({} stale file{})",
                     stale_files,
                     if *stale_files == 1 { "" } else { "s" }
-                )),
+                )
+            };
+            Recommendations {
+                use_commands: use_cmds,
+                run: Some(run_msg),
             }
         }
         IndexStatus::Fresh { .. } => {
@@ -236,7 +259,7 @@ fn build_recommendations(index: &IndexStatus, summaries: &SummaryStatus) -> Reco
                 "explain".to_string(),
                 "graph".to_string(),
             ];
-            let run = match summaries {
+            let mut run = match summaries {
                 SummaryStatus::Available {
                     cached_files,
                     total_indexed_files,
@@ -257,6 +280,12 @@ fn build_recommendations(index: &IndexStatus, summaries: &SummaryStatus) -> Reco
                 SummaryStatus::None => Some("tsift summarize --extract src/".to_string()),
                 SummaryStatus::Unavailable => None,
             };
+            if refresh {
+                run = Some(match run {
+                    Some(existing) => format!("tsift init && {}", existing),
+                    None => "tsift init".to_string(),
+                });
+            }
             Recommendations {
                 use_commands: use_cmds,
                 run,
@@ -417,6 +446,51 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
         out.push_str(&format_recovery_line(recovery, compact));
     }
 
+    match &report.instructions {
+        InstructionStatus::Current { version } => {
+            if compact {
+                out.push_str(&format!("instructions: current v={}\n", version));
+            } else {
+                out.push_str(&format!("instructions: current (v{})\n", version));
+            }
+        }
+        InstructionStatus::Stale {
+            found: Some(v),
+            expected,
+        } => {
+            if compact {
+                out.push_str(&format!(
+                    "instructions: stale v={} expected={}\n",
+                    v, expected
+                ));
+            } else {
+                out.push_str(&format!(
+                    "instructions: stale (v{} installed, v{} available — run tsift init)\n",
+                    v, expected
+                ));
+            }
+        }
+        InstructionStatus::Stale {
+            found: None,
+            expected,
+        } => {
+            if compact {
+                out.push_str(&format!(
+                    "instructions: stale pre-versioned expected={}\n",
+                    expected
+                ));
+            } else {
+                out.push_str(&format!(
+                    "instructions: stale (pre-versioned, v{} available — run tsift init)\n",
+                    expected
+                ));
+            }
+        }
+        InstructionStatus::Missing => {
+            out.push_str("instructions: missing (run tsift init)\n");
+        }
+    }
+
     match &report.summaries {
         SummaryStatus::Available {
             cached_files,
@@ -532,8 +606,12 @@ mod tests {
         let report = check_status(dir.path()).unwrap();
         assert!(matches!(report.index, IndexStatus::Missing));
         assert!(matches!(report.summaries, SummaryStatus::Unavailable));
+        assert!(matches!(report.instructions, InstructionStatus::Missing));
         assert!(report.recommendations.use_commands.is_empty());
-        assert_eq!(report.recommendations.run.as_deref(), Some("tsift index ."));
+        assert_eq!(
+            report.recommendations.run.as_deref(),
+            Some("tsift init && tsift index .")
+        );
     }
 
     #[test]
@@ -629,16 +707,17 @@ mod tests {
         let report = StatusReport {
             index: IndexStatus::Missing,
             summaries: SummaryStatus::Unavailable,
+            instructions: InstructionStatus::Missing,
             recommendations: Recommendations {
                 use_commands: vec![],
-                run: Some("tsift index .".to_string()),
+                run: Some("tsift init && tsift index .".to_string()),
             },
         };
         let output = format_human(&report, false);
         assert!(output.contains("index: missing"));
+        assert!(output.contains("instructions: missing"));
         assert!(output.contains("summaries: unavailable"));
         assert!(output.contains("use: (none"));
-        assert!(output.contains("run: tsift index ."));
     }
 
     #[test]
@@ -655,6 +734,9 @@ mod tests {
                 total_indexed_files: 42,
                 coverage_pct: 71,
             },
+            instructions: InstructionStatus::Current {
+                version: "0.1.0".to_string(),
+            },
             recommendations: Recommendations {
                 use_commands: vec![
                     "search".to_string(),
@@ -668,6 +750,7 @@ mod tests {
         let output = format_human(&report, false);
         assert!(output.contains("index: fresh"));
         assert!(output.contains("42 files"));
+        assert!(output.contains("instructions: current (v0.1.0)"));
         assert!(output.contains("30/42 files cached (71%)"));
         assert!(output.contains("use: search, explain, graph, summarize"));
     }
@@ -682,17 +765,22 @@ mod tests {
                 recovery: None,
             },
             summaries: SummaryStatus::None,
+            instructions: InstructionStatus::Stale {
+                found: Some("0.0.9".to_string()),
+                expected: "0.1.0".to_string(),
+            },
             recommendations: Recommendations {
                 use_commands: vec![
                     "search".to_string(),
                     "explain".to_string(),
                     "graph".to_string(),
                 ],
-                run: Some("tsift index .".to_string()),
+                run: Some("tsift init && tsift index .".to_string()),
             },
         };
         let output = format_human(&report, true);
         assert!(output.contains("index: stale tracked:42 stale:3"));
+        assert!(output.contains("instructions: stale v=0.0.9 expected=0.1.0"));
         assert!(output.contains("use: search, explain, graph"));
         assert!(!output.contains("recommendations:"));
     }
@@ -707,6 +795,9 @@ mod tests {
                 recovery: Some(ReadOnlyRecovery::SnapshotFallback),
             },
             summaries: SummaryStatus::None,
+            instructions: InstructionStatus::Current {
+                version: "0.1.0".to_string(),
+            },
             recommendations: Recommendations {
                 use_commands: vec!["search".to_string()],
                 run: None,
@@ -726,6 +817,9 @@ mod tests {
                 recovery: Some(ReadOnlyRecovery::SnapshotFallback),
             },
             summaries: SummaryStatus::None,
+            instructions: InstructionStatus::Current {
+                version: "0.1.0".to_string(),
+            },
             recommendations: Recommendations {
                 use_commands: vec!["search".to_string()],
                 run: None,
@@ -775,5 +869,39 @@ mod tests {
         ));
         assert!(report.recommended_action.contains("remove"));
         assert!(report.recommended_action.contains("tsift index"));
+    }
+
+    #[test]
+    fn status_instructions_stale_recommends_init() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "<!-- tsift:code-navigation -->\n## Code Navigation\nOld.\n<!-- /tsift:code-navigation -->\n",
+        )
+        .unwrap();
+        let report = check_status(dir.path()).unwrap();
+        assert!(matches!(
+            report.instructions,
+            InstructionStatus::Stale { found: None, .. }
+        ));
+        assert!(
+            report
+                .recommendations
+                .run
+                .as_deref()
+                .unwrap()
+                .contains("tsift init")
+        );
+    }
+
+    #[test]
+    fn status_instructions_current_after_init() {
+        let dir = TempDir::new().unwrap();
+        init::init(dir.path(), false, false).unwrap();
+        let report = check_status(dir.path()).unwrap();
+        assert!(matches!(
+            report.instructions,
+            InstructionStatus::Current { .. }
+        ));
     }
 }

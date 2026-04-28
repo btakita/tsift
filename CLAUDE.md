@@ -9,7 +9,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | Command | Purpose |
 |---------|---------|
 | `tsift index` | Build AST symbol index via tree-sitter. `--workspace` / `--submodule <name>` / `--prune` / `--check` (dry-run) / `--exit-code` (exit 1 if stale, for hooks) |
-| `tsift search` | Hybrid BM25 + vector search via sift library. Built-in stale precheck + default autoindexing; use `--no-autoindex` to opt out. `--federated` / `--scope <name>` for workspace |
+| `tsift search` | Hybrid BM25 + vector search via sift library. Built-in stale precheck + optional `--autoindex`. `--federated` / `--scope <name>` for workspace |
 | `tsift graph` | Call-graph queries: `--callers` / `--callees` of a symbol. `--limit N` (default 20, 0=unlimited) / `--scope <name>` / `--json` |
 | `tsift edit` | Batch file edits from JSON (stdin or `--file`), atomic validate-then-write |
 | `tsift route` | Classify task → model tier (haiku/sonnet/opus) |
@@ -21,9 +21,9 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift audit` | Skill drift detection: scan installed skills, check health, compare against manifest, detect duplicates via Jaccard similarity. `--manifest <file>` / `--usage` / `--cleanup` / `--report <path>` / `--json` |
 | `tsift summarize` | Cached LLM analysis: pre-computed summaries, entities, relationships. `--extract <path>` / `--extract --diff` / `--file <path>` / `--stats` / `--json` |
 | `tsift lint` | Markdown lint: detect unannotated concepts (symbols, headings, bold terms) cross-referenced against graph entities. `--index <dir>` / `--entities-from <file>` / `--json` |
-| `tsift status` | Session health check: index freshness, summary cache, recommended commands. `--json` for structured output |
+| `tsift status` | Session health check: index freshness, instruction version, summary cache, recommended commands. `--json` for structured output |
 | `tsift locks` | Diagnose `index.lock` / `index.db-journal` state and recommend the next recovery step. `--scope <name>` / `--json` |
-| `tsift init` | Project setup: ensure Code Navigation section in AGENTS.md and mirror it into CLAUDE.md when present. `--codex` injects or updates a repo-aware autoindex hook; `--workspace` resolves to the parent workspace root. |
+| `tsift init` | Project setup: ensure versioned Code Navigation section (`v=X.Y.Z`) in AGENTS.md and mirror it into CLAUDE.md when present. `--codex` injects or updates a repo-aware autoindex hook; `--workspace` resolves to the parent workspace root. Detects and refreshes stale/pre-versioned markers on re-run. |
 
 Global flags: `--compact` reduces human-readable output volume (abbreviated kind/match_type labels, shorter section headers like `syms`, `crs`, `ces`, `comm`). `--pretty` switches JSON output from compact (default) to indented format. `--terse` outputs JSON with abbreviated field names and inline schema (implies `--json`). `--schema` converts repeated object arrays to columnar `{"_c":[cols],"_r":[[vals],...]}` format (implies `--json`; combines with `--terse`). `--absolute` shows full filesystem paths instead of project-relative (relative is default for token savings). `--tabular` outputs repeated structures as TSV with header row (search, graph, communities, explain).
 
@@ -61,6 +61,14 @@ make check          # clippy + test (236 tests)
 cargo install --path .   # install to ~/.cargo/bin/
 ```
 
+## Versioning
+
+Canonical version source: [`Cargo.toml`](Cargo.toml) `package.version`. The installed binary exposes the same value via `tsift --version`.
+
+Change history lives in [`VERSIONS.md`](VERSIONS.md). Even while tsift remains private, keep the Cargo package version and a matching `VERSIONS.md` entry in sync when the command surface or behavior changes.
+
+If copied skill instructions lag behind the installed binary, treat this file, `VERSIONS.md`, and `tsift --help` as the current source of truth.
+
 ## Conventions
 
 - **Read-only SQL**: `open_db()` uses `SQLITE_OPEN_READ_ONLY` — never mutates user databases.
@@ -77,6 +85,7 @@ cargo install --path .   # install to ~/.cargo/bin/
 - **Inline lock diagnostics**: if `tsift search` autoindex or `tsift index` still loses a write race, stderr now includes the live `lock` / `journal` state, the exact reindex command, and the recommended next step without requiring a separate `tsift locks`.
 - **Search rewrite** (`PreToolUse`): `~/.claude/hooks/tsift-rewrite.sh` rewrites `rg`/`grep -r` to `tsift search --strategy lexical`.
 - **RTK output filtering** (`PreToolUse`): same hook routes verbose commands (`communities`, `explain`, `graph`, `index`, `search`) through RTK when installed. TOML filters at `~/.config/rtk/filters.toml` cap output lines.
+- **Stale-session recovery**: if a resumed tmux or Codex session hits `tsift search timed out ... The index may be stale`, run `tsift index .` and retry the original tsift command.
 
 ## Repo
 
@@ -91,11 +100,7 @@ Run `tsift status` at session start. Use the commands listed in its `use:` outpu
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
 
-If `tsift status` reports a stale index, `tsift search` will usually repair it automatically. Use `tsift search --no-autoindex ...` only when you explicitly want a non-mutating stale check. If `tsift search` still times out after indexing, narrow the path/query or retry with a larger `--timeout`.
-
-If `tsift status`, `tsift index --check`, or a search freshness precheck hits a rollback-journal lock, tsift now retries the read against a temporary snapshot of the DB. That recovers the health check / stale precheck, but it does not kill a live writer or delete the journal for you.
-
-Use `tsift locks` when you need the operator view: it reports `index.lock`, rollback-journal presence, PID hints, and the recommended next step.
+If `tsift status` reports a stale index, either run `tsift index .` first or use `tsift search --autoindex ...`. If `tsift search` still times out after that, narrow the path/query or retry with a larger `--timeout`.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->

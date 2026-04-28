@@ -77,11 +77,9 @@ tsift audit --manifest <file>   # compare against expected skill list
 tsift summarize <symbol>        # cached LLM summary for a symbol
 tsift summarize --extract <path>  # batch LLM extraction (one-time)
 tsift summarize --extract --diff  # re-extract only git-changed files
-tsift search <query>            # lexical by default; autoindexes missing/stale indexes before search
-tsift search --no-autoindex <query> # opt-out: fail fast on stale indexes instead of rebuilding
+tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
+tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
 tsift search --scope <submod>   # restrict to one submodule's index + sift path
-tsift locks [path]              # diagnose index.lock / index.db-journal state
-tsift locks --scope <submod>    # inspect a specific submodule index
 tsift search --strategy hybrid  # opt-in to slower hybrid BM25 + vector search
 tsift search --timeout 60       # custom timeout in seconds (default: 30, 0 = no timeout)
 tsift --compact search <query>  # terse human output across commands
@@ -89,43 +87,32 @@ tsift --compact search <query>  # terse human output across commands
 
 ## Search Stale Precheck + Timeout
 
-`tsift search` now performs a cheap freshness precheck before it calls the sift engine. By default it incrementally rebuilds missing or stale indexes first, so ordinary searches stay on the fast path without a separate `index` step.
+`tsift search` now performs a cheap freshness precheck before it calls the sift engine. If an existing local index is stale, search fails fast instead of spending up to 30 seconds in the lexical engine first.
 
 Default behavior:
 
 - fresh index: search proceeds normally
-- stale index: search incrementally rebuilds it, then continues
-- missing index: search creates the index first, then continues
+- stale index: search exits non-zero immediately and tells the user to run `tsift index ...`
+- missing index: search still proceeds, but symbol ranking stays unavailable until the project is indexed
 
-Opt-out recovery:
+Opt-in recovery:
 
-- `tsift search --no-autoindex ...` skips the rebuild and fails fast when an existing local or scoped index is stale
-- `tsift search --scope <submod> --no-autoindex ...` preserves that fail-fast behavior for a single submodule
-- `tsift search --federated --no-autoindex ...` fails fast when any targeted federated submodule index is stale
-- those stale prechecks now reuse the same rollback-journal snapshot fallback as `status` / `index --check`, so locked live DBs still resolve to stale/missing/fresh instead of surfacing raw SQLite lock errors
+- `tsift search --autoindex ...` mirrors the hook behavior for unhooked sessions: if the local or scoped index is missing or stale, tsift incrementally builds it before searching
+- `tsift search --scope <submod> --autoindex ...` rebuilds only that submodule's index
+- `tsift search --federated --autoindex ...` rebuilds stale/missing federated submodule indexes before aggregating symbol hits
 - writable index updates now claim a sibling `index.lock` sidecar first, so concurrent `tsift index` / `tsift search --autoindex` writers fail fast with a tsift-owned error instead of surfacing raw SQLite lock contention
-- when a mutating write still fails on lock contention, `tsift search` autoindex and `tsift index` now inline the same lock diagnostics (`lock`, `journal`, exact reindex command, recommended next step) directly in stderr instead of forcing a follow-up `tsift locks`
 
 `tsift search` still wraps the sift engine call in a 30-second timeout (configurable via `--timeout`). The timeout remains a backstop for genuinely slow lexical searches or for sessions that reach search without a usable index.
 
-With `--no-autoindex`, stale existing indexes exit early with a message like:
+On stale existing indexes, search exits early with a message like:
 ```
-tsift search aborted: index is stale (51 files). Run `tsift index .` or re-run without `--no-autoindex`.
+tsift search aborted: index is stale (51 files). Run `tsift index .` or re-run with `--autoindex`.
 ```
 
 If the sift engine itself still times out, search exits with a non-zero code and prints:
 ```
 tsift search timed out after 30s (strategy: lexical). The index may be stale — run `tsift index .` to rebuild, or use `--timeout 0` to disable the timeout.
 ```
-
-## SQLite Concurrency
-
-tsift treats query/status paths and writer paths differently so a live index rebuild does not unnecessarily block readers.
-
-- writable opens (`index`, `summarize`) set a 5-second SQLite busy timeout and require `PRAGMA journal_mode=WAL`; if SQLite refuses WAL, tsift fails closed instead of continuing in rollback-journal mode
-- read/query paths (`search`, `graph`, `communities`, `path`, `explain`, `status`, and summary status checks) use read-only SQLite handles with the same busy timeout
-- `status`, `index --check`, and search freshness prechecks add one extra recovery step: if a rollback-journal writer has left the live DB locked, tsift copies the DB file to a temporary snapshot and runs the freshness check against that copy instead of failing with raw SQLite lock output
-- this is a concurrency hardening step, not a filesystem-stall fix: if the host itself wedges a write in kernel `D` state, tsift now surfaces the bad journal mode early rather than silently proceeding with a lock-prone writer
 
 `--timeout 0` disables the timeout for cases where a long search is expected.
 
@@ -636,7 +623,7 @@ With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject
 ### Injected Section
 
 ```markdown
-<!-- tsift:code-navigation -->
+<!-- tsift:code-navigation v=0.1.0 -->
 ## Code Navigation
 
 Run `tsift status` at session start. Use the commands listed in its `use:` output:
@@ -651,9 +638,19 @@ Only read full source files when tsift results are insufficient.
 
 The HTML comment markers enable idempotent updates without parsing markdown structure.
 
+### Version Markers
+
+The opening marker embeds the tsift version (`v=X.Y.Z`) that generated it. When tsift is upgraded:
+
+- `tsift status` reports `instructions: stale` and recommends `tsift init`
+- `tsift init` detects the older version marker and replaces the section with the current version's content
+- Pre-versioned markers (no `v=` attribute) are treated as stale
+
+This ensures agent sessions always use instructions matching the installed binary.
+
 ## Status (Session Health Check)
 
-`tsift status` reports index freshness, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session.
+`tsift status` reports index freshness, instruction version, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session.
 
 ```bash
 tsift status            # human-readable output
@@ -663,19 +660,12 @@ tsift status <path>     # check a specific codebase directory
 
 ### Output
 
-Three sections: index state, summary cache state, recommendations.
-
-If the live index is stuck behind a rollback-journal writer lock, `tsift status` now retries the freshness check against a temporary snapshot of `.tsift/index.db`. That auto-recovers the session health check without deleting the live journal or killing the writer process; subsequent mutating work still needs a real `tsift index ...` once the writer issue is resolved.
-
-When snapshot fallback was used, `status` surfaces it explicitly in both human and JSON output:
-```
-index: fresh (last indexed 2m ago, 200 files tracked)
-recovery: snapshot fallback (rollback-journal lock on live index)
-```
+Four sections: index state, instruction version, summary cache state, recommendations.
 
 When everything is available:
 ```
 index: fresh (last indexed 2m ago, 200 files tracked)
+instructions: current (v0.1.0)
 summaries: 142/200 files cached (71%)
 recommendations:
   use: search, explain, graph, summarize
@@ -685,41 +675,27 @@ recommendations:
 When no index exists:
 ```
 index: missing
+instructions: missing (run tsift init)
 summaries: unavailable (no index)
 recommendations:
   use: (none — run tsift index first)
-  run: tsift index .
+  run: tsift init && tsift index .
 ```
 
 ### JSON Schema
 
 ```json
 {
-  "index": { "state": "fresh|stale|missing", "total_files": N, "stale_files": N, "last_indexed_secs_ago": N, "recovery": "snapshot_fallback?" },
+  "index": { "state": "fresh|stale|missing", "total_files": N, "stale_files": N, "last_indexed_secs_ago": N },
+  "instructions": { "state": "current|stale|missing", "version": "0.1.0", "found": "0.0.1", "expected": "0.1.0" },
   "summaries": { "state": "available|none|unavailable", "cached_files": N, "total_indexed_files": N, "coverage_pct": N },
   "recommendations": { "use": ["search", "explain", ...], "run": "tsift index ." }
 }
 ```
 
-## Locks (Writer-Lock Diagnostics)
-
-`tsift locks` reports the current operator-facing lock state for one index database and recommends the next action.
-
-```bash
-tsift locks
-tsift locks --json
-tsift locks --scope session-share
-```
-
-It reports:
-
-- the targeted DB path
-- sibling `index.lock` state (`absent`, `live`, `stale`, or `unknown`) plus PID hint when available
-- rollback-journal presence (`index.db-journal`)
-- the exact reindex command to run after the lock issue is cleared
-- a recommended next step based on the current signals
-
 ### Recommendation Logic
+
+When instructions are stale or missing, `tsift init` is prepended to the `run:` recommendation.
 
 | Index | Summaries | `use:` | `run:` |
 |-------|-----------|--------|--------|
