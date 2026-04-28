@@ -868,7 +868,12 @@ fn summarize_stats_fails_closed_when_cache_missing() {
     let dir = tempfile::tempdir().unwrap();
 
     let output = tsift_bin()
-        .args(["summarize", "--stats", "--path", dir.path().to_str().unwrap()])
+        .args([
+            "summarize",
+            "--stats",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
         .output()
         .unwrap();
 
@@ -888,11 +893,7 @@ fn summarize_stats_fails_closed_when_cache_missing() {
 fn summarize_extract_resolves_relative_path_against_explicit_root() {
     let project = tempfile::tempdir().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
-    fs::write(
-        project.path().join("src/main.rs"),
-        "fn alpha_helper() {}\n",
-    )
-    .unwrap();
+    fs::write(project.path().join("src/main.rs"), "fn alpha_helper() {}\n").unwrap();
     write_missing_summary_api_key_config(project.path());
 
     let caller = tempfile::tempdir().unwrap();
@@ -924,9 +925,80 @@ fn summarize_extract_resolves_relative_path_against_explicit_root() {
     );
     assert!(stdout.contains("errors:1"), "stdout was: {stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("src/main.rs"), "stderr was: {stderr}");
+}
+
+#[test]
+fn summarize_extract_uses_matching_scoped_index_prompt_context() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+[submodule "src/beta"]
+	path = src/beta
+	url = https://example.com/beta
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("src/alpha/src")).unwrap();
+    fs::create_dir_all(dir.path().join("src/beta/src")).unwrap();
+    fs::write(
+        dir.path().join("src/alpha/src/lib.rs"),
+        "fn alpha_helper() {}\nfn alpha_entry() { alpha_helper(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src/beta/src/lib.rs"),
+        "fn beta_helper() {}\nfn beta_entry() { beta_helper(); }\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
     assert!(
-        stderr.contains("src/main.rs"),
-        "stderr was: {stderr}"
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let prompt_path = dir.path().join("captured-prompt.txt");
+    let output = tsift_bin()
+        .current_dir(dir.path())
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env(
+            "TSIFT_TEST_ANTHROPIC_RESPONSE_JSON",
+            r#"{"summary":"ok","entities":[],"relationships":[],"concept_labels":[]}"#,
+        )
+        .env("TSIFT_TEST_ANTHROPIC_CAPTURE_PROMPT", &prompt_path)
+        .args([
+            "summarize",
+            "--extract",
+            "src/beta/src/lib.rs",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--compact",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "summarize stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let prompt = fs::read_to_string(&prompt_path).unwrap();
+    assert!(
+        prompt.contains("- beta_helper (function)"),
+        "prompt was: {prompt}"
+    );
+    assert!(
+        !prompt.contains("- alpha_helper (function)"),
+        "prompt was: {prompt}"
     );
 }
 

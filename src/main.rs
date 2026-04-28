@@ -2401,7 +2401,6 @@ fn cmd_summarize(
     if let Some(extract_path) = extract {
         let extract_scope = resolve_extract_scope(&root, &extract_path);
         let cfg = load_summarize_config(&root);
-        let symbols_db = find_symbols_db(&root);
         let summary_db = summarize::SummaryDb::open(&db_path)?;
 
         let files_to_extract = if diff {
@@ -2448,7 +2447,13 @@ fn cmd_summarize(
                 continue; // already extracted for this version
             }
 
-            match summarize::extract_for_file(file_path, symbols_db.as_deref(), &cfg) {
+            let symbol_context = find_symbols_db_for_file(&root, file_path)?;
+            match summarize::extract_for_file(
+                file_path,
+                symbol_context.as_ref().map(|ctx| ctx.db_path.as_path()),
+                symbol_context.as_ref().map(|ctx| ctx.source_root.as_path()),
+                &cfg,
+            ) {
                 Ok(mut summaries) => {
                     for summary in &mut summaries {
                         summary.file_path = rel_path.clone();
@@ -2788,23 +2793,44 @@ fn load_summarize_config(root: &std::path::Path) -> summarize::SummarizeConfig {
     }
 }
 
-fn find_symbols_db(root: &std::path::Path) -> Option<PathBuf> {
-    let single = root.join(".tsift/index.db");
-    if single.exists() {
-        return Some(single);
-    }
-    let indexes = root.join(".tsift/indexes");
-    if indexes.exists()
-        && let Ok(entries) = std::fs::read_dir(&indexes)
-    {
-        for entry in entries.flatten() {
-            let db = entry.path().join("index.db");
-            if db.exists() {
-                return Some(db);
-            }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtractSymbolContext {
+    db_path: PathBuf,
+    source_root: PathBuf,
+}
+
+fn find_symbols_db_for_file(root: &Path, file_path: &Path) -> Result<Option<ExtractSymbolContext>> {
+    let cfg = config::Config::load(root)?;
+    let mut submodules = config::Config::submodule_dirs(root)?;
+    submodules.sort_by(|(_, left_path), (_, right_path)| {
+        right_path
+            .components()
+            .count()
+            .cmp(&left_path.components().count())
+    });
+
+    for (name, source_root) in submodules {
+        if !file_path.starts_with(&source_root) {
+            continue;
+        }
+        let db_path = cfg.db_path_for(root, &name);
+        if db_path.exists() {
+            return Ok(Some(ExtractSymbolContext {
+                db_path,
+                source_root,
+            }));
         }
     }
-    None
+
+    let single = root.join(".tsift/index.db");
+    if single.exists() && file_path.starts_with(root) {
+        return Ok(Some(ExtractSymbolContext {
+            db_path: single,
+            source_root: root.to_path_buf(),
+        }));
+    }
+
+    Ok(None)
 }
 
 fn resolve_extract_scope(root: &Path, extract_path: &Path) -> PathBuf {
@@ -3525,6 +3551,44 @@ mod tests {
             "got: {err}"
         );
         assert!(!dir.path().join(".tsift/summaries.db").exists());
+    }
+
+    #[test]
+    fn summarize_extract_uses_matching_scoped_index_for_workspace_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".gitmodules"),
+            r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+[submodule "src/beta"]
+	path = src/beta
+	url = https://example.com/beta
+"#,
+        )
+        .unwrap();
+
+        let alpha_root = dir.path().join("src/alpha");
+        let beta_root = dir.path().join("src/beta");
+        std::fs::create_dir_all(alpha_root.join("src")).unwrap();
+        std::fs::create_dir_all(beta_root.join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".tsift/indexes/alpha")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".tsift/indexes/beta")).unwrap();
+        std::fs::write(alpha_root.join("src/lib.rs"), "fn alpha_helper() {}\n").unwrap();
+        let beta_file = beta_root.join("src/lib.rs");
+        std::fs::write(&beta_file, "fn beta_helper() {}\n").unwrap();
+        std::fs::write(dir.path().join(".tsift/indexes/alpha/index.db"), "").unwrap();
+        std::fs::write(dir.path().join(".tsift/indexes/beta/index.db"), "").unwrap();
+
+        let context = find_symbols_db_for_file(dir.path(), &beta_file)
+            .unwrap()
+            .expect("expected matching scoped index");
+
+        assert_eq!(
+            context.db_path,
+            dir.path().join(".tsift/indexes/beta/index.db")
+        );
+        assert_eq!(context.source_root, beta_root);
     }
 
     // --- apply_edit_op ---

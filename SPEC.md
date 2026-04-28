@@ -75,7 +75,7 @@ tsift explain <symbol>          # full symbol context: callers, callees, communi
 tsift audit                     # scan installed skills, check health
 tsift audit --manifest <file>   # compare against expected skill list
 tsift summarize <symbol>        # cached LLM summary for a symbol
-tsift summarize --extract <path>  # batch LLM extraction (one-time; relative path resolves against --path)
+tsift summarize --extract <path>  # batch LLM extraction (one-time; relative path resolves against --path, workspace files use the matching scoped index)
 tsift summarize --extract --diff  # re-extract only git-changed files within the requested path
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
 tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
@@ -85,7 +85,7 @@ tsift search --timeout 60       # custom timeout in seconds (default: 30, 0 = no
 tsift --compact search <query>  # terse human output across commands
 ```
 
-`tsift summarize --stats`, `tsift summarize <symbol>`, and `tsift summarize --file <path>` are read-only cache queries: they fail closed when `.tsift/summaries.db` is absent and never create the summary cache as a side effect.
+`tsift summarize --stats`, `tsift summarize <symbol>`, and `tsift summarize --file <path>` are read-only cache queries: they fail closed when `.tsift/summaries.db` is absent and never create the summary cache as a side effect. During `--extract`, workspace files resolve symbol context against the matching scoped `index.db`, and symbol preload uses exact normalized file-path matches so duplicate `src/lib.rs`-style paths across scopes do not bleed into each other.
 
 ## Search Stale Precheck + Timeout
 

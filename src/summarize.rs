@@ -325,6 +325,7 @@ pub fn content_hash(content: &[u8]) -> String {
 pub fn extract_for_file(
     file_path: &Path,
     symbols_db_path: Option<&Path>,
+    symbols_source_root: Option<&Path>,
     config: &SummarizeConfig,
 ) -> Result<Vec<Summary>> {
     let source = std::fs::read_to_string(file_path)
@@ -344,7 +345,7 @@ pub fn extract_for_file(
     let file_str = file_path.to_string_lossy().to_string();
 
     let symbols = if let Some(db_path) = symbols_db_path {
-        load_symbols_for_file(db_path, &file_str)?
+        load_symbols_for_file(db_path, file_path, symbols_source_root)?
     } else {
         Vec::new()
     };
@@ -408,7 +409,28 @@ pub fn extract_for_file(
     Ok(summaries)
 }
 
-fn load_symbols_for_file(db_path: &Path, file_path: &str) -> Result<Vec<(String, String)>> {
+fn normalize_lookup_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn symbol_lookup_candidates(file_path: &Path, source_root: Option<&Path>) -> Vec<String> {
+    let mut candidates = vec![normalize_lookup_path(file_path)];
+    if let Some(root) = source_root
+        && let Ok(relative) = file_path.strip_prefix(root)
+    {
+        let relative = normalize_lookup_path(relative);
+        if !candidates.iter().any(|candidate| candidate == &relative) {
+            candidates.push(relative);
+        }
+    }
+    candidates
+}
+
+fn load_symbols_for_file(
+    db_path: &Path,
+    file_path: &Path,
+    source_root: Option<&Path>,
+) -> Result<Vec<(String, String)>> {
     if !db_path.exists() {
         return Ok(Vec::new());
     }
@@ -427,13 +449,22 @@ fn load_symbols_for_file(db_path: &Path, file_path: &str) -> Result<Vec<(String,
     if !table_exists {
         return Ok(Vec::new());
     }
-    let mut stmt =
-        conn.prepare("SELECT name, kind FROM symbols WHERE file LIKE '%' || ?1 ORDER BY line")?;
-    let rows = stmt
-        .query_map([file_path], |row| {
+    let candidates = symbol_lookup_candidates(file_path, source_root);
+    let rows = if candidates.len() == 1 {
+        let mut stmt =
+            conn.prepare("SELECT name, kind FROM symbols WHERE file = ?1 ORDER BY line")?;
+        stmt.query_map([candidates[0].as_str()], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect::<std::result::Result<Vec<_>, _>>()?
+    } else {
+        let mut stmt = conn
+            .prepare("SELECT name, kind FROM symbols WHERE file = ?1 OR file = ?2 ORDER BY line")?;
+        stmt.query_map([candidates[0].as_str(), candidates[1].as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+    };
     Ok(rows)
 }
 
@@ -519,6 +550,10 @@ fn parse_anthropic_api_response(
 }
 
 fn call_anthropic_api(api_key: &str, model: &str, prompt: &str) -> Result<(String, i64, i64)> {
+    if let Some(result) = maybe_mock_anthropic_api(prompt)? {
+        return Ok(result);
+    }
+
     let body = serde_json::json!({
         "model": model,
         "max_tokens": 4096,
@@ -547,6 +582,18 @@ fn call_anthropic_api(api_key: &str, model: &str, prompt: &str) -> Result<(Strin
         .with_context(|| format!("parsing Anthropic API response JSON (HTTP {})", status))?;
 
     parse_anthropic_api_response(status.as_u16(), response_json)
+}
+
+fn maybe_mock_anthropic_api(prompt: &str) -> Result<Option<(String, i64, i64)>> {
+    if let Ok(capture_path) = std::env::var("TSIFT_TEST_ANTHROPIC_CAPTURE_PROMPT") {
+        std::fs::write(&capture_path, prompt)
+            .with_context(|| format!("writing prompt capture: {capture_path}"))?;
+    }
+
+    let Ok(response) = std::env::var("TSIFT_TEST_ANTHROPIC_RESPONSE_JSON") else {
+        return Ok(None);
+    };
+    Ok(Some((response, 0, 0)))
 }
 
 pub fn git_changed_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -858,7 +905,7 @@ mod tests {
             max_file_tokens: 8000,
             ..Default::default()
         };
-        let result = extract_for_file(&big_file, None, &config);
+        let result = extract_for_file(&big_file, None, None, &config);
         assert!(result.is_err());
         assert!(
             result
@@ -877,9 +924,53 @@ mod tests {
             api_key_env: "TSIFT_TEST_NONEXISTENT_KEY".to_string(),
             ..Default::default()
         };
-        let result = extract_for_file(&file, None, &config);
+        let result = extract_for_file(&file, None, None, &config);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("missing API key"));
+    }
+
+    #[test]
+    fn load_symbols_for_file_uses_exact_relative_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE symbols (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                language TEXT NOT NULL,
+                signature TEXT,
+                file TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                end_line INTEGER,
+                parent_module TEXT,
+                visibility TEXT,
+                tags TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, language, signature, file, line, end_line, parent_module, visibility, tags)
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, NULL, NULL, NULL, NULL)",
+            rusqlite::params!["target", "function", "rust", "src/lib.rs", 1_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, language, signature, file, line, end_line, parent_module, visibility, tags)
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, NULL, NULL, NULL, NULL)",
+            rusqlite::params!["wrong", "function", "rust", "nested/src/lib.rs", 1_i64],
+        )
+        .unwrap();
+
+        let file_path = Path::new("/workspace/src/lib.rs");
+        let symbols =
+            load_symbols_for_file(&db_path, file_path, Some(Path::new("/workspace"))).unwrap();
+
+        assert_eq!(
+            symbols,
+            vec![("target".to_string(), "function".to_string())]
+        );
     }
 
     #[test]
