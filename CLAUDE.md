@@ -22,6 +22,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift summarize` | Cached LLM analysis: pre-computed summaries, entities, relationships. `--extract <path>` / `--extract --diff` / `--file <path>` / `--stats` / `--json` |
 | `tsift lint` | Markdown lint: detect unannotated concepts (symbols, headings, bold terms) cross-referenced against graph entities. `--index <dir>` / `--entities-from <file>` / `--json` |
 | `tsift status` | Session health check: index freshness, summary cache, recommended commands. `--json` for structured output |
+| `tsift locks` | Diagnose `index.lock` / `index.db-journal` state and recommend the next recovery step. `--scope <name>` / `--json` |
 | `tsift init` | Project setup: ensure Code Navigation section in AGENTS.md and mirror it into CLAUDE.md when present. Idempotent — safe to re-run after upgrades. |
 
 Global flags: `--compact` reduces human-readable output volume (abbreviated kind/match_type labels, shorter section headers like `syms`, `crs`, `ces`, `comm`). `--pretty` switches JSON output from compact (default) to indented format. `--terse` outputs JSON with abbreviated field names and inline schema (implies `--json`). `--schema` converts repeated object arrays to columnar `{"_c":[cols],"_r":[[vals],...]}` format (implies `--json`; combines with `--terse`). `--absolute` shows full filesystem paths instead of project-relative (relative is default for token savings). `--tabular` outputs repeated structures as TSV with header row (search, graph, communities, explain).
@@ -72,6 +73,7 @@ cargo install --path .   # install to ~/.cargo/bin/
 
 - **Auto-reindex** (`UserPromptSubmit`): `examples/hooks/tsift-autoindex.sh` runs `tsift index --check --exit-code .` on every prompt, auto-reindexes when stale. Install via `.claude/settings.json`.
 - **Unhooked fallback**: `tsift search` now autoindexes missing or stale indexes by default. Use `--no-autoindex` when you want the old fail-fast stale check instead of a write.
+- **Locked freshness prechecks**: search stale checks now use the same rollback-journal snapshot fallback as `tsift status` / `tsift index --check`, so `--scope`, `--federated`, and `--no-autoindex` do not regress back to raw `database is locked` failures.
 - **Search rewrite** (`PreToolUse`): `~/.claude/hooks/tsift-rewrite.sh` rewrites `rg`/`grep -r` to `tsift search --strategy lexical`.
 - **RTK output filtering** (`PreToolUse`): same hook routes verbose commands (`communities`, `explain`, `graph`, `index`, `search`) through RTK when installed. TOML filters at `~/.config/rtk/filters.toml` cap output lines.
 
@@ -90,7 +92,9 @@ Run `tsift status` at session start. Use the commands listed in its `use:` outpu
 
 If `tsift status` reports a stale index, `tsift search` will usually repair it automatically. Use `tsift search --no-autoindex ...` only when you explicitly want a non-mutating stale check. If `tsift search` still times out after indexing, narrow the path/query or retry with a larger `--timeout`.
 
-If `tsift status` or `tsift index --check` hits a rollback-journal lock, tsift now retries the freshness read against a temporary snapshot of the DB. That recovers the health check, but it does not kill a live writer or delete the journal for you.
+If `tsift status`, `tsift index --check`, or a search freshness precheck hits a rollback-journal lock, tsift now retries the read against a temporary snapshot of the DB. That recovers the health check / stale precheck, but it does not kill a live writer or delete the journal for you.
+
+Use `tsift locks` when you need the operator view: it reports `index.lock`, rollback-journal presence, PID hints, and the recommended next step.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->

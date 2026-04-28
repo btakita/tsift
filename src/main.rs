@@ -304,6 +304,18 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Diagnose tsift writer-lock and rollback-journal state for an index
+    Locks {
+        /// Path to the codebase (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Inspect a specific submodule index
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Deserialize)]
@@ -560,6 +572,15 @@ fn main() -> Result<()> {
         ),
         Some(Commands::Status { path, json }) => cmd_status(
             &path,
+            json || terse || schema,
+            compact,
+            pretty,
+            terse,
+            schema,
+        ),
+        Some(Commands::Locks { path, scope, json }) => cmd_locks(
+            &path,
+            scope.as_deref(),
             json || terse || schema,
             compact,
             pretty,
@@ -1340,8 +1361,7 @@ fn cmd_index(
                 let db = index::IndexDb::open(&db_path)?;
                 db.rebuild(sub_path)?
             } else if check {
-                let (_, summary) = index::IndexDb::inspect_read_only(&db_path, sub_path, prune)?;
-                summary
+                index::IndexDb::inspect_read_only(&db_path, sub_path, prune)?.summary
             } else if prune {
                 let db = index::IndexDb::open(&db_path)?;
                 db.apply_changes_pruned(sub_path)?
@@ -1448,8 +1468,7 @@ fn cmd_index(
         let db = index::IndexDb::open(&db_path)?;
         db.rebuild(&root)?
     } else if check {
-        let (_, summary) = index::IndexDb::inspect_read_only(&db_path, &root, prune)?;
-        summary
+        index::IndexDb::inspect_read_only(&db_path, &root, prune)?.summary
     } else if prune {
         let db = index::IndexDb::open(&db_path)?;
         db.apply_changes_pruned(&root)?
@@ -2557,6 +2576,27 @@ fn cmd_status(
     Ok(())
 }
 
+fn cmd_locks(
+    path: &std::path::Path,
+    scope: Option<&str>,
+    json_output: bool,
+    compact: bool,
+    pretty: bool,
+    terse: bool,
+    schema: bool,
+) -> Result<()> {
+    let root = path
+        .canonicalize()
+        .with_context(|| format!("resolving path: {}", path.display()))?;
+    let report = status::check_locks(&root, scope)?;
+    if json_output {
+        println!("{}", to_json_schema(&report, pretty, terse, schema)?);
+    } else {
+        print!("{}", status::format_locks_human(&report, compact));
+    }
+    Ok(())
+}
+
 fn load_summarize_config(root: &std::path::Path) -> summarize::SummarizeConfig {
     let config_path = root.join(".tsift/config.toml");
     if !config_path.exists() {
@@ -2675,9 +2715,10 @@ fn inspect_search_index(target: &SearchIndexTarget) -> Result<SearchIndexState> 
         return Ok(SearchIndexState::Missing);
     }
 
-    let db = index::IndexDb::open_read_only(&target.db_path)?;
-    let summary = db.compute_changes(&target.source_root)?;
-    let stale_files = summary.new + summary.modified + summary.deleted;
+    let inspection =
+        index::IndexDb::inspect_read_only(&target.db_path, &target.source_root, false)?;
+    let stale_files =
+        inspection.summary.new + inspection.summary.modified + inspection.summary.deleted;
     if stale_files == 0 {
         Ok(SearchIndexState::Fresh)
     } else {
@@ -3852,6 +3893,14 @@ tier = "isolated"
         conn
     }
 
+    fn hold_rollback_journal_lock(db_path: &std::path::Path) -> Connection {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        std::fs::write(index::rollback_journal_path(db_path), "locked").unwrap();
+        conn
+    }
+
     #[test]
     fn search_cmd_succeeds_while_writer_lock_is_held() {
         let dir = setup_graph_index();
@@ -3911,6 +3960,41 @@ tier = "isolated"
         assert!(err.to_string().contains("search aborted"));
         assert!(err.to_string().contains("index is stale"));
         assert!(err.to_string().contains("--no-autoindex"));
+    }
+
+    #[test]
+    fn search_cmd_reports_stale_when_root_index_is_locked_by_rollback_journal() {
+        let dir = setup_graph_index();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() { println!(\"updated\"); }\nfn main() { helper(); Vec::new(); }",
+        )
+        .unwrap();
+        let _lock = hold_rollback_journal_lock(&dir.path().join(".tsift/index.db"));
+
+        let err = cmd_search(
+            "helper".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            None,
+            false,
+            false,
+            false,
+            30,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("search aborted"));
+        assert!(err.to_string().contains("index is stale"));
+        assert!(!err.to_string().contains("database is locked"));
     }
 
     #[test]
@@ -4004,6 +4088,62 @@ tier = "isolated"
     }
 
     #[test]
+    fn scoped_search_cmd_reports_stale_when_submodule_index_is_locked_by_rollback_journal() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let alpha = dir.path().join("src/alpha/lib.rs");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            &alpha,
+            "fn alpha_helper() { println!(\"updated\"); }\nfn alpha_main() { alpha_helper(); }",
+        )
+        .unwrap();
+
+        let cfg = config::Config::load(dir.path()).unwrap();
+        let _lock = hold_rollback_journal_lock(&cfg.db_path_for(dir.path(), "alpha"));
+
+        let err = cmd_search(
+            "alpha_helper".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            Some("alpha".to_string()),
+            false,
+            false,
+            false,
+            30,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("search aborted"));
+        assert!(err.to_string().contains("submodule `alpha` index"));
+        assert!(!err.to_string().contains("database is locked"));
+    }
+
+    #[test]
     fn federated_search_cmd_autoindexes_stale_indexes_by_default() {
         let dir = setup_workspace();
         cmd_index(
@@ -4056,6 +4196,62 @@ tier = "isolated"
         let db = index::IndexDb::open_read_only(&cfg.db_path_for(dir.path(), "alpha")).unwrap();
         let summary = db.compute_changes(&dir.path().join("src/alpha")).unwrap();
         assert_eq!(summary.new + summary.modified + summary.deleted, 0);
+    }
+
+    #[test]
+    fn federated_search_cmd_reports_stale_when_submodule_index_is_locked_by_rollback_journal() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let alpha = dir.path().join("src/alpha/lib.rs");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            &alpha,
+            "fn alpha_helper() { println!(\"updated\"); }\nfn alpha_main() { alpha_helper(); }",
+        )
+        .unwrap();
+
+        let cfg = config::Config::load(dir.path()).unwrap();
+        let _lock = hold_rollback_journal_lock(&cfg.db_path_for(dir.path(), "alpha"));
+
+        let err = cmd_search(
+            "alpha_helper".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            None,
+            true,
+            false,
+            false,
+            30,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("stale"));
+        assert!(err.to_string().contains("submodule `alpha` index"));
+        assert!(!err.to_string().contains("database is locked"));
     }
 
     #[test]
@@ -4334,6 +4530,23 @@ tier = "isolated"
         let cli = Cli::parse_from(["tsift", "--schema", "search", "test"]);
         assert!(cli.schema);
         assert!(matches!(cli.command, Some(Commands::Search { .. })));
+    }
+
+    #[test]
+    fn cli_accepts_locks_command() {
+        let cli = Cli::parse_from(["tsift", "locks"]);
+        assert!(matches!(cli.command, Some(Commands::Locks { .. })));
+    }
+
+    #[test]
+    fn cli_locks_accepts_scope_flag() {
+        let cli = Cli::parse_from(["tsift", "locks", "--scope", "alpha"]);
+        match cli.command {
+            Some(Commands::Locks { scope, .. }) => {
+                assert_eq!(scope.as_deref(), Some("alpha"));
+            }
+            _ => panic!("expected Locks command"),
+        }
     }
 
     #[test]

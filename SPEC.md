@@ -80,6 +80,8 @@ tsift summarize --extract --diff  # re-extract only git-changed files
 tsift search <query>            # lexical by default; autoindexes missing/stale indexes before search
 tsift search --no-autoindex <query> # opt-out: fail fast on stale indexes instead of rebuilding
 tsift search --scope <submod>   # restrict to one submodule's index + sift path
+tsift locks [path]              # diagnose index.lock / index.db-journal state
+tsift locks --scope <submod>    # inspect a specific submodule index
 tsift search --strategy hybrid  # opt-in to slower hybrid BM25 + vector search
 tsift search --timeout 60       # custom timeout in seconds (default: 30, 0 = no timeout)
 tsift --compact search <query>  # terse human output across commands
@@ -100,6 +102,7 @@ Opt-out recovery:
 - `tsift search --no-autoindex ...` skips the rebuild and fails fast when an existing local or scoped index is stale
 - `tsift search --scope <submod> --no-autoindex ...` preserves that fail-fast behavior for a single submodule
 - `tsift search --federated --no-autoindex ...` fails fast when any targeted federated submodule index is stale
+- those stale prechecks now reuse the same rollback-journal snapshot fallback as `status` / `index --check`, so locked live DBs still resolve to stale/missing/fresh instead of surfacing raw SQLite lock errors
 - writable index updates now claim a sibling `index.lock` sidecar first, so concurrent `tsift index` / `tsift search --autoindex` writers fail fast with a tsift-owned error instead of surfacing raw SQLite lock contention
 
 `tsift search` still wraps the sift engine call in a 30-second timeout (configurable via `--timeout`). The timeout remains a backstop for genuinely slow lexical searches or for sessions that reach search without a usable index.
@@ -120,7 +123,7 @@ tsift treats query/status paths and writer paths differently so a live index reb
 
 - writable opens (`index`, `summarize`) set a 5-second SQLite busy timeout and require `PRAGMA journal_mode=WAL`; if SQLite refuses WAL, tsift fails closed instead of continuing in rollback-journal mode
 - read/query paths (`search`, `graph`, `communities`, `path`, `explain`, `status`, and summary status checks) use read-only SQLite handles with the same busy timeout
-- `status` and `index --check` add one extra recovery step: if a rollback-journal writer has left the live DB locked, tsift copies the DB file to a temporary snapshot and runs the freshness check against that copy instead of failing with raw SQLite lock output
+- `status`, `index --check`, and search freshness prechecks add one extra recovery step: if a rollback-journal writer has left the live DB locked, tsift copies the DB file to a temporary snapshot and runs the freshness check against that copy instead of failing with raw SQLite lock output
 - this is a concurrency hardening step, not a filesystem-stall fix: if the host itself wedges a write in kernel `D` state, tsift now surfaces the bad journal mode early rather than silently proceeding with a lock-prone writer
 
 `--timeout 0` disables the timeout for cases where a long search is expected.
@@ -659,6 +662,12 @@ Three sections: index state, summary cache state, recommendations.
 
 If the live index is stuck behind a rollback-journal writer lock, `tsift status` now retries the freshness check against a temporary snapshot of `.tsift/index.db`. That auto-recovers the session health check without deleting the live journal or killing the writer process; subsequent mutating work still needs a real `tsift index ...` once the writer issue is resolved.
 
+When snapshot fallback was used, `status` surfaces it explicitly in both human and JSON output:
+```
+index: fresh (last indexed 2m ago, 200 files tracked)
+recovery: snapshot fallback (rollback-journal lock on live index)
+```
+
 When everything is available:
 ```
 index: fresh (last indexed 2m ago, 200 files tracked)
@@ -681,11 +690,29 @@ recommendations:
 
 ```json
 {
-  "index": { "state": "fresh|stale|missing", "total_files": N, "stale_files": N, "last_indexed_secs_ago": N },
+  "index": { "state": "fresh|stale|missing", "total_files": N, "stale_files": N, "last_indexed_secs_ago": N, "recovery": "snapshot_fallback?" },
   "summaries": { "state": "available|none|unavailable", "cached_files": N, "total_indexed_files": N, "coverage_pct": N },
   "recommendations": { "use": ["search", "explain", ...], "run": "tsift index ." }
 }
 ```
+
+## Locks (Writer-Lock Diagnostics)
+
+`tsift locks` reports the current operator-facing lock state for one index database and recommends the next action.
+
+```bash
+tsift locks
+tsift locks --json
+tsift locks --scope session-share
+```
+
+It reports:
+
+- the targeted DB path
+- sibling `index.lock` state (`absent`, `live`, `stale`, or `unknown`) plus PID hint when available
+- rollback-journal presence (`index.db-journal`)
+- the exact reindex command to run after the lock issue is cleared
+- a recommended next step based on the current signals
 
 ### Recommendation Logic
 

@@ -71,6 +71,19 @@ impl IndexSummary {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadOnlyRecovery {
+    SnapshotFallback,
+}
+
+#[derive(Debug)]
+pub struct ReadOnlyInspectResult {
+    pub total_files: usize,
+    pub summary: IndexSummary,
+    pub recovery: Option<ReadOnlyRecovery>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StoredSymbol {
     pub name: String,
@@ -205,7 +218,7 @@ impl IndexDb {
         db_path: &Path,
         root: &Path,
         prune: bool,
-    ) -> Result<(usize, IndexSummary)> {
+    ) -> Result<ReadOnlyInspectResult> {
         match Self::inspect_read_only_once(db_path, root, prune) {
             Ok(result) => Ok(result),
             Err(err) if should_retry_read_only_with_snapshot(db_path, &err) => {
@@ -216,7 +229,11 @@ impl IndexDb {
                 } else {
                     db.compute_changes(root)?
                 };
-                Ok((total_files, summary))
+                Ok(ReadOnlyInspectResult {
+                    total_files,
+                    summary,
+                    recovery: Some(ReadOnlyRecovery::SnapshotFallback),
+                })
             }
             Err(err) => Err(err),
         }
@@ -226,7 +243,7 @@ impl IndexDb {
         db_path: &Path,
         root: &Path,
         prune: bool,
-    ) -> Result<(usize, IndexSummary)> {
+    ) -> Result<ReadOnlyInspectResult> {
         let db = Self::open_read_only(db_path)?;
         let total_files = db.file_count()?;
         let summary = if prune {
@@ -234,7 +251,11 @@ impl IndexDb {
         } else {
             db.compute_changes(root)?
         };
-        Ok((total_files, summary))
+        Ok(ReadOnlyInspectResult {
+            total_files,
+            summary,
+            recovery: None,
+        })
     }
 
     fn open_read_only_snapshot(db_path: &Path) -> Result<Self> {
@@ -813,7 +834,7 @@ fn acquire_write_lock(db_path: &Path) -> Result<WriteLockGuard> {
     unreachable!("lock acquisition retries are bounded")
 }
 
-fn writer_lock_path(db_path: &Path) -> PathBuf {
+pub(crate) fn writer_lock_path(db_path: &Path) -> PathBuf {
     let stem = db_path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -837,7 +858,7 @@ fn should_retry_read_only_with_snapshot(db_path: &Path, err: &anyhow::Error) -> 
     rollback_journal_path(db_path).exists() && error_mentions_locked_db(err)
 }
 
-fn rollback_journal_path(db_path: &Path) -> PathBuf {
+pub(crate) fn rollback_journal_path(db_path: &Path) -> PathBuf {
     let mut journal = db_path.as_os_str().to_os_string();
     journal.push("-journal");
     PathBuf::from(journal)
@@ -862,18 +883,18 @@ fn error_mentions_locked_db(err: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains("database is locked"))
 }
 
-fn read_lock_pid(lock_path: &Path) -> Option<u32> {
+pub(crate) fn read_lock_pid(lock_path: &Path) -> Option<u32> {
     let content = std::fs::read_to_string(lock_path).ok()?;
     content.trim().parse().ok()
 }
 
 #[cfg(target_os = "linux")]
-fn process_exists(pid: u32) -> bool {
+pub(crate) fn process_exists(pid: u32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_exists(_pid: u32) -> bool {
+pub(crate) fn process_exists(_pid: u32) -> bool {
     true
 }
 
@@ -1577,12 +1598,15 @@ mod tests {
         conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
         std::fs::write(rollback_journal_path(&db_path), "locked").unwrap();
 
-        let (total_files, summary) =
-            IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
-        assert_eq!(total_files, 1);
-        assert_eq!(summary.new, 0);
-        assert_eq!(summary.modified, 0);
-        assert_eq!(summary.deleted, 0);
+        let inspection = IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
+        assert_eq!(inspection.total_files, 1);
+        assert_eq!(inspection.summary.new, 0);
+        assert_eq!(inspection.summary.modified, 0);
+        assert_eq!(inspection.summary.deleted, 0);
+        assert_eq!(
+            inspection.recovery,
+            Some(ReadOnlyRecovery::SnapshotFallback)
+        );
     }
 
     #[test]

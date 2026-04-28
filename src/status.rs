@@ -1,8 +1,12 @@
-use crate::index::IndexDb;
+use crate::config;
+use crate::index::{
+    IndexDb, ReadOnlyRecovery, process_exists, read_lock_pid, rollback_journal_path,
+    writer_lock_path,
+};
 use crate::summarize::SummaryDb;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 #[derive(Debug, Serialize)]
@@ -20,12 +24,16 @@ pub enum IndexStatus {
         total_files: usize,
         stale_files: usize,
         last_indexed_secs_ago: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery: Option<ReadOnlyRecovery>,
     },
     #[serde(rename = "stale")]
     Stale {
         total_files: usize,
         stale_files: usize,
         last_indexed_secs_ago: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery: Option<ReadOnlyRecovery>,
     },
     #[serde(rename = "missing")]
     Missing,
@@ -52,6 +60,32 @@ pub struct Recommendations {
     pub use_commands: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct LockReport {
+    pub label: String,
+    pub source_root: PathBuf,
+    pub db_path: PathBuf,
+    pub writer_lock: WriterLockStatus,
+    pub rollback_journal: RollbackJournalStatus,
+    pub reindex_command: String,
+    pub recommended_action: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WriterLockStatus {
+    Absent { path: PathBuf },
+    Live { path: PathBuf, pid: Option<u32> },
+    Stale { path: PathBuf, pid: Option<u32> },
+    Unknown { path: PathBuf },
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RollbackJournalStatus {
+    pub path: PathBuf,
+    pub present: bool,
 }
 
 pub fn check_status(root: &Path) -> Result<StatusReport> {
@@ -82,22 +116,61 @@ fn check_index(db_path: &Path, root: &Path) -> Result<IndexStatus> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let (total_files, summary) = IndexDb::inspect_read_only(db_path, root, false)?;
-    let stale_files = summary.new + summary.modified + summary.deleted;
+    let inspection = IndexDb::inspect_read_only(db_path, root, false)?;
+    let stale_files =
+        inspection.summary.new + inspection.summary.modified + inspection.summary.deleted;
 
     if stale_files > 0 {
         Ok(IndexStatus::Stale {
-            total_files,
+            total_files: inspection.total_files,
             stale_files,
             last_indexed_secs_ago,
+            recovery: inspection.recovery,
         })
     } else {
         Ok(IndexStatus::Fresh {
-            total_files,
+            total_files: inspection.total_files,
             stale_files: 0,
             last_indexed_secs_ago,
+            recovery: inspection.recovery,
         })
     }
+}
+
+pub fn check_locks(root: &Path, scope: Option<&str>) -> Result<LockReport> {
+    let (label, source_root, db_path, reindex_command) = resolve_lock_target(root, scope)?;
+    let lock_path = writer_lock_path(&db_path);
+    let writer_lock = if !lock_path.exists() {
+        WriterLockStatus::Absent { path: lock_path }
+    } else {
+        match read_lock_pid(&lock_path) {
+            Some(pid) if process_exists(pid) => WriterLockStatus::Live {
+                path: lock_path,
+                pid: Some(pid),
+            },
+            Some(pid) => WriterLockStatus::Stale {
+                path: lock_path,
+                pid: Some(pid),
+            },
+            None => WriterLockStatus::Unknown { path: lock_path },
+        }
+    };
+    let rollback_journal = RollbackJournalStatus {
+        path: rollback_journal_path(&db_path),
+        present: rollback_journal_path(&db_path).exists(),
+    };
+    let recommended_action =
+        build_lock_recommendation(&writer_lock, &rollback_journal, &reindex_command);
+
+    Ok(LockReport {
+        label,
+        source_root,
+        db_path,
+        writer_lock,
+        rollback_journal,
+        reindex_command,
+        recommended_action,
+    })
 }
 
 fn check_summaries(db_path: &Path, index: &IndexStatus) -> Result<SummaryStatus> {
@@ -204,6 +277,92 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
+fn resolve_lock_target(
+    root: &Path,
+    scope: Option<&str>,
+) -> Result<(String, PathBuf, PathBuf, String)> {
+    if let Some(scope_name) = scope {
+        let cfg = config::Config::load(root)?;
+        let Some(source_root) = config::Config::submodule_dirs(root)?
+            .into_iter()
+            .find(|(name, _)| name == scope_name)
+            .map(|(_, path)| path)
+        else {
+            bail!(
+                "no submodule named `{}` found under {}",
+                scope_name,
+                root.display()
+            );
+        };
+        Ok((
+            format!("submodule `{}` index", scope_name),
+            source_root,
+            cfg.db_path_for(root, scope_name),
+            format!("tsift index --submodule {} {}", scope_name, root.display()),
+        ))
+    } else {
+        Ok((
+            "index".to_string(),
+            root.to_path_buf(),
+            root.join(".tsift/index.db"),
+            format!("tsift index {}", root.display()),
+        ))
+    }
+}
+
+fn build_lock_recommendation(
+    writer_lock: &WriterLockStatus,
+    rollback_journal: &RollbackJournalStatus,
+    reindex_command: &str,
+) -> String {
+    match writer_lock {
+        WriterLockStatus::Live { pid, .. } => {
+            let pid_hint = pid
+                .map(|value| format!(" (pid {})", value))
+                .unwrap_or_default();
+            if rollback_journal.present {
+                format!(
+                    "wait for the active tsift writer{} to finish, then run `{}` to rebuild a clean WAL-mode index.",
+                    pid_hint, reindex_command
+                )
+            } else {
+                format!(
+                    "wait for the active tsift writer{} to finish before rerunning `{}`.",
+                    pid_hint, reindex_command
+                )
+            }
+        }
+        WriterLockStatus::Stale { path, .. } | WriterLockStatus::Unknown { path } => {
+            format!(
+                "if no tsift writer is still active, remove `{}` and then run `{}`.",
+                path.display(),
+                reindex_command
+            )
+        }
+        WriterLockStatus::Absent { .. } if rollback_journal.present => format!(
+            "inspect the host for a wedged writer, then run `{}` once writes are healthy. Read-only status checks can use snapshot fallback in the meantime.",
+            reindex_command
+        ),
+        WriterLockStatus::Absent { .. } => "no lock remediation needed".to_string(),
+    }
+}
+
+fn format_recovery_line(recovery: ReadOnlyRecovery, compact: bool) -> String {
+    match (recovery, compact) {
+        (ReadOnlyRecovery::SnapshotFallback, true) => "recovery:snapshot_fallback\n".to_string(),
+        (ReadOnlyRecovery::SnapshotFallback, false) => {
+            "recovery: snapshot fallback (rollback-journal lock on live index)\n".to_string()
+        }
+    }
+}
+
+fn index_recovery(index: &IndexStatus) -> Option<ReadOnlyRecovery> {
+    match index {
+        IndexStatus::Fresh { recovery, .. } | IndexStatus::Stale { recovery, .. } => *recovery,
+        IndexStatus::Missing => None,
+    }
+}
+
 pub fn format_human(report: &StatusReport, compact: bool) -> String {
     let mut out = String::new();
 
@@ -234,6 +393,7 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
             total_files,
             stale_files,
             last_indexed_secs_ago,
+            ..
         } => {
             if compact {
                 out.push_str(&format!(
@@ -251,6 +411,10 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
                 ));
             }
         }
+    }
+
+    if let Some(recovery) = index_recovery(&report.index) {
+        out.push_str(&format_recovery_line(recovery, compact));
     }
 
     match &report.summaries {
@@ -306,6 +470,54 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
         }
     }
 
+    out
+}
+
+pub fn format_locks_human(report: &LockReport, compact: bool) -> String {
+    let lock_line = match &report.writer_lock {
+        WriterLockStatus::Absent { path } => format!("lock: absent {}\n", path.display()),
+        WriterLockStatus::Live { path, pid } => match pid {
+            Some(value) => format!("lock: live pid:{} {}\n", value, path.display()),
+            None => format!("lock: live {}\n", path.display()),
+        },
+        WriterLockStatus::Stale { path, pid } => match pid {
+            Some(value) => format!("lock: stale pid:{} {}\n", value, path.display()),
+            None => format!("lock: stale {}\n", path.display()),
+        },
+        WriterLockStatus::Unknown { path } => format!("lock: unknown {}\n", path.display()),
+    };
+    let journal_line = if report.rollback_journal.present {
+        format!(
+            "journal: present {}\n",
+            report.rollback_journal.path.display()
+        )
+    } else {
+        format!(
+            "journal: absent {}\n",
+            report.rollback_journal.path.display()
+        )
+    };
+
+    let mut out = String::new();
+    if compact {
+        out.push_str(&format!(
+            "target:{} db:{}\n",
+            report.label,
+            report.db_path.display()
+        ));
+        out.push_str(&lock_line);
+        out.push_str(&journal_line);
+        out.push_str(&format!("run:{}\n", report.reindex_command));
+        out.push_str(&format!("next:{}\n", report.recommended_action));
+    } else {
+        out.push_str(&format!("target: {}\n", report.label));
+        out.push_str(&format!("source: {}\n", report.source_root.display()));
+        out.push_str(&format!("db: {}\n", report.db_path.display()));
+        out.push_str(&lock_line);
+        out.push_str(&journal_line);
+        out.push_str(&format!("run: {}\n", report.reindex_command));
+        out.push_str(&format!("next: {}\n", report.recommended_action));
+    }
     out
 }
 
@@ -436,6 +648,7 @@ mod tests {
                 total_files: 42,
                 stale_files: 0,
                 last_indexed_secs_ago: 120,
+                recovery: None,
             },
             summaries: SummaryStatus::Available {
                 cached_files: 30,
@@ -466,6 +679,7 @@ mod tests {
                 total_files: 42,
                 stale_files: 3,
                 last_indexed_secs_ago: 120,
+                recovery: None,
             },
             summaries: SummaryStatus::None,
             recommendations: Recommendations {
@@ -481,5 +695,85 @@ mod tests {
         assert!(output.contains("index: stale tracked:42 stale:3"));
         assert!(output.contains("use: search, explain, graph"));
         assert!(!output.contains("recommendations:"));
+    }
+
+    #[test]
+    fn status_human_format_mentions_snapshot_recovery() {
+        let report = StatusReport {
+            index: IndexStatus::Fresh {
+                total_files: 3,
+                stale_files: 0,
+                last_indexed_secs_ago: 5,
+                recovery: Some(ReadOnlyRecovery::SnapshotFallback),
+            },
+            summaries: SummaryStatus::None,
+            recommendations: Recommendations {
+                use_commands: vec!["search".to_string()],
+                run: None,
+            },
+        };
+        let output = format_human(&report, false);
+        assert!(output.contains("recovery: snapshot fallback"));
+    }
+
+    #[test]
+    fn status_json_includes_recovery_when_snapshot_fallback_is_used() {
+        let report = StatusReport {
+            index: IndexStatus::Fresh {
+                total_files: 1,
+                stale_files: 0,
+                last_indexed_secs_ago: 1,
+                recovery: Some(ReadOnlyRecovery::SnapshotFallback),
+            },
+            summaries: SummaryStatus::None,
+            recommendations: Recommendations {
+                use_commands: vec!["search".to_string()],
+                run: None,
+            },
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"recovery\":\"snapshot_fallback\""));
+    }
+
+    #[test]
+    fn lock_report_marks_live_writer_and_journal() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join(".tsift/index.lock");
+        let journal_path = dir.path().join(".tsift/index.db-journal");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, std::process::id().to_string()).unwrap();
+        std::fs::write(&journal_path, "locked").unwrap();
+
+        let report = check_locks(dir.path(), None).unwrap();
+        assert!(matches!(
+            report.writer_lock,
+            WriterLockStatus::Live { pid: Some(_), .. }
+        ));
+        assert!(report.rollback_journal.present);
+        assert!(
+            report
+                .recommended_action
+                .contains("wait for the active tsift writer")
+        );
+        assert!(report.recommended_action.contains("tsift index"));
+    }
+
+    #[test]
+    fn lock_report_marks_stale_writer_lock() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join(".tsift/index.lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, "999999").unwrap();
+
+        let report = check_locks(dir.path(), None).unwrap();
+        assert!(matches!(
+            report.writer_lock,
+            WriterLockStatus::Stale {
+                pid: Some(999999),
+                ..
+            }
+        ));
+        assert!(report.recommended_action.contains("remove"));
+        assert!(report.recommended_action.contains("tsift index"));
     }
 }
