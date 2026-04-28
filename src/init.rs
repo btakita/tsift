@@ -1,3 +1,4 @@
+use crate::config;
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -18,8 +19,6 @@ Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->"#;
 
 const GITIGNORE_ENTRY: &str = ".tsift/";
-
-const CODEX_HOOK_COMMAND: &str = "tsift index --check --exit-code . >/dev/null 2>&1 || tsift index . >/dev/null 2>&1";
 const CODEX_HOOK_STATUS: &str = "tsift auto-reindex";
 
 pub struct InitResult {
@@ -29,10 +28,23 @@ pub struct InitResult {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CodexHooksResult {
+pub struct CodexHooksResult {
+    pub action: CodexHookAction,
+    pub scope: CodexHookScope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodexHookAction {
     Created,
     Added,
+    Updated,
     AlreadyPresent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodexHookScope {
+    Project,
+    Workspace,
 }
 
 pub struct InstructionUpdate {
@@ -78,13 +90,7 @@ fn ensure_gitignore(dir: &Path) -> Result<bool> {
 }
 
 pub fn resolve_project_dir(path: &Path) -> Result<PathBuf> {
-    let dir = if path.is_file() {
-        path.parent()
-            .ok_or_else(|| anyhow::anyhow!("cannot determine parent of {}", path.display()))?
-            .to_path_buf()
-    } else {
-        path.to_path_buf()
-    };
+    let dir = input_dir(path)?;
 
     let output = Command::new("git")
         .args(["-C", &dir.to_string_lossy(), "rev-parse", "--show-toplevel"])
@@ -99,7 +105,36 @@ pub fn resolve_project_dir(path: &Path) -> Result<PathBuf> {
     }
 }
 
-pub fn init(dir: &Path, codex: bool) -> Result<InitResult> {
+pub fn resolve_workspace_dir(path: &Path) -> Result<PathBuf> {
+    let dir = input_dir(path)?;
+
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &dir.to_string_lossy(),
+            "rev-parse",
+            "--show-superproject-working-tree",
+        ])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let root = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !root.is_empty() {
+                return Ok(PathBuf::from(root));
+            }
+        }
+        _ => {}
+    }
+
+    resolve_project_dir(path)
+}
+
+pub fn has_submodules(dir: &Path) -> Result<bool> {
+    Ok(!config::Config::submodule_dirs(dir)?.is_empty())
+}
+
+pub fn init(dir: &Path, codex: bool, codex_workspace: bool) -> Result<InitResult> {
     let gitignore_added = ensure_gitignore(dir)?;
     let mut updates = Vec::new();
 
@@ -118,7 +153,15 @@ pub fn init(dir: &Path, codex: bool) -> Result<InitResult> {
     }
 
     let codex_hooks = if codex {
-        Some(ensure_codex_hooks(dir)?)
+        let scope = if codex_workspace {
+            if !has_submodules(dir)? {
+                bail!("no submodules found in {}", dir.display());
+            }
+            CodexHookScope::Workspace
+        } else {
+            CodexHookScope::Project
+        };
+        Some(ensure_codex_hooks(dir, scope)?)
     } else {
         None
     };
@@ -172,35 +215,68 @@ fn ensure_instruction_file(file: &Path) -> Result<InitAction> {
     Ok(InitAction::Created)
 }
 
-fn ensure_codex_hooks(dir: &Path) -> Result<CodexHooksResult> {
+fn ensure_codex_hooks(dir: &Path, scope: CodexHookScope) -> Result<CodexHooksResult> {
     let codex_dir = dir.join(".codex");
     let hooks_path = codex_dir.join("hooks.json");
+    let tsift_hook = codex_hook_json(dir, scope);
 
     if hooks_path.exists() {
         let content = std::fs::read_to_string(&hooks_path)?;
         let mut doc: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| anyhow::anyhow!("invalid .codex/hooks.json: {}", e))?;
 
-        if content.contains(CODEX_HOOK_STATUS) {
-            return Ok(CodexHooksResult::AlreadyPresent);
-        }
-
         let hooks_obj = doc
             .as_object_mut()
             .and_then(|o| o.get_mut("hooks"))
             .and_then(|h| h.as_object_mut());
 
-        if let Some(hooks_obj) = hooks_obj {
-            let tsift_hook = serde_json::json!({
-                "command": CODEX_HOOK_COMMAND,
-                "statusMessage": CODEX_HOOK_STATUS,
-                "type": "command"
-            });
+        let Some(hooks_obj) = hooks_obj else {
+            bail!(".codex/hooks.json has unexpected structure (missing \"hooks\" object)");
+        };
 
-            let event_key = "UserPromptSubmit";
-            if let Some(event_arr) = hooks_obj.get_mut(event_key).and_then(|v| v.as_array_mut()) {
+        let event_key = "UserPromptSubmit";
+        let mut action = CodexHookAction::Added;
+
+        if let Some(event_arr) = hooks_obj.get_mut(event_key).and_then(|v| v.as_array_mut()) {
+            let mut matched = false;
+            for group in event_arr.iter_mut() {
+                if let Some(hook_list) = group
+                    .as_object_mut()
+                    .and_then(|g| g.get_mut("hooks"))
+                    .and_then(|h| h.as_array_mut())
+                {
+                    let mut i = 0;
+                    while i < hook_list.len() {
+                        let is_tsift = hook_list[i].get("statusMessage").and_then(|v| v.as_str())
+                            == Some(CODEX_HOOK_STATUS);
+                        if !is_tsift {
+                            i += 1;
+                            continue;
+                        }
+
+                        if !matched {
+                            matched = true;
+                            if hook_list[i] == tsift_hook {
+                                action = CodexHookAction::AlreadyPresent;
+                                i += 1;
+                                continue;
+                            }
+                            hook_list[i] = tsift_hook.clone();
+                            action = CodexHookAction::Updated;
+                            i += 1;
+                        } else {
+                            hook_list.remove(i);
+                            action = CodexHookAction::Updated;
+                        }
+                    }
+                }
+            }
+
+            if !matched {
                 if let Some(first_group) = event_arr.first_mut().and_then(|g| g.as_object_mut()) {
-                    if let Some(hook_list) = first_group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    if let Some(hook_list) =
+                        first_group.get_mut("hooks").and_then(|h| h.as_array_mut())
+                    {
                         hook_list.push(tsift_hook);
                     } else {
                         first_group.insert("hooks".to_string(), serde_json::json!([tsift_hook]));
@@ -208,35 +284,72 @@ fn ensure_codex_hooks(dir: &Path) -> Result<CodexHooksResult> {
                 } else {
                     event_arr.push(serde_json::json!({"hooks": [tsift_hook]}));
                 }
-            } else {
-                hooks_obj.insert(
-                    event_key.to_string(),
-                    serde_json::json!([{"hooks": [tsift_hook]}]),
-                );
             }
         } else {
-            bail!(".codex/hooks.json has unexpected structure (missing \"hooks\" object)");
+            hooks_obj.insert(
+                event_key.to_string(),
+                serde_json::json!([{"hooks": [tsift_hook]}]),
+            );
+        }
+
+        if action == CodexHookAction::AlreadyPresent {
+            return Ok(CodexHooksResult { action, scope });
         }
 
         let formatted = serde_json::to_string_pretty(&doc)?;
         std::fs::write(&hooks_path, format!("{}\n", formatted))?;
-        Ok(CodexHooksResult::Added)
+        Ok(CodexHooksResult { action, scope })
     } else {
         std::fs::create_dir_all(&codex_dir)?;
-        let doc = serde_json::json!({
-            "hooks": {
-                "UserPromptSubmit": [{
-                    "hooks": [{
-                        "command": CODEX_HOOK_COMMAND,
-                        "statusMessage": CODEX_HOOK_STATUS,
-                        "type": "command"
-                    }]
-                }]
-            }
-        });
+        let doc = serde_json::json!({"hooks": {"UserPromptSubmit": [{"hooks": [tsift_hook]}]}});
         let formatted = serde_json::to_string_pretty(&doc)?;
         std::fs::write(&hooks_path, format!("{}\n", formatted))?;
-        Ok(CodexHooksResult::Created)
+        Ok(CodexHooksResult {
+            action: CodexHookAction::Created,
+            scope,
+        })
+    }
+}
+
+fn input_dir(path: &Path) -> Result<PathBuf> {
+    if path.is_file() {
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine parent of {}", path.display()))
+            .map(Path::to_path_buf)
+    } else {
+        Ok(path.to_path_buf())
+    }
+}
+
+fn codex_hook_json(dir: &Path, scope: CodexHookScope) -> serde_json::Value {
+    serde_json::json!({
+        "command": codex_hook_command(dir, scope),
+        "statusMessage": CODEX_HOOK_STATUS,
+        "type": "command"
+    })
+}
+
+fn codex_hook_command(dir: &Path, scope: CodexHookScope) -> String {
+    let quoted_dir = shell_quote(&dir.display().to_string());
+    match scope {
+        CodexHookScope::Project => format!(
+            "tsift index --check --exit-code {} >/dev/null 2>&1 || tsift index {} >/dev/null 2>&1",
+            quoted_dir, quoted_dir
+        ),
+        CodexHookScope::Workspace => format!(
+            "tsift index --check --exit-code --workspace {} >/dev/null 2>&1 || tsift index --workspace {} >/dev/null 2>&1",
+            quoted_dir, quoted_dir
+        ),
+    }
+}
+
+fn shell_quote(s: &str) -> String {
+    if s.chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/')
+    {
+        format!("\"{}\"", s)
+    } else {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     }
 }
 
@@ -248,7 +361,7 @@ mod tests {
     #[test]
     fn init_creates_agents_md_when_none_exists() {
         let dir = TempDir::new().unwrap();
-        let result = init(dir.path(), false).unwrap();
+        let result = init(dir.path(), false, false).unwrap();
         assert_eq!(result.updates.len(), 1);
         assert!(matches!(result.updates[0].action, InitAction::Created));
         assert_eq!(result.updates[0].file.file_name().unwrap(), "AGENTS.md");
@@ -262,7 +375,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let agents = dir.path().join("AGENTS.md");
         std::fs::write(&agents, "# My Project\n\nSome instructions.\n").unwrap();
-        let result = init(dir.path(), false).unwrap();
+        let result = init(dir.path(), false, false).unwrap();
         assert_eq!(result.updates.len(), 1);
         assert!(matches!(result.updates[0].action, InitAction::Created));
         let content = std::fs::read_to_string(&agents).unwrap();
@@ -275,7 +388,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "# Agents\n").unwrap();
         std::fs::write(dir.path().join("CLAUDE.md"), "# Claude\n").unwrap();
-        let result = init(dir.path(), false).unwrap();
+        let result = init(dir.path(), false, false).unwrap();
         assert_eq!(result.updates.len(), 2);
         assert_eq!(result.updates[0].file.file_name().unwrap(), "AGENTS.md");
         assert_eq!(result.updates[1].file.file_name().unwrap(), "CLAUDE.md");
@@ -296,7 +409,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let claude = dir.path().join("CLAUDE.md");
         std::fs::write(&claude, "# Claude\n").unwrap();
-        let result = init(dir.path(), false).unwrap();
+        let result = init(dir.path(), false, false).unwrap();
         assert_eq!(result.updates.len(), 2);
         assert_eq!(result.updates[0].file.file_name().unwrap(), "AGENTS.md");
         assert!(dir.path().join("AGENTS.md").exists());
@@ -315,11 +428,11 @@ mod tests {
         let agents = dir.path().join("AGENTS.md");
         std::fs::write(&agents, "# Project\n").unwrap();
 
-        let r1 = init(dir.path(), false).unwrap();
+        let r1 = init(dir.path(), false, false).unwrap();
         assert!(matches!(r1.updates[0].action, InitAction::Created));
         let content_after_first = std::fs::read_to_string(&agents).unwrap();
 
-        let r2 = init(dir.path(), false).unwrap();
+        let r2 = init(dir.path(), false, false).unwrap();
         assert!(matches!(r2.updates[0].action, InitAction::AlreadyPresent));
         let content_after_second = std::fs::read_to_string(&agents).unwrap();
         assert_eq!(content_after_first, content_after_second);
@@ -335,7 +448,7 @@ mod tests {
         );
         std::fs::write(&agents, format!("# Project\n\n{}\n", old_section)).unwrap();
 
-        let result = init(dir.path(), false).unwrap();
+        let result = init(dir.path(), false, false).unwrap();
         assert!(matches!(result.updates[0].action, InitAction::Updated));
         let content = std::fs::read_to_string(&agents).unwrap();
         assert!(content.contains("tsift search"));
@@ -346,7 +459,7 @@ mod tests {
     #[test]
     fn init_creates_gitignore_with_tsift_entry() {
         let dir = TempDir::new().unwrap();
-        let result = init(dir.path(), false).unwrap();
+        let result = init(dir.path(), false, false).unwrap();
         assert!(result.gitignore_added);
         let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         assert!(content.contains(".tsift/"));
@@ -356,7 +469,7 @@ mod tests {
     fn init_appends_to_existing_gitignore() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join(".gitignore"), "/target\n").unwrap();
-        let result = init(dir.path(), false).unwrap();
+        let result = init(dir.path(), false, false).unwrap();
         assert!(result.gitignore_added);
         let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         assert!(content.contains("/target"));
@@ -367,7 +480,7 @@ mod tests {
     fn init_skips_gitignore_when_already_present() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join(".gitignore"), "/target\n.tsift/\n").unwrap();
-        let result = init(dir.path(), false).unwrap();
+        let result = init(dir.path(), false, false).unwrap();
         assert!(!result.gitignore_added);
         let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         assert_eq!(content.matches(".tsift/").count(), 1);
@@ -377,7 +490,6 @@ mod tests {
     fn resolve_project_dir_returns_dir_for_directory() {
         let dir = TempDir::new().unwrap();
         let resolved = resolve_project_dir(dir.path()).unwrap();
-        // No git repo, so falls back to the directory itself
         assert_eq!(resolved, dir.path());
     }
 
@@ -387,7 +499,6 @@ mod tests {
         let file = dir.path().join("test.md");
         std::fs::write(&file, "content").unwrap();
         let resolved = resolve_project_dir(&file).unwrap();
-        // No git repo, falls back to parent dir
         assert_eq!(resolved, dir.path());
     }
 
@@ -396,7 +507,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let sub = dir.path().join("sub").join("deep");
         std::fs::create_dir_all(&sub).unwrap();
-        // Init a git repo at the top
         Command::new("git")
             .args(["init", &dir.path().to_string_lossy()])
             .output()
@@ -427,6 +537,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_workspace_dir_falls_back_to_project_dir() {
+        let dir = TempDir::new().unwrap();
+        Command::new("git")
+            .args(["init", &dir.path().to_string_lossy()])
+            .output()
+            .unwrap();
+        let resolved = resolve_workspace_dir(dir.path()).unwrap();
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn has_submodules_reads_gitmodules() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".gitmodules"),
+            "[submodule \"src/foo\"]\n\tpath = src/foo\n",
+        )
+        .unwrap();
+        assert!(has_submodules(dir.path()).unwrap());
+    }
+
+    #[test]
     fn init_preserves_surrounding_content() {
         let dir = TempDir::new().unwrap();
         let agents = dir.path().join("AGENTS.md");
@@ -435,7 +570,7 @@ mod tests {
             "# Header\n\nBefore content.\n\n## Footer\n\nAfter content.\n",
         )
         .unwrap();
-        init(dir.path(), false).unwrap();
+        init(dir.path(), false, false).unwrap();
         let content = std::fs::read_to_string(&agents).unwrap();
         assert!(content.contains("# Header"));
         assert!(content.contains("Before content."));
@@ -447,15 +582,24 @@ mod tests {
     #[test]
     fn init_codex_creates_hooks_json() {
         let dir = TempDir::new().unwrap();
-        let result = init(dir.path(), true).unwrap();
-        assert_eq!(result.codex_hooks, Some(CodexHooksResult::Created));
+        let result = init(dir.path(), true, false).unwrap();
+        assert_eq!(
+            result.codex_hooks,
+            Some(CodexHooksResult {
+                action: CodexHookAction::Created,
+                scope: CodexHookScope::Project,
+            })
+        );
         let hooks_path = dir.path().join(".codex/hooks.json");
         assert!(hooks_path.exists());
         let content = std::fs::read_to_string(&hooks_path).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
         let hooks = &doc["hooks"]["UserPromptSubmit"][0]["hooks"];
+        let command = hooks[0]["command"].as_str().unwrap();
         assert_eq!(hooks[0]["statusMessage"], CODEX_HOOK_STATUS);
-        assert!(hooks[0]["command"].as_str().unwrap().contains("tsift index"));
+        assert!(command.contains("tsift index --check --exit-code"));
+        assert!(command.contains(&dir.path().display().to_string()));
+        assert!(!command.contains("--workspace"));
     }
 
     #[test]
@@ -480,28 +624,137 @@ mod tests {
         )
         .unwrap();
 
-        let result = init(dir.path(), true).unwrap();
-        assert_eq!(result.codex_hooks, Some(CodexHooksResult::Added));
+        let result = init(dir.path(), true, false).unwrap();
+        assert_eq!(
+            result.codex_hooks,
+            Some(CodexHooksResult {
+                action: CodexHookAction::Added,
+                scope: CodexHookScope::Project,
+            })
+        );
         let content = std::fs::read_to_string(codex_dir.join("hooks.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let hooks = doc["hooks"]["UserPromptSubmit"][0]["hooks"].as_array().unwrap();
+        let hooks = doc["hooks"]["UserPromptSubmit"][0]["hooks"]
+            .as_array()
+            .unwrap();
         assert_eq!(hooks.len(), 2);
-        assert_eq!(hooks[0]["statusMessage"], "Tracking active agent-doc session");
+        assert_eq!(
+            hooks[0]["statusMessage"],
+            "Tracking active agent-doc session"
+        );
         assert_eq!(hooks[1]["statusMessage"], CODEX_HOOK_STATUS);
     }
 
     #[test]
     fn init_codex_is_idempotent() {
         let dir = TempDir::new().unwrap();
-        let r1 = init(dir.path(), true).unwrap();
-        assert_eq!(r1.codex_hooks, Some(CodexHooksResult::Created));
+        let r1 = init(dir.path(), true, false).unwrap();
+        assert_eq!(
+            r1.codex_hooks,
+            Some(CodexHooksResult {
+                action: CodexHookAction::Created,
+                scope: CodexHookScope::Project,
+            })
+        );
 
-        let r2 = init(dir.path(), true).unwrap();
-        assert_eq!(r2.codex_hooks, Some(CodexHooksResult::AlreadyPresent));
+        let r2 = init(dir.path(), true, false).unwrap();
+        assert_eq!(
+            r2.codex_hooks,
+            Some(CodexHooksResult {
+                action: CodexHookAction::AlreadyPresent,
+                scope: CodexHookScope::Project,
+            })
+        );
 
         let content = std::fs::read_to_string(dir.path().join(".codex/hooks.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let hooks = doc["hooks"]["UserPromptSubmit"][0]["hooks"].as_array().unwrap();
+        let hooks = doc["hooks"]["UserPromptSubmit"][0]["hooks"]
+            .as_array()
+            .unwrap();
+        assert_eq!(hooks.len(), 1);
+    }
+
+    #[test]
+    fn init_codex_updates_existing_project_hook_command() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let existing = serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [{
+                    "hooks": [{
+                        "command": "tsift index --check --exit-code . >/dev/null 2>&1 || tsift index . >/dev/null 2>&1",
+                        "statusMessage": CODEX_HOOK_STATUS,
+                        "type": "command"
+                    }]
+                }]
+            }
+        });
+        std::fs::write(
+            codex_dir.join("hooks.json"),
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        let result = init(dir.path(), true, false).unwrap();
+        assert_eq!(
+            result.codex_hooks,
+            Some(CodexHooksResult {
+                action: CodexHookAction::Updated,
+                scope: CodexHookScope::Project,
+            })
+        );
+        let content = std::fs::read_to_string(codex_dir.join("hooks.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let command = doc["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(command.contains(&dir.path().display().to_string()));
+        assert!(!command.contains("--workspace"));
+    }
+
+    #[test]
+    fn init_codex_deduplicates_existing_tsift_hooks() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let existing = serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [{
+                    "hooks": [
+                        {
+                            "command": "tsift index --check --exit-code . >/dev/null 2>&1 || tsift index . >/dev/null 2>&1",
+                            "statusMessage": CODEX_HOOK_STATUS,
+                            "type": "command"
+                        },
+                        {
+                            "command": "tsift index --check --exit-code . >/dev/null 2>&1 || tsift index . >/dev/null 2>&1",
+                            "statusMessage": CODEX_HOOK_STATUS,
+                            "type": "command"
+                        }
+                    ]
+                }]
+            }
+        });
+        std::fs::write(
+            codex_dir.join("hooks.json"),
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        let result = init(dir.path(), true, false).unwrap();
+        assert_eq!(
+            result.codex_hooks,
+            Some(CodexHooksResult {
+                action: CodexHookAction::Updated,
+                scope: CodexHookScope::Project,
+            })
+        );
+        let content = std::fs::read_to_string(codex_dir.join("hooks.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let hooks = doc["hooks"]["UserPromptSubmit"][0]["hooks"]
+            .as_array()
+            .unwrap();
         assert_eq!(hooks.len(), 1);
     }
 
@@ -527,20 +780,104 @@ mod tests {
         )
         .unwrap();
 
-        let result = init(dir.path(), true).unwrap();
-        assert_eq!(result.codex_hooks, Some(CodexHooksResult::Added));
+        let result = init(dir.path(), true, false).unwrap();
+        assert_eq!(
+            result.codex_hooks,
+            Some(CodexHooksResult {
+                action: CodexHookAction::Added,
+                scope: CodexHookScope::Project,
+            })
+        );
         let content = std::fs::read_to_string(codex_dir.join("hooks.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(doc["hooks"]["Stop"].is_array());
-        let ups_hooks = doc["hooks"]["UserPromptSubmit"][0]["hooks"].as_array().unwrap();
+        let ups_hooks = doc["hooks"]["UserPromptSubmit"][0]["hooks"]
+            .as_array()
+            .unwrap();
         assert_eq!(ups_hooks.len(), 1);
         assert_eq!(ups_hooks[0]["statusMessage"], CODEX_HOOK_STATUS);
     }
 
     #[test]
+    fn init_codex_creates_workspace_hook_for_submodules() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".gitmodules"),
+            "[submodule \"src/alpha\"]\n\tpath = src/alpha\n",
+        )
+        .unwrap();
+
+        let result = init(dir.path(), true, true).unwrap();
+        assert_eq!(
+            result.codex_hooks,
+            Some(CodexHooksResult {
+                action: CodexHookAction::Created,
+                scope: CodexHookScope::Workspace,
+            })
+        );
+        let content = std::fs::read_to_string(dir.path().join(".codex/hooks.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let command = doc["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(command.contains("--workspace"));
+        assert!(command.contains(&dir.path().display().to_string()));
+    }
+
+    #[test]
+    fn init_codex_updates_project_hook_to_workspace_hook() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".gitmodules"),
+            "[submodule \"src/alpha\"]\n\tpath = src/alpha\n",
+        )
+        .unwrap();
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let existing = serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [{
+                    "hooks": [{
+                        "command": "tsift index --check --exit-code . >/dev/null 2>&1 || tsift index . >/dev/null 2>&1",
+                        "statusMessage": CODEX_HOOK_STATUS,
+                        "type": "command"
+                    }]
+                }]
+            }
+        });
+        std::fs::write(
+            codex_dir.join("hooks.json"),
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        let result = init(dir.path(), true, true).unwrap();
+        assert_eq!(
+            result.codex_hooks,
+            Some(CodexHooksResult {
+                action: CodexHookAction::Updated,
+                scope: CodexHookScope::Workspace,
+            })
+        );
+        let content = std::fs::read_to_string(codex_dir.join("hooks.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let command = doc["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(command.contains("--workspace"));
+    }
+
+    #[test]
+    fn init_workspace_hook_requires_submodules() {
+        let dir = TempDir::new().unwrap();
+        let err = init(dir.path(), true, true).err().unwrap().to_string();
+        assert!(err.contains("no submodules found"));
+    }
+
+    #[test]
     fn init_without_codex_flag_skips_hooks() {
         let dir = TempDir::new().unwrap();
-        let result = init(dir.path(), false).unwrap();
+        let result = init(dir.path(), false, false).unwrap();
         assert!(result.codex_hooks.is_none());
         assert!(!dir.path().join(".codex/hooks.json").exists());
     }

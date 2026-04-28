@@ -23,7 +23,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift lint` | Markdown lint: detect unannotated concepts (symbols, headings, bold terms) cross-referenced against graph entities. `--index <dir>` / `--entities-from <file>` / `--json` |
 | `tsift status` | Session health check: index freshness, summary cache, recommended commands. `--json` for structured output |
 | `tsift locks` | Diagnose `index.lock` / `index.db-journal` state and recommend the next recovery step. `--scope <name>` / `--json` |
-| `tsift init` | Project setup: ensure Code Navigation section in AGENTS.md and mirror it into CLAUDE.md when present. Idempotent — safe to re-run after upgrades. |
+| `tsift init` | Project setup: ensure Code Navigation section in AGENTS.md and mirror it into CLAUDE.md when present. `--codex` injects or updates a repo-aware autoindex hook; `--workspace` resolves to the parent workspace root. |
 
 Global flags: `--compact` reduces human-readable output volume (abbreviated kind/match_type labels, shorter section headers like `syms`, `crs`, `ces`, `comm`). `--pretty` switches JSON output from compact (default) to indented format. `--terse` outputs JSON with abbreviated field names and inline schema (implies `--json`). `--schema` converts repeated object arrays to columnar `{"_c":[cols],"_r":[[vals],...]}` format (implies `--json`; combines with `--terse`). `--absolute` shows full filesystem paths instead of project-relative (relative is default for token savings). `--tabular` outputs repeated structures as TSV with header row (search, graph, communities, explain).
 
@@ -71,7 +71,7 @@ cargo install --path .   # install to ~/.cargo/bin/
 
 ## Hook Integration
 
-- **Auto-reindex** (`UserPromptSubmit`): `examples/hooks/tsift-autoindex.sh` runs `tsift index --check --exit-code .` on every prompt, auto-reindexes when stale. Install via `.claude/settings.json`.
+- **Auto-reindex** (`UserPromptSubmit`): `examples/hooks/tsift-autoindex.sh` resolves the git root, runs `tsift index --check --exit-code <root>`, and automatically switches to `--workspace` when the root has `.gitmodules`, so one hook covers initialized submodules. Install via `.claude/settings.json`.
 - **Unhooked fallback**: `tsift search` now autoindexes missing or stale indexes by default. Use `--no-autoindex` when you want the old fail-fast stale check instead of a write.
 - **Locked freshness prechecks**: search stale checks now use the same rollback-journal snapshot fallback as `tsift status` / `tsift index --check`, so `--scope`, `--federated`, and `--no-autoindex` do not regress back to raw `database is locked` failures.
 - **Inline lock diagnostics**: if `tsift search` autoindex or `tsift index` still loses a write race, stderr now includes the live `lock` / `journal` state, the exact reindex command, and the recommended next step without requiring a separate `tsift locks`.

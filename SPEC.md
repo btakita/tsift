@@ -608,6 +608,7 @@ tsift init                              # ensure AGENTS.md (and CLAUDE.md if pre
 tsift init <path>                       # inject at <path> (dir or file)
 tsift init src/sub/tasks/plan.md        # resolves to submodule root src/sub/
 tsift init --codex                      # also inject auto-reindex hook into .codex/hooks.json
+tsift init --codex --workspace          # resolve to workspace root + install one workspace hook
 ```
 
 ### Path Resolution
@@ -620,6 +621,8 @@ tsift init --codex                      # also inject auto-reindex hook into .co
 
 This means `tsift init src/session-share/tasks/claudescore-3.md` resolves to `src/session-share/` — the submodule root — and initializes there. When the resolved path differs from the input, a `resolved: <input> → <target>` line is printed.
 
+With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject-working-tree`. When invoked inside a submodule, that promotes the target to the parent workspace root before the normal git-root fallback.
+
 ### Behavior
 
 1. Adds `.tsift/` to `.gitignore` (creates the file if needed, appends if entry missing, skips if already present)
@@ -627,7 +630,8 @@ This means `tsift init src/session-share/tasks/claudescore-3.md` resolves to `sr
 3. If `CLAUDE.md` exists, updates or appends the same section there too
 4. If the section already exists (detected by `<!-- tsift:code-navigation -->` markers), updates it in place
 5. Idempotent — running twice produces no changes on the second run
-6. With `--codex`: merges a `UserPromptSubmit` auto-reindex hook into `.codex/hooks.json` (creates the file and directory if needed, appends to existing hooks, idempotent)
+6. With `--codex`: merges a `UserPromptSubmit` auto-reindex hook into `.codex/hooks.json` (creates the file and directory if needed, updates stale tsift commands in place, removes duplicate tsift hook entries, idempotent)
+7. When the resolved target has `.gitmodules`, the Codex hook automatically uses `tsift index --check --exit-code --workspace <root>` / `tsift index --workspace <root>` so one root hook covers initialized submodules. `--workspace` makes that root resolution explicit from inside a submodule.
 
 ### Injected Section
 
@@ -830,9 +834,7 @@ api_key_env = "ANTHROPIC_API_KEY"    # env var for API key
 }
 ```
 
-The hook runs `tsift index --check --exit-code .` silently on every prompt. If the index is stale, it runs `tsift index .` to rebuild incrementally. When the index is fresh, the check completes in ~50ms with no side effects.
-
-For workspace mode, replace `. ` with `--workspace` in the hook.
+The hook resolves the git root first, then runs `tsift index --check --exit-code <root>` silently on every prompt. If the repo root has `.gitmodules`, it automatically switches to `tsift index --check --exit-code --workspace <root>` so one root hook covers initialized submodules. When the index is stale, it runs the matching `tsift index ...` rebuild command. When the index is fresh, the check completes in ~50ms with no side effects.
 
 ### Search Rewrite (`PreToolUse`)
 

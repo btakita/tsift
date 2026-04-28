@@ -271,6 +271,9 @@ enum Commands {
         /// Also inject auto-reindex hook into .codex/hooks.json
         #[arg(long)]
         codex: bool,
+        /// Resolve to the workspace root and install a workspace-wide hook
+        #[arg(long)]
+        workspace: bool,
     },
     /// Cached LLM analysis — pre-computed summaries, entities, relationships
     Summarize {
@@ -533,7 +536,11 @@ fn main() -> Result<()> {
             terse,
             schema,
         ),
-        Some(Commands::Init { path, codex }) => cmd_init(&path, codex),
+        Some(Commands::Init {
+            path,
+            codex,
+            workspace,
+        }) => cmd_init(&path, codex, workspace),
         Some(Commands::Lint {
             file,
             index,
@@ -3156,12 +3163,17 @@ fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn cmd_init(path: &std::path::Path, codex: bool) -> Result<()> {
-    let resolved = init::resolve_project_dir(path)?;
+fn cmd_init(path: &std::path::Path, codex: bool, workspace: bool) -> Result<()> {
+    let resolved = if workspace {
+        init::resolve_workspace_dir(path)?
+    } else {
+        init::resolve_project_dir(path)?
+    };
     if resolved != path {
         println!("resolved: {} → {}", path.display(), resolved.display());
     }
-    let result = init::init(&resolved, codex)?;
+    let codex_workspace = codex && (workspace || init::has_submodules(&resolved)?);
+    let result = init::init(&resolved, codex, codex_workspace)?;
     for update in result.updates {
         println!(
             "{}: {} ({})",
@@ -3178,15 +3190,34 @@ fn cmd_init(path: &std::path::Path, codex: bool) -> Result<()> {
         println!(".gitignore: added .tsift/");
     }
     if let Some(codex_result) = &result.codex_hooks {
-        match codex_result {
-            init::CodexHooksResult::Added => {
-                println!(".codex/hooks.json: tsift auto-reindex hook added");
+        let scope_label = match codex_result.scope {
+            init::CodexHookScope::Project => "project",
+            init::CodexHookScope::Workspace => "workspace",
+        };
+        match codex_result.action {
+            init::CodexHookAction::Added => {
+                println!(
+                    ".codex/hooks.json: tsift {} auto-reindex hook added",
+                    scope_label
+                );
             }
-            init::CodexHooksResult::AlreadyPresent => {
-                println!(".codex/hooks.json: tsift hook already present");
+            init::CodexHookAction::Updated => {
+                println!(
+                    ".codex/hooks.json: tsift {} auto-reindex hook updated",
+                    scope_label
+                );
             }
-            init::CodexHooksResult::Created => {
-                println!(".codex/hooks.json: created with tsift auto-reindex hook");
+            init::CodexHookAction::AlreadyPresent => {
+                println!(
+                    ".codex/hooks.json: tsift {} hook already present",
+                    scope_label
+                );
+            }
+            init::CodexHookAction::Created => {
+                println!(
+                    ".codex/hooks.json: created with tsift {} auto-reindex hook",
+                    scope_label
+                );
             }
         }
     }
