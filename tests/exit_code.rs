@@ -1,5 +1,7 @@
+use fs4::fs_std::FileExt;
 use rusqlite::Connection;
 use std::fs;
+use std::fs::OpenOptions;
 use std::process::Command;
 
 fn tsift_bin() -> Command {
@@ -12,6 +14,20 @@ fn hold_rollback_journal_lock(db_path: &std::path::Path) -> Connection {
         .unwrap();
     fs::write(format!("{}-journal", db_path.display()), "locked").unwrap();
     conn
+}
+
+fn hold_writer_lock(lock_path: &std::path::Path) -> std::fs::File {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .unwrap();
+    assert!(file.try_lock_exclusive().unwrap());
+    use std::io::Write;
+    writeln!(file, "{}", std::process::id()).unwrap();
+    file
 }
 
 #[test]
@@ -247,11 +263,7 @@ fn search_autoindex_fails_fast_when_writer_lock_exists() {
         "fn helper() {}\nfn main() { helper(); }",
     )
     .unwrap();
-    fs::write(
-        dir.path().join(".tsift/index.lock"),
-        std::process::id().to_string(),
-    )
-    .unwrap();
+    let _lock = hold_writer_lock(&dir.path().join(".tsift/index.lock"));
 
     let output = tsift_bin()
         .args([
@@ -285,11 +297,7 @@ fn index_check_stays_read_only_while_writer_lock_exists() {
         .unwrap();
     assert!(status.success());
 
-    fs::write(
-        dir.path().join(".tsift/index.lock"),
-        std::process::id().to_string(),
-    )
-    .unwrap();
+    let _lock = hold_writer_lock(&dir.path().join(".tsift/index.lock"));
 
     let status = tsift_bin()
         .args([

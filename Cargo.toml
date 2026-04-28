@@ -10,6 +10,7 @@ authors = ["Brian Takita <brian.takita@gmail.com>"]
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+fs4 = "0.13"
 ignore = "0.4"
 rusqlite = { version = "0.34", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

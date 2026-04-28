@@ -2,13 +2,15 @@ use crate::graph;
 use crate::lang::Lang;
 use crate::walk::{self, FileEntry, PruneStats};
 use anyhow::{Context, Result, bail};
+use fs4::fs_std::FileExt;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tagpath::parser as tagpath_parser;
@@ -20,12 +22,13 @@ pub struct IndexDb {
 }
 
 struct WriteLockGuard {
-    path: PathBuf,
+    file: File,
 }
 
 impl Drop for WriteLockGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = clear_lock_metadata(&mut self.file);
+        let _ = self.file.unlock();
     }
 }
 
@@ -897,41 +900,37 @@ fn acquire_write_lock(db_path: &Path) -> Result<WriteLockGuard> {
             .with_context(|| format!("creating lock dir: {}", parent.display()))?;
     }
 
-    for _ in 0..2 {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(mut lock_file) => {
-                use std::io::Write;
-                writeln!(lock_file, "{}", std::process::id())
-                    .with_context(|| format!("writing {}", lock_path.display()))?;
-                return Ok(WriteLockGuard { path: lock_path });
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                if clear_stale_lock_if_possible(&lock_path)? {
-                    continue;
-                }
-                let holder = read_lock_pid(&lock_path)
-                    .map(|pid| format!(" (pid {})", pid))
-                    .unwrap_or_default();
-                bail!(
-                    "another tsift index writer is already active for {}{} (lock: {}). \
-                     A concurrent `tsift index` or `tsift search --autoindex` is already updating this index; \
-                     wait for it to finish, or remove the lock file if that writer crashed.",
-                    db_path.display(),
-                    holder,
-                    lock_path.display()
-                );
-            }
-            Err(err) => {
-                return Err(err).with_context(|| format!("creating {}", lock_path.display()));
-            }
-        }
-    }
+    let mut lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
 
-    unreachable!("lock acquisition retries are bounded")
+    match lock_file.try_lock_exclusive() {
+        Ok(true) => {
+            write_lock_pid(&mut lock_file, &lock_path)?;
+            Ok(WriteLockGuard { file: lock_file })
+        }
+        Ok(false) => {
+            let holder = match read_lock_marker(&mut lock_file)
+                .with_context(|| format!("reading {}", lock_path.display()))?
+            {
+                LockFileMarker::Pid(pid) => format!(" (pid {})", pid),
+                _ => String::new(),
+            };
+            bail!(
+                "another tsift index writer is already active for {}{} (lock: {}). \
+                 A concurrent `tsift index` or `tsift search --autoindex` is already updating this index; \
+                 wait for it to finish before retrying.",
+                db_path.display(),
+                holder,
+                lock_path.display()
+            );
+        }
+        Err(err) => Err(err).with_context(|| format!("locking {}", lock_path.display())),
+    }
 }
 
 pub(crate) fn writer_lock_path(db_path: &Path) -> PathBuf {
@@ -942,16 +941,70 @@ pub(crate) fn writer_lock_path(db_path: &Path) -> PathBuf {
     db_path.with_file_name(format!("{stem}.lock"))
 }
 
-fn clear_stale_lock_if_possible(lock_path: &Path) -> Result<bool> {
-    let Some(pid) = read_lock_pid(lock_path) else {
-        return Ok(false);
-    };
-    if process_exists(pid) {
-        return Ok(false);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockFileMarker {
+    Empty,
+    Pid(u32),
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WriterLockProbe {
+    Absent { path: PathBuf },
+    Live { path: PathBuf, pid: Option<u32> },
+    Stale { path: PathBuf, pid: Option<u32> },
+    Unknown { path: PathBuf },
+}
+
+pub(crate) fn probe_writer_lock(lock_path: &Path) -> Result<WriterLockProbe> {
+    if !lock_path.exists() {
+        return Ok(WriterLockProbe::Absent {
+            path: lock_path.to_path_buf(),
+        });
     }
-    std::fs::remove_file(lock_path)
-        .with_context(|| format!("removing stale lock {}", lock_path.display()))?;
-    Ok(true)
+
+    let mut lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+
+    match lock_file.try_lock_exclusive() {
+        Ok(true) => {
+            let marker = read_lock_marker(&mut lock_file)
+                .with_context(|| format!("reading {}", lock_path.display()))?;
+            lock_file
+                .unlock()
+                .with_context(|| format!("unlocking {}", lock_path.display()))?;
+            Ok(match marker {
+                LockFileMarker::Empty => WriterLockProbe::Absent {
+                    path: lock_path.to_path_buf(),
+                },
+                LockFileMarker::Pid(pid) => WriterLockProbe::Stale {
+                    path: lock_path.to_path_buf(),
+                    pid: Some(pid),
+                },
+                LockFileMarker::Invalid => WriterLockProbe::Unknown {
+                    path: lock_path.to_path_buf(),
+                },
+            })
+        }
+        Ok(false) => {
+            let marker = read_lock_marker(&mut lock_file)
+                .with_context(|| format!("reading {}", lock_path.display()))?;
+            Ok(match marker {
+                LockFileMarker::Pid(pid) => WriterLockProbe::Live {
+                    path: lock_path.to_path_buf(),
+                    pid: Some(pid),
+                },
+                LockFileMarker::Empty | LockFileMarker::Invalid => WriterLockProbe::Live {
+                    path: lock_path.to_path_buf(),
+                    pid: None,
+                },
+            })
+        }
+        Err(err) => Err(err).with_context(|| format!("locking {}", lock_path.display())),
+    }
 }
 
 fn should_retry_read_only_with_snapshot(db_path: &Path, err: &anyhow::Error) -> bool {
@@ -983,19 +1036,37 @@ pub(crate) fn error_mentions_locked_db(err: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains("database is locked"))
 }
 
-pub(crate) fn read_lock_pid(lock_path: &Path) -> Option<u32> {
-    let content = std::fs::read_to_string(lock_path).ok()?;
-    content.trim().parse().ok()
+fn read_lock_marker(file: &mut File) -> std::io::Result<LockFileMarker> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        Ok(LockFileMarker::Empty)
+    } else if let Ok(pid) = trimmed.parse::<u32>() {
+        Ok(LockFileMarker::Pid(pid))
+    } else {
+        Ok(LockFileMarker::Invalid)
+    }
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn process_exists(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
+fn write_lock_pid(file: &mut File, lock_path: &Path) -> Result<()> {
+    file.set_len(0)
+        .with_context(|| format!("clearing {}", lock_path.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("seeking {}", lock_path.display()))?;
+    writeln!(file, "{}", std::process::id())
+        .with_context(|| format!("writing {}", lock_path.display()))?;
+    file.sync_data()
+        .with_context(|| format!("syncing {}", lock_path.display()))?;
+    Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn process_exists(_pid: u32) -> bool {
-    true
+fn clear_lock_metadata(file: &mut File) -> std::io::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.sync_data()?;
+    Ok(())
 }
 
 fn compute_tags(name: &str) -> String {
@@ -1799,7 +1870,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join(".tsift/index.lock");
         fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        fs::write(&lock_path, std::process::id().to_string()).unwrap();
+        let mut lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        lock_file.try_lock_exclusive().unwrap();
+        write_lock_pid(&mut lock_file, &lock_path).unwrap();
 
         let err = match IndexDb::open(&dir.path().join(".tsift/index.db")) {
             Ok(_) => panic!("expected writer lock conflict"),
@@ -1811,7 +1890,7 @@ mod tests {
     }
 
     #[test]
-    fn open_removes_stale_writer_lock() {
+    fn open_reuses_stale_writer_lock_file() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join(".tsift/index.lock");
         fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
@@ -1823,6 +1902,17 @@ mod tests {
             assert_eq!(contents.trim(), std::process::id().to_string());
         }
 
-        assert!(!lock_path.exists());
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), "");
+    }
+
+    #[test]
+    fn probe_writer_lock_ignores_empty_unlocked_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".tsift/index.lock");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::write(&lock_path, "").unwrap();
+
+        let probe = probe_writer_lock(&lock_path).unwrap();
+        assert!(matches!(probe, WriterLockProbe::Absent { .. }));
     }
 }

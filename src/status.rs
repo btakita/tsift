@@ -1,6 +1,6 @@
 use crate::config;
 use crate::index::{
-    IndexDb, ReadOnlyRecovery, process_exists, read_lock_pid, rollback_journal_path,
+    IndexDb, ReadOnlyRecovery, WriterLockProbe, probe_writer_lock, rollback_journal_path,
     writer_lock_path,
 };
 use crate::init::{self, InstructionStatus};
@@ -144,20 +144,11 @@ fn check_index(db_path: &Path, root: &Path) -> Result<IndexStatus> {
 pub fn check_locks(root: &Path, scope: Option<&str>) -> Result<LockReport> {
     let (label, source_root, db_path, reindex_command) = resolve_lock_target(root, scope)?;
     let lock_path = writer_lock_path(&db_path);
-    let writer_lock = if !lock_path.exists() {
-        WriterLockStatus::Absent { path: lock_path }
-    } else {
-        match read_lock_pid(&lock_path) {
-            Some(pid) if process_exists(pid) => WriterLockStatus::Live {
-                path: lock_path,
-                pid: Some(pid),
-            },
-            Some(pid) => WriterLockStatus::Stale {
-                path: lock_path,
-                pid: Some(pid),
-            },
-            None => WriterLockStatus::Unknown { path: lock_path },
-        }
+    let writer_lock = match probe_writer_lock(&lock_path)? {
+        WriterLockProbe::Absent { path } => WriterLockStatus::Absent { path },
+        WriterLockProbe::Live { path, pid } => WriterLockStatus::Live { path, pid },
+        WriterLockProbe::Stale { path, pid } => WriterLockStatus::Stale { path, pid },
+        WriterLockProbe::Unknown { path } => WriterLockStatus::Unknown { path },
     };
     let rollback_journal = RollbackJournalStatus {
         path: rollback_journal_path(&db_path),
@@ -363,7 +354,7 @@ fn build_lock_recommendation(
         }
         WriterLockStatus::Stale { path, .. } | WriterLockStatus::Unknown { path } => {
             format!(
-                "if no tsift writer is still active, remove `{}` and then run `{}`.",
+                "the lock sidecar at `{}` is stale metadata only; rerun `{}` and tsift will reuse it automatically.",
                 path.display(),
                 reindex_command
             )
@@ -598,6 +589,8 @@ pub fn format_locks_human(report: &LockReport, compact: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs4::fs_std::FileExt;
+    use std::fs::OpenOptions;
     use tempfile::TempDir;
 
     #[test]
@@ -835,7 +828,16 @@ mod tests {
         let lock_path = dir.path().join(".tsift/index.lock");
         let journal_path = dir.path().join(".tsift/index.db-journal");
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        std::fs::write(&lock_path, std::process::id().to_string()).unwrap();
+        let mut lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        assert!(lock_file.try_lock_exclusive().unwrap());
+        use std::io::Write;
+        writeln!(lock_file, "{}", std::process::id()).unwrap();
         std::fs::write(&journal_path, "locked").unwrap();
 
         let report = check_locks(dir.path(), None).unwrap();
@@ -867,7 +869,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(report.recommended_action.contains("remove"));
+        assert!(report.recommended_action.contains("reuse it automatically"));
         assert!(report.recommended_action.contains("tsift index"));
     }
 
