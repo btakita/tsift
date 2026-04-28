@@ -4,6 +4,8 @@ use crate::walk::{self, FileEntry, PruneStats};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::OpenOptions;
@@ -35,6 +37,73 @@ impl Drop for SnapshotCopyGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_APPLY_CHANGES_AFTER_FILE_MUTATIONS: Cell<bool> = const { Cell::new(false) };
+    static FAIL_REBUILD_AFTER_CLEAR: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+enum TestFailpoint {
+    ApplyChangesAfterFileMutations,
+    RebuildAfterClear,
+}
+
+#[cfg(test)]
+struct TestFailpointGuard(TestFailpoint);
+
+#[cfg(test)]
+impl Drop for TestFailpointGuard {
+    fn drop(&mut self) {
+        match self.0 {
+            TestFailpoint::ApplyChangesAfterFileMutations => {
+                FAIL_APPLY_CHANGES_AFTER_FILE_MUTATIONS.with(|flag| flag.set(false));
+            }
+            TestFailpoint::RebuildAfterClear => {
+                FAIL_REBUILD_AFTER_CLEAR.with(|flag| flag.set(false));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn arm_apply_changes_failpoint() -> TestFailpointGuard {
+    FAIL_APPLY_CHANGES_AFTER_FILE_MUTATIONS.with(|flag| flag.set(true));
+    TestFailpointGuard(TestFailpoint::ApplyChangesAfterFileMutations)
+}
+
+#[cfg(test)]
+fn arm_rebuild_failpoint() -> TestFailpointGuard {
+    FAIL_REBUILD_AFTER_CLEAR.with(|flag| flag.set(true));
+    TestFailpointGuard(TestFailpoint::RebuildAfterClear)
+}
+
+#[cfg(test)]
+fn maybe_fail_apply_changes_after_file_mutations() -> Result<()> {
+    if FAIL_APPLY_CHANGES_AFTER_FILE_MUTATIONS.with(|flag| flag.replace(false)) {
+        bail!("injected apply_changes failure after file mutations");
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_fail_apply_changes_after_file_mutations() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_fail_rebuild_after_clear() -> Result<()> {
+    if FAIL_REBUILD_AFTER_CLEAR.with(|flag| flag.replace(false)) {
+        bail!("injected rebuild failure after clearing index tables");
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_fail_rebuild_after_clear() -> Result<()> {
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -487,113 +556,144 @@ impl IndexDb {
             prune_stats,
         };
 
-        let mut insert_file = self.conn.prepare(
-            "INSERT OR REPLACE INTO file_state (path, mtime_secs, mtime_nanos, language) VALUES (?1, ?2, ?3, ?4)"
-        )?;
-        let mut delete_file = self
-            .conn
-            .prepare("DELETE FROM file_state WHERE path = ?1")?;
-        let mut delete_symbols = self.conn.prepare("DELETE FROM symbols WHERE file = ?1")?;
-        let mut insert_symbol = self.conn.prepare(
-            "INSERT INTO symbols (name, kind, language, signature, file, line, end_line, parent_module, visibility, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
-        )?;
-        let mut delete_edges = self
-            .conn
-            .prepare("DELETE FROM call_edges WHERE caller_file = ?1")?;
-        let mut insert_edge = self.conn.prepare(
-            "INSERT INTO call_edges (caller_file, caller_name, caller_line, callee_name, call_site_line) VALUES (?1, ?2, ?3, ?4, ?5)"
-        )?;
+        self.conn.execute_batch("SAVEPOINT sp_apply")?;
+        let apply_result: Result<()> = (|| {
+            let mut insert_file = self.conn.prepare(
+                "INSERT OR REPLACE INTO file_state (path, mtime_secs, mtime_nanos, language) VALUES (?1, ?2, ?3, ?4)"
+            )?;
+            let mut delete_file = self
+                .conn
+                .prepare("DELETE FROM file_state WHERE path = ?1")?;
+            let mut delete_symbols = self.conn.prepare("DELETE FROM symbols WHERE file = ?1")?;
+            let mut insert_symbol = self.conn.prepare(
+                "INSERT INTO symbols (name, kind, language, signature, file, line, end_line, parent_module, visibility, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+            )?;
+            let mut delete_edges = self
+                .conn
+                .prepare("DELETE FROM call_edges WHERE caller_file = ?1")?;
+            let mut insert_edge = self.conn.prepare(
+                "INSERT INTO call_edges (caller_file, caller_name, caller_line, callee_name, call_site_line) VALUES (?1, ?2, ?3, ?4, ?5)"
+            )?;
 
-        for change in &summary.changes {
-            let path_str = change.path.to_string_lossy();
-            match change.kind {
-                ChangeKind::New | ChangeKind::Modified => {
-                    let metadata = std::fs::metadata(&change.path)
-                        .with_context(|| format!("stat {}", change.path.display()))?;
-                    let mtime = metadata.modified()?;
-                    let (secs, nanos) = system_time_to_pair(mtime);
-                    insert_file.execute(rusqlite::params![
-                        &path_str,
-                        secs,
-                        nanos,
-                        change.language.as_deref().unwrap_or("unknown"),
-                    ])?;
+            for change in &summary.changes {
+                let path_str = change.path.to_string_lossy();
+                match change.kind {
+                    ChangeKind::New | ChangeKind::Modified => {
+                        let metadata = std::fs::metadata(&change.path)
+                            .with_context(|| format!("stat {}", change.path.display()))?;
+                        let mtime = metadata.modified()?;
+                        let (secs, nanos) = system_time_to_pair(mtime);
+                        insert_file.execute(rusqlite::params![
+                            &path_str,
+                            secs,
+                            nanos,
+                            change.language.as_deref().unwrap_or("unknown"),
+                        ])?;
 
-                    delete_symbols.execute(rusqlite::params![&path_str])?;
-                    delete_edges.execute(rusqlite::params![&path_str])?;
-                    let lang = change
-                        .path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .and_then(Lang::from_extension);
-                    if let Some(lang) = lang {
-                        let source = std::fs::read(&change.path).ok();
-                        let symbols = source.as_ref().and_then(|s| lang.extract_symbols(s).ok());
-                        if let Some(ref symbols) = symbols {
-                            let lang_name = lang.name();
-                            for sym in symbols {
-                                let tags = compute_tags(&sym.name);
-                                insert_symbol.execute(rusqlite::params![
-                                    sym.name,
-                                    sym.kind,
-                                    lang_name,
-                                    Option::<String>::None,
-                                    &path_str,
-                                    sym.line as i64,
-                                    sym.end_line as i64,
-                                    Option::<String>::None,
-                                    Option::<String>::None,
-                                    tags,
-                                ])?;
-                            }
-                        }
-                        if let Some(ref source) = source {
-                            let call_sites = graph::extract_call_sites(lang, source).ok();
-                            if let (Some(sites), Some(symbols)) = (call_sites, &symbols) {
-                                let edges = graph::resolve_edges(symbols, &sites);
-                                for edge in &edges {
-                                    insert_edge.execute(rusqlite::params![
+                        delete_symbols.execute(rusqlite::params![&path_str])?;
+                        delete_edges.execute(rusqlite::params![&path_str])?;
+                        let lang = change
+                            .path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .and_then(Lang::from_extension);
+                        if let Some(lang) = lang {
+                            let source = std::fs::read(&change.path).ok();
+                            let symbols =
+                                source.as_ref().and_then(|s| lang.extract_symbols(s).ok());
+                            if let Some(ref symbols) = symbols {
+                                let lang_name = lang.name();
+                                for sym in symbols {
+                                    let tags = compute_tags(&sym.name);
+                                    insert_symbol.execute(rusqlite::params![
+                                        sym.name,
+                                        sym.kind,
+                                        lang_name,
+                                        Option::<String>::None,
                                         &path_str,
-                                        edge.caller,
-                                        edge.caller_line as i64,
-                                        edge.callee,
-                                        edge.call_site_line as i64,
+                                        sym.line as i64,
+                                        sym.end_line as i64,
+                                        Option::<String>::None,
+                                        Option::<String>::None,
+                                        tags,
                                     ])?;
+                                }
+                            }
+                            if let Some(ref source) = source {
+                                let call_sites = graph::extract_call_sites(lang, source).ok();
+                                if let (Some(sites), Some(symbols)) = (call_sites, &symbols) {
+                                    let edges = graph::resolve_edges(symbols, &sites);
+                                    for edge in &edges {
+                                        insert_edge.execute(rusqlite::params![
+                                            &path_str,
+                                            edge.caller,
+                                            edge.caller_line as i64,
+                                            edge.callee,
+                                            edge.call_site_line as i64,
+                                        ])?;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                ChangeKind::Deleted => {
-                    delete_file.execute(rusqlite::params![&path_str])?;
-                    delete_symbols.execute(rusqlite::params![&path_str])?;
-                    delete_edges.execute(rusqlite::params![&path_str])?;
-                }
-            }
-        }
-
-        if let Some(ref dm) = dir_mtimes {
-            let mut all_dirs = dm.clone();
-            // Preserve stored mtimes for pruned dirs (they weren't walked)
-            if let Ok(stored_dirs) = self.load_dir_state() {
-                for (path, mtime) in stored_dirs {
-                    if pruned_dirs.contains(&path) {
-                        all_dirs.insert(path, mtime);
+                    ChangeKind::Deleted => {
+                        delete_file.execute(rusqlite::params![&path_str])?;
+                        delete_symbols.execute(rusqlite::params![&path_str])?;
+                        delete_edges.execute(rusqlite::params![&path_str])?;
                     }
                 }
             }
-            self.save_dir_state(&all_dirs)?;
+
+            maybe_fail_apply_changes_after_file_mutations()?;
+
+            if let Some(ref dm) = dir_mtimes {
+                let mut all_dirs = dm.clone();
+                // Preserve stored mtimes for pruned dirs (they weren't walked)
+                if let Ok(stored_dirs) = self.load_dir_state() {
+                    for (path, mtime) in stored_dirs {
+                        if pruned_dirs.contains(&path) {
+                            all_dirs.insert(path, mtime);
+                        }
+                    }
+                }
+                self.save_dir_state(&all_dirs)?;
+            }
+
+            Ok(())
+        })();
+        match apply_result {
+            Ok(()) => self.conn.execute_batch("RELEASE sp_apply")?,
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO sp_apply");
+                let _ = self.conn.execute_batch("RELEASE sp_apply");
+                return Err(err);
+            }
         }
 
         Ok(summary)
     }
 
     pub fn rebuild(&self, root: &Path) -> Result<IndexSummary> {
-        self.conn.execute("DELETE FROM file_state", [])?;
-        self.conn.execute("DELETE FROM symbols", [])?;
-        self.conn.execute("DELETE FROM call_edges", [])?;
-        self.conn.execute("DELETE FROM dir_state", [])?;
-        self.apply_changes(root)
+        self.conn.execute_batch("SAVEPOINT sp_rebuild")?;
+        let result: Result<IndexSummary> = (|| {
+            self.conn.execute("DELETE FROM file_state", [])?;
+            self.conn.execute("DELETE FROM symbols", [])?;
+            self.conn.execute("DELETE FROM call_edges", [])?;
+            self.conn.execute("DELETE FROM dir_state", [])?;
+            maybe_fail_rebuild_after_clear()?;
+            self.apply_changes(root)
+        })();
+        match result {
+            Ok(summary) => {
+                self.conn.execute_batch("RELEASE sp_rebuild")?;
+                Ok(summary)
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO sp_rebuild");
+                let _ = self.conn.execute_batch("RELEASE sp_rebuild");
+                Err(err)
+            }
+        }
     }
 
     pub fn file_count(&self) -> Result<usize> {
@@ -1433,6 +1533,91 @@ mod tests {
         db.rebuild(dir.path()).unwrap();
         let dirs = db.load_dir_state().unwrap();
         assert!(dirs.is_empty(), "dir_state should be cleared after rebuild");
+    }
+
+    #[test]
+    fn apply_changes_savepoint_releases_cleanly() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+
+        db.apply_changes(dir.path()).unwrap();
+        assert_eq!(db.file_count().unwrap(), 3);
+
+        let summary = db.apply_changes(dir.path()).unwrap();
+        assert_eq!(summary.unchanged, 3);
+        assert_eq!(db.file_count().unwrap(), 3);
+
+        fs::write(dir.path().join("extra.rs"), "fn extra() {}").unwrap();
+        let summary = db.apply_changes(dir.path()).unwrap();
+        assert_eq!(summary.new, 1);
+        assert_eq!(db.file_count().unwrap(), 4);
+    }
+
+    #[test]
+    fn apply_changes_rolls_back_on_failure() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let main_path = dir.path().join("main.rs");
+        let main_key = main_path.to_string_lossy().into_owned();
+        assert_eq!(db.symbols_for_file(&main_key).unwrap().len(), 1);
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(&main_path, "fn main() {}\nfn extra() {}").unwrap();
+
+        let _guard = arm_apply_changes_failpoint();
+        let err = db.apply_changes(dir.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected apply_changes failure after file mutations")
+        );
+
+        assert_eq!(db.file_count().unwrap(), 3);
+        assert_eq!(db.symbols_for_file(&main_key).unwrap().len(), 1);
+
+        db.apply_changes(dir.path()).unwrap();
+        assert_eq!(db.symbols_for_file(&main_key).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rebuild_nested_savepoints_work() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+        assert_eq!(db.file_count().unwrap(), 3);
+
+        db.rebuild(dir.path()).unwrap();
+        assert_eq!(db.file_count().unwrap(), 3);
+
+        db.rebuild(dir.path()).unwrap();
+        assert_eq!(db.file_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn rebuild_rolls_back_on_failure_after_clear() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let initial_file_count = db.file_count().unwrap();
+        let initial_symbol_count = db.symbol_count().unwrap();
+        let initial_edge_count = db.edge_count().unwrap();
+
+        let _guard = arm_rebuild_failpoint();
+        let err = db.rebuild(dir.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected rebuild failure after clearing index tables")
+        );
+
+        assert_eq!(db.file_count().unwrap(), initial_file_count);
+        assert_eq!(db.symbol_count().unwrap(), initial_symbol_count);
+        assert_eq!(db.edge_count().unwrap(), initial_edge_count);
+
+        db.rebuild(dir.path()).unwrap();
+        assert_eq!(db.file_count().unwrap(), initial_file_count);
+        assert_eq!(db.symbol_count().unwrap(), initial_symbol_count);
     }
 
     #[test]

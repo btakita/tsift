@@ -72,6 +72,7 @@ If copied skill instructions lag behind the installed binary, treat this file, `
 ## Conventions
 
 - **Read-only SQL**: `open_db()` uses `SQLITE_OPEN_READ_ONLY` — never mutates user databases.
+- **Transactional index updates**: `apply_changes` and `rebuild` wrap SQLite mutations in nested savepoints, so a failed reindex rolls back instead of leaving partial symbols/edges behind.
 - **Atomic batch edits**: `cmd_edit` validates ALL edits before writing ANY (two-phase).
 - **Rewrite protocol**: exit 0 + stdout = rewrite, exit 1 = pass through (matches rtk convention).
 - **Search strategy default**: `lexical` for instant results. `hybrid`/`vector` require model download on first run.

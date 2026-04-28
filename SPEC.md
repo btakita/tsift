@@ -545,6 +545,12 @@ CREATE TABLE dir_state (
 );
 ```
 
+### Transactional Index Updates
+
+`apply_changes` and `rebuild` wrap all SQLite mutations in a SAVEPOINT. If any insert, delete, metadata read, or directory-state write fails mid-batch, the entire mutation is rolled back. The index stays at its pre-call state instead of landing in a partially-updated mix of old and new symbols.
+
+`rebuild` nests its own SAVEPOINT around the inner `apply_changes` SAVEPOINT. If a rebuild fails after the bulk DELETEs but before the re-index finishes, both layers are rolled back and the prior index contents are preserved.
+
 ### Large Repo Optimization: Directory mtime Pruning
 
 For repos with 100K+ files, `tsift index --prune` skips unchanged directory subtrees during the file walk. Directory mtime changes when files are created, deleted, or renamed within it. When a directory's mtime matches stored state, the entire subtree is skipped.
