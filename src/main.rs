@@ -297,7 +297,7 @@ enum Commands {
         /// Show cached summary for a file/module
         #[arg(long)]
         file: Option<String>,
-        /// Run LLM extraction on the given path
+        /// Run LLM extraction on the given path (relative paths resolve against --path)
         #[arg(long)]
         extract: Option<PathBuf>,
         /// Only re-extract git-changed files (use with --extract)
@@ -2411,7 +2411,7 @@ fn cmd_summarize(
                 .filter(|f| summarize_diff_matches_scope(f, &extract_scope))
                 .collect::<Vec<_>>()
         } else {
-            collect_source_files(&extract_path)?
+            collect_source_files(&extract_scope)?
         };
 
         if files_to_extract.is_empty() {
@@ -2508,7 +2508,7 @@ fn cmd_summarize(
 
     // --stats mode
     if stats {
-        let summary_db = summarize::SummaryDb::open(&db_path)?;
+        let summary_db = open_existing_summary_db_read_only(&db_path)?;
         let s = summary_db.stats()?;
         if json_output {
             println!("{}", to_json_schema(&s, pretty, terse, schema)?);
@@ -2533,10 +2533,7 @@ fn cmd_summarize(
     }
 
     // Query mode: --file or positional symbol
-    if !db_path.exists() {
-        bail!("no summaries.db found — run `tsift summarize --extract <path>` first");
-    }
-    let summary_db = summarize::SummaryDb::open(&db_path)?;
+    let summary_db = open_existing_summary_db_read_only(&db_path)?;
 
     if let Some(file_query) = file {
         let results = summary_db.get_by_file(&file_query)?;
@@ -2617,6 +2614,13 @@ fn cmd_summarize(
     }
 
     bail!("specify a symbol, --file, --extract, or --stats");
+}
+
+fn open_existing_summary_db_read_only(db_path: &Path) -> Result<summarize::SummaryDb> {
+    if !db_path.exists() {
+        bail!("no summaries.db found — run `tsift summarize --extract <path>` first");
+    }
+    summarize::SummaryDb::open_read_only(db_path)
 }
 
 fn cmd_status(
@@ -3482,6 +3486,45 @@ mod tests {
             Path::new("/repo/src/feature/lib.rs"),
             &extract_scope
         ));
+    }
+
+    #[test]
+    fn summarize_extract_scope_walks_relative_paths_from_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = dir.path().join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let main_rs = source_dir.join("main.rs");
+        std::fs::write(&main_rs, "fn alpha() {}\n").unwrap();
+
+        let extract_scope = resolve_extract_scope(dir.path(), Path::new("src"));
+        let files = collect_source_files(&extract_scope).unwrap();
+
+        assert_eq!(files, vec![main_rs]);
+    }
+
+    #[test]
+    fn summarize_stats_fails_closed_when_cache_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = cmd_summarize(
+            None,
+            None,
+            None,
+            false,
+            true,
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("no summaries.db found"),
+            "got: {err}"
+        );
+        assert!(!dir.path().join(".tsift/summaries.db").exists());
     }
 
     // --- apply_edit_op ---

@@ -119,6 +119,71 @@ fn indexed_cli_fixture() -> tempfile::TempDir {
     dir
 }
 
+fn create_summary_cache(dir: &Path) {
+    fs::create_dir_all(dir.join(".tsift")).unwrap();
+    let db_path = dir.join(".tsift/summaries.db");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE summaries (
+             id INTEGER PRIMARY KEY,
+             symbol_name TEXT NOT NULL,
+             file_path TEXT NOT NULL,
+             content_hash TEXT NOT NULL,
+             summary TEXT NOT NULL,
+             entities TEXT,
+             relationships TEXT,
+             concept_labels TEXT,
+             extracted_at TEXT NOT NULL,
+             model TEXT NOT NULL,
+             tokens_input INTEGER,
+             tokens_output INTEGER
+         );
+         CREATE INDEX idx_summaries_symbol ON summaries(symbol_name);
+         CREATE INDEX idx_summaries_file ON summaries(file_path);
+         CREATE INDEX idx_summaries_hash ON summaries(content_hash);",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO summaries (
+            symbol_name,
+            file_path,
+            content_hash,
+            summary,
+            entities,
+            relationships,
+            concept_labels,
+            extracted_at,
+            model,
+            tokens_input,
+            tokens_output
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![
+            "alpha_helper",
+            "src/lib.rs",
+            "hash1",
+            "cached summary",
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            "1700000000",
+            "claude-haiku-4-5-20251001",
+            100_i64,
+            40_i64
+        ],
+    )
+    .unwrap();
+}
+
+fn write_missing_summary_api_key_config(dir: &Path) {
+    fs::create_dir_all(dir.join(".tsift")).unwrap();
+    fs::write(
+        dir.join(".tsift/config.toml"),
+        "[summarize]\napi_key_env = \"TSIFT_TEST_NONEXISTENT_KEY\"\n",
+    )
+    .unwrap();
+}
+
 #[test]
 fn check_exit_code_zero_when_fresh() {
     let dir = tempfile::tempdir().unwrap();
@@ -793,6 +858,117 @@ fn lint_stays_read_only_while_rollback_journal_lock_exists() {
         annotations
             .iter()
             .any(|ann| ann["text"].as_str() == Some("alpha_helper")),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn summarize_stats_fails_closed_when_cache_missing() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = tsift_bin()
+        .args(["summarize", "--stats", "--path", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "expected summarize --stats to fail when cache is missing"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no summaries.db found"),
+        "stderr was: {stderr}"
+    );
+    assert!(!dir.path().join(".tsift/summaries.db").exists());
+}
+
+#[test]
+fn summarize_extract_resolves_relative_path_against_explicit_root() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::write(
+        project.path().join("src/main.rs"),
+        "fn alpha_helper() {}\n",
+    )
+    .unwrap();
+    write_missing_summary_api_key_config(project.path());
+
+    let caller = tempfile::tempdir().unwrap();
+    fs::create_dir_all(caller.path().join("src")).unwrap();
+
+    let output = tsift_bin()
+        .current_dir(caller.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .args([
+            "summarize",
+            "--extract",
+            "src",
+            "--path",
+            project.path().to_str().unwrap(),
+            "--compact",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "summarize stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("No files to extract."),
+        "stdout was: {stdout}"
+    );
+    assert!(stdout.contains("errors:1"), "stdout was: {stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("src/main.rs"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn summarize_symbol_query_accepts_read_only_cache_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    create_summary_cache(dir.path());
+
+    let db_path = dir.path().join(".tsift/summaries.db");
+    let original_mode = fs::metadata(&db_path).unwrap().permissions().mode();
+    let mut read_only = fs::metadata(&db_path).unwrap().permissions();
+    read_only.set_mode(0o444);
+    fs::set_permissions(&db_path, read_only).unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "summarize",
+            "alpha_helper",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    let mut restored = fs::metadata(&db_path).unwrap().permissions();
+    restored.set_mode(original_mode);
+    fs::set_permissions(&db_path, restored).unwrap();
+
+    assert!(
+        output.status.success(),
+        "summarize stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let summaries = json.as_array().unwrap();
+    assert!(
+        summaries
+            .iter()
+            .any(|summary| summary["symbol_name"] == "alpha_helper"),
         "stdout was: {}",
         String::from_utf8_lossy(&output.stdout)
     );

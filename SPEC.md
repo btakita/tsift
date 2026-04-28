@@ -75,7 +75,7 @@ tsift explain <symbol>          # full symbol context: callers, callees, communi
 tsift audit                     # scan installed skills, check health
 tsift audit --manifest <file>   # compare against expected skill list
 tsift summarize <symbol>        # cached LLM summary for a symbol
-tsift summarize --extract <path>  # batch LLM extraction (one-time)
+tsift summarize --extract <path>  # batch LLM extraction (one-time; relative path resolves against --path)
 tsift summarize --extract --diff  # re-extract only git-changed files within the requested path
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
 tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
@@ -84,6 +84,8 @@ tsift search --strategy hybrid  # opt-in to slower hybrid BM25 + vector search
 tsift search --timeout 60       # custom timeout in seconds (default: 30, 0 = no timeout)
 tsift --compact search <query>  # terse human output across commands
 ```
+
+`tsift summarize --stats`, `tsift summarize <symbol>`, and `tsift summarize --file <path>` are read-only cache queries: they fail closed when `.tsift/summaries.db` is absent and never create the summary cache as a side effect.
 
 ## Search Stale Precheck + Timeout
 
@@ -743,7 +745,7 @@ When instructions are stale or missing, `tsift init` is prepended to the `run:` 
 ```bash
 tsift summarize <symbol>            # show cached summary for a symbol
 tsift summarize --file <path>       # show cached summary for a file/module
-tsift summarize --extract <path>    # run LLM extraction on path (batch)
+tsift summarize --extract <path>    # run LLM extraction on path (batch; relative path resolves against --path)
 tsift summarize --extract --diff    # re-extract only git-changed files within the requested path
 tsift summarize --stats             # cache hit rate, staleness, token savings
 tsift summarize --json              # structured output
