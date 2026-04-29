@@ -89,7 +89,7 @@ tsift search --timeout 60       # custom timeout in seconds (default: 30, 0 = no
 tsift --compact search <query>  # terse human output across commands
 ```
 
-`tsift summarize --stats`, `tsift summarize <symbol>`, and `tsift summarize --file <path>` are read-only cache queries: they fail closed when `.tsift/summaries.db` is absent and never create the summary cache as a side effect. `--path` first resolves through the nearest ancestor `.tsift` project/workspace root, so nested directories reuse the shared summary cache instead of creating shadow caches. During `--extract`, workspace files resolve symbol context against the matching scoped `index.db`, symbol preload uses exact normalized file-path matches so duplicate `src/lib.rs`-style paths across scopes do not bleed into each other, symbol preload reuses the same busy-timeout plus snapshot fallback path as other read-only index consumers when a rollback-journal writer is live, and `--diff` includes untracked files within the requested extract scope.
+`tsift summarize --stats`, `tsift summarize <symbol>`, and `tsift summarize --file <path>` are read-only cache queries: they fail closed when `.tsift/summaries.db` is absent and never create the summary cache as a side effect. `--path` first resolves through the nearest ancestor `.tsift` project/workspace root, so nested directories reuse the shared summary cache instead of creating shadow caches. During `--extract`, relative extract paths resolve against the caller's `--path` anchor (or that file's parent directory) while still reusing the ancestor project's shared summary cache, workspace files resolve symbol context against the matching scoped `index.db`, symbol preload uses exact normalized file-path matches so duplicate `src/lib.rs`-style paths across scopes do not bleed into each other, symbol preload reuses the same busy-timeout plus snapshot fallback path as other read-only index consumers when a rollback-journal writer is live, and `--diff` includes untracked files within the requested extract scope.
 
 `tsift edit` now stages each rewritten file beside its target and only swaps the batch into place after every edit validates and every staged file is ready. If any later swap fails, tsift restores earlier files before returning an error instead of leaving a partially-written batch behind.
 
@@ -819,7 +819,7 @@ When instructions are stale or missing, `tsift init` is prepended to the `run:` 
 ```bash
 tsift summarize <symbol>            # show cached summary for a symbol
 tsift summarize --file <path>       # show cached summary for a file/module
-tsift summarize --extract <path>    # run LLM extraction on path (batch; relative path resolves against the resolved project/workspace root)
+tsift summarize --extract <path>    # run LLM extraction on path (batch; relative path resolves against --path, or that file's parent directory)
 tsift summarize --extract --diff    # re-extract only git-changed files within the requested path
 tsift summarize --stats             # cache hit rate, staleness, token savings
 tsift summarize --json              # structured output

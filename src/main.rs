@@ -2599,7 +2599,8 @@ fn cmd_summarize(
 
     // --extract mode: run LLM extraction
     if let Some(extract_path) = extract {
-        let extract_scope = resolve_extract_scope(&root, &extract_path);
+        let extract_base = resolve_extract_base(path)?;
+        let extract_scope = resolve_extract_scope(&extract_base, &extract_path);
         let cfg = load_summarize_config(&root);
         let summary_db = summarize::SummaryDb::open(&db_path)?;
 
@@ -3028,6 +3029,21 @@ fn find_symbols_db_for_file(root: &Path, file_path: &Path) -> Result<Option<Extr
     }
 
     Ok(None)
+}
+
+fn resolve_extract_base(path: &Path) -> Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", path.display()))?;
+
+    Ok(if canonical.is_dir() {
+        canonical
+    } else {
+        canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or(canonical)
+    })
 }
 
 fn resolve_extract_scope(root: &Path, extract_path: &Path) -> PathBuf {
@@ -3784,6 +3800,36 @@ mod tests {
         let files = collect_source_files(&extract_scope).unwrap();
 
         assert_eq!(files, vec![main_rs]);
+    }
+
+    #[test]
+    fn summarize_extract_base_uses_nested_path_instead_of_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("src/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.path().join("root.rs"), "fn root_level() {}\n").unwrap();
+        let nested_file = nested.join("main.rs");
+        std::fs::write(&nested_file, "fn nested_only() {}\n").unwrap();
+
+        let extract_base = resolve_extract_base(&nested).unwrap();
+        let extract_scope = resolve_extract_scope(&extract_base, Path::new("."));
+        let files = collect_source_files(&extract_scope).unwrap();
+
+        assert_eq!(extract_scope, nested);
+        assert_eq!(files, vec![nested_file]);
+    }
+
+    #[test]
+    fn summarize_extract_base_uses_parent_of_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("src/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file_path = nested.join("main.rs");
+        std::fs::write(&file_path, "fn nested_only() {}\n").unwrap();
+
+        let extract_base = resolve_extract_base(&file_path).unwrap();
+
+        assert_eq!(extract_base, nested);
     }
 
     #[test]

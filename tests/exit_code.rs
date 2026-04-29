@@ -1655,11 +1655,16 @@ fn summarize_extract_resolves_relative_path_against_explicit_root() {
 }
 
 #[test]
-fn summarize_extract_uses_ancestor_project_root_for_nested_paths() {
+fn summarize_extract_uses_nested_path_as_relative_extract_anchor() {
     let project = tempfile::tempdir().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
     fs::create_dir_all(project.path().join("src/nested")).unwrap();
-    fs::write(project.path().join("src/main.rs"), "fn alpha_helper() {}\n").unwrap();
+    fs::write(project.path().join("src/main.rs"), "fn root_helper() {}\n").unwrap();
+    fs::write(
+        project.path().join("src/nested/main.rs"),
+        "fn nested_helper() {}\n",
+    )
+    .unwrap();
     write_missing_summary_api_key_config(project.path());
 
     let nested = project.path().join("src/nested");
@@ -1669,7 +1674,7 @@ fn summarize_extract_uses_ancestor_project_root_for_nested_paths() {
         .args([
             "summarize",
             "--extract",
-            "src",
+            ".",
             "--path",
             nested.to_str().unwrap(),
             "--compact",
@@ -1689,8 +1694,13 @@ fn summarize_extract_uses_ancestor_project_root_for_nested_paths() {
     );
     assert!(stdout.contains("errors:1"), "stdout was: {stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("src/main.rs"), "stderr was: {stderr}");
+    assert!(stderr.contains("src/nested/"), "stderr was: {stderr}");
+    assert!(
+        !stderr.contains("error: src/main.rs"),
+        "stderr was: {stderr}"
+    );
     assert!(!nested.join(".tsift/summaries.db").exists());
+    assert!(project.path().join(".tsift/summaries.db").exists());
 }
 
 #[test]
