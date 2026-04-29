@@ -215,7 +215,6 @@ pub fn collect_entities_from_index_path(index_path: &Path) -> Result<HashSet<Str
 pub fn collect_entities_from_workspace_root(root: &Path) -> Result<HashSet<String>> {
     let mut entities = HashSet::new();
 
-    push_entities_if_exists(&mut entities, &root.join("index.db"))?;
     push_entities_if_exists(&mut entities, &root.join(".tsift/index.db"))?;
 
     let cfg = config::Config::load(root)?;
@@ -246,7 +245,6 @@ fn workspace_root_for_aggregate_index_path(index_path: &Path) -> Result<Option<P
 
     let is_workspace_aggregate_target = canonical == root
         || canonical == root.join(".tsift")
-        || canonical == root.join("index.db")
         || canonical == root.join(".tsift/index.db")
         || canonical == root.join(".tsift/indexes");
 
@@ -692,6 +690,29 @@ federation = false
             assert!(!entities.contains("isolated_helper"));
             assert!(!entities.contains("nonfed_helper"));
         }
+    }
+
+    #[test]
+    fn collect_entities_from_workspace_root_ignores_repo_root_index_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".tsift")).unwrap();
+        fs::write(
+            root.join(".gitmodules"),
+            r#"[submodule "src/public"]
+	path = src/public
+	url = https://example.com/public
+"#,
+        )
+        .unwrap();
+        create_symbol_index(&root.join(".tsift/index.db"), &["root_helper"]);
+        let conn = rusqlite::Connection::open(root.join("index.db")).unwrap();
+        conn.execute_batch("CREATE TABLE unrelated (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let entities = collect_entities_from_index_path(root).unwrap();
+
+        assert!(entities.contains("root_helper"));
     }
 
     #[test]

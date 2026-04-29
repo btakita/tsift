@@ -457,6 +457,7 @@ tsift lint README.md --json                       # structured output
 - `--index <dir>` live symbol index discovery (`index.db`, names ≥4 chars) from a project root, `.tsift` directory, `.tsift/indexes`, scope directory, or direct `index.db` path
 - Explicit `indexes` directories recurse through nested scope-id paths (for example `indexes/pkg/app/foo/index.db`), so duplicate-leaf workspace exports stay lintable even outside the original workspace root
 - When `--index` points at a workspace aggregate target (workspace root, `.tsift`, `.tsift/index.db`, or `.tsift/indexes`), `tsift lint` applies the same federation filter as auto-discovered roots. Private, isolated, and explicitly non-federated scopes are excluded unless the caller points `--index` at that specific scope directory or `index.db`.
+- Workspace aggregate discovery only reads `.tsift`-owned indexes; an unrelated repo-root `index.db` is ignored unless the caller passes that file path explicitly.
 - Default: the nearest ancestor project root with `.tsift/index.db`, plus only scoped indexes under `.tsift/indexes/**/index.db` whose workspace scope still participates in federation. Private, isolated, or explicitly non-federated scopes are excluded unless the caller points `--index` at them directly.
 
 **Locking:**

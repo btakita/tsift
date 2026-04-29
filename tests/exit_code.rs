@@ -1486,6 +1486,66 @@ fn lint_accepts_explicit_indexes_dir_with_nested_scope_ids() {
 }
 
 #[test]
+fn lint_ignores_repo_root_index_db_for_workspace_aggregate_discovery() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("src/alpha")).unwrap();
+    fs::write(
+        dir.path().join("src/alpha/lib.rs"),
+        "fn alpha_helper() {}\nfn alpha_main() { alpha_helper(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("README.md"),
+        "alpha_helper should be backticked.\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let conn = Connection::open(dir.path().join("index.db")).unwrap();
+    conn.execute_batch("CREATE TABLE unrelated (id INTEGER PRIMARY KEY);")
+        .unwrap();
+    drop(conn);
+
+    let output = tsift_bin()
+        .current_dir(dir.path())
+        .args(["lint", "README.md", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "lint stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let annotations = json["annotations"].as_array().unwrap();
+    assert!(
+        annotations
+            .iter()
+            .any(|ann| ann["text"].as_str() == Some("alpha_helper")),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn lint_stays_read_only_while_rollback_journal_lock_exists() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn alpha_helper() {}\n").unwrap();
