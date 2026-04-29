@@ -296,7 +296,11 @@ fn collect_child_index_dbs(dbs: &mut BTreeSet<PathBuf>, indexes_dir: &Path) -> R
 
     for entry in std::fs::read_dir(indexes_dir)? {
         let entry = entry?;
-        push_if_exists(dbs, &entry.path().join("index.db"));
+        let path = entry.path();
+        if path.is_dir() {
+            push_if_exists(dbs, &path.join("index.db"));
+            collect_child_index_dbs(dbs, &path)?;
+        }
     }
 
     Ok(())
@@ -596,6 +600,25 @@ mod tests {
 
         assert!(entities.contains("alpha_helper"));
         assert!(entities.contains("beta_helper"));
+    }
+
+    #[test]
+    fn collect_entities_from_explicit_indexes_dir_recurses_nested_scope_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        create_symbol_index(
+            &dir.path().join(".tsift/indexes/pkg/app/foo/index.db"),
+            &["pkg_helper"],
+        );
+        create_symbol_index(
+            &dir.path().join(".tsift/indexes/vendor/foo/index.db"),
+            &["vendor_helper"],
+        );
+
+        let entities =
+            collect_entities_from_index_path(&dir.path().join(".tsift/indexes")).unwrap();
+
+        assert!(entities.contains("pkg_helper"));
+        assert!(entities.contains("vendor_helper"));
     }
 
     #[test]

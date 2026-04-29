@@ -1402,6 +1402,90 @@ fn lint_accepts_explicit_indexes_dir() {
 }
 
 #[test]
+fn lint_accepts_explicit_indexes_dir_with_nested_scope_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        r#"[submodule "pkg/app/foo"]
+	path = pkg/app/foo
+	url = https://example.com/pkg-foo
+[submodule "vendor/foo"]
+	path = vendor/foo
+	url = https://example.com/vendor-foo
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("pkg/app/foo")).unwrap();
+    fs::create_dir_all(dir.path().join("vendor/foo")).unwrap();
+    fs::create_dir_all(dir.path().join("exported/indexes/pkg/app/foo")).unwrap();
+    fs::create_dir_all(dir.path().join("exported/indexes/vendor/foo")).unwrap();
+    fs::write(
+        dir.path().join("pkg/app/foo/lib.rs"),
+        "fn pkg_helper() {}\nfn pkg_main() { pkg_helper(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("vendor/foo/lib.rs"),
+        "fn vendor_helper() {}\nfn vendor_main() { vendor_helper(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("README.md"),
+        "pkg_helper and vendor_helper should be backticked.\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::copy(
+        dir.path().join(".tsift/indexes/pkg/app/foo/index.db"),
+        dir.path().join("exported/indexes/pkg/app/foo/index.db"),
+    )
+    .unwrap();
+    fs::copy(
+        dir.path().join(".tsift/indexes/vendor/foo/index.db"),
+        dir.path().join("exported/indexes/vendor/foo/index.db"),
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .current_dir(dir.path())
+        .args(["lint", "README.md", "--index", "exported/indexes", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "lint stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let annotations = json["annotations"].as_array().unwrap();
+    assert!(
+        annotations
+            .iter()
+            .any(|ann| ann["text"].as_str() == Some("pkg_helper")),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        annotations
+            .iter()
+            .any(|ann| ann["text"].as_str() == Some("vendor_helper")),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn lint_stays_read_only_while_rollback_journal_lock_exists() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn alpha_helper() {}\n").unwrap();
