@@ -136,6 +136,14 @@ pub fn check_status(root: &Path) -> Result<StatusReport> {
 }
 
 fn check_index(root: &Path) -> Result<IndexStatus> {
+    if !config::Config::submodule_dirs(root)?.is_empty() {
+        return check_workspace_index(root);
+    }
+
+    check_single_index(root)
+}
+
+fn check_single_index(root: &Path) -> Result<IndexStatus> {
     let db_path = root.join(".tsift/index.db");
     if !db_path.exists() {
         return check_workspace_index(root);
@@ -1001,6 +1009,41 @@ mod tests {
                 assert_eq!(missing_scopes[0].scope, "beta");
             }
             other => panic!("expected partial workspace status, got {other:?}"),
+        }
+        assert_eq!(
+            report.recommendations.run.as_deref(),
+            Some("tsift init --workspace && tsift index --workspace .  (1 missing scope)")
+        );
+    }
+
+    #[test]
+    fn status_workspace_prefers_scoped_indexes_when_root_index_also_exists() {
+        let dir = setup_workspace();
+        let root_db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        root_db.apply_changes(dir.path()).unwrap();
+
+        let cfg = Config::load(dir.path()).unwrap();
+        let alpha = Config::resolve_submodule(dir.path(), "alpha").unwrap();
+        let alpha_db = IndexDb::open(&cfg.db_path_for(dir.path(), &alpha.id)).unwrap();
+        alpha_db.apply_changes(&alpha.source_root).unwrap();
+
+        let report = check_status(dir.path()).unwrap();
+        match &report.index {
+            IndexStatus::Stale {
+                total_files,
+                stale_files,
+                workspace_scopes,
+                missing_scopes,
+                ..
+            } => {
+                assert_eq!(*total_files, 1);
+                assert_eq!(*stale_files, 0);
+                assert_eq!(workspace_scopes.len(), 1);
+                assert_eq!(workspace_scopes[0].scope, "alpha");
+                assert_eq!(missing_scopes.len(), 1);
+                assert_eq!(missing_scopes[0].scope, "beta");
+            }
+            other => panic!("expected mixed workspace status to stay scope-aware, got {other:?}"),
         }
         assert_eq!(
             report.recommendations.run.as_deref(),

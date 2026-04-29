@@ -690,7 +690,7 @@ This ensures agent sessions always use instructions matching the installed binar
 
 ## Status (Session Health Check)
 
-`tsift status` reports index freshness, instruction version, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session. When the input path is a nested subdirectory, `status` first promotes it to the nearest ancestor that already owns `.tsift/` so the check reuses the existing project/workspace state. On workspace roots, it detects scoped indexes under `.tsift/indexes/<scope>/index.db`, aggregates them into the top-level index state, reports the contributing scopes explicitly, and surfaces configured scopes whose `index.db` is still missing so partially indexed workspaces do not masquerade as `fresh`.
+`tsift status` reports index freshness, instruction version, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session. When the input path is a nested subdirectory, `status` first promotes it to the nearest ancestor that already owns `.tsift/` so the check reuses the existing project/workspace state. On workspace roots, it treats scoped indexes under `.tsift/indexes/<scope>/index.db` as the authoritative status surface even if a shared `.tsift/index.db` also exists, reports the contributing scopes explicitly, and surfaces configured scopes whose `index.db` is still missing so partially indexed workspaces do not masquerade as `fresh`.
 
 ```bash
 tsift status            # human-readable output
