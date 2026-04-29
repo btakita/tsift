@@ -199,6 +199,10 @@ pub fn collect_entities_from_db(db_path: &Path) -> Result<HashSet<String>> {
 }
 
 pub fn collect_entities_from_index_path(index_path: &Path) -> Result<HashSet<String>> {
+    if let Some(root) = workspace_root_for_aggregate_index_path(index_path)? {
+        return collect_entities_from_workspace_root(&root);
+    }
+
     let mut entities = HashSet::new();
 
     for db_path in discover_index_dbs(index_path)? {
@@ -223,6 +227,30 @@ pub fn collect_entities_from_workspace_root(root: &Path) -> Result<HashSet<Strin
     }
 
     Ok(entities)
+}
+
+fn workspace_root_for_aggregate_index_path(index_path: &Path) -> Result<Option<PathBuf>> {
+    if !index_path.exists() {
+        return Ok(None);
+    }
+
+    let canonical = index_path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", index_path.display()))?;
+    let Some(root) = project_root_from_canonical_path(&canonical) else {
+        return Ok(None);
+    };
+    if config::Config::submodule_dirs(&root)?.is_empty() {
+        return Ok(None);
+    }
+
+    let is_workspace_aggregate_target = canonical == root
+        || canonical == root.join(".tsift")
+        || canonical == root.join("index.db")
+        || canonical == root.join(".tsift/index.db")
+        || canonical == root.join(".tsift/indexes");
+
+    Ok(is_workspace_aggregate_target.then_some(root))
 }
 
 fn discover_index_dbs(index_path: &Path) -> Result<Vec<PathBuf>> {
@@ -568,6 +596,111 @@ mod tests {
 
         assert!(entities.contains("alpha_helper"));
         assert!(entities.contains("beta_helper"));
+    }
+
+    #[test]
+    fn collect_entities_from_workspace_index_targets_skip_non_federated_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".tsift/indexes/public")).unwrap();
+        fs::create_dir_all(root.join(".tsift/indexes/private")).unwrap();
+        fs::create_dir_all(root.join(".tsift/indexes/isolated")).unwrap();
+        fs::create_dir_all(root.join(".tsift/indexes/nonfed")).unwrap();
+        fs::write(
+            root.join(".gitmodules"),
+            r#"[submodule "src/public"]
+	path = src/public
+	url = https://example.com/public
+[submodule "src/private"]
+	path = src/private
+	url = https://example.com/private
+[submodule "src/isolated"]
+	path = src/isolated
+	url = https://example.com/isolated
+[submodule "src/nonfed"]
+	path = src/nonfed
+	url = https://example.com/nonfed
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join(".tsift/config.toml"),
+            r#"
+[overrides.private]
+tier = "private"
+
+[overrides.isolated]
+tier = "isolated"
+
+[overrides.nonfed]
+federation = false
+"#,
+        )
+        .unwrap();
+
+        create_symbol_index(&root.join(".tsift/index.db"), &["root_helper"]);
+        create_symbol_index(
+            &root.join(".tsift/indexes/public/index.db"),
+            &["public_helper"],
+        );
+        create_symbol_index(
+            &root.join(".tsift/indexes/private/index.db"),
+            &["private_helper"],
+        );
+        create_symbol_index(
+            &root.join(".tsift/indexes/isolated/index.db"),
+            &["isolated_helper"],
+        );
+        create_symbol_index(
+            &root.join(".tsift/indexes/nonfed/index.db"),
+            &["nonfed_helper"],
+        );
+
+        for target in [
+            root.to_path_buf(),
+            root.join(".tsift"),
+            root.join(".tsift/indexes"),
+        ] {
+            let entities = collect_entities_from_index_path(&target).unwrap();
+
+            assert!(entities.contains("root_helper"));
+            assert!(entities.contains("public_helper"));
+            assert!(!entities.contains("private_helper"));
+            assert!(!entities.contains("isolated_helper"));
+            assert!(!entities.contains("nonfed_helper"));
+        }
+    }
+
+    #[test]
+    fn collect_entities_from_explicit_private_scope_dir_keeps_private_entities() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".tsift/indexes/private")).unwrap();
+        fs::write(
+            root.join(".gitmodules"),
+            r#"[submodule "src/private"]
+	path = src/private
+	url = https://example.com/private
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join(".tsift/config.toml"),
+            r#"
+[overrides.private]
+tier = "private"
+"#,
+        )
+        .unwrap();
+        create_symbol_index(
+            &root.join(".tsift/indexes/private/index.db"),
+            &["private_helper"],
+        );
+
+        let entities =
+            collect_entities_from_index_path(&root.join(".tsift/indexes/private")).unwrap();
+
+        assert!(entities.contains("private_helper"));
     }
 
     #[test]
