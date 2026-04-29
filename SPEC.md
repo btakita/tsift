@@ -81,7 +81,7 @@ tsift summarize --extract <path>  # batch LLM extraction (one-time; relative pat
 tsift summarize --extract --diff  # re-extract only git-changed files within the requested path
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
 tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
-tsift search --scope <submod>   # restrict to one submodule's index + sift path
+tsift search --scope <submod>   # restrict to one submodule's index + lexical root
 tsift index --submodule <submod> # unknown/ambiguous workspace scopes fail closed
 tsift search --strategy hybrid  # opt-in to slower hybrid BM25 + vector search
 tsift search --timeout 60       # custom timeout in seconds (default: 30, 0 = no timeout)
@@ -104,7 +104,7 @@ Opt-in recovery:
 
 - `tsift search --autoindex ...` mirrors the hook behavior for unhooked sessions: if the local or scoped index is missing or stale, tsift incrementally builds it before searching
 - `tsift search --scope <submod> --autoindex ...` rebuilds only that submodule's index
-- `tsift search --federated --autoindex ...` rebuilds stale/missing federated submodule indexes before aggregating symbol hits
+- `tsift search --federated --autoindex ...` rebuilds stale/missing federated submodule indexes before aggregating symbol hits, and its lexical/vector/hybrid sift pass only searches the same federated scope roots instead of the whole workspace
 - `tsift search --scope <submod> ...` now fails closed when the named submodule does not exist, and reports the available scope ids instead of silently searching the workspace root
 - `tsift index --submodule <submod> ...` now fails closed on that same unknown or ambiguous selector set, instead of indexing `root/<submod>` into an unreachable scoped DB
 - when duplicate submodules share the same trailing directory name, leaf-name selectors fail closed as ambiguous and the full `.gitmodules` path becomes the required scope id

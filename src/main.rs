@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sift::{SearchInput, SearchOptions, Sift};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{Read as _, Write as _};
@@ -3101,8 +3102,11 @@ fn cmd_search(
     }
 
     let effective_strategy = strategy.unwrap_or_else(|| "lexical".to_string());
-    let response =
-        run_search_with_timeout(&sift_path, &query, limit, timeout_secs, &effective_strategy)?;
+    let response = if federated && scope.is_none() {
+        federated_sift_search(&root, &query, limit, timeout_secs, &effective_strategy)?
+    } else {
+        run_search_with_timeout(&sift_path, &query, limit, timeout_secs, &effective_strategy)?
+    };
 
     if json_output {
         #[derive(Serialize)]
@@ -4257,6 +4261,100 @@ tier = "isolated"
         assert!(
             hits.is_empty(),
             "isolated submodule should not appear in federated search"
+        );
+    }
+
+    #[test]
+    fn federated_lexical_search_respects_isolation() {
+        let dir = setup_workspace();
+        let tsift_dir = dir.path().join(".tsift");
+        std::fs::create_dir_all(&tsift_dir).unwrap();
+        std::fs::write(
+            tsift_dir.join("config.toml"),
+            r#"
+[overrides.alpha]
+tier = "isolated"
+"#,
+        )
+        .unwrap();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let response = federated_sift_search(dir.path(), "fn", 10, 0, "lexical").unwrap();
+
+        assert!(
+            !response.hits.is_empty(),
+            "shared scopes should still contribute lexical hits"
+        );
+        assert!(
+            response
+                .hits
+                .iter()
+                .all(|hit| hit.path.ends_with("src/beta/lib.rs")),
+            "isolated scope should not leak lexical hits: {:?}",
+            response.hits
+        );
+    }
+
+    #[test]
+    fn federated_lexical_search_respects_private_tier() {
+        let dir = setup_workspace();
+        let tsift_dir = dir.path().join(".tsift");
+        std::fs::create_dir_all(&tsift_dir).unwrap();
+        std::fs::write(
+            tsift_dir.join("config.toml"),
+            r#"
+[overrides.alpha]
+tier = "private"
+"#,
+        )
+        .unwrap();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let response = federated_sift_search(dir.path(), "fn", 10, 0, "lexical").unwrap();
+
+        assert!(
+            !response.hits.is_empty(),
+            "shared scopes should still contribute lexical hits"
+        );
+        assert!(
+            response
+                .hits
+                .iter()
+                .all(|hit| hit.path.ends_with("src/beta/lib.rs")),
+            "private scope should not leak lexical hits: {:?}",
+            response.hits
         );
     }
 
@@ -6297,6 +6395,169 @@ fn shell_quote(s: &str) -> String {
             unquoted.replace('\\', "\\\\").replace('"', "\\\"")
         )
     }
+}
+
+fn empty_search_coverage() -> sift::SearchCoverageSnapshot {
+    sift::SearchCoverageSnapshot {
+        mode: sift::SearchCoverageMode::Sealed,
+        total_sector_count: 0,
+        mounted_sector_count: 0,
+        reused_sector_count: 0,
+        dirty_sector_count: 0,
+        completed_dirty_sector_count: 0,
+        rebuilding_sector_count: 0,
+        resumed_sector_count: 0,
+        active_rebuild: None,
+    }
+}
+
+fn aggregate_search_coverage(responses: &[sift::SearchResponse]) -> sift::SearchCoverageSnapshot {
+    let total_sector_count = responses
+        .iter()
+        .map(|response| response.coverage.total_sector_count)
+        .sum();
+    let mounted_sector_count = responses
+        .iter()
+        .map(|response| response.coverage.mounted_sector_count)
+        .sum();
+    let reused_sector_count = responses
+        .iter()
+        .map(|response| response.coverage.reused_sector_count)
+        .sum();
+    let dirty_sector_count = responses
+        .iter()
+        .map(|response| response.coverage.dirty_sector_count)
+        .sum();
+    let completed_dirty_sector_count = responses
+        .iter()
+        .map(|response| response.coverage.completed_dirty_sector_count)
+        .sum();
+    let rebuilding_sector_count = responses
+        .iter()
+        .map(|response| response.coverage.rebuilding_sector_count)
+        .sum();
+    let resumed_sector_count = responses
+        .iter()
+        .map(|response| response.coverage.resumed_sector_count)
+        .sum();
+
+    let mode = if dirty_sector_count == 0 && rebuilding_sector_count == 0 {
+        sift::SearchCoverageMode::Sealed
+    } else if completed_dirty_sector_count > 0
+        || rebuilding_sector_count > 0
+        || resumed_sector_count > 0
+    {
+        sift::SearchCoverageMode::Converging
+    } else {
+        sift::SearchCoverageMode::Frontier
+    };
+
+    sift::SearchCoverageSnapshot {
+        mode,
+        total_sector_count,
+        mounted_sector_count,
+        reused_sector_count,
+        dirty_sector_count,
+        completed_dirty_sector_count,
+        rebuilding_sector_count,
+        resumed_sector_count,
+        active_rebuild: responses
+            .iter()
+            .find_map(|response| response.coverage.active_rebuild.clone()),
+    }
+}
+
+fn empty_search_response(root: &Path, strategy: &str) -> sift::SearchResponse {
+    sift::SearchResponse {
+        strategy: strategy.to_string(),
+        root: root.display().to_string(),
+        indexed_artifacts: 0,
+        skipped_artifacts: 0,
+        coverage: empty_search_coverage(),
+        hits: Vec::new(),
+    }
+}
+
+fn absolutize_search_hit_paths(response: &mut sift::SearchResponse, search_root: &Path) {
+    for hit in &mut response.hits {
+        let path = Path::new(&hit.path);
+        if path.is_relative() {
+            hit.path = search_root.join(path).display().to_string();
+        }
+    }
+}
+
+fn merge_search_responses(
+    root: &Path,
+    strategy: &str,
+    limit: usize,
+    responses: Vec<sift::SearchResponse>,
+) -> sift::SearchResponse {
+    let indexed_artifacts = responses
+        .iter()
+        .map(|response| response.indexed_artifacts)
+        .sum();
+    let skipped_artifacts = responses
+        .iter()
+        .map(|response| response.skipped_artifacts)
+        .sum();
+    let coverage = if responses.is_empty() {
+        empty_search_coverage()
+    } else {
+        aggregate_search_coverage(&responses)
+    };
+    let mut hits: Vec<sift::SearchHit> = responses
+        .into_iter()
+        .flat_map(|response| response.hits)
+        .collect();
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.location.cmp(&right.location))
+    });
+    hits.truncate(limit);
+    for (rank, hit) in hits.iter_mut().enumerate() {
+        hit.rank = rank + 1;
+    }
+
+    sift::SearchResponse {
+        strategy: strategy.to_string(),
+        root: root.display().to_string(),
+        indexed_artifacts,
+        skipped_artifacts,
+        coverage,
+        hits,
+    }
+}
+
+fn federated_sift_search(
+    root: &Path,
+    query: &str,
+    limit: usize,
+    timeout_secs: u64,
+    strategy: &str,
+) -> Result<sift::SearchResponse> {
+    let targets = resolve_search_index_targets(root, None, true)?;
+    if targets.is_empty() {
+        if config::Config::submodule_dirs(root)?.is_empty() {
+            return run_search_with_timeout(root, query, limit, timeout_secs, strategy);
+        }
+        return Ok(empty_search_response(root, strategy));
+    }
+
+    let mut responses = Vec::with_capacity(targets.len());
+    for target in targets {
+        let mut response =
+            run_search_with_timeout(&target.source_root, query, limit, timeout_secs, strategy)?;
+        absolutize_search_hit_paths(&mut response, &target.source_root);
+        response.root = root.display().to_string();
+        responses.push(response);
+    }
+
+    Ok(merge_search_responses(root, strategy, limit, responses))
 }
 
 fn federated_symbol_search(
