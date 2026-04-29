@@ -1,4 +1,4 @@
-use crate::index::IndexDb;
+use crate::{config, index::IndexDb};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
@@ -208,6 +208,23 @@ pub fn collect_entities_from_index_path(index_path: &Path) -> Result<HashSet<Str
     Ok(entities)
 }
 
+pub fn collect_entities_from_workspace_root(root: &Path) -> Result<HashSet<String>> {
+    let mut entities = HashSet::new();
+
+    push_entities_if_exists(&mut entities, &root.join("index.db"))?;
+    push_entities_if_exists(&mut entities, &root.join(".tsift/index.db"))?;
+
+    let cfg = config::Config::load(root)?;
+    for scope in config::Config::submodule_dirs(root)? {
+        if !cfg.federation_for_scope(&scope) {
+            continue;
+        }
+        push_entities_if_exists(&mut entities, &cfg.db_path_for(root, &scope.id))?;
+    }
+
+    Ok(entities)
+}
+
 fn discover_index_dbs(index_path: &Path) -> Result<Vec<PathBuf>> {
     let mut dbs = BTreeSet::new();
 
@@ -235,6 +252,13 @@ fn push_if_exists(dbs: &mut BTreeSet<PathBuf>, db_path: &Path) {
     if db_path.is_file() {
         dbs.insert(db_path.to_path_buf());
     }
+}
+
+fn push_entities_if_exists(entities: &mut HashSet<String>, db_path: &Path) -> Result<()> {
+    if db_path.is_file() {
+        entities.extend(collect_entities_from_db(db_path)?);
+    }
+    Ok(())
 }
 
 fn collect_child_index_dbs(dbs: &mut BTreeSet<PathBuf>, indexes_dir: &Path) -> Result<()> {
@@ -524,6 +548,70 @@ mod tests {
 
         assert!(entities.contains("alpha_helper"));
         assert!(entities.contains("beta_helper"));
+    }
+
+    #[test]
+    fn collect_entities_from_workspace_root_skips_non_federated_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".tsift")).unwrap();
+        fs::write(
+            root.join(".gitmodules"),
+            r#"[submodule "src/public"]
+	path = src/public
+	url = https://example.com/public
+[submodule "src/private"]
+	path = src/private
+	url = https://example.com/private
+[submodule "src/isolated"]
+	path = src/isolated
+	url = https://example.com/isolated
+[submodule "src/nonfed"]
+	path = src/nonfed
+	url = https://example.com/nonfed
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join(".tsift/config.toml"),
+            r#"
+[overrides.private]
+tier = "private"
+
+[overrides.isolated]
+tier = "isolated"
+
+[overrides.nonfed]
+federation = false
+"#,
+        )
+        .unwrap();
+
+        create_symbol_index(&root.join(".tsift/index.db"), &["root_helper"]);
+        create_symbol_index(
+            &root.join(".tsift/indexes/public/index.db"),
+            &["public_helper"],
+        );
+        create_symbol_index(
+            &root.join(".tsift/indexes/private/index.db"),
+            &["private_helper"],
+        );
+        create_symbol_index(
+            &root.join(".tsift/indexes/isolated/index.db"),
+            &["isolated_helper"],
+        );
+        create_symbol_index(
+            &root.join(".tsift/indexes/nonfed/index.db"),
+            &["nonfed_helper"],
+        );
+
+        let entities = collect_entities_from_workspace_root(root).unwrap();
+
+        assert!(entities.contains("root_helper"));
+        assert!(entities.contains("public_helper"));
+        assert!(!entities.contains("private_helper"));
+        assert!(!entities.contains("isolated_helper"));
+        assert!(!entities.contains("nonfed_helper"));
     }
 
     #[test]

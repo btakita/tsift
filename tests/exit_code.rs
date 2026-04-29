@@ -1248,6 +1248,105 @@ fn lint_auto_discovers_root_index_db() {
 }
 
 #[test]
+fn lint_auto_discovery_skips_non_federated_workspace_scopes() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        r#"[submodule "src/public"]
+	path = src/public
+	url = https://example.com/public
+[submodule "src/private"]
+	path = src/private
+	url = https://example.com/private
+[submodule "src/isolated"]
+	path = src/isolated
+	url = https://example.com/isolated
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join(".tsift")).unwrap();
+    fs::write(
+        dir.path().join(".tsift/config.toml"),
+        r#"
+[overrides.private]
+tier = "private"
+
+[overrides.isolated]
+tier = "isolated"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("src/public")).unwrap();
+    fs::create_dir_all(dir.path().join("src/private")).unwrap();
+    fs::create_dir_all(dir.path().join("src/isolated")).unwrap();
+    fs::write(
+        dir.path().join("src/public/lib.rs"),
+        "fn public_helper() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src/private/lib.rs"),
+        "fn private_helper() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src/isolated/lib.rs"),
+        "fn isolated_helper() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("README.md"),
+        "public_helper should be backticked.\nprivate_helper should stay hidden.\nisolated_helper should stay hidden.\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = tsift_bin()
+        .current_dir(dir.path())
+        .args(["lint", "README.md", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "lint stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let annotations = json["annotations"].as_array().unwrap();
+    assert!(
+        annotations
+            .iter()
+            .any(|ann| ann["text"].as_str() == Some("public_helper")),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        annotations
+            .iter()
+            .all(|ann| ann["text"].as_str() != Some("private_helper")),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        annotations
+            .iter()
+            .all(|ann| ann["text"].as_str() != Some("isolated_helper")),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn lint_accepts_explicit_indexes_dir() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(

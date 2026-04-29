@@ -3379,7 +3379,7 @@ fn cmd_lint(
     if let Some(index_dir) = index {
         entities.extend(lint::collect_entities_from_index_path(&index_dir)?);
     } else if let Some(root) = lint::find_project_root_for_path(file_path)? {
-        entities.extend(lint::collect_entities_from_index_path(&root)?);
+        entities.extend(lint::collect_entities_from_workspace_root(&root)?);
     }
 
     for md_path in &entities_from {
