@@ -9,7 +9,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | Command | Purpose |
 |---------|---------|
 | `tsift index` | Build AST symbol index via tree-sitter. `--workspace` / `--submodule <scope>` / `--prune` (currently a conservative full scan for correctness) / `--check` (dry-run) / `--exit-code` (exit 1 if stale, for hooks). Unknown `--submodule` names fail closed, and duplicate trailing submodule names promote to full-path scope ids like `vendor/foo`. |
-| `tsift search` | Hybrid BM25 + vector search via sift library. Built-in stale precheck + optional `--autoindex`. `--federated` / `--scope <scope>` for workspace; unknown scopes fail closed with the available scope ids, and ambiguous duplicate leaf names require the full submodule path |
+| `tsift search` | Hybrid BM25 + vector search via sift library. Built-in stale precheck + optional `--autoindex`. `--federated` / `--scope <scope>` for workspace; unknown scopes fail closed with the available scope ids, ambiguous duplicate leaf names require the full submodule path, and scoped-only workspace roots now require `--scope` or `--federated` instead of auto-creating a shared root index |
 | `tsift graph` | Call-graph queries: `--callers` / `--callees` of a symbol. `--limit N` (default 20, 0=unlimited) / `--scope <name>` / `--json`. Workspace roots with only scoped `.tsift/indexes/*/index.db` state fail closed until the caller selects a scope. |
 | `tsift edit` | Batch file edits from JSON (stdin or `--file`), atomic validate-then-write |
 | `tsift route` | Classify task → model tier (haiku/sonnet/opus) |

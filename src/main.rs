@@ -2917,6 +2917,36 @@ fn resolve_search_index_targets(
         return Ok(targets);
     }
 
+    let scopes = config::Config::submodule_dirs(root)?;
+    if !scopes.is_empty() {
+        let root_db = root.join(".tsift/index.db");
+        if !root_db.exists() {
+            let available_scopes = scopes
+                .iter()
+                .map(|scope| scope.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let cfg = config::Config::load(root)?;
+            let indexed_scopes = scopes
+                .iter()
+                .filter(|scope| cfg.db_path_for(root, &scope.id).exists())
+                .map(|scope| scope.id.as_str())
+                .collect::<Vec<_>>();
+            let indexed_label = if indexed_scopes.is_empty() {
+                "none".to_string()
+            } else {
+                indexed_scopes.join(", ")
+            };
+            bail!(
+                "workspace root {} has no shared root index at {}. Default search requires `--scope <scope>` or `--federated` when the workspace uses scoped `.tsift/indexes/*/index.db` files. Available scopes: {}. Indexed scopes: {}.",
+                root.display(),
+                root_db.display(),
+                available_scopes,
+                indexed_label,
+            );
+        }
+    }
+
     Ok(vec![SearchIndexTarget {
         label: "index".to_string(),
         db_path: root.join(".tsift/index.db"),
@@ -4371,6 +4401,20 @@ tier = "isolated"
         );
     }
 
+    fn assert_workspace_search_requires_explicit_target(err: anyhow::Error) {
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires `--scope <scope>` or `--federated`"),
+            "{msg}"
+        );
+        assert!(msg.contains("Available scopes: alpha, beta"), "{msg}");
+        assert!(msg.contains("Indexed scopes: alpha, beta"), "{msg}");
+        assert!(
+            !msg.contains("autoindexing index"),
+            "workspace search should fail before creating a shared root index: {msg}"
+        );
+    }
+
     #[test]
     fn graph_cmd_requires_scope_for_workspace_root_without_shared_index() {
         let dir = setup_workspace();
@@ -5071,6 +5115,50 @@ tier = "isolated"
         assert!(err.to_string().contains("stale"));
         assert!(err.to_string().contains("submodule `alpha` index"));
         assert!(!err.to_string().contains("database is locked"));
+    }
+
+    #[test]
+    fn workspace_search_cmd_requires_explicit_target_without_shared_root_index() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let err = cmd_search(
+            "alpha_helper".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            None,
+            false,
+            false,
+            true,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert_workspace_search_requires_explicit_target(err);
+        assert!(!dir.path().join(".tsift/index.db").exists());
     }
 
     #[test]

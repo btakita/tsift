@@ -1092,6 +1092,27 @@ fn workspace_graph_queries_require_scope_without_shared_root_index() {
 }
 
 #[test]
+fn workspace_search_requires_explicit_scope_or_federated_without_shared_root_index() {
+    let dir = indexed_workspace_cli_fixture();
+    let root = dir.path().to_str().unwrap();
+
+    let output = tsift_bin()
+        .args(["search", "alpha_helper", "--path", root, "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "workspace search should fail closed without an explicit target"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("requires `--scope <scope>` or `--federated`"), "{stderr}");
+    assert!(stderr.contains("Available scopes: alpha, beta"), "{stderr}");
+    assert!(stderr.contains("Indexed scopes: alpha, beta"), "{stderr}");
+    assert!(!dir.path().join(".tsift/index.db").exists());
+}
+
+#[test]
 fn nested_query_paths_use_the_ancestor_tsift_root() {
     let dir = indexed_cli_fixture();
     fs::create_dir_all(dir.path().join("src/nested")).unwrap();
