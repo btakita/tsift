@@ -75,6 +75,12 @@ pub struct ExtractionReport {
     pub errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitChangedFiles {
+    pub existing: Vec<PathBuf>,
+    pub deleted: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SummarizeConfig {
     pub model: String,
@@ -222,6 +228,15 @@ impl SummaryDb {
             .conn
             .execute("DELETE FROM summaries WHERE file_path = ?1", [file_path])?;
         Ok(count)
+    }
+
+    pub fn cached_file_paths(&self) -> Result<BTreeSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT file_path FROM summaries ORDER BY file_path")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<BTreeSet<_>, _>>()
+            .map_err(Into::into)
     }
 
     fn replace_file_with_hook<F>(
@@ -568,25 +583,35 @@ fn maybe_mock_anthropic_api(prompt: &str) -> Result<Option<(String, i64, i64)>> 
     Ok(Some((response, 0, 0)))
 }
 
-pub fn git_changed_files(root: &Path) -> Result<Vec<PathBuf>> {
+pub fn git_changed_files(root: &Path) -> Result<GitChangedFiles> {
     let tracked = git_list_paths(
         root,
         &["diff", "--name-only", "--diff-filter=d", "HEAD"],
         "git diff",
+    )?;
+    let deleted = git_list_paths(
+        root,
+        &["diff", "--name-only", "--diff-filter=D", "HEAD"],
+        "git diff deleted",
     )?;
     let untracked = git_list_paths(
         root,
         &["ls-files", "--others", "--exclude-standard"],
         "git ls-files",
     )?;
-    let files = tracked
+    let existing = tracked
         .into_iter()
         .chain(untracked)
         .filter(|path| path.is_file())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    Ok(files)
+    let deleted = deleted
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(GitChangedFiles { existing, deleted })
 }
 
 fn git_list_paths(root: &Path, args: &[&str], label: &str) -> Result<Vec<PathBuf>> {
@@ -699,6 +724,21 @@ mod tests {
         assert_eq!(stats.total_files, 2);
         assert_eq!(stats.total_tokens_input, 1500); // 3 * 500
         assert_eq!(stats.total_tokens_output, 600); // 3 * 200
+    }
+
+    #[test]
+    fn db_cached_file_paths() {
+        let (_tmp, db) = test_db();
+        db.insert(&make_summary("a", "f1.rs", "h1")).unwrap();
+        db.insert(&make_summary("b", "f1.rs", "h1")).unwrap();
+        db.insert(&make_summary("c", "f2.rs", "h2")).unwrap();
+
+        let paths = db.cached_file_paths().unwrap();
+
+        assert_eq!(
+            paths.into_iter().collect::<Vec<_>>(),
+            vec!["f1.rs".to_string(), "f2.rs".to_string()]
+        );
     }
 
     #[test]

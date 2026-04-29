@@ -4,7 +4,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sift::{SearchInput, SearchOptions, Sift};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -2604,17 +2604,35 @@ fn cmd_summarize(
         let cfg = load_summarize_config(&root);
         let summary_db = summarize::SummaryDb::open(&db_path)?;
 
-        let files_to_extract = if diff {
+        let (files_to_extract, deleted_summary_paths) = if diff {
             let changed = summarize::git_changed_files(&root)?;
-            changed
+            let existing = changed
+                .existing
                 .into_iter()
                 .filter(|f| summarize_diff_matches_scope(f, &extract_scope))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let deleted = changed
+                .deleted
+                .into_iter()
+                .filter(|f| summarize_diff_matches_scope(f, &extract_scope))
+                .map(|file_path| {
+                    file_path
+                        .strip_prefix(&root)
+                        .unwrap_or(file_path.as_path())
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect::<BTreeSet<_>>();
+            (existing, deleted)
         } else {
-            collect_source_files(&extract_scope)?
+            (collect_source_files(&extract_scope)?, BTreeSet::new())
         };
 
-        if files_to_extract.is_empty() {
+        for rel_path in &deleted_summary_paths {
+            summary_db.delete_by_file(rel_path)?;
+        }
+
+        if files_to_extract.is_empty() && deleted_summary_paths.is_empty() {
             println!("No files to extract.");
             return Ok(());
         }
@@ -3845,7 +3863,74 @@ mod tests {
 
         let files = summarize::git_changed_files(dir.path()).unwrap();
 
-        assert_eq!(files, vec![new_file]);
+        assert_eq!(files.existing, vec![new_file]);
+        assert!(files.deleted.is_empty());
+    }
+
+    #[test]
+    fn summarize_diff_extract_tracks_deleted_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = dir.path().join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let deleted_file = source_dir.join("gone.rs");
+        std::fs::write(&deleted_file, "fn stale() {}\n").unwrap();
+        init_git_repo(dir.path());
+
+        std::fs::remove_file(&deleted_file).unwrap();
+
+        let files = summarize::git_changed_files(dir.path()).unwrap();
+
+        assert!(files.existing.is_empty());
+        assert_eq!(files.deleted, vec![deleted_file]);
+    }
+
+    #[test]
+    fn summarize_diff_extract_deletes_removed_summary_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = dir.path().join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let deleted_file = source_dir.join("gone.rs");
+        std::fs::write(&deleted_file, "fn stale() {}\n").unwrap();
+        std::fs::write(dir.path().join("README.md"), "# repo\n").unwrap();
+        init_git_repo(dir.path());
+
+        let summary_db =
+            summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+        summary_db
+            .insert(&summarize::Summary {
+                id: 0,
+                symbol_name: "stale".to_string(),
+                file_path: "src/gone.rs".to_string(),
+                content_hash: "hash1".to_string(),
+                summary: "stale summary".to_string(),
+                entities: None,
+                relationships: None,
+                concept_labels: None,
+                extracted_at: "1700000000".to_string(),
+                model: "test".to_string(),
+                tokens_input: Some(100),
+                tokens_output: Some(50),
+            })
+            .unwrap();
+
+        std::fs::remove_file(&deleted_file).unwrap();
+
+        cmd_summarize(
+            None,
+            None,
+            Some(PathBuf::from("src")),
+            true,
+            false,
+            dir.path(),
+            false,
+            true,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(summary_db.get_by_file("src/gone.rs").unwrap().is_empty());
     }
 
     #[test]

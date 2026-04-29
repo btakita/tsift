@@ -7,6 +7,7 @@ use crate::init::{self, InstructionStatus};
 use crate::summarize::SummaryDb;
 use anyhow::Result;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -123,7 +124,7 @@ pub fn check_status(root: &Path) -> Result<StatusReport> {
     let summaries_db_path = root.join(".tsift/summaries.db");
 
     let index = check_index(root)?;
-    let summaries = check_summaries(&summaries_db_path, &index)?;
+    let summaries = check_summaries(root, &summaries_db_path, &index)?;
     let instructions = init::check_instruction_version(root);
     let recommendations = build_recommendations(&index, &summaries, &instructions, workspace);
 
@@ -283,21 +284,21 @@ pub fn check_locks(
     })
 }
 
-fn check_summaries(db_path: &Path, index: &IndexStatus) -> Result<SummaryStatus> {
-    let total_indexed_files = match index {
-        IndexStatus::Fresh { total_files, .. } | IndexStatus::Stale { total_files, .. } => {
-            *total_files
-        }
-        IndexStatus::Missing { .. } => return Ok(SummaryStatus::Unavailable),
-    };
-
+fn check_summaries(root: &Path, db_path: &Path, index: &IndexStatus) -> Result<SummaryStatus> {
+    if matches!(index, IndexStatus::Missing { .. }) {
+        return Ok(SummaryStatus::Unavailable);
+    }
     if !db_path.exists() {
         return Ok(SummaryStatus::None);
     }
 
     let db = SummaryDb::open_read_only(db_path)?;
-    let stats = db.stats()?;
-    let cached_files = stats.total_files;
+    let cached_summary_paths = db.cached_file_paths()?.into_iter().collect::<HashSet<_>>();
+    let live_indexed_files = live_indexed_summary_paths(root, index)?;
+    let total_indexed_files = live_indexed_files.len();
+    let cached_files = cached_summary_paths
+        .intersection(&live_indexed_files)
+        .count();
 
     if cached_files == 0 {
         return Ok(SummaryStatus::None);
@@ -314,6 +315,43 @@ fn check_summaries(db_path: &Path, index: &IndexStatus) -> Result<SummaryStatus>
         total_indexed_files,
         coverage_pct,
     })
+}
+
+fn live_indexed_summary_paths(root: &Path, index: &IndexStatus) -> Result<HashSet<String>> {
+    match index {
+        IndexStatus::Fresh {
+            workspace_scopes, ..
+        }
+        | IndexStatus::Stale {
+            workspace_scopes, ..
+        } => {
+            if workspace_scopes.is_empty() {
+                tracked_summary_paths_from_index(&root.join(".tsift/index.db"), root)
+            } else {
+                let mut paths = HashSet::new();
+                for scope in workspace_scopes {
+                    paths.extend(tracked_summary_paths_from_index(&scope.db_path, root)?);
+                }
+                Ok(paths)
+            }
+        }
+        IndexStatus::Missing { .. } => Ok(HashSet::new()),
+    }
+}
+
+fn tracked_summary_paths_from_index(db_path: &Path, root: &Path) -> Result<HashSet<String>> {
+    let tracked = IndexDb::file_paths_read_only(db_path)?;
+    Ok(tracked
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .map(|path| {
+            path.strip_prefix(root)
+                .unwrap_or(path.as_path())
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect())
 }
 
 fn build_recommendations(
@@ -1167,6 +1205,60 @@ mod tests {
                 .use_commands
                 .contains(&"summarize".to_string())
         );
+    }
+
+    #[test]
+    fn status_summary_coverage_ignores_deleted_summary_rows() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+
+        let sdb = SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+        sdb.insert(&crate::summarize::Summary {
+            id: 0,
+            symbol_name: "main".to_string(),
+            file_path: "main.rs".to_string(),
+            content_hash: "abc123".to_string(),
+            summary: "Entry point".to_string(),
+            entities: None,
+            relationships: None,
+            concept_labels: None,
+            extracted_at: "2026-01-01".to_string(),
+            model: "test".to_string(),
+            tokens_input: Some(100),
+            tokens_output: Some(50),
+        })
+        .unwrap();
+        sdb.insert(&crate::summarize::Summary {
+            id: 0,
+            symbol_name: "ghost".to_string(),
+            file_path: "removed.rs".to_string(),
+            content_hash: "def456".to_string(),
+            summary: "Stale summary".to_string(),
+            entities: None,
+            relationships: None,
+            concept_labels: None,
+            extracted_at: "2026-01-01".to_string(),
+            model: "test".to_string(),
+            tokens_input: Some(100),
+            tokens_output: Some(50),
+        })
+        .unwrap();
+
+        let report = check_status(dir.path()).unwrap();
+        match report.summaries {
+            SummaryStatus::Available {
+                cached_files,
+                total_indexed_files,
+                coverage_pct,
+            } => {
+                assert_eq!(cached_files, 1);
+                assert_eq!(total_indexed_files, 1);
+                assert_eq!(coverage_pct, 100);
+            }
+            other => panic!("expected available summaries, got {other:?}"),
+        }
     }
 
     #[test]

@@ -368,6 +368,17 @@ impl IndexDb {
         }
     }
 
+    pub fn file_paths_read_only(db_path: &Path) -> Result<Vec<String>> {
+        match Self::open_read_only(db_path).and_then(|db| db.file_paths()) {
+            Ok(paths) => Ok(paths),
+            Err(err) if should_retry_read_only_with_snapshot(db_path, &err) => {
+                let db = Self::open_read_only_snapshot(db_path)?;
+                db.file_paths()
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn inspect_read_only(
         db_path: &Path,
         root: &Path,
@@ -841,6 +852,15 @@ impl IndexDb {
             .conn
             .query_row("SELECT COUNT(*) FROM file_state", [], |row| row.get(0))?;
         Ok(count as usize)
+    }
+
+    pub fn file_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM file_state ORDER BY path")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn symbol_count(&self) -> Result<usize> {
