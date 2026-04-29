@@ -690,7 +690,11 @@ fn index_submodule_fails_on_unknown_submodule_name() {
     .unwrap();
     fs::create_dir_all(dir.path().join("src/alpha")).unwrap();
     fs::create_dir_all(dir.path().join("src/beta")).unwrap();
-    fs::write(dir.path().join("src/alpha/lib.rs"), "fn alpha_helper() {}\n").unwrap();
+    fs::write(
+        dir.path().join("src/alpha/lib.rs"),
+        "fn alpha_helper() {}\n",
+    )
+    .unwrap();
     fs::write(dir.path().join("src/beta/lib.rs"), "fn beta_func() {}\n").unwrap();
 
     let output = tsift_bin()
@@ -841,6 +845,74 @@ fn status_reports_workspace_scoped_indexes_in_json() {
         !stdout.contains("\"index\":{\"state\":\"missing\""),
         "stdout was: {stdout}"
     );
+}
+
+#[test]
+fn status_reports_partially_indexed_workspace_as_stale_with_missing_scopes_in_json() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+[submodule "src/beta"]
+	path = src/beta
+	url = https://example.com/beta
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("src/alpha")).unwrap();
+    fs::create_dir_all(dir.path().join("src/beta")).unwrap();
+    fs::write(dir.path().join("src/alpha/lib.rs"), "fn alpha() {}\n").unwrap();
+    fs::write(dir.path().join("src/beta/lib.rs"), "fn beta() {}\n").unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "index",
+            "--submodule",
+            "alpha",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = tsift_bin()
+        .args(["status", "--json", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"state\":\"stale\""),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"workspace_scopes\""),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"missing_scopes\""),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"scope\":\"alpha\""),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"scope\":\"beta\""),
+        "stdout was: {stdout}"
+    );
+    assert!(stdout.contains("1 missing scope"), "stdout was: {stdout}");
 }
 
 #[test]

@@ -30,6 +30,8 @@ pub enum IndexStatus {
         recovery: Option<ReadOnlyRecovery>,
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
         workspace_scopes: Vec<WorkspaceScopeStatus>,
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        missing_scopes: Vec<MissingWorkspaceScopeStatus>,
     },
     #[serde(rename = "stale")]
     Stale {
@@ -40,9 +42,14 @@ pub enum IndexStatus {
         recovery: Option<ReadOnlyRecovery>,
         #[serde(skip_serializing_if = "Vec::is_empty", default)]
         workspace_scopes: Vec<WorkspaceScopeStatus>,
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        missing_scopes: Vec<MissingWorkspaceScopeStatus>,
     },
     #[serde(rename = "missing")]
-    Missing,
+    Missing {
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        missing_scopes: Vec<MissingWorkspaceScopeStatus>,
+    },
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -54,6 +61,12 @@ pub struct WorkspaceScopeStatus {
     pub last_indexed_secs_ago: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<ReadOnlyRecovery>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct MissingWorkspaceScopeStatus {
+    pub scope: String,
+    pub db_path: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,6 +160,7 @@ fn check_index(root: &Path) -> Result<IndexStatus> {
             last_indexed_secs_ago,
             recovery: inspection.recovery,
             workspace_scopes: Vec::new(),
+            missing_scopes: Vec::new(),
         })
     } else {
         Ok(IndexStatus::Fresh {
@@ -155,6 +169,7 @@ fn check_index(root: &Path) -> Result<IndexStatus> {
             last_indexed_secs_ago,
             recovery: inspection.recovery,
             workspace_scopes: Vec::new(),
+            missing_scopes: Vec::new(),
         })
     }
 }
@@ -162,9 +177,14 @@ fn check_index(root: &Path) -> Result<IndexStatus> {
 fn check_workspace_index(root: &Path) -> Result<IndexStatus> {
     let cfg = config::Config::load(root)?;
     let mut scopes = Vec::new();
+    let mut missing_scopes = Vec::new();
     for scope in config::Config::submodule_dirs(root)? {
         let db_path = cfg.db_path_for(root, &scope.id);
         if !scope.source_root.exists() || !db_path.exists() {
+            missing_scopes.push(MissingWorkspaceScopeStatus {
+                scope: scope.id,
+                db_path,
+            });
             continue;
         }
 
@@ -189,7 +209,7 @@ fn check_workspace_index(root: &Path) -> Result<IndexStatus> {
     }
 
     if scopes.is_empty() {
-        return Ok(IndexStatus::Missing);
+        return Ok(IndexStatus::Missing { missing_scopes });
     }
 
     scopes.sort_by(|left, right| left.scope.cmp(&right.scope));
@@ -202,13 +222,14 @@ fn check_workspace_index(root: &Path) -> Result<IndexStatus> {
         .unwrap_or(0);
     let recovery = scopes.iter().find_map(|scope| scope.recovery);
 
-    if stale_files > 0 {
+    if stale_files > 0 || !missing_scopes.is_empty() {
         Ok(IndexStatus::Stale {
             total_files,
             stale_files,
             last_indexed_secs_ago,
             recovery,
             workspace_scopes: scopes,
+            missing_scopes,
         })
     } else {
         Ok(IndexStatus::Fresh {
@@ -217,6 +238,7 @@ fn check_workspace_index(root: &Path) -> Result<IndexStatus> {
             last_indexed_secs_ago,
             recovery,
             workspace_scopes: scopes,
+            missing_scopes,
         })
     }
 }
@@ -253,7 +275,7 @@ fn check_summaries(db_path: &Path, index: &IndexStatus) -> Result<SummaryStatus>
         IndexStatus::Fresh { total_files, .. } | IndexStatus::Stale { total_files, .. } => {
             *total_files
         }
-        IndexStatus::Missing => return Ok(SummaryStatus::Unavailable),
+        IndexStatus::Missing { .. } => return Ok(SummaryStatus::Unavailable),
     };
 
     if !db_path.exists() {
@@ -300,15 +322,26 @@ fn build_recommendations(
     };
 
     match index {
-        IndexStatus::Missing => Recommendations {
+        IndexStatus::Missing { missing_scopes } => Recommendations {
             use_commands: vec![],
             run: if refresh {
-                Some(format!("{init_cmd} && {index_cmd}"))
+                Some(format!(
+                    "{init_cmd} && {}",
+                    format_index_run_with_gap(index_cmd, 0, missing_scopes.len())
+                ))
             } else {
-                Some(index_cmd.to_string())
+                Some(format_index_run_with_gap(
+                    index_cmd,
+                    0,
+                    missing_scopes.len(),
+                ))
             },
         },
-        IndexStatus::Stale { stale_files, .. } => {
+        IndexStatus::Stale {
+            stale_files,
+            missing_scopes,
+            ..
+        } => {
             let mut use_cmds = vec![
                 "search".to_string(),
                 "explain".to_string(),
@@ -317,21 +350,11 @@ fn build_recommendations(
             if matches!(summaries, SummaryStatus::Available { .. }) {
                 use_cmds.push("summarize".to_string());
             }
+            let run_msg = format_index_run_with_gap(index_cmd, *stale_files, missing_scopes.len());
             let run_msg = if refresh {
-                format!(
-                    "{} && {}  ({} stale file{})",
-                    init_cmd,
-                    index_cmd,
-                    stale_files,
-                    if *stale_files == 1 { "" } else { "s" }
-                )
+                format!("{init_cmd} && {run_msg}")
             } else {
-                format!(
-                    "{}  ({} stale file{})",
-                    index_cmd,
-                    stale_files,
-                    if *stale_files == 1 { "" } else { "s" }
-                )
+                run_msg
             };
             Recommendations {
                 use_commands: use_cmds,
@@ -463,7 +486,7 @@ fn format_recovery_line(recovery: ReadOnlyRecovery, compact: bool) -> String {
 fn index_recovery(index: &IndexStatus) -> Option<ReadOnlyRecovery> {
     match index {
         IndexStatus::Fresh { recovery, .. } | IndexStatus::Stale { recovery, .. } => *recovery,
-        IndexStatus::Missing => None,
+        IndexStatus::Missing { .. } => None,
     }
 }
 
@@ -475,7 +498,15 @@ fn workspace_scopes(index: &IndexStatus) -> &[WorkspaceScopeStatus] {
         | IndexStatus::Stale {
             workspace_scopes, ..
         } => workspace_scopes.as_slice(),
-        IndexStatus::Missing => &[],
+        IndexStatus::Missing { .. } => &[],
+    }
+}
+
+fn missing_workspace_scopes(index: &IndexStatus) -> &[MissingWorkspaceScopeStatus] {
+    match index {
+        IndexStatus::Fresh { missing_scopes, .. }
+        | IndexStatus::Stale { missing_scopes, .. }
+        | IndexStatus::Missing { missing_scopes } => missing_scopes.as_slice(),
     }
 }
 
@@ -512,12 +543,67 @@ fn format_workspace_scope_line(scope: &WorkspaceScopeStatus, compact: bool) -> S
     }
 }
 
+fn format_missing_workspace_scope_line(
+    scope: &MissingWorkspaceScopeStatus,
+    compact: bool,
+) -> String {
+    if compact {
+        format!("scope:{} state:missing\n", scope.scope)
+    } else {
+        format!(
+            "  scope {}: missing index ({})\n",
+            scope.scope,
+            scope.db_path.display()
+        )
+    }
+}
+
+fn format_index_run_with_gap(index_cmd: &str, stale_files: usize, missing_scopes: usize) -> String {
+    let mut notes = Vec::new();
+    if stale_files > 0 {
+        notes.push(format!(
+            "{} stale file{}",
+            stale_files,
+            if stale_files == 1 { "" } else { "s" }
+        ));
+    }
+    if missing_scopes > 0 {
+        notes.push(format!(
+            "{} missing scope{}",
+            missing_scopes,
+            if missing_scopes == 1 { "" } else { "s" }
+        ));
+    }
+    if notes.is_empty() {
+        index_cmd.to_string()
+    } else {
+        format!("{}  ({})", index_cmd, notes.join(", "))
+    }
+}
+
 pub fn format_human(report: &StatusReport, compact: bool) -> String {
     let mut out = String::new();
 
     match &report.index {
-        IndexStatus::Missing => {
-            out.push_str("index: missing\n");
+        IndexStatus::Missing { missing_scopes } => {
+            if compact {
+                if missing_scopes.is_empty() {
+                    out.push_str("index: missing\n");
+                } else {
+                    out.push_str(&format!(
+                        "index: missing workspace_missing:{}\n",
+                        missing_scopes.len()
+                    ));
+                }
+            } else if missing_scopes.is_empty() {
+                out.push_str("index: missing\n");
+            } else {
+                out.push_str(&format!(
+                    "index: missing (workspace, {} scope{} not indexed)\n",
+                    missing_scopes.len(),
+                    if missing_scopes.len() == 1 { "" } else { "s" }
+                ));
+            }
         }
         IndexStatus::Fresh {
             total_files,
@@ -562,6 +648,7 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
             stale_files,
             last_indexed_secs_ago,
             workspace_scopes,
+            missing_scopes,
             ..
         } => {
             if compact {
@@ -573,9 +660,15 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
                         format_duration(*last_indexed_secs_ago)
                     ));
                 } else {
+                    let missing_suffix = if missing_scopes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" missing:{}", missing_scopes.len())
+                    };
                     out.push_str(&format!(
-                        "index: stale workspace:{} tracked:{} stale:{} age:{}\n",
+                        "index: stale workspace:{}{} tracked:{} stale:{} age:{}\n",
                         workspace_scopes.len(),
+                        missing_suffix,
                         total_files,
                         stale_files,
                         format_duration(*last_indexed_secs_ago)
@@ -591,8 +684,11 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
                     ));
                 } else {
                     out.push_str(&format!(
-                        "index: stale (workspace, {} scopes, last indexed {}, {} files tracked, {} stale)\n",
+                        "index: stale (workspace, {} indexed scope{}, {} missing scope{}, last indexed {}, {} files tracked, {} stale)\n",
                         workspace_scopes.len(),
+                        if workspace_scopes.len() == 1 { "" } else { "s" },
+                        missing_scopes.len(),
+                        if missing_scopes.len() == 1 { "" } else { "s" },
                         format_duration(*last_indexed_secs_ago),
                         total_files,
                         stale_files
@@ -604,6 +700,9 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
 
     for scope in workspace_scopes(&report.index) {
         out.push_str(&format_workspace_scope_line(scope, compact));
+    }
+    for scope in missing_workspace_scopes(&report.index) {
+        out.push_str(&format_missing_workspace_scope_line(scope, compact));
     }
 
     if let Some(recovery) = index_recovery(&report.index) {
@@ -795,7 +894,10 @@ mod tests {
     fn status_no_index() {
         let dir = TempDir::new().unwrap();
         let report = check_status(dir.path()).unwrap();
-        assert!(matches!(report.index, IndexStatus::Missing));
+        assert!(matches!(
+            report.index,
+            IndexStatus::Missing { ref missing_scopes } if missing_scopes.is_empty()
+        ));
         assert!(matches!(report.summaries, SummaryStatus::Unavailable));
         assert!(matches!(report.instructions, InstructionStatus::Missing));
         assert!(report.recommendations.use_commands.is_empty());
@@ -860,10 +962,49 @@ mod tests {
         let dir = setup_workspace();
 
         let report = check_status(dir.path()).unwrap();
-        assert!(matches!(report.index, IndexStatus::Missing));
+        match &report.index {
+            IndexStatus::Missing { missing_scopes } => {
+                assert_eq!(missing_scopes.len(), 2);
+                assert_eq!(missing_scopes[0].scope, "alpha");
+                assert_eq!(missing_scopes[1].scope, "beta");
+            }
+            other => panic!("expected missing workspace status, got {other:?}"),
+        }
         assert_eq!(
             report.recommendations.run.as_deref(),
-            Some("tsift init --workspace && tsift index --workspace .")
+            Some("tsift init --workspace && tsift index --workspace .  (2 missing scopes)")
+        );
+    }
+
+    #[test]
+    fn status_workspace_partial_indexes_report_missing_scopes() {
+        let dir = setup_workspace();
+        let cfg = Config::load(dir.path()).unwrap();
+        let alpha = Config::resolve_submodule(dir.path(), "alpha").unwrap();
+        let db = IndexDb::open(&cfg.db_path_for(dir.path(), &alpha.id)).unwrap();
+        db.apply_changes(&alpha.source_root).unwrap();
+
+        let report = check_status(dir.path()).unwrap();
+        match &report.index {
+            IndexStatus::Stale {
+                total_files,
+                stale_files,
+                workspace_scopes,
+                missing_scopes,
+                ..
+            } => {
+                assert_eq!(*total_files, 1);
+                assert_eq!(*stale_files, 0);
+                assert_eq!(workspace_scopes.len(), 1);
+                assert_eq!(workspace_scopes[0].scope, "alpha");
+                assert_eq!(missing_scopes.len(), 1);
+                assert_eq!(missing_scopes[0].scope, "beta");
+            }
+            other => panic!("expected partial workspace status, got {other:?}"),
+        }
+        assert_eq!(
+            report.recommendations.run.as_deref(),
+            Some("tsift init --workspace && tsift index --workspace .  (1 missing scope)")
         );
     }
 
@@ -976,7 +1117,9 @@ mod tests {
     #[test]
     fn status_human_format_missing() {
         let report = StatusReport {
-            index: IndexStatus::Missing,
+            index: IndexStatus::Missing {
+                missing_scopes: Vec::new(),
+            },
             summaries: SummaryStatus::Unavailable,
             instructions: InstructionStatus::Missing,
             recommendations: Recommendations {
@@ -1000,6 +1143,7 @@ mod tests {
                 last_indexed_secs_ago: 120,
                 recovery: None,
                 workspace_scopes: Vec::new(),
+                missing_scopes: Vec::new(),
             },
             summaries: SummaryStatus::Available {
                 cached_files: 30,
@@ -1036,6 +1180,7 @@ mod tests {
                 last_indexed_secs_ago: 120,
                 recovery: None,
                 workspace_scopes: Vec::new(),
+                missing_scopes: Vec::new(),
             },
             summaries: SummaryStatus::None,
             instructions: InstructionStatus::Stale {
@@ -1067,6 +1212,7 @@ mod tests {
                 last_indexed_secs_ago: 5,
                 recovery: Some(ReadOnlyRecovery::SnapshotFallback),
                 workspace_scopes: Vec::new(),
+                missing_scopes: Vec::new(),
             },
             summaries: SummaryStatus::None,
             instructions: InstructionStatus::Current {
@@ -1090,6 +1236,7 @@ mod tests {
                 last_indexed_secs_ago: 1,
                 recovery: Some(ReadOnlyRecovery::SnapshotFallback),
                 workspace_scopes: Vec::new(),
+                missing_scopes: Vec::new(),
             },
             summaries: SummaryStatus::None,
             instructions: InstructionStatus::Current {

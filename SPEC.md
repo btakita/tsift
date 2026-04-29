@@ -688,7 +688,7 @@ This ensures agent sessions always use instructions matching the installed binar
 
 ## Status (Session Health Check)
 
-`tsift status` reports index freshness, instruction version, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session. On workspace roots, it detects scoped indexes under `.tsift/indexes/<scope>/index.db`, aggregates them into the top-level index state, and reports the contributing scopes explicitly.
+`tsift status` reports index freshness, instruction version, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session. On workspace roots, it detects scoped indexes under `.tsift/indexes/<scope>/index.db`, aggregates them into the top-level index state, reports the contributing scopes explicitly, and surfaces configured scopes whose `index.db` is still missing so partially indexed workspaces do not masquerade as `fresh`.
 
 ```bash
 tsift status            # human-readable output
@@ -732,6 +732,18 @@ recommendations:
   run: tsift summarize --extract src/
 ```
 
+When a workspace is only partially indexed:
+```
+index: stale (workspace, 1 indexed scope, 1 missing scope, last indexed 2m ago, 120 files tracked, 0 stale)
+  scope alpha: fresh (last indexed 2m ago, 120 files tracked)
+  scope beta: missing index (/repo/.tsift/indexes/beta/index.db)
+instructions: current (v0.1.0)
+summaries: none
+recommendations:
+  use: search, explain, graph
+  run: tsift init --workspace && tsift index --workspace .  (1 missing scope)
+```
+
 ### JSON Schema
 
 ```json
@@ -748,6 +760,12 @@ recommendations:
         "total_files": N,
         "stale_files": N,
         "last_indexed_secs_ago": N
+      }
+    ],
+    "missing_scopes": [
+      {
+        "scope": "beta",
+        "db_path": "/repo/.tsift/indexes/beta/index.db"
       }
     ]
   },
