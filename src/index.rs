@@ -354,6 +354,20 @@ impl IndexDb {
         }
     }
 
+    pub fn file_symbols_read_only(
+        db_path: &Path,
+        candidates: &[String],
+    ) -> Result<Vec<(String, String)>> {
+        match Self::open_read_only(db_path).and_then(|db| db.file_symbols(candidates)) {
+            Ok(symbols) => Ok(symbols),
+            Err(err) if should_retry_read_only_with_snapshot(db_path, &err) => {
+                let db = Self::open_read_only_snapshot(db_path)?;
+                db.file_symbols(candidates)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn inspect_read_only(
         db_path: &Path,
         root: &Path,
@@ -420,6 +434,34 @@ impl IndexDb {
                 path: snapshot_path,
             }),
         })
+    }
+
+    fn file_symbols(&self, candidates: &[String]) -> Result<Vec<(String, String)>> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table_exists: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='symbols'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !table_exists {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = (1..=candidates.len())
+            .map(|idx| format!("?{idx}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql =
+            format!("SELECT name, kind FROM symbols WHERE file IN ({placeholders}) ORDER BY line");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(candidates.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     fn load_dir_state(&self) -> Result<HashMap<PathBuf, SystemTime>> {

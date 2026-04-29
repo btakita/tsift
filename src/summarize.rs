@@ -1,3 +1,4 @@
+use crate::index::IndexDb;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -435,38 +436,8 @@ fn load_symbols_for_file(
     if !db_path.exists() {
         return Ok(Vec::new());
     }
-    let conn = Connection::open_with_flags(
-        db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    // Check if symbols table exists
-    let table_exists: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='symbols'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-    if !table_exists {
-        return Ok(Vec::new());
-    }
     let candidates = symbol_lookup_candidates(file_path, source_root);
-    let rows = if candidates.len() == 1 {
-        let mut stmt =
-            conn.prepare("SELECT name, kind FROM symbols WHERE file = ?1 ORDER BY line")?;
-        stmt.query_map([candidates[0].as_str()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-    } else {
-        let mut stmt = conn
-            .prepare("SELECT name, kind FROM symbols WHERE file = ?1 OR file = ?2 ORDER BY line")?;
-        stmt.query_map([candidates[0].as_str(), candidates[1].as_str()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    Ok(rows)
+    IndexDb::file_symbols_read_only(db_path, &candidates)
 }
 
 fn build_extraction_prompt(file_path: &str, source: &str, symbols: &[(String, String)]) -> String {
@@ -649,6 +620,7 @@ fn chrono_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::rollback_journal_path;
     use serde_json::json;
     use tempfile::NamedTempFile;
 
@@ -982,6 +954,47 @@ mod tests {
             rusqlite::params!["wrong", "function", "rust", "nested/src/lib.rs", 1_i64],
         )
         .unwrap();
+
+        let file_path = Path::new("/workspace/src/lib.rs");
+        let symbols =
+            load_symbols_for_file(&db_path, file_path, Some(Path::new("/workspace"))).unwrap();
+
+        assert_eq!(
+            symbols,
+            vec![("target".to_string(), "function".to_string())]
+        );
+    }
+
+    #[test]
+    fn load_symbols_for_file_uses_snapshot_fallback_when_rollback_journal_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             CREATE TABLE symbols (
+                 id INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 language TEXT NOT NULL,
+                 signature TEXT,
+                 file TEXT NOT NULL,
+                 line INTEGER NOT NULL,
+                 end_line INTEGER,
+                 parent_module TEXT,
+                 visibility TEXT,
+                 tags TEXT
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, language, signature, file, line, end_line, parent_module, visibility, tags)
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, NULL, NULL, NULL, NULL)",
+            rusqlite::params!["target", "function", "rust", "src/lib.rs", 1_i64],
+        )
+        .unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        std::fs::write(rollback_journal_path(&db_path), "locked").unwrap();
 
         let file_path = Path::new("/workspace/src/lib.rs");
         let symbols =
