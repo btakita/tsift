@@ -1,16 +1,23 @@
-use crate::index::IndexDb;
+use crate::index::{IndexDb, ReadOnlyRecovery, error_mentions_locked_db, rollback_journal_path};
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct SummaryDb {
     conn: Connection,
+    _snapshot_copy: Option<SnapshotCopyGuard>,
+}
+
+pub struct SummaryReadOnlyOpen {
+    pub db: SummaryDb,
+    pub recovery: Option<ReadOnlyRecovery>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,10 +105,21 @@ pub(crate) struct SummaryWriteLockGuard {
     file: File,
 }
 
+#[derive(Debug)]
+struct SnapshotCopyGuard {
+    path: PathBuf,
+}
+
 impl Drop for SummaryWriteLockGuard {
     fn drop(&mut self) {
         let _ = clear_lock_metadata(&mut self.file);
         let _ = self.file.unlock();
+    }
+}
+
+impl Drop for SnapshotCopyGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -207,7 +225,10 @@ impl SummaryDb {
             CREATE INDEX IF NOT EXISTS idx_summaries_file ON summaries(file_path);
             CREATE INDEX IF NOT EXISTS idx_summaries_hash ON summaries(content_hash);",
         )?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            _snapshot_copy: None,
+        })
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self> {
@@ -217,7 +238,31 @@ impl SummaryDb {
         )
         .with_context(|| format!("opening summaries db: {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            _snapshot_copy: None,
+        })
+    }
+
+    pub fn open_read_only_resilient(path: &Path) -> Result<Self> {
+        Self::open_read_only_with_recovery(path).map(|result| result.db)
+    }
+
+    pub fn open_read_only_with_recovery(path: &Path) -> Result<SummaryReadOnlyOpen> {
+        match Self::open_read_only(path).and_then(|db| {
+            db.ensure_readable()?;
+            Ok(db)
+        }) {
+            Ok(db) => Ok(SummaryReadOnlyOpen { db, recovery: None }),
+            Err(err) if should_retry_read_only_with_snapshot(path, &err) => {
+                let db = Self::open_read_only_snapshot(path)?;
+                Ok(SummaryReadOnlyOpen {
+                    db,
+                    recovery: Some(ReadOnlyRecovery::SnapshotFallback),
+                })
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub fn get_by_symbol(&self, name: &str) -> Result<Vec<Summary>> {
@@ -351,6 +396,53 @@ impl SummaryDb {
             }
         }
     }
+
+    fn ensure_readable(&self) -> Result<()> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |_row| Ok(()))
+            .map_err(anyhow::Error::from)
+    }
+
+    fn open_read_only_snapshot(path: &Path) -> Result<Self> {
+        let snapshot_path = snapshot_copy_path(path);
+        std::fs::copy(path, &snapshot_path).with_context(|| {
+            format!(
+                "copying locked summaries db {} to snapshot {}",
+                path.display(),
+                snapshot_path.display()
+            )
+        })?;
+        let conn = Connection::open_with_flags(
+            &snapshot_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening summaries snapshot {}", snapshot_path.display()))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self {
+            conn,
+            _snapshot_copy: Some(SnapshotCopyGuard {
+                path: snapshot_path,
+            }),
+        })
+    }
+}
+
+fn should_retry_read_only_with_snapshot(path: &Path, err: &anyhow::Error) -> bool {
+    rollback_journal_path(path).exists() && error_mentions_locked_db(err)
+}
+
+fn snapshot_copy_path(db_path: &Path) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos();
+    let stem = db_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("summaries");
+    let mut file_name = OsString::from(format!("tsift-{stem}-{}-{nanos}", std::process::id()));
+    file_name.push(".db");
+    std::env::temp_dir().join(file_name)
 }
 
 fn read_lock_marker(file: &mut File) -> std::io::Result<LockFileMarker> {
@@ -749,6 +841,7 @@ fn chrono_now() -> String {
 mod tests {
     use super::*;
     use crate::index::rollback_journal_path;
+    use rusqlite::Connection;
     use serde_json::json;
     use tempfile::NamedTempFile;
 
@@ -1178,6 +1271,57 @@ mod tests {
             symbols,
             vec![("target".to_string(), "function".to_string())]
         );
+    }
+
+    #[test]
+    fn summary_read_only_uses_snapshot_fallback_when_rollback_journal_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("summaries.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             CREATE TABLE summaries (
+                 id INTEGER PRIMARY KEY,
+                 symbol_name TEXT NOT NULL,
+                 file_path TEXT NOT NULL,
+                 content_hash TEXT NOT NULL,
+                 summary TEXT NOT NULL,
+                 entities TEXT,
+                 relationships TEXT,
+                 concept_labels TEXT,
+                 extracted_at TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 tokens_input INTEGER,
+                 tokens_output INTEGER
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO summaries
+             (symbol_name, file_path, content_hash, summary, entities, relationships, concept_labels, extracted_at, model, tokens_input, tokens_output)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6, NULL, NULL)",
+            rusqlite::params![
+                "main",
+                "src/main.rs",
+                "hash1",
+                "cached summary",
+                "1700000000",
+                "test-model",
+            ],
+        )
+        .unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        std::fs::write(rollback_journal_path(&db_path), "locked").unwrap();
+
+        let opened = SummaryDb::open_read_only_with_recovery(&db_path).unwrap();
+
+        assert_eq!(
+            opened.recovery,
+            Some(crate::index::ReadOnlyRecovery::SnapshotFallback)
+        );
+        let results = opened.db.get_by_symbol("main").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].summary, "cached summary");
     }
 
     #[test]

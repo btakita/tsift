@@ -2848,7 +2848,7 @@ fn open_existing_summary_db_read_only(db_path: &Path) -> Result<summarize::Summa
     if !db_path.exists() {
         bail!("no summaries.db found — run `tsift summarize --extract <path>` first");
     }
-    summarize::SummaryDb::open_read_only(db_path)
+    summarize::SummaryDb::open_read_only_resilient(db_path)
 }
 
 fn cmd_status(
@@ -4013,6 +4013,88 @@ mod tests {
             "got: {err}"
         );
         assert!(!dir.path().join(".tsift/summaries.db").exists());
+    }
+
+    #[test]
+    fn summarize_stats_uses_snapshot_fallback_when_rollback_journal_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let summary_db =
+            summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+        summary_db
+            .insert(&summarize::Summary {
+                id: 0,
+                symbol_name: "alpha_helper".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                content_hash: "hash1".to_string(),
+                summary: "cached summary".to_string(),
+                entities: None,
+                relationships: None,
+                concept_labels: None,
+                extracted_at: "1700000000".to_string(),
+                model: "claude-haiku-4-5-20251001".to_string(),
+                tokens_input: Some(100),
+                tokens_output: Some(40),
+            })
+            .unwrap();
+        drop(summary_db);
+        let _lock = hold_rollback_journal_lock(&dir.path().join(".tsift/summaries.db"));
+
+        let result = cmd_summarize(
+            None,
+            None,
+            None,
+            false,
+            true,
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn summarize_symbol_query_uses_snapshot_fallback_when_rollback_journal_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let summary_db =
+            summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+        summary_db
+            .insert(&summarize::Summary {
+                id: 0,
+                symbol_name: "alpha_helper".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                content_hash: "hash1".to_string(),
+                summary: "cached summary".to_string(),
+                entities: None,
+                relationships: None,
+                concept_labels: None,
+                extracted_at: "1700000000".to_string(),
+                model: "claude-haiku-4-5-20251001".to_string(),
+                tokens_input: Some(100),
+                tokens_output: Some(40),
+            })
+            .unwrap();
+        drop(summary_db);
+        let _lock = hold_rollback_journal_lock(&dir.path().join(".tsift/summaries.db"));
+
+        let result = cmd_summarize(
+            Some("alpha_helper".to_string()),
+            None,
+            None,
+            false,
+            false,
+            dir.path(),
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
     }
 
     #[test]

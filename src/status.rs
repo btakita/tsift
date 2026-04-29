@@ -78,9 +78,14 @@ pub enum SummaryStatus {
         cached_files: usize,
         total_indexed_files: usize,
         coverage_pct: u8,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery: Option<ReadOnlyRecovery>,
     },
     #[serde(rename = "none")]
-    None,
+    None {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery: Option<ReadOnlyRecovery>,
+    },
     #[serde(rename = "unavailable")]
     Unavailable,
 }
@@ -289,10 +294,12 @@ fn check_summaries(root: &Path, db_path: &Path, index: &IndexStatus) -> Result<S
         return Ok(SummaryStatus::Unavailable);
     }
     if !db_path.exists() {
-        return Ok(SummaryStatus::None);
+        return Ok(SummaryStatus::None { recovery: None });
     }
 
-    let db = SummaryDb::open_read_only(db_path)?;
+    let read_only = SummaryDb::open_read_only_with_recovery(db_path)?;
+    let recovery = read_only.recovery;
+    let db = read_only.db;
     let cached_summary_paths = db.cached_file_paths()?.into_iter().collect::<HashSet<_>>();
     let live_indexed_files = live_indexed_summary_paths(root, index)?;
     let total_indexed_files = live_indexed_files.len();
@@ -301,7 +308,7 @@ fn check_summaries(root: &Path, db_path: &Path, index: &IndexStatus) -> Result<S
         .count();
 
     if cached_files == 0 {
-        return Ok(SummaryStatus::None);
+        return Ok(SummaryStatus::None { recovery });
     }
 
     let coverage_pct = if total_indexed_files > 0 {
@@ -314,6 +321,7 @@ fn check_summaries(root: &Path, db_path: &Path, index: &IndexStatus) -> Result<S
         cached_files,
         total_indexed_files,
         coverage_pct,
+        recovery,
     })
 }
 
@@ -436,7 +444,7 @@ fn build_recommendations(
                         None
                     }
                 }
-                SummaryStatus::None => Some("tsift summarize --extract src/".to_string()),
+                SummaryStatus::None { .. } => Some("tsift summarize --extract src/".to_string()),
                 SummaryStatus::Unavailable => None,
             };
             if refresh {
@@ -554,6 +562,25 @@ fn index_recovery(index: &IndexStatus) -> Option<ReadOnlyRecovery> {
     match index {
         IndexStatus::Fresh { recovery, .. } | IndexStatus::Stale { recovery, .. } => *recovery,
         IndexStatus::Missing { .. } => None,
+    }
+}
+
+fn summary_recovery(summaries: &SummaryStatus) -> Option<ReadOnlyRecovery> {
+    match summaries {
+        SummaryStatus::Available { recovery, .. } | SummaryStatus::None { recovery } => *recovery,
+        SummaryStatus::Unavailable => None,
+    }
+}
+
+fn format_summary_recovery_line(recovery: ReadOnlyRecovery, compact: bool) -> String {
+    match (recovery, compact) {
+        (ReadOnlyRecovery::SnapshotFallback, true) => {
+            "summaries_recovery:snapshot_fallback\n".to_string()
+        }
+        (ReadOnlyRecovery::SnapshotFallback, false) => {
+            "summaries recovery: snapshot fallback (rollback-journal lock on live summaries db)\n"
+                .to_string()
+        }
     }
 }
 
@@ -826,6 +853,7 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
             cached_files,
             total_indexed_files,
             coverage_pct,
+            ..
         } => {
             if compact {
                 out.push_str(&format!(
@@ -839,12 +867,16 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
                 ));
             }
         }
-        SummaryStatus::None => {
+        SummaryStatus::None { .. } => {
             out.push_str("summaries: none\n");
         }
         SummaryStatus::Unavailable => {
             out.push_str("summaries: unavailable (no index)\n");
         }
+    }
+
+    if let Some(recovery) = summary_recovery(&report.summaries) {
+        out.push_str(&format_summary_recovery_line(recovery, compact));
     }
 
     if compact {
@@ -930,6 +962,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use fs4::fs_std::FileExt;
+    use rusqlite::Connection;
     use std::fs::OpenOptions;
     use tempfile::TempDir;
 
@@ -986,7 +1019,7 @@ mod tests {
             report.index,
             IndexStatus::Fresh { stale_files: 0, .. }
         ));
-        assert!(matches!(report.summaries, SummaryStatus::None));
+        assert!(matches!(report.summaries, SummaryStatus::None { .. }));
         let cmds = &report.recommendations.use_commands;
         assert!(cmds.contains(&"search".to_string()));
         assert!(cmds.contains(&"explain".to_string()));
@@ -1017,7 +1050,7 @@ mod tests {
             }
             other => panic!("expected fresh workspace status, got {other:?}"),
         }
-        assert!(matches!(report.summaries, SummaryStatus::None));
+        assert!(matches!(report.summaries, SummaryStatus::None { .. }));
         assert_eq!(
             report.recommendations.run.as_deref(),
             Some("tsift init --workspace && tsift summarize --extract src/")
@@ -1208,6 +1241,68 @@ mod tests {
     }
 
     #[test]
+    fn status_summaries_use_snapshot_fallback_when_rollback_journal_is_locked() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+
+        let db_path = dir.path().join(".tsift/summaries.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             CREATE TABLE summaries (
+                 id INTEGER PRIMARY KEY,
+                 symbol_name TEXT NOT NULL,
+                 file_path TEXT NOT NULL,
+                 content_hash TEXT NOT NULL,
+                 summary TEXT NOT NULL,
+                 entities TEXT,
+                 relationships TEXT,
+                 concept_labels TEXT,
+                 extracted_at TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 tokens_input INTEGER,
+                 tokens_output INTEGER
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO summaries
+             (symbol_name, file_path, content_hash, summary, entities, relationships, concept_labels, extracted_at, model, tokens_input, tokens_output)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6, NULL, NULL)",
+            rusqlite::params![
+                "main",
+                "main.rs",
+                "abc123",
+                "Entry point",
+                "2026-01-01",
+                "test",
+            ],
+        )
+        .unwrap();
+        conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        std::fs::write(rollback_journal_path(&db_path), "locked").unwrap();
+
+        let report = check_status(dir.path()).unwrap();
+
+        match report.summaries {
+            SummaryStatus::Available {
+                cached_files,
+                total_indexed_files,
+                coverage_pct,
+                recovery,
+            } => {
+                assert_eq!(cached_files, 1);
+                assert_eq!(total_indexed_files, 1);
+                assert_eq!(coverage_pct, 100);
+                assert_eq!(recovery, Some(ReadOnlyRecovery::SnapshotFallback));
+            }
+            other => panic!("expected available summaries, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn status_summary_coverage_ignores_deleted_summary_rows() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
@@ -1252,6 +1347,7 @@ mod tests {
                 cached_files,
                 total_indexed_files,
                 coverage_pct,
+                ..
             } => {
                 assert_eq!(cached_files, 1);
                 assert_eq!(total_indexed_files, 1);
@@ -1305,6 +1401,7 @@ mod tests {
                 cached_files: 30,
                 total_indexed_files: 42,
                 coverage_pct: 71,
+                recovery: None,
             },
             instructions: InstructionStatus::Current {
                 version: "0.1.0".to_string(),
@@ -1338,7 +1435,7 @@ mod tests {
                 workspace_scopes: Vec::new(),
                 missing_scopes: Vec::new(),
             },
-            summaries: SummaryStatus::None,
+            summaries: SummaryStatus::None { recovery: None },
             instructions: InstructionStatus::Stale {
                 found: Some("0.0.9".to_string()),
                 expected: "0.1.0".to_string(),
@@ -1370,7 +1467,7 @@ mod tests {
                 workspace_scopes: Vec::new(),
                 missing_scopes: Vec::new(),
             },
-            summaries: SummaryStatus::None,
+            summaries: SummaryStatus::None { recovery: None },
             instructions: InstructionStatus::Current {
                 version: "0.1.0".to_string(),
             },
@@ -1394,7 +1491,7 @@ mod tests {
                 workspace_scopes: Vec::new(),
                 missing_scopes: Vec::new(),
             },
-            summaries: SummaryStatus::None,
+            summaries: SummaryStatus::None { recovery: None },
             instructions: InstructionStatus::Current {
                 version: "0.1.0".to_string(),
             },
@@ -1404,6 +1501,62 @@ mod tests {
             },
         };
         let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"recovery\":\"snapshot_fallback\""));
+    }
+
+    #[test]
+    fn status_human_format_mentions_summary_snapshot_recovery() {
+        let report = StatusReport {
+            index: IndexStatus::Fresh {
+                total_files: 3,
+                stale_files: 0,
+                last_indexed_secs_ago: 5,
+                recovery: None,
+                workspace_scopes: Vec::new(),
+                missing_scopes: Vec::new(),
+            },
+            summaries: SummaryStatus::Available {
+                cached_files: 2,
+                total_indexed_files: 3,
+                coverage_pct: 66,
+                recovery: Some(ReadOnlyRecovery::SnapshotFallback),
+            },
+            instructions: InstructionStatus::Current {
+                version: "0.1.0".to_string(),
+            },
+            recommendations: Recommendations {
+                use_commands: vec!["search".to_string(), "summarize".to_string()],
+                run: None,
+            },
+        };
+        let output = format_human(&report, false);
+        assert!(output.contains("summaries recovery: snapshot fallback"));
+    }
+
+    #[test]
+    fn status_json_includes_summary_recovery_when_snapshot_fallback_is_used() {
+        let report = StatusReport {
+            index: IndexStatus::Fresh {
+                total_files: 1,
+                stale_files: 0,
+                last_indexed_secs_ago: 1,
+                recovery: None,
+                workspace_scopes: Vec::new(),
+                missing_scopes: Vec::new(),
+            },
+            summaries: SummaryStatus::None {
+                recovery: Some(ReadOnlyRecovery::SnapshotFallback),
+            },
+            instructions: InstructionStatus::Current {
+                version: "0.1.0".to_string(),
+            },
+            recommendations: Recommendations {
+                use_commands: vec!["search".to_string()],
+                run: None,
+            },
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"state\":\"none\""));
         assert!(json.contains("\"recovery\":\"snapshot_fallback\""));
     }
 
