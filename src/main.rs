@@ -3,6 +3,8 @@ use clap::{Parser, Subcommand};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sift::{SearchInput, SearchOptions, Sift};
+#[cfg(test)]
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
@@ -3295,6 +3297,7 @@ fn cmd_search(
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
     let root = lint::resolve_project_root_or_canonical_path(&base_path)?;
     precheck_search_indexes(&root, &base_path, scope.as_deref(), federated, autoindex)?;
+    maybe_apply_search_post_precheck_test_hooks()?;
 
     let inferred_scope = if scope.is_none() && !federated {
         config::Config::infer_submodule_from_path(&root, &base_path)?
@@ -3306,7 +3309,7 @@ fn cmd_search(
         let cfg = config::Config::load(&root)?;
         let db_path = cfg.db_path_for(&root, &scope.id);
         let hits = if db_path.exists() {
-            let db = index::IndexDb::open_read_only(&db_path)?;
+            let db = index::IndexDb::open_read_only_resilient(&db_path)?;
             db.symbol_search(&query, limit)?
         } else {
             Vec::new()
@@ -3317,7 +3320,7 @@ fn cmd_search(
         let scope = config::Config::resolve_submodule(&root, scope_name)?;
         let db_path = cfg.db_path_for(&root, &scope.id);
         let hits = if db_path.exists() {
-            let db = index::IndexDb::open_read_only(&db_path)?;
+            let db = index::IndexDb::open_read_only_resilient(&db_path)?;
             db.symbol_search(&query, limit)?
         } else {
             Vec::new()
@@ -3328,7 +3331,7 @@ fn cmd_search(
     } else {
         let db_path = root.join(".tsift/index.db");
         let hits = if db_path.exists() {
-            let db = index::IndexDb::open_read_only(&db_path)?;
+            let db = index::IndexDb::open_read_only_resilient(&db_path)?;
             db.symbol_search(&query, limit)?
         } else {
             Vec::new()
@@ -5492,6 +5495,32 @@ tier = "private"
     }
 
     #[test]
+    fn search_cmd_uses_snapshot_fallback_when_rollback_journal_lock_appears_after_precheck() {
+        let dir = setup_graph_index();
+        let _hook = install_search_post_precheck_lock(dir.path().join(".tsift/index.db"));
+
+        let result = cmd_search(
+            "main".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            None,
+            false,
+            false,
+            false,
+            0,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn search_cmd_fails_fast_when_autoindex_disabled_and_index_is_stale() {
         let dir = setup_graph_index();
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -7588,5 +7617,62 @@ fn maybe_apply_search_worker_test_hooks() -> Result<()> {
             .with_context(|| format!("parsing TSIFT_TEST_SEARCH_WORKER_SLEEP_MS={ms}"))?;
         std::thread::sleep(Duration::from_millis(delay_ms));
     }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static SEARCH_POST_PRECHECK_LOCK_PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct SearchPostPrecheckLockGuard;
+
+#[cfg(test)]
+impl Drop for SearchPostPrecheckLockGuard {
+    fn drop(&mut self) {
+        SEARCH_POST_PRECHECK_LOCK_PATH.with(|path| {
+            path.borrow_mut().take();
+        });
+    }
+}
+
+#[cfg(test)]
+fn install_search_post_precheck_lock(db_path: PathBuf) -> SearchPostPrecheckLockGuard {
+    SEARCH_POST_PRECHECK_LOCK_PATH.with(|path| {
+        assert!(
+            path.borrow().is_none(),
+            "search post-precheck lock hook already installed"
+        );
+        *path.borrow_mut() = Some(db_path);
+    });
+    SearchPostPrecheckLockGuard
+}
+
+#[cfg(test)]
+fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
+    let Some(db_path) = SEARCH_POST_PRECHECK_LOCK_PATH.with(|path| path.borrow_mut().take()) else {
+        return Ok(());
+    };
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let conn = Connection::open(&db_path).expect("opening db for rollback-journal hook");
+        conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .expect("acquiring rollback-journal hook lock");
+        fs::write(index::rollback_journal_path(&db_path), "locked")
+            .expect("writing rollback journal marker");
+        ready_tx.send(()).expect("signaling rollback-journal hook");
+        std::thread::sleep(Duration::from_millis(200));
+        drop(conn);
+        let _ = fs::remove_file(index::rollback_journal_path(&db_path));
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(1))
+        .context("waiting for search post-precheck rollback-journal hook")?;
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
     Ok(())
 }
