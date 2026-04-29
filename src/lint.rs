@@ -170,7 +170,7 @@ fn project_root_from_canonical_path(canonical: &Path) -> Option<PathBuf> {
     };
 
     for ancestor in start.ancestors() {
-        if ancestor.join(".tsift").is_dir() {
+        if ancestor.join(".tsift").is_dir() || ancestor.join(".gitmodules").is_file() {
             return Some(ancestor.to_path_buf());
         }
     }
@@ -496,6 +496,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".tsift")).unwrap();
         let nested = dir.path().join("src/nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        let root = resolve_project_root_or_canonical_path(&nested).unwrap();
+
+        assert_eq!(root, dir.path());
+    }
+
+    #[test]
+    fn resolve_project_root_or_canonical_path_promotes_nested_workspace_subdir_to_gitmodules_root()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".gitmodules"),
+            r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+"#,
+        )
+        .unwrap();
+        let nested = dir.path().join("docs/nested");
         fs::create_dir_all(&nested).unwrap();
 
         let root = resolve_project_root_or_canonical_path(&nested).unwrap();

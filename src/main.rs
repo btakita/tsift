@@ -1534,9 +1534,7 @@ fn cmd_index(
     schema: bool,
 ) -> Result<()> {
     let quiet = quiet || exit_code;
-    let root = path
-        .canonicalize()
-        .with_context(|| format!("resolving path: {}", path.display()))?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
 
     if workspace || submodule.is_some() {
         let cfg = config::Config::load(&root)?;
@@ -2853,9 +2851,7 @@ fn cmd_locks(
     terse: bool,
     schema: bool,
 ) -> Result<()> {
-    let root = path
-        .canonicalize()
-        .with_context(|| format!("resolving path: {}", path.display()))?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     let report = status::check_locks(&root, scope)?;
     if json_output {
         println!("{}", to_json_schema(&report, pretty, terse, schema)?);
@@ -5250,6 +5246,54 @@ tier = "private"
 
         assert!(result.is_ok());
         assert!(!nested.join(".tsift/index.db").exists());
+    }
+
+    #[test]
+    fn index_cmd_uses_ancestor_project_root_for_nested_paths() {
+        let dir = setup_graph_index();
+        let nested = dir.path().join("src/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("extra.rs"), "fn nested_helper() {}\n").unwrap();
+
+        let result = cmd_index(
+            &nested, false, false, false, false, false, false, None, false, false, false, false,
+            false, false,
+        );
+
+        assert!(result.is_ok());
+        assert!(dir.path().join(".tsift/index.db").exists());
+        assert!(!nested.join(".tsift/index.db").exists());
+    }
+
+    #[test]
+    fn workspace_index_cmd_uses_ancestor_project_root_for_nested_paths() {
+        let dir = setup_workspace();
+        let nested = dir.path().join("docs/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let result = cmd_index(
+            &nested, false, false, false, false, false, true, None, false, false, false, false,
+            false, false,
+        );
+
+        let cfg = config::Config::load(dir.path()).unwrap();
+
+        assert!(result.is_ok());
+        assert!(cfg.db_path_for(dir.path(), "alpha").exists());
+        assert!(cfg.db_path_for(dir.path(), "beta").exists());
+    }
+
+    #[test]
+    fn locks_report_uses_ancestor_project_root_for_nested_paths() {
+        let dir = setup_graph_index();
+        let nested = dir.path().join("src/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let root = lint::resolve_project_root_or_canonical_path(&nested).unwrap();
+        let report = status::check_locks(&root, None).unwrap();
+
+        assert_eq!(report.source_root, dir.path());
+        assert_eq!(report.db_path, dir.path().join(".tsift/index.db"));
     }
 
     #[test]
