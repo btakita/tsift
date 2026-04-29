@@ -2417,7 +2417,7 @@ fn cmd_summarize(
     terse: bool,
     schema: bool,
 ) -> Result<()> {
-    let root = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     let db_path = root.join(".tsift/summaries.db");
 
     // --extract mode: run LLM extraction
@@ -3621,6 +3621,49 @@ mod tests {
             "got: {err}"
         );
         assert!(!dir.path().join(".tsift/summaries.db").exists());
+    }
+
+    #[test]
+    fn summarize_cmd_uses_ancestor_project_root_for_nested_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("src/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let summary_db =
+            summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+        summary_db
+            .insert(&summarize::Summary {
+                id: 0,
+                symbol_name: "alpha_helper".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                content_hash: "hash1".to_string(),
+                summary: "cached summary".to_string(),
+                entities: None,
+                relationships: None,
+                concept_labels: None,
+                extracted_at: "1700000000".to_string(),
+                model: "claude-haiku-4-5-20251001".to_string(),
+                tokens_input: Some(100),
+                tokens_output: Some(40),
+            })
+            .unwrap();
+
+        let result = cmd_summarize(
+            Some("alpha_helper".to_string()),
+            None,
+            None,
+            false,
+            false,
+            &nested,
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+        assert!(!nested.join(".tsift/summaries.db").exists());
     }
 
     #[test]

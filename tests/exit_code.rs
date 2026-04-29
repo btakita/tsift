@@ -1041,10 +1041,7 @@ fn status_reports_missing_workspace_scopes_even_when_root_index_exists_in_json()
         stdout.contains("\"state\":\"stale\""),
         "stdout was: {stdout}"
     );
-    assert!(
-        stdout.contains("\"total_files\":1"),
-        "stdout was: {stdout}"
-    );
+    assert!(stdout.contains("\"total_files\":1"), "stdout was: {stdout}");
     assert!(
         stdout.contains("\"workspace_scopes\""),
         "stdout was: {stdout}"
@@ -1106,7 +1103,10 @@ fn workspace_search_requires_explicit_scope_or_federated_without_shared_root_ind
         "workspace search should fail closed without an explicit target"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("requires `--scope <scope>` or `--federated`"), "{stderr}");
+    assert!(
+        stderr.contains("requires `--scope <scope>` or `--federated`"),
+        "{stderr}"
+    );
     assert!(stderr.contains("Available scopes: alpha, beta"), "{stderr}");
     assert!(stderr.contains("Indexed scopes: alpha, beta"), "{stderr}");
     assert!(!dir.path().join(".tsift/index.db").exists());
@@ -1511,6 +1511,45 @@ fn summarize_extract_resolves_relative_path_against_explicit_root() {
 }
 
 #[test]
+fn summarize_extract_uses_ancestor_project_root_for_nested_paths() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::create_dir_all(project.path().join("src/nested")).unwrap();
+    fs::write(project.path().join("src/main.rs"), "fn alpha_helper() {}\n").unwrap();
+    write_missing_summary_api_key_config(project.path());
+
+    let nested = project.path().join("src/nested");
+    let output = tsift_bin()
+        .current_dir(project.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .args([
+            "summarize",
+            "--extract",
+            "src",
+            "--path",
+            nested.to_str().unwrap(),
+            "--compact",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "summarize stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("No files to extract."),
+        "stdout was: {stdout}"
+    );
+    assert!(stdout.contains("errors:1"), "stdout was: {stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("src/main.rs"), "stderr was: {stderr}");
+    assert!(!nested.join(".tsift/summaries.db").exists());
+}
+
+#[test]
 fn summarize_diff_extract_includes_untracked_files() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("README.md"), "# repo\n").unwrap();
@@ -1665,6 +1704,42 @@ fn summarize_symbol_query_accepts_read_only_cache_permissions() {
         "stdout was: {}",
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+#[test]
+fn summarize_symbol_query_uses_ancestor_project_root_for_nested_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    create_summary_cache(dir.path());
+    fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+
+    let nested = dir.path().join("src/nested");
+    let output = tsift_bin()
+        .args([
+            "summarize",
+            "alpha_helper",
+            "--path",
+            nested.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "summarize stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let summaries = json.as_array().unwrap();
+    assert!(
+        summaries
+            .iter()
+            .any(|summary| summary["symbol_name"] == "alpha_helper"),
+        "stdout was: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(!nested.join(".tsift/summaries.db").exists());
 }
 
 #[test]
