@@ -343,40 +343,35 @@ impl IndexDb {
         })
     }
 
-    pub fn symbol_names_read_only_min_len(db_path: &Path, min_len: usize) -> Result<Vec<String>> {
-        match Self::open_read_only(db_path).and_then(|db| db.symbol_names_min_len(min_len)) {
-            Ok(names) => Ok(names),
+    pub fn open_read_only_resilient(db_path: &Path) -> Result<Self> {
+        match Self::open_read_only(db_path).and_then(|db| {
+            db.ensure_readable()?;
+            Ok(db)
+        }) {
+            Ok(db) => Ok(db),
             Err(err) if should_retry_read_only_with_snapshot(db_path, &err) => {
-                let db = Self::open_read_only_snapshot(db_path)?;
-                db.symbol_names_min_len(min_len)
+                Self::open_read_only_snapshot(db_path)
             }
             Err(err) => Err(err),
         }
+    }
+
+    pub fn symbol_names_read_only_min_len(db_path: &Path, min_len: usize) -> Result<Vec<String>> {
+        let db = Self::open_read_only_resilient(db_path)?;
+        db.symbol_names_min_len(min_len)
     }
 
     pub fn file_symbols_read_only(
         db_path: &Path,
         candidates: &[String],
     ) -> Result<Vec<(String, String)>> {
-        match Self::open_read_only(db_path).and_then(|db| db.file_symbols(candidates)) {
-            Ok(symbols) => Ok(symbols),
-            Err(err) if should_retry_read_only_with_snapshot(db_path, &err) => {
-                let db = Self::open_read_only_snapshot(db_path)?;
-                db.file_symbols(candidates)
-            }
-            Err(err) => Err(err),
-        }
+        let db = Self::open_read_only_resilient(db_path)?;
+        db.file_symbols(candidates)
     }
 
     pub fn file_paths_read_only(db_path: &Path) -> Result<Vec<String>> {
-        match Self::open_read_only(db_path).and_then(|db| db.file_paths()) {
-            Ok(paths) => Ok(paths),
-            Err(err) if should_retry_read_only_with_snapshot(db_path, &err) => {
-                let db = Self::open_read_only_snapshot(db_path)?;
-                db.file_paths()
-            }
-            Err(err) => Err(err),
-        }
+        let db = Self::open_read_only_resilient(db_path)?;
+        db.file_paths()
     }
 
     pub fn inspect_read_only(
@@ -445,6 +440,12 @@ impl IndexDb {
                 path: snapshot_path,
             }),
         })
+    }
+
+    fn ensure_readable(&self) -> Result<()> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |_row| Ok(()))
+            .map_err(anyhow::Error::from)
     }
 
     fn file_symbols(&self, candidates: &[String]) -> Result<Vec<(String, String)>> {
@@ -2177,6 +2178,22 @@ mod tests {
             inspection.recovery,
             Some(ReadOnlyRecovery::SnapshotFallback)
         );
+    }
+
+    #[test]
+    fn open_read_only_resilient_uses_snapshot_when_rollback_journal_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(".tsift/index.db");
+        let _ = IndexDb::open(&db_path).unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        std::fs::write(rollback_journal_path(&db_path), "locked").unwrap();
+
+        let db = IndexDb::open_read_only_resilient(&db_path).unwrap();
+        assert!(db._snapshot_copy.is_some());
+        assert!(db.file_count().is_ok());
     }
 
     #[test]

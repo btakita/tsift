@@ -2163,7 +2163,7 @@ fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::I
             db_path.display()
         );
     }
-    index::IndexDb::open_read_only(&db_path)
+    index::IndexDb::open_read_only_resilient(&db_path)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5159,6 +5159,27 @@ tier = "private"
     }
 
     #[test]
+    fn path_cmd_uses_snapshot_fallback_when_rollback_journal_is_locked() {
+        let dir = setup_graph_index();
+        let db_path = dir.path().join(".tsift/index.db");
+        let _lock = hold_rollback_journal_lock(&db_path);
+
+        let result = cmd_path(
+            "main",
+            "helper",
+            dir.path(),
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn explain_cmd_requires_scope_for_workspace_root_without_shared_index() {
         let dir = setup_workspace();
         cmd_index(
@@ -5223,6 +5244,29 @@ tier = "private"
         let result = cmd_explain(
             "alpha_main",
             &nested,
+            None,
+            15,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn explain_cmd_uses_snapshot_fallback_when_rollback_journal_is_locked() {
+        let dir = setup_graph_index();
+        let db_path = dir.path().join(".tsift/index.db");
+        let _lock = hold_rollback_journal_lock(&db_path);
+
+        let result = cmd_explain(
+            "main",
+            dir.path(),
             None,
             15,
             false,
@@ -6012,6 +6056,31 @@ tier = "private"
     }
 
     #[test]
+    fn graph_cmd_uses_snapshot_fallback_when_rollback_journal_is_locked() {
+        let dir = setup_graph_index();
+        let db_path = dir.path().join(".tsift/index.db");
+        let _lock = hold_rollback_journal_lock(&db_path);
+
+        let result = cmd_graph(
+            "main",
+            dir.path(),
+            false,
+            false,
+            None,
+            20,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn graph_cmd_uses_ancestor_project_root_for_nested_paths() {
         let dir = setup_graph_index();
         let nested = dir.path().join("src/nested");
@@ -6029,6 +6098,28 @@ tier = "private"
     fn communities_cmd_succeeds_while_writer_lock_is_held() {
         let dir = setup_graph_index();
         let _lock = hold_writer_lock(&dir.path().join(".tsift/index.lock"));
+
+        let result = cmd_communities(
+            dir.path(),
+            None,
+            1,
+            10,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn communities_cmd_uses_snapshot_fallback_when_rollback_journal_is_locked() {
+        let dir = setup_graph_index();
+        let db_path = dir.path().join(".tsift/index.db");
+        let _lock = hold_rollback_journal_lock(&db_path);
 
         let result = cmd_communities(
             dir.path(),
