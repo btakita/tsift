@@ -1659,20 +1659,7 @@ fn cmd_graph(
     let root = path
         .canonicalize()
         .with_context(|| format!("resolving path: {}", path.display()))?;
-    let db_path = if let Some(scope_name) = scope {
-        let cfg = config::Config::load(&root)?;
-        let scope = config::Config::resolve_submodule(&root, scope_name)?;
-        cfg.db_path_for(&root, &scope.id)
-    } else {
-        root.join(".tsift/index.db")
-    };
-    if !db_path.exists() {
-        bail!(
-            "no index found at {}. Run `tsift index` first.",
-            db_path.display()
-        );
-    }
-    let db = index::IndexDb::open_read_only(&db_path)?;
+    let db = open_index_db(&root, scope)?;
 
     let show_both = !callers && !callees;
 
@@ -1949,17 +1936,53 @@ fn cmd_communities(
     Ok(())
 }
 
+fn resolve_query_db_path(root: &Path, scope: Option<&str>) -> Result<PathBuf> {
+    let cfg = config::Config::load(root)?;
+    if let Some(scope_name) = scope {
+        let scope = config::Config::resolve_submodule(root, scope_name)?;
+        return Ok(cfg.db_path_for(root, &scope.id));
+    }
+
+    let db_path = root.join(".tsift/index.db");
+    if db_path.exists() {
+        return Ok(db_path);
+    }
+
+    let scopes = config::Config::submodule_dirs(root)?;
+    if scopes.is_empty() {
+        return Ok(db_path);
+    }
+
+    let available_scopes = scopes
+        .iter()
+        .map(|scope| scope.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let indexed_scopes = scopes
+        .iter()
+        .filter(|scope| cfg.db_path_for(root, &scope.id).exists())
+        .map(|scope| scope.id.as_str())
+        .collect::<Vec<_>>();
+    let indexed_label = if indexed_scopes.is_empty() {
+        "none".to_string()
+    } else {
+        indexed_scopes.join(", ")
+    };
+
+    bail!(
+        "workspace root {} has no shared root index at {}. Read-only graph queries require `--scope <scope>` when the workspace is indexed into `.tsift/indexes/*/index.db`. Available scopes: {}. Indexed scopes: {}.",
+        root.display(),
+        db_path.display(),
+        available_scopes,
+        indexed_label
+    );
+}
+
 fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::IndexDb> {
     let root = path
         .canonicalize()
         .with_context(|| format!("resolving path: {}", path.display()))?;
-    let db_path = if let Some(scope_name) = scope {
-        let cfg = config::Config::load(&root)?;
-        let scope = config::Config::resolve_submodule(&root, scope_name)?;
-        cfg.db_path_for(&root, &scope.id)
-    } else {
-        root.join(".tsift/index.db")
-    };
+    let db_path = resolve_query_db_path(&root, scope)?;
     if !db_path.exists() {
         bail!(
             "no index found at {}. Run `tsift index` first.",
@@ -4297,6 +4320,172 @@ tier = "isolated"
         let callees = db.callees_of("alpha_main").unwrap();
         let names: Vec<&str> = callees.iter().map(|e| e.callee_name.as_str()).collect();
         assert!(names.contains(&"alpha_helper"));
+    }
+
+    fn assert_workspace_query_requires_scope(err: anyhow::Error) {
+        let msg = err.to_string();
+        assert!(msg.contains("require `--scope <scope>`"), "{msg}");
+        assert!(msg.contains("Available scopes: alpha, beta"), "{msg}");
+        assert!(msg.contains("Indexed scopes: alpha, beta"), "{msg}");
+        assert!(
+            !msg.contains("no index found at"),
+            "workspace query should fail with scope guidance, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_cmd_requires_scope_for_workspace_root_without_shared_index() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let err = cmd_graph(
+            "alpha_main",
+            dir.path(),
+            false,
+            false,
+            None,
+            20,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert_workspace_query_requires_scope(err);
+    }
+
+    #[test]
+    fn communities_cmd_requires_scope_for_workspace_root_without_shared_index() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let err = cmd_communities(
+            dir.path(),
+            None,
+            1,
+            10,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert_workspace_query_requires_scope(err);
+    }
+
+    #[test]
+    fn path_cmd_requires_scope_for_workspace_root_without_shared_index() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let err = cmd_path(
+            "alpha_main",
+            "alpha_helper",
+            dir.path(),
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert_workspace_query_requires_scope(err);
+    }
+
+    #[test]
+    fn explain_cmd_requires_scope_for_workspace_root_without_shared_index() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let err = cmd_explain(
+            "alpha_main",
+            dir.path(),
+            None,
+            15,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert_workspace_query_requires_scope(err);
     }
 
     // --- community detection ---

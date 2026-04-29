@@ -10,14 +10,14 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 |---------|---------|
 | `tsift index` | Build AST symbol index via tree-sitter. `--workspace` / `--submodule <scope>` / `--prune` (currently a conservative full scan for correctness) / `--check` (dry-run) / `--exit-code` (exit 1 if stale, for hooks). Unknown `--submodule` names fail closed, and duplicate trailing submodule names promote to full-path scope ids like `vendor/foo`. |
 | `tsift search` | Hybrid BM25 + vector search via sift library. Built-in stale precheck + optional `--autoindex`. `--federated` / `--scope <scope>` for workspace; unknown scopes fail closed with the available scope ids, and ambiguous duplicate leaf names require the full submodule path |
-| `tsift graph` | Call-graph queries: `--callers` / `--callees` of a symbol. `--limit N` (default 20, 0=unlimited) / `--scope <name>` / `--json` |
+| `tsift graph` | Call-graph queries: `--callers` / `--callees` of a symbol. `--limit N` (default 20, 0=unlimited) / `--scope <name>` / `--json`. Workspace roots with only scoped `.tsift/indexes/*/index.db` state fail closed until the caller selects a scope. |
 | `tsift edit` | Batch file edits from JSON (stdin or `--file`), atomic validate-then-write |
 | `tsift route` | Classify task → model tier (haiku/sonnet/opus) |
 | `tsift rewrite` | Shell command → tsift equivalent (for Claude Code hook integration) |
 | `tsift sql` | SQLite introspection: schema overview, table detail, read-only query |
-| `tsift communities` | Louvain community detection over call graph. `--min-size N` / `--limit N` (default 10, 0=unlimited) / `--scope <name>` / `--json` |
-| `tsift path` | BFS shortest path between two symbols. `--scope <name>` / `--json` |
-| `tsift explain` | Full symbol context: definitions, callers, callees, community. `--limit N` (default 15, 0=unlimited) / `--scope <name>` / `--json` |
+| `tsift communities` | Louvain community detection over call graph. `--min-size N` / `--limit N` (default 10, 0=unlimited) / `--scope <name>` / `--json`. Workspace roots with scoped-only indexes require an explicit scope. |
+| `tsift path` | BFS shortest path between two symbols. `--scope <name>` / `--json`. Workspace roots with scoped-only indexes require an explicit scope. |
+| `tsift explain` | Full symbol context: definitions, callers, callees, community. `--limit N` (default 15, 0=unlimited) / `--scope <name>` / `--json`. Workspace roots with scoped-only indexes require an explicit scope. |
 | `tsift audit` | Skill drift detection: scan installed skills, check health, compare against manifest, detect duplicates via Jaccard similarity. `--manifest <file>` / `--usage` / `--cleanup` / `--report <path>` / `--json` |
 | `tsift summarize` | Cached LLM analysis: pre-computed summaries, entities, relationships. `--extract <path>` / `--extract --diff` (relative extract paths resolve against `--path`; extraction stays scoped to the requested file/dir; workspace extraction loads symbols from the matching scoped `index.db`; per-file cache rewrite is transactional; non-2xx Anthropic responses fail closed with status + API message) / `--file <path>` / `--stats` / `--json`. Read-only lookup paths fail closed when `summaries.db` is missing and never create the cache as a side effect. |
 | `tsift lint` | Markdown lint: detect unannotated concepts (symbols, headings, bold terms) cross-referenced against graph entities. Auto-discovers live `index.db` files from the nearest `.tsift` root by default, and `--index` accepts a project root, `.tsift`, direct `index.db`, or `.tsift/indexes`. `--index <dir>` / `--entities-from <file>` / `--json` |
@@ -73,6 +73,7 @@ If copied skill instructions lag behind the installed binary, treat this file, `
 
 - **Read-only SQL**: `open_db()` uses `SQLITE_OPEN_READ_ONLY` — never mutates user databases.
 - **Read-only graph queries**: `graph`, `communities`, `path`, and `explain` all open `index.db` through the shared read-only path, so they do not contend on the writer-side `index.lock`.
+- **Workspace graph queries fail closed without scope**: when a workspace only has scoped `.tsift/indexes/<scope>/index.db` files, `graph`, `communities`, `path`, and `explain` now require `--scope <scope>` and list the available/indexed scope ids instead of blaming a missing root `.tsift/index.db`.
 - **Read-only summary lookups**: `tsift summarize --stats`, `tsift summarize <symbol>`, and `tsift summarize --file <path>` open `summaries.db` read-only and fail closed when the cache is absent, so query-mode summarize commands do not create or contend on the summary cache.
 - **Transactional index updates**: `apply_changes` and `rebuild` wrap SQLite mutations in nested savepoints, so a failed reindex rolls back instead of leaving partial symbols/edges behind.
 - **Explicit WAL checkpoint budget**: writable `index.db` opens set and verify `PRAGMA wal_autocheckpoint=256` so normal write traffic checkpoints the WAL before it grows without a tsift-owned bound.

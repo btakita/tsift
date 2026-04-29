@@ -119,6 +119,41 @@ fn indexed_cli_fixture() -> tempfile::TempDir {
     dir
 }
 
+fn indexed_workspace_cli_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+[submodule "src/beta"]
+	path = src/beta
+	url = https://example.com/beta
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("src/alpha")).unwrap();
+    fs::create_dir_all(dir.path().join("src/beta")).unwrap();
+    fs::write(
+        dir.path().join("src/alpha/lib.rs"),
+        "fn alpha_helper() {}\nfn alpha_main() { alpha_helper(); }\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("src/beta/lib.rs"), "fn beta_func() {}\n").unwrap();
+
+    let output = tsift_bin()
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "workspace index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
+}
+
 fn create_summary_cache(dir: &Path) {
     fs::create_dir_all(dir.join(".tsift")).unwrap();
     let db_path = dir.join(".tsift/summaries.db");
@@ -913,6 +948,34 @@ fn status_reports_partially_indexed_workspace_as_stale_with_missing_scopes_in_js
         "stdout was: {stdout}"
     );
     assert!(stdout.contains("1 missing scope"), "stdout was: {stdout}");
+}
+
+#[test]
+fn workspace_graph_queries_require_scope_without_shared_root_index() {
+    let dir = indexed_workspace_cli_fixture();
+    let root = dir.path().to_str().unwrap();
+    let cases = [
+        ("graph", vec!["graph", "alpha_main", root, "--json"]),
+        ("communities", vec!["communities", root, "--json"]),
+        (
+            "path",
+            vec!["path", "alpha_main", "alpha_helper", root, "--json"],
+        ),
+        ("explain", vec!["explain", "alpha_main", root, "--json"]),
+    ];
+
+    for (label, args) in cases {
+        let output = tsift_bin().args(args).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "{label} should fail closed without an explicit workspace scope"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("require `--scope <scope>`"), "{stderr}");
+        assert!(stderr.contains("Available scopes: alpha, beta"), "{stderr}");
+        assert!(stderr.contains("Indexed scopes: alpha, beta"), "{stderr}");
+        assert!(!stderr.contains("no index found at"), "{stderr}");
+    }
 }
 
 #[test]
