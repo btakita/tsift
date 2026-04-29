@@ -2856,7 +2856,7 @@ fn cmd_locks(
     schema: bool,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    let report = status::check_locks(&root, scope)?;
+    let report = status::check_locks(&root, Some(path), scope)?;
     if json_output {
         println!("{}", to_json_schema(&report, pretty, terse, schema)?);
     } else {
@@ -2887,7 +2887,7 @@ fn add_write_lock_context(
         return contextualize_error(err, action);
     }
 
-    let Ok(report) = status::check_locks(root, scope) else {
+    let Ok(report) = status::check_locks(root, None, scope) else {
         return contextualize_error(err, action);
     };
 
@@ -5473,10 +5473,46 @@ tier = "private"
         std::fs::create_dir_all(&nested).unwrap();
 
         let root = lint::resolve_project_root_or_canonical_path(&nested).unwrap();
-        let report = status::check_locks(&root, None).unwrap();
+        let report = status::check_locks(&root, Some(&nested), None).unwrap();
 
         assert_eq!(report.source_root, dir.path());
         assert_eq!(report.db_path, dir.path().join(".tsift/index.db"));
+    }
+
+    #[test]
+    fn workspace_locks_report_infers_scope_from_nested_path() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let nested = dir.path().join("src/alpha/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let root = lint::resolve_project_root_or_canonical_path(&nested).unwrap();
+        let report = status::check_locks(&root, Some(&nested), None).unwrap();
+        let cfg = config::Config::load(dir.path()).unwrap();
+
+        assert_eq!(report.label, "submodule `alpha` index");
+        assert_eq!(report.source_root, dir.path().join("src/alpha"));
+        assert_eq!(report.db_path, cfg.db_path_for(dir.path(), "alpha"));
+        assert_eq!(
+            report.reindex_command,
+            format!("tsift index --submodule alpha {}", dir.path().display())
+        );
     }
 
     #[test]

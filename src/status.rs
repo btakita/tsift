@@ -251,8 +251,13 @@ fn check_workspace_index(root: &Path) -> Result<IndexStatus> {
     }
 }
 
-pub fn check_locks(root: &Path, scope: Option<&str>) -> Result<LockReport> {
-    let (label, source_root, db_path, reindex_command) = resolve_lock_target(root, scope)?;
+pub fn check_locks(
+    root: &Path,
+    path_hint: Option<&Path>,
+    scope: Option<&str>,
+) -> Result<LockReport> {
+    let (label, source_root, db_path, reindex_command) =
+        resolve_lock_target(root, path_hint, scope)?;
     let lock_path = writer_lock_path(&db_path);
     let writer_lock = match probe_writer_lock(&lock_path)? {
         WriterLockProbe::Absent { path } => WriterLockStatus::Absent { path },
@@ -424,16 +429,32 @@ fn format_duration(secs: u64) -> String {
 
 fn resolve_lock_target(
     root: &Path,
+    path_hint: Option<&Path>,
     scope: Option<&str>,
 ) -> Result<(String, PathBuf, PathBuf, String)> {
+    let cfg = config::Config::load(root)?;
     if let Some(scope_name) = scope {
-        let cfg = config::Config::load(root)?;
         let scope = config::Config::resolve_submodule(root, scope_name)?;
         Ok((
             format!("submodule `{}` index", scope.id),
             scope.source_root.clone(),
             cfg.db_path_for(root, &scope.id),
             format!("tsift index --submodule {} {}", scope.id, root.display()),
+        ))
+    } else if let Some(path_hint) = path_hint {
+        if let Some(scope) = config::Config::infer_submodule_from_path(root, path_hint)? {
+            return Ok((
+                format!("submodule `{}` index", scope.id),
+                scope.source_root.clone(),
+                cfg.db_path_for(root, &scope.id),
+                format!("tsift index --submodule {} {}", scope.id, root.display()),
+            ));
+        }
+        Ok((
+            "index".to_string(),
+            root.to_path_buf(),
+            root.join(".tsift/index.db"),
+            format!("tsift index {}", root.display()),
         ))
     } else {
         Ok((
@@ -1312,7 +1333,7 @@ mod tests {
         writeln!(lock_file, "{}", std::process::id()).unwrap();
         std::fs::write(&journal_path, "locked").unwrap();
 
-        let report = check_locks(dir.path(), None).unwrap();
+        let report = check_locks(dir.path(), None, None).unwrap();
         assert!(matches!(
             report.writer_lock,
             WriterLockStatus::Live { pid: Some(_), .. }
@@ -1333,7 +1354,7 @@ mod tests {
         std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         std::fs::write(&lock_path, "999999").unwrap();
 
-        let report = check_locks(dir.path(), None).unwrap();
+        let report = check_locks(dir.path(), None, None).unwrap();
         assert!(matches!(
             report.writer_lock,
             WriterLockStatus::Stale {
