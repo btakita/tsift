@@ -182,6 +182,23 @@ impl Config {
         );
     }
 
+    pub fn infer_submodule_from_path(root: &Path, path: &Path) -> Result<Option<WorkspaceScope>> {
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("canonicalizing {}", path.display()))?;
+        let mut scopes = Self::submodule_dirs(root)?;
+        scopes.sort_by(|left, right| {
+            right
+                .source_root
+                .components()
+                .count()
+                .cmp(&left.source_root.components().count())
+        });
+        Ok(scopes
+            .into_iter()
+            .find(|scope| canonical.starts_with(&scope.source_root)))
+    }
+
     pub fn submodule_dirs(root: &Path) -> Result<Vec<WorkspaceScope>> {
         let gitmodules = root.join(".gitmodules");
         if !gitmodules.exists() {
@@ -415,5 +432,30 @@ federation = false
         assert!(err.to_string().contains("ambiguous scope `foo`"));
         assert!(err.to_string().contains("pkg/app/foo"));
         assert!(err.to_string().contains("vendor/foo"));
+    }
+
+    #[test]
+    fn infer_submodule_from_path_uses_matching_nested_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".gitmodules"),
+            r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+[submodule "src/beta"]
+	path = src/beta
+	url = https://example.com/beta
+"#,
+        )
+        .unwrap();
+        let nested = dir.path().join("src/alpha/nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        let scope = Config::infer_submodule_from_path(dir.path(), &nested)
+            .unwrap()
+            .expect("expected inferred scope");
+
+        assert_eq!(scope.id, "alpha");
+        assert_eq!(scope.source_root, dir.path().join("src/alpha"));
     }
 }

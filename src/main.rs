@@ -1831,7 +1831,7 @@ fn cmd_graph(
     schema: bool,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    let db = open_index_db(&root, scope)?;
+    let db = open_index_db(path, scope)?;
 
     let show_both = !callers && !callees;
 
@@ -2108,10 +2108,14 @@ fn cmd_communities(
     Ok(())
 }
 
-fn resolve_query_db_path(root: &Path, scope: Option<&str>) -> Result<PathBuf> {
+fn resolve_query_db_path(root: &Path, path_hint: &Path, scope: Option<&str>) -> Result<PathBuf> {
     let cfg = config::Config::load(root)?;
     if let Some(scope_name) = scope {
         let scope = config::Config::resolve_submodule(root, scope_name)?;
+        return Ok(cfg.db_path_for(root, &scope.id));
+    }
+
+    if let Some(scope) = config::Config::infer_submodule_from_path(root, path_hint)? {
         return Ok(cfg.db_path_for(root, &scope.id));
     }
 
@@ -2152,7 +2156,7 @@ fn resolve_query_db_path(root: &Path, scope: Option<&str>) -> Result<PathBuf> {
 
 fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::IndexDb> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    let db_path = resolve_query_db_path(&root, scope)?;
+    let db_path = resolve_query_db_path(&root, path, scope)?;
     if !db_path.exists() {
         bail!(
             "no index found at {}. Run `tsift index` first.",
@@ -3056,6 +3060,7 @@ enum SearchIndexState {
 
 fn resolve_search_index_targets(
     root: &Path,
+    path_hint: &Path,
     scope: Option<&str>,
     federated: bool,
 ) -> Result<Vec<SearchIndexTarget>> {
@@ -3087,6 +3092,17 @@ fn resolve_search_index_targets(
             });
         }
         return Ok(targets);
+    }
+
+    if let Some(scope) = config::Config::infer_submodule_from_path(root, path_hint)? {
+        let cfg = config::Config::load(root)?;
+        return Ok(vec![SearchIndexTarget {
+            label: format!("submodule `{}` index", scope.id),
+            db_path: cfg.db_path_for(root, &scope.id),
+            source_root: scope.source_root.clone(),
+            scope_name: Some(scope.id.clone()),
+            reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
+        }]);
     }
 
     let scopes = config::Config::submodule_dirs(root)?;
@@ -3159,11 +3175,12 @@ fn apply_search_index_update(root: &Path, target: &SearchIndexTarget) -> Result<
 
 fn precheck_search_indexes(
     root: &Path,
+    path_hint: &Path,
     scope: Option<&str>,
     federated: bool,
     autoindex: bool,
 ) -> Result<()> {
-    let targets = resolve_search_index_targets(root, scope, federated)?;
+    let targets = resolve_search_index_targets(root, path_hint, scope, federated)?;
     let mut stale_targets: Vec<(String, usize, String)> = Vec::new();
 
     for target in targets {
@@ -3241,9 +3258,25 @@ fn cmd_search(
 ) -> Result<()> {
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
     let root = lint::resolve_project_root_or_canonical_path(&base_path)?;
-    precheck_search_indexes(&root, scope.as_deref(), federated, autoindex)?;
+    precheck_search_indexes(&root, &base_path, scope.as_deref(), federated, autoindex)?;
 
-    let (symbol_hits, sift_path) = if let Some(ref scope_name) = scope {
+    let inferred_scope = if scope.is_none() && !federated {
+        config::Config::infer_submodule_from_path(&root, &base_path)?
+    } else {
+        None
+    };
+
+    let (symbol_hits, sift_path) = if let Some(scope) = inferred_scope.as_ref() {
+        let cfg = config::Config::load(&root)?;
+        let db_path = cfg.db_path_for(&root, &scope.id);
+        let hits = if db_path.exists() {
+            let db = index::IndexDb::open_read_only(&db_path)?;
+            db.symbol_search(&query, limit)?
+        } else {
+            Vec::new()
+        };
+        (hits, scope.source_root.clone())
+    } else if let Some(ref scope_name) = scope {
         let cfg = config::Config::load(&root)?;
         let scope = config::Config::resolve_submodule(&root, scope_name)?;
         let db_path = cfg.db_path_for(&root, &scope.id);
@@ -4810,6 +4843,48 @@ tier = "private"
     }
 
     #[test]
+    fn graph_cmd_infers_scope_from_nested_workspace_path() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let nested = dir.path().join("src/alpha/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let result = cmd_graph(
+            "alpha_main",
+            &nested,
+            false,
+            false,
+            None,
+            20,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn communities_cmd_requires_scope_for_workspace_root_without_shared_index() {
         let dir = setup_workspace();
         cmd_index(
@@ -4845,6 +4920,36 @@ tier = "private"
         .unwrap_err();
 
         assert_workspace_query_requires_scope(err);
+    }
+
+    #[test]
+    fn communities_cmd_infers_scope_from_nested_workspace_path() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let nested = dir.path().join("src/alpha/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let result = cmd_communities(
+            &nested, None, 1, 10, false, false, false, false, false, false,
+        );
+
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -4885,6 +4990,44 @@ tier = "private"
     }
 
     #[test]
+    fn path_cmd_infers_scope_from_nested_workspace_path() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let nested = dir.path().join("src/alpha/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let result = cmd_path(
+            "alpha_main",
+            "alpha_helper",
+            &nested,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn explain_cmd_requires_scope_for_workspace_root_without_shared_index() {
         let dir = setup_workspace();
         cmd_index(
@@ -4921,6 +5064,46 @@ tier = "private"
         .unwrap_err();
 
         assert_workspace_query_requires_scope(err);
+    }
+
+    #[test]
+    fn explain_cmd_infers_scope_from_nested_workspace_path() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let nested = dir.path().join("src/alpha/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let result = cmd_explain(
+            "alpha_main",
+            &nested,
+            None,
+            15,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
     }
 
     // --- community detection ---
@@ -5560,6 +5743,80 @@ tier = "private"
 
         assert_workspace_search_requires_explicit_target(err);
         assert!(!dir.path().join(".tsift/index.db").exists());
+    }
+
+    #[test]
+    fn workspace_search_cmd_infers_scope_from_nested_path() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let nested = dir.path().join("src/alpha/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let result = cmd_search(
+            "alpha_helper".to_string(),
+            Some(nested),
+            5,
+            Some("lexical".to_string()),
+            None,
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn resolve_query_db_path_infers_matching_duplicate_leaf_scope_from_nested_path() {
+        let dir = setup_workspace_with_duplicate_leaf_names();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let nested = dir.path().join("vendor/foo/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let root = lint::resolve_project_root_or_canonical_path(&nested).unwrap();
+        let db_path = resolve_query_db_path(&root, &nested, None).unwrap();
+        let cfg = config::Config::load(dir.path()).unwrap();
+
+        assert_eq!(db_path, cfg.db_path_for(dir.path(), "vendor/foo"));
     }
 
     #[test]
@@ -6842,7 +7099,7 @@ fn federated_sift_search(
     timeout_secs: u64,
     strategy: &str,
 ) -> Result<sift::SearchResponse> {
-    let targets = resolve_search_index_targets(root, None, true)?;
+    let targets = resolve_search_index_targets(root, root, None, true)?;
     if targets.is_empty() {
         if config::Config::submodule_dirs(root)?.is_empty() {
             return run_search_with_timeout(root, query, limit, timeout_secs, strategy);
