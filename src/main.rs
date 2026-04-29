@@ -1656,9 +1656,7 @@ fn cmd_graph(
     tabular: bool,
     schema: bool,
 ) -> Result<()> {
-    let root = path
-        .canonicalize()
-        .with_context(|| format!("resolving path: {}", path.display()))?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     let db = open_index_db(&root, scope)?;
 
     let show_both = !callers && !callees;
@@ -1979,9 +1977,7 @@ fn resolve_query_db_path(root: &Path, scope: Option<&str>) -> Result<PathBuf> {
 }
 
 fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::IndexDb> {
-    let root = path
-        .canonicalize()
-        .with_context(|| format!("resolving path: {}", path.display()))?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     let db_path = resolve_query_db_path(&root, scope)?;
     if !db_path.exists() {
         bail!(
@@ -2074,9 +2070,7 @@ fn cmd_explain(
     tabular: bool,
     schema: bool,
 ) -> Result<()> {
-    let root = path
-        .canonicalize()
-        .with_context(|| format!("resolving path: {}", path.display()))?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     let db = open_index_db(path, scope)?;
 
     let mut symbols = db.symbol_info(symbol)?;
@@ -2664,9 +2658,7 @@ fn cmd_status(
     terse: bool,
     schema: bool,
 ) -> Result<()> {
-    let root = path
-        .canonicalize()
-        .with_context(|| format!("resolving path: {}", path.display()))?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     let report = status::check_status(&root)?;
     if json_output {
         println!("{}", to_json_schema(&report, pretty, terse, schema)?);
@@ -3046,9 +3038,7 @@ fn cmd_search(
     schema: bool,
 ) -> Result<()> {
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
-    let root = base_path
-        .canonicalize()
-        .with_context(|| format!("resolving path: {}", base_path.display()))?;
+    let root = lint::resolve_project_root_or_canonical_path(&base_path)?;
     precheck_search_indexes(&root, scope.as_deref(), federated, autoindex)?;
 
     let (symbol_hits, sift_path) = if let Some(ref scope_name) = scope {
@@ -4834,6 +4824,34 @@ tier = "isolated"
     }
 
     #[test]
+    fn search_cmd_uses_ancestor_project_root_for_nested_paths() {
+        let dir = setup_graph_index();
+        let nested = dir.path().join("src/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let result = cmd_search(
+            "helper".to_string(),
+            Some(nested.clone()),
+            5,
+            Some("lexical".to_string()),
+            None,
+            false,
+            false,
+            true,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+        assert!(!nested.join(".tsift/index.db").exists());
+    }
+
+    #[test]
     fn scoped_search_cmd_autoindexes_stale_submodule_index_by_default() {
         let dir = setup_workspace();
         cmd_index(
@@ -5074,6 +5092,20 @@ tier = "isolated"
             false,
             false,
             false,
+            false,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn graph_cmd_uses_ancestor_project_root_for_nested_paths() {
+        let dir = setup_graph_index();
+        let nested = dir.path().join("src/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let result = cmd_graph(
+            "helper", &nested, true, false, None, 20, false, false, false, false, false, false,
             false,
         );
 

@@ -159,26 +159,37 @@ fn guess_annotation_kind(entity: &str) -> AnnotationKind {
     }
 }
 
-pub fn find_project_root_for_path(path: &Path) -> Result<Option<PathBuf>> {
-    let canonical = path
-        .canonicalize()
-        .with_context(|| format!("canonicalizing {}", path.display()))?;
+fn project_root_from_canonical_path(canonical: &Path) -> Option<PathBuf> {
     let start = if canonical.is_dir() {
-        canonical
+        canonical.to_path_buf()
     } else {
         canonical
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or(canonical)
+            .unwrap_or_else(|| canonical.to_path_buf())
     };
 
     for ancestor in start.ancestors() {
         if ancestor.join(".tsift").is_dir() {
-            return Ok(Some(ancestor.to_path_buf()));
+            return Some(ancestor.to_path_buf());
         }
     }
 
-    Ok(None)
+    None
+}
+
+pub fn find_project_root_for_path(path: &Path) -> Result<Option<PathBuf>> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", path.display()))?;
+    Ok(project_root_from_canonical_path(&canonical))
+}
+
+pub fn resolve_project_root_or_canonical_path(path: &Path) -> Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", path.display()))?;
+    Ok(project_root_from_canonical_path(&canonical).unwrap_or(canonical))
 }
 
 pub fn collect_entities_from_db(db_path: &Path) -> Result<HashSet<String>> {
@@ -454,6 +465,18 @@ mod tests {
         let root = find_project_root_for_path(&file).unwrap();
 
         assert_eq!(root.unwrap(), dir.path());
+    }
+
+    #[test]
+    fn resolve_project_root_or_canonical_path_promotes_nested_subdir_to_tsift_root() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".tsift")).unwrap();
+        let nested = dir.path().join("src/nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        let root = resolve_project_root_or_canonical_path(&nested).unwrap();
+
+        assert_eq!(root, dir.path());
     }
 
     #[test]

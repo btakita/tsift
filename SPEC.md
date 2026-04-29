@@ -108,6 +108,7 @@ Opt-in recovery:
 - `tsift search --scope <submod> ...` now fails closed when the named submodule does not exist, and reports the available scope ids instead of silently searching the workspace root
 - `tsift index --submodule <submod> ...` now fails closed on that same unknown or ambiguous selector set, instead of indexing `root/<submod>` into an unreachable scoped DB
 - when duplicate submodules share the same trailing directory name, leaf-name selectors fail closed as ambiguous and the full `.gitmodules` path becomes the required scope id
+- `tsift status`, `tsift search`, `graph`, `communities`, `path`, and `explain` now resolve nested input paths against the nearest ancestor that already owns `.tsift/`, so subdirectory invocations reuse the intended project/workspace indexes instead of creating nested `.tsift/index.db` state
 - workspace roots that only have scoped `.tsift/indexes/<scope>/index.db` files now make `graph`, `communities`, `path`, and `explain` fail closed until the caller picks `--scope <scope>`, instead of surfacing a misleading missing-root-index error
 - writable index updates now claim an OS-backed exclusive lock on the sibling `index.lock` sidecar first, so concurrent `tsift index` / `tsift search --autoindex` writers fail fast with a tsift-owned error instead of surfacing raw SQLite lock contention or PID-recycling false positives
 - read-only graph queries (`graph`, `communities`, `path`, `explain`) open `index.db` without taking that writer-side `index.lock`, so diagnostic and graph traversal commands keep working while an index writer is active
@@ -689,7 +690,7 @@ This ensures agent sessions always use instructions matching the installed binar
 
 ## Status (Session Health Check)
 
-`tsift status` reports index freshness, instruction version, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session. On workspace roots, it detects scoped indexes under `.tsift/indexes/<scope>/index.db`, aggregates them into the top-level index state, reports the contributing scopes explicitly, and surfaces configured scopes whose `index.db` is still missing so partially indexed workspaces do not masquerade as `fresh`.
+`tsift status` reports index freshness, instruction version, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session. When the input path is a nested subdirectory, `status` first promotes it to the nearest ancestor that already owns `.tsift/` so the check reuses the existing project/workspace state. On workspace roots, it detects scoped indexes under `.tsift/indexes/<scope>/index.db`, aggregates them into the top-level index state, reports the contributing scopes explicitly, and surfaces configured scopes whose `index.db` is still missing so partially indexed workspaces do not masquerade as `fresh`.
 
 ```bash
 tsift status            # human-readable output

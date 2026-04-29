@@ -1011,6 +1011,51 @@ fn workspace_graph_queries_require_scope_without_shared_root_index() {
 }
 
 #[test]
+fn nested_query_paths_use_the_ancestor_tsift_root() {
+    let dir = indexed_cli_fixture();
+    fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+    let nested = dir.path().join("src");
+    let nested_str = nested.to_str().unwrap();
+
+    let status_output = tsift_bin()
+        .args(["status", "--json", nested_str])
+        .output()
+        .unwrap();
+    assert!(
+        status_output.status.success(),
+        "status stderr: {}",
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+    let status_json: serde_json::Value = serde_json::from_slice(&status_output.stdout).unwrap();
+    assert_eq!(status_json["index"]["state"], "fresh");
+
+    let search_output = tsift_bin()
+        .args(["search", "--path", nested_str, "helper", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        search_output.status.success(),
+        "search stderr: {}",
+        String::from_utf8_lossy(&search_output.stderr)
+    );
+    assert!(
+        !nested.join(".tsift/index.db").exists(),
+        "search should not create a nested index under {}",
+        nested.display()
+    );
+
+    let graph_output = tsift_bin()
+        .args(["graph", "helper", nested_str, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        graph_output.status.success(),
+        "graph stderr: {}",
+        String::from_utf8_lossy(&graph_output.stderr)
+    );
+}
+
+#[test]
 fn index_check_stays_read_only_while_writer_lock_exists() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
