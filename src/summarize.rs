@@ -1,8 +1,11 @@
 use crate::index::IndexDb;
 use anyhow::{Context, Result, bail};
+use fs4::fs_std::FileExt;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -90,6 +93,25 @@ pub struct SummarizeConfig {
 
 const REPLACE_FILE_SAVEPOINT: &str = "tsift_summary_replace";
 
+#[derive(Debug)]
+pub(crate) struct SummaryWriteLockGuard {
+    file: File,
+}
+
+impl Drop for SummaryWriteLockGuard {
+    fn drop(&mut self) {
+        let _ = clear_lock_metadata(&mut self.file);
+        let _ = self.file.unlock();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockFileMarker {
+    Empty,
+    Pid(u32),
+    Invalid,
+}
+
 impl Default for SummarizeConfig {
     fn default() -> Self {
         Self {
@@ -98,6 +120,54 @@ impl Default for SummarizeConfig {
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
         }
     }
+}
+
+pub(crate) fn acquire_write_lock(db_path: &Path) -> Result<SummaryWriteLockGuard> {
+    let lock_path = writer_lock_path(db_path);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating lock dir: {}", parent.display()))?;
+    }
+
+    let mut lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+
+    match lock_file.try_lock_exclusive() {
+        Ok(true) => {
+            write_lock_pid(&mut lock_file, &lock_path)?;
+            Ok(SummaryWriteLockGuard { file: lock_file })
+        }
+        Ok(false) => {
+            let holder = match read_lock_marker(&mut lock_file)
+                .with_context(|| format!("reading {}", lock_path.display()))?
+            {
+                LockFileMarker::Pid(pid) => format!(" (pid {})", pid),
+                _ => String::new(),
+            };
+            bail!(
+                "another tsift summarize extractor is already active for {}{} (lock: {}). \
+                 A concurrent `tsift summarize --extract` is already updating this summary cache; \
+                 wait for it to finish before retrying.",
+                db_path.display(),
+                holder,
+                lock_path.display()
+            );
+        }
+        Err(err) => Err(err).with_context(|| format!("locking {}", lock_path.display())),
+    }
+}
+
+pub(crate) fn writer_lock_path(db_path: &Path) -> PathBuf {
+    let stem = db_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("summaries");
+    db_path.with_file_name(format!("{stem}.lock"))
 }
 
 impl SummaryDb {
@@ -281,6 +351,39 @@ impl SummaryDb {
             }
         }
     }
+}
+
+fn read_lock_marker(file: &mut File) -> std::io::Result<LockFileMarker> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        Ok(LockFileMarker::Empty)
+    } else if let Ok(pid) = trimmed.parse::<u32>() {
+        Ok(LockFileMarker::Pid(pid))
+    } else {
+        Ok(LockFileMarker::Invalid)
+    }
+}
+
+fn write_lock_pid(file: &mut File, lock_path: &Path) -> Result<()> {
+    file.set_len(0)
+        .with_context(|| format!("clearing {}", lock_path.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("seeking {}", lock_path.display()))?;
+    writeln!(file, "{}", std::process::id())
+        .with_context(|| format!("writing {}", lock_path.display()))?;
+    file.sync_data()
+        .with_context(|| format!("syncing {}", lock_path.display()))?;
+    Ok(())
+}
+
+fn clear_lock_metadata(file: &mut File) -> std::io::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.sync_data()?;
+    Ok(())
 }
 
 fn insert_summary(conn: &Connection, summary: &Summary) -> Result<()> {
@@ -816,6 +919,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(timeout_ms, 5000);
+    }
+
+    #[test]
+    fn summary_write_lock_records_pid_and_clears_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(".tsift/summaries.db");
+        let lock_path = writer_lock_path(&db_path);
+
+        {
+            let _lock = acquire_write_lock(&db_path).unwrap();
+            let marker = std::fs::read_to_string(&lock_path).unwrap();
+            assert_eq!(marker.trim(), std::process::id().to_string());
+        }
+
+        let marker = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(marker.trim().is_empty());
+        acquire_write_lock(&db_path).unwrap();
+    }
+
+    #[test]
+    fn summary_write_lock_fails_fast_when_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(".tsift/summaries.db");
+        let _lock = acquire_write_lock(&db_path).unwrap();
+
+        let err = acquire_write_lock(&db_path).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("another tsift summarize extractor is already active"));
+        assert!(message.contains("tsift summarize --extract"));
+        assert!(message.contains(&writer_lock_path(&db_path).display().to_string()));
     }
 
     #[test]

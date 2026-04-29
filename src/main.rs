@@ -2602,7 +2602,6 @@ fn cmd_summarize(
         let extract_base = resolve_extract_base(path)?;
         let extract_scope = resolve_extract_scope(&extract_base, &extract_path);
         let cfg = load_summarize_config(&root);
-        let summary_db = summarize::SummaryDb::open(&db_path)?;
 
         let (files_to_extract, deleted_summary_paths) = if diff {
             let changed = summarize::git_changed_files(&root)?;
@@ -2628,13 +2627,16 @@ fn cmd_summarize(
             (collect_source_files(&extract_scope)?, BTreeSet::new())
         };
 
-        for rel_path in &deleted_summary_paths {
-            summary_db.delete_by_file(rel_path)?;
-        }
-
         if files_to_extract.is_empty() && deleted_summary_paths.is_empty() {
             println!("No files to extract.");
             return Ok(());
+        }
+
+        let _summary_write_lock = summarize::acquire_write_lock(&db_path)?;
+        let summary_db = summarize::SummaryDb::open(&db_path)?;
+
+        for rel_path in &deleted_summary_paths {
+            summary_db.delete_by_file(rel_path)?;
         }
 
         let mut report = summarize::ExtractionReport {
@@ -3931,6 +3933,58 @@ mod tests {
         .unwrap();
 
         assert!(summary_db.get_by_file("src/gone.rs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn summarize_extract_fails_fast_when_summary_writer_lock_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = dir.path().join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let file = source_dir.join("lib.rs");
+        std::fs::write(&file, "fn helper() {}\n").unwrap();
+
+        let content = std::fs::read(&file).unwrap();
+        let summary_db =
+            summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+        summary_db
+            .insert(&summarize::Summary {
+                id: 0,
+                symbol_name: "lib.rs".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                content_hash: summarize::content_hash(&content),
+                summary: "cached summary".to_string(),
+                entities: None,
+                relationships: None,
+                concept_labels: None,
+                extracted_at: "1700000000".to_string(),
+                model: "test".to_string(),
+                tokens_input: Some(100),
+                tokens_output: Some(50),
+            })
+            .unwrap();
+        drop(summary_db);
+
+        let lock_path = summarize::writer_lock_path(&dir.path().join(".tsift/summaries.db"));
+        let _lock = hold_writer_lock(&lock_path);
+
+        let err = cmd_summarize(
+            None,
+            None,
+            Some(PathBuf::from("src")),
+            false,
+            false,
+            dir.path(),
+            false,
+            true,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("another tsift summarize extractor is already active"));
+        assert!(message.contains("tsift summarize --extract"));
     }
 
     #[test]
