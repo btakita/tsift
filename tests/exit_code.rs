@@ -57,6 +57,38 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
     !process_exists(pid)
 }
 
+fn init_git_repo(path: &Path) {
+    let status = Command::new("git")
+        .args(["init"])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git init failed");
+
+    let status = Command::new("git")
+        .args(["add", "."])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git add failed");
+
+    let status = Command::new("git")
+        .args([
+            "-c",
+            "user.name=tsift-tests",
+            "-c",
+            "user.email=tsift-tests@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "init",
+        ])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git commit failed");
+}
+
 fn build_cli_fixture(dir: &Path) {
     fs::write(
         dir.join("main.rs"),
@@ -1230,6 +1262,45 @@ fn summarize_extract_resolves_relative_path_against_explicit_root() {
     assert!(stdout.contains("errors:1"), "stdout was: {stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("src/main.rs"), "stderr was: {stderr}");
+}
+
+#[test]
+fn summarize_diff_extract_includes_untracked_files() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("README.md"), "# repo\n").unwrap();
+    init_git_repo(dir.path());
+
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/new.rs"), "fn alpha_helper() {}\n").unwrap();
+    write_missing_summary_api_key_config(dir.path());
+
+    let output = tsift_bin()
+        .args([
+            "summarize",
+            "--extract",
+            "src",
+            "--diff",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--compact",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "summarize stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing API key"), "stderr was: {stderr}");
+    assert!(stderr.contains("src/new.rs"), "stderr was: {stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("No files to extract."),
+        "stdout was: {stdout}"
+    );
+    assert!(stdout.contains("errors:1"), "stdout was: {stdout}");
 }
 
 #[test]

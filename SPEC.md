@@ -88,7 +88,7 @@ tsift search --timeout 60       # custom timeout in seconds (default: 30, 0 = no
 tsift --compact search <query>  # terse human output across commands
 ```
 
-`tsift summarize --stats`, `tsift summarize <symbol>`, and `tsift summarize --file <path>` are read-only cache queries: they fail closed when `.tsift/summaries.db` is absent and never create the summary cache as a side effect. During `--extract`, workspace files resolve symbol context against the matching scoped `index.db`, and symbol preload uses exact normalized file-path matches so duplicate `src/lib.rs`-style paths across scopes do not bleed into each other.
+`tsift summarize --stats`, `tsift summarize <symbol>`, and `tsift summarize --file <path>` are read-only cache queries: they fail closed when `.tsift/summaries.db` is absent and never create the summary cache as a side effect. During `--extract`, workspace files resolve symbol context against the matching scoped `index.db`, symbol preload uses exact normalized file-path matches so duplicate `src/lib.rs`-style paths across scopes do not bleed into each other, and `--diff` includes untracked files within the requested extract scope.
 
 ## Search Stale Precheck + Timeout
 
@@ -816,7 +816,7 @@ tsift summarize
 │   └── by concept → cross-file entity matches
 └── invalidation
     ├── cache key: blake3(file_content) + symbol_name
-    ├── --diff mode: only re-extracts files changed since last extraction
+    ├── --diff mode: only re-extracts tracked changes plus untracked files within the requested extract scope
     └── stale entries kept readable, marked for re-extraction
 ```
 

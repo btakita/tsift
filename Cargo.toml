@@ -1,6 +1,6 @@
 [package]
 name = "tsift"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2024"
 description = "Token-efficient CLI plugin for Claude Code — Sift-powered search + native tool routing"
 license = "MIT"

@@ -3427,6 +3427,38 @@ fn cmd_search_worker(
 mod tests {
     use super::*;
 
+    fn init_git_repo(path: &Path) {
+        let status = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+
+        let status = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git add failed");
+
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=tsift-tests",
+                "-c",
+                "user.email=tsift-tests@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "init",
+            ])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git commit failed");
+    }
+
     // --- classify_task ---
 
     #[test]
@@ -3524,6 +3556,22 @@ mod tests {
         let files = collect_source_files(&extract_scope).unwrap();
 
         assert_eq!(files, vec![main_rs]);
+    }
+
+    #[test]
+    fn summarize_diff_extract_includes_untracked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# repo\n").unwrap();
+        init_git_repo(dir.path());
+
+        let source_dir = dir.path().join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let new_file = source_dir.join("new.rs");
+        std::fs::write(&new_file, "fn alpha_helper() {}\n").unwrap();
+
+        let files = summarize::git_changed_files(dir.path()).unwrap();
+
+        assert_eq!(files, vec![new_file]);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -597,24 +598,43 @@ fn maybe_mock_anthropic_api(prompt: &str) -> Result<Option<(String, i64, i64)>> 
 }
 
 pub fn git_changed_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let tracked = git_list_paths(
+        root,
+        &["diff", "--name-only", "--diff-filter=d", "HEAD"],
+        "git diff",
+    )?;
+    let untracked = git_list_paths(
+        root,
+        &["ls-files", "--others", "--exclude-standard"],
+        "git ls-files",
+    )?;
+    let files = tracked
+        .into_iter()
+        .chain(untracked)
+        .filter(|path| path.is_file())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(files)
+}
+
+fn git_list_paths(root: &Path, args: &[&str], label: &str) -> Result<Vec<PathBuf>> {
     let output = std::process::Command::new("git")
-        .args(["diff", "--name-only", "HEAD"])
+        .args(args)
         .current_dir(root)
         .output()
-        .context("running git diff")?;
+        .with_context(|| format!("running {label}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git diff failed: {}", stderr);
+        bail!("{label} failed: {}", stderr.trim());
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let files = stdout
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| root.join(l))
-        .collect();
-    Ok(files)
+        .filter(|line| !line.is_empty())
+        .map(|line| root.join(line))
+        .collect())
 }
 
 fn chrono_now() -> String {
