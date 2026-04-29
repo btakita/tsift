@@ -74,6 +74,7 @@ tsift graph --callees <symbol>  # what does this function call?
 tsift communities [--path]      # Louvain community detection over call graph
 tsift path <from> <to>          # BFS shortest path between symbols
 tsift explain <symbol>          # full symbol context: callers, callees, community
+tsift edit < edits.json         # staged multi-file search/replace batch
 tsift audit                     # scan installed skills, check health
 tsift audit --manifest <file>   # compare against expected skill list
 tsift summarize <symbol>        # cached LLM summary for a symbol
@@ -89,6 +90,8 @@ tsift --compact search <query>  # terse human output across commands
 ```
 
 `tsift summarize --stats`, `tsift summarize <symbol>`, and `tsift summarize --file <path>` are read-only cache queries: they fail closed when `.tsift/summaries.db` is absent and never create the summary cache as a side effect. `--path` first resolves through the nearest ancestor `.tsift` project/workspace root, so nested directories reuse the shared summary cache instead of creating shadow caches. During `--extract`, workspace files resolve symbol context against the matching scoped `index.db`, symbol preload uses exact normalized file-path matches so duplicate `src/lib.rs`-style paths across scopes do not bleed into each other, and `--diff` includes untracked files within the requested extract scope.
+
+`tsift edit` now stages each rewritten file beside its target and only swaps the batch into place after every edit validates and every staged file is ready. If any later swap fails, tsift restores earlier files before returning an error instead of leaving a partially-written batch behind.
 
 ## Search Stale Precheck + Timeout
 

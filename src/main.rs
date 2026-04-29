@@ -10,6 +10,7 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tempfile::NamedTempFile;
 
 pub mod audit;
 pub mod config;
@@ -369,8 +370,28 @@ struct EditResult {
 #[serde(rename_all = "lowercase")]
 enum EditStatus {
     Ok,
-    Error,
     Skipped,
+}
+
+struct PlannedEdit {
+    index: usize,
+    file: PathBuf,
+    new_content: String,
+    replacements: usize,
+}
+
+struct StagedEdit {
+    index: usize,
+    file: PathBuf,
+    replacements: usize,
+    staged_file: NamedTempFile,
+}
+
+struct AppliedEdit {
+    index: usize,
+    file: PathBuf,
+    replacements: usize,
+    backup_path: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -1229,6 +1250,193 @@ pub(crate) fn apply_edit_op(content: &str, op: &EditOp) -> Result<(String, usize
     Ok((replaced, count))
 }
 
+fn build_edit_plan(batch: &EditBatch) -> Result<Vec<PlannedEdit>> {
+    let mut plan = Vec::with_capacity(batch.edits.len());
+    for (i, op) in batch.edits.iter().enumerate() {
+        let content = fs::read_to_string(&op.file)
+            .with_context(|| format!("edit #{}: reading {}", i + 1, op.file.display()))?;
+        let (replaced, count) = apply_edit_op(&content, op)
+            .with_context(|| format!("edit #{}: {}", i + 1, op.file.display()))?;
+        plan.push(PlannedEdit {
+            index: i,
+            file: op.file.clone(),
+            new_content: replaced,
+            replacements: count,
+        });
+    }
+    Ok(plan)
+}
+
+fn stage_edit_plan(plan: Vec<PlannedEdit>) -> Result<Vec<StagedEdit>> {
+    let mut staged = Vec::with_capacity(plan.len());
+    for planned in plan {
+        let parent = planned.file.parent().unwrap_or_else(|| Path::new("."));
+        let mut staged_file = NamedTempFile::new_in(parent)
+            .with_context(|| format!("staging {}", planned.file.display()))?;
+        staged_file
+            .write_all(planned.new_content.as_bytes())
+            .with_context(|| format!("staging {}", planned.file.display()))?;
+        staged_file
+            .as_file_mut()
+            .sync_all()
+            .with_context(|| format!("flushing staged edit for {}", planned.file.display()))?;
+        staged.push(StagedEdit {
+            index: planned.index,
+            file: planned.file,
+            replacements: planned.replacements,
+            staged_file,
+        });
+    }
+    Ok(staged)
+}
+
+fn edit_backup_path(file: &Path, index: usize) -> PathBuf {
+    let parent = file.parent().unwrap_or_else(|| Path::new("."));
+    let name = file
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "edit-target".to_string());
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    parent.join(format!(
+        ".{name}.tsift-edit-{stamp}-{}-{index}.bak",
+        std::process::id()
+    ))
+}
+
+fn rollback_applied_edits(applied: &[AppliedEdit]) -> Result<()> {
+    let mut rollback_errors = Vec::new();
+    for entry in applied.iter().rev() {
+        if let Err(err) = fs::remove_file(&entry.file)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            rollback_errors.push(format!(
+                "removing {} during rollback: {}",
+                entry.file.display(),
+                err
+            ));
+            continue;
+        }
+        if let Err(err) = fs::rename(&entry.backup_path, &entry.file) {
+            rollback_errors.push(format!(
+                "restoring {} during rollback: {}",
+                entry.file.display(),
+                err
+            ));
+        }
+    }
+    if rollback_errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(rollback_errors.join("; "));
+    }
+}
+
+fn cleanup_edit_backups(applied: &[AppliedEdit]) {
+    for entry in applied {
+        let _ = fs::remove_file(&entry.backup_path);
+    }
+}
+
+fn ok_results_from_applied(applied: &[AppliedEdit]) -> Vec<EditResult> {
+    applied
+        .iter()
+        .map(|entry| EditResult {
+            file: entry.file.clone(),
+            status: EditStatus::Ok,
+            error: None,
+            replacements: Some(entry.replacements),
+        })
+        .collect()
+}
+
+fn apply_edit_plan_atomically(plan: Vec<PlannedEdit>) -> Result<Vec<EditResult>> {
+    apply_edit_plan_atomically_inner(plan, |_, _| Ok(()))
+}
+
+fn apply_edit_plan_atomically_inner<F>(
+    plan: Vec<PlannedEdit>,
+    mut before_swap: F,
+) -> Result<Vec<EditResult>>
+where
+    F: FnMut(usize, &Path) -> Result<()>,
+{
+    let staged = stage_edit_plan(plan)?;
+    let mut applied = Vec::with_capacity(staged.len());
+
+    for (commit_index, staged_edit) in staged.into_iter().enumerate() {
+        if let Err(err) = before_swap(commit_index, &staged_edit.file) {
+            match rollback_applied_edits(&applied) {
+                Ok(()) => cleanup_edit_backups(&applied),
+                Err(rollback_error) => {
+                    return Err(err.context(format!("rollback also failed: {rollback_error}")));
+                }
+            }
+            return Err(err);
+        }
+
+        let backup_path = edit_backup_path(&staged_edit.file, staged_edit.index);
+        if let Err(err) = fs::rename(&staged_edit.file, &backup_path) {
+            match rollback_applied_edits(&applied) {
+                Ok(()) => cleanup_edit_backups(&applied),
+                Err(rollback_error) => {
+                    bail!(
+                        "moving {} into backup slot failed: {}; rollback also failed: {}",
+                        staged_edit.file.display(),
+                        err,
+                        rollback_error
+                    );
+                }
+            }
+            bail!(
+                "moving {} into backup slot failed: {}",
+                staged_edit.file.display(),
+                err
+            );
+        }
+        match staged_edit.staged_file.persist(&staged_edit.file) {
+            Ok(_) => applied.push(AppliedEdit {
+                index: staged_edit.index,
+                file: staged_edit.file,
+                replacements: staged_edit.replacements,
+                backup_path,
+            }),
+            Err(err) => {
+                let persist_error = err.error;
+                drop(err.file);
+                let restore_error = fs::rename(&backup_path, &staged_edit.file).err();
+                let rollback_error = rollback_applied_edits(&applied).err();
+                if rollback_error.is_none() {
+                    cleanup_edit_backups(&applied);
+                }
+                let mut message = format!(
+                    "committing {} failed: {}",
+                    staged_edit.file.display(),
+                    persist_error
+                );
+                if let Some(restore_error) = restore_error {
+                    message.push_str(&format!(
+                        "; restoring original {} failed: {}",
+                        staged_edit.file.display(),
+                        restore_error
+                    ));
+                }
+                if let Some(rollback_error) = rollback_error {
+                    message.push_str(&format!("; rollback also failed: {rollback_error}"));
+                }
+                bail!(message);
+            }
+        }
+    }
+
+    applied.sort_by_key(|entry| entry.index);
+    let results = ok_results_from_applied(&applied);
+    cleanup_edit_backups(&applied);
+    Ok(results)
+}
+
 fn cmd_edit(
     dry_run: bool,
     file: Option<PathBuf>,
@@ -1255,49 +1463,19 @@ fn cmd_edit(
         return Ok(());
     }
 
-    // Phase 1: validate all edits before writing any (atomic batch)
-    let mut plan: Vec<(usize, String, usize)> = Vec::new(); // (idx, new_content, replacement_count)
-
-    for (i, op) in batch.edits.iter().enumerate() {
-        let content = fs::read_to_string(&op.file)
-            .with_context(|| format!("edit #{}: reading {}", i + 1, op.file.display()))?;
-        let (replaced, count) = apply_edit_op(&content, op)
-            .with_context(|| format!("edit #{}: {}", i + 1, op.file.display()))?;
-        plan.push((i, replaced, count));
-    }
-
-    // Phase 2: write all validated edits
-    let mut results: Vec<EditResult> = Vec::new();
-
-    for (i, new_content, count) in &plan {
-        if dry_run {
-            results.push(EditResult {
-                file: batch.edits[*i].file.clone(),
+    let plan = build_edit_plan(&batch)?;
+    let results: Vec<EditResult> = if dry_run {
+        plan.iter()
+            .map(|entry| EditResult {
+                file: entry.file.clone(),
                 status: EditStatus::Skipped,
                 error: Some("dry run".into()),
-                replacements: Some(*count),
-            });
-        } else {
-            match fs::write(&batch.edits[*i].file, new_content) {
-                Ok(()) => {
-                    results.push(EditResult {
-                        file: batch.edits[*i].file.clone(),
-                        status: EditStatus::Ok,
-                        error: None,
-                        replacements: Some(*count),
-                    });
-                }
-                Err(e) => {
-                    results.push(EditResult {
-                        file: batch.edits[*i].file.clone(),
-                        status: EditStatus::Error,
-                        error: Some(e.to_string()),
-                        replacements: None,
-                    });
-                }
-            }
-        }
-    }
+                replacements: Some(entry.replacements),
+            })
+            .collect()
+    } else {
+        apply_edit_plan_atomically(plan)?
+    };
 
     // Summary output
     let ok_count = results
@@ -1308,10 +1486,7 @@ fn cmd_edit(
         .iter()
         .filter(|r| matches!(r.status, EditStatus::Skipped))
         .count();
-    let err_count = results
-        .iter()
-        .filter(|r| matches!(r.status, EditStatus::Error))
-        .count();
+    let err_count = 0usize;
 
     if compact {
         println!(
@@ -3753,6 +3928,47 @@ mod tests {
         let content = "hello";
         let op = make_op("hello", "hello", false);
         assert!(apply_edit_op(content, &op).is_err());
+    }
+
+    #[test]
+    fn edit_batch_rolls_back_when_later_swap_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let alpha = dir.path().join("alpha.txt");
+        let beta = dir.path().join("beta.txt");
+        fs::write(&alpha, "alpha old\n").unwrap();
+        fs::write(&beta, "beta old\n").unwrap();
+
+        let batch = EditBatch {
+            edits: vec![
+                EditOp {
+                    file: alpha.clone(),
+                    old: "old".to_string(),
+                    new: "new".to_string(),
+                    replace_all: false,
+                },
+                EditOp {
+                    file: beta.clone(),
+                    old: "old".to_string(),
+                    new: "new".to_string(),
+                    replace_all: false,
+                },
+            ],
+        };
+
+        let plan = build_edit_plan(&batch).unwrap();
+        let err = match apply_edit_plan_atomically_inner(plan, |commit_index, _| {
+            if commit_index == 1 {
+                bail!("simulated swap failure");
+            }
+            Ok(())
+        }) {
+            Ok(_) => panic!("expected simulated swap failure"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("simulated swap failure"));
+        assert_eq!(fs::read_to_string(&alpha).unwrap(), "alpha old\n");
+        assert_eq!(fs::read_to_string(&beta).unwrap(), "beta old\n");
     }
 
     // --- SQL introspection ---
