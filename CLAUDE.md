@@ -49,7 +49,8 @@ tsift graph <symbol> --scope sub  # restrict to submodule
 
 ## Dependencies
 
-- **sift** — git dep (`github.com/rupurt/sift`), not on crates.io. Provides `Sift::builder().build()` + `engine.search()`.
+- **sift** — upstream git dep (`github.com/rupurt/sift`). It is not currently published on crates.io under a compatible package name, so crates.io release automation must stay gated until that upstream publish story exists.
+- **tagpath** — local path dep during development, with the published `0.6.0` version requirement retained so the dependency is already crates.io-compatible once the sift blocker is removed.
 - **rusqlite** — `bundled` feature (no system SQLite needed).
 - **tree-sitter** + per-language grammar crates — AST parsing for symbol extraction and call-graph.
 - **clap**, **anyhow**, **serde**, **serde_json** — standard Rust CLI stack.

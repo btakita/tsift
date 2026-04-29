@@ -5916,7 +5916,6 @@ tier = "private"
             }) => {
                 assert!(!autoindex);
                 assert!(no_autoindex);
-                assert!(!(autoindex || !no_autoindex));
             }
             _ => panic!("expected Search command"),
         }

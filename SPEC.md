@@ -376,6 +376,21 @@ The graph-oriented CLI surface should stay covered through the compiled binary, 
 
 Keep that fixture aligned with the command output contracts so changes in indexing, graph extraction, or JSON rendering fail in one integration layer before release.
 
+## Release Workflow
+
+tsift release automation is tag-driven:
+
+- `push` of a `vX.Y.Z` tag runs the release workflow
+- the workflow fails closed if the tag does not exactly match `Cargo.toml` `package.version`
+- release verification includes `cargo clippy --all-targets -- -D warnings` and `cargo test`
+- successful tagged releases attach prebuilt archives plus `.sha256` checksum files to the matching GitHub Release
+- prebuilt binaries are emitted for `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`
+- the crates.io publish job exists but is gated behind the `TSIFT_ENABLE_CRATES_PUBLISH=true` repo variable so normal GitHub releases do not fail on the current upstream packaging blocker
+
+Current blocker: tsift's search engine dependency comes from `github.com/rupurt/sift`, but that library is not published on crates.io under a compatible package name. The existing crates.io `sift` crate is a different project. Until the upstream dependency is published under a consumable crates.io package name and `Cargo.toml` is retargeted to it, crates.io publishing must remain explicitly disabled.
+
+To keep the remaining dependency surface publish-ready, any dependency that uses a local `path` source should also carry the matching crates.io `version` requirement whenever that published crate already exists.
+
 ## Skill Audit
 
 `tsift audit` scans Claude Code skill directories for health and drift detection.

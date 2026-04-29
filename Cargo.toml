@@ -19,7 +19,7 @@ toml = "0.8"
 blake3 = "1"
 ureq = { version = "3", features = ["json"] }
 sift = { git = "https://github.com/rupurt/sift" }
-tagpath = { path = "../tagpath", default-features = false }
+tagpath = { version = "0.6.0", path = "../tagpath", default-features = false }
 tree-sitter = "0.25"
 
 # Language grammars (optional, behind feature flags)
