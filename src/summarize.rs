@@ -313,15 +313,13 @@ impl SummaryDb {
         Ok(count > 0)
     }
 
-    pub fn stats(&self) -> Result<SummaryStats> {
+    pub fn stats(&self, root: &Path) -> Result<SummaryStats> {
         let total_summaries: usize =
             self.conn
                 .query_row("SELECT COUNT(*) FROM summaries", [], |row| row.get(0))?;
-        let total_files: usize = self.conn.query_row(
-            "SELECT COUNT(DISTINCT file_path) FROM summaries",
-            [],
-            |row| row.get(0),
-        )?;
+        let cached_file_paths = self.cached_file_paths()?;
+        let total_files = cached_file_paths.len();
+        let stale_count = self.stale_file_count(root, &cached_file_paths)?;
         let total_tokens_input: i64 = self.conn.query_row(
             "SELECT COALESCE(SUM(tokens_input), 0) FROM summaries",
             [],
@@ -338,7 +336,7 @@ impl SummaryDb {
         Ok(SummaryStats {
             total_summaries,
             total_files,
-            stale_count: 0, // computed externally when file hashes are available
+            stale_count,
             total_tokens_input,
             total_tokens_output,
             estimated_tokens_saved,
@@ -365,6 +363,27 @@ impl SummaryDb {
             .into_iter()
             .map(|path| normalize_summary_file_key_str(&path))
             .collect())
+    }
+
+    fn stale_file_count(&self, root: &Path, cached_file_paths: &BTreeSet<String>) -> Result<usize> {
+        let mut stale_count = 0;
+
+        for cached_path in cached_file_paths {
+            let live_path = root.join(cached_path);
+            if !live_path.is_file() {
+                stale_count += 1;
+                continue;
+            }
+
+            let content = std::fs::read(&live_path)
+                .with_context(|| format!("reading summary source {}", live_path.display()))?;
+            let live_hash = content_hash(&content);
+            if !self.is_current(cached_path, &live_hash)? {
+                stale_count += 1;
+            }
+        }
+
+        Ok(stale_count)
     }
 
     fn replace_file_with_hook<F>(
@@ -1147,15 +1166,50 @@ mod tests {
 
     #[test]
     fn db_stats() {
+        let root = tempfile::tempdir().unwrap();
+        let f1 = b"fn a() {}\n";
+        let f2 = b"fn c() {}\n";
+        std::fs::write(root.path().join("f1.rs"), f1).unwrap();
+        std::fs::write(root.path().join("f2.rs"), f2).unwrap();
         let (_tmp, db) = test_db();
-        db.insert(&make_summary("a", "f1.rs", "h1")).unwrap();
-        db.insert(&make_summary("b", "f1.rs", "h1")).unwrap();
-        db.insert(&make_summary("c", "f2.rs", "h2")).unwrap();
-        let stats = db.stats().unwrap();
+        let f1_hash = content_hash(f1);
+        let f2_hash = content_hash(f2);
+        db.insert(&make_summary("a", "f1.rs", &f1_hash)).unwrap();
+        db.insert(&make_summary("b", "f1.rs", &f1_hash)).unwrap();
+        db.insert(&make_summary("c", "f2.rs", &f2_hash)).unwrap();
+        let stats = db.stats(root.path()).unwrap();
         assert_eq!(stats.total_summaries, 3);
         assert_eq!(stats.total_files, 2);
+        assert_eq!(stats.stale_count, 0);
         assert_eq!(stats.total_tokens_input, 1500); // 3 * 500
         assert_eq!(stats.total_tokens_output, 600); // 3 * 200
+    }
+
+    #[test]
+    fn db_stats_counts_missing_and_hash_mismatched_files_as_stale() {
+        let root = tempfile::tempdir().unwrap();
+        let fresh = b"fn fresh() {}\n";
+        let changed_current = b"fn changed() { new_impl(); }\n";
+        let changed_old = b"fn changed() { old_impl(); }\n";
+        std::fs::write(root.path().join("fresh.rs"), fresh).unwrap();
+        std::fs::write(root.path().join("changed.rs"), changed_current).unwrap();
+
+        let (_tmp, db) = test_db();
+        db.insert(&make_summary("fresh", "fresh.rs", &content_hash(fresh)))
+            .unwrap();
+        db.insert(&make_summary(
+            "changed",
+            "changed.rs",
+            &content_hash(changed_old),
+        ))
+        .unwrap();
+        db.insert(&make_summary("missing", "missing.rs", "stale-hash"))
+            .unwrap();
+
+        let stats = db.stats(root.path()).unwrap();
+
+        assert_eq!(stats.total_files, 3);
+        assert_eq!(stats.stale_count, 2);
     }
 
     #[test]

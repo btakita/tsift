@@ -2745,14 +2745,15 @@ fn cmd_summarize(
     // --stats mode
     if stats {
         let summary_db = open_existing_summary_db_read_only(&db_path)?;
-        let s = summary_db.stats()?;
+        let s = summary_db.stats(&root)?;
         if json_output {
             println!("{}", to_json_schema(&s, pretty, terse, schema)?);
         } else if compact {
             println!(
-                "summaries:{} files:{} in:{} out:{} saved:{}",
+                "summaries:{} files:{} stale:{} in:{} out:{} saved:{}",
                 s.total_summaries,
                 s.total_files,
+                s.stale_count,
                 s.total_tokens_input,
                 s.total_tokens_output,
                 s.estimated_tokens_saved
@@ -2761,6 +2762,7 @@ fn cmd_summarize(
             println!("Summary cache statistics:");
             println!("  summaries:       {}", s.total_summaries);
             println!("  files:           {}", s.total_files);
+            println!("  stale files:     {}", s.stale_count);
             println!("  tokens input:    {}", s.total_tokens_input);
             println!("  tokens output:   {}", s.total_tokens_output);
             println!("  est. savings:    {} tokens", s.estimated_tokens_saved);
