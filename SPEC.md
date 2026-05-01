@@ -89,7 +89,7 @@ tsift search --timeout 60       # custom timeout in seconds (default: 30, 0 = no
 tsift --compact search <query>  # terse human output across commands
 ```
 
-`tsift summarize --stats`, `tsift summarize <symbol>`, and `tsift summarize --file <path>` are read-only cache queries: they fail closed when `.tsift/summaries.db` is absent, never create the summary cache as a side effect, and retry against a snapshot copy when a rollback-journal lock wedges the live cache. `--path` first resolves through the nearest ancestor `.tsift` project/workspace root, so nested directories reuse the shared summary cache instead of creating shadow caches. During `--extract`, relative extract paths resolve against the caller's `--path` anchor (or that file's parent directory) while still reusing the ancestor project's shared summary cache, tsift claims an exclusive sibling `summaries.lock` sidecar before it deletes stale rows, rechecks content hashes, or calls the LLM so concurrent extractors fail fast instead of duplicating API spend, workspace files resolve symbol context against the matching scoped `index.db`, symbol preload uses exact normalized file-path matches so duplicate `src/lib.rs`-style paths across scopes do not bleed into each other, symbol preload reuses the same busy-timeout plus snapshot fallback path as other read-only index consumers when a rollback-journal writer is live, and `--diff` includes untracked files within the requested extract scope while deleting cached summary rows for tracked files that were removed from that scope. `tsift status` computes summary coverage against live indexed files only, so stale summary rows for deleted files do not over-report cache coverage, and it surfaces summary-cache recovery diagnostics when it had to degrade off the live database.
+`tsift summarize --stats`, `tsift summarize <symbol>`, and `tsift summarize --file <path>` are read-only cache queries: they fail closed when `.tsift/summaries.db` is absent, never create the summary cache as a side effect, and retry against a snapshot copy when a rollback-journal lock wedges the live cache. `--path` first resolves through the nearest ancestor `.tsift` project/workspace root, so nested directories reuse the shared summary cache instead of creating shadow caches. During `--extract`, relative extract paths resolve against the caller's `--path` anchor (or that file's parent directory) while still reusing the ancestor project's shared summary cache, tsift claims an exclusive sibling `summaries.lock` sidecar before it deletes stale rows, rechecks content hashes, or calls the LLM so concurrent extractors fail fast instead of duplicating API spend, workspace files resolve symbol context against the matching scoped `index.db`, symbol preload uses exact normalized file-path matches so duplicate `src/lib.rs`-style paths across scopes do not bleed into each other, symbol preload reuses the same busy-timeout plus snapshot fallback path as other read-only index consumers when a rollback-journal writer is live, and `--diff` includes untracked files within the requested extract scope while deleting cached summary rows for tracked files that were removed from that scope; on an unborn `HEAD`, `--diff` degrades to untracked-only extraction instead of failing on `git diff ... HEAD`. `tsift status` computes summary coverage against live indexed files only, so stale summary rows for deleted files do not over-report cache coverage, and it surfaces summary-cache recovery diagnostics when it had to degrade off the live database.
 
 `tsift edit` now stages each rewritten file beside its target and only swaps the batch into place after every edit validates and every staged file is ready. If any later swap fails, tsift restores earlier files before returning an error instead of leaving a partially-written batch behind.
 
@@ -841,7 +841,7 @@ tsift summarize
 │   └── by concept → cross-file entity matches
 └── invalidation
     ├── cache key: blake3(file_content) + symbol_name
-    ├── --diff mode: only re-extracts tracked changes plus untracked files within the requested extract scope
+    ├── --diff mode: only re-extracts tracked changes plus untracked files within the requested extract scope, and treats unborn HEAD as untracked-only
     └── stale entries kept readable, marked for re-extraction
 ```
 
@@ -869,7 +869,7 @@ CREATE INDEX idx_summaries_hash ON summaries(content_hash);
 
 ### Extraction Protocol
 
-1. Collect target files (from path arg or `--diff` against `git diff --name-only`)
+1. Collect target files (from path arg or `--diff` against `git diff --name-only`; unborn HEAD falls back to untracked files only)
 2. Claim the coarse `summaries.lock` sidecar so only one extractor mutates a cache at a time
 3. For each file, load source + symbols from `index.db`
 4. Build extraction prompt: source snippet + symbol list + "extract entities, relationships, 2-sentence summary"

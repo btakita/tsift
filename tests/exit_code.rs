@@ -1743,6 +1743,49 @@ fn summarize_diff_extract_includes_untracked_files() {
 }
 
 #[test]
+fn summarize_diff_extract_treats_unborn_head_as_untracked_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let status = Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git init failed");
+
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/new.rs"), "fn alpha_helper() {}\n").unwrap();
+    write_missing_summary_api_key_config(dir.path());
+
+    let output = tsift_bin()
+        .args([
+            "summarize",
+            "--extract",
+            "src",
+            "--diff",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--compact",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "summarize stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing API key"), "stderr was: {stderr}");
+    assert!(stderr.contains("src/new.rs"), "stderr was: {stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("No files to extract."),
+        "stdout was: {stdout}"
+    );
+    assert!(stdout.contains("errors:1"), "stdout was: {stdout}");
+}
+
+#[test]
 fn summarize_extract_uses_matching_scoped_index_prompt_context() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(

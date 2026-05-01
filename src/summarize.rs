@@ -779,16 +779,22 @@ fn maybe_mock_anthropic_api(prompt: &str) -> Result<Option<(String, i64, i64)>> 
 }
 
 pub fn git_changed_files(root: &Path) -> Result<GitChangedFiles> {
-    let tracked = git_list_paths(
-        root,
-        &["diff", "--name-only", "--diff-filter=d", "HEAD"],
-        "git diff",
-    )?;
-    let deleted = git_list_paths(
-        root,
-        &["diff", "--name-only", "--diff-filter=D", "HEAD"],
-        "git diff deleted",
-    )?;
+    let (tracked, deleted) = if git_has_head_commit(root)? {
+        (
+            git_list_paths(
+                root,
+                &["diff", "--name-only", "--diff-filter=d", "HEAD"],
+                "git diff",
+            )?,
+            git_list_paths(
+                root,
+                &["diff", "--name-only", "--diff-filter=D", "HEAD"],
+                "git diff deleted",
+            )?,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let untracked = git_list_paths(
         root,
         &["ls-files", "--others", "--exclude-standard"],
@@ -807,6 +813,30 @@ pub fn git_changed_files(root: &Path) -> Result<GitChangedFiles> {
         .into_iter()
         .collect();
     Ok(GitChangedFiles { existing, deleted })
+}
+
+fn git_has_head_commit(root: &Path) -> Result<bool> {
+    let inside_work_tree = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(root)
+        .output()
+        .with_context(|| "running git rev-parse --is-inside-work-tree")?;
+
+    if !inside_work_tree.status.success() {
+        let stderr = String::from_utf8_lossy(&inside_work_tree.stderr);
+        bail!(
+            "git rev-parse --is-inside-work-tree failed: {}",
+            stderr.trim()
+        );
+    }
+
+    let verify_head = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .current_dir(root)
+        .output()
+        .with_context(|| "running git rev-parse --verify HEAD")?;
+
+    Ok(verify_head.status.success())
 }
 
 fn git_list_paths(root: &Path, args: &[&str], label: &str) -> Result<Vec<PathBuf>> {

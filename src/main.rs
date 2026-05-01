@@ -3873,6 +3873,27 @@ mod tests {
     }
 
     #[test]
+    fn summarize_diff_extract_treats_unborn_head_as_untracked_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+
+        let source_dir = dir.path().join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let new_file = source_dir.join("new.rs");
+        std::fs::write(&new_file, "fn alpha_helper() {}\n").unwrap();
+
+        let files = summarize::git_changed_files(dir.path()).unwrap();
+
+        assert_eq!(files.existing, vec![new_file]);
+        assert!(files.deleted.is_empty());
+    }
+
+    #[test]
     fn summarize_diff_extract_tracks_deleted_files() {
         let dir = tempfile::tempdir().unwrap();
         let source_dir = dir.path().join("src");
