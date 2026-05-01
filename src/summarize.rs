@@ -655,7 +655,7 @@ fn normalize_lookup_path(path: &Path) -> String {
     normalize_summary_file_key(path)
 }
 
-fn normalize_lexical_path(path: &Path) -> PathBuf {
+pub(crate) fn normalize_lexical_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
 
     for component in path.components() {

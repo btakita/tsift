@@ -1786,6 +1786,54 @@ fn summarize_diff_extract_treats_unborn_head_as_untracked_only() {
 }
 
 #[test]
+fn summarize_diff_extract_normalizes_relative_scope_before_filtering() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn alpha_helper() {}\n").unwrap();
+    fs::write(dir.path().join("README.md"), "# repo\n").unwrap();
+    init_git_repo(dir.path());
+
+    fs::write(
+        dir.path().join("src/lib.rs"),
+        "fn alpha_helper() {}\nfn beta_helper() {}\n",
+    )
+    .unwrap();
+    write_missing_summary_api_key_config(dir.path());
+
+    let output = tsift_bin()
+        .args([
+            "summarize",
+            "--extract",
+            "src/../src",
+            "--diff",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--compact",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "summarize stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("No files to extract."),
+        "stdout was: {stdout}"
+    );
+    assert!(stdout.contains("errors:1"), "stdout was: {stdout}");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("src/lib.rs"), "stderr was: {stderr}");
+    assert!(
+        !stderr.contains("src/../src/lib.rs"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
 fn summarize_extract_uses_matching_scoped_index_prompt_context() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(

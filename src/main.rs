@@ -2602,7 +2602,7 @@ fn cmd_summarize(
     // --extract mode: run LLM extraction
     if let Some(extract_path) = extract {
         let extract_base = resolve_extract_base(path)?;
-        let extract_scope = resolve_extract_scope(&extract_base, &extract_path);
+        let extract_scope = resolve_extract_scope(&extract_base, &extract_path)?;
         let cfg = load_summarize_config(&root);
 
         let (files_to_extract, mut deleted_summary_paths) = if diff {
@@ -3085,16 +3085,29 @@ fn resolve_extract_base(path: &Path) -> Result<PathBuf> {
     })
 }
 
-fn resolve_extract_scope(root: &Path, extract_path: &Path) -> PathBuf {
-    if extract_path.is_absolute() {
+fn normalize_extract_scope_path(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return path
+            .canonicalize()
+            .with_context(|| format!("canonicalizing extract scope {}", path.display()));
+    }
+
+    Ok(summarize::normalize_lexical_path(path))
+}
+
+fn resolve_extract_scope(root: &Path, extract_path: &Path) -> Result<PathBuf> {
+    let scope = if extract_path.is_absolute() {
         extract_path.to_path_buf()
     } else {
         root.join(extract_path)
-    }
+    };
+    normalize_extract_scope_path(&scope)
 }
 
 fn summarize_diff_matches_scope(changed_path: &Path, extract_scope: &Path) -> bool {
-    changed_path.starts_with(extract_scope)
+    normalize_extract_scope_path(changed_path)
+        .unwrap_or_else(|_| summarize::normalize_lexical_path(changed_path))
+        .starts_with(extract_scope)
 }
 
 fn summarize_relative_file_path(root: &Path, file_path: &Path) -> String {
@@ -3829,7 +3842,7 @@ mod tests {
     #[test]
     fn summarize_diff_scope_matches_relative_directory() {
         let root = Path::new("/repo");
-        let extract_scope = resolve_extract_scope(root, Path::new("src/feature"));
+        let extract_scope = resolve_extract_scope(root, Path::new("src/feature")).unwrap();
 
         assert!(summarize_diff_matches_scope(
             Path::new("/repo/src/feature/main.rs"),
@@ -3844,7 +3857,7 @@ mod tests {
     #[test]
     fn summarize_diff_scope_matches_relative_file() {
         let root = Path::new("/repo");
-        let extract_scope = resolve_extract_scope(root, Path::new("src/feature/main.rs"));
+        let extract_scope = resolve_extract_scope(root, Path::new("src/feature/main.rs")).unwrap();
 
         assert!(summarize_diff_matches_scope(
             Path::new("/repo/src/feature/main.rs"),
@@ -3864,7 +3877,7 @@ mod tests {
         let main_rs = source_dir.join("main.rs");
         std::fs::write(&main_rs, "fn alpha() {}\n").unwrap();
 
-        let extract_scope = resolve_extract_scope(dir.path(), Path::new("src"));
+        let extract_scope = resolve_extract_scope(dir.path(), Path::new("src")).unwrap();
         let files = collect_source_files(&extract_scope).unwrap();
 
         assert_eq!(files, vec![main_rs]);
@@ -3880,7 +3893,7 @@ mod tests {
         std::fs::write(&nested_file, "fn nested_only() {}\n").unwrap();
 
         let extract_base = resolve_extract_base(&nested).unwrap();
-        let extract_scope = resolve_extract_scope(&extract_base, Path::new("."));
+        let extract_scope = resolve_extract_scope(&extract_base, Path::new(".")).unwrap();
         let files = collect_source_files(&extract_scope).unwrap();
 
         assert_eq!(extract_scope, nested);
@@ -3898,6 +3911,42 @@ mod tests {
         let extract_base = resolve_extract_base(&file_path).unwrap();
 
         assert_eq!(extract_base, nested);
+    }
+
+    #[test]
+    fn summarize_extract_scope_normalizes_dotdot_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = dir.path().join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+
+        let extract_scope = resolve_extract_scope(dir.path(), Path::new("src/../src")).unwrap();
+
+        assert_eq!(extract_scope, source_dir.canonicalize().unwrap());
+        assert!(summarize_diff_matches_scope(
+            &source_dir.join("main.rs"),
+            &extract_scope
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn summarize_extract_scope_canonicalizes_absolute_symlink_paths() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real");
+        let source_dir = real_root.join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let symlink_scope = dir.path().join("scope-link");
+        symlink(&source_dir, &symlink_scope).unwrap();
+
+        let extract_scope = resolve_extract_scope(&real_root, &symlink_scope).unwrap();
+
+        assert_eq!(extract_scope, source_dir.canonicalize().unwrap());
+        assert!(summarize_diff_matches_scope(
+            &source_dir.join("lib.rs"),
+            &extract_scope
+        ));
     }
 
     #[test]
