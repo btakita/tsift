@@ -3098,11 +3098,7 @@ fn summarize_diff_matches_scope(changed_path: &Path, extract_scope: &Path) -> bo
 }
 
 fn summarize_relative_file_path(root: &Path, file_path: &Path) -> String {
-    file_path
-        .strip_prefix(root)
-        .unwrap_or(file_path)
-        .to_string_lossy()
-        .to_string()
+    summarize::normalize_summary_file_key(file_path.strip_prefix(root).unwrap_or(file_path))
 }
 
 fn summarize_full_extract_deleted_summary_paths(

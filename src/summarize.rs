@@ -278,13 +278,17 @@ impl SummaryDb {
     }
 
     pub fn get_by_file(&self, path: &str) -> Result<Vec<Summary>> {
+        let normalized = normalize_summary_file_key_str(path);
+        let legacy = legacy_windows_summary_file_key(&normalized);
         let mut stmt = self.conn.prepare(
             "SELECT id, symbol_name, file_path, content_hash, summary, entities, relationships,
                     concept_labels, extracted_at, model, tokens_input, tokens_output
-             FROM summaries WHERE file_path = ?1 ORDER BY symbol_name",
+             FROM summaries WHERE file_path = ?1 OR file_path = ?2 ORDER BY symbol_name",
         )?;
         let rows = stmt
-            .query_map([path], |row| Ok(row_to_summary(row)))?
+            .query_map(rusqlite::params![normalized, legacy], |row| {
+                Ok(row_to_summary(row))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -298,9 +302,12 @@ impl SummaryDb {
     }
 
     pub fn is_current(&self, file_path: &str, content_hash: &str) -> Result<bool> {
+        let normalized = normalize_summary_file_key_str(file_path);
+        let legacy = legacy_windows_summary_file_key(&normalized);
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM summaries WHERE file_path = ?1 AND content_hash = ?2",
-            [file_path, content_hash],
+            "SELECT COUNT(*) FROM summaries
+             WHERE content_hash = ?2 AND (file_path = ?1 OR file_path = ?3)",
+            rusqlite::params![normalized, content_hash, legacy],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -339,9 +346,12 @@ impl SummaryDb {
     }
 
     pub fn delete_by_file(&self, file_path: &str) -> Result<usize> {
-        let count = self
-            .conn
-            .execute("DELETE FROM summaries WHERE file_path = ?1", [file_path])?;
+        let normalized = normalize_summary_file_key_str(file_path);
+        let legacy = legacy_windows_summary_file_key(&normalized);
+        let count = self.conn.execute(
+            "DELETE FROM summaries WHERE file_path = ?1 OR file_path = ?2",
+            rusqlite::params![normalized, legacy],
+        )?;
         Ok(count)
     }
 
@@ -350,8 +360,11 @@ impl SummaryDb {
             .conn
             .prepare("SELECT DISTINCT file_path FROM summaries ORDER BY file_path")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        rows.collect::<std::result::Result<BTreeSet<_>, _>>()
-            .map_err(Into::into)
+        let paths = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(paths
+            .into_iter()
+            .map(|path| normalize_summary_file_key_str(&path))
+            .collect())
     }
 
     fn replace_file_with_hook<F>(
@@ -363,13 +376,17 @@ impl SummaryDb {
     where
         F: FnMut(usize) -> Result<()>,
     {
+        let normalized = normalize_summary_file_key_str(file_path);
+        let legacy = legacy_windows_summary_file_key(&normalized);
         self.conn
             .execute_batch(&format!("SAVEPOINT {REPLACE_FILE_SAVEPOINT}"))
             .context("starting summary replacement transaction")?;
 
         let result = (|| -> Result<()> {
-            self.conn
-                .execute("DELETE FROM summaries WHERE file_path = ?1", [file_path])?;
+            self.conn.execute(
+                "DELETE FROM summaries WHERE file_path = ?1 OR file_path = ?2",
+                rusqlite::params![normalized, legacy],
+            )?;
             for (idx, summary) in summaries.iter().enumerate() {
                 insert_summary(&self.conn, summary)?;
                 after_insert(idx)?;
@@ -479,6 +496,7 @@ fn clear_lock_metadata(file: &mut File) -> std::io::Result<()> {
 }
 
 fn insert_summary(conn: &Connection, summary: &Summary) -> Result<()> {
+    let normalized_file_path = normalize_summary_file_key_str(&summary.file_path);
     conn.execute(
         "INSERT OR REPLACE INTO summaries
          (symbol_name, file_path, content_hash, summary, entities, relationships,
@@ -486,7 +504,7 @@ fn insert_summary(conn: &Connection, summary: &Summary) -> Result<()> {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         rusqlite::params![
             summary.symbol_name,
-            summary.file_path,
+            normalized_file_path,
             summary.content_hash,
             summary.summary,
             summary
@@ -517,7 +535,7 @@ fn row_to_summary(row: &rusqlite::Row) -> Summary {
     Summary {
         id: row.get(0).unwrap_or(0),
         symbol_name: row.get(1).unwrap_or_default(),
-        file_path: row.get(2).unwrap_or_default(),
+        file_path: normalize_summary_file_key_str(&row.get::<_, String>(2).unwrap_or_default()),
         content_hash: row.get(3).unwrap_or_default(),
         summary: row.get(4).unwrap_or_default(),
         entities: entities_json.and_then(|j| serde_json::from_str(&j).ok()),
@@ -528,6 +546,18 @@ fn row_to_summary(row: &rusqlite::Row) -> Summary {
         tokens_input: row.get(10).unwrap_or(None),
         tokens_output: row.get(11).unwrap_or(None),
     }
+}
+
+pub(crate) fn normalize_summary_file_key(path: &Path) -> String {
+    normalize_summary_file_key_str(path.to_string_lossy().as_ref())
+}
+
+pub(crate) fn normalize_summary_file_key_str(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn legacy_windows_summary_file_key(path: &str) -> String {
+    path.replace('/', "\\")
 }
 
 pub fn content_hash(content: &[u8]) -> String {
@@ -622,7 +652,7 @@ pub fn extract_for_file(
 }
 
 fn normalize_lookup_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    normalize_summary_file_key(path)
 }
 
 fn normalize_lexical_path(path: &Path) -> PathBuf {
@@ -1022,6 +1052,36 @@ mod tests {
             .unwrap();
         let results = db.get_by_file("src/lib.rs").unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn db_get_by_file_normalizes_legacy_windows_separator_rows() {
+        let (_tmp, db) = test_db();
+        db.insert(&make_summary("fn_a", r"src\lib.rs", "hash1"))
+            .unwrap();
+
+        let results = db.get_by_file("src/lib.rs").unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file_path, "src/lib.rs");
+    }
+
+    #[test]
+    fn replace_file_reaps_legacy_windows_separator_rows() {
+        let (_tmp, db) = test_db();
+        db.insert(&make_summary("stale", r"src\lib.rs", "hash1"))
+            .unwrap();
+
+        db.replace_file(
+            "src/lib.rs",
+            &[make_summary("fresh", "src/lib.rs", "hash2")],
+        )
+        .unwrap();
+
+        let results = db.get_by_file("src/lib.rs").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].symbol_name, "fresh");
+        assert_eq!(results[0].file_path, "src/lib.rs");
     }
 
     #[test]

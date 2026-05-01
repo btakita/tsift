@@ -2040,6 +2040,65 @@ fn summarize_file_query_normalizes_equivalent_paths() {
 }
 
 #[test]
+fn summarize_file_query_reads_legacy_windows_separator_cache_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    create_summary_cache(dir.path());
+
+    let conn = Connection::open(dir.path().join(".tsift/summaries.db")).unwrap();
+    conn.execute("DELETE FROM summaries", []).unwrap();
+    conn.execute(
+        "INSERT INTO summaries (
+            symbol_name,
+            file_path,
+            content_hash,
+            summary,
+            entities,
+            relationships,
+            concept_labels,
+            extracted_at,
+            model,
+            tokens_input,
+            tokens_output
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![
+            "alpha_helper",
+            r"src\lib.rs",
+            "hash1",
+            "cached summary",
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            "1700000000",
+            "claude-haiku-4-5-20251001",
+            100_i64,
+            40_i64
+        ],
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "summarize",
+            "--file",
+            "./src/lib.rs",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "summarize stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json[0]["symbol_name"], "alpha_helper");
+    assert_eq!(json[0]["file_path"], "src/lib.rs");
+}
+
+#[test]
 fn index_reports_lock_diagnostics_when_rollback_journal_blocks_writer() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
