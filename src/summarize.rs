@@ -365,11 +365,28 @@ impl SummaryDb {
             .collect())
     }
 
+    fn stats_live_path(root: &Path, cached_path: &str) -> Option<PathBuf> {
+        let normalized_cached_path = normalize_lexical_path(Path::new(cached_path));
+        if normalized_cached_path.is_absolute() {
+            return None;
+        }
+
+        let live_path = normalize_lexical_path(&root.join(&normalized_cached_path));
+        if !live_path.starts_with(root) {
+            return None;
+        }
+
+        Some(live_path)
+    }
+
     fn stale_file_count(&self, root: &Path, cached_file_paths: &BTreeSet<String>) -> Result<usize> {
         let mut stale_count = 0;
 
         for cached_path in cached_file_paths {
-            let live_path = root.join(cached_path);
+            let Some(live_path) = Self::stats_live_path(root, cached_path) else {
+                stale_count += 1;
+                continue;
+            };
             if !live_path.is_file() {
                 stale_count += 1;
                 continue;
@@ -1225,6 +1242,22 @@ mod tests {
             paths.into_iter().collect::<Vec<_>>(),
             vec!["f1.rs".to_string(), "f2.rs".to_string()]
         );
+    }
+
+    #[test]
+    fn stats_live_path_rejects_paths_outside_root() {
+        let root = Path::new("/tmp/project");
+
+        assert_eq!(
+            SummaryDb::stats_live_path(root, "src/lib.rs").unwrap(),
+            PathBuf::from("/tmp/project/src/lib.rs")
+        );
+        assert_eq!(
+            SummaryDb::stats_live_path(root, "src/../src/lib.rs").unwrap(),
+            PathBuf::from("/tmp/project/src/lib.rs")
+        );
+        assert!(SummaryDb::stats_live_path(root, "../secret.rs").is_none());
+        assert!(SummaryDb::stats_live_path(root, "/etc/passwd").is_none());
     }
 
     #[test]

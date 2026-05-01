@@ -1680,6 +1680,69 @@ fn summarize_stats_reports_real_stale_counts() {
 }
 
 #[test]
+fn summarize_stats_treats_out_of_root_cache_keys_as_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn alpha_helper() {}\n").unwrap();
+    create_summary_cache(dir.path());
+
+    let escaped = dir.path().join("..").join("secret.rs");
+    fs::write(&escaped, "fn secret() {}\n").unwrap();
+
+    let conn = Connection::open(dir.path().join(".tsift/summaries.db")).unwrap();
+    conn.execute(
+        "INSERT INTO summaries (
+            symbol_name,
+            file_path,
+            content_hash,
+            summary,
+            entities,
+            relationships,
+            concept_labels,
+            extracted_at,
+            model,
+            tokens_input,
+            tokens_output
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![
+            "escaped_helper",
+            "../secret.rs",
+            "secret-hash",
+            "escaped summary",
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            "1700000000",
+            "claude-haiku-4-5-20251001",
+            100_i64,
+            40_i64
+        ],
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "summarize",
+            "--stats",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "summarize stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["total_files"], 2);
+    assert_eq!(json["stale_count"], 2);
+}
+
+#[test]
 fn summarize_extract_resolves_relative_path_against_explicit_root() {
     let project = tempfile::tempdir().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
