@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct SummaryDb {
@@ -625,6 +625,58 @@ fn normalize_lookup_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => normalized.push(component.as_os_str()),
+            },
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+
+    if normalized.as_os_str().is_empty() && !path.is_absolute() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
+}
+
+fn push_lookup_candidate(candidates: &mut Vec<String>, candidate: String) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+pub fn file_lookup_candidates(
+    file_query: &Path,
+    query_base: &Path,
+    project_root: &Path,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    push_lookup_candidate(
+        &mut candidates,
+        normalize_lookup_path(&normalize_lexical_path(file_query)),
+    );
+
+    let resolved = if file_query.is_absolute() {
+        normalize_lexical_path(file_query)
+    } else {
+        normalize_lexical_path(&query_base.join(file_query))
+    };
+    let project_relative = resolved.strip_prefix(project_root).unwrap_or(&resolved);
+    push_lookup_candidate(&mut candidates, normalize_lookup_path(project_relative));
+
+    candidates
+}
+
 fn symbol_lookup_candidates(file_path: &Path, source_root: Option<&Path>) -> Vec<String> {
     let mut candidates = vec![normalize_lookup_path(file_path)];
     if let Some(root) = source_root
@@ -928,6 +980,31 @@ mod tests {
             .unwrap();
         let results = db.get_by_file("src/lib.rs").unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn file_lookup_candidates_normalize_dot_prefixed_root_relative_query() {
+        let candidates = file_lookup_candidates(
+            Path::new("./src/lib.rs"),
+            Path::new("/repo"),
+            Path::new("/repo"),
+        );
+
+        assert_eq!(candidates, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn file_lookup_candidates_include_anchor_relative_project_key() {
+        let candidates = file_lookup_candidates(
+            Path::new("../lib.rs"),
+            Path::new("/repo/src/nested"),
+            Path::new("/repo"),
+        );
+
+        assert_eq!(
+            candidates,
+            vec!["../lib.rs".to_string(), "src/lib.rs".to_string()]
+        );
     }
 
     #[test]

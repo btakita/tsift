@@ -2772,7 +2772,16 @@ fn cmd_summarize(
     let summary_db = open_existing_summary_db_read_only(&db_path)?;
 
     if let Some(file_query) = file {
-        let results = summary_db.get_by_file(&file_query)?;
+        let query_base = resolve_extract_base(path)?;
+        let mut results = Vec::new();
+        for candidate in
+            summarize::file_lookup_candidates(Path::new(&file_query), &query_base, &root)
+        {
+            results = summary_db.get_by_file(&candidate)?;
+            if !results.is_empty() {
+                break;
+            }
+        }
         if results.is_empty() {
             println!("No cached summary for file: {}", file_query);
             println!("Run: tsift summarize --extract <path>");

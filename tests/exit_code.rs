@@ -1940,6 +1940,68 @@ fn summarize_symbol_query_uses_ancestor_project_root_for_nested_paths() {
 }
 
 #[test]
+fn summarize_file_query_normalizes_equivalent_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    create_summary_cache(dir.path());
+    fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+
+    let root_relative = tsift_bin()
+        .args([
+            "summarize",
+            "--file",
+            "./src/lib.rs",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        root_relative.status.success(),
+        "summarize stderr: {}",
+        String::from_utf8_lossy(&root_relative.stderr)
+    );
+    let root_relative_json: serde_json::Value =
+        serde_json::from_slice(&root_relative.stdout).unwrap();
+    let root_relative_summaries = root_relative_json.as_array().unwrap();
+    assert!(
+        root_relative_summaries
+            .iter()
+            .any(|summary| summary["symbol_name"] == "alpha_helper"),
+        "stdout was: {}",
+        String::from_utf8_lossy(&root_relative.stdout)
+    );
+
+    let nested = dir.path().join("src/nested");
+    let nested_relative = tsift_bin()
+        .args([
+            "summarize",
+            "--file",
+            "../lib.rs",
+            "--path",
+            nested.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        nested_relative.status.success(),
+        "summarize stderr: {}",
+        String::from_utf8_lossy(&nested_relative.stderr)
+    );
+    let nested_relative_json: serde_json::Value =
+        serde_json::from_slice(&nested_relative.stdout).unwrap();
+    let nested_relative_summaries = nested_relative_json.as_array().unwrap();
+    assert!(
+        nested_relative_summaries
+            .iter()
+            .any(|summary| summary["symbol_name"] == "alpha_helper"),
+        "stdout was: {}",
+        String::from_utf8_lossy(&nested_relative.stdout)
+    );
+}
+
+#[test]
 fn index_reports_lock_diagnostics_when_rollback_journal_blocks_writer() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
