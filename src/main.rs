@@ -2605,37 +2605,49 @@ fn cmd_summarize(
         let extract_scope = resolve_extract_scope(&extract_base, &extract_path);
         let cfg = load_summarize_config(&root);
 
-        let (files_to_extract, deleted_summary_paths) = if diff {
+        let (files_to_extract, mut deleted_summary_paths) = if diff {
             let changed = summarize::git_changed_files(&root)?;
             let existing = changed
                 .existing
                 .into_iter()
                 .filter(|f| summarize_diff_matches_scope(f, &extract_scope))
                 .collect::<Vec<_>>();
-            let deleted = changed
+            let deleted_summary_paths = changed
                 .deleted
                 .into_iter()
                 .filter(|f| summarize_diff_matches_scope(f, &extract_scope))
-                .map(|file_path| {
-                    file_path
-                        .strip_prefix(&root)
-                        .unwrap_or(file_path.as_path())
-                        .to_string_lossy()
-                        .to_string()
-                })
+                .map(|file_path| summarize_relative_file_path(&root, &file_path))
                 .collect::<BTreeSet<_>>();
-            (existing, deleted)
+            if existing.is_empty() && deleted_summary_paths.is_empty() {
+                println!("No files to extract.");
+                return Ok(());
+            }
+            (existing, deleted_summary_paths)
         } else {
             (collect_source_files(&extract_scope)?, BTreeSet::new())
         };
 
-        if files_to_extract.is_empty() && deleted_summary_paths.is_empty() {
+        if !diff && files_to_extract.is_empty() && !db_path.exists() {
             println!("No files to extract.");
             return Ok(());
         }
 
         let _summary_write_lock = summarize::acquire_write_lock(&db_path)?;
         let summary_db = summarize::SummaryDb::open(&db_path)?;
+
+        if !diff {
+            deleted_summary_paths.extend(summarize_full_extract_deleted_summary_paths(
+                &summary_db,
+                &root,
+                &extract_scope,
+                &files_to_extract,
+            )?);
+        }
+
+        if files_to_extract.is_empty() && deleted_summary_paths.is_empty() {
+            println!("No files to extract.");
+            return Ok(());
+        }
 
         for rel_path in &deleted_summary_paths {
             summary_db.delete_by_file(rel_path)?;
@@ -2660,11 +2672,7 @@ fn cmd_summarize(
                 }
             };
             let hash = summarize::content_hash(&content);
-            let rel_path = file_path
-                .strip_prefix(&root)
-                .unwrap_or(file_path)
-                .to_string_lossy()
-                .to_string();
+            let rel_path = summarize_relative_file_path(&root, file_path);
 
             if summary_db.is_current(&rel_path, &hash)? {
                 continue; // already extracted for this version
@@ -3078,6 +3086,38 @@ fn resolve_extract_scope(root: &Path, extract_path: &Path) -> PathBuf {
 
 fn summarize_diff_matches_scope(changed_path: &Path, extract_scope: &Path) -> bool {
     changed_path.starts_with(extract_scope)
+}
+
+fn summarize_relative_file_path(root: &Path, file_path: &Path) -> String {
+    file_path
+        .strip_prefix(root)
+        .unwrap_or(file_path)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn summarize_full_extract_deleted_summary_paths(
+    summary_db: &summarize::SummaryDb,
+    root: &Path,
+    extract_scope: &Path,
+    files_to_extract: &[PathBuf],
+) -> Result<BTreeSet<String>> {
+    let live_paths = files_to_extract
+        .iter()
+        .map(|file_path| summarize_relative_file_path(root, file_path))
+        .collect::<BTreeSet<_>>();
+    let mut deleted = BTreeSet::new();
+
+    for cached_path in summary_db.cached_file_paths()? {
+        if !summarize_diff_matches_scope(&root.join(&cached_path), extract_scope) {
+            continue;
+        }
+        if !live_paths.contains(&cached_path) {
+            deleted.insert(cached_path);
+        }
+    }
+
+    Ok(deleted)
 }
 
 #[derive(Debug, Clone)]
@@ -3946,6 +3986,53 @@ mod tests {
             None,
             Some(PathBuf::from("src")),
             true,
+            false,
+            dir.path(),
+            false,
+            true,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(summary_db.get_by_file("src/gone.rs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn summarize_full_extract_deletes_removed_summary_rows_when_scope_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = dir.path().join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let deleted_file = source_dir.join("gone.rs");
+        std::fs::write(&deleted_file, "fn stale() {}\n").unwrap();
+
+        let summary_db =
+            summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+        summary_db
+            .insert(&summarize::Summary {
+                id: 0,
+                symbol_name: "stale".to_string(),
+                file_path: "src/gone.rs".to_string(),
+                content_hash: "hash1".to_string(),
+                summary: "stale summary".to_string(),
+                entities: None,
+                relationships: None,
+                concept_labels: None,
+                extracted_at: "1700000000".to_string(),
+                model: "test".to_string(),
+                tokens_input: Some(100),
+                tokens_output: Some(50),
+            })
+            .unwrap();
+
+        std::fs::remove_file(&deleted_file).unwrap();
+
+        cmd_summarize(
+            None,
+            None,
+            Some(PathBuf::from("src")),
+            false,
             false,
             dir.path(),
             false,
