@@ -63,6 +63,14 @@ pub struct SummaryStats {
     pub total_tokens_input: i64,
     pub total_tokens_output: i64,
     pub estimated_tokens_saved: i64,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<SummaryStatsWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SummaryStatsWarning {
+    pub path: PathBuf,
+    pub message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,7 +327,7 @@ impl SummaryDb {
                 .query_row("SELECT COUNT(*) FROM summaries", [], |row| row.get(0))?;
         let cached_file_paths = self.cached_file_paths()?;
         let total_files = cached_file_paths.len();
-        let stale_count = self.stale_file_count(root, &cached_file_paths)?;
+        let (stale_count, warnings) = self.stale_file_count(root, &cached_file_paths)?;
         let total_tokens_input: i64 = self.conn.query_row(
             "SELECT COALESCE(SUM(tokens_input), 0) FROM summaries",
             [],
@@ -340,6 +348,7 @@ impl SummaryDb {
             total_tokens_input,
             total_tokens_output,
             estimated_tokens_saved,
+            warnings,
         })
     }
 
@@ -379,8 +388,13 @@ impl SummaryDb {
         Some(live_path)
     }
 
-    fn stale_file_count(&self, root: &Path, cached_file_paths: &BTreeSet<String>) -> Result<usize> {
+    fn stale_file_count(
+        &self,
+        root: &Path,
+        cached_file_paths: &BTreeSet<String>,
+    ) -> Result<(usize, Vec<SummaryStatsWarning>)> {
         let mut stale_count = 0;
+        let mut warnings = Vec::new();
 
         for cached_path in cached_file_paths {
             let Some(live_path) = Self::stats_live_path(root, cached_path) else {
@@ -392,15 +406,26 @@ impl SummaryDb {
                 continue;
             }
 
-            let content = std::fs::read(&live_path)
-                .with_context(|| format!("reading summary source {}", live_path.display()))?;
+            let content = match std::fs::read(&live_path) {
+                Ok(content) => content,
+                Err(err) => {
+                    stale_count += 1;
+                    warnings.push(SummaryStatsWarning {
+                        path: PathBuf::from(normalize_summary_file_key_str(cached_path)),
+                        message: format!(
+                            "counting cached summary as stale because the source file could not be read ({err})"
+                        ),
+                    });
+                    continue;
+                }
+            };
             let live_hash = content_hash(&content);
             if !self.is_current(cached_path, &live_hash)? {
                 stale_count += 1;
             }
         }
 
-        Ok(stale_count)
+        Ok((stale_count, warnings))
     }
 
     fn replace_file_with_hook<F>(
@@ -1258,6 +1283,49 @@ mod tests {
         );
         assert!(SummaryDb::stats_live_path(root, "../secret.rs").is_none());
         assert!(SummaryDb::stats_live_path(root, "/etc/passwd").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stats_marks_unreadable_files_stale_with_warning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let file_path = root.path().join("src/lib.rs");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        let source = b"fn alpha_helper() {}\n";
+        std::fs::write(&file_path, source).unwrap();
+
+        let (_tmp, db) = test_db();
+        db.insert(&make_summary(
+            "alpha_helper",
+            "src/lib.rs",
+            &content_hash(source),
+        ))
+        .unwrap();
+
+        let metadata = std::fs::metadata(&file_path).unwrap();
+        let original_mode = metadata.permissions().mode();
+        let mut unreadable = metadata.permissions();
+        unreadable.set_mode(0o000);
+        std::fs::set_permissions(&file_path, unreadable).unwrap();
+
+        let stats = db.stats(root.path()).unwrap();
+
+        let mut restored = std::fs::metadata(&file_path).unwrap().permissions();
+        restored.set_mode(original_mode);
+        std::fs::set_permissions(&file_path, restored).unwrap();
+
+        assert_eq!(stats.stale_count, 1);
+        assert_eq!(stats.warnings.len(), 1);
+        assert_eq!(stats.warnings[0].path, PathBuf::from("src/lib.rs"));
+        assert!(
+            stats.warnings[0]
+                .message
+                .contains("counting cached summary as stale"),
+            "warning was: {}",
+            stats.warnings[0].message
+        );
     }
 
     #[test]

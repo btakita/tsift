@@ -2767,6 +2767,7 @@ fn cmd_summarize(
             println!("  tokens output:   {}", s.total_tokens_output);
             println!("  est. savings:    {} tokens", s.estimated_tokens_saved);
         }
+        emit_summary_stats_warnings(&s, &root);
         return Ok(());
     }
 
@@ -2886,6 +2887,17 @@ fn cmd_status(
         print!("{}", status::format_human(&report, compact));
     }
     Ok(())
+}
+
+fn emit_summary_stats_warnings(stats: &summarize::SummaryStats, root: &Path) {
+    for warning in &stats.warnings {
+        let rel_path = relativize_pathbuf(&warning.path, root);
+        eprintln!(
+            "warning: summarize stats {}: {}",
+            rel_path.display(),
+            warning.message
+        );
+    }
 }
 
 fn cmd_locks(
