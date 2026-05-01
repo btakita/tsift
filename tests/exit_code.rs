@@ -1903,6 +1903,44 @@ fn summarize_symbol_query_accepts_read_only_cache_permissions() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn summarize_file_query_accepts_absolute_symlinked_checkout_path() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn alpha_helper() {}\n").unwrap();
+    create_summary_cache(dir.path());
+
+    let link_parent = tempfile::tempdir().unwrap();
+    let link_root = link_parent.path().join("repo-link");
+    symlink(dir.path(), &link_root).unwrap();
+    let symlinked_file = link_root.join("src/lib.rs");
+
+    let output = tsift_bin()
+        .args([
+            "summarize",
+            "--file",
+            symlinked_file.to_str().unwrap(),
+            "--path",
+            link_root.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "summarize stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json[0]["symbol_name"], "alpha_helper");
+    assert_eq!(json[0]["file_path"], "src/lib.rs");
+}
+
 #[test]
 fn summarize_symbol_query_uses_ancestor_project_root_for_nested_paths() {
     let dir = tempfile::tempdir().unwrap();

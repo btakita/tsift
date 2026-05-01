@@ -667,7 +667,9 @@ pub fn file_lookup_candidates(
     );
 
     let resolved = if file_query.is_absolute() {
-        normalize_lexical_path(file_query)
+        file_query
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_lexical_path(file_query))
     } else {
         normalize_lexical_path(&query_base.join(file_query))
     };
@@ -1044,6 +1046,33 @@ mod tests {
         assert_eq!(
             candidates,
             vec!["../lib.rs".to_string(), "src/lib.rs".to_string()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_lookup_candidates_canonicalize_absolute_symlink_queries() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real");
+        std::fs::create_dir_all(real_root.join("src")).unwrap();
+        std::fs::write(real_root.join("src/lib.rs"), "fn alpha_helper() {}\n").unwrap();
+        let link_root = dir.path().join("link");
+        symlink(&real_root, &link_root).unwrap();
+
+        let candidates =
+            file_lookup_candidates(&link_root.join("src/lib.rs"), &real_root, &real_root);
+
+        assert_eq!(
+            candidates,
+            vec![
+                link_root
+                    .join("src/lib.rs")
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                "src/lib.rs".to_string()
+            ]
         );
     }
 
