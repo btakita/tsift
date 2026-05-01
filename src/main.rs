@@ -3960,6 +3960,29 @@ mod tests {
     }
 
     #[test]
+    fn summarize_diff_extract_tracks_git_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = dir.path().join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let old_file = source_dir.join("old.rs");
+        let new_file = source_dir.join("new.rs");
+        std::fs::write(&old_file, "fn stale() {}\n").unwrap();
+        init_git_repo(dir.path());
+
+        let status = std::process::Command::new("git")
+            .args(["mv", "src/old.rs", "src/new.rs"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git mv failed");
+
+        let files = summarize::git_changed_files(dir.path()).unwrap();
+
+        assert_eq!(files.existing, vec![new_file]);
+        assert_eq!(files.deleted, vec![old_file]);
+    }
+
+    #[test]
     fn summarize_diff_extract_deletes_removed_summary_rows() {
         let dir = tempfile::tempdir().unwrap();
         let source_dir = dir.path().join("src");
@@ -4006,6 +4029,60 @@ mod tests {
         .unwrap();
 
         assert!(summary_db.get_by_file("src/gone.rs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn summarize_diff_extract_deletes_renamed_summary_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = dir.path().join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let old_file = source_dir.join("old.rs");
+        std::fs::write(&old_file, "fn stale() {}\n").unwrap();
+        std::fs::write(dir.path().join("README.md"), "# repo\n").unwrap();
+        init_git_repo(dir.path());
+
+        let summary_db =
+            summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+        summary_db
+            .insert(&summarize::Summary {
+                id: 0,
+                symbol_name: "stale".to_string(),
+                file_path: "src/old.rs".to_string(),
+                content_hash: "hash1".to_string(),
+                summary: "stale summary".to_string(),
+                entities: None,
+                relationships: None,
+                concept_labels: None,
+                extracted_at: "1700000000".to_string(),
+                model: "test".to_string(),
+                tokens_input: Some(100),
+                tokens_output: Some(50),
+            })
+            .unwrap();
+
+        let status = std::process::Command::new("git")
+            .args(["mv", "src/old.rs", "src/new.rs"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git mv failed");
+
+        cmd_summarize(
+            None,
+            None,
+            Some(PathBuf::from("src")),
+            true,
+            false,
+            dir.path(),
+            false,
+            true,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(summary_db.get_by_file("src/old.rs").unwrap().is_empty());
     }
 
     #[test]

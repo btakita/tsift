@@ -832,18 +832,7 @@ fn maybe_mock_anthropic_api(prompt: &str) -> Result<Option<(String, i64, i64)>> 
 
 pub fn git_changed_files(root: &Path) -> Result<GitChangedFiles> {
     let (tracked, deleted) = if git_has_head_commit(root)? {
-        (
-            git_list_paths(
-                root,
-                &["diff", "--name-only", "--diff-filter=d", "HEAD"],
-                "git diff",
-            )?,
-            git_list_paths(
-                root,
-                &["diff", "--name-only", "--diff-filter=D", "HEAD"],
-                "git diff deleted",
-            )?,
-        )
+        git_diff_changed_files(root)?
     } else {
         (Vec::new(), Vec::new())
     };
@@ -865,6 +854,57 @@ pub fn git_changed_files(root: &Path) -> Result<GitChangedFiles> {
         .into_iter()
         .collect();
     Ok(GitChangedFiles { existing, deleted })
+}
+
+fn git_diff_changed_files(root: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let output = std::process::Command::new("git")
+        .args(["diff", "--name-status", "--find-renames", "HEAD"])
+        .current_dir(root)
+        .output()
+        .with_context(|| "running git diff --name-status")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git diff --name-status failed: {}", stderr.trim());
+    }
+
+    let mut tracked = Vec::new();
+    let mut deleted = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let status = fields.next().unwrap_or_default();
+        match status.chars().next() {
+            Some('D') => {
+                let path = fields
+                    .next()
+                    .with_context(|| format!("parsing deleted git diff path: {line}"))?;
+                deleted.push(root.join(path));
+            }
+            Some('R') => {
+                let old_path = fields
+                    .next()
+                    .with_context(|| format!("parsing renamed git diff old path: {line}"))?;
+                let new_path = fields
+                    .next()
+                    .with_context(|| format!("parsing renamed git diff new path: {line}"))?;
+                deleted.push(root.join(old_path));
+                tracked.push(root.join(new_path));
+            }
+            Some(_) => {
+                let path = fields
+                    .next_back()
+                    .or_else(|| fields.next())
+                    .with_context(|| format!("parsing changed git diff path: {line}"))?;
+                tracked.push(root.join(path));
+            }
+            None => {}
+        }
+    }
+
+    Ok((tracked, deleted))
 }
 
 fn git_has_head_commit(root: &Path) -> Result<bool> {
