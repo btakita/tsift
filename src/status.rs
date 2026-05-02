@@ -127,13 +127,21 @@ pub struct SidecarStatus {
 }
 
 pub fn check_status(root: &Path) -> Result<StatusReport> {
-    let workspace = !config::Config::submodule_dirs(root)?.is_empty();
+    let workspace_scopes = config::Config::submodule_dirs(root)?;
+    let workspace = !workspace_scopes.is_empty();
     let summaries_db_path = root.join(".tsift/summaries.db");
 
     let index = check_index(root)?;
     let summaries = check_summaries(root, &summaries_db_path, &index)?;
+    let summarize_extract = recommended_summarize_extract_path(root, &index, &workspace_scopes);
     let instructions = init::check_instruction_version(root);
-    let recommendations = build_recommendations(&index, &summaries, &instructions, workspace);
+    let recommendations = build_recommendations(
+        &index,
+        &summaries,
+        &instructions,
+        workspace,
+        &summarize_extract,
+    );
 
     Ok(StatusReport {
         index,
@@ -384,6 +392,7 @@ fn build_recommendations(
     summaries: &SummaryStatus,
     instructions: &InstructionStatus,
     workspace: bool,
+    summarize_extract: &str,
 ) -> Recommendations {
     let refresh = !matches!(instructions, InstructionStatus::Current { .. });
     let index_cmd = if workspace {
@@ -453,7 +462,8 @@ fn build_recommendations(
                     let uncached = total_indexed_files.saturating_sub(*cached_files);
                     if uncached > 0 {
                         Some(format!(
-                            "tsift summarize --extract src/  ({} uncached file{})",
+                            "tsift summarize --extract {}  ({} uncached file{})",
+                            summarize_extract,
                             uncached,
                             if uncached == 1 { "" } else { "s" }
                         ))
@@ -461,7 +471,9 @@ fn build_recommendations(
                         None
                     }
                 }
-                SummaryStatus::None { .. } => Some("tsift summarize --extract src/".to_string()),
+                SummaryStatus::None { .. } => {
+                    Some(format!("tsift summarize --extract {}", summarize_extract))
+                }
                 SummaryStatus::Unavailable => None,
             };
             if refresh {
@@ -476,6 +488,78 @@ fn build_recommendations(
             }
         }
     }
+}
+
+fn recommended_summarize_extract_path(
+    root: &Path,
+    index: &IndexStatus,
+    workspace_scopes: &[config::WorkspaceScope],
+) -> String {
+    if !workspace_scopes.is_empty() {
+        return common_extract_scope(
+            workspace_scopes
+                .iter()
+                .map(|scope| Path::new(&scope.relative_path)),
+            false,
+        )
+        .unwrap_or_else(|| ".".to_string());
+    }
+
+    match index {
+        IndexStatus::Fresh { .. } | IndexStatus::Stale { .. } => common_extract_scope(
+            IndexDb::file_paths_read_only(&root.join(".tsift/index.db"))
+                .ok()
+                .into_iter()
+                .flatten()
+                .map(PathBuf::from)
+                .map(|path| path.strip_prefix(root).map(PathBuf::from).unwrap_or(path)),
+            true,
+        )
+        .unwrap_or_else(|| ".".to_string()),
+        IndexStatus::Missing { .. } => ".".to_string(),
+    }
+}
+
+fn common_extract_scope<I, P>(paths: I, treat_inputs_as_files: bool) -> Option<String>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    let mut common: Option<Vec<String>> = None;
+
+    for raw_path in paths {
+        let path = raw_path.as_ref();
+        let scope = if treat_inputs_as_files {
+            path.parent().unwrap_or_else(|| Path::new("."))
+        } else {
+            path
+        };
+        let components = scope
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        match &mut common {
+            None => common = Some(components),
+            Some(existing) => {
+                let shared_len = existing
+                    .iter()
+                    .zip(components.iter())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                existing.truncate(shared_len);
+            }
+        }
+    }
+
+    Some(match common {
+        None => ".".to_string(),
+        Some(components) if components.is_empty() => ".".to_string(),
+        Some(components) => format!("{}/", components.join("/")),
+    })
 }
 
 fn format_duration(secs: u64) -> String {
@@ -1107,6 +1191,26 @@ mod tests {
         assert!(cmds.contains(&"explain".to_string()));
         assert!(cmds.contains(&"graph".to_string()));
         assert!(!cmds.contains(&"summarize".to_string()));
+        assert_eq!(
+            report.recommendations.run.as_deref(),
+            Some("tsift init && tsift summarize --extract .")
+        );
+    }
+
+    #[test]
+    fn status_fresh_src_layout_recommends_src_extract() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn alpha() {}").unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        let db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+
+        let report = check_status(dir.path()).unwrap();
+        assert_eq!(
+            report.recommendations.run.as_deref(),
+            Some("tsift init && tsift summarize --extract src/")
+        );
     }
 
     #[test]
@@ -1136,6 +1240,46 @@ mod tests {
         assert_eq!(
             report.recommendations.run.as_deref(),
             Some("tsift init --workspace && tsift summarize --extract src/")
+        );
+    }
+
+    #[test]
+    fn status_workspace_non_src_layout_recommends_dot_extract() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".gitmodules"),
+            r#"[submodule "alpha"]
+	path = alpha
+	url = https://example.com/alpha
+[submodule "crates/beta"]
+	path = crates/beta
+	url = https://example.com/beta
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("alpha/src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/beta/src")).unwrap();
+        std::fs::write(
+            dir.path().join("alpha/src/lib.rs"),
+            "fn alpha_helper() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("crates/beta/src/lib.rs"),
+            "fn beta_helper() {}\n",
+        )
+        .unwrap();
+
+        let cfg = Config::load(dir.path()).unwrap();
+        for scope in Config::submodule_dirs(dir.path()).unwrap() {
+            let db = IndexDb::open(&cfg.db_path_for(dir.path(), &scope.id)).unwrap();
+            db.apply_changes(&scope.source_root).unwrap();
+        }
+
+        let report = check_status(dir.path()).unwrap();
+        assert_eq!(
+            report.recommendations.run.as_deref(),
+            Some("tsift init --workspace && tsift summarize --extract .")
         );
     }
 

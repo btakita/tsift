@@ -929,7 +929,7 @@ fn status_reports_workspace_scoped_indexes_in_json() {
 }
 
 #[test]
-fn status_reports_partially_indexed_workspace_as_stale_with_missing_scopes_in_json() {
+fn status_autoindexes_partially_indexed_workspace_before_reporting_json() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join(".gitmodules"),
@@ -974,15 +974,11 @@ fn status_reports_partially_indexed_workspace_as_stale_with_missing_scopes_in_js
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("\"state\":\"stale\""),
+        stdout.contains("\"state\":\"fresh\""),
         "stdout was: {stdout}"
     );
     assert!(
         stdout.contains("\"workspace_scopes\""),
-        "stdout was: {stdout}"
-    );
-    assert!(
-        stdout.contains("\"missing_scopes\""),
         "stdout was: {stdout}"
     );
     assert!(
@@ -993,11 +989,15 @@ fn status_reports_partially_indexed_workspace_as_stale_with_missing_scopes_in_js
         stdout.contains("\"scope\":\"beta\""),
         "stdout was: {stdout}"
     );
-    assert!(stdout.contains("1 missing scope"), "stdout was: {stdout}");
+    assert!(
+        !stdout.contains("\"missing_scopes\""),
+        "stdout was: {stdout}"
+    );
+    assert!(dir.path().join(".tsift/indexes/beta/index.db").exists());
 }
 
 #[test]
-fn status_reports_missing_workspace_scopes_even_when_root_index_exists_in_json() {
+fn status_autoindexes_missing_workspace_scopes_even_when_root_index_exists_in_json() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join(".gitmodules"),
@@ -1052,16 +1052,12 @@ fn status_reports_missing_workspace_scopes_even_when_root_index_exists_in_json()
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("\"state\":\"stale\""),
+        stdout.contains("\"state\":\"fresh\""),
         "stdout was: {stdout}"
     );
-    assert!(stdout.contains("\"total_files\":1"), "stdout was: {stdout}");
+    assert!(stdout.contains("\"total_files\":2"), "stdout was: {stdout}");
     assert!(
         stdout.contains("\"workspace_scopes\""),
-        "stdout was: {stdout}"
-    );
-    assert!(
-        stdout.contains("\"missing_scopes\""),
         "stdout was: {stdout}"
     );
     assert!(
@@ -1072,6 +1068,11 @@ fn status_reports_missing_workspace_scopes_even_when_root_index_exists_in_json()
         stdout.contains("\"scope\":\"beta\""),
         "stdout was: {stdout}"
     );
+    assert!(
+        !stdout.contains("\"missing_scopes\""),
+        "stdout was: {stdout}"
+    );
+    assert!(dir.path().join(".tsift/indexes/beta/index.db").exists());
 }
 
 #[test]

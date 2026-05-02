@@ -714,7 +714,7 @@ This ensures agent sessions always use instructions matching the installed binar
 
 ## Status (Session Health Check)
 
-`tsift status` reports index freshness, instruction version, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session. When the input path is a nested subdirectory, `status` first promotes it to the nearest ancestor that already owns `.tsift/` so the check reuses the existing project/workspace state. On workspace roots, it treats scoped indexes under `.tsift/indexes/<scope>/index.db` as the authoritative status surface even if a shared `.tsift/index.db` also exists, reports the contributing scopes explicitly, and surfaces configured scopes whose `index.db` is still missing so partially indexed workspaces do not masquerade as `fresh`.
+`tsift status` reports index freshness, instruction version, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session. When the input path is a nested subdirectory, `status` first promotes it to the nearest ancestor that already owns `.tsift/` so the check reuses the existing project/workspace state. On workspace roots, it treats scoped indexes under `.tsift/indexes/<scope>/index.db` as the authoritative status surface even if a shared `.tsift/index.db` also exists. If one or more configured workspace scopes are present on disk but their scoped `index.db` files are missing, the CLI auto-builds just those missing scoped indexes before it prints the final status so a partially initialized workspace does not stay stuck at `index: missing` / `stale` after a successful status pass. When status recommends `tsift summarize --extract ...`, that extract scope is derived from the indexed layout: it uses the common indexed root (for example `src/` when every tracked file or scope lives under `src/`) and falls back to `.` when the indexed files span the project root or multiple unrelated workspace roots.
 
 ```bash
 tsift status            # human-readable output
@@ -803,14 +803,14 @@ recommendations:
 
 ### Recommendation Logic
 
-When instructions are stale or missing, `tsift init` is prepended to the `run:` recommendation. Workspace roots use `tsift init --workspace` and `tsift index --workspace .` for their rebuild path.
+When instructions are stale or missing, `tsift init` is prepended to the `run:` recommendation. Workspace roots use `tsift init --workspace` and `tsift index --workspace .` for their rebuild path. Fresh-index summarize recommendations derive the `--extract` target from the indexed layout instead of assuming `src/`.
 
 | Index | Summaries | `use:` | `run:` |
 |-------|-----------|--------|--------|
 | missing | — | (none) | `tsift index .` |
 | stale | — | search, explain, graph | `tsift index .` |
-| fresh | none | search, explain, graph | `tsift summarize --extract src/` |
-| fresh | partial | search, explain, graph, summarize | `tsift summarize --extract src/` |
+| fresh | none | search, explain, graph | `tsift summarize --extract <common indexed root>` |
+| fresh | partial | search, explain, graph, summarize | `tsift summarize --extract <common indexed root>` |
 | fresh | complete | search, explain, graph, summarize | (none) |
 
 ## Summarize (Cached LLM Analysis)

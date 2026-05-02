@@ -2880,11 +2880,59 @@ fn cmd_status(
     schema: bool,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    let report = status::check_status(&root)?;
+    let mut report = status::check_status(&root)?;
+    if status_missing_workspace_scopes(&report) {
+        autoindex_missing_workspace_scopes(&root, &report)?;
+        report = status::check_status(&root)?;
+    }
     if json_output {
         println!("{}", to_json_schema(&report, pretty, terse, schema)?);
     } else {
         print!("{}", status::format_human(&report, compact));
+    }
+    Ok(())
+}
+
+fn status_missing_workspace_scopes(report: &status::StatusReport) -> bool {
+    match &report.index {
+        status::IndexStatus::Fresh { missing_scopes, .. }
+        | status::IndexStatus::Stale { missing_scopes, .. }
+        | status::IndexStatus::Missing { missing_scopes } => !missing_scopes.is_empty(),
+    }
+}
+
+fn autoindex_missing_workspace_scopes(root: &Path, report: &status::StatusReport) -> Result<()> {
+    let missing_scopes = match &report.index {
+        status::IndexStatus::Fresh { missing_scopes, .. }
+        | status::IndexStatus::Stale { missing_scopes, .. }
+        | status::IndexStatus::Missing { missing_scopes } => missing_scopes,
+    };
+    if missing_scopes.is_empty() {
+        return Ok(());
+    }
+
+    let missing_scope_ids = missing_scopes
+        .iter()
+        .map(|scope| scope.scope.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let cfg = config::Config::load(root)?;
+    for scope in config::Config::submodule_dirs(root)? {
+        if !missing_scope_ids.contains(scope.id.as_str()) || !scope.source_root.exists() {
+            continue;
+        }
+        let db_path = cfg.db_path_for(root, &scope.id);
+        run_index_update(
+            &db_path,
+            &scope.source_root,
+            format!(
+                "autoindexing missing submodule `{}` during status",
+                scope.id
+            ),
+            root,
+            Some(scope.id.as_str()),
+            false,
+            false,
+        )?;
     }
     Ok(())
 }
@@ -6057,6 +6105,38 @@ tier = "private"
         assert!(result.is_ok());
         assert!(cfg.db_path_for(dir.path(), "alpha").exists());
         assert!(cfg.db_path_for(dir.path(), "beta").exists());
+    }
+
+    #[test]
+    fn status_cmd_autoindexes_missing_workspace_scopes() {
+        let dir = setup_workspace();
+        let cfg = config::Config::load(dir.path()).unwrap();
+        let alpha = config::Config::resolve_submodule(dir.path(), "alpha").unwrap();
+        let alpha_db_path = cfg.db_path_for(dir.path(), &alpha.id);
+        let alpha_db = index::IndexDb::open(&alpha_db_path).unwrap();
+        alpha_db.apply_changes(&alpha.source_root).unwrap();
+
+        let beta_db_path = cfg.db_path_for(dir.path(), "beta");
+        assert!(!beta_db_path.exists());
+
+        cmd_status(dir.path(), true, false, false, false, false).unwrap();
+
+        assert!(beta_db_path.exists());
+        let report = status::check_status(dir.path()).unwrap();
+        assert!(matches!(report.index, status::IndexStatus::Fresh { .. }));
+    }
+
+    #[test]
+    fn status_cmd_autoindexes_workspace_when_all_scopes_are_missing() {
+        let dir = setup_workspace();
+        let cfg = config::Config::load(dir.path()).unwrap();
+
+        cmd_status(dir.path(), true, false, false, false, false).unwrap();
+
+        assert!(cfg.db_path_for(dir.path(), "alpha").exists());
+        assert!(cfg.db_path_for(dir.path(), "beta").exists());
+        let report = status::check_status(dir.path()).unwrap();
+        assert!(matches!(report.index, status::IndexStatus::Fresh { .. }));
     }
 
     #[test]
