@@ -33,12 +33,14 @@ impl Drop for WriteLockGuard {
 }
 
 struct SnapshotCopyGuard {
-    path: PathBuf,
+    paths: Vec<PathBuf>,
 }
 
 impl Drop for SnapshotCopyGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -168,6 +170,7 @@ impl IndexSummary {
 #[serde(rename_all = "snake_case")]
 pub enum ReadOnlyRecovery {
     SnapshotFallback,
+    SnapshotFallbackWal,
 }
 
 #[derive(Debug)]
@@ -349,10 +352,10 @@ impl IndexDb {
             Ok(db)
         }) {
             Ok(db) => Ok(db),
-            Err(err) if should_retry_read_only_with_snapshot(db_path, &err) => {
-                Self::open_read_only_snapshot(db_path)
-            }
-            Err(err) => Err(err),
+            Err(err) => match read_only_snapshot_recovery(db_path, &err) {
+                Some(_) => Self::open_read_only_snapshot(db_path),
+                None => Err(err),
+            },
         }
     }
 
@@ -381,7 +384,10 @@ impl IndexDb {
     ) -> Result<ReadOnlyInspectResult> {
         match Self::inspect_read_only_once(db_path, root, prune) {
             Ok(result) => Ok(result),
-            Err(err) if should_retry_read_only_with_snapshot(db_path, &err) => {
+            Err(err) => {
+                let Some(recovery) = read_only_snapshot_recovery(db_path, &err) else {
+                    return Err(err);
+                };
                 let db = Self::open_read_only_snapshot(db_path)?;
                 let total_files = db.file_count()?;
                 let summary = if prune {
@@ -392,10 +398,9 @@ impl IndexDb {
                 Ok(ReadOnlyInspectResult {
                     total_files,
                     summary,
-                    recovery: Some(ReadOnlyRecovery::SnapshotFallback),
+                    recovery: Some(recovery),
                 })
             }
-            Err(err) => Err(err),
         }
     }
 
@@ -419,14 +424,7 @@ impl IndexDb {
     }
 
     fn open_read_only_snapshot(db_path: &Path) -> Result<Self> {
-        let snapshot_path = snapshot_copy_path(db_path);
-        std::fs::copy(db_path, &snapshot_path).with_context(|| {
-            format!(
-                "copying locked index db {} to snapshot {}",
-                db_path.display(),
-                snapshot_path.display()
-            )
-        })?;
+        let (snapshot_path, cleanup_paths) = copy_read_only_snapshot(db_path, "index")?;
         let conn = Connection::open_with_flags(
             &snapshot_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -437,7 +435,7 @@ impl IndexDb {
             conn,
             _write_lock: None,
             _snapshot_copy: Some(SnapshotCopyGuard {
-                path: snapshot_path,
+                paths: cleanup_paths,
             }),
         })
     }
@@ -1222,8 +1220,20 @@ pub(crate) fn probe_writer_lock(lock_path: &Path) -> Result<WriterLockProbe> {
     }
 }
 
-fn should_retry_read_only_with_snapshot(db_path: &Path, err: &anyhow::Error) -> bool {
-    rollback_journal_path(db_path).exists() && error_mentions_locked_db(err)
+pub(crate) fn read_only_snapshot_recovery(
+    db_path: &Path,
+    err: &anyhow::Error,
+) -> Option<ReadOnlyRecovery> {
+    if !error_mentions_locked_db(err) {
+        return None;
+    }
+    if wal_sidecar_path(db_path).exists() || shared_memory_sidecar_path(db_path).exists() {
+        Some(ReadOnlyRecovery::SnapshotFallbackWal)
+    } else if rollback_journal_path(db_path).exists() {
+        Some(ReadOnlyRecovery::SnapshotFallback)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn rollback_journal_path(db_path: &Path) -> PathBuf {
@@ -1232,7 +1242,66 @@ pub(crate) fn rollback_journal_path(db_path: &Path) -> PathBuf {
     PathBuf::from(journal)
 }
 
-fn snapshot_copy_path(db_path: &Path) -> PathBuf {
+pub(crate) fn wal_sidecar_path(db_path: &Path) -> PathBuf {
+    let mut wal = db_path.as_os_str().to_os_string();
+    wal.push("-wal");
+    PathBuf::from(wal)
+}
+
+pub(crate) fn shared_memory_sidecar_path(db_path: &Path) -> PathBuf {
+    let mut shm = db_path.as_os_str().to_os_string();
+    shm.push("-shm");
+    PathBuf::from(shm)
+}
+
+pub(crate) fn copy_read_only_snapshot(
+    db_path: &Path,
+    default_stem: &str,
+) -> Result<(PathBuf, Vec<PathBuf>)> {
+    let snapshot_path = snapshot_copy_path(db_path, default_stem);
+    std::fs::copy(db_path, &snapshot_path).with_context(|| {
+        format!(
+            "copying locked db {} to snapshot {}",
+            db_path.display(),
+            snapshot_path.display()
+        )
+    })?;
+    let mut cleanup_paths = vec![snapshot_path.clone()];
+    copy_optional_snapshot_sidecar(
+        &wal_sidecar_path(db_path),
+        &wal_sidecar_path(&snapshot_path),
+        &mut cleanup_paths,
+    )?;
+    copy_optional_snapshot_sidecar(
+        &shared_memory_sidecar_path(db_path),
+        &shared_memory_sidecar_path(&snapshot_path),
+        &mut cleanup_paths,
+    )?;
+    Ok((snapshot_path, cleanup_paths))
+}
+
+fn copy_optional_snapshot_sidecar(
+    source_path: &Path,
+    snapshot_path: &Path,
+    cleanup_paths: &mut Vec<PathBuf>,
+) -> Result<()> {
+    match std::fs::copy(source_path, snapshot_path) {
+        Ok(_) => {
+            cleanup_paths.push(snapshot_path.to_path_buf());
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "copying SQLite sidecar {} to snapshot {}",
+                source_path.display(),
+                snapshot_path.display()
+            )
+        }),
+    }
+}
+
+fn snapshot_copy_path(db_path: &Path, default_stem: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
@@ -1240,7 +1309,7 @@ fn snapshot_copy_path(db_path: &Path) -> PathBuf {
     let stem = db_path
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .unwrap_or("index");
+        .unwrap_or(default_stem);
     let mut file_name = OsString::from(format!("tsift-{stem}-{}-{nanos}", std::process::id()));
     file_name.push(".db");
     std::env::temp_dir().join(file_name)
@@ -1309,6 +1378,21 @@ mod tests {
 
     fn db_in(dir: &Path) -> IndexDb {
         IndexDb::open(&dir.join(".tsift/index.db")).unwrap()
+    }
+
+    fn hold_wal_lock(db_path: &Path) -> Connection {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE IF NOT EXISTS wal_lock_probe (id INTEGER PRIMARY KEY);
+             INSERT INTO wal_lock_probe DEFAULT VALUES;
+             PRAGMA locking_mode=EXCLUSIVE;
+             BEGIN EXCLUSIVE;",
+        )
+        .unwrap();
+        assert!(wal_sidecar_path(db_path).exists());
+        conn
     }
 
     #[test]
@@ -2190,6 +2274,38 @@ mod tests {
         conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
             .unwrap();
         std::fs::write(rollback_journal_path(&db_path), "locked").unwrap();
+
+        let db = IndexDb::open_read_only_resilient(&db_path).unwrap();
+        assert!(db._snapshot_copy.is_some());
+        assert!(db.file_count().is_ok());
+    }
+
+    #[test]
+    fn inspect_read_only_reports_wal_snapshot_recovery_when_wal_db_is_locked() {
+        let dir = setup_tree();
+        let db_path = dir.path().join(".tsift/index.db");
+        let db = IndexDb::open(&db_path).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+        drop(db);
+
+        let _lock = hold_wal_lock(&db_path);
+
+        let inspection = IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
+        assert_eq!(
+            inspection.recovery,
+            Some(ReadOnlyRecovery::SnapshotFallbackWal)
+        );
+    }
+
+    #[test]
+    fn open_read_only_resilient_copies_wal_sidecars_for_locked_wal_db() {
+        let dir = setup_tree();
+        let db_path = dir.path().join(".tsift/index.db");
+        let db = IndexDb::open(&db_path).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+        drop(db);
+
+        let _lock = hold_wal_lock(&db_path);
 
         let db = IndexDb::open_read_only_resilient(&db_path).unwrap();
         assert!(db._snapshot_copy.is_some());

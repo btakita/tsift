@@ -1,14 +1,15 @@
-use crate::index::{IndexDb, ReadOnlyRecovery, error_mentions_locked_db, rollback_journal_path};
+use crate::index::{
+    IndexDb, ReadOnlyRecovery, copy_read_only_snapshot, read_only_snapshot_recovery,
+};
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 pub struct SummaryDb {
     conn: Connection,
@@ -115,7 +116,7 @@ pub(crate) struct SummaryWriteLockGuard {
 
 #[derive(Debug)]
 struct SnapshotCopyGuard {
-    path: PathBuf,
+    paths: Vec<PathBuf>,
 }
 
 impl Drop for SummaryWriteLockGuard {
@@ -127,7 +128,9 @@ impl Drop for SummaryWriteLockGuard {
 
 impl Drop for SnapshotCopyGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -262,14 +265,16 @@ impl SummaryDb {
             Ok(db)
         }) {
             Ok(db) => Ok(SummaryReadOnlyOpen { db, recovery: None }),
-            Err(err) if should_retry_read_only_with_snapshot(path, &err) => {
+            Err(err) => {
+                let Some(recovery) = read_only_snapshot_recovery(path, &err) else {
+                    return Err(err);
+                };
                 let db = Self::open_read_only_snapshot(path)?;
                 Ok(SummaryReadOnlyOpen {
                     db,
-                    recovery: Some(ReadOnlyRecovery::SnapshotFallback),
+                    recovery: Some(recovery),
                 })
             }
-            Err(err) => Err(err),
         }
     }
 
@@ -482,14 +487,7 @@ impl SummaryDb {
     }
 
     fn open_read_only_snapshot(path: &Path) -> Result<Self> {
-        let snapshot_path = snapshot_copy_path(path);
-        std::fs::copy(path, &snapshot_path).with_context(|| {
-            format!(
-                "copying locked summaries db {} to snapshot {}",
-                path.display(),
-                snapshot_path.display()
-            )
-        })?;
+        let (snapshot_path, cleanup_paths) = copy_read_only_snapshot(path, "summaries")?;
         let conn = Connection::open_with_flags(
             &snapshot_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -499,28 +497,10 @@ impl SummaryDb {
         Ok(Self {
             conn,
             _snapshot_copy: Some(SnapshotCopyGuard {
-                path: snapshot_path,
+                paths: cleanup_paths,
             }),
         })
     }
-}
-
-fn should_retry_read_only_with_snapshot(path: &Path, err: &anyhow::Error) -> bool {
-    rollback_journal_path(path).exists() && error_mentions_locked_db(err)
-}
-
-fn snapshot_copy_path(db_path: &Path) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_nanos();
-    let stem = db_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("summaries");
-    let mut file_name = OsString::from(format!("tsift-{stem}-{}-{nanos}", std::process::id()));
-    file_name.push(".db");
-    std::env::temp_dir().join(file_name)
 }
 
 fn read_lock_marker(file: &mut File) -> std::io::Result<LockFileMarker> {
@@ -1055,7 +1035,7 @@ fn chrono_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::rollback_journal_path;
+    use crate::index::{rollback_journal_path, wal_sidecar_path};
     use rusqlite::Connection;
     use serde_json::json;
     use tempfile::NamedTempFile;
@@ -1089,6 +1069,21 @@ mod tests {
             tokens_input: Some(500),
             tokens_output: Some(200),
         }
+    }
+
+    fn hold_wal_lock(db_path: &Path) -> Connection {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE IF NOT EXISTS wal_lock_probe (id INTEGER PRIMARY KEY);
+             INSERT INTO wal_lock_probe DEFAULT VALUES;
+             PRAGMA locking_mode=EXCLUSIVE;
+             BEGIN EXCLUSIVE;",
+        )
+        .unwrap();
+        assert!(wal_sidecar_path(db_path).exists());
+        conn
     }
 
     #[test]
@@ -1713,6 +1708,26 @@ mod tests {
         let results = opened.db.get_by_symbol("main").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].summary, "cached summary");
+    }
+
+    #[test]
+    fn summary_read_only_reports_wal_snapshot_fallback_when_wal_db_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("summaries.db");
+        let db = SummaryDb::open(&db_path).unwrap();
+        db.insert(&make_summary("main", "src/main.rs", "hash1"))
+            .unwrap();
+        drop(db);
+
+        let _lock = hold_wal_lock(&db_path);
+
+        let opened = SummaryDb::open_read_only_with_recovery(&db_path).unwrap();
+        assert_eq!(
+            opened.recovery,
+            Some(crate::index::ReadOnlyRecovery::SnapshotFallbackWal)
+        );
+        let results = opened.db.get_by_symbol("main").unwrap();
+        assert_eq!(results.len(), 1);
     }
 
     #[test]

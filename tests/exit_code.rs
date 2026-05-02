@@ -20,6 +20,20 @@ fn hold_rollback_journal_lock(db_path: &std::path::Path) -> Connection {
     conn
 }
 
+fn hold_wal_lock(db_path: &std::path::Path) -> Connection {
+    let conn = Connection::open(db_path).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA wal_autocheckpoint=0;
+         CREATE TABLE IF NOT EXISTS wal_lock_probe (id INTEGER PRIMARY KEY);
+         INSERT INTO wal_lock_probe DEFAULT VALUES;
+         PRAGMA locking_mode=EXCLUSIVE;
+         BEGIN EXCLUSIVE;",
+    )
+    .unwrap();
+    conn
+}
+
 fn hold_writer_lock(lock_path: &std::path::Path) -> std::fs::File {
     let mut file = OpenOptions::new()
         .read(true)
@@ -1206,6 +1220,51 @@ fn communities_stays_read_only_while_writer_lock_exists() {
 }
 
 #[test]
+fn status_stays_read_only_while_live_wal_writer_holds_index_db() {
+    let dir = indexed_cli_fixture();
+    let _lock = hold_wal_lock(&dir.path().join(".tsift/index.db"));
+
+    let output = tsift_bin()
+        .args(["status", "--json", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"recovery\":\"snapshot_fallback_wal\""));
+}
+
+#[test]
+fn summarize_stats_stays_read_only_while_live_wal_writer_holds_summary_db() {
+    let dir = indexed_cli_fixture();
+    create_summary_cache(dir.path());
+    let _lock = hold_wal_lock(&dir.path().join(".tsift/summaries.db"));
+
+    let output = tsift_bin()
+        .args([
+            "summarize",
+            "--stats",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "summarize stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Summary cache statistics:"));
+    assert!(stdout.contains("files:           1"));
+}
+
+#[test]
 fn lint_auto_discovers_root_index_db() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn alpha_helper() {}\n").unwrap();
@@ -2382,7 +2441,7 @@ fn index_reports_lock_diagnostics_when_rollback_journal_blocks_writer() {
     assert!(stderr.contains("lock diagnostics:"));
     assert!(stderr.contains("journal: present"));
     assert!(stderr.contains("run: tsift index"));
-    assert!(stderr.contains("next: inspect the host for a wedged writer"));
+    assert!(stderr.contains("next: inspect the host for a wedged rollback-journal writer"));
 }
 
 #[test]

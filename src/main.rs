@@ -5993,7 +5993,7 @@ tier = "private"
         assert!(msg.contains("autoindexing index"));
         assert!(msg.contains("lock diagnostics:"));
         assert!(msg.contains("journal: present"));
-        assert!(msg.contains("next: inspect the host for a wedged writer"));
+        assert!(msg.contains("next: inspect the host for a wedged rollback-journal writer"));
     }
 
     #[test]

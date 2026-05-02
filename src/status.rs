@@ -1,7 +1,7 @@
 use crate::config;
 use crate::index::{
     IndexDb, ReadOnlyRecovery, WriterLockProbe, probe_writer_lock, rollback_journal_path,
-    writer_lock_path,
+    shared_memory_sidecar_path, wal_sidecar_path, writer_lock_path,
 };
 use crate::init::{self, InstructionStatus};
 use crate::summarize::SummaryDb;
@@ -104,7 +104,9 @@ pub struct LockReport {
     pub source_root: PathBuf,
     pub db_path: PathBuf,
     pub writer_lock: WriterLockStatus,
-    pub rollback_journal: RollbackJournalStatus,
+    pub rollback_journal: SidecarStatus,
+    pub wal_sidecar: SidecarStatus,
+    pub shared_memory_sidecar: SidecarStatus,
     pub reindex_command: String,
     pub recommended_action: String,
 }
@@ -119,7 +121,7 @@ pub enum WriterLockStatus {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct RollbackJournalStatus {
+pub struct SidecarStatus {
     pub path: PathBuf,
     pub present: bool,
 }
@@ -271,12 +273,25 @@ pub fn check_locks(
         WriterLockProbe::Stale { path, pid } => WriterLockStatus::Stale { path, pid },
         WriterLockProbe::Unknown { path } => WriterLockStatus::Unknown { path },
     };
-    let rollback_journal = RollbackJournalStatus {
+    let rollback_journal = SidecarStatus {
         path: rollback_journal_path(&db_path),
         present: rollback_journal_path(&db_path).exists(),
     };
-    let recommended_action =
-        build_lock_recommendation(&writer_lock, &rollback_journal, &reindex_command);
+    let wal_sidecar = SidecarStatus {
+        path: wal_sidecar_path(&db_path),
+        present: wal_sidecar_path(&db_path).exists(),
+    };
+    let shared_memory_sidecar = SidecarStatus {
+        path: shared_memory_sidecar_path(&db_path),
+        present: shared_memory_sidecar_path(&db_path).exists(),
+    };
+    let recommended_action = build_lock_recommendation(
+        &writer_lock,
+        &rollback_journal,
+        &wal_sidecar,
+        &shared_memory_sidecar,
+        &reindex_command,
+    );
 
     Ok(LockReport {
         label,
@@ -284,6 +299,8 @@ pub fn check_locks(
         db_path,
         writer_lock,
         rollback_journal,
+        wal_sidecar,
+        shared_memory_sidecar,
         reindex_command,
         recommended_action,
     })
@@ -514,15 +531,23 @@ fn resolve_lock_target(
 
 fn build_lock_recommendation(
     writer_lock: &WriterLockStatus,
-    rollback_journal: &RollbackJournalStatus,
+    rollback_journal: &SidecarStatus,
+    wal_sidecar: &SidecarStatus,
+    shared_memory_sidecar: &SidecarStatus,
     reindex_command: &str,
 ) -> String {
+    let has_live_wal_state = wal_sidecar.present || shared_memory_sidecar.present;
     match writer_lock {
         WriterLockStatus::Live { pid, .. } => {
             let pid_hint = pid
                 .map(|value| format!(" (pid {})", value))
                 .unwrap_or_default();
-            if rollback_journal.present {
+            if has_live_wal_state {
+                format!(
+                    "wait for the active tsift writer{} to finish, then run `{}` to rebuild a clean WAL-mode index after the live sidecars clear.",
+                    pid_hint, reindex_command
+                )
+            } else if rollback_journal.present {
                 format!(
                     "wait for the active tsift writer{} to finish, then run `{}` to rebuild a clean WAL-mode index.",
                     pid_hint, reindex_command
@@ -541,10 +566,18 @@ fn build_lock_recommendation(
                 reindex_command
             )
         }
-        WriterLockStatus::Absent { .. } if rollback_journal.present => format!(
-            "inspect the host for a wedged writer, then run `{}` once writes are healthy. Read-only status checks can use snapshot fallback in the meantime.",
-            reindex_command
-        ),
+        WriterLockStatus::Absent { .. } if has_live_wal_state => {
+            format!(
+                "inspect the host for a wedged writer holding live WAL sidecars, then run `{}` once writes are healthy. Read-only status checks can use snapshot fallback in the meantime.",
+                reindex_command
+            )
+        }
+        WriterLockStatus::Absent { .. } if rollback_journal.present => {
+            format!(
+                "inspect the host for a wedged rollback-journal writer, then run `{}` once writes are healthy. Read-only status checks can use snapshot fallback in the meantime.",
+                reindex_command
+            )
+        }
         WriterLockStatus::Absent { .. } => "no lock remediation needed".to_string(),
     }
 }
@@ -554,6 +587,12 @@ fn format_recovery_line(recovery: ReadOnlyRecovery, compact: bool) -> String {
         (ReadOnlyRecovery::SnapshotFallback, true) => "recovery:snapshot_fallback\n".to_string(),
         (ReadOnlyRecovery::SnapshotFallback, false) => {
             "recovery: snapshot fallback (rollback-journal lock on live index)\n".to_string()
+        }
+        (ReadOnlyRecovery::SnapshotFallbackWal, true) => {
+            "recovery:snapshot_fallback_wal\n".to_string()
+        }
+        (ReadOnlyRecovery::SnapshotFallbackWal, false) => {
+            "recovery: snapshot fallback (copied live WAL sidecars from index db)\n".to_string()
         }
     }
 }
@@ -579,6 +618,13 @@ fn format_summary_recovery_line(recovery: ReadOnlyRecovery, compact: bool) -> St
         }
         (ReadOnlyRecovery::SnapshotFallback, false) => {
             "summaries recovery: snapshot fallback (rollback-journal lock on live summaries db)\n"
+                .to_string()
+        }
+        (ReadOnlyRecovery::SnapshotFallbackWal, true) => {
+            "summaries_recovery:snapshot_fallback_wal\n".to_string()
+        }
+        (ReadOnlyRecovery::SnapshotFallbackWal, false) => {
+            "summaries recovery: snapshot fallback (copied live WAL sidecars from summaries db)\n"
                 .to_string()
         }
     }
@@ -933,6 +979,22 @@ pub fn format_locks_human(report: &LockReport, compact: bool) -> String {
             report.rollback_journal.path.display()
         )
     };
+    let wal_line = if report.wal_sidecar.present {
+        format!("wal: present {}\n", report.wal_sidecar.path.display())
+    } else {
+        format!("wal: absent {}\n", report.wal_sidecar.path.display())
+    };
+    let shm_line = if report.shared_memory_sidecar.present {
+        format!(
+            "shm: present {}\n",
+            report.shared_memory_sidecar.path.display()
+        )
+    } else {
+        format!(
+            "shm: absent {}\n",
+            report.shared_memory_sidecar.path.display()
+        )
+    };
 
     let mut out = String::new();
     if compact {
@@ -943,6 +1005,8 @@ pub fn format_locks_human(report: &LockReport, compact: bool) -> String {
         ));
         out.push_str(&lock_line);
         out.push_str(&journal_line);
+        out.push_str(&wal_line);
+        out.push_str(&shm_line);
         out.push_str(&format!("run:{}\n", report.reindex_command));
         out.push_str(&format!("next:{}\n", report.recommended_action));
     } else {
@@ -951,6 +1015,8 @@ pub fn format_locks_human(report: &LockReport, compact: bool) -> String {
         out.push_str(&format!("db: {}\n", report.db_path.display()));
         out.push_str(&lock_line);
         out.push_str(&journal_line);
+        out.push_str(&wal_line);
+        out.push_str(&shm_line);
         out.push_str(&format!("run: {}\n", report.reindex_command));
         out.push_str(&format!("next: {}\n", report.recommended_action));
     }
@@ -961,6 +1027,7 @@ pub fn format_locks_human(report: &LockReport, compact: bool) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::index::wal_sidecar_path;
     use fs4::fs_std::FileExt;
     use rusqlite::Connection;
     use std::fs::OpenOptions;
@@ -988,6 +1055,21 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("src/beta/lib.rs"), "fn beta_helper() {}\n").unwrap();
         dir
+    }
+
+    fn hold_wal_lock(db_path: &Path) -> Connection {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE IF NOT EXISTS wal_lock_probe (id INTEGER PRIMARY KEY);
+             INSERT INTO wal_lock_probe DEFAULT VALUES;
+             PRAGMA locking_mode=EXCLUSIVE;
+             BEGIN EXCLUSIVE;",
+        )
+        .unwrap();
+        assert!(wal_sidecar_path(db_path).exists());
+        conn
     }
 
     #[test]
@@ -1303,6 +1385,43 @@ mod tests {
     }
 
     #[test]
+    fn status_summaries_report_wal_snapshot_recovery_when_wal_db_is_locked() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+
+        let db_path = dir.path().join(".tsift/summaries.db");
+        let sdb = SummaryDb::open(&db_path).unwrap();
+        sdb.insert(&crate::summarize::Summary {
+            id: 0,
+            symbol_name: "main".to_string(),
+            file_path: "main.rs".to_string(),
+            content_hash: "abc123".to_string(),
+            summary: "Entry point".to_string(),
+            entities: None,
+            relationships: None,
+            concept_labels: None,
+            extracted_at: "2026-01-01".to_string(),
+            model: "test".to_string(),
+            tokens_input: None,
+            tokens_output: None,
+        })
+        .unwrap();
+        drop(sdb);
+
+        let _lock = hold_wal_lock(&db_path);
+
+        let report = check_status(dir.path()).unwrap();
+        match report.summaries {
+            SummaryStatus::Available { recovery, .. } => {
+                assert_eq!(recovery, Some(ReadOnlyRecovery::SnapshotFallbackWal));
+            }
+            other => panic!("expected available summaries, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn status_summary_coverage_ignores_deleted_summary_rows() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
@@ -1481,6 +1600,30 @@ mod tests {
     }
 
     #[test]
+    fn status_human_format_mentions_wal_snapshot_recovery() {
+        let report = StatusReport {
+            index: IndexStatus::Fresh {
+                total_files: 3,
+                stale_files: 0,
+                last_indexed_secs_ago: 5,
+                recovery: Some(ReadOnlyRecovery::SnapshotFallbackWal),
+                workspace_scopes: Vec::new(),
+                missing_scopes: Vec::new(),
+            },
+            summaries: SummaryStatus::None { recovery: None },
+            instructions: InstructionStatus::Current {
+                version: "0.1.0".to_string(),
+            },
+            recommendations: Recommendations {
+                use_commands: vec!["search".to_string()],
+                run: None,
+            },
+        };
+        let output = format_human(&report, false);
+        assert!(output.contains("copied live WAL sidecars"));
+    }
+
+    #[test]
     fn status_json_includes_recovery_when_snapshot_fallback_is_used() {
         let report = StatusReport {
             index: IndexStatus::Fresh {
@@ -1590,6 +1733,24 @@ mod tests {
                 .contains("wait for the active tsift writer")
         );
         assert!(report.recommended_action.contains("tsift index"));
+    }
+
+    #[test]
+    fn lock_report_marks_live_writer_and_wal_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join(".tsift/index.db");
+        let db = IndexDb::open(&db_path).unwrap();
+        drop(db);
+
+        let _lock = hold_wal_lock(&db_path);
+
+        let report = check_locks(dir.path(), None, None).unwrap();
+        assert!(report.wal_sidecar.present);
+        assert!(
+            report
+                .recommended_action
+                .contains("wedged writer holding live WAL sidecars")
+        );
     }
 
     #[test]
