@@ -130,10 +130,12 @@ On stale existing indexes, search exits early with a message like:
 tsift search aborted: index is stale (51 files). Run `tsift index .` or re-run with `--autoindex`.
 ```
 
-If the sift engine itself still times out, search exits with a non-zero code and prints:
+If the sift engine itself still times out while the search target is fresh, search exits with a non-zero code and prints:
 ```
-tsift search timed out after 30s (strategy: lexical). The index may be stale — run `tsift index .` to rebuild, or use `--timeout 0` to disable the timeout.
+tsift search timed out after 30s (strategy: lexical). The search root looks fresh, so reindexing is unlikely to help. Re-run with `--timeout 0` to disable the timeout, narrow `--path` / `--scope`, or try a different strategy.
 ```
+
+If the timeout re-check finds that the index became stale or disappeared while the worker was running, the timeout error switches back to a concrete rebuild instruction for that target instead of the fresh-root hint.
 
 `--timeout 0` disables the timeout for cases where a long search is expected and keeps the sift call in-process.
 

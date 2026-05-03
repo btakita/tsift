@@ -3318,6 +3318,19 @@ fn inspect_search_index(target: &SearchIndexTarget) -> Result<SearchIndexState> 
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RebuildSearchTarget {
+    label: String,
+    reason: RebuildSearchReason,
+    reindex_cmd: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RebuildSearchReason {
+    Missing,
+    Stale { stale_files: usize },
+}
+
 fn apply_search_index_update(root: &Path, target: &SearchIndexTarget) -> Result<()> {
     run_index_update(
         &target.db_path,
@@ -3331,17 +3344,78 @@ fn apply_search_index_update(root: &Path, target: &SearchIndexTarget) -> Result<
     Ok(())
 }
 
+fn collect_rebuild_search_targets(
+    targets: &[SearchIndexTarget],
+) -> Result<Vec<RebuildSearchTarget>> {
+    let mut rebuild_targets = Vec::new();
+    for target in targets {
+        let reason = match inspect_search_index(target)? {
+            SearchIndexState::Missing => RebuildSearchReason::Missing,
+            SearchIndexState::Fresh => continue,
+            SearchIndexState::Stale { stale_files } => RebuildSearchReason::Stale { stale_files },
+        };
+        rebuild_targets.push(RebuildSearchTarget {
+            label: target.label.clone(),
+            reason,
+            reindex_cmd: target.reindex_cmd.clone(),
+        });
+    }
+    Ok(rebuild_targets)
+}
+
+fn rebuild_search_target_detail(target: &RebuildSearchTarget) -> String {
+    match target.reason {
+        RebuildSearchReason::Missing => format!("{} is missing", target.label),
+        RebuildSearchReason::Stale { stale_files } => {
+            let file_suffix = if stale_files == 1 { "" } else { "s" };
+            format!(
+                "{} is stale ({} file{})",
+                target.label, stale_files, file_suffix
+            )
+        }
+    }
+}
+
+fn rebuild_search_targets_message(rebuild_targets: &[RebuildSearchTarget]) -> String {
+    if rebuild_targets.len() == 1 {
+        let target = &rebuild_targets[0];
+        return format!(
+            "{}. Run `{}` to rebuild before retrying.",
+            rebuild_search_target_detail(target),
+            target.reindex_cmd
+        );
+    }
+
+    let summary: Vec<String> = rebuild_targets
+        .iter()
+        .take(3)
+        .map(rebuild_search_target_detail)
+        .collect();
+    let overflow = rebuild_targets.len().saturating_sub(summary.len());
+    let mut details = summary.join(", ");
+    if overflow > 0 {
+        details.push_str(&format!(", +{} more", overflow));
+    }
+    let reindex_cmd = rebuild_targets[0].reindex_cmd.clone();
+    format!(
+        "{} indexes need rebuild: {}. Run `{}` to rebuild before retrying.",
+        rebuild_targets.len(),
+        details,
+        reindex_cmd
+    )
+}
+
 fn precheck_search_indexes(
     root: &Path,
     path_hint: &Path,
     scope: Option<&str>,
     federated: bool,
     autoindex: bool,
-) -> Result<()> {
+) -> Result<Vec<SearchIndexTarget>> {
     let targets = resolve_search_index_targets(root, path_hint, scope, federated)?;
-    let mut stale_targets: Vec<(String, usize, String)> = Vec::new();
+    let mut stale_targets = Vec::new();
 
-    for target in targets {
+    for target in &targets {
         match inspect_search_index(&target)? {
             SearchIndexState::Missing => {
                 if autoindex {
@@ -3353,47 +3427,49 @@ fn precheck_search_indexes(
                 if autoindex {
                     apply_search_index_update(root, &target)?;
                 } else {
-                    stale_targets.push((target.label, stale_files, target.reindex_cmd));
+                    stale_targets.push(RebuildSearchTarget {
+                        label: target.label.clone(),
+                        reason: RebuildSearchReason::Stale { stale_files },
+                        reindex_cmd: target.reindex_cmd.clone(),
+                    });
                 }
             }
         }
     }
 
     if stale_targets.is_empty() {
-        return Ok(());
+        return Ok(targets);
     }
 
-    if stale_targets.len() == 1 {
-        let (label, stale_files, reindex_cmd) = &stale_targets[0];
-        let file_suffix = if *stale_files == 1 { "" } else { "s" };
-        bail!(
-            "tsift search aborted: {} is stale ({} file{}). \
-             Run `{}` or re-run without `--no-autoindex`.",
-            label,
-            stale_files,
-            file_suffix,
-            reindex_cmd,
-        );
-    }
-
-    let summary: Vec<String> = stale_targets
-        .iter()
-        .take(3)
-        .map(|(label, stale_files, _)| format!("{} ({})", label, stale_files))
-        .collect();
-    let overflow = stale_targets.len().saturating_sub(summary.len());
-    let mut details = summary.join(", ");
-    if overflow > 0 {
-        details.push_str(&format!(", +{} more", overflow));
-    }
-    let reindex_cmd = format!("tsift index --workspace {}", root.display());
     bail!(
-        "tsift search aborted: {} indexes are stale: {}. \
-         Run `{}` or re-run without `--no-autoindex`.",
-        stale_targets.len(),
-        details,
-        reindex_cmd,
+        "tsift search aborted: {} \
+         or re-run without `--no-autoindex`.",
+        rebuild_search_targets_message(&stale_targets),
     );
+}
+
+fn search_timeout_message(
+    timeout_secs: u64,
+    strategy: &str,
+    targets: &[SearchIndexTarget],
+) -> Result<String> {
+    let rebuild_targets = collect_rebuild_search_targets(targets)?;
+    if rebuild_targets.is_empty() {
+        return Ok(format!(
+            "tsift search timed out after {}s (strategy: {}). \
+             The search root looks fresh, so reindexing is unlikely to help. \
+             Re-run with `--timeout 0` to disable the timeout, narrow `--path` / `--scope`, \
+             or try a different strategy.",
+            timeout_secs, strategy,
+        ));
+    }
+
+    Ok(format!(
+        "tsift search timed out after {}s (strategy: {}). {}",
+        timeout_secs,
+        strategy,
+        rebuild_search_targets_message(&rebuild_targets),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3416,7 +3492,8 @@ fn cmd_search(
 ) -> Result<()> {
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
     let root = lint::resolve_project_root_or_canonical_path(&base_path)?;
-    precheck_search_indexes(&root, &base_path, scope.as_deref(), federated, autoindex)?;
+    let search_targets =
+        precheck_search_indexes(&root, &base_path, scope.as_deref(), federated, autoindex)?;
     maybe_apply_search_post_precheck_test_hooks()?;
 
     let inferred_scope = if scope.is_none() && !federated {
@@ -3468,7 +3545,14 @@ fn cmd_search(
     let response = if federated && scope.is_none() {
         federated_sift_search(&root, &query, limit, timeout_secs, &effective_strategy)?
     } else {
-        run_search_with_timeout(&sift_path, &query, limit, timeout_secs, &effective_strategy)?
+        run_search_with_timeout(
+            &sift_path,
+            &query,
+            limit,
+            timeout_secs,
+            &effective_strategy,
+            &search_targets,
+        )?
     };
 
     if json_output {
@@ -6692,8 +6776,47 @@ tier = "private"
         let dir = tempfile::tempdir().unwrap();
         let search_dir = dir.path().to_path_buf();
         std::fs::write(search_dir.join("test.rs"), "fn main() {}").unwrap();
-        let result = run_search_with_timeout(&search_dir, "main", 1, 0, "lexical");
+        let result = run_search_with_timeout(&search_dir, "main", 1, 0, "lexical", &[]);
         assert!(result.is_ok(), "timeout=0 should still work (no timeout)");
+    }
+
+    #[test]
+    fn search_timeout_message_reports_missing_index_as_rebuild_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let db_path = dir.path().join(".tsift/index.db");
+        std::fs::remove_file(&db_path).unwrap();
+        let search_target = SearchIndexTarget {
+            label: "index".to_string(),
+            db_path,
+            source_root: dir.path().to_path_buf(),
+            scope_name: None,
+            reindex_cmd: format!("tsift index {}", dir.path().display()),
+        };
+
+        let message = search_timeout_message(1, "lexical", &[search_target]).unwrap();
+
+        assert!(message.contains("timed out after 1s"));
+        assert!(message.contains("index is missing"));
+        assert!(message.contains("Run `tsift index"));
+        assert!(!message.contains("search root looks fresh"));
     }
 
     #[test]
@@ -7858,15 +7981,21 @@ fn federated_sift_search(
     let targets = resolve_search_index_targets(root, root, None, true)?;
     if targets.is_empty() {
         if config::Config::submodule_dirs(root)?.is_empty() {
-            return run_search_with_timeout(root, query, limit, timeout_secs, strategy);
+            return run_search_with_timeout(root, query, limit, timeout_secs, strategy, &[]);
         }
         return Ok(empty_search_response(root, strategy));
     }
 
     let mut responses = Vec::with_capacity(targets.len());
-    for target in targets {
-        let mut response =
-            run_search_with_timeout(&target.source_root, query, limit, timeout_secs, strategy)?;
+    for target in &targets {
+        let mut response = run_search_with_timeout(
+            &target.source_root,
+            query,
+            limit,
+            timeout_secs,
+            strategy,
+            std::slice::from_ref(target),
+        )?;
         absolutize_search_hit_paths(&mut response, &target.source_root);
         response.root = root.display().to_string();
         responses.push(response);
@@ -7924,6 +8053,7 @@ fn run_search_with_timeout(
     limit: usize,
     timeout_secs: u64,
     strategy: &str,
+    search_targets: &[SearchIndexTarget],
 ) -> Result<sift::SearchResponse> {
     if timeout_secs == 0 {
         return run_sift_search(search_path, query, limit, strategy);
@@ -7958,11 +8088,8 @@ fn run_search_with_timeout(
         let _ = child.wait();
         let _ = fs::remove_file(&output_path);
         bail!(
-            "tsift search timed out after {}s (strategy: {}). \
-             The index may be stale — run `tsift index .` to rebuild, \
-             or use `--timeout 0` to disable the timeout.",
-            timeout_secs,
-            strategy,
+            "{}",
+            search_timeout_message(timeout_secs, strategy, search_targets)?
         );
     }
 

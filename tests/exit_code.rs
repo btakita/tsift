@@ -2474,6 +2474,8 @@ fn search_timeout_kills_worker_process() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("timed out after 1s"));
+    assert!(stderr.contains("search root looks fresh"));
+    assert!(!stderr.contains("index may be stale"));
 
     let pid = fs::read_to_string(&pid_file)
         .unwrap()
@@ -2484,6 +2486,90 @@ fn search_timeout_kills_worker_process() {
         wait_for_process_exit(pid, Duration::from_secs(2)),
         "timed-out worker process {pid} should be gone"
     );
+}
+
+#[test]
+fn search_timeout_reports_reindex_when_index_turns_stale_during_worker_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("main.rs");
+    fs::write(&source, "fn main() {}\n").unwrap();
+
+    let status = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let source_for_writer = source.clone();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        fs::write(
+            &source_for_writer,
+            "fn helper() {}\nfn main() { helper(); }\n",
+        )
+        .unwrap();
+    });
+
+    let output = tsift_bin()
+        .env("TSIFT_TEST_SEARCH_WORKER_SLEEP_MS", "5000")
+        .args([
+            "search",
+            "--timeout",
+            "1",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "main",
+        ])
+        .output()
+        .unwrap();
+    writer.join().unwrap();
+
+    assert!(!output.status.success(), "expected timeout failure");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out after 1s"));
+    assert!(stderr.contains("index is stale"));
+    assert!(stderr.contains("Run `tsift index"));
+}
+
+#[test]
+fn search_timeout_reports_reindex_when_index_disappears_during_worker_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("main.rs");
+    let index_path = dir.path().join(".tsift/index.db");
+    fs::write(&source, "fn main() {}\n").unwrap();
+
+    let status = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let index_path_for_remover = index_path.clone();
+    let remover = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        fs::remove_file(&index_path_for_remover).unwrap();
+    });
+
+    let output = tsift_bin()
+        .env("TSIFT_TEST_SEARCH_WORKER_SLEEP_MS", "5000")
+        .args([
+            "search",
+            "--timeout",
+            "1",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "main",
+        ])
+        .output()
+        .unwrap();
+    remover.join().unwrap();
+
+    assert!(!output.status.success(), "expected timeout failure");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out after 1s"));
+    assert!(stderr.contains("index is missing"));
+    assert!(stderr.contains("Run `tsift index"));
+    assert!(!stderr.contains("search root looks fresh"));
 }
 
 #[test]
