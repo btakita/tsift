@@ -126,7 +126,9 @@ Opt-in recovery:
 
 Both the in-process lexical path and the timed `__search-worker` helper now point sift at a stable `.tsift/search-cache` directory under the resolved project/workspace root. That keeps corpus/BM25 artifacts reusable across repeated searches, including scoped and federated queries that execute from subpaths but still belong to the same root-owned `.tsift/` state.
 
-`tsift search --exact` (and `--strategy exact`) bypasses that lexical/index precheck entirely and executes a literal `rg -F` scan instead. That path keeps rg-style lookups fast, works even when the symbol index is stale or missing, and does not require a shared root `.tsift/index.db` in workspaces that only maintain scoped indexes.
+`tsift search --exact` (and `--strategy exact`) bypasses that lexical/index precheck entirely and executes a literal `rg -F` scan instead. Plain `tsift search <query>` also auto-promotes single-token identifier/path-like queries such as `claudescore-3`, `alpha_helper`, `src/main.rs`, and `crate::module` to that exact backend by default. That path keeps rg-style lookups fast, works even when the symbol index is stale or missing, and does not require a shared root `.tsift/index.db` in workspaces that only maintain scoped indexes.
+
+Because that auto-exact routing closes the main literal-lookup gap after the stable search cache work, tsift still defers any native content/FTS table inside `.tsift/index.db`. Broad prose retrieval remains sift's job; exact content lookups stay on ripgrep unless real usage proves that rg-backed exact search leaves an important gap.
 
 When an index is present, the AST symbol-ranking prepass is now bounded: SQLite only pulls exact-name rows and overlapping-tag candidates, orders them by exact/tag overlap, and caps that candidate scan to the requested search `--limit` instead of loading the full `symbols` table into memory first.
 

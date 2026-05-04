@@ -3483,6 +3483,31 @@ fn search_timeout_message(
     ))
 }
 
+fn is_exact_preferring_query_char(ch: char) -> bool {
+    matches!(ch, '-' | '_' | '/' | '\\' | '.' | ':' | '#' | '@')
+}
+
+fn query_prefers_exact_search(query: &str) -> bool {
+    let trimmed = query.trim();
+    !trimmed.is_empty()
+        && !trimmed.chars().any(char::is_whitespace)
+        && trimmed.chars().any(|ch| ch.is_alphanumeric())
+        && trimmed.chars().any(is_exact_preferring_query_char)
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || is_exact_preferring_query_char(ch))
+}
+
+fn resolve_search_strategy(query: &str, strategy: Option<String>) -> String {
+    strategy.unwrap_or_else(|| {
+        if query_prefers_exact_search(query) {
+            "exact".to_string()
+        } else {
+            "lexical".to_string()
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_search(
     query: String,
@@ -3504,7 +3529,7 @@ fn cmd_search(
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
     let root = lint::resolve_project_root_or_canonical_path(&base_path)?;
     let search_cache_dir = root.join(".tsift/search-cache");
-    let requested_strategy = strategy.unwrap_or_else(|| "lexical".to_string());
+    let requested_strategy = resolve_search_strategy(&query, strategy);
     let exact_search = requested_strategy == "exact";
     let effective_strategy = if exact_search {
         "exact".to_string()
@@ -6278,6 +6303,70 @@ tier = "private"
             Some(dir.path().to_path_buf()),
             5,
             Some("exact".to_string()),
+            None,
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+        assert!(!dir.path().join(".tsift/index.db").exists());
+    }
+
+    #[test]
+    fn identifier_like_query_prefers_exact_search() {
+        assert!(query_prefers_exact_search("claudescore-3"));
+        assert!(query_prefers_exact_search("alpha_helper"));
+        assert!(query_prefers_exact_search("src/main.rs"));
+        assert!(query_prefers_exact_search("crate::module"));
+        assert!(!query_prefers_exact_search("authenticate"));
+        assert!(!query_prefers_exact_search("fn main"));
+        assert!(!query_prefers_exact_search("."));
+    }
+
+    #[test]
+    fn resolve_search_strategy_auto_promotes_identifier_like_queries() {
+        assert_eq!(resolve_search_strategy("claudescore-3", None), "exact");
+        assert_eq!(resolve_search_strategy("authenticate", None), "lexical");
+        assert_eq!(
+            resolve_search_strategy("claudescore-3", Some("hybrid".to_string())),
+            "hybrid"
+        );
+    }
+
+    #[test]
+    fn workspace_identifier_like_search_auto_uses_exact_backend() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let result = cmd_search(
+            "alpha_helper".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            None,
             None,
             false,
             false,

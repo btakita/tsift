@@ -1109,7 +1109,7 @@ fn workspace_search_requires_explicit_scope_or_federated_without_shared_root_ind
     let root = dir.path().to_str().unwrap();
 
     let output = tsift_bin()
-        .args(["search", "alpha_helper", "--path", root, "--json"])
+        .args(["search", "helper", "--path", root, "--json"])
         .output()
         .unwrap();
 
@@ -2620,5 +2620,39 @@ fn search_worker_uses_stable_tsift_cache_dir() {
     assert!(
         dir.path().join(".tsift/search-cache").exists(),
         "timed worker search should reuse the stable .tsift/search-cache dir"
+    );
+}
+
+#[test]
+fn identifier_like_default_search_uses_exact_backend_without_index() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("notes.md"),
+        "workspace anchor: claudescore-3\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "search",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "claudescore-3",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "identifier-like query should succeed"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["strategy"], "exact");
+    assert_eq!(json["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(json["hits"][0]["path"], "notes.md");
+    assert!(
+        !dir.path().join(".tsift/index.db").exists(),
+        "auto-exact routing should not build or require an index"
     );
 }
