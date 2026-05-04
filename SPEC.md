@@ -81,6 +81,7 @@ tsift summarize <symbol>        # cached LLM summary for a symbol
 tsift summarize --extract <path>  # batch LLM extraction (one-time; relative path resolves against --path, workspace files use the matching scoped index)
 tsift summarize --extract --diff  # re-extract only git-changed files within the requested path
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
+tsift search --exact <query>    # literal text lookup via `rg -F`
 tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
 tsift search --scope <submod>   # restrict to one submodule's index + lexical root
 tsift index --submodule <submod> # unknown/ambiguous workspace scopes fail closed
@@ -124,6 +125,8 @@ Opt-in recovery:
 `tsift search` still wraps the sift engine call in a 30-second timeout (configurable via `--timeout`). Timed searches now run in an internal helper process so a timeout kills the underlying sift work instead of leaving a detached worker thread behind. The timeout remains a backstop for genuinely slow lexical searches or for sessions that reach search without a usable index.
 
 Both the in-process lexical path and the timed `__search-worker` helper now point sift at a stable `.tsift/search-cache` directory under the resolved project/workspace root. That keeps corpus/BM25 artifacts reusable across repeated searches, including scoped and federated queries that execute from subpaths but still belong to the same root-owned `.tsift/` state.
+
+`tsift search --exact` (and `--strategy exact`) bypasses that lexical/index precheck entirely and executes a literal `rg -F` scan instead. That path keeps rg-style lookups fast, works even when the symbol index is stale or missing, and does not require a shared root `.tsift/index.db` in workspaces that only maintain scoped indexes.
 
 When an index is present, the AST symbol-ranking prepass is now bounded: SQLite only pulls exact-name rows and overlapping-tag candidates, orders them by exact/tag overlap, and caps that candidate scan to the requested search `--limit` instead of loading the full `symbols` table into memory first.
 
@@ -928,7 +931,7 @@ The hook resolves the git root first, then runs `tsift index --check --exit-code
 
 ### Search Rewrite (`PreToolUse`)
 
-The existing `tsift-rewrite.sh` hook intercepts `rg`/`grep -r` Bash calls and silently rewrites them to `tsift search --strategy lexical`. See `~/.claude/hooks/tsift-rewrite.sh`.
+The existing `tsift-rewrite.sh` hook intercepts `rg`/`grep -r` Bash calls and silently rewrites them to `tsift search --exact`. See `~/.claude/hooks/tsift-rewrite.sh`.
 
 ### RTK Output Filtering (`PreToolUse`)
 

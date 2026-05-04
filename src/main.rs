@@ -72,9 +72,12 @@ enum Commands {
         /// Maximum number of results
         #[arg(short, long, default_value = "10")]
         limit: usize,
-        /// Search strategy: lexical, vector, hybrid, path-hybrid
+        /// Search strategy: lexical, exact, vector, hybrid, path-hybrid
         #[arg(short, long)]
         strategy: Option<String>,
+        /// Use the exact-text backend (`rg -F`) instead of sift/BM25
+        #[arg(long, conflicts_with = "strategy")]
+        exact: bool,
         /// Restrict search to a specific submodule
         #[arg(long)]
         scope: Option<String>,
@@ -412,6 +415,7 @@ fn main() -> Result<()> {
             path,
             limit,
             strategy,
+            exact,
             scope,
             federated,
             json,
@@ -422,7 +426,11 @@ fn main() -> Result<()> {
             query,
             path,
             limit,
-            strategy,
+            if exact {
+                Some("exact".to_string())
+            } else {
+                strategy
+            },
             scope,
             federated,
             json || terse || schema,
@@ -3496,9 +3504,21 @@ fn cmd_search(
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
     let root = lint::resolve_project_root_or_canonical_path(&base_path)?;
     let search_cache_dir = root.join(".tsift/search-cache");
-    let search_targets =
-        precheck_search_indexes(&root, &base_path, scope.as_deref(), federated, autoindex)?;
-    maybe_apply_search_post_precheck_test_hooks()?;
+    let requested_strategy = strategy.unwrap_or_else(|| "lexical".to_string());
+    let exact_search = requested_strategy == "exact";
+    let effective_strategy = if exact_search {
+        "exact".to_string()
+    } else {
+        requested_strategy
+    };
+    let search_targets = if exact_search {
+        Vec::new()
+    } else {
+        let targets =
+            precheck_search_indexes(&root, &base_path, scope.as_deref(), federated, autoindex)?;
+        maybe_apply_search_post_precheck_test_hooks()?;
+        targets
+    };
 
     let inferred_scope = if scope.is_none() && !federated {
         config::Config::infer_submodule_from_path(&root, &base_path)?
@@ -3545,8 +3565,13 @@ fn cmd_search(
         relativize_symbol_hits(&mut symbol_hits, &root);
     }
 
-    let effective_strategy = strategy.unwrap_or_else(|| "lexical".to_string());
-    let response = if federated && scope.is_none() {
+    let response = if exact_search {
+        if federated && scope.is_none() {
+            federated_exact_search(&root, &query, limit, timeout_secs)?
+        } else {
+            run_exact_search_with_timeout(&sift_path, &query, limit, timeout_secs)?
+        }
+    } else if federated && scope.is_none() {
         federated_sift_search(
             &root,
             &search_cache_dir,
@@ -4693,7 +4718,7 @@ mod tests {
         let result = rewrite_command("rg authenticate");
         assert_eq!(
             result,
-            Some("tsift search \"authenticate\" --strategy lexical".to_string())
+            Some("tsift search \"authenticate\" --exact".to_string())
         );
     }
 
@@ -4702,7 +4727,7 @@ mod tests {
         let result = rewrite_command("rg authenticate src/");
         assert_eq!(
             result,
-            Some("tsift search \"authenticate\" --strategy lexical --path \"src/\"".to_string())
+            Some("tsift search \"authenticate\" --exact --path \"src/\"".to_string())
         );
     }
 
@@ -4711,7 +4736,7 @@ mod tests {
         let result = rewrite_command("rg -i authenticate src/");
         assert_eq!(
             result,
-            Some("tsift search \"authenticate\" --strategy lexical --path \"src/\"".to_string())
+            Some("tsift search \"authenticate\" --exact --path \"src/\"".to_string())
         );
     }
 
@@ -4721,7 +4746,7 @@ mod tests {
         let result = rewrite_command("rg -t rs authenticate");
         assert_eq!(
             result,
-            Some("tsift search \"authenticate\" --strategy lexical".to_string())
+            Some("tsift search \"authenticate\" --exact".to_string())
         );
     }
 
@@ -4737,7 +4762,7 @@ mod tests {
         let result = rewrite_command("grep -r authenticate src/");
         assert_eq!(
             result,
-            Some("tsift search \"authenticate\" --strategy lexical --path \"src/\"".to_string())
+            Some("tsift search \"authenticate\" --exact --path \"src/\"".to_string())
         );
     }
 
@@ -4762,10 +4787,7 @@ mod tests {
     #[test]
     fn rewrite_rg_quoted_pattern() {
         let result = rewrite_command("rg \"fn main\"");
-        assert_eq!(
-            result,
-            Some("tsift search \"fn main\" --strategy lexical".to_string())
-        );
+        assert_eq!(result, Some("tsift search \"fn main\" --exact".to_string()));
     }
 
     #[test]
@@ -6186,6 +6208,94 @@ tier = "private"
     }
 
     #[test]
+    fn exact_search_returns_literal_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "alpha\nclaudescore-3\nbeta\n").unwrap();
+
+        let response = run_exact_search_with_timeout(dir.path(), "claudescore-3", 5, 0).unwrap();
+
+        assert_eq!(response.strategy, "exact");
+        assert_eq!(response.hits.len(), 1);
+        assert!(response.hits[0].path.ends_with("notes.txt"));
+        assert_eq!(response.hits[0].location.as_deref(), Some("line 2"));
+        assert!(response.hits[0].snippet.contains("claudescore-3"));
+    }
+
+    #[test]
+    fn exact_search_skips_stale_index_precheck() {
+        let dir = setup_graph_index();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() { println!(\"updated\"); }\nfn main() { helper(); }\n",
+        )
+        .unwrap();
+
+        let result = cmd_search(
+            "println!(\"updated\")".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("exact".to_string()),
+            None,
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn workspace_exact_search_does_not_require_shared_root_index() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let result = cmd_search(
+            "alpha_helper".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("exact".to_string()),
+            None,
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+        assert!(!dir.path().join(".tsift/index.db").exists());
+    }
+
+    #[test]
     fn index_cmd_uses_ancestor_project_root_for_nested_paths() {
         let dir = setup_graph_index();
         let nested = dir.path().join("src/nested");
@@ -7108,6 +7218,33 @@ tier = "private"
     }
 
     #[test]
+    fn cli_search_accepts_exact_flag() {
+        let cli = Cli::parse_from(["tsift", "search", "test", "--exact"]);
+        match cli.command {
+            Some(Commands::Search {
+                exact, strategy, ..
+            }) => {
+                assert!(exact);
+                assert!(strategy.is_none());
+            }
+            _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn cli_search_rejects_exact_with_strategy_flag() {
+        let cli = Cli::try_parse_from([
+            "tsift",
+            "search",
+            "test",
+            "--exact",
+            "--strategy",
+            "lexical",
+        ]);
+        assert!(cli.is_err());
+    }
+
+    #[test]
     fn cli_search_autoindexes_by_default() {
         let cli = Cli::parse_from(["tsift", "search", "test"]);
         match cli.command {
@@ -7684,12 +7821,12 @@ pub(crate) fn rewrite_command(command: &str) -> Option<String> {
         return Some(command.to_string());
     }
 
-    // rg <pattern> [path] [flags] → tsift search "<pattern>" --strategy lexical [--path <path>]
+    // rg <pattern> [path] [flags] → tsift search "<pattern>" --exact [--path <path>]
     if let Some(rewritten) = rewrite_rg(trimmed) {
         return Some(rewritten);
     }
 
-    // grep -r <pattern> [path] → tsift search "<pattern>" --strategy lexical [--path <path>]
+    // grep -r <pattern> [path] → tsift search "<pattern>" --exact [--path <path>]
     if let Some(rewritten) = rewrite_grep(trimmed) {
         return Some(rewritten);
     }
@@ -7757,7 +7894,7 @@ fn rewrite_rg(cmd: &str) -> Option<String> {
     }
 
     let pattern = pattern?;
-    let mut result = format!("tsift search {} --strategy lexical", shell_quote(pattern));
+    let mut result = format!("tsift search {} --exact", shell_quote(pattern));
     if let Some(p) = path {
         result.push_str(&format!(" --path {}", shell_quote(p)));
     }
@@ -7811,7 +7948,7 @@ fn rewrite_grep(cmd: &str) -> Option<String> {
     }
 
     let pattern = pattern?;
-    let mut result = format!("tsift search {} --strategy lexical", shell_quote(pattern));
+    let mut result = format!("tsift search {} --exact", shell_quote(pattern));
     if let Some(p) = path {
         result.push_str(&format!(" --path {}", shell_quote(p)));
     }
@@ -8082,6 +8219,50 @@ fn federated_symbol_search(
     Ok(all_hits)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum RipgrepJsonEvent {
+    Match {
+        data: RipgrepMatchData,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct RipgrepMatchData {
+    path: RipgrepTextField,
+    lines: RipgrepTextField,
+    line_number: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RipgrepTextField {
+    text: Option<String>,
+}
+
+fn federated_exact_search(
+    root: &Path,
+    query: &str,
+    limit: usize,
+    timeout_secs: u64,
+) -> Result<sift::SearchResponse> {
+    let cfg = config::Config::load(root)?;
+    let mut responses = Vec::new();
+    for scope in config::Config::submodule_dirs(root)? {
+        if !cfg.federation_for_scope(&scope) {
+            continue;
+        }
+        let mut response =
+            run_exact_search_with_timeout(&scope.source_root, query, limit, timeout_secs)?;
+        absolutize_search_hit_paths(&mut response, &scope.source_root);
+        response.root = root.display().to_string();
+        responses.push(response);
+    }
+
+    Ok(merge_search_responses(root, "exact", limit, responses))
+}
+
 fn run_sift_search(
     search_path: &Path,
     cache_dir: &Path,
@@ -8095,6 +8276,185 @@ fn run_sift_search(
         .with_strategy(strategy.to_string());
     let input = SearchInput::new(search_path, query).with_options(options);
     engine.search(input).context("sift search failed")
+}
+
+fn exact_search_timeout_message(timeout_secs: u64) -> String {
+    format!(
+        "tsift search timed out after {}s (strategy: exact). \
+         Re-run with `--timeout 0` to disable the timeout or narrow `--path` / `--scope`.",
+        timeout_secs
+    )
+}
+
+fn exact_search_command(search_path: &Path, query: &str) -> Command {
+    let mut command = Command::new("rg");
+    command
+        .arg("--json")
+        .arg("--fixed-strings")
+        .arg("--line-number")
+        .arg("--hidden")
+        .arg("--max-count")
+        .arg("1")
+        .arg("--")
+        .arg(query)
+        .arg(search_path);
+    command
+}
+
+fn exact_search_file_timestamp(path: &Path) -> sift::ArtifactFreshness {
+    let observed_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let modified_unix_secs = fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64);
+    sift::ArtifactFreshness {
+        observed_unix_secs,
+        modified_unix_secs,
+    }
+}
+
+fn parse_exact_search_output(
+    search_path: &Path,
+    limit: usize,
+    raw: &str,
+) -> Result<sift::SearchResponse> {
+    if limit == 0 {
+        return Ok(sift::SearchResponse {
+            strategy: "exact".to_string(),
+            root: search_path.display().to_string(),
+            indexed_artifacts: 0,
+            skipped_artifacts: 0,
+            coverage: empty_search_coverage(),
+            hits: Vec::new(),
+        });
+    }
+
+    let mut hits = Vec::new();
+    for line in raw.lines() {
+        let event: RipgrepJsonEvent =
+            serde_json::from_str(line).context("parsing ripgrep exact-search output")?;
+        let RipgrepJsonEvent::Match { data } = event else {
+            continue;
+        };
+        let Some(path_text) = data.path.text else {
+            continue;
+        };
+        let Some(lines_text) = data.lines.text else {
+            continue;
+        };
+        let path = PathBuf::from(path_text);
+        let snippet = lines_text.trim_end_matches(['\r', '\n']).to_string();
+        let rank = hits.len() + 1;
+        hits.push(sift::SearchHit {
+            artifact_id: format!(
+                "exact:{}:{}:{}",
+                path.display(),
+                data.line_number.unwrap_or(0),
+                rank
+            ),
+            artifact_kind: sift::ContextArtifactKind::File,
+            path: path.display().to_string(),
+            rank,
+            score: (limit.saturating_sub(rank).saturating_add(1)) as f64,
+            confidence: sift::ScoreConfidence::High,
+            location: data.line_number.map(|line| format!("line {}", line)),
+            snippet: snippet.clone(),
+            provenance: sift::ArtifactProvenance {
+                adapter: sift::AcquisitionAdapterKind::FileSystem,
+                source: "ripgrep -F".to_string(),
+                synthetic: false,
+            },
+            freshness: exact_search_file_timestamp(&path),
+            budget: sift::ArtifactBudget::from_text(&snippet, 1),
+        });
+        if hits.len() >= limit {
+            break;
+        }
+    }
+
+    Ok(sift::SearchResponse {
+        strategy: "exact".to_string(),
+        root: search_path.display().to_string(),
+        indexed_artifacts: hits.len(),
+        skipped_artifacts: 0,
+        coverage: empty_search_coverage(),
+        hits,
+    })
+}
+
+fn exact_search_response_from_process(
+    search_path: &Path,
+    limit: usize,
+    status: std::process::ExitStatus,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<sift::SearchResponse> {
+    if !status.success() && status.code() != Some(1) {
+        let message = String::from_utf8_lossy(stderr);
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            bail!("ripgrep exact search exited with status {}", status);
+        }
+        bail!("{}", trimmed);
+    }
+
+    let raw = String::from_utf8(stdout.to_vec()).context("decoding ripgrep exact-search output")?;
+    parse_exact_search_output(search_path, limit, &raw)
+}
+
+fn run_exact_search(search_path: &Path, query: &str, limit: usize) -> Result<sift::SearchResponse> {
+    let output = exact_search_command(search_path, query)
+        .output()
+        .context("running exact search with ripgrep")?;
+    exact_search_response_from_process(
+        search_path,
+        limit,
+        output.status,
+        &output.stdout,
+        &output.stderr,
+    )
+}
+
+fn run_exact_search_with_timeout(
+    search_path: &Path,
+    query: &str,
+    limit: usize,
+    timeout_secs: u64,
+) -> Result<sift::SearchResponse> {
+    if timeout_secs == 0 {
+        return run_exact_search(search_path, query, limit);
+    }
+
+    let mut child = exact_search_command(search_path, query)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning timed exact search worker")?;
+
+    let timeout = Duration::from_secs(timeout_secs);
+    let status = wait_for_child_exit(&mut child, timeout)
+        .context("waiting for timed exact search worker")?;
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("{}", exact_search_timeout_message(timeout_secs));
+    }
+
+    let status = status.unwrap();
+    let stdout = read_child_stdout(&mut child)?;
+    let stderr = read_child_stderr(&mut child)?;
+    exact_search_response_from_process(
+        search_path,
+        limit,
+        status,
+        stdout.as_bytes(),
+        stderr.as_bytes(),
+    )
 }
 
 fn run_search_with_timeout(
@@ -8199,6 +8559,15 @@ fn read_child_stderr(child: &mut std::process::Child) -> Result<String> {
             .context("reading search worker stderr")?;
     }
     Ok(stderr)
+}
+
+fn read_child_stdout(child: &mut std::process::Child) -> Result<String> {
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_string(&mut stdout)
+            .context("reading search worker stdout")?;
+    }
+    Ok(stdout)
 }
 
 fn maybe_apply_search_worker_test_hooks() -> Result<()> {

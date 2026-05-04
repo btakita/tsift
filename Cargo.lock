@@ -3182,7 +3182,7 @@ dependencies = [
 
 [[package]]
 name = "tsift"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3992,3 +3992,11 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "agent-kit"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "tmux-router"
+version = "0.3.10"
