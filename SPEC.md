@@ -123,6 +123,8 @@ Opt-in recovery:
 
 `tsift search` still wraps the sift engine call in a 30-second timeout (configurable via `--timeout`). Timed searches now run in an internal helper process so a timeout kills the underlying sift work instead of leaving a detached worker thread behind. The timeout remains a backstop for genuinely slow lexical searches or for sessions that reach search without a usable index.
 
+Both the in-process lexical path and the timed `__search-worker` helper now point sift at a stable `.tsift/search-cache` directory under the resolved project/workspace root. That keeps corpus/BM25 artifacts reusable across repeated searches, including scoped and federated queries that execute from subpaths but still belong to the same root-owned `.tsift/` state.
+
 When an index is present, the AST symbol-ranking prepass is now bounded: SQLite only pulls exact-name rows and overlapping-tag candidates, orders them by exact/tag overlap, and caps that candidate scan to the requested search `--limit` instead of loading the full `symbols` table into memory first.
 
 On stale existing indexes, search exits early with a message like:

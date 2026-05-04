@@ -99,6 +99,8 @@ enum Commands {
         #[arg(long)]
         path: PathBuf,
         #[arg(long)]
+        cache_dir: PathBuf,
+        #[arg(long)]
         query: String,
         #[arg(long)]
         limit: usize,
@@ -435,11 +437,12 @@ fn main() -> Result<()> {
         ),
         Some(Commands::SearchWorker {
             path,
+            cache_dir,
             query,
             limit,
             strategy,
             output,
-        }) => cmd_search_worker(&path, &query, limit, &strategy, &output),
+        }) => cmd_search_worker(&path, &cache_dir, &query, limit, &strategy, &output),
         Some(Commands::Edit { dry_run, file }) => {
             cmd_edit(dry_run, file, compact, pretty, terse, schema)
         }
@@ -3416,16 +3419,16 @@ fn precheck_search_indexes(
     let mut stale_targets = Vec::new();
 
     for target in &targets {
-        match inspect_search_index(&target)? {
+        match inspect_search_index(target)? {
             SearchIndexState::Missing => {
                 if autoindex {
-                    apply_search_index_update(root, &target)?;
+                    apply_search_index_update(root, target)?;
                 }
             }
             SearchIndexState::Fresh => {}
             SearchIndexState::Stale { stale_files } => {
                 if autoindex {
-                    apply_search_index_update(root, &target)?;
+                    apply_search_index_update(root, target)?;
                 } else {
                     stale_targets.push(RebuildSearchTarget {
                         label: target.label.clone(),
@@ -3492,6 +3495,7 @@ fn cmd_search(
 ) -> Result<()> {
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
     let root = lint::resolve_project_root_or_canonical_path(&base_path)?;
+    let search_cache_dir = root.join(".tsift/search-cache");
     let search_targets =
         precheck_search_indexes(&root, &base_path, scope.as_deref(), federated, autoindex)?;
     maybe_apply_search_post_precheck_test_hooks()?;
@@ -3543,10 +3547,18 @@ fn cmd_search(
 
     let effective_strategy = strategy.unwrap_or_else(|| "lexical".to_string());
     let response = if federated && scope.is_none() {
-        federated_sift_search(&root, &query, limit, timeout_secs, &effective_strategy)?
+        federated_sift_search(
+            &root,
+            &search_cache_dir,
+            &query,
+            limit,
+            timeout_secs,
+            &effective_strategy,
+        )?
     } else {
         run_search_with_timeout(
             &sift_path,
+            &search_cache_dir,
             &query,
             limit,
             timeout_secs,
@@ -3872,13 +3884,14 @@ fn cmd_lint(
 
 fn cmd_search_worker(
     path: &Path,
+    cache_dir: &Path,
     query: &str,
     limit: usize,
     strategy: &str,
     output: &Path,
 ) -> Result<()> {
     maybe_apply_search_worker_test_hooks()?;
-    let response = run_sift_search(path, query, limit, strategy)?;
+    let response = run_sift_search(path, cache_dir, query, limit, strategy)?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -5238,7 +5251,15 @@ tier = "isolated"
         )
         .unwrap();
 
-        let response = federated_sift_search(dir.path(), "fn", 10, 0, "lexical").unwrap();
+        let response = federated_sift_search(
+            dir.path(),
+            &dir.path().join(".tsift/search-cache"),
+            "fn",
+            10,
+            0,
+            "lexical",
+        )
+        .unwrap();
 
         assert!(
             !response.hits.is_empty(),
@@ -5285,7 +5306,15 @@ tier = "private"
         )
         .unwrap();
 
-        let response = federated_sift_search(dir.path(), "fn", 10, 0, "lexical").unwrap();
+        let response = federated_sift_search(
+            dir.path(),
+            &dir.path().join(".tsift/search-cache"),
+            "fn",
+            10,
+            0,
+            "lexical",
+        )
+        .unwrap();
 
         assert!(
             !response.hits.is_empty(),
@@ -6766,18 +6795,28 @@ tier = "private"
     fn search_direct_runs_ok() {
         let dir = tempfile::tempdir().unwrap();
         let search_dir = dir.path().to_path_buf();
+        let cache_dir = search_dir.join(".tsift/search-cache");
         std::fs::write(search_dir.join("test.rs"), "fn main() {}").unwrap();
-        let result = run_sift_search(&search_dir, "main", 1, "lexical");
+        let result = run_sift_search(&search_dir, &cache_dir, "main", 1, "lexical");
         assert!(result.is_ok(), "direct search should succeed");
+        assert!(
+            cache_dir.exists(),
+            "search should create the configured cache dir"
+        );
     }
 
     #[test]
     fn search_timeout_zero_disables_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let search_dir = dir.path().to_path_buf();
+        let cache_dir = search_dir.join(".tsift/search-cache");
         std::fs::write(search_dir.join("test.rs"), "fn main() {}").unwrap();
-        let result = run_search_with_timeout(&search_dir, "main", 1, 0, "lexical", &[]);
+        let result = run_search_with_timeout(&search_dir, &cache_dir, "main", 1, 0, "lexical", &[]);
         assert!(result.is_ok(), "timeout=0 should still work (no timeout)");
+        assert!(
+            cache_dir.exists(),
+            "timeout=0 should keep using the stable search cache dir"
+        );
     }
 
     #[test]
@@ -7973,6 +8012,7 @@ fn merge_search_responses(
 
 fn federated_sift_search(
     root: &Path,
+    cache_dir: &Path,
     query: &str,
     limit: usize,
     timeout_secs: u64,
@@ -7981,7 +8021,15 @@ fn federated_sift_search(
     let targets = resolve_search_index_targets(root, root, None, true)?;
     if targets.is_empty() {
         if config::Config::submodule_dirs(root)?.is_empty() {
-            return run_search_with_timeout(root, query, limit, timeout_secs, strategy, &[]);
+            return run_search_with_timeout(
+                root,
+                cache_dir,
+                query,
+                limit,
+                timeout_secs,
+                strategy,
+                &[],
+            );
         }
         return Ok(empty_search_response(root, strategy));
     }
@@ -7990,6 +8038,7 @@ fn federated_sift_search(
     for target in &targets {
         let mut response = run_search_with_timeout(
             &target.source_root,
+            cache_dir,
             query,
             limit,
             timeout_secs,
@@ -8035,11 +8084,12 @@ fn federated_symbol_search(
 
 fn run_sift_search(
     search_path: &Path,
+    cache_dir: &Path,
     query: &str,
     limit: usize,
     strategy: &str,
 ) -> Result<sift::SearchResponse> {
-    let engine = Sift::builder().build();
+    let engine = Sift::builder().with_cache_dir(cache_dir).build();
     let options = SearchOptions::default()
         .with_limit(limit)
         .with_strategy(strategy.to_string());
@@ -8049,6 +8099,7 @@ fn run_sift_search(
 
 fn run_search_with_timeout(
     search_path: &Path,
+    cache_dir: &Path,
     query: &str,
     limit: usize,
     timeout_secs: u64,
@@ -8056,7 +8107,7 @@ fn run_search_with_timeout(
     search_targets: &[SearchIndexTarget],
 ) -> Result<sift::SearchResponse> {
     if timeout_secs == 0 {
-        return run_sift_search(search_path, query, limit, strategy);
+        return run_sift_search(search_path, cache_dir, query, limit, strategy);
     }
 
     let output_path = next_search_worker_output_path();
@@ -8066,6 +8117,8 @@ fn run_search_with_timeout(
     .arg("__search-worker")
     .arg("--path")
     .arg(search_path)
+    .arg("--cache-dir")
+    .arg(cache_dir)
     .arg("--query")
     .arg(query)
     .arg("--limit")

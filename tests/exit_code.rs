@@ -2600,4 +2600,25 @@ fn search_timeout_zero_keeps_search_in_process() {
         !pid_file.exists(),
         "timeout=0 should not spawn the hidden search worker"
     );
+    assert!(
+        dir.path().join(".tsift/search-cache").exists(),
+        "timeout=0 should still populate the stable search cache dir"
+    );
+}
+
+#[test]
+fn search_worker_uses_stable_tsift_cache_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+    let output = tsift_bin()
+        .args(["search", "--path", dir.path().to_str().unwrap(), "main"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "search should succeed");
+    assert!(
+        dir.path().join(".tsift/search-cache").exists(),
+        "timed worker search should reuse the stable .tsift/search-cache dir"
+    );
 }
