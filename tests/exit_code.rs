@@ -3129,3 +3129,51 @@ fn identifier_like_default_search_uses_exact_backend_without_index() {
         "auto-exact routing should not build or require an index"
     );
 }
+
+#[test]
+fn exact_search_human_output_collapses_repeated_hits_by_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("notes.md"),
+        "claudescore-3 a\nclaudescore-3 b\nclaudescore-3 c\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("other.md"), "claudescore-3 d\n").unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "search",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "claudescore-3",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "search should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("File matches (2 files / 4 hits):"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("#1 [High] notes.md (hits: 3"), "{stdout}");
+    assert!(stdout.contains("(+1 more hits in file)"), "{stdout}");
+}
+
+#[test]
+fn explain_human_output_collapses_dense_edges_by_file() {
+    let dir = indexed_cli_fixture();
+
+    let output = tsift_bin()
+        .args(["explain", "alpha", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "explain should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Callers (3):"), "{stdout}");
+    assert!(
+        stdout.contains("main.rs (3): main, beta, gamma"),
+        "{stdout}"
+    );
+}

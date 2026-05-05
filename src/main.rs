@@ -1452,6 +1452,70 @@ fn symbol_path_summary(path: &[String]) -> String {
     path.join(" -> ")
 }
 
+const SEARCH_GROUP_SAMPLE_LIMIT: usize = 2;
+
+struct SearchHitGroup {
+    path: String,
+    first_rank: usize,
+    top_score: f64,
+    confidence: String,
+    hits: usize,
+    samples: Vec<String>,
+}
+
+fn format_search_sample(hit: &sift::SearchHit) -> Option<String> {
+    let snippet = compact_snippet(&hit.snippet)?;
+    Some(match hit.location.as_deref() {
+        Some(location) => format!("{location}: {snippet}"),
+        None => snippet,
+    })
+}
+
+fn group_search_hits(hits: &[sift::SearchHit], root: &Path, absolute: bool) -> Vec<SearchHitGroup> {
+    let mut positions = BTreeMap::new();
+    let mut groups = Vec::new();
+    for hit in hits {
+        let path = if absolute {
+            hit.path.clone()
+        } else {
+            relativize(&hit.path, root)
+        };
+        let entry = positions.entry(path.clone()).or_insert_with(|| {
+            groups.push(SearchHitGroup {
+                path: path.clone(),
+                first_rank: hit.rank,
+                top_score: hit.score,
+                confidence: format!("{:?}", hit.confidence),
+                hits: 0,
+                samples: Vec::new(),
+            });
+            groups.len() - 1
+        });
+        let group = &mut groups[*entry];
+        group.hits += 1;
+        if hit.rank < group.first_rank {
+            group.first_rank = hit.rank;
+        }
+        if hit.score > group.top_score {
+            group.top_score = hit.score;
+        }
+        if let Some(sample) = format_search_sample(hit)
+            && group.samples.len() < SEARCH_GROUP_SAMPLE_LIMIT
+            && !group.samples.contains(&sample)
+        {
+            group.samples.push(sample);
+        }
+    }
+    groups.sort_by_key(|group| group.first_rank);
+    groups
+}
+
+fn should_collapse_search_hits(hits: &[sift::SearchHit], root: &Path, absolute: bool) -> bool {
+    let groups = group_search_hits(hits, root, absolute);
+    let max_hits_per_file = groups.iter().map(|group| group.hits).max().unwrap_or(0);
+    max_hits_per_file >= 3 || (hits.len() >= 6 && groups.len() < hits.len())
+}
+
 fn format_edge_groups(edges: &[index::StoredEdge], use_callers: bool) -> Vec<String> {
     let mut grouped: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for edge in edges {
@@ -1469,8 +1533,17 @@ fn format_edge_groups(edges: &[index::StoredEdge], use_callers: bool) -> Vec<Str
 
     grouped
         .into_iter()
-        .map(|(file, names)| format!("  {}: {}", file, names.join(", ")))
+        .map(|(file, names)| format!("  {} ({}): {}", file, names.len(), names.join(", ")))
         .collect()
+}
+
+fn should_collapse_edge_groups(edges: &[index::StoredEdge]) -> bool {
+    let mut grouped: BTreeMap<&str, usize> = BTreeMap::new();
+    for edge in edges {
+        *grouped.entry(edge.caller_file.as_str()).or_default() += 1;
+    }
+    let max_hits_per_file = grouped.values().copied().max().unwrap_or(0);
+    max_hits_per_file >= 3 || (edges.len() >= 6 && grouped.len() < edges.len())
 }
 
 /// Apply a single edit operation to file contents. Returns new content.
@@ -2643,6 +2716,16 @@ fn cmd_explain(
         println!("Callers ({}):", callers_total);
         if callers.is_empty() {
             println!("  (none)");
+        } else if should_collapse_edge_groups(&callers) {
+            for line in format_edge_groups(&callers, true) {
+                println!("{line}");
+            }
+            if callers_truncated {
+                println!(
+                    "  (+{} more callers, use --limit 0 to show all)",
+                    callers_total - limit
+                );
+            }
         } else {
             for edge in &callers {
                 println!(
@@ -2662,6 +2745,16 @@ fn cmd_explain(
         println!("Callees ({}):", callees_total);
         if callees.is_empty() {
             println!("  (none)");
+        } else if should_collapse_edge_groups(&callees) {
+            for line in format_edge_groups(&callees, false) {
+                println!("{line}");
+            }
+            if callees_truncated {
+                println!(
+                    "  (+{} more callees, use --limit 0 to show all)",
+                    callees_total - limit
+                );
+            }
         } else {
             for edge in &callees {
                 println!(
@@ -4735,30 +4828,49 @@ fn cmd_search(
         }
 
         println!("hits[{}]:", response.hits.len());
-        for hit in &response.hits {
-            let hp = if absolute {
-                hit.path.clone()
-            } else {
-                relativize(&hit.path, &root)
-            };
-            let snippet = compact_snippet(&hit.snippet).unwrap_or_default();
-            if snippet.is_empty() {
+        if should_collapse_search_hits(&response.hits, &root, absolute) {
+            for group in group_search_hits(&response.hits, &root, absolute) {
+                let sample_suffix = if group.samples.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", group.samples.join(" | "))
+                };
                 println!(
-                    "  {}. {} [{:?} {}]",
-                    hit.rank,
-                    hp,
-                    hit.confidence,
-                    format_score(hit.score, true)
+                    "  {}. {} [{} {} hits:{}]{}",
+                    group.first_rank,
+                    group.path,
+                    group.confidence,
+                    format_score(group.top_score, true),
+                    group.hits,
+                    sample_suffix
                 );
-            } else {
-                println!(
-                    "  {}. {} [{:?} {}] {}",
-                    hit.rank,
-                    hp,
-                    hit.confidence,
-                    format_score(hit.score, true),
-                    snippet
-                );
+            }
+        } else {
+            for hit in &response.hits {
+                let hp = if absolute {
+                    hit.path.clone()
+                } else {
+                    relativize(&hit.path, &root)
+                };
+                let snippet = compact_snippet(&hit.snippet).unwrap_or_default();
+                if snippet.is_empty() {
+                    println!(
+                        "  {}. {} [{:?} {}]",
+                        hit.rank,
+                        hp,
+                        hit.confidence,
+                        format_score(hit.score, true)
+                    );
+                } else {
+                    println!(
+                        "  {}. {} [{:?} {}] {}",
+                        hit.rank,
+                        hp,
+                        hit.confidence,
+                        format_score(hit.score, true),
+                        snippet
+                    );
+                }
             }
         }
         if symbol_hits.is_empty() && response.hits.is_empty() {
@@ -4788,22 +4900,46 @@ fn cmd_search(
             response.strategy, response.indexed_artifacts, response.skipped_artifacts
         );
         println!();
-        for hit in &response.hits {
-            let hp = if absolute {
-                hit.path.clone()
-            } else {
-                relativize(&hit.path, &root)
-            };
+        if should_collapse_search_hits(&response.hits, &root, absolute) {
+            let groups = group_search_hits(&response.hits, &root, absolute);
             println!(
-                "  #{} [{:?}] {} (score: {:.4})",
-                hit.rank, hit.confidence, hp, hit.score
+                "File matches ({} files / {} hits):",
+                groups.len(),
+                response.hits.len()
             );
-            if !hit.snippet.is_empty() {
-                for line in hit.snippet.lines().take(3) {
-                    println!("    {}", line);
-                }
-            }
             println!();
+            for group in groups {
+                println!(
+                    "  #{} [{}] {} (hits: {}, top score: {:.4})",
+                    group.first_rank, group.confidence, group.path, group.hits, group.top_score
+                );
+                for sample in &group.samples {
+                    println!("    {}", sample);
+                }
+                let hidden_hits = group.hits.saturating_sub(group.samples.len());
+                if hidden_hits > 0 {
+                    println!("    (+{} more hits in file)", hidden_hits);
+                }
+                println!();
+            }
+        } else {
+            for hit in &response.hits {
+                let hp = if absolute {
+                    hit.path.clone()
+                } else {
+                    relativize(&hit.path, &root)
+                };
+                println!(
+                    "  #{} [{:?}] {} (score: {:.4})",
+                    hit.rank, hit.confidence, hp, hit.score
+                );
+                if !hit.snippet.is_empty() {
+                    for line in hit.snippet.lines().take(3) {
+                        println!("    {}", line);
+                    }
+                }
+                println!();
+            }
         }
         if symbol_hits.is_empty() && response.hits.is_empty() {
             println!("  No results.");
@@ -6266,7 +6402,111 @@ mod tests {
             },
         ];
         let lines = format_edge_groups(&edges, false);
-        assert_eq!(lines, vec!["  src/main.rs: helper, render"]);
+        assert_eq!(lines, vec!["  src/main.rs (2): helper, render"]);
+    }
+
+    #[test]
+    fn search_hit_groups_preserve_file_counts_and_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let main_rs = root.join("src/main.rs");
+        fs::create_dir_all(main_rs.parent().unwrap()).unwrap();
+        fs::write(&main_rs, "claudescore-3 anchor\nclaudescore-3 follow-up\n").unwrap();
+        let freshness = exact_search_file_timestamp(&main_rs);
+        let hits = vec![
+            sift::SearchHit {
+                artifact_id: "a".to_string(),
+                artifact_kind: sift::ContextArtifactKind::File,
+                path: main_rs.display().to_string(),
+                rank: 1,
+                score: 10.0,
+                confidence: sift::ScoreConfidence::High,
+                location: Some("line 3".to_string()),
+                snippet: "claudescore-3 anchor".to_string(),
+                provenance: sift::ArtifactProvenance {
+                    adapter: sift::AcquisitionAdapterKind::FileSystem,
+                    source: "ripgrep -F".to_string(),
+                    synthetic: false,
+                },
+                freshness: freshness.clone(),
+                budget: sift::ArtifactBudget::from_text("claudescore-3 anchor", 1),
+            },
+            sift::SearchHit {
+                artifact_id: "b".to_string(),
+                artifact_kind: sift::ContextArtifactKind::File,
+                path: main_rs.display().to_string(),
+                rank: 2,
+                score: 9.0,
+                confidence: sift::ScoreConfidence::High,
+                location: Some("line 7".to_string()),
+                snippet: "claudescore-3 follow-up".to_string(),
+                provenance: sift::ArtifactProvenance {
+                    adapter: sift::AcquisitionAdapterKind::FileSystem,
+                    source: "ripgrep -F".to_string(),
+                    synthetic: false,
+                },
+                freshness: freshness.clone(),
+                budget: sift::ArtifactBudget::from_text("claudescore-3 follow-up", 1),
+            },
+            sift::SearchHit {
+                artifact_id: "c".to_string(),
+                artifact_kind: sift::ContextArtifactKind::File,
+                path: main_rs.display().to_string(),
+                rank: 3,
+                score: 8.0,
+                confidence: sift::ScoreConfidence::High,
+                location: Some("line 9".to_string()),
+                snippet: "claudescore-3 tail".to_string(),
+                provenance: sift::ArtifactProvenance {
+                    adapter: sift::AcquisitionAdapterKind::FileSystem,
+                    source: "ripgrep -F".to_string(),
+                    synthetic: false,
+                },
+                freshness,
+                budget: sift::ArtifactBudget::from_text("claudescore-3 tail", 1),
+            },
+        ];
+
+        let groups = group_search_hits(&hits, root, false);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].path, "src/main.rs");
+        assert_eq!(groups[0].hits, 3);
+        assert_eq!(
+            groups[0].samples,
+            vec![
+                "line 3: claudescore-3 anchor".to_string(),
+                "line 7: claudescore-3 follow-up".to_string()
+            ]
+        );
+        assert!(should_collapse_search_hits(&hits, root, false));
+    }
+
+    #[test]
+    fn dense_edge_groups_trigger_collapse() {
+        let edges = vec![
+            index::StoredEdge {
+                caller_file: "src/main.rs".to_string(),
+                caller_name: "main".to_string(),
+                caller_line: 1,
+                callee_name: "helper".to_string(),
+                call_site_line: 2,
+            },
+            index::StoredEdge {
+                caller_file: "src/main.rs".to_string(),
+                caller_name: "beta".to_string(),
+                caller_line: 5,
+                callee_name: "helper".to_string(),
+                call_site_line: 6,
+            },
+            index::StoredEdge {
+                caller_file: "src/main.rs".to_string(),
+                caller_name: "gamma".to_string(),
+                caller_line: 9,
+                callee_name: "helper".to_string(),
+                call_site_line: 10,
+            },
+        ];
+        assert!(should_collapse_edge_groups(&edges));
     }
 
     // --- workspace indexing ---
@@ -10263,8 +10503,6 @@ fn exact_search_command(search_path: &Path, query: &str) -> Command {
         .arg("--fixed-strings")
         .arg("--line-number")
         .arg("--hidden")
-        .arg("--max-count")
-        .arg("1")
         .arg("--")
         .arg(query)
         .arg(search_path);
