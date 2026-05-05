@@ -82,6 +82,7 @@ tsift summarize --extract <path>  # batch LLM extraction (one-time; relative pat
 tsift summarize --extract --diff  # re-extract only git-changed files within the requested path
 tsift diff-digest [path]        # bounded git diff digest: changed files, symbols, summaries, call-edge deltas
 tsift test-digest --path . < test.log  # bounded test-output digest from stdin or --input
+tsift metric-digest < runs.json  # repeated metric-run digest: deltas, improvements, news-ready table
 tsift log-digest --path . < build.log  # bounded verbose-log digest from stdin or --input
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
 tsift search --exact <query>    # literal text lookup via `rg -F`
@@ -949,6 +950,34 @@ Behavior:
 4. When `.tsift/summaries.db` already has current rows for an anchored file, include up to two cached summary snippets; otherwise report `missing`, `stale`, or `unavailable` without mutating the cache.
 
 `test-digest` is intentionally transcript-only. It does not execute the test runner itself, and it keeps summary enrichment read-only so digesting noisy output never contends with `tsift summarize --extract`.
+
+## Metric Digest
+
+`tsift metric-digest` turns repeated metric-run histories into bounded deltas for agent context and news updates.
+
+```bash
+tsift metric-digest --input runs.json
+tsift metric-digest --baseline yesterday.json --input today.json --metric session_mae --metric composite_score
+cat benchmark-runs.ndjson | tsift metric-digest --lower-is-better session_mae --higher-is-better composite_score
+```
+
+Accepted input shapes:
+
+- a single JSON object with a `metrics` map
+- a JSON object with `runs: [...]`
+- a JSON array of run objects
+- NDJSON with one run object per line
+
+Each run object may include `label`, `id`, and `timestamp`, plus either `metrics: {key: number}` or inline numeric metric fields.
+
+Behavior:
+
+1. Read run history from stdin by default, or from `--input <file>`.
+2. Compare the latest input run against `--baseline <file>` when present; otherwise compare it against the previous run in the same history.
+3. Infer common metric directions automatically (`mae`, `latency`, `cost`, `error` prefer lower; `score`, `accuracy`, `pass`, `throughput` prefer higher) and allow explicit `--lower-is-better` / `--higher-is-better` overrides.
+4. Emit bounded per-metric deltas, top improvements/regressions, and a markdown-ready history table suitable for session notes or news updates.
+
+`metric-digest` is intentionally schema-light. It does not execute the underlying benchmark/test/perf workflow, and it avoids hard-coding session-share-specific parsers so different run producers can feed the same digest surface.
 
 ## Log Digest
 

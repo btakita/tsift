@@ -2747,6 +2747,53 @@ at src/lib.rs:1:1
 }
 
 #[test]
+fn metric_digest_reads_run_history_from_stdin() {
+    let input = r#"{
+  "runs": [
+    {"label": "bootstrap-20260503", "metrics": {"session_mae": 1.11, "composite_score": 67.5, "cost_usd": 4.20}},
+    {"label": "bootstrap-20260504", "metrics": {"session_mae": 1.07, "composite_score": 69.4, "cost_usd": 4.60}}
+  ]
+}"#;
+
+    let mut child = tsift_bin()
+        .args(["metric-digest", "--json"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "metric-digest should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["runs_loaded"], 2);
+    assert_eq!(json["current_run"]["label"], "bootstrap-20260504");
+    assert_eq!(json["previous_run"]["label"], "bootstrap-20260503");
+    assert_eq!(json["shared_metrics"], 3);
+    assert!(
+        json["top_improvements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|delta| delta["metric"] == "session_mae")
+    );
+    assert!(
+        json["news_table_markdown"]
+            .as_str()
+            .unwrap()
+            .contains("| run |")
+    );
+}
+
+#[test]
 fn digest_runner_preserves_failing_test_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();

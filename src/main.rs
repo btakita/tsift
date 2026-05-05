@@ -23,6 +23,7 @@ pub mod init;
 mod lang;
 pub mod lint;
 pub mod log_digest;
+pub mod metric_digest;
 pub mod status;
 pub mod summarize;
 pub mod test_digest;
@@ -379,6 +380,33 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Summarize repeated metric runs into compact deltas and news-ready tables
+    MetricDigest {
+        /// Read metric-run JSON from a file instead of stdin
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Optional baseline/history JSON to compare against
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        /// Focus the digest on specific metric keys (repeatable)
+        #[arg(long = "metric")]
+        metrics: Vec<String>,
+        /// Override the direction for metrics where lower values are better (repeatable)
+        #[arg(long = "lower-is-better")]
+        lower_is_better: Vec<String>,
+        /// Override the direction for metrics where higher values are better (repeatable)
+        #[arg(long = "higher-is-better")]
+        higher_is_better: Vec<String>,
+        /// Number of runs to keep in the emitted history/news table
+        #[arg(long, default_value = "3")]
+        history: usize,
+        /// Number of top improvements/regressions to emit
+        #[arg(long, default_value = "3")]
+        top: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Report index + summary status and recommended commands for this session
     Status {
         /// Path to the codebase (defaults to current directory)
@@ -426,6 +454,16 @@ struct OutputFormat {
     pretty: bool,
     terse: bool,
     schema: bool,
+}
+
+struct MetricDigestOptions<'a> {
+    input_path: Option<&'a Path>,
+    baseline_path: Option<&'a Path>,
+    metrics: &'a [String],
+    lower_is_better: &'a [String],
+    higher_is_better: &'a [String],
+    history: usize,
+    top: usize,
 }
 
 #[derive(Serialize)]
@@ -746,6 +784,33 @@ fn main() -> Result<()> {
         Some(Commands::LogDigest { path, input, json }) => cmd_log_digest(
             &path,
             input.as_deref(),
+            OutputFormat {
+                json_output: json || terse || schema,
+                compact,
+                pretty,
+                terse,
+                schema,
+            },
+        ),
+        Some(Commands::MetricDigest {
+            input,
+            baseline,
+            metrics,
+            lower_is_better,
+            higher_is_better,
+            history,
+            top,
+            json,
+        }) => cmd_metric_digest(
+            MetricDigestOptions {
+                input_path: input.as_deref(),
+                baseline_path: baseline.as_deref(),
+                metrics: &metrics,
+                lower_is_better: &lower_is_better,
+                higher_is_better: &higher_is_better,
+                history,
+                top,
+            },
             OutputFormat {
                 json_output: json || terse || schema,
                 compact,
@@ -3432,6 +3497,160 @@ fn render_log_digest_from_input(path: &Path, input: &str, format: OutputFormat) 
                 println!("    - {}", frame);
             }
         }
+    }
+
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    Ok(())
+}
+
+fn metric_digest_trend_label(trend: metric_digest::MetricDigestTrend) -> &'static str {
+    match trend {
+        metric_digest::MetricDigestTrend::Improved => "improved",
+        metric_digest::MetricDigestTrend::Regressed => "regressed",
+        metric_digest::MetricDigestTrend::Flat => "flat",
+        metric_digest::MetricDigestTrend::Unknown => "changed",
+    }
+}
+
+fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: OutputFormat) -> Result<()> {
+    let input = match options.input_path {
+        Some(file_path) => fs::read_to_string(file_path)
+            .with_context(|| format!("reading metric input: {}", file_path.display()))?,
+        None => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("reading metric input from stdin")?;
+            buf
+        }
+    };
+    if input.trim().is_empty() {
+        bail!("no metric input provided; pass --input <file> or pipe JSON/NDJSON on stdin");
+    }
+
+    let baseline = match options.baseline_path {
+        Some(file_path) => Some(
+            fs::read_to_string(file_path)
+                .with_context(|| format!("reading metric baseline: {}", file_path.display()))?,
+        ),
+        None => None,
+    };
+
+    let report = metric_digest::compute(
+        &input,
+        baseline.as_deref(),
+        options.metrics,
+        options.lower_is_better,
+        options.higher_is_better,
+        options.history,
+        options.top,
+    )?;
+    if format.json_output {
+        println!(
+            "{}",
+            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+        );
+        return Ok(());
+    }
+
+    if format.compact {
+        let previous = report
+            .previous_run
+            .as_ref()
+            .map(|run| run.label.as_str())
+            .unwrap_or("-");
+        println!(
+            "metric runs:{} current:{} previous:{} metrics:{} imp:{} reg:{}",
+            report.runs_loaded,
+            report.current_run.label,
+            previous,
+            report.shared_metrics.max(report.current_run.metrics.len()),
+            report.top_improvements.len(),
+            report.top_regressions.len()
+        );
+        for delta in &report.metric_deltas {
+            println!(
+                "{} current:{} prev:{} delta:{} trend:{}",
+                delta.metric,
+                metric_digest::format_number(delta.current),
+                metric_digest::format_number(delta.previous),
+                metric_digest::format_number(delta.delta),
+                metric_digest_trend_label(delta.trend)
+            );
+        }
+        for warning in &report.warnings {
+            println!("warning: {warning}");
+        }
+        return Ok(());
+    }
+
+    println!("Metric digest");
+    println!("  runs loaded:    {}", report.runs_loaded);
+    println!("  current:        {}", report.current_run.label);
+    match report.previous_run.as_ref() {
+        Some(previous) => println!("  previous:       {}", previous.label),
+        None => println!("  previous:       (none)"),
+    }
+    println!("  shared metrics: {}", report.shared_metrics);
+
+    if report.metric_deltas.is_empty() {
+        println!();
+        println!("Current metrics:");
+        for (metric, value) in &report.current_run.metrics {
+            println!("  {}: {}", metric, metric_digest::format_number(*value));
+        }
+    } else {
+        println!();
+        println!("Current vs previous:");
+        for delta in &report.metric_deltas {
+            let percent = delta
+                .percent_delta
+                .map(|value| format!(", {value:+.2}%"))
+                .unwrap_or_default();
+            println!(
+                "  {}: {} (prev {}, delta {:+}{}; {})",
+                delta.metric,
+                metric_digest::format_number(delta.current),
+                metric_digest::format_number(delta.previous),
+                metric_digest::format_number(delta.delta),
+                percent,
+                metric_digest_trend_label(delta.trend)
+            );
+        }
+    }
+
+    if !report.top_improvements.is_empty() {
+        println!();
+        println!("Top improvements:");
+        for delta in &report.top_improvements {
+            println!(
+                "  {}: {} -> {}",
+                delta.metric,
+                metric_digest::format_number(delta.previous),
+                metric_digest::format_number(delta.current)
+            );
+        }
+    }
+
+    if !report.top_regressions.is_empty() {
+        println!();
+        println!("Top regressions:");
+        for delta in &report.top_regressions {
+            println!(
+                "  {}: {} -> {}",
+                delta.metric,
+                metric_digest::format_number(delta.previous),
+                metric_digest::format_number(delta.current)
+            );
+        }
+    }
+
+    if !report.news_table_markdown.is_empty() {
+        println!();
+        println!("News-ready table:");
+        println!("{}", report.news_table_markdown);
     }
 
     for warning in &report.warnings {
@@ -8052,6 +8271,48 @@ tier = "private"
                 assert_eq!(input, Some(PathBuf::from("target/build.log")));
             }
             _ => panic!("expected LogDigest command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_metric_digest_command() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "metric-digest",
+            "--input",
+            "target/runs.json",
+            "--baseline",
+            "target/prior.json",
+            "--metric",
+            "session_mae",
+            "--lower-is-better",
+            "session_mae",
+            "--history",
+            "4",
+            "--top",
+            "2",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::MetricDigest {
+                input,
+                baseline,
+                metrics,
+                lower_is_better,
+                history,
+                top,
+                json,
+                ..
+            }) => {
+                assert!(json);
+                assert_eq!(input, Some(PathBuf::from("target/runs.json")));
+                assert_eq!(baseline, Some(PathBuf::from("target/prior.json")));
+                assert_eq!(metrics, vec!["session_mae"]);
+                assert_eq!(lower_is_better, vec!["session_mae"]);
+                assert_eq!(history, 4);
+                assert_eq!(top, 2);
+            }
+            _ => panic!("expected MetricDigest command"),
         }
     }
 
