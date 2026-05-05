@@ -10,6 +10,20 @@ use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum DiffDigestMode {
+    WorkingTree,
+    Cached,
+    Revision,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiffDigestOptions<'a> {
+    pub cached: bool,
+    pub revision: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DiffDigestFileStatus {
     Added,
     Modified,
@@ -48,6 +62,9 @@ pub struct DiffDigestFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiffDigestReport {
     pub root: String,
+    pub mode: DiffDigestMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     pub files_changed: usize,
     pub files_with_current_summaries: usize,
     pub symbols_touched: usize,
@@ -63,9 +80,23 @@ struct ParsedSnapshot {
     warnings: Vec<String>,
 }
 
-pub fn compute(path: &Path) -> Result<DiffDigestReport> {
+#[derive(Debug, Clone)]
+enum SnapshotSource {
+    WorkingTree,
+    Index,
+    GitRef(String),
+}
+
+#[derive(Debug, Clone)]
+struct RevisionBounds {
+    base: Option<String>,
+    target: String,
+}
+
+pub fn compute(path: &Path, options: DiffDigestOptions<'_>) -> Result<DiffDigestReport> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    let changed = summarize::git_changed_files(&root)?;
+    let mode = resolve_mode(&root, options)?;
+    let changed = collect_changed_files(&root, &mode)?;
     let summary_db = open_summary_db_if_present(&root)?;
 
     let mut files = Vec::new();
@@ -74,18 +105,21 @@ pub fn compute(path: &Path) -> Result<DiffDigestReport> {
         if is_internal_tsift_artifact(&root, &file_path) {
             continue;
         }
-        let previous = git_head_file_bytes(&root, &file_path)?;
+        let previous = load_previous_bytes(&root, &mode, &file_path)?;
         let status = if previous.is_some() {
             DiffDigestFileStatus::Modified
         } else {
             DiffDigestFileStatus::Added
         };
+        let (current, warnings) = load_current_bytes(&root, &mode, &file_path);
         files.push(build_diff_file(
             &root,
             summary_db.as_ref(),
             &file_path,
             status,
             previous.as_deref(),
+            current.as_deref(),
+            warnings,
         )?);
     }
 
@@ -95,6 +129,7 @@ pub fn compute(path: &Path) -> Result<DiffDigestReport> {
         }
         files.push(build_deleted_diff_file(
             &root,
+            &mode,
             summary_db.as_ref(),
             &file_path,
         )?);
@@ -112,6 +147,8 @@ pub fn compute(path: &Path) -> Result<DiffDigestReport> {
 
     Ok(DiffDigestReport {
         root: root.display().to_string(),
+        mode: mode.report_mode(),
+        revision: mode.report_revision(),
         files_changed: files.len(),
         files_with_current_summaries,
         symbols_touched,
@@ -135,22 +172,15 @@ fn build_diff_file(
     file_path: &Path,
     status: DiffDigestFileStatus,
     previous_bytes: Option<&[u8]>,
+    current_bytes: Option<&[u8]>,
+    mut warnings: Vec<String>,
 ) -> Result<DiffDigestFile> {
     let rel_path = relative_git_path(root, file_path);
-    let mut warnings = Vec::new();
-    let current_bytes = match std::fs::read(file_path) {
-        Ok(bytes) => Some(bytes),
-        Err(err) => {
-            warnings.push(format!("reading current file failed: {err}"));
-            None
-        }
-    };
 
     let previous = previous_bytes
         .map(|bytes| parse_snapshot(file_path, bytes))
         .unwrap_or_default();
     let current = current_bytes
-        .as_deref()
         .map(|bytes| parse_snapshot(file_path, bytes))
         .unwrap_or_default();
     warnings.extend(previous.warnings);
@@ -160,7 +190,6 @@ fn build_diff_file(
     let added_call_edges = diff_edges(&current.edges, &previous.edges);
     let removed_call_edges = diff_edges(&previous.edges, &current.edges);
     let content_hash = current_bytes
-        .as_deref()
         .map(summarize::content_hash)
         .or_else(|| previous_bytes.map(summarize::content_hash));
     let (summary_state, current_summaries) = collect_current_summaries(
@@ -184,11 +213,12 @@ fn build_diff_file(
 
 fn build_deleted_diff_file(
     root: &Path,
+    mode: &ResolvedDiffDigestMode,
     summary_db: Option<&SummaryDb>,
     file_path: &Path,
 ) -> Result<DiffDigestFile> {
     let rel_path = relative_git_path(root, file_path);
-    let previous_bytes = git_head_file_bytes(root, file_path)?;
+    let previous_bytes = load_previous_bytes(root, mode, file_path)?;
     let previous = previous_bytes
         .as_deref()
         .map(|bytes| parse_snapshot(file_path, bytes))
@@ -336,19 +366,289 @@ fn is_internal_tsift_artifact(root: &Path, file_path: &Path) -> bool {
     rel_path == ".tsift" || rel_path.starts_with(".tsift/")
 }
 
-fn git_head_file_bytes(root: &Path, file_path: &Path) -> Result<Option<Vec<u8>>> {
+fn git_file_bytes(root: &Path, git_ref: &str, file_path: &Path) -> Result<Option<Vec<u8>>> {
     let rel_path = relative_git_path(root, file_path);
     let output = Command::new("git")
-        .args(["show", &format!("HEAD:{rel_path}")])
+        .args(["show", &format!("{git_ref}:{rel_path}")])
         .current_dir(root)
         .output()
-        .with_context(|| format!("running git show for {rel_path}"))?;
+        .with_context(|| format!("running git show {git_ref}:{rel_path}"))?;
 
     if output.status.success() {
         return Ok(Some(output.stdout));
     }
 
     Ok(None)
+}
+
+fn git_index_file_bytes(root: &Path, file_path: &Path) -> Result<Option<Vec<u8>>> {
+    let rel_path = relative_git_path(root, file_path);
+    let output = Command::new("git")
+        .args(["show", &format!(":{rel_path}")])
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("running git show :{rel_path}"))?;
+
+    if output.status.success() {
+        return Ok(Some(output.stdout));
+    }
+
+    Ok(None)
+}
+
+#[derive(Debug, Clone)]
+enum ResolvedDiffDigestMode {
+    WorkingTree,
+    Cached,
+    Revision(RevisionBounds),
+}
+
+impl ResolvedDiffDigestMode {
+    fn report_mode(&self) -> DiffDigestMode {
+        match self {
+            Self::WorkingTree => DiffDigestMode::WorkingTree,
+            Self::Cached => DiffDigestMode::Cached,
+            Self::Revision(_) => DiffDigestMode::Revision,
+        }
+    }
+
+    fn report_revision(&self) -> Option<String> {
+        match self {
+            Self::Revision(bounds) => Some(bounds.target.clone()),
+            _ => None,
+        }
+    }
+
+    fn previous_source(&self) -> Option<SnapshotSource> {
+        match self {
+            Self::WorkingTree | Self::Cached => Some(SnapshotSource::GitRef("HEAD".to_string())),
+            Self::Revision(bounds) => bounds
+                .base
+                .as_ref()
+                .map(|base| SnapshotSource::GitRef(base.clone())),
+        }
+    }
+
+    fn current_source(&self) -> SnapshotSource {
+        match self {
+            Self::WorkingTree => SnapshotSource::WorkingTree,
+            Self::Cached => SnapshotSource::Index,
+            Self::Revision(bounds) => SnapshotSource::GitRef(bounds.target.clone()),
+        }
+    }
+}
+
+fn resolve_mode(root: &Path, options: DiffDigestOptions<'_>) -> Result<ResolvedDiffDigestMode> {
+    match (options.cached, options.revision) {
+        (true, Some(_)) => {
+            anyhow::bail!("diff-digest accepts either --cached or --revision, not both")
+        }
+        (true, None) => Ok(ResolvedDiffDigestMode::Cached),
+        (false, Some(revision)) => Ok(ResolvedDiffDigestMode::Revision(resolve_revision_bounds(
+            root, revision,
+        )?)),
+        (false, None) => Ok(ResolvedDiffDigestMode::WorkingTree),
+    }
+}
+
+fn collect_changed_files(
+    root: &Path,
+    mode: &ResolvedDiffDigestMode,
+) -> Result<summarize::GitChangedFiles> {
+    match mode {
+        ResolvedDiffDigestMode::WorkingTree => summarize::git_changed_files(root),
+        ResolvedDiffDigestMode::Cached => git_changed_files_from_args(
+            root,
+            if git_has_head_commit(root)? {
+                &[
+                    "diff",
+                    "--cached",
+                    "--name-status",
+                    "--find-renames",
+                    "HEAD",
+                ]
+            } else {
+                &[
+                    "diff",
+                    "--cached",
+                    "--name-status",
+                    "--find-renames",
+                    "--root",
+                ]
+            },
+            "git diff --cached --name-status",
+        ),
+        ResolvedDiffDigestMode::Revision(bounds) => git_changed_files_for_revision(root, bounds),
+    }
+}
+
+fn git_changed_files_for_revision(
+    root: &Path,
+    bounds: &RevisionBounds,
+) -> Result<summarize::GitChangedFiles> {
+    if let Some(base) = &bounds.base {
+        return git_changed_files_from_args(
+            root,
+            &[
+                "diff",
+                "--name-status",
+                "--find-renames",
+                base,
+                &bounds.target,
+            ],
+            "git diff --name-status",
+        );
+    }
+
+    git_changed_files_from_args(
+        root,
+        &[
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "-r",
+            "--name-status",
+            "--find-renames",
+            &bounds.target,
+        ],
+        "git diff-tree --root --name-status",
+    )
+}
+
+fn git_changed_files_from_args(
+    root: &Path,
+    args: &[&str],
+    label: &str,
+) -> Result<summarize::GitChangedFiles> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("running {label}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("{label} failed: {}", stderr.trim());
+    }
+
+    let mut existing = Vec::new();
+    let mut deleted = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let status = fields.next().unwrap_or_default();
+        match status.chars().next() {
+            Some('D') => {
+                let path = fields
+                    .next()
+                    .with_context(|| format!("parsing deleted git path: {line}"))?;
+                deleted.push(root.join(path));
+            }
+            Some('R') => {
+                let old_path = fields
+                    .next()
+                    .with_context(|| format!("parsing renamed git old path: {line}"))?;
+                let new_path = fields
+                    .next()
+                    .with_context(|| format!("parsing renamed git new path: {line}"))?;
+                deleted.push(root.join(old_path));
+                existing.push(root.join(new_path));
+            }
+            Some(_) => {
+                let path = fields
+                    .next_back()
+                    .or_else(|| fields.next())
+                    .with_context(|| format!("parsing changed git path: {line}"))?;
+                existing.push(root.join(path));
+            }
+            None => {}
+        }
+    }
+
+    existing.sort();
+    existing.dedup();
+    deleted.sort();
+    deleted.dedup();
+    Ok(summarize::GitChangedFiles { existing, deleted })
+}
+
+fn load_previous_bytes(
+    root: &Path,
+    mode: &ResolvedDiffDigestMode,
+    file_path: &Path,
+) -> Result<Option<Vec<u8>>> {
+    let Some(source) = mode.previous_source() else {
+        return Ok(None);
+    };
+    load_snapshot_bytes(root, file_path, &source)
+}
+
+fn load_current_bytes(
+    root: &Path,
+    mode: &ResolvedDiffDigestMode,
+    file_path: &Path,
+) -> (Option<Vec<u8>>, Vec<String>) {
+    match load_snapshot_bytes(root, file_path, &mode.current_source()) {
+        Ok(bytes) => (bytes, Vec::new()),
+        Err(err) if matches!(mode.current_source(), SnapshotSource::WorkingTree) => {
+            (None, vec![format!("reading current file failed: {err}")])
+        }
+        Err(err) => (
+            None,
+            vec![format!("loading current snapshot failed: {err}")],
+        ),
+    }
+}
+
+fn load_snapshot_bytes(
+    root: &Path,
+    file_path: &Path,
+    source: &SnapshotSource,
+) -> Result<Option<Vec<u8>>> {
+    match source {
+        SnapshotSource::WorkingTree => {
+            Ok(Some(std::fs::read(file_path).with_context(|| {
+                format!("reading working tree file {}", file_path.display())
+            })?))
+        }
+        SnapshotSource::Index => git_index_file_bytes(root, file_path),
+        SnapshotSource::GitRef(git_ref) => git_file_bytes(root, git_ref, file_path),
+    }
+}
+
+fn resolve_revision_bounds(root: &Path, revision: &str) -> Result<RevisionBounds> {
+    let output = Command::new("git")
+        .args(["rev-list", "--parents", "-n", "1", revision])
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("running git rev-list for {revision}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git rev-list --parents failed: {}", stderr.trim());
+    }
+
+    let line = String::from_utf8_lossy(&output.stdout);
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.is_empty() {
+        anyhow::bail!("git rev-list returned no commit for revision `{revision}`");
+    }
+
+    let target = fields[0].to_string();
+    let base = fields.get(1).map(|parent| (*parent).to_string());
+    Ok(RevisionBounds { base, target })
+}
+
+fn git_has_head_commit(root: &Path) -> Result<bool> {
+    let verify_head = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .current_dir(root)
+        .output()
+        .with_context(|| "running git rev-parse --verify HEAD")?;
+
+    Ok(verify_head.status.success())
 }
 
 #[cfg(test)]
@@ -423,8 +723,10 @@ mod tests {
                 .unwrap();
         }
 
-        let report = compute(dir.path()).unwrap();
+        let report = compute(dir.path(), DiffDigestOptions::default()).unwrap();
         assert_eq!(report.files_changed, 1);
+        assert_eq!(report.mode, DiffDigestMode::WorkingTree);
+        assert_eq!(report.revision, None);
         assert_eq!(report.files_with_current_summaries, 1);
         assert_eq!(report.symbols_touched, 3);
         assert_eq!(report.call_edges_added, 1);
@@ -461,6 +763,134 @@ mod tests {
         assert_eq!(
             file.removed_call_edges,
             vec!["main -> old_helper".to_string()]
+        );
+    }
+
+    #[test]
+    fn diff_digest_cached_uses_index_snapshot_instead_of_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("main.rs");
+        std::fs::write(
+            &file_path,
+            "fn old_helper() {}\nfn main() { old_helper(); }\n",
+        )
+        .unwrap();
+        init_git_repo(dir.path());
+
+        std::fs::write(
+            &file_path,
+            "fn staged_helper() {}\nfn main() { staged_helper(); }\n",
+        )
+        .unwrap();
+        let status = Command::new("git")
+            .args(["add", "main.rs"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git add failed");
+
+        std::fs::write(
+            &file_path,
+            "fn unstaged_helper() {}\nfn main() { unstaged_helper(); }\n",
+        )
+        .unwrap();
+
+        let report = compute(
+            dir.path(),
+            DiffDigestOptions {
+                cached: true,
+                revision: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.mode, DiffDigestMode::Cached);
+        let file = &report.files[0];
+        assert!(
+            file.touched_symbols
+                .iter()
+                .any(|symbol| symbol == "staged_helper")
+        );
+        assert!(
+            !file
+                .touched_symbols
+                .iter()
+                .any(|symbol| symbol == "unstaged_helper")
+        );
+        assert_eq!(
+            file.added_call_edges,
+            vec!["main -> staged_helper".to_string()]
+        );
+    }
+
+    #[test]
+    fn diff_digest_revision_uses_commit_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("main.rs");
+        std::fs::write(
+            &file_path,
+            "fn old_helper() {}\nfn main() { old_helper(); }\n",
+        )
+        .unwrap();
+        init_git_repo(dir.path());
+
+        std::fs::write(
+            &file_path,
+            "fn committed_helper() {}\nfn main() { committed_helper(); }\n",
+        )
+        .unwrap();
+        let status = Command::new("git")
+            .args(["add", "main.rs"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git add failed");
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=tsift-tests",
+                "-c",
+                "user.email=tsift-tests@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "second",
+            ])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git commit failed");
+
+        std::fs::write(
+            &file_path,
+            "fn working_tree_only() {}\nfn main() { working_tree_only(); }\n",
+        )
+        .unwrap();
+
+        let report = compute(
+            dir.path(),
+            DiffDigestOptions {
+                cached: false,
+                revision: Some("HEAD"),
+            },
+        )
+        .unwrap();
+        assert_eq!(report.mode, DiffDigestMode::Revision);
+        assert!(report.revision.as_deref().is_some());
+        let file = &report.files[0];
+        assert!(
+            file.touched_symbols
+                .iter()
+                .any(|symbol| symbol == "committed_helper")
+        );
+        assert!(
+            !file
+                .touched_symbols
+                .iter()
+                .any(|symbol| symbol == "working_tree_only")
+        );
+        assert_eq!(
+            file.added_call_edges,
+            vec!["main -> committed_helper".to_string()]
         );
     }
 }

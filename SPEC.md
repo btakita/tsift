@@ -80,7 +80,9 @@ tsift audit --manifest <file>   # compare against expected skill list
 tsift summarize <symbol>        # cached LLM summary for a symbol
 tsift summarize --extract <path>  # batch LLM extraction (one-time; relative path resolves against --path, workspace files use the matching scoped index)
 tsift summarize --extract --diff  # re-extract only git-changed files within the requested path
-tsift diff-digest [path]        # bounded git diff digest: changed files, symbols, summaries, call-edge deltas
+tsift diff-digest [path]        # bounded worktree diff digest
+tsift diff-digest --cached .    # bounded staged-index diff digest
+tsift diff-digest --revision HEAD . # bounded single-revision/history digest
 tsift test-digest --path . < test.log  # bounded test-output digest from stdin or --input
 tsift metric-digest < runs.json  # repeated metric-run digest: deltas, improvements, news-ready table
 tsift log-digest --path . < build.log  # bounded verbose-log digest from stdin or --input
@@ -918,21 +920,22 @@ api_key_env = "ANTHROPIC_API_KEY"    # env var for API key
 
 ## Diff Digest
 
-`tsift diff-digest [path]` turns the current git diff into a bounded, code-aware report for agent context.
+`tsift diff-digest [path]` turns worktree, staged, or single-revision diffs into a bounded, code-aware report for agent context.
 
 ```bash
 tsift diff-digest .        # current repo root
+tsift diff-digest --cached . # staged index against HEAD
+tsift diff-digest --revision HEAD . # HEAD commit against its first parent
 tsift diff-digest --json . # structured output
 ```
 
 Behavior:
 
-1. Collect tracked changes from `HEAD` plus untracked files.
-2. Compare each changed file's `HEAD` snapshot to the working tree.
-3. Parse both snapshots directly with tree-sitter when the file language is supported.
-4. Emit changed-file status, touched symbols, up to two current cached summary snippets when `summaries.db` matches the file content, and added/removed call edges.
+1. In default mode, collect tracked changes from `HEAD` plus untracked files and compare `HEAD` to the working tree. With `--cached`, compare the staged index to `HEAD`. With `--revision <rev>`, compare that single revision to its first parent (or to the empty tree for a root commit).
+2. Parse both snapshots directly with tree-sitter when the file language is supported.
+3. Emit changed-file status, touched symbols, up to two current cached summary snippets when `summaries.db` matches the compared snapshot, and added/removed call edges.
 
-`diff-digest` intentionally does not require a fresh `index.db`. It reads the changed file snapshots directly so unindexed working-tree edits still appear in the digest. Summary lookups stay read-only and degrade to `missing`, `stale`, or `unavailable` instead of mutating the cache.
+`diff-digest` intentionally does not require a fresh `index.db`. It reads the compared snapshots directly so unindexed working-tree edits, staged-only content, and historical commit review all stay bounded without mutating the index. Summary lookups stay read-only and degrade to `missing`, `stale`, or `unavailable` instead of mutating the cache.
 
 ## Test Digest
 
@@ -1046,7 +1049,7 @@ The hook resolves the git root first, then runs `tsift index --check --exit-code
 The existing `tsift-rewrite.sh` hook intercepts high-token shell commands and silently rewrites them to lower-context tsift flows:
 
 - `rg ...` / `grep -r ...` → `tsift search --exact ...`
-- plain `git diff` / `git diff -- <path>` → `tsift diff-digest [path]`
+- `git diff`, `git diff --cached`, `git show`, and simple `git log -p -1 ...` history review → `tsift diff-digest ...`
 - `cargo test ...`, `pytest ...`, `python -m pytest ...` → `tsift __digest-runner --kind test ...`
 - `cargo build ...`, `cargo check ...`, `cargo clippy ...`, `cargo install ...` → `tsift __digest-runner --kind log ...`
 

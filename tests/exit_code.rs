@@ -2649,6 +2649,134 @@ fn diff_digest_reports_changed_symbols_and_call_edges() {
 }
 
 #[test]
+fn diff_digest_cached_reads_staged_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("main.rs");
+    fs::write(&source, "fn old_helper() {}\nfn main() { old_helper(); }\n").unwrap();
+    init_git_repo(dir.path());
+
+    fs::write(
+        &source,
+        "fn staged_helper() {}\nfn main() { staged_helper(); }\n",
+    )
+    .unwrap();
+    let status = Command::new("git")
+        .args(["add", "main.rs"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git add failed");
+
+    fs::write(
+        &source,
+        "fn unstaged_helper() {}\nfn main() { unstaged_helper(); }\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "diff-digest",
+            "--cached",
+            "--json",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "cached diff-digest should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["mode"], "cached");
+    assert!(
+        json["files"][0]["touched_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol == "staged_helper")
+    );
+    assert!(
+        !json["files"][0]["touched_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol == "unstaged_helper")
+    );
+}
+
+#[test]
+fn diff_digest_revision_reads_commit_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("main.rs");
+    fs::write(&source, "fn old_helper() {}\nfn main() { old_helper(); }\n").unwrap();
+    init_git_repo(dir.path());
+
+    fs::write(
+        &source,
+        "fn committed_helper() {}\nfn main() { committed_helper(); }\n",
+    )
+    .unwrap();
+    let status = Command::new("git")
+        .args(["add", "main.rs"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git add failed");
+    let status = Command::new("git")
+        .args([
+            "-c",
+            "user.name=tsift-tests",
+            "-c",
+            "user.email=tsift-tests@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "second",
+        ])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "git commit failed");
+
+    fs::write(
+        &source,
+        "fn working_tree_only() {}\nfn main() { working_tree_only(); }\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "diff-digest",
+            "--revision",
+            "HEAD",
+            "--json",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "revision diff-digest should succeed"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["mode"], "revision");
+    assert!(json["revision"].as_str().is_some());
+    assert!(
+        json["files"][0]["touched_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol == "committed_helper")
+    );
+    assert!(
+        !json["files"][0]["touched_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol == "working_tree_only")
+    );
+}
+
+#[test]
 fn test_digest_reads_cargo_output_from_stdin() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();

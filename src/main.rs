@@ -350,6 +350,12 @@ enum Commands {
         /// Path to the codebase (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Compare the staged index against HEAD instead of the working tree
+        #[arg(long, conflicts_with = "revision")]
+        cached: bool,
+        /// Compare a single revision against its first parent instead of the working tree
+        #[arg(long)]
+        revision: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -772,13 +778,22 @@ fn main() -> Result<()> {
             terse,
             schema,
         ),
-        Some(Commands::DiffDigest { path, json }) => cmd_diff_digest(
+        Some(Commands::DiffDigest {
+            path,
+            cached,
+            revision,
+            json,
+        }) => cmd_diff_digest(
             &path,
-            json || terse || schema,
-            compact,
-            pretty,
-            terse,
-            schema,
+            cached,
+            revision.as_deref(),
+            OutputFormat {
+                json_output: json || terse || schema,
+                compact,
+                pretty,
+                terse,
+                schema,
+            },
         ),
         Some(Commands::TestDigest {
             path,
@@ -3130,26 +3145,28 @@ fn log_digest_summary_label(state: log_digest::LogDigestSummaryState) -> &'stati
 
 fn cmd_diff_digest(
     path: &Path,
-    json_output: bool,
-    compact: bool,
-    pretty: bool,
-    terse: bool,
-    schema: bool,
+    cached: bool,
+    revision: Option<&str>,
+    format: OutputFormat,
 ) -> Result<()> {
-    let report = diff_digest::compute(path)?;
-    if json_output {
-        println!("{}", to_json_schema(&report, pretty, terse, schema)?);
+    let report = diff_digest::compute(path, diff_digest::DiffDigestOptions { cached, revision })?;
+    if format.json_output {
+        println!(
+            "{}",
+            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+        );
         return Ok(());
     }
 
     if report.files.is_empty() {
-        println!("No git changes found.");
+        println!("{}", diff_digest_empty_message(&report));
         return Ok(());
     }
 
-    if compact {
+    if format.compact {
         println!(
-            "diff files:{} summaries:{} syms:{} edges:+{}/-{}",
+            "diff mode:{} files:{} summaries:{} syms:{} edges:+{}/-{}",
+            diff_digest_mode_label(report.mode),
             report.files_changed,
             report.files_with_current_summaries,
             report.symbols_touched,
@@ -3175,7 +3192,7 @@ fn cmd_diff_digest(
         return Ok(());
     }
 
-    println!("Diff digest:");
+    println!("Diff digest ({})", diff_digest_mode_display(&report));
     println!("  files changed:                 {}", report.files_changed);
     println!(
         "  files with current summaries: {}",
@@ -3224,6 +3241,36 @@ fn cmd_diff_digest(
     }
 
     Ok(())
+}
+
+fn diff_digest_mode_label(mode: diff_digest::DiffDigestMode) -> &'static str {
+    match mode {
+        diff_digest::DiffDigestMode::WorkingTree => "worktree",
+        diff_digest::DiffDigestMode::Cached => "cached",
+        diff_digest::DiffDigestMode::Revision => "revision",
+    }
+}
+
+fn diff_digest_mode_display(report: &diff_digest::DiffDigestReport) -> String {
+    match (&report.mode, &report.revision) {
+        (diff_digest::DiffDigestMode::WorkingTree, _) => "working tree".to_string(),
+        (diff_digest::DiffDigestMode::Cached, _) => "staged index".to_string(),
+        (diff_digest::DiffDigestMode::Revision, Some(revision)) => {
+            format!("revision {revision}")
+        }
+        (diff_digest::DiffDigestMode::Revision, None) => "revision".to_string(),
+    }
+}
+
+fn diff_digest_empty_message(report: &diff_digest::DiffDigestReport) -> String {
+    match (&report.mode, &report.revision) {
+        (diff_digest::DiffDigestMode::WorkingTree, _) => "No git changes found.".to_string(),
+        (diff_digest::DiffDigestMode::Cached, _) => "No staged git changes found.".to_string(),
+        (diff_digest::DiffDigestMode::Revision, Some(revision)) => {
+            format!("No diff found for revision {revision}.")
+        }
+        (diff_digest::DiffDigestMode::Revision, None) => "No revision diff found.".to_string(),
+    }
 }
 
 fn cmd_test_digest(
@@ -5821,6 +5868,12 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_git_diff_cached_to_diff_digest() {
+        let result = rewrite_command("git diff --cached");
+        assert_eq!(result, Some("tsift diff-digest --cached .".to_string()));
+    }
+
+    #[test]
     fn rewrite_git_diff_with_path_to_diff_digest() {
         let result = rewrite_command("git diff -- src/");
         assert_eq!(result, Some("tsift diff-digest \"src/\"".to_string()));
@@ -5830,6 +5883,24 @@ mod tests {
     fn rewrite_git_diff_with_revision_passthrough() {
         let result = rewrite_command("git diff HEAD~1");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn rewrite_git_show_to_revision_diff_digest() {
+        let result = rewrite_command("git show HEAD~1");
+        assert_eq!(
+            result,
+            Some("tsift diff-digest --revision \"HEAD~1\" .".to_string())
+        );
+    }
+
+    #[test]
+    fn rewrite_git_log_patch_history_to_revision_diff_digest() {
+        let result = rewrite_command("git log -p -1 HEAD~2");
+        assert_eq!(
+            result,
+            Some("tsift diff-digest --revision \"HEAD~2\" .".to_string())
+        );
     }
 
     #[test]
@@ -8391,11 +8462,36 @@ tier = "private"
     fn cli_parses_diff_digest_command() {
         let cli = Cli::parse_from(["tsift", "diff-digest", "--json", "."]);
         match cli.command {
-            Some(Commands::DiffDigest { json, path }) => {
+            Some(Commands::DiffDigest {
+                json,
+                path,
+                cached,
+                revision,
+            }) => {
                 assert!(json);
                 assert_eq!(path, PathBuf::from("."));
+                assert!(!cached);
+                assert!(revision.is_none());
             }
             _ => panic!("expected DiffDigest command"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_conflicting_diff_digest_modes() {
+        match Cli::try_parse_from([
+            "tsift",
+            "diff-digest",
+            "--cached",
+            "--revision",
+            "HEAD",
+            ".",
+        ]) {
+            Ok(_) => panic!("expected conflicting diff-digest modes to fail"),
+            Err(err) => {
+                assert!(err.to_string().contains("--cached"));
+                assert!(err.to_string().contains("--revision"));
+            }
         }
     }
 
@@ -9120,8 +9216,14 @@ pub(crate) fn rewrite_command(command: &str) -> Option<String> {
         return Some(rewritten);
     }
 
-    // git diff [path] / git diff -- [path] → tsift diff-digest [path]
+    // git diff / git show / patch-style history → tsift diff-digest
     if let Some(rewritten) = rewrite_git_diff(trimmed) {
+        return Some(rewritten);
+    }
+    if let Some(rewritten) = rewrite_git_show(trimmed) {
+        return Some(rewritten);
+    }
+    if let Some(rewritten) = rewrite_git_patch_history(trimmed) {
         return Some(rewritten);
     }
 
@@ -9268,17 +9370,149 @@ fn rewrite_git_diff(cmd: &str) -> Option<String> {
     if parts.len() < 2 || parts[0] != "git" || parts[1] != "diff" {
         return None;
     }
-    if parts.len() == 2 {
-        return Some("tsift diff-digest .".to_string());
+    let mut cached = false;
+    let mut path = None;
+    let mut after_double_dash = false;
+
+    for part in &parts[2..] {
+        if after_double_dash {
+            if path.is_none() && !part.starts_with('-') {
+                path = Some(*part);
+                continue;
+            }
+            return None;
+        }
+        match *part {
+            "--cached" | "--staged" => cached = true,
+            "--" => after_double_dash = true,
+            raw if looks_like_path_selector(raw) => {
+                if path.replace(raw).is_some() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
     }
 
-    let remainder = &parts[2..];
-    let path = match remainder {
-        [path] if looks_like_path_selector(path) => *path,
-        ["--", path] if !path.starts_with('-') => *path,
-        _ => return None,
-    };
-    Some(format!("tsift diff-digest {}", shell_quote(path)))
+    Some(build_diff_digest_command(path.unwrap_or("."), cached, None))
+}
+
+fn rewrite_git_show(cmd: &str) -> Option<String> {
+    if has_shell_metacharacters(cmd) {
+        return None;
+    }
+
+    let parts: Vec<&str> = shell_split(cmd);
+    if parts.len() < 2 || parts[0] != "git" || parts[1] != "show" {
+        return None;
+    }
+
+    let mut revision = "HEAD";
+    let mut path = None;
+    let mut after_double_dash = false;
+
+    for part in &parts[2..] {
+        if after_double_dash {
+            if path.is_none() && !part.starts_with('-') {
+                path = Some(*part);
+                continue;
+            }
+            return None;
+        }
+        match *part {
+            "--" => after_double_dash = true,
+            "-p" | "--patch" | "--stat" => {}
+            raw if raw.starts_with("--format=") => {}
+            raw if !raw.starts_with('-') => {
+                if revision != "HEAD" {
+                    return None;
+                }
+                revision = raw;
+            }
+            _ => return None,
+        }
+    }
+
+    Some(build_diff_digest_command(
+        path.unwrap_or("."),
+        false,
+        Some(revision),
+    ))
+}
+
+fn rewrite_git_patch_history(cmd: &str) -> Option<String> {
+    if has_shell_metacharacters(cmd) {
+        return None;
+    }
+
+    let parts: Vec<&str> = shell_split(cmd);
+    if parts.len() < 2 || parts[0] != "git" || parts[1] != "log" {
+        return None;
+    }
+
+    let mut saw_patch = false;
+    let mut saw_single_commit = false;
+    let mut revision = "HEAD";
+    let mut path = None;
+    let mut after_double_dash = false;
+    let mut skip_next = false;
+
+    for part in &parts[2..] {
+        if skip_next {
+            skip_next = false;
+            if *part == "1" {
+                saw_single_commit = true;
+                continue;
+            }
+            return None;
+        }
+        if after_double_dash {
+            if path.is_none() && !part.starts_with('-') {
+                path = Some(*part);
+                continue;
+            }
+            return None;
+        }
+        match *part {
+            "--" => after_double_dash = true,
+            "-p" | "--patch" => saw_patch = true,
+            "-1" | "-n1" | "--max-count=1" => saw_single_commit = true,
+            "-n" | "--max-count" => skip_next = true,
+            raw if !raw.starts_with('-') => {
+                if revision != "HEAD" {
+                    return None;
+                }
+                revision = raw;
+            }
+            _ => return None,
+        }
+    }
+
+    if !saw_patch || !saw_single_commit {
+        return None;
+    }
+
+    Some(build_diff_digest_command(
+        path.unwrap_or("."),
+        false,
+        Some(revision),
+    ))
+}
+
+fn build_diff_digest_command(path: &str, cached: bool, revision: Option<&str>) -> String {
+    let mut result = "tsift diff-digest".to_string();
+    if cached {
+        result.push_str(" --cached");
+    }
+    if let Some(revision) = revision {
+        result.push_str(&format!(" --revision {}", shell_quote(revision)));
+    }
+    if path == "." {
+        result.push_str(" .");
+    } else {
+        result.push_str(&format!(" {}", shell_quote(path)));
+    }
+    result
 }
 
 fn rewrite_test_command(cmd: &str) -> Option<String> {
