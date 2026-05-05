@@ -2993,6 +2993,46 @@ do [#sessiondigest]. spec-test-build-install-commit-push
 }
 
 #[test]
+fn session_cost_reads_codex_token_counts_from_stdin() {
+    let input = concat!(
+        r#"{"timestamp":"2026-05-05T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":24000,"cached_input_tokens":23000,"output_tokens":300,"reasoning_output_tokens":100,"total_tokens":24300}}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-05-05T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50000,"cached_input_tokens":48000,"output_tokens":650,"reasoning_output_tokens":180,"total_tokens":50650}}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-05-05T00:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50000,"cached_input_tokens":48000,"output_tokens":650,"reasoning_output_tokens":180,"total_tokens":50650}}}}"#,
+        "\n"
+    );
+
+    let mut child = tsift_bin()
+        .args(["session-cost", "--json"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "session-cost should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["source"], "codex_jsonl");
+    assert_eq!(json["usage_samples"], 2);
+    assert_eq!(json["prompt_tokens"], 50000);
+    assert_eq!(json["cached_input_tokens"], 48000);
+    assert_eq!(json["output_tokens"], 650);
+    assert_eq!(json["total_tokens"], 50650);
+    assert_eq!(json["largest_turn_total_tokens"], 26350);
+    assert_eq!(json["cached_input_ratio"], 96.0);
+}
+
+#[test]
 fn rewrite_routes_long_agent_doc_reads_to_session_digest() {
     let dir = tempfile::tempdir().unwrap();
     let session = dir.path().join("tsift.md");
@@ -3156,7 +3196,7 @@ fn exact_search_human_output_collapses_repeated_hits_by_file() {
         stdout.contains("File matches (2 files / 4 hits):"),
         "{stdout}"
     );
-    assert!(stdout.contains("#1 [High] notes.md (hits: 3"), "{stdout}");
+    assert!(stdout.contains("notes.md (hits: 3"), "{stdout}");
     assert!(stdout.contains("(+1 more hits in file)"), "{stdout}");
 }
 

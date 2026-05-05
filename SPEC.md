@@ -87,6 +87,7 @@ tsift test-digest --path . < test.log  # bounded test-output digest from stdin o
 tsift metric-digest < runs.json  # repeated metric-run digest: deltas, improvements, news-ready table
 tsift log-digest --path . < build.log  # bounded verbose-log digest from stdin or --input
 tsift session-digest --path . < session.md  # session transcript digest: prompt targets, commands, touched files/symbols, failures, closeout
+tsift session-cost < session.jsonl  # token/runtime cost digest: prompt totals, cache ratios, large-turn outliers, restart churn
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
 tsift search --exact <query>    # literal text lookup via `rg -F`
 tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
@@ -1027,6 +1028,31 @@ Behavior:
 4. Keep the digest transcript-only: it summarizes what happened in the session, but it does not replay tool calls or attempt to reconstruct the full conversation.
 
 `session-digest` is intentionally conservative. It favors bounded evidence over perfect transcript reconstruction so long agent sessions can be collapsed into compact handoff or review context.
+
+## Session Cost
+
+`tsift session-cost` turns Claude/Codex transcript usage and `agent-doc` runtime logs into bounded cost summaries for agent context.
+
+```bash
+tsift session-cost --input ~/.claude/projects/foo/session.jsonl --json
+tsift session-cost --source codex-jsonl --input ~/.codex/sessions/2026/05/02/rollout-....jsonl
+tsift session-cost --source agent-doc-log --input .agent-doc/logs/tsift-v0.1.log
+```
+
+Accepted sources:
+
+- Claude JSONL transcripts with assistant `message.usage` payloads
+- Codex JSONL transcripts with `event_msg` `token_count` records
+- `agent-doc` runtime `.log` files with start/restart/timeout events
+
+Behavior:
+
+1. Read captured transcript/log input from stdin by default, or from `--input <file>`.
+2. Auto-detect Claude JSONL, Codex JSONL, or `agent-doc` runtime logs unless `--source claude-jsonl|codex-jsonl|agent-doc-log` forces one parser.
+3. Normalize prompt-side totals, cached-input totals, output totals, and largest per-turn outliers so token-heavy sessions can be compared without ad hoc `jq` pipelines.
+4. For `agent-doc` runtime logs, summarize bounded churn counters such as `fresh_restart`, `continue`, and `auto_trigger_timeout`, including the highest observed `restart_count`.
+
+`session-cost` is intentionally cost-focused. It does not reconstruct the full conversation or replay tool calls; it compresses token/runtime overhead into a bounded report you can paste into backlog triage, handoffs, or benchmark notes.
 
 ## Hook Integration
 

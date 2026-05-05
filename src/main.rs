@@ -24,6 +24,7 @@ mod lang;
 pub mod lint;
 pub mod log_digest;
 pub mod metric_digest;
+pub mod session_cost;
 pub mod session_digest;
 pub mod status;
 pub mod summarize;
@@ -423,6 +424,18 @@ enum Commands {
         #[arg(long)]
         input: Option<PathBuf>,
         /// Force the transcript source (`markdown` or `jsonl`)
+        #[arg(long)]
+        source: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Summarize Claude/Codex token usage and agent-doc restart churn into bounded cost reports
+    SessionCost {
+        /// Read session transcript or agent-doc log input from a file instead of stdin
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Force the input source (`claude-jsonl`, `codex-jsonl`, or `agent-doc-log`)
         #[arg(long)]
         source: Option<String>,
         /// Output as JSON
@@ -857,6 +870,21 @@ fn main() -> Result<()> {
             json,
         }) => cmd_session_digest(
             &path,
+            input.as_deref(),
+            source.as_deref(),
+            OutputFormat {
+                json_output: json || terse || schema,
+                compact,
+                pretty,
+                terse,
+                schema,
+            },
+        ),
+        Some(Commands::SessionCost {
+            input,
+            source,
+            json,
+        }) => cmd_session_cost(
             input.as_deref(),
             source.as_deref(),
             OutputFormat {
@@ -3972,6 +4000,140 @@ fn cmd_session_digest(
         println!("warning: {warning}");
     }
     Ok(())
+}
+
+fn cmd_session_cost(
+    input_path: Option<&Path>,
+    source: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let input = match input_path {
+        Some(file_path) => fs::read_to_string(file_path)
+            .with_context(|| format!("reading session-cost input: {}", file_path.display()))?,
+        None => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("reading session-cost input from stdin")?;
+            buf
+        }
+    };
+    if input.trim().is_empty() {
+        bail!(
+            "no session-cost input provided; pass --input <file> or pipe transcript/log data on stdin"
+        );
+    }
+
+    let report = session_cost::compute(&input, source)?;
+    if format.json_output {
+        println!(
+            "{}",
+            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+        );
+        return Ok(());
+    }
+
+    if format.compact {
+        let cache_ratio = report
+            .cached_input_ratio
+            .map(|value| format!("{value:.2}%"))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "session-cost src:{} samples:{} prompt:{} cached:{} cache_ratio:{} output:{} total:{} runtime:{}",
+            report.source,
+            report.usage_samples,
+            format_compact_count(report.prompt_tokens),
+            format_compact_count(report.cached_input_tokens),
+            cache_ratio,
+            format_compact_count(report.output_tokens),
+            format_compact_count(report.total_tokens),
+            report.total_runtime_events
+        );
+        for turn in &report.largest_turns {
+            println!(
+                "turn total:{} prompt:{} cached:{} output:{} label:{}",
+                format_compact_count(turn.total_tokens),
+                format_compact_count(turn.prompt_tokens),
+                format_compact_count(turn.cached_input_tokens),
+                format_compact_count(turn.output_tokens),
+                truncate_for_compact(&turn.label, 72)
+            );
+        }
+        for event in &report.runtime_events {
+            println!("event count:{} {}", event.occurrences, event.event);
+        }
+        for warning in &report.warnings {
+            println!("warning: {warning}");
+        }
+        return Ok(());
+    }
+
+    println!("Session cost digest ({})", report.source);
+    println!("  records:                {}", report.record_count);
+    println!("  usage samples:          {}", report.usage_samples);
+    println!("  prompt tokens:          {}", report.prompt_tokens);
+    println!("  cached input tokens:    {}", report.cached_input_tokens);
+    println!(
+        "  cache creation tokens:  {}",
+        report.cache_creation_input_tokens
+    );
+    println!("  output tokens:          {}", report.output_tokens);
+    println!(
+        "  reasoning output:       {}",
+        report.reasoning_output_tokens
+    );
+    println!("  total tokens:           {}", report.total_tokens);
+    if let Some(ratio) = report.cached_input_ratio {
+        println!("  cached input ratio:     {ratio:.2}%");
+    }
+    println!(
+        "  largest turn total:     {}",
+        report.largest_turn_total_tokens
+    );
+    println!("  runtime events:         {}", report.total_runtime_events);
+    println!("  runtime groups:         {}", report.runtime_event_groups);
+    if let Some(max_restart_count) = report.max_restart_count {
+        println!("  max restart count:      {}", max_restart_count);
+    }
+
+    if !report.largest_turns.is_empty() {
+        println!();
+        println!("Largest turns:");
+        for turn in &report.largest_turns {
+            println!(
+                "  - {}: total {} | prompt {} | cached {} | output {} | reasoning {}",
+                turn.label,
+                turn.total_tokens,
+                turn.prompt_tokens,
+                turn.cached_input_tokens,
+                turn.output_tokens,
+                turn.reasoning_output_tokens
+            );
+        }
+    }
+
+    if !report.runtime_events.is_empty() {
+        println!();
+        println!("Runtime churn:");
+        for event in &report.runtime_events {
+            println!("  - {} ({})", event.event, event.occurrences);
+        }
+    }
+
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    Ok(())
+}
+
+fn format_compact_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
 }
 
 fn cmd_digest_runner(
@@ -8950,6 +9112,31 @@ tier = "private"
                 assert_eq!(source.as_deref(), Some("markdown"));
             }
             _ => panic!("expected SessionDigest command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_cost_command() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "session-cost",
+            "--input",
+            "target/session.jsonl",
+            "--source",
+            "codex-jsonl",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::SessionCost {
+                json,
+                input,
+                source,
+            }) => {
+                assert!(json);
+                assert_eq!(input, Some(PathBuf::from("target/session.jsonl")));
+                assert_eq!(source.as_deref(), Some("codex-jsonl"));
+            }
+            _ => panic!("expected SessionCost command"),
         }
     }
 
