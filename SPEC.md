@@ -84,6 +84,7 @@ tsift diff-digest [path]        # bounded git diff digest: changed files, symbol
 tsift test-digest --path . < test.log  # bounded test-output digest from stdin or --input
 tsift metric-digest < runs.json  # repeated metric-run digest: deltas, improvements, news-ready table
 tsift log-digest --path . < build.log  # bounded verbose-log digest from stdin or --input
+tsift session-digest --path . < session.md  # session transcript digest: prompt targets, commands, touched files/symbols, failures, closeout
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
 tsift search --exact <query>    # literal text lookup via `rg -F`
 tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
@@ -996,6 +997,29 @@ Behavior:
 4. When `.tsift/summaries.db` already has current rows for anchored files or extracted symbols, include up to two cached summary snippets; otherwise report `missing`, `stale`, or `unavailable` without mutating the cache.
 
 `log-digest` is intentionally transcript-only. It does not execute the underlying command, and it keeps summary enrichment read-only so digesting verbose output never contends with `tsift summarize --extract`.
+
+## Session Digest
+
+`tsift session-digest` turns long session transcripts into bounded execution evidence for agent context.
+
+```bash
+tsift session-digest --path . < tasks/software/tsift.md
+tsift session-digest --source jsonl --input ~/.claude/projects/foo/session.jsonl --json
+```
+
+Accepted sources:
+
+- markdown session documents such as `agent-doc` / Codex task files
+- Claude JSONL transcripts with `message.content` text/tool blocks
+
+Behavior:
+
+1. Read captured session input from stdin by default, or from `--input <file>`.
+2. Auto-detect markdown versus JSONL unless `--source markdown|jsonl` forces one parser.
+3. Extract bounded prompt targets, shell commands, touched file paths, symbol-like identifiers, failure lines, and closeout evidence such as verification/install/commit/push/version mentions.
+4. Keep the digest transcript-only: it summarizes what happened in the session, but it does not replay tool calls or attempt to reconstruct the full conversation.
+
+`session-digest` is intentionally conservative. It favors bounded evidence over perfect transcript reconstruction so long agent sessions can be collapsed into compact handoff or review context.
 
 ## Hook Integration
 

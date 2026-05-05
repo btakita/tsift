@@ -2794,6 +2794,77 @@ fn metric_digest_reads_run_history_from_stdin() {
 }
 
 #[test]
+fn session_digest_reads_markdown_session_from_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn run_sync() {}\n").unwrap();
+
+    let input = "\
+❯ Why was this symbol search attempted?
+Symbol `run_sync` not found in index.
+Error: tsift search timed out after 30s at src/lib.rs:7:9
+Verification in `src/tsift`: `cargo test`, `make check`, `cargo build --release`, `cargo install --path . --force`
+Committed and pushed in `src/tsift` as `1af09d3` (`feat: add metric run digest`).
+do [#sessiondigest]. spec-test-build-install-commit-push
+";
+
+    let mut child = tsift_bin()
+        .args([
+            "session-digest",
+            "--json",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "session-digest should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["source"], "markdown");
+    assert_eq!(json["prompt_target_count"], 2);
+    assert!(
+        json["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["command"] == "cargo test")
+    );
+    assert!(
+        json["touched_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["symbol"] == "run_sync")
+    );
+    assert!(
+        json["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|failure| failure["kind"] == "timeout")
+    );
+    assert!(
+        json["closeout"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["kind"] == "push")
+    );
+}
+
+#[test]
 fn digest_runner_preserves_failing_test_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();

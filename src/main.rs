@@ -24,6 +24,7 @@ mod lang;
 pub mod lint;
 pub mod log_digest;
 pub mod metric_digest;
+pub mod session_digest;
 pub mod status;
 pub mod summarize;
 pub mod test_digest;
@@ -403,6 +404,21 @@ enum Commands {
         /// Number of top improvements/regressions to emit
         #[arg(long, default_value = "3")]
         top: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Summarize session transcripts into prompt targets, commands, touched code, failures, and closeout evidence
+    SessionDigest {
+        /// Path to the codebase (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Read session transcript input from a file instead of stdin
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Force the transcript source (`markdown` or `jsonl`)
+        #[arg(long)]
+        source: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -811,6 +827,23 @@ fn main() -> Result<()> {
                 history,
                 top,
             },
+            OutputFormat {
+                json_output: json || terse || schema,
+                compact,
+                pretty,
+                terse,
+                schema,
+            },
+        ),
+        Some(Commands::SessionDigest {
+            path,
+            input,
+            source,
+            json,
+        }) => cmd_session_digest(
+            &path,
+            input.as_deref(),
+            source.as_deref(),
             OutputFormat {
                 json_output: json || terse || schema,
                 compact,
@@ -3651,6 +3684,148 @@ fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: OutputFormat) -> 
         println!();
         println!("News-ready table:");
         println!("{}", report.news_table_markdown);
+    }
+
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    Ok(())
+}
+
+fn cmd_session_digest(
+    path: &Path,
+    input_path: Option<&Path>,
+    source: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let input = match input_path {
+        Some(file_path) => fs::read_to_string(file_path)
+            .with_context(|| format!("reading session transcript: {}", file_path.display()))?,
+        None => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("reading session transcript from stdin")?;
+            buf
+        }
+    };
+    if input.trim().is_empty() {
+        bail!("no session input provided; pass --input <file> or pipe transcript on stdin");
+    }
+
+    let report = session_digest::compute(path, &input, source)?;
+    if format.json_output {
+        println!(
+            "{}",
+            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+        );
+        return Ok(());
+    }
+
+    if format.compact {
+        println!(
+            "session src:{} prompts:{} cmds:{} files:{} syms:{} fails:{} closeout:{}",
+            report.source,
+            report.prompt_target_count,
+            report.command_groups,
+            report.file_groups,
+            report.symbol_groups,
+            report.failure_groups,
+            report.closeout_groups
+        );
+        for prompt in &report.prompt_targets {
+            println!("prompt: {}", truncate_for_compact(prompt, 100));
+        }
+        for command in &report.commands {
+            println!(
+                "cmd count:{} {}",
+                command.occurrences,
+                truncate_for_compact(&command.command, 100)
+            );
+        }
+        for failure in &report.failures {
+            println!(
+                "fail {} count:{} {}",
+                failure.kind,
+                failure.occurrences,
+                truncate_for_compact(&failure.message, 100)
+            );
+        }
+        for entry in &report.closeout {
+            println!(
+                "closeout {} count:{} {}",
+                entry.kind,
+                entry.occurrences,
+                truncate_for_compact(&entry.detail, 100)
+            );
+        }
+        for warning in &report.warnings {
+            println!("warning: {warning}");
+        }
+        return Ok(());
+    }
+
+    println!("Session digest ({})", report.source);
+    println!("  transcript items: {}", report.transcript_items);
+    println!("  prompt targets:   {}", report.prompt_target_count);
+    println!("  commands:         {}", report.command_groups);
+    println!("  touched files:    {}", report.file_groups);
+    println!("  touched symbols:  {}", report.symbol_groups);
+    println!("  failures:         {}", report.failure_groups);
+    println!("  closeout:         {}", report.closeout_groups);
+
+    if !report.prompt_targets.is_empty() {
+        println!();
+        println!("Prompt targets:");
+        for prompt in &report.prompt_targets {
+            println!("  - {}", prompt);
+        }
+    }
+
+    if !report.commands.is_empty() {
+        println!();
+        println!("Commands:");
+        for command in &report.commands {
+            println!("  - {} ({})", command.command, command.occurrences);
+        }
+    }
+
+    if !report.touched_files.is_empty() {
+        println!();
+        println!("Touched files:");
+        for path in &report.touched_files {
+            println!("  - {} ({})", path.path, path.occurrences);
+        }
+    }
+
+    if !report.touched_symbols.is_empty() {
+        println!();
+        println!("Touched symbols:");
+        for symbol in &report.touched_symbols {
+            println!("  - {} ({})", symbol.symbol, symbol.occurrences);
+        }
+    }
+
+    if !report.failures.is_empty() {
+        println!();
+        println!("Failures:");
+        for failure in &report.failures {
+            println!(
+                "  - [{}] {} ({})",
+                failure.kind, failure.message, failure.occurrences
+            );
+        }
+    }
+
+    if !report.closeout.is_empty() {
+        println!();
+        println!("Closeout evidence:");
+        for entry in &report.closeout {
+            println!(
+                "  - [{}] {} ({})",
+                entry.kind, entry.detail, entry.occurrences
+            );
+        }
     }
 
     for warning in &report.warnings {
@@ -8313,6 +8488,35 @@ tier = "private"
                 assert_eq!(top, 2);
             }
             _ => panic!("expected MetricDigest command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_digest_command() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "session-digest",
+            "--path",
+            ".",
+            "--input",
+            "target/session.md",
+            "--source",
+            "markdown",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::SessionDigest {
+                json,
+                path,
+                input,
+                source,
+            }) => {
+                assert!(json);
+                assert_eq!(path, PathBuf::from("."));
+                assert_eq!(input, Some(PathBuf::from("target/session.md")));
+                assert_eq!(source.as_deref(), Some("markdown"));
+            }
+            _ => panic!("expected SessionDigest command"),
         }
     }
 
