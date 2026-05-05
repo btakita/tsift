@@ -2607,6 +2607,48 @@ fn search_timeout_zero_keeps_search_in_process() {
 }
 
 #[test]
+fn diff_digest_reports_changed_symbols_and_call_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("main.rs");
+    fs::write(&source, "fn old_helper() {}\nfn main() { old_helper(); }\n").unwrap();
+    init_git_repo(dir.path());
+
+    fs::write(&source, "fn new_helper() {}\nfn main() { new_helper(); }\n").unwrap();
+
+    let output = tsift_bin()
+        .args(["diff-digest", "--json", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "diff-digest should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["files_changed"], 1);
+    assert_eq!(json["files"][0]["path"], "main.rs");
+    assert_eq!(json["files"][0]["status"], "modified");
+    assert!(
+        json["files"][0]["touched_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol == "new_helper")
+    );
+    assert!(
+        json["files"][0]["removed_call_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge == "main -> old_helper")
+    );
+    assert!(
+        json["files"][0]["added_call_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge == "main -> new_helper")
+    );
+}
+
+#[test]
 fn search_worker_uses_stable_tsift_cache_dir() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();

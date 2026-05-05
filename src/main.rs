@@ -16,6 +16,7 @@ use tempfile::NamedTempFile;
 
 pub mod audit;
 pub mod config;
+pub mod diff_digest;
 pub mod graph;
 pub mod index;
 pub mod init;
@@ -317,6 +318,15 @@ enum Commands {
         stats: bool,
         /// Path to the indexed codebase (defaults to current directory)
         #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Summarize git-changed files into a bounded, code-aware digest
+    DiffDigest {
+        /// Path to the codebase (defaults to current directory)
+        #[arg(default_value = ".")]
         path: PathBuf,
         /// Output as JSON
         #[arg(long)]
@@ -627,6 +637,14 @@ fn main() -> Result<()> {
             extract,
             diff,
             stats,
+            &path,
+            json || terse || schema,
+            compact,
+            pretty,
+            terse,
+            schema,
+        ),
+        Some(Commands::DiffDigest { path, json }) => cmd_diff_digest(
             &path,
             json || terse || schema,
             compact,
@@ -2873,6 +2891,121 @@ fn cmd_summarize(
     }
 
     bail!("specify a symbol, --file, --extract, or --stats");
+}
+
+fn diff_digest_status_label(status: diff_digest::DiffDigestFileStatus) -> &'static str {
+    match status {
+        diff_digest::DiffDigestFileStatus::Added => "added",
+        diff_digest::DiffDigestFileStatus::Modified => "modified",
+        diff_digest::DiffDigestFileStatus::Deleted => "deleted",
+    }
+}
+
+fn diff_digest_summary_label(state: diff_digest::DiffDigestSummaryState) -> &'static str {
+    match state {
+        diff_digest::DiffDigestSummaryState::Current => "current",
+        diff_digest::DiffDigestSummaryState::Stale => "stale",
+        diff_digest::DiffDigestSummaryState::Missing => "missing",
+        diff_digest::DiffDigestSummaryState::Unavailable => "unavailable",
+    }
+}
+
+fn cmd_diff_digest(
+    path: &Path,
+    json_output: bool,
+    compact: bool,
+    pretty: bool,
+    terse: bool,
+    schema: bool,
+) -> Result<()> {
+    let report = diff_digest::compute(path)?;
+    if json_output {
+        println!("{}", to_json_schema(&report, pretty, terse, schema)?);
+        return Ok(());
+    }
+
+    if report.files.is_empty() {
+        println!("No git changes found.");
+        return Ok(());
+    }
+
+    if compact {
+        println!(
+            "diff files:{} summaries:{} syms:{} edges:+{}/-{}",
+            report.files_changed,
+            report.files_with_current_summaries,
+            report.symbols_touched,
+            report.call_edges_added,
+            report.call_edges_removed
+        );
+        for file in &report.files {
+            let symbols = if file.touched_symbols.is_empty() {
+                "-".to_string()
+            } else {
+                truncate_for_compact(&file.touched_symbols.join(","), 60)
+            };
+            println!(
+                "{} status:{} syms:{} sums:{} edges:+{}/-{}",
+                file.path,
+                diff_digest_status_label(file.status),
+                symbols,
+                diff_digest_summary_label(file.summary_state),
+                file.added_call_edges.len(),
+                file.removed_call_edges.len()
+            );
+        }
+        return Ok(());
+    }
+
+    println!("Diff digest:");
+    println!("  files changed:                 {}", report.files_changed);
+    println!(
+        "  files with current summaries: {}",
+        report.files_with_current_summaries
+    );
+    println!("  touched symbols:              {}", report.symbols_touched);
+    println!(
+        "  call edges:                   +{} / -{}",
+        report.call_edges_added, report.call_edges_removed
+    );
+
+    for file in &report.files {
+        println!();
+        println!("{} [{}]", file.path, diff_digest_status_label(file.status));
+        if file.touched_symbols.is_empty() {
+            println!("  touched symbols: none");
+        } else {
+            println!("  touched symbols: {}", file.touched_symbols.join(", "));
+        }
+        println!(
+            "  cached summaries: {}",
+            diff_digest_summary_label(file.summary_state)
+        );
+        for summary in &file.current_summaries {
+            println!(
+                "    - {}: {}",
+                summary.symbol,
+                truncate_for_compact(&summary.summary, 160)
+            );
+        }
+        if !file.added_call_edges.is_empty() {
+            println!("  call edges added:");
+            for edge in &file.added_call_edges {
+                println!("    - {}", edge);
+            }
+        }
+        if !file.removed_call_edges.is_empty() {
+            println!("  call edges removed:");
+            for edge in &file.removed_call_edges {
+                println!("    - {}", edge);
+            }
+        }
+        for warning in &file.warnings {
+            println!("  warning: {}", warning);
+        }
+    }
+
+    Ok(())
 }
 
 fn open_existing_summary_db_read_only(db_path: &Path) -> Result<summarize::SummaryDb> {
@@ -7317,6 +7450,18 @@ tier = "private"
                 assert!(strategy.is_none());
             }
             _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_diff_digest_command() {
+        let cli = Cli::parse_from(["tsift", "diff-digest", "--json", "."]);
+        match cli.command {
+            Some(Commands::DiffDigest { json, path }) => {
+                assert!(json);
+                assert_eq!(path, PathBuf::from("."));
+            }
+            _ => panic!("expected DiffDigest command"),
         }
     }
 

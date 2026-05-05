@@ -80,6 +80,7 @@ tsift audit --manifest <file>   # compare against expected skill list
 tsift summarize <symbol>        # cached LLM summary for a symbol
 tsift summarize --extract <path>  # batch LLM extraction (one-time; relative path resolves against --path, workspace files use the matching scoped index)
 tsift summarize --extract --diff  # re-extract only git-changed files within the requested path
+tsift diff-digest [path]        # bounded git diff digest: changed files, symbols, summaries, call-edge deltas
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
 tsift search --exact <query>    # literal text lookup via `rg -F`
 tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
@@ -162,7 +163,7 @@ In JSON mode, `--quiet` also omits the `changes` array and uses compact (non-pre
 - `explain` groups callers/callees by file instead of repeating the same path per edge; abbreviates kind labels; uses `sym:`, `crs[N]:`, `ces[N]:`, `comm[N]:` headers
 - `graph` uses `crs[N]:` / `ces[N]:` headers
 - `communities` shows top members per cluster with `(+N more)` instead of full dumps; uses `comms n:N e:N iter:N q:Q cnt:N` header with `mbrs` label
-- `path`, `status`, `audit`, `summarize`, `lint`, `sql`, and `index` switch to denser summary-oriented layouts
+- `path`, `status`, `audit`, `summarize`, `diff-digest`, `lint`, `sql`, and `index` switch to denser summary-oriented layouts
 
 ### Compact Abbreviation Conventions
 
@@ -910,6 +911,24 @@ batch = true                          # use batch API (50% savings)
 max_file_tokens = 8000               # skip files larger than this
 api_key_env = "ANTHROPIC_API_KEY"    # env var for API key
 ```
+
+## Diff Digest
+
+`tsift diff-digest [path]` turns the current git diff into a bounded, code-aware report for agent context.
+
+```bash
+tsift diff-digest .        # current repo root
+tsift diff-digest --json . # structured output
+```
+
+Behavior:
+
+1. Collect tracked changes from `HEAD` plus untracked files.
+2. Compare each changed file's `HEAD` snapshot to the working tree.
+3. Parse both snapshots directly with tree-sitter when the file language is supported.
+4. Emit changed-file status, touched symbols, up to two current cached summary snippets when `summaries.db` matches the file content, and added/removed call edges.
+
+`diff-digest` intentionally does not require a fresh `index.db`. It reads the changed file snapshots directly so unindexed working-tree edits still appear in the digest. Summary lookups stay read-only and degrade to `missing`, `stale`, or `unavailable` instead of mutating the cache.
 
 ## Hook Integration
 
