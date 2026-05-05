@@ -22,6 +22,7 @@ pub mod index;
 pub mod init;
 mod lang;
 pub mod lint;
+pub mod log_digest;
 pub mod status;
 pub mod summarize;
 pub mod test_digest;
@@ -344,6 +345,18 @@ enum Commands {
         /// Force the parser (`cargo`, `pytest`, or `auto`)
         #[arg(long)]
         runner: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Summarize captured verbose logs into bounded signals, anchors, and repeated lines
+    LogDigest {
+        /// Path to the codebase (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Read captured log output from a file instead of stdin
+        #[arg(long)]
+        input: Option<PathBuf>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -685,6 +698,17 @@ fn main() -> Result<()> {
             &path,
             input.as_deref(),
             runner.as_deref(),
+            OutputFormat {
+                json_output: json || terse || schema,
+                compact,
+                pretty,
+                terse,
+                schema,
+            },
+        ),
+        Some(Commands::LogDigest { path, input, json }) => cmd_log_digest(
+            &path,
+            input.as_deref(),
             OutputFormat {
                 json_output: json || terse || schema,
                 compact,
@@ -2960,6 +2984,15 @@ fn test_digest_summary_label(state: test_digest::TestDigestSummaryState) -> &'st
     }
 }
 
+fn log_digest_summary_label(state: log_digest::LogDigestSummaryState) -> &'static str {
+    match state {
+        log_digest::LogDigestSummaryState::Current => "current",
+        log_digest::LogDigestSummaryState::Stale => "stale",
+        log_digest::LogDigestSummaryState::Missing => "missing",
+        log_digest::LogDigestSummaryState::Unavailable => "unavailable",
+    }
+}
+
 fn cmd_diff_digest(
     path: &Path,
     json_output: bool,
@@ -3164,6 +3197,193 @@ fn cmd_test_digest(
             );
         }
     }
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    Ok(())
+}
+
+fn cmd_log_digest(path: &Path, input_path: Option<&Path>, format: OutputFormat) -> Result<()> {
+    let input = match input_path {
+        Some(file_path) => fs::read_to_string(file_path)
+            .with_context(|| format!("reading log output: {}", file_path.display()))?,
+        None => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("reading log output from stdin")?;
+            buf
+        }
+    };
+    if input.trim().is_empty() {
+        bail!("no log output provided; pass --input <file> or pipe log output on stdin");
+    }
+
+    let report = log_digest::compute(path, &input)?;
+    if format.json_output {
+        println!(
+            "{}",
+            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+        );
+        return Ok(());
+    }
+
+    if format.compact {
+        println!(
+            "log lines:{} signals:{} repeats:{} files:{} syms:{} stacks:{}",
+            report.non_empty_lines,
+            report.signal_groups,
+            report.repeated_line_groups,
+            report.file_ref_groups,
+            report.symbol_ref_groups,
+            report.stack_groups
+        );
+        for signal in &report.signals {
+            let location = match (&signal.path, signal.line) {
+                (Some(path), Some(line)) => format!("{path}:{line}"),
+                (Some(path), None) => path.clone(),
+                _ => "-".to_string(),
+            };
+            println!(
+                "{} sev:{} count:{} sums:{} msg:{}",
+                location,
+                signal.severity,
+                signal.occurrences,
+                log_digest_summary_label(signal.summary_state),
+                truncate_for_compact(&signal.message, 80)
+            );
+        }
+        for repeated in &report.repeated_lines {
+            println!(
+                "repeat count:{} line:{}",
+                repeated.occurrences,
+                truncate_for_compact(&repeated.line, 80)
+            );
+        }
+        for symbol in &report.symbol_refs {
+            println!(
+                "sym:{} count:{} sums:{}",
+                symbol.symbol,
+                symbol.occurrences,
+                log_digest_summary_label(symbol.summary_state)
+            );
+        }
+        for warning in &report.warnings {
+            println!("warning: {warning}");
+        }
+        return Ok(());
+    }
+
+    println!("Log digest");
+    println!("  lines:                    {}", report.total_lines);
+    println!("  non-empty lines:          {}", report.non_empty_lines);
+    println!("  signal groups:            {}", report.signal_groups);
+    println!(
+        "  repeated lines:           {}",
+        report.repeated_line_groups
+    );
+    println!(
+        "  repeated line instances:  {}",
+        report.repeated_line_occurrences
+    );
+    println!("  file refs:                {}", report.file_ref_groups);
+    println!("  symbol refs:              {}", report.symbol_ref_groups);
+    println!("  stack groups:             {}", report.stack_groups);
+
+    if !report.signals.is_empty() {
+        println!();
+        println!("Signals:");
+        for signal in &report.signals {
+            match (&signal.path, signal.line, signal.column) {
+                (Some(path), Some(line), Some(column)) => println!("{path}:{line}:{column}"),
+                (Some(path), Some(line), None) => println!("{path}:{line}"),
+                (Some(path), None, _) => println!("{path}"),
+                (None, _, _) => println!("(no file anchor)"),
+            }
+            println!("  severity: {}", signal.severity);
+            println!("  occurrences: {}", signal.occurrences);
+            println!("  message: {}", signal.message);
+            println!(
+                "  cached summaries: {}",
+                log_digest_summary_label(signal.summary_state)
+            );
+            for summary in &signal.current_summaries {
+                println!(
+                    "    - {}: {}",
+                    summary.symbol,
+                    truncate_for_compact(&summary.summary, 160)
+                );
+            }
+        }
+    }
+
+    if !report.repeated_lines.is_empty() {
+        println!();
+        println!("Repeated lines:");
+        for repeated in &report.repeated_lines {
+            println!(
+                "  {}x {}",
+                repeated.occurrences,
+                truncate_for_compact(&repeated.line, 180)
+            );
+        }
+    }
+
+    if !report.file_refs.is_empty() {
+        println!();
+        println!("Anchored files:");
+        for file_ref in &report.file_refs {
+            match (file_ref.line, file_ref.column) {
+                (Some(line), Some(column)) => println!("{}:{}:{}", file_ref.path, line, column),
+                (Some(line), None) => println!("{}:{}", file_ref.path, line),
+                (None, _) => println!("{}", file_ref.path),
+            }
+            println!("  occurrences: {}", file_ref.occurrences);
+            println!(
+                "  cached summaries: {}",
+                log_digest_summary_label(file_ref.summary_state)
+            );
+            for summary in &file_ref.current_summaries {
+                println!(
+                    "    - {}: {}",
+                    summary.symbol,
+                    truncate_for_compact(&summary.summary, 160)
+                );
+            }
+        }
+    }
+
+    if !report.symbol_refs.is_empty() {
+        println!();
+        println!("Symbol candidates:");
+        for symbol in &report.symbol_refs {
+            println!("{}", symbol.symbol);
+            println!("  occurrences: {}", symbol.occurrences);
+            println!(
+                "  cached summaries: {}",
+                log_digest_summary_label(symbol.summary_state)
+            );
+            for summary in &symbol.current_summaries {
+                println!(
+                    "    - {}: {}",
+                    summary.symbol,
+                    truncate_for_compact(&summary.summary, 160)
+                );
+            }
+        }
+    }
+
+    if !report.stack_traces.is_empty() {
+        println!();
+        println!("Stack groups:");
+        for stack in &report.stack_traces {
+            println!("  occurrences: {}", stack.occurrences);
+            for frame in &stack.frames {
+                println!("    - {}", frame);
+            }
+        }
+    }
+
     for warning in &report.warnings {
         println!("warning: {warning}");
     }
@@ -7653,6 +7873,27 @@ tier = "private"
                 assert_eq!(runner.as_deref(), Some("cargo"));
             }
             _ => panic!("expected TestDigest command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_log_digest_command() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "log-digest",
+            "--path",
+            ".",
+            "--input",
+            "target/build.log",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::LogDigest { json, path, input }) => {
+                assert!(json);
+                assert_eq!(path, PathBuf::from("."));
+                assert_eq!(input, Some(PathBuf::from("target/build.log")));
+            }
+            _ => panic!("expected LogDigest command"),
         }
     }
 

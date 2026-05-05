@@ -82,6 +82,7 @@ tsift summarize --extract <path>  # batch LLM extraction (one-time; relative pat
 tsift summarize --extract --diff  # re-extract only git-changed files within the requested path
 tsift diff-digest [path]        # bounded git diff digest: changed files, symbols, summaries, call-edge deltas
 tsift test-digest --path . < test.log  # bounded test-output digest from stdin or --input
+tsift log-digest --path . < build.log  # bounded verbose-log digest from stdin or --input
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
 tsift search --exact <query>    # literal text lookup via `rg -F`
 tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
@@ -164,7 +165,7 @@ In JSON mode, `--quiet` also omits the `changes` array and uses compact (non-pre
 - `explain` groups callers/callees by file instead of repeating the same path per edge; abbreviates kind labels; uses `sym:`, `crs[N]:`, `ces[N]:`, `comm[N]:` headers
 - `graph` uses `crs[N]:` / `ces[N]:` headers
 - `communities` shows top members per cluster with `(+N more)` instead of full dumps; uses `comms n:N e:N iter:N q:Q cnt:N` header with `mbrs` label
-- `path`, `status`, `audit`, `summarize`, `diff-digest`, `test-digest`, `lint`, `sql`, and `index` switch to denser summary-oriented layouts
+- `path`, `status`, `audit`, `summarize`, `diff-digest`, `test-digest`, `log-digest`, `lint`, `sql`, and `index` switch to denser summary-oriented layouts
 
 ### Compact Abbreviation Conventions
 
@@ -948,6 +949,24 @@ Behavior:
 4. When `.tsift/summaries.db` already has current rows for an anchored file, include up to two cached summary snippets; otherwise report `missing`, `stale`, or `unavailable` without mutating the cache.
 
 `test-digest` is intentionally transcript-only. It does not execute the test runner itself, and it keeps summary enrichment read-only so digesting noisy output never contends with `tsift summarize --extract`.
+
+## Log Digest
+
+`tsift log-digest` turns captured verbose stdout/stderr into a bounded transcript digest for agent context.
+
+```bash
+cargo build 2>&1 | tsift log-digest --path .
+tsift log-digest --input target/build.log --json
+```
+
+Behavior:
+
+1. Read captured log output from stdin by default, or from `--input <file>`.
+2. Collapse repeated lines, group warning/error signal lines, and count repeated stack blocks so noisy transcripts stay bounded.
+3. Extract file anchors and symbol-like tokens from the transcript for quick follow-up lookups.
+4. When `.tsift/summaries.db` already has current rows for anchored files or extracted symbols, include up to two cached summary snippets; otherwise report `missing`, `stale`, or `unavailable` without mutating the cache.
+
+`log-digest` is intentionally transcript-only. It does not execute the underlying command, and it keeps summary enrichment read-only so digesting verbose output never contends with `tsift summarize --extract`.
 
 ## Hook Integration
 

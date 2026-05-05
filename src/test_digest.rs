@@ -216,14 +216,21 @@ pub fn compute(path: &Path, input: &str, runner: Option<&str>) -> Result<TestDig
     Ok(TestDigestReport {
         root: root.display().to_string(),
         runner: selected_runner.as_str().to_string(),
-        failures: failure_groups.iter().map(|failure| failure.occurrences).sum(),
+        failures: failure_groups
+            .iter()
+            .map(|failure| failure.occurrences)
+            .sum(),
         grouped_failures: failure_groups.len(),
         counts: TestDigestCounts {
             passed: parsed.counts.passed,
-            failed: parsed
-                .counts
-                .failed
-                .or_else(|| (!failure_groups.is_empty()).then_some(failure_groups.iter().map(|failure| failure.occurrences).sum())),
+            failed: parsed.counts.failed.or_else(|| {
+                (!failure_groups.is_empty()).then_some(
+                    failure_groups
+                        .iter()
+                        .map(|failure| failure.occurrences)
+                        .sum(),
+                )
+            }),
             skipped: parsed.counts.skipped,
         },
         failure_groups,
@@ -451,7 +458,9 @@ fn parse_failure_block(test_name: String, block: &[&str]) -> RawFailure {
 
     for entry in block {
         let trimmed = entry.trim();
-        if trimmed.is_empty() || trimmed.starts_with("note:") || trimmed.starts_with("stack backtrace")
+        if trimmed.is_empty()
+            || trimmed.starts_with("note:")
+            || trimmed.starts_with("stack backtrace")
         {
             continue;
         }

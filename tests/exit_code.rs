@@ -2664,7 +2664,12 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
 ";
 
     let mut child = tsift_bin()
-        .args(["test-digest", "--json", "--path", dir.path().to_str().unwrap()])
+        .args([
+            "test-digest",
+            "--json",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -2688,6 +2693,57 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
     assert_eq!(json["counts"]["failed"], 1);
     assert_eq!(json["failure_groups"][0]["path"], "src/lib.rs");
     assert_eq!(json["failure_groups"][0]["line"], 7);
+}
+
+#[test]
+fn log_digest_reads_verbose_output_from_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn run_sync() {}\n").unwrap();
+
+    let input = "\
+error: run_sync failed at src/lib.rs:1:1
+error: run_sync failed at src/lib.rs:1:1
+warning: retrying run_sync
+warning: retrying run_sync
+0: my_crate::run_sync
+at src/lib.rs:1:1
+";
+
+    let mut child = tsift_bin()
+        .args([
+            "log-digest",
+            "--json",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "log-digest should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["signal_groups"], 2);
+    assert_eq!(json["repeated_line_groups"], 2);
+    assert_eq!(json["file_refs"][0]["path"], "src/lib.rs");
+    assert!(
+        json["symbol_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["symbol"] == "run_sync")
+    );
 }
 
 #[test]
