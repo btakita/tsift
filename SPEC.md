@@ -990,7 +990,14 @@ The hook resolves the git root first, then runs `tsift index --check --exit-code
 
 ### Search Rewrite (`PreToolUse`)
 
-The existing `tsift-rewrite.sh` hook intercepts `rg`/`grep -r` Bash calls and silently rewrites them to `tsift search --exact`. See `~/.claude/hooks/tsift-rewrite.sh`.
+The existing `tsift-rewrite.sh` hook intercepts high-token shell commands and silently rewrites them to lower-context tsift flows:
+
+- `rg ...` / `grep -r ...` → `tsift search --exact ...`
+- plain `git diff` / `git diff -- <path>` → `tsift diff-digest [path]`
+- `cargo test ...`, `pytest ...`, `python -m pytest ...` → `tsift __digest-runner --kind test ...`
+- `cargo build ...`, `cargo check ...`, `cargo clippy ...`, `cargo install ...` → `tsift __digest-runner --kind log ...`
+
+The digest-runner path preserves the wrapped command's original exit status while replacing raw stdout/stderr with a bounded digest, so failing tests/builds still fail closed instead of being laundered through a successful shell pipe. See `~/.claude/hooks/tsift-rewrite.sh`.
 
 ### RTK Output Filtering (`PreToolUse`)
 

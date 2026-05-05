@@ -2747,6 +2747,71 @@ at src/lib.rs:1:1
 }
 
 #[test]
+fn digest_runner_preserves_failing_test_exit_code() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn helper() {}\n").unwrap();
+
+    let shell_command = r#"cat <<'EOF'
+running 2 tests
+---- tests::alpha stdout ----
+thread 'tests::alpha' panicked at src/lib.rs:7:9:
+assertion `left == right` failed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+EOF
+exit 7"#;
+
+    let output = tsift_bin()
+        .args([
+            "__digest-runner",
+            "--kind",
+            "test",
+            "--runner",
+            "cargo",
+            "--json",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--shell-command",
+            shell_command,
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(7));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["runner"], "cargo");
+    assert_eq!(json["failures"], 1);
+    assert_eq!(json["failure_groups"][0]["path"], "src/lib.rs");
+}
+
+#[test]
+fn digest_runner_captures_stderr_for_log_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn run_sync() {}\n").unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "__digest-runner",
+            "--kind",
+            "log",
+            "--json",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--shell-command",
+            "printf 'error: run_sync failed at src/lib.rs:1:1\n' >&2; exit 3",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["signal_groups"], 1);
+    assert_eq!(json["file_refs"][0]["path"], "src/lib.rs");
+}
+
+#[test]
 fn search_worker_uses_stable_tsift_cache_dir() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();

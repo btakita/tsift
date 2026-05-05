@@ -115,6 +115,24 @@ enum Commands {
         #[arg(long)]
         output: PathBuf,
     },
+    #[command(hide = true, name = "__digest-runner")]
+    DigestRunner {
+        /// Digest mode: test or log
+        #[arg(long)]
+        kind: String,
+        /// Path to the codebase (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Force the test parser (`cargo`, `pytest`, or `auto`) when kind=test
+        #[arg(long)]
+        runner: Option<String>,
+        /// Shell command to execute and digest
+        #[arg(long)]
+        shell_command: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Apply multiple file edits in one invocation (reads JSON from stdin)
     Edit {
         /// Preview changes without writing
@@ -498,6 +516,25 @@ fn main() -> Result<()> {
             strategy,
             output,
         }) => cmd_search_worker(&path, &cache_dir, &query, limit, &strategy, &output),
+        Some(Commands::DigestRunner {
+            kind,
+            path,
+            runner,
+            shell_command,
+            json,
+        }) => cmd_digest_runner(
+            &kind,
+            &path,
+            runner.as_deref(),
+            &shell_command,
+            OutputFormat {
+                json_output: json || terse || schema,
+                compact,
+                pretty,
+                terse,
+                schema,
+            },
+        ),
         Some(Commands::Edit { dry_run, file }) => {
             cmd_edit(dry_run, file, compact, pretty, terse, schema)
         }
@@ -3112,7 +3149,16 @@ fn cmd_test_digest(
         bail!("no test output provided; pass --input <file> or pipe runner output on stdin");
     }
 
-    let report = test_digest::compute(path, &input, runner)?;
+    render_test_digest_from_input(path, &input, runner, format)
+}
+
+fn render_test_digest_from_input(
+    path: &Path,
+    input: &str,
+    runner: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let report = test_digest::compute(path, input, runner)?;
     if format.json_output {
         println!(
             "{}",
@@ -3219,7 +3265,11 @@ fn cmd_log_digest(path: &Path, input_path: Option<&Path>, format: OutputFormat) 
         bail!("no log output provided; pass --input <file> or pipe log output on stdin");
     }
 
-    let report = log_digest::compute(path, &input)?;
+    render_log_digest_from_input(path, &input, format)
+}
+
+fn render_log_digest_from_input(path: &Path, input: &str, format: OutputFormat) -> Result<()> {
+    let report = log_digest::compute(path, input)?;
     if format.json_output {
         println!(
             "{}",
@@ -3388,6 +3438,46 @@ fn cmd_log_digest(path: &Path, input_path: Option<&Path>, format: OutputFormat) 
         println!("warning: {warning}");
     }
     Ok(())
+}
+
+fn cmd_digest_runner(
+    kind: &str,
+    path: &Path,
+    runner: Option<&str>,
+    shell_command: &str,
+    format: OutputFormat,
+) -> Result<()> {
+    let digest_kind = DigestRunnerKind::parse(kind)?;
+    let output = Command::new("sh")
+        .arg("-lc")
+        .arg(format!("({shell_command}) 2>&1"))
+        .stdout(Stdio::piped())
+        .output()
+        .with_context(|| format!("running digest-wrapped command: {shell_command}"))?;
+
+    let captured = String::from_utf8_lossy(&output.stdout).into_owned();
+    if captured.trim().is_empty() {
+        let label = match digest_kind {
+            DigestRunnerKind::Test => "test",
+            DigestRunnerKind::Log => "log",
+        };
+        println!("No {label} output captured.");
+    } else {
+        match digest_kind {
+            DigestRunnerKind::Test => {
+                render_test_digest_from_input(path, &captured, runner, format)?
+            }
+            DigestRunnerKind::Log => render_log_digest_from_input(path, &captured, format)?,
+        }
+    }
+
+    if output.status.success() {
+        return Ok(());
+    }
+    if let Some(code) = output.status.code() {
+        std::process::exit(code);
+    }
+    bail!("digest-wrapped command terminated by signal: {shell_command}");
 }
 
 fn open_existing_summary_db_read_only(db_path: &Path) -> Result<summarize::SummaryDb> {
@@ -5320,7 +5410,7 @@ mod tests {
 
     #[test]
     fn rewrite_unrelated_passthrough() {
-        let result = rewrite_command("cargo build");
+        let result = rewrite_command("echo cargo build");
         assert_eq!(result, None);
     }
 
@@ -5328,6 +5418,74 @@ mod tests {
     fn rewrite_rg_quoted_pattern() {
         let result = rewrite_command("rg \"fn main\"");
         assert_eq!(result, Some("tsift search \"fn main\" --exact".to_string()));
+    }
+
+    #[test]
+    fn rewrite_git_diff_to_diff_digest() {
+        let result = rewrite_command("git diff");
+        assert_eq!(result, Some("tsift diff-digest .".to_string()));
+    }
+
+    #[test]
+    fn rewrite_git_diff_with_path_to_diff_digest() {
+        let result = rewrite_command("git diff -- src/");
+        assert_eq!(result, Some("tsift diff-digest \"src/\"".to_string()));
+    }
+
+    #[test]
+    fn rewrite_git_diff_with_revision_passthrough() {
+        let result = rewrite_command("git diff HEAD~1");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn rewrite_cargo_test_to_digest_runner() {
+        let result = rewrite_command("cargo test --lib");
+        assert_eq!(
+            result,
+            Some(
+                "tsift __digest-runner --kind \"test\" --path \".\" --shell-command \"cargo test --lib\" --runner \"cargo\"".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn rewrite_pytest_to_digest_runner() {
+        let result = rewrite_command("pytest -q tests/test_cli.py");
+        assert_eq!(
+            result,
+            Some(
+                "tsift __digest-runner --kind \"test\" --path \".\" --shell-command \"pytest -q tests/test_cli.py\" --runner \"pytest\"".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn rewrite_python_m_pytest_to_digest_runner() {
+        let result = rewrite_command("python -m pytest tests/test_cli.py");
+        assert_eq!(
+            result,
+            Some(
+                "tsift __digest-runner --kind \"test\" --path \".\" --shell-command \"python -m pytest tests/test_cli.py\" --runner \"pytest\"".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn rewrite_cargo_build_to_log_digest_runner() {
+        let result = rewrite_command("cargo build --release");
+        assert_eq!(
+            result,
+            Some(
+                "tsift __digest-runner --kind \"log\" --path \".\" --shell-command \"cargo build --release\"".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn rewrite_metacharacter_command_passthrough() {
+        let result = rewrite_command("cargo test | head");
+        assert_eq!(result, None);
     }
 
     #[test]
@@ -8497,6 +8655,21 @@ pub(crate) fn rewrite_command(command: &str) -> Option<String> {
         return Some(rewritten);
     }
 
+    // git diff [path] / git diff -- [path] → tsift diff-digest [path]
+    if let Some(rewritten) = rewrite_git_diff(trimmed) {
+        return Some(rewritten);
+    }
+
+    // cargo test / pytest → tsift-owned test digest wrapper that preserves exit status
+    if let Some(rewritten) = rewrite_test_command(trimmed) {
+        return Some(rewritten);
+    }
+
+    // verbose build/check/install commands → tsift-owned log digest wrapper
+    if let Some(rewritten) = rewrite_log_command(trimmed) {
+        return Some(rewritten);
+    }
+
     None
 }
 
@@ -8619,6 +8792,117 @@ fn rewrite_grep(cmd: &str) -> Option<String> {
         result.push_str(&format!(" --path {}", shell_quote(p)));
     }
     Some(result)
+}
+
+fn rewrite_git_diff(cmd: &str) -> Option<String> {
+    if has_shell_metacharacters(cmd) {
+        return None;
+    }
+
+    let parts: Vec<&str> = shell_split(cmd);
+    if parts.len() < 2 || parts[0] != "git" || parts[1] != "diff" {
+        return None;
+    }
+    if parts.len() == 2 {
+        return Some("tsift diff-digest .".to_string());
+    }
+
+    let remainder = &parts[2..];
+    let path = match remainder {
+        [path] if looks_like_path_selector(path) => *path,
+        ["--", path] if !path.starts_with('-') => *path,
+        _ => return None,
+    };
+    Some(format!("tsift diff-digest {}", shell_quote(path)))
+}
+
+fn rewrite_test_command(cmd: &str) -> Option<String> {
+    if has_shell_metacharacters(cmd) {
+        return None;
+    }
+
+    let parts: Vec<&str> = shell_split(cmd);
+    if parts.len() >= 2 && parts[0] == "cargo" && parts[1] == "test" {
+        return Some(build_digest_runner_command("test", ".", Some("cargo"), cmd));
+    }
+    if !parts.is_empty() && parts[0] == "pytest" {
+        return Some(build_digest_runner_command(
+            "test",
+            ".",
+            Some("pytest"),
+            cmd,
+        ));
+    }
+    if parts.len() >= 3 && parts[0] == "python" && parts[1] == "-m" && parts[2] == "pytest" {
+        return Some(build_digest_runner_command(
+            "test",
+            ".",
+            Some("pytest"),
+            cmd,
+        ));
+    }
+    None
+}
+
+fn rewrite_log_command(cmd: &str) -> Option<String> {
+    if has_shell_metacharacters(cmd) {
+        return None;
+    }
+
+    let parts: Vec<&str> = shell_split(cmd);
+    if parts.len() >= 2
+        && parts[0] == "cargo"
+        && matches!(parts[1], "build" | "check" | "clippy" | "install")
+    {
+        return Some(build_digest_runner_command("log", ".", None, cmd));
+    }
+    None
+}
+
+fn build_digest_runner_command(
+    kind: &str,
+    path: &str,
+    runner: Option<&str>,
+    shell_command: &str,
+) -> String {
+    let mut result = format!(
+        "tsift __digest-runner --kind {} --path {} --shell-command {}",
+        shell_quote(kind),
+        shell_quote(path),
+        shell_quote(shell_command)
+    );
+    if let Some(runner) = runner {
+        result.push_str(&format!(" --runner {}", shell_quote(runner)));
+    }
+    result
+}
+
+fn has_shell_metacharacters(cmd: &str) -> bool {
+    cmd.contains('|') || cmd.contains('>') || cmd.contains('<') || cmd.contains('&')
+}
+
+fn looks_like_path_selector(raw: &str) -> bool {
+    raw.ends_with('/')
+        || raw.starts_with("./")
+        || raw.starts_with("../")
+        || raw.contains('/')
+        || raw.contains('.')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DigestRunnerKind {
+    Test,
+    Log,
+}
+
+impl DigestRunnerKind {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "test" => Ok(Self::Test),
+            "log" => Ok(Self::Log),
+            other => bail!("unsupported digest runner kind `{other}`; expected test or log"),
+        }
+    }
 }
 
 /// Simple shell word splitting (handles single and double quotes).
