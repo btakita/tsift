@@ -81,6 +81,7 @@ tsift summarize <symbol>        # cached LLM summary for a symbol
 tsift summarize --extract <path>  # batch LLM extraction (one-time; relative path resolves against --path, workspace files use the matching scoped index)
 tsift summarize --extract --diff  # re-extract only git-changed files within the requested path
 tsift diff-digest [path]        # bounded git diff digest: changed files, symbols, summaries, call-edge deltas
+tsift test-digest --path . < test.log  # bounded test-output digest from stdin or --input
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
 tsift search --exact <query>    # literal text lookup via `rg -F`
 tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
@@ -163,7 +164,7 @@ In JSON mode, `--quiet` also omits the `changes` array and uses compact (non-pre
 - `explain` groups callers/callees by file instead of repeating the same path per edge; abbreviates kind labels; uses `sym:`, `crs[N]:`, `ces[N]:`, `comm[N]:` headers
 - `graph` uses `crs[N]:` / `ces[N]:` headers
 - `communities` shows top members per cluster with `(+N more)` instead of full dumps; uses `comms n:N e:N iter:N q:Q cnt:N` header with `mbrs` label
-- `path`, `status`, `audit`, `summarize`, `diff-digest`, `lint`, `sql`, and `index` switch to denser summary-oriented layouts
+- `path`, `status`, `audit`, `summarize`, `diff-digest`, `test-digest`, `lint`, `sql`, and `index` switch to denser summary-oriented layouts
 
 ### Compact Abbreviation Conventions
 
@@ -929,6 +930,24 @@ Behavior:
 4. Emit changed-file status, touched symbols, up to two current cached summary snippets when `summaries.db` matches the file content, and added/removed call edges.
 
 `diff-digest` intentionally does not require a fresh `index.db`. It reads the changed file snapshots directly so unindexed working-tree edits still appear in the digest. Summary lookups stay read-only and degrade to `missing`, `stale`, or `unavailable` instead of mutating the cache.
+
+## Test Digest
+
+`tsift test-digest` turns captured test runner output into a bounded failure report for agent context.
+
+```bash
+cargo test 2>&1 | tsift test-digest --path .
+tsift test-digest --runner pytest --input .pytest-failures.log --json
+```
+
+Behavior:
+
+1. Read captured test output from stdin by default, or from `--input <file>`.
+2. Auto-detect `cargo` and `pytest` output formats unless `--runner` forces one parser.
+3. Group duplicate failures by file/line/message, preserve the failing test names, and keep the first assertion/error message instead of the full transcript noise.
+4. When `.tsift/summaries.db` already has current rows for an anchored file, include up to two cached summary snippets; otherwise report `missing`, `stale`, or `unavailable` without mutating the cache.
+
+`test-digest` is intentionally transcript-only. It does not execute the test runner itself, and it keeps summary enrichment read-only so digesting noisy output never contends with `tsift summarize --extract`.
 
 ## Hook Integration
 

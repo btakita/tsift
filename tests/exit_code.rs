@@ -2649,6 +2649,48 @@ fn diff_digest_reports_changed_symbols_and_call_edges() {
 }
 
 #[test]
+fn test_digest_reads_cargo_output_from_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn helper() {}\n").unwrap();
+
+    let input = "\
+running 2 tests
+---- tests::alpha stdout ----
+thread 'tests::alpha' panicked at src/lib.rs:7:9:
+assertion `left == right` failed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+";
+
+    let mut child = tsift_bin()
+        .args(["test-digest", "--json", "--path", dir.path().to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "test-digest should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["runner"], "cargo");
+    assert_eq!(json["failures"], 1);
+    assert_eq!(json["grouped_failures"], 1);
+    assert_eq!(json["counts"]["failed"], 1);
+    assert_eq!(json["failure_groups"][0]["path"], "src/lib.rs");
+    assert_eq!(json["failure_groups"][0]["line"], 7);
+}
+
+#[test]
 fn search_worker_uses_stable_tsift_cache_dir() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();

@@ -24,6 +24,7 @@ mod lang;
 pub mod lint;
 pub mod status;
 pub mod summarize;
+pub mod test_digest;
 pub mod walk;
 
 #[derive(Parser)]
@@ -332,6 +333,21 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Summarize captured test runner output into grouped failures
+    TestDigest {
+        /// Path to the codebase (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Read captured test output from a file instead of stdin
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Force the parser (`cargo`, `pytest`, or `auto`)
+        #[arg(long)]
+        runner: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Report index + summary status and recommended commands for this session
     Status {
         /// Path to the codebase (defaults to current directory)
@@ -371,6 +387,14 @@ struct EditOp {
     /// Replace all occurrences (default: false — fails if not unique)
     #[serde(default)]
     replace_all: bool,
+}
+
+struct OutputFormat {
+    json_output: bool,
+    compact: bool,
+    pretty: bool,
+    terse: bool,
+    schema: bool,
 }
 
 #[derive(Serialize)]
@@ -651,6 +675,23 @@ fn main() -> Result<()> {
             pretty,
             terse,
             schema,
+        ),
+        Some(Commands::TestDigest {
+            path,
+            input,
+            runner,
+            json,
+        }) => cmd_test_digest(
+            &path,
+            input.as_deref(),
+            runner.as_deref(),
+            OutputFormat {
+                json_output: json || terse || schema,
+                compact,
+                pretty,
+                terse,
+                schema,
+            },
         ),
         Some(Commands::Status { path, json }) => cmd_status(
             &path,
@@ -2910,6 +2951,15 @@ fn diff_digest_summary_label(state: diff_digest::DiffDigestSummaryState) -> &'st
     }
 }
 
+fn test_digest_summary_label(state: test_digest::TestDigestSummaryState) -> &'static str {
+    match state {
+        test_digest::TestDigestSummaryState::Current => "current",
+        test_digest::TestDigestSummaryState::Stale => "stale",
+        test_digest::TestDigestSummaryState::Missing => "missing",
+        test_digest::TestDigestSummaryState::Unavailable => "unavailable",
+    }
+}
+
 fn cmd_diff_digest(
     path: &Path,
     json_output: bool,
@@ -3005,6 +3055,118 @@ fn cmd_diff_digest(
         }
     }
 
+    Ok(())
+}
+
+fn cmd_test_digest(
+    path: &Path,
+    input_path: Option<&Path>,
+    runner: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let input = match input_path {
+        Some(file_path) => fs::read_to_string(file_path)
+            .with_context(|| format!("reading test output: {}", file_path.display()))?,
+        None => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("reading test output from stdin")?;
+            buf
+        }
+    };
+    if input.trim().is_empty() {
+        bail!("no test output provided; pass --input <file> or pipe runner output on stdin");
+    }
+
+    let report = test_digest::compute(path, &input, runner)?;
+    if format.json_output {
+        println!(
+            "{}",
+            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+        );
+        return Ok(());
+    }
+
+    if report.failure_groups.is_empty() {
+        println!("No failures detected (runner: {}).", report.runner);
+        for warning in &report.warnings {
+            println!("warning: {warning}");
+        }
+        return Ok(());
+    }
+
+    if format.compact {
+        println!(
+            "test runner:{} failures:{} groups:{} passed:{} failed:{} skipped:{}",
+            report.runner,
+            report.failures,
+            report.grouped_failures,
+            report.counts.passed.unwrap_or(0),
+            report.counts.failed.unwrap_or(report.grouped_failures),
+            report.counts.skipped.unwrap_or(0),
+        );
+        for failure in &report.failure_groups {
+            let tests = truncate_for_compact(&failure.tests.join(","), 60);
+            let location = match (&failure.path, failure.line) {
+                (Some(path), Some(line)) => format!("{path}:{line}"),
+                (Some(path), None) => path.clone(),
+                _ => "-".to_string(),
+            };
+            println!(
+                "{} tests:{} count:{} summaries:{} msg:{}",
+                location,
+                tests,
+                failure.occurrences,
+                test_digest_summary_label(failure.summary_state),
+                truncate_for_compact(&failure.message, 80)
+            );
+        }
+        for warning in &report.warnings {
+            println!("warning: {warning}");
+        }
+        return Ok(());
+    }
+
+    println!("Test digest ({})", report.runner);
+    println!("  failures:        {}", report.failures);
+    println!("  failure groups:  {}", report.grouped_failures);
+    if let Some(passed) = report.counts.passed {
+        println!("  passed:          {}", passed);
+    }
+    if let Some(failed) = report.counts.failed {
+        println!("  failed:          {}", failed);
+    }
+    if let Some(skipped) = report.counts.skipped {
+        println!("  skipped:         {}", skipped);
+    }
+
+    for failure in &report.failure_groups {
+        println!();
+        match (&failure.path, failure.line, failure.column) {
+            (Some(path), Some(line), Some(column)) => println!("{path}:{line}:{column}"),
+            (Some(path), Some(line), None) => println!("{path}:{line}"),
+            (Some(path), None, _) => println!("{path}"),
+            (None, _, _) => println!("(no file anchor)"),
+        }
+        println!("  tests: {}", failure.tests.join(", "));
+        println!("  occurrences: {}", failure.occurrences);
+        println!("  message: {}", failure.message);
+        println!(
+            "  cached summaries: {}",
+            test_digest_summary_label(failure.summary_state)
+        );
+        for summary in &failure.current_summaries {
+            println!(
+                "    - {}: {}",
+                summary.symbol,
+                truncate_for_compact(&summary.summary, 160)
+            );
+        }
+    }
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
     Ok(())
 }
 
@@ -7462,6 +7624,35 @@ tier = "private"
                 assert_eq!(path, PathBuf::from("."));
             }
             _ => panic!("expected DiffDigest command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_test_digest_command() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "test-digest",
+            "--path",
+            ".",
+            "--input",
+            "target/test.log",
+            "--runner",
+            "cargo",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::TestDigest {
+                json,
+                path,
+                input,
+                runner,
+            }) => {
+                assert!(json);
+                assert_eq!(path, PathBuf::from("."));
+                assert_eq!(input, Some(PathBuf::from("target/test.log")));
+                assert_eq!(runner.as_deref(), Some("cargo"));
+            }
+            _ => panic!("expected TestDigest command"),
         }
     }
 
