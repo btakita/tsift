@@ -1050,6 +1050,7 @@ The existing `tsift-rewrite.sh` hook intercepts high-token shell commands and si
 
 - `rg ...` / `grep -r ...` → `tsift search --exact ...`
 - `git diff`, `git diff --cached`, `git show`, and simple `git log -p -1 ...` history review → `tsift diff-digest ...`
+- long transcript reads (`cat`, `bat`, `head -n`, `tail -n`, `sed -n`) over recognized agent-doc markdown sessions or Claude JSONL → `tsift session-digest ...`
 - `cargo test ...`, `pytest ...`, `python -m pytest ...` → `tsift __digest-runner --kind test ...`
 - `cargo build ...`, `cargo check ...`, `cargo clippy ...`, `cargo install ...` → `tsift __digest-runner --kind log ...`
 

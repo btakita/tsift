@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -5904,6 +5904,103 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_cat_long_agent_doc_session_to_session_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("tsift.md");
+        let mut body = String::from("---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n");
+        for index in 0..90 {
+            body.push_str(&format!("❯ prompt {index}?\n"));
+        }
+        fs::write(&session, body).unwrap();
+
+        let result = rewrite_command(&format!("cat {}", shell_quote(session.to_str().unwrap())));
+        assert_eq!(
+            result,
+            Some(format!(
+                "tsift session-digest --path \".\" --input {} --source markdown",
+                shell_quote(session.to_str().unwrap())
+            ))
+        );
+    }
+
+    #[test]
+    fn rewrite_head_long_claude_jsonl_to_session_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session.jsonl");
+        let line =
+            r#"{"message":{"role":"assistant","content":[{"type":"text","text":"❯ do [#yyhd]"}]}}"#;
+        let body = std::iter::repeat_n(line, 120)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&session, format!("{body}\n")).unwrap();
+
+        let result = rewrite_command(&format!(
+            "head -n 120 {}",
+            shell_quote(session.to_str().unwrap())
+        ));
+        assert_eq!(
+            result,
+            Some(format!(
+                "tsift session-digest --path \".\" --input {} --source jsonl",
+                shell_quote(session.to_str().unwrap())
+            ))
+        );
+    }
+
+    #[test]
+    fn rewrite_small_transcript_window_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("session.jsonl");
+        let line = r#"{"message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#;
+        let body = std::iter::repeat_n(line, 120)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&session, format!("{body}\n")).unwrap();
+
+        let result = rewrite_command(&format!(
+            "tail -n 20 {}",
+            shell_quote(session.to_str().unwrap())
+        ));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn rewrite_sed_large_agent_doc_range_to_session_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("tsift.md");
+        let mut body = String::from("---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n");
+        for index in 0..120 {
+            body.push_str(&format!("### Re: topic {index}\n"));
+        }
+        fs::write(&session, body).unwrap();
+
+        let result = rewrite_command(&format!(
+            "sed -n '1,120p' {}",
+            shell_quote(session.to_str().unwrap())
+        ));
+        assert_eq!(
+            result,
+            Some(format!(
+                "tsift session-digest --path \".\" --input {} --source markdown",
+                shell_quote(session.to_str().unwrap())
+            ))
+        );
+    }
+
+    #[test]
+    fn rewrite_regular_markdown_read_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let readme = dir.path().join("README.md");
+        let body = std::iter::repeat_n("plain markdown", 120)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&readme, format!("{body}\n")).unwrap();
+
+        let result = rewrite_command(&format!("cat {}", shell_quote(readme.to_str().unwrap())));
+        assert_eq!(result, None);
+    }
+
+    #[test]
     fn rewrite_cargo_test_to_digest_runner() {
         let result = rewrite_command("cargo test --lib");
         assert_eq!(
@@ -9227,6 +9324,11 @@ pub(crate) fn rewrite_command(command: &str) -> Option<String> {
         return Some(rewritten);
     }
 
+    // long session/doc transcript reads → tsift session-digest
+    if let Some(rewritten) = rewrite_session_read_command(trimmed) {
+        return Some(rewritten);
+    }
+
     // cargo test / pytest → tsift-owned test digest wrapper that preserves exit status
     if let Some(rewritten) = rewrite_test_command(trimmed) {
         return Some(rewritten);
@@ -9515,6 +9617,215 @@ fn build_diff_digest_command(path: &str, cached: bool, revision: Option<&str>) -
     result
 }
 
+const SESSION_READ_LINE_THRESHOLD: usize = 80;
+
+struct SessionReadTarget {
+    input: String,
+    requested_lines: Option<usize>,
+}
+
+fn rewrite_session_read_command(cmd: &str) -> Option<String> {
+    if has_shell_metacharacters(cmd) {
+        return None;
+    }
+
+    let target = parse_session_read_target(cmd)?;
+    let input_path = Path::new(&target.input);
+    let source = detect_session_digest_source(input_path)?;
+
+    if let Some(requested_lines) = target.requested_lines {
+        if requested_lines < SESSION_READ_LINE_THRESHOLD {
+            return None;
+        }
+    } else if !file_has_at_least_lines(input_path, SESSION_READ_LINE_THRESHOLD) {
+        return None;
+    }
+
+    Some(build_session_digest_command(".", &target.input, source))
+}
+
+fn parse_session_read_target(cmd: &str) -> Option<SessionReadTarget> {
+    let parts: Vec<&str> = shell_split(cmd);
+    let head = parts.first().copied()?;
+    match head {
+        "cat" | "bat" | "batcat" => parse_cat_like_session_target(&parts),
+        "head" | "tail" => parse_head_tail_session_target(&parts),
+        "sed" => parse_sed_session_target(&parts),
+        _ => None,
+    }
+}
+
+fn parse_cat_like_session_target(parts: &[&str]) -> Option<SessionReadTarget> {
+    let mut input = None;
+    for part in &parts[1..] {
+        if part.starts_with('-') {
+            continue;
+        }
+        if input.replace(strip_shell_quotes(part)).is_some() {
+            return None;
+        }
+    }
+    Some(SessionReadTarget {
+        input: input?.to_string(),
+        requested_lines: None,
+    })
+}
+
+fn parse_head_tail_session_target(parts: &[&str]) -> Option<SessionReadTarget> {
+    let mut requested_lines = 10;
+    let mut input = None;
+    let mut index = 1;
+
+    while index < parts.len() {
+        let part = parts[index];
+        if part == "-n" || part == "--lines" {
+            index += 1;
+            requested_lines = parse_requested_line_count(parts.get(index).copied()?)?;
+            index += 1;
+            continue;
+        }
+        if let Some(raw) = part.strip_prefix("-n")
+            && !raw.is_empty()
+        {
+            requested_lines = parse_requested_line_count(raw)?;
+            index += 1;
+            continue;
+        }
+        if let Some(raw) = part.strip_prefix("--lines=") {
+            requested_lines = parse_requested_line_count(raw)?;
+            index += 1;
+            continue;
+        }
+        if part.starts_with('-') && part[1..].chars().all(|ch| ch.is_ascii_digit()) {
+            requested_lines = parse_requested_line_count(&part[1..])?;
+            index += 1;
+            continue;
+        }
+        if input.replace(strip_shell_quotes(part)).is_some() {
+            return None;
+        }
+        index += 1;
+    }
+
+    Some(SessionReadTarget {
+        input: input?.to_string(),
+        requested_lines: Some(requested_lines),
+    })
+}
+
+fn parse_sed_session_target(parts: &[&str]) -> Option<SessionReadTarget> {
+    if parts.len() != 4 || parts[1] != "-n" {
+        return None;
+    }
+
+    let requested_lines = parse_sed_print_range(parts[2])?;
+    Some(SessionReadTarget {
+        input: strip_shell_quotes(parts[3]).to_string(),
+        requested_lines: Some(requested_lines),
+    })
+}
+
+fn parse_requested_line_count(raw: &str) -> Option<usize> {
+    let trimmed = strip_shell_quotes(raw);
+    if let Some(number) = trimmed.strip_prefix('+') {
+        number.parse::<usize>().ok()?;
+        return Some(SESSION_READ_LINE_THRESHOLD);
+    }
+    trimmed.parse::<usize>().ok()
+}
+
+fn parse_sed_print_range(raw: &str) -> Option<usize> {
+    let trimmed = strip_shell_quotes(raw);
+    let range = trimmed.strip_suffix('p')?;
+    let (start, end) = range.split_once(',')?;
+    let start = start.parse::<usize>().ok()?;
+    let end = end.parse::<usize>().ok()?;
+    (end >= start).then_some(end - start + 1)
+}
+
+fn detect_session_digest_source(path: &Path) -> Option<session_digest::SessionDigestSource> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("md") if file_looks_like_agent_doc_session(path) => {
+            Some(session_digest::SessionDigestSource::Markdown)
+        }
+        Some("jsonl") if file_looks_like_claude_jsonl(path) => {
+            Some(session_digest::SessionDigestSource::Jsonl)
+        }
+        _ => None,
+    }
+}
+
+fn file_looks_like_agent_doc_session(path: &Path) -> bool {
+    let prefix = match read_file_prefix(path, 16 * 1024) {
+        Some(prefix) => prefix,
+        None => return false,
+    };
+    prefix.contains("agent_doc_session:")
+        || prefix.contains("<!-- agent:exchange")
+        || prefix.contains("\n## Exchange")
+}
+
+fn file_looks_like_claude_jsonl(path: &Path) -> bool {
+    let prefix = match read_file_prefix(path, 16 * 1024) {
+        Some(prefix) => prefix,
+        None => return false,
+    };
+
+    prefix
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(3)
+        .any(|line| {
+            let value = match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(value) => value,
+                Err(_) => return false,
+            };
+            value.get("message").is_some()
+                || value.get("role").is_some()
+                || value.get("content").is_some()
+        })
+}
+
+fn read_file_prefix(path: &Path, max_bytes: usize) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut buffer = Vec::new();
+    reader
+        .by_ref()
+        .take(max_bytes as u64)
+        .read_to_end(&mut buffer)
+        .ok()?;
+    Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn file_has_at_least_lines(path: &Path, min_lines: usize) -> bool {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let reader = BufReader::new(file);
+    reader
+        .lines()
+        .take(min_lines)
+        .filter(|line| line.is_ok())
+        .count()
+        >= min_lines
+}
+
+fn build_session_digest_command(
+    path: &str,
+    input: &str,
+    source: session_digest::SessionDigestSource,
+) -> String {
+    format!(
+        "tsift session-digest --path {} --input {} --source {}",
+        shell_quote(path),
+        shell_quote(input),
+        source.as_str()
+    )
+}
+
 fn rewrite_test_command(cmd: &str) -> Option<String> {
     if has_shell_metacharacters(cmd) {
         return None;
@@ -9578,6 +9889,16 @@ fn build_digest_runner_command(
 
 fn has_shell_metacharacters(cmd: &str) -> bool {
     cmd.contains('|') || cmd.contains('>') || cmd.contains('<') || cmd.contains('&')
+}
+
+fn strip_shell_quotes(s: &str) -> &str {
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 fn looks_like_path_selector(raw: &str) -> bool {

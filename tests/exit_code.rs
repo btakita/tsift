@@ -2993,6 +2993,28 @@ do [#sessiondigest]. spec-test-build-install-commit-push
 }
 
 #[test]
+fn rewrite_routes_long_agent_doc_reads_to_session_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = dir.path().join("tsift.md");
+    let mut body = String::from("---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n");
+    for index in 0..100 {
+        body.push_str(&format!("❯ prompt {index}?\n"));
+    }
+    fs::write(&session, body).unwrap();
+
+    let output = tsift_bin()
+        .args(["rewrite", &format!("cat {}", session.to_str().unwrap())])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "rewrite should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("tsift session-digest"));
+    assert!(stdout.contains("--source markdown"));
+    assert!(stdout.contains(session.to_str().unwrap()));
+}
+
+#[test]
 fn digest_runner_preserves_failing_test_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
