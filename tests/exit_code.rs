@@ -3121,6 +3121,43 @@ fn rewrite_routes_long_agent_doc_reads_to_session_digest() {
 }
 
 #[test]
+fn rewrite_routes_submodule_session_reads_to_submodule_digest_root() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        r#"[submodule "src/tsift"]
+	path = src/tsift
+	url = https://example.com/tsift
+"#,
+    )
+    .unwrap();
+    let submodule = dir.path().join("src/tsift");
+    fs::create_dir_all(submodule.join("tasks")).unwrap();
+    fs::write(
+        submodule.join(".git"),
+        "gitdir: ../../.git/modules/src/tsift\n",
+    )
+    .unwrap();
+    let session = submodule.join("tasks/tsift.md");
+    let mut body = String::from("---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n");
+    for index in 0..100 {
+        body.push_str(&format!("❯ prompt {index}?\n"));
+    }
+    fs::write(&session, body).unwrap();
+
+    let output = tsift_bin()
+        .args(["rewrite", &format!("cat {}", session.to_str().unwrap())])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "rewrite should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("tsift session-digest"));
+    assert!(stdout.contains("--source markdown"));
+    assert!(stdout.contains(submodule.to_str().unwrap()));
+}
+
+#[test]
 fn rewrite_routes_long_codex_jsonl_reads_to_session_digest() {
     let dir = tempfile::tempdir().unwrap();
     let session = dir.path().join("rollout.jsonl");

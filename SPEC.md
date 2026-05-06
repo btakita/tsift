@@ -704,6 +704,7 @@ With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject
 5. Idempotent — running twice produces no changes on the second run
 6. With `--codex`: merges a `UserPromptSubmit` auto-reindex hook into `.codex/hooks.json` (creates the file and directory if needed, updates stale tsift commands in place, removes duplicate tsift hook entries, idempotent)
 7. When the resolved target has `.gitmodules`, the Codex hook automatically uses `tsift index --check --exit-code --workspace <root>` / `tsift index --workspace <root>` so one root hook covers initialized submodules. `--workspace` makes that root resolution explicit from inside a submodule.
+8. The injected Code Navigation section explicitly tells harnesses to switch to the owning repo or submodule root before running tsift/build/test commands, so submodule work does not inherit the wider superproject instruction surface by accident.
 
 ### Injected Section
 
@@ -711,7 +712,9 @@ With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject
 <!-- tsift:code-navigation v=0.1.0 -->
 ## Code Navigation
 
-Run `tsift status` at session start. Use the commands listed in its `use:` output:
+Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root.
+
+Use the commands listed in its `use:` output:
 - `tsift search <query>` — AST-aware hybrid search (prefer over grep/rg)
 - `tsift explain <symbol>` — callers, callees, community context
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
@@ -1084,7 +1087,7 @@ The existing `tsift-rewrite.sh` hook intercepts high-token shell commands and si
 
 - `rg ...` / `grep -r ...` → `tsift search --exact ...`
 - `git diff`, `git diff --cached`, `git show`, and simple `git log -p -1 ...` history review → `tsift diff-digest ...`
-- long transcript reads (`cat`, `bat`, `head -n`, `tail -n`, `sed -n`) over recognized agent-doc markdown sessions, Claude JSONL, Codex JSONL, or `agent-doc` runtime logs → `tsift session-digest ...`
+- long transcript reads (`cat`, `bat`, `head -n`, `tail -n`, `sed -n`) over recognized agent-doc markdown sessions, Claude JSONL, Codex JSONL, or `agent-doc` runtime logs → `tsift session-digest ...`, anchored to the transcript's owning repo or submodule root when the file lives under one
 - `cargo test ...`, `pytest ...`, `python -m pytest ...` → `tsift __digest-runner --kind test ...`
 - `cargo build ...`, `cargo check ...`, `cargo clippy ...`, `cargo install ...` → `tsift __digest-runner --kind log ...`
 

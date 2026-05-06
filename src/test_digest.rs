@@ -140,7 +140,7 @@ struct FailureGroupBuilder {
 }
 
 pub fn compute(path: &Path, input: &str, runner: Option<&str>) -> Result<TestDigestReport> {
-    let root = crate::lint::resolve_project_root_or_canonical_path(path)?;
+    let root = crate::lint::resolve_harness_root_or_canonical_path(path)?;
     let selected_runner = match runner {
         Some(raw) => {
             let parsed = TestRunner::parse(raw)?;

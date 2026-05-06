@@ -139,7 +139,7 @@ pub fn compute(path: &Path, input: &str, source_hint: Option<&str>) -> Result<Se
         bail!("no session input provided; pass --input <file> or pipe transcript on stdin");
     }
 
-    let root = crate::lint::resolve_project_root_or_canonical_path(path)?;
+    let root = crate::lint::resolve_harness_root_or_canonical_path(path)?;
     let source = resolve_source(input, source_hint)?;
     let total_lines = input.lines().count();
     let mut state = DigestState::default();

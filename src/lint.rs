@@ -160,14 +160,7 @@ fn guess_annotation_kind(entity: &str) -> AnnotationKind {
 }
 
 fn project_root_from_canonical_path(canonical: &Path) -> Option<PathBuf> {
-    let start = if canonical.is_dir() {
-        canonical.to_path_buf()
-    } else {
-        canonical
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| canonical.to_path_buf())
-    };
+    let start = canonical_path_start_dir(canonical);
 
     for ancestor in start.ancestors() {
         if ancestor.join(".tsift").is_dir() || ancestor.join(".gitmodules").is_file() {
@@ -176,6 +169,33 @@ fn project_root_from_canonical_path(canonical: &Path) -> Option<PathBuf> {
     }
 
     None
+}
+
+fn harness_root_from_canonical_path(canonical: &Path) -> Option<PathBuf> {
+    let start = canonical_path_start_dir(canonical);
+    let mut workspace_root = None;
+
+    for ancestor in start.ancestors() {
+        if ancestor.join(".tsift").is_dir() || ancestor.join(".git").exists() {
+            return Some(ancestor.to_path_buf());
+        }
+        if workspace_root.is_none() && ancestor.join(".gitmodules").is_file() {
+            workspace_root = Some(ancestor.to_path_buf());
+        }
+    }
+
+    workspace_root
+}
+
+fn canonical_path_start_dir(canonical: &Path) -> PathBuf {
+    if canonical.is_dir() {
+        canonical.to_path_buf()
+    } else {
+        canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| canonical.to_path_buf())
+    }
 }
 
 pub fn find_project_root_for_path(path: &Path) -> Result<Option<PathBuf>> {
@@ -190,6 +210,14 @@ pub fn resolve_project_root_or_canonical_path(path: &Path) -> Result<PathBuf> {
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", path.display()))?;
     Ok(project_root_from_canonical_path(&canonical).unwrap_or(canonical))
+}
+
+pub fn resolve_harness_root_or_canonical_path(path: &Path) -> Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", path.display()))?;
+    Ok(harness_root_from_canonical_path(&canonical)
+        .unwrap_or_else(|| canonical_path_start_dir(&canonical)))
 }
 
 pub fn collect_entities_from_db(db_path: &Path) -> Result<HashSet<String>> {
@@ -551,6 +579,42 @@ mod tests {
         let root = resolve_project_root_or_canonical_path(&nested).unwrap();
 
         assert_eq!(root, dir.path());
+    }
+
+    #[test]
+    fn resolve_harness_root_or_canonical_path_prefers_submodule_git_root() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".gitmodules"),
+            r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+"#,
+        )
+        .unwrap();
+        let submodule = dir.path().join("src/alpha");
+        fs::create_dir_all(submodule.join("nested")).unwrap();
+        fs::write(
+            submodule.join(".git"),
+            "gitdir: ../../.git/modules/src/alpha\n",
+        )
+        .unwrap();
+
+        let root = resolve_harness_root_or_canonical_path(&submodule.join("nested")).unwrap();
+
+        assert_eq!(root, submodule);
+    }
+
+    #[test]
+    fn resolve_harness_root_or_canonical_path_falls_back_to_parent_dir_for_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("session.jsonl");
+        fs::write(&file, "{\"message\":\"hi\"}\n").unwrap();
+
+        let root = resolve_harness_root_or_canonical_path(&file).unwrap();
+
+        assert!(file.starts_with(&root));
+        assert!(root.is_dir());
     }
 
     #[test]

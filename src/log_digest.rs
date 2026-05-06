@@ -128,7 +128,7 @@ struct FileRefBuilder {
 }
 
 pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
-    let root = crate::lint::resolve_project_root_or_canonical_path(path)?;
+    let root = crate::lint::resolve_harness_root_or_canonical_path(path)?;
     let summary_db = open_summary_db_if_present(&root)?;
 
     let mut repeated_lines = BTreeMap::<String, usize>::new();

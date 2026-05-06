@@ -6232,7 +6232,8 @@ mod tests {
         assert_eq!(
             result,
             Some(format!(
-                "tsift session-digest --path \".\" --input {} --source markdown",
+                "tsift session-digest --path {} --input {} --source markdown",
+                shell_quote(&resolve_digest_context_path(&session)),
                 shell_quote(session.to_str().unwrap())
             ))
         );
@@ -6256,7 +6257,8 @@ mod tests {
         assert_eq!(
             result,
             Some(format!(
-                "tsift session-digest --path \".\" --input {} --source claude-jsonl",
+                "tsift session-digest --path {} --input {} --source claude-jsonl",
+                shell_quote(&resolve_digest_context_path(&session)),
                 shell_quote(session.to_str().unwrap())
             ))
         );
@@ -6279,7 +6281,8 @@ mod tests {
         assert_eq!(
             result,
             Some(format!(
-                "tsift session-digest --path \".\" --input {} --source codex-jsonl",
+                "tsift session-digest --path {} --input {} --source codex-jsonl",
+                shell_quote(&resolve_digest_context_path(&session)),
                 shell_quote(session.to_str().unwrap())
             ))
         );
@@ -6319,7 +6322,8 @@ mod tests {
         assert_eq!(
             result,
             Some(format!(
-                "tsift session-digest --path \".\" --input {} --source markdown",
+                "tsift session-digest --path {} --input {} --source markdown",
+                shell_quote(&resolve_digest_context_path(&session)),
                 shell_quote(session.to_str().unwrap())
             ))
         );
@@ -6339,7 +6343,45 @@ mod tests {
         assert_eq!(
             result,
             Some(format!(
-                "tsift session-digest --path \".\" --input {} --source agent-doc-log",
+                "tsift session-digest --path {} --input {} --source agent-doc-log",
+                shell_quote(&resolve_digest_context_path(&session)),
+                shell_quote(session.to_str().unwrap())
+            ))
+        );
+    }
+
+    #[test]
+    fn rewrite_session_reads_prefer_submodule_root_for_digest_path() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".gitmodules"),
+            r#"[submodule "src/tsift"]
+	path = src/tsift
+	url = https://example.com/tsift
+"#,
+        )
+        .unwrap();
+        let submodule = dir.path().join("src/tsift");
+        fs::create_dir_all(submodule.join("tasks")).unwrap();
+        fs::write(
+            submodule.join(".git"),
+            "gitdir: ../../.git/modules/src/tsift\n",
+        )
+        .unwrap();
+        let session = submodule.join("tasks/plan.md");
+        let mut body = String::from("---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n");
+        for index in 0..90 {
+            body.push_str(&format!("❯ prompt {index}?\n"));
+        }
+        fs::write(&session, body).unwrap();
+
+        let result = rewrite_command(&format!("cat {}", shell_quote(session.to_str().unwrap())));
+
+        assert_eq!(
+            result,
+            Some(format!(
+                "tsift session-digest --path {} --input {} --source markdown",
+                shell_quote(submodule.to_str().unwrap()),
                 shell_quote(session.to_str().unwrap())
             ))
         );
@@ -10128,7 +10170,12 @@ fn rewrite_session_read_command(cmd: &str) -> Option<String> {
         return None;
     }
 
-    Some(build_session_digest_command(".", &target.input, source))
+    let digest_path = resolve_digest_context_path(input_path);
+    Some(build_session_digest_command(
+        &digest_path,
+        &target.input,
+        source,
+    ))
 }
 
 fn parse_session_read_target(cmd: &str) -> Option<SessionReadTarget> {
@@ -10353,6 +10400,12 @@ fn build_session_digest_command(
         shell_quote(input),
         source.cli_arg()
     )
+}
+
+fn resolve_digest_context_path(path: &Path) -> String {
+    crate::lint::resolve_harness_root_or_canonical_path(path)
+        .map(|root| root.display().to_string())
+        .unwrap_or_else(|_| ".".to_string())
 }
 
 fn rewrite_test_command(cmd: &str) -> Option<String> {
