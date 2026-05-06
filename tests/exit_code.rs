@@ -3033,6 +3033,72 @@ fn session_cost_reads_codex_token_counts_from_stdin() {
 }
 
 #[test]
+fn session_digest_reads_codex_jsonl_from_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn run_sync() {}\n").unwrap();
+
+    let input = concat!(
+        r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#cdxlog]. spec-test-build-install-commit-push"}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test --manifest-path Cargo.toml\"}"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"exec_command_end","exit_code":1,"aggregated_output":"Error: Symbol `run_sync` not found in src/lib.rs:7:9\nCommitted and pushed in `src/tsift` as `943d77d`.","parsed_cmd":[{"type":"unknown","cmd":"cargo test --manifest-path Cargo.toml"}]}}"#,
+        "\n"
+    );
+
+    let mut child = tsift_bin()
+        .args([
+            "session-digest",
+            "--json",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--source",
+            "codex-jsonl",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "session-digest should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["source"], "codex_jsonl");
+    assert_eq!(json["prompt_target_count"], 1);
+    assert!(
+        json["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["command"] == "cargo test --manifest-path Cargo.toml")
+    );
+    assert!(
+        json["touched_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["symbol"] == "run_sync")
+    );
+    assert!(
+        json["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|failure| failure["kind"] == "exit")
+    );
+}
+
+#[test]
 fn rewrite_routes_long_agent_doc_reads_to_session_digest() {
     let dir = tempfile::tempdir().unwrap();
     let session = dir.path().join("tsift.md");
@@ -3051,6 +3117,31 @@ fn rewrite_routes_long_agent_doc_reads_to_session_digest() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("tsift session-digest"));
     assert!(stdout.contains("--source markdown"));
+    assert!(stdout.contains(session.to_str().unwrap()));
+}
+
+#[test]
+fn rewrite_routes_long_codex_jsonl_reads_to_session_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = dir.path().join("rollout.jsonl");
+    let line = r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#cdxlog]. spec-test-build-install-commit-push"}}"#;
+    let body = std::iter::repeat_n(line, 120)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&session, format!("{body}\n")).unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "rewrite",
+            &format!("head -n 120 {}", session.to_str().unwrap()),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "rewrite should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("tsift session-digest"));
+    assert!(stdout.contains("--source codex-jsonl"));
     assert!(stdout.contains(session.to_str().unwrap()));
 }
 

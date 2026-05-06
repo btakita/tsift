@@ -423,7 +423,7 @@ enum Commands {
         /// Read session transcript input from a file instead of stdin
         #[arg(long)]
         input: Option<PathBuf>,
-        /// Force the transcript source (`markdown` or `jsonl`)
+        /// Force the transcript source (`markdown`, `claude-jsonl`, `codex-jsonl`, or `agent-doc-log`)
         #[arg(long)]
         source: Option<String>,
         /// Output as JSON
@@ -3892,13 +3892,14 @@ fn cmd_session_digest(
 
     if format.compact {
         println!(
-            "session src:{} prompts:{} cmds:{} files:{} syms:{} fails:{} closeout:{}",
+            "session src:{} prompts:{} cmds:{} files:{} syms:{} fails:{} runtime:{} closeout:{}",
             report.source,
             report.prompt_target_count,
             report.command_groups,
             report.file_groups,
             report.symbol_groups,
             report.failure_groups,
+            report.runtime_event_groups,
             report.closeout_groups
         );
         for prompt in &report.prompt_targets {
@@ -3917,6 +3918,13 @@ fn cmd_session_digest(
                 failure.kind,
                 failure.occurrences,
                 truncate_for_compact(&failure.message, 100)
+            );
+        }
+        for event in &report.runtime_events {
+            println!(
+                "runtime count:{} {}",
+                event.occurrences,
+                truncate_for_compact(&event.event, 100)
             );
         }
         for entry in &report.closeout {
@@ -3940,6 +3948,7 @@ fn cmd_session_digest(
     println!("  touched files:    {}", report.file_groups);
     println!("  touched symbols:  {}", report.symbol_groups);
     println!("  failures:         {}", report.failure_groups);
+    println!("  runtime events:   {}", report.runtime_event_groups);
     println!("  closeout:         {}", report.closeout_groups);
 
     if !report.prompt_targets.is_empty() {
@@ -3982,6 +3991,14 @@ fn cmd_session_digest(
                 "  - [{}] {} ({})",
                 failure.kind, failure.message, failure.occurrences
             );
+        }
+    }
+
+    if !report.runtime_events.is_empty() {
+        println!();
+        println!("Runtime events:");
+        for event in &report.runtime_events {
+            println!("  - {} ({})", event.event, event.occurrences);
         }
     }
 
@@ -6239,7 +6256,30 @@ mod tests {
         assert_eq!(
             result,
             Some(format!(
-                "tsift session-digest --path \".\" --input {} --source jsonl",
+                "tsift session-digest --path \".\" --input {} --source claude-jsonl",
+                shell_quote(session.to_str().unwrap())
+            ))
+        );
+    }
+
+    #[test]
+    fn rewrite_head_long_codex_jsonl_to_session_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("codex.jsonl");
+        let line = r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#cdxlog]. spec-test-build-install-commit-push"}}"#;
+        let body = std::iter::repeat_n(line, 120)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&session, format!("{body}\n")).unwrap();
+
+        let result = rewrite_command(&format!(
+            "head -n 120 {}",
+            shell_quote(session.to_str().unwrap())
+        ));
+        assert_eq!(
+            result,
+            Some(format!(
+                "tsift session-digest --path \".\" --input {} --source codex-jsonl",
                 shell_quote(session.to_str().unwrap())
             ))
         );
@@ -6280,6 +6320,26 @@ mod tests {
             result,
             Some(format!(
                 "tsift session-digest --path \".\" --input {} --source markdown",
+                shell_quote(session.to_str().unwrap())
+            ))
+        );
+    }
+
+    #[test]
+    fn rewrite_cat_large_agent_doc_log_to_session_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("tsift.log");
+        let line = "[1776528398] claude_start mode=fresh_restart restart_count=1";
+        let body = std::iter::repeat_n(line, 120)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&session, format!("{body}\n")).unwrap();
+
+        let result = rewrite_command(&format!("cat {}", shell_quote(session.to_str().unwrap())));
+        assert_eq!(
+            result,
+            Some(format!(
+                "tsift session-digest --path \".\" --input {} --source agent-doc-log",
                 shell_quote(session.to_str().unwrap())
             ))
         );
@@ -10176,7 +10236,13 @@ fn detect_session_digest_source(path: &Path) -> Option<session_digest::SessionDi
             Some(session_digest::SessionDigestSource::Markdown)
         }
         Some("jsonl") if file_looks_like_claude_jsonl(path) => {
-            Some(session_digest::SessionDigestSource::Jsonl)
+            Some(session_digest::SessionDigestSource::ClaudeJsonl)
+        }
+        Some("jsonl") if file_looks_like_codex_jsonl(path) => {
+            Some(session_digest::SessionDigestSource::CodexJsonl)
+        }
+        Some("log") if file_looks_like_agent_doc_log(path) => {
+            Some(session_digest::SessionDigestSource::AgentDocLog)
         }
         _ => None,
     }
@@ -10214,6 +10280,42 @@ fn file_looks_like_claude_jsonl(path: &Path) -> bool {
         })
 }
 
+fn file_looks_like_codex_jsonl(path: &Path) -> bool {
+    let prefix = match read_file_prefix(path, 16 * 1024) {
+        Some(prefix) => prefix,
+        None => return false,
+    };
+
+    prefix
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(8)
+        .any(|line| {
+            let value = match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(value) => value,
+                Err(_) => return false,
+            };
+            matches!(
+                value.get("type").and_then(serde_json::Value::as_str),
+                Some("session_meta" | "response_item" | "event_msg")
+            )
+        })
+}
+
+fn file_looks_like_agent_doc_log(path: &Path) -> bool {
+    let prefix = match read_file_prefix(path, 16 * 1024) {
+        Some(prefix) => prefix,
+        None => return false,
+    };
+    prefix
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(8)
+        .all(|line| line.starts_with('[') && line.contains("] "))
+}
+
 fn read_file_prefix(path: &Path, max_bytes: usize) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file);
@@ -10249,7 +10351,7 @@ fn build_session_digest_command(
         "tsift session-digest --path {} --input {} --source {}",
         shell_quote(path),
         shell_quote(input),
-        source.as_str()
+        source.cli_arg()
     )
 }
 

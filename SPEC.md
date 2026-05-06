@@ -1008,23 +1008,27 @@ Behavior:
 
 ## Session Digest
 
-`tsift session-digest` turns long session transcripts into bounded execution evidence for agent context.
+`tsift session-digest` turns long session transcripts and harness runtime logs into bounded execution evidence for agent context.
 
 ```bash
 tsift session-digest --path . < tasks/software/tsift.md
-tsift session-digest --source jsonl --input ~/.claude/projects/foo/session.jsonl --json
+tsift session-digest --source claude-jsonl --input ~/.claude/projects/foo/session.jsonl --json
+tsift session-digest --source codex-jsonl --input ~/.codex/sessions/2026/05/02/rollout-....jsonl --json
+tsift session-digest --source agent-doc-log --input .agent-doc/logs/tsift-v0.1.log --json
 ```
 
 Accepted sources:
 
 - markdown session documents such as `agent-doc` / Codex task files
 - Claude JSONL transcripts with `message.content` text/tool blocks
+- Codex JSONL transcripts with `response_item` / `event_msg` records
+- `agent-doc` runtime `.log` files with session start/restart/timeout/exit events
 
 Behavior:
 
 1. Read captured session input from stdin by default, or from `--input <file>`.
-2. Auto-detect markdown versus JSONL unless `--source markdown|jsonl` forces one parser.
-3. Extract bounded prompt targets, shell commands, touched file paths, symbol-like identifiers, failure lines, and closeout evidence such as verification/install/commit/push/version mentions.
+2. Auto-detect markdown, Claude JSONL, Codex JSONL, or `agent-doc` runtime logs unless `--source markdown|claude-jsonl|codex-jsonl|agent-doc-log` forces one parser.
+3. Extract bounded prompt targets, shell commands, touched file paths, symbol-like identifiers, failure lines, runtime-event churn, and closeout evidence such as verification/install/commit/push/version mentions.
 4. Keep the digest transcript-only: it summarizes what happened in the session, but it does not replay tool calls or attempt to reconstruct the full conversation.
 
 `session-digest` is intentionally conservative. It favors bounded evidence over perfect transcript reconstruction so long agent sessions can be collapsed into compact handoff or review context.
@@ -1080,7 +1084,7 @@ The existing `tsift-rewrite.sh` hook intercepts high-token shell commands and si
 
 - `rg ...` / `grep -r ...` → `tsift search --exact ...`
 - `git diff`, `git diff --cached`, `git show`, and simple `git log -p -1 ...` history review → `tsift diff-digest ...`
-- long transcript reads (`cat`, `bat`, `head -n`, `tail -n`, `sed -n`) over recognized agent-doc markdown sessions or Claude JSONL → `tsift session-digest ...`
+- long transcript reads (`cat`, `bat`, `head -n`, `tail -n`, `sed -n`) over recognized agent-doc markdown sessions, Claude JSONL, Codex JSONL, or `agent-doc` runtime logs → `tsift session-digest ...`
 - `cargo test ...`, `pytest ...`, `python -m pytest ...` → `tsift __digest-runner --kind test ...`
 - `cargo build ...`, `cargo check ...`, `cargo clippy ...`, `cargo install ...` → `tsift __digest-runner --kind log ...`
 

@@ -10,27 +10,45 @@ const MAX_FILES: usize = 12;
 const MAX_SYMBOLS: usize = 12;
 const MAX_FAILURES: usize = 12;
 const MAX_CLOSEOUT: usize = 10;
+const MAX_RUNTIME_EVENTS: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionDigestSource {
     Markdown,
-    Jsonl,
+    ClaudeJsonl,
+    CodexJsonl,
+    AgentDocLog,
 }
 
 impl SessionDigestSource {
     pub fn parse(raw: &str) -> Result<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "markdown" | "md" => Ok(Self::Markdown),
-            "jsonl" | "json-lines" | "claude-jsonl" => Ok(Self::Jsonl),
-            other => bail!("unsupported session source `{other}`; expected markdown or jsonl"),
+            "jsonl" | "json-lines" | "claude" | "claude-jsonl" => Ok(Self::ClaudeJsonl),
+            "codex" | "codex-jsonl" => Ok(Self::CodexJsonl),
+            "agent-doc-log" | "agent_doc_log" | "log" => Ok(Self::AgentDocLog),
+            other => bail!(
+                "unsupported session source `{other}`; expected markdown, claude-jsonl, codex-jsonl, or agent-doc-log"
+            ),
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Markdown => "markdown",
-            Self::Jsonl => "jsonl",
+            Self::ClaudeJsonl => "claude_jsonl",
+            Self::CodexJsonl => "codex_jsonl",
+            Self::AgentDocLog => "agent_doc_log",
+        }
+    }
+
+    pub fn cli_arg(self) -> &'static str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::ClaudeJsonl => "claude-jsonl",
+            Self::CodexJsonl => "codex-jsonl",
+            Self::AgentDocLog => "agent-doc-log",
         }
     }
 }
@@ -68,6 +86,12 @@ pub struct SessionDigestCloseout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionDigestRuntimeEvent {
+    pub event: String,
+    pub occurrences: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionDigestReport {
     pub root: String,
     pub source: String,
@@ -78,12 +102,14 @@ pub struct SessionDigestReport {
     pub file_groups: usize,
     pub symbol_groups: usize,
     pub failure_groups: usize,
+    pub runtime_event_groups: usize,
     pub closeout_groups: usize,
     pub prompt_targets: Vec<String>,
     pub commands: Vec<SessionDigestCommand>,
     pub touched_files: Vec<SessionDigestFileRef>,
     pub touched_symbols: Vec<SessionDigestSymbolRef>,
     pub failures: Vec<SessionDigestFailure>,
+    pub runtime_events: Vec<SessionDigestRuntimeEvent>,
     pub closeout: Vec<SessionDigestCloseout>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
@@ -96,6 +122,7 @@ struct DigestState {
     files: BTreeMap<String, usize>,
     symbols: BTreeMap<String, usize>,
     failures: BTreeMap<(String, String), usize>,
+    runtime_events: BTreeMap<String, usize>,
     closeout: BTreeMap<(String, String), usize>,
     warnings: Vec<String>,
     transcript_items: usize,
@@ -119,7 +146,9 @@ pub fn compute(path: &Path, input: &str, source_hint: Option<&str>) -> Result<Se
 
     match source {
         SessionDigestSource::Markdown => ingest_markdown(&root, input, &mut state)?,
-        SessionDigestSource::Jsonl => ingest_jsonl(&root, input, &mut state)?,
+        SessionDigestSource::ClaudeJsonl => ingest_claude_jsonl(&root, input, &mut state)?,
+        SessionDigestSource::CodexJsonl => ingest_codex_jsonl(&root, input, &mut state)?,
+        SessionDigestSource::AgentDocLog => ingest_agent_doc_log(&root, input, &mut state),
     }
 
     let prompt_target_count = state.prompt_targets.len();
@@ -191,6 +220,20 @@ pub fn compute(path: &Path, input: &str, source_hint: Option<&str>) -> Result<Se
     let failure_groups = failures.len();
     failures.truncate(MAX_FAILURES);
 
+    let mut runtime_events = state
+        .runtime_events
+        .into_iter()
+        .map(|(event, occurrences)| SessionDigestRuntimeEvent { event, occurrences })
+        .collect::<Vec<_>>();
+    runtime_events.sort_by(|left, right| {
+        right
+            .occurrences
+            .cmp(&left.occurrences)
+            .then(left.event.cmp(&right.event))
+    });
+    let runtime_event_groups = runtime_events.len();
+    runtime_events.truncate(MAX_RUNTIME_EVENTS);
+
     let mut closeout = state
         .closeout
         .into_iter()
@@ -220,12 +263,14 @@ pub fn compute(path: &Path, input: &str, source_hint: Option<&str>) -> Result<Se
         file_groups,
         symbol_groups,
         failure_groups,
+        runtime_event_groups,
         closeout_groups,
         prompt_targets: state.prompt_targets,
         commands,
         touched_files,
         touched_symbols,
         failures,
+        runtime_events,
         closeout,
         warnings: state.warnings,
     })
@@ -241,12 +286,36 @@ fn resolve_source(input: &str, source_hint: Option<&str>) -> Result<SessionDiges
                 .filter(|line| !line.is_empty())
                 .collect::<Vec<_>>();
             if !non_empty.is_empty()
-                && non_empty.iter().all(|line| line.starts_with('{'))
+                && non_empty.iter().all(|line| {
+                    line.starts_with('{') && serde_json::from_str::<Value>(line).is_ok()
+                })
+            {
+                for line in &non_empty {
+                    let value = serde_json::from_str::<Value>(line).unwrap_or(Value::Null);
+                    if value
+                        .get("message")
+                        .and_then(|message| message.get("content"))
+                        .is_some()
+                        || value
+                            .get("message")
+                            .and_then(|message| message.get("usage"))
+                            .is_some()
+                    {
+                        return Ok(SessionDigestSource::ClaudeJsonl);
+                    }
+                    if value.get("type").and_then(Value::as_str) == Some("response_item")
+                        || value.get("type").and_then(Value::as_str) == Some("event_msg")
+                    {
+                        return Ok(SessionDigestSource::CodexJsonl);
+                    }
+                }
+                Ok(SessionDigestSource::ClaudeJsonl)
+            } else if !non_empty.is_empty()
                 && non_empty
                     .iter()
-                    .all(|line| serde_json::from_str::<Value>(line).is_ok())
+                    .all(|line| line.starts_with('[') && line.contains(']'))
             {
-                Ok(SessionDigestSource::Jsonl)
+                Ok(SessionDigestSource::AgentDocLog)
             } else {
                 Ok(SessionDigestSource::Markdown)
             }
@@ -262,7 +331,7 @@ fn ingest_markdown(root: &Path, input: &str, state: &mut DigestState) -> Result<
     Ok(())
 }
 
-fn ingest_jsonl(root: &Path, input: &str, state: &mut DigestState) -> Result<()> {
+fn ingest_claude_jsonl(root: &Path, input: &str, state: &mut DigestState) -> Result<()> {
     for (index, raw_line) in input.lines().enumerate() {
         let trimmed = raw_line.trim();
         if trimmed.is_empty() {
@@ -280,23 +349,96 @@ fn ingest_jsonl(root: &Path, input: &str, state: &mut DigestState) -> Result<()>
             continue;
         }
         for block in blocks {
-            state.transcript_items += 1;
             match block {
                 TranscriptBlock::Text { role, text } => {
                     let user_bias = role
                         .as_deref()
                         .is_some_and(|value| value.eq_ignore_ascii_case("user"));
-                    for line in text.lines() {
-                        ingest_text_line(root, line, user_bias, state)?;
-                    }
+                    ingest_text_block(root, &text, user_bias, state)?;
                 }
                 TranscriptBlock::ToolUse { name, input } => {
+                    state.transcript_items += 1;
                     ingest_tool_use(root, &name, &input, state)?;
                 }
             }
         }
     }
     Ok(())
+}
+
+fn ingest_codex_jsonl(root: &Path, input: &str, state: &mut DigestState) -> Result<()> {
+    for (index, raw_line) in input.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(trimmed)
+            .with_context(|| format!("parsing Codex transcript jsonl line {}", index + 1))?;
+        match value.get("type").and_then(Value::as_str) {
+            Some("response_item") => ingest_codex_response_item(root, &value, index + 1, state)?,
+            Some("event_msg") => ingest_codex_event_msg(root, &value, index + 1, state)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn ingest_agent_doc_log(root: &Path, input: &str, state: &mut DigestState) {
+    for raw_line in input.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((_, after_bracket)) = trimmed.split_once("] ") else {
+            continue;
+        };
+        let detail = after_bracket.trim();
+        let Some(event_name) = detail.split_whitespace().next() else {
+            continue;
+        };
+
+        state.transcript_items += 1;
+        *state
+            .runtime_events
+            .entry(normalize_runtime_event(event_name, detail))
+            .or_default() += 1;
+
+        for key in ["file", "path", "project_root"] {
+            if let Some(path) = extract_field(detail, key) {
+                for normalized in extract_file_refs(path, root) {
+                    *state.files.entry(normalized).or_default() += 1;
+                }
+            }
+        }
+
+        if matches!(event_name, "claude_exit" | "codex_exit")
+            && extract_field(detail, "code").is_some_and(|code| code != "0")
+        {
+            let message = truncate_detail(
+                &format!(
+                    "{} exited with code {}",
+                    event_name,
+                    extract_field(detail, "code").unwrap_or("?")
+                ),
+                220,
+            );
+            *state
+                .failures
+                .entry(("exit".to_string(), message))
+                .or_default() += 1;
+        }
+
+        if event_name.contains("timeout") {
+            *state
+                .failures
+                .entry(("timeout".to_string(), truncate_detail(detail, 220)))
+                .or_default() += 1;
+        }
+
+        for (kind, closeout) in detect_closeout(detail) {
+            *state.closeout.entry((kind, closeout)).or_default() += 1;
+        }
+    }
 }
 
 fn collect_transcript_blocks(value: &Value, out: &mut Vec<TranscriptBlock>) {
@@ -331,6 +473,131 @@ fn collect_message_blocks(value: &Value, out: &mut Vec<TranscriptBlock>) {
             text: text.to_string(),
         });
     }
+}
+
+fn ingest_codex_response_item(
+    root: &Path,
+    value: &Value,
+    line_number: usize,
+    state: &mut DigestState,
+) -> Result<()> {
+    let Some(payload) = value.get("payload") else {
+        return Ok(());
+    };
+    match payload.get("type").and_then(Value::as_str) {
+        Some("message") => {
+            let role = payload
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if role != "assistant" {
+                return Ok(());
+            }
+            let Some(content) = payload.get("content").and_then(Value::as_array) else {
+                return Ok(());
+            };
+            for item in content {
+                let Some(text) = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("content").and_then(Value::as_str))
+                else {
+                    continue;
+                };
+                ingest_text_block(root, text, false, state)?;
+            }
+        }
+        Some("function_call") => {
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("function_call");
+            let Some(arguments) = payload.get("arguments").and_then(Value::as_str) else {
+                return Ok(());
+            };
+            let input = serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| {
+                state.warnings.push(format!(
+                    "codex function_call arguments on line {} were not valid JSON; command extraction may be incomplete",
+                    line_number
+                ));
+                Value::String(arguments.to_string())
+            });
+            state.transcript_items += 1;
+            ingest_tool_use(root, name, &input, state)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn ingest_codex_event_msg(
+    root: &Path,
+    value: &Value,
+    _line_number: usize,
+    state: &mut DigestState,
+) -> Result<()> {
+    let Some(payload) = value.get("payload") else {
+        return Ok(());
+    };
+    match payload.get("type").and_then(Value::as_str) {
+        Some("user_message") => {
+            if let Some(message) = payload.get("message").and_then(Value::as_str) {
+                ingest_text_block(root, message, true, state)?;
+            }
+        }
+        Some("agent_message") => {
+            if let Some(message) = payload.get("message").and_then(Value::as_str) {
+                ingest_text_block(root, message, false, state)?;
+            }
+        }
+        Some("exec_command_end") => {
+            state.transcript_items += 1;
+            if let Some(command) = extract_codex_exec_command(payload) {
+                *state.commands.entry(command.clone()).or_default() += 1;
+                for path in extract_file_refs(&command, root) {
+                    *state.files.entry(path).or_default() += 1;
+                }
+                for symbol in extract_symbol_refs(&command) {
+                    *state.symbols.entry(symbol).or_default() += 1;
+                }
+            }
+            if let Some(output) = payload
+                .get("aggregated_output")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("stdout").and_then(Value::as_str))
+            {
+                for line in output.lines() {
+                    ingest_text_line(root, line, false, state)?;
+                }
+            }
+            if payload
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                != 0
+            {
+                let command =
+                    extract_codex_exec_command(payload).unwrap_or_else(|| "command".to_string());
+                let message = truncate_detail(
+                    &format!(
+                        "{} exited with code {}",
+                        command,
+                        payload
+                            .get("exit_code")
+                            .and_then(Value::as_i64)
+                            .unwrap_or_default()
+                    ),
+                    220,
+                );
+                *state
+                    .failures
+                    .entry(("exit".to_string(), message))
+                    .or_default() += 1;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn collect_content_block(role: Option<String>, value: &Value, out: &mut Vec<TranscriptBlock>) {
@@ -395,6 +662,19 @@ fn ingest_tool_use(root: &Path, name: &str, input: &Value, state: &mut DigestSta
     Ok(())
 }
 
+fn ingest_text_block(
+    root: &Path,
+    text: &str,
+    user_bias: bool,
+    state: &mut DigestState,
+) -> Result<()> {
+    state.transcript_items += 1;
+    for line in text.lines() {
+        ingest_text_line(root, line, user_bias, state)?;
+    }
+    Ok(())
+}
+
 fn extract_tool_command(name: &str, input: &Value) -> Option<String> {
     if !matches!(
         name.to_ascii_lowercase().as_str(),
@@ -436,6 +716,29 @@ fn extract_tool_text(input: &Value) -> Option<String> {
         Value::String(raw) => Some(raw.to_string()),
         _ => None,
     }
+}
+
+fn extract_codex_exec_command(payload: &Value) -> Option<String> {
+    if let Some(parsed) = payload.get("parsed_cmd").and_then(Value::as_array) {
+        for item in parsed {
+            if let Some(command) = item.get("cmd").and_then(Value::as_str) {
+                let normalized = normalize_whitespace(command);
+                if looks_like_command(&normalized) {
+                    return Some(normalized);
+                }
+            }
+        }
+    }
+
+    if let Some(command) = payload.get("command").and_then(Value::as_array)
+        && let Some(last) = command.last().and_then(Value::as_str)
+    {
+        let normalized = normalize_whitespace(last);
+        if looks_like_command(&normalized) {
+            return Some(normalized);
+        }
+    }
+    None
 }
 
 fn ingest_text_line(
@@ -626,7 +929,11 @@ fn normalize_file_token(raw: &str, root: &Path) -> Option<String> {
         return None;
     }
 
-    let without_line = strip_line_suffix(trimmed);
+    let value = trimmed
+        .split_once('=')
+        .map(|(_, value)| value)
+        .unwrap_or(trimmed);
+    let without_line = strip_line_suffix(value);
     let candidate = without_line.trim_end_matches('/');
     if candidate.is_empty() || candidate == "." {
         return None;
@@ -822,6 +1129,27 @@ fn detect_closeout(text: &str) -> Vec<(String, String)> {
     dedupe_pairs(out)
 }
 
+fn normalize_runtime_event(event_name: &str, detail: &str) -> String {
+    if matches!(
+        event_name,
+        "claude_start" | "codex_start" | "claude_restart" | "codex_restart"
+    ) && let Some(mode) = extract_field(detail, "mode")
+    {
+        return format!("{event_name}:{mode}");
+    }
+    event_name.to_string()
+}
+
+fn extract_field<'a>(detail: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("{key}=");
+    let start = detail.find(&needle)? + needle.len();
+    let remainder = &detail[start..];
+    let end = remainder
+        .find(char::is_whitespace)
+        .unwrap_or(remainder.len());
+    Some(remainder[..end].trim_matches('"'))
+}
+
 fn dedupe_pairs(items: Vec<(String, String)>) -> Vec<(String, String)> {
     let mut seen = BTreeSet::new();
     let mut deduped = Vec::new();
@@ -929,7 +1257,7 @@ do [#sessiondigest]. spec-test-build-install-commit-push
         );
 
         let report = compute(dir.path(), input, None).unwrap();
-        assert_eq!(report.source, "jsonl");
+        assert_eq!(report.source, "claude_jsonl");
         assert!(
             report
                 .prompt_targets
@@ -956,8 +1284,106 @@ do [#sessiondigest]. spec-test-build-install-commit-push
             report
                 .failures
                 .iter()
-                .any(|failure| failure.kind == "missing")
+                .any(|failure| matches!(failure.kind.as_str(), "error" | "missing"))
         );
         assert!(report.closeout.iter().any(|entry| entry.kind == "push"));
+    }
+
+    #[test]
+    fn codex_jsonl_digest_extracts_prompt_command_failures_and_closeout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn run_sync() {}\n").unwrap();
+
+        let input = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"ignore this instruction blob"}]}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#cdxlog]. spec-test-build-install-commit-push"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test --manifest-path Cargo.toml\"}","call_id":"call_1"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"exec_command_end","exit_code":1,"aggregated_output":"Error: Symbol `run_sync` not found in src/lib.rs:7:9\nVerification in `src/tsift`: `cargo test`\nCommitted and pushed in `src/tsift` as `943d77d`.","parsed_cmd":[{"type":"unknown","cmd":"cargo test --manifest-path Cargo.toml"}]}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"I’m checking `src/tsift/SPEC.md` next."}}"#,
+            "\n"
+        );
+
+        let report = compute(dir.path(), input, Some("codex-jsonl")).unwrap();
+        assert_eq!(report.source, "codex_jsonl");
+        assert!(
+            report
+                .prompt_targets
+                .iter()
+                .any(|target| target.contains("[#cdxlog]"))
+        );
+        assert!(
+            report
+                .commands
+                .iter()
+                .any(|command| command.command == "cargo test --manifest-path Cargo.toml")
+        );
+        assert!(
+            report
+                .touched_files
+                .iter()
+                .any(|path| path.path == "Cargo.toml")
+        );
+        assert!(
+            report
+                .touched_files
+                .iter()
+                .any(|path| path.path == "src/lib.rs")
+        );
+        assert!(
+            report
+                .touched_symbols
+                .iter()
+                .any(|symbol| symbol.symbol == "run_sync")
+        );
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| matches!(failure.kind.as_str(), "error" | "missing"))
+        );
+        assert!(report.failures.iter().any(|failure| failure.kind == "exit"));
+        assert!(report.closeout.iter().any(|entry| entry.kind == "push"));
+    }
+
+    #[test]
+    fn agent_doc_log_digest_extracts_runtime_events_and_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tasks/software")).unwrap();
+        std::fs::write(dir.path().join("tasks/software/tsift.md"), "# tsift\n").unwrap();
+
+        let input = "\
+[1776452736] session_start file=tasks/software/tsift.md pane=%141 session=tsift-v0
+[1776528398] claude_start mode=fresh_restart restart_count=1
+[1776528446] auto_trigger_timeout (no prompt after 30s)
+[1776528532] claude_exit code=1 restart_count=0
+";
+
+        let report = compute(dir.path(), input, Some("agent-doc-log")).unwrap();
+        assert_eq!(report.source, "agent_doc_log");
+        assert_eq!(report.runtime_event_groups, 4);
+        assert!(
+            report
+                .runtime_events
+                .iter()
+                .any(|event| event.event == "claude_start:fresh_restart")
+        );
+        assert!(
+            report
+                .touched_files
+                .iter()
+                .any(|path| path.path == "tasks/software/tsift.md")
+        );
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.kind == "timeout")
+        );
+        assert!(report.failures.iter().any(|failure| failure.kind == "exit"));
     }
 }
