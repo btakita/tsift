@@ -3030,6 +3030,13 @@ fn session_cost_reads_codex_token_counts_from_stdin() {
     assert_eq!(json["total_tokens"], 50650);
     assert_eq!(json["largest_turn_total_tokens"], 26350);
     assert_eq!(json["cached_input_ratio"], 96.0);
+    assert!(
+        json["guardrails"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|guardrail| guardrail["kind"] == "cache_resend")
+    );
 }
 
 #[test]
@@ -3077,6 +3084,13 @@ fn session_cost_summarizes_agent_doc_restart_churn_from_stdin() {
             .unwrap()
             .iter()
             .any(|entry| entry["family"] == "quit_after_eof" && entry["occurrences"] == 2)
+    );
+    assert!(
+        json["guardrails"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|guardrail| guardrail["kind"] == "restart_loop")
     );
 }
 
@@ -3224,7 +3238,8 @@ fn session_review_aggregates_cross_harness_logs() {
         concat!(
             "[1776712372] session_start file=tasks/software/tsift.md pane=%77 session=tsift-v0.1\n",
             "[1776712373] cwd_resolved path=/tmp/replace-me source=project_root\n",
-            "[1776712374] codex_start mode=fresh_restart restart_count=1\n"
+            "[1776712374] codex_start mode=fresh_restart restart_count=1\n",
+            "[1776712375] auto_trigger_timeout harness=codex reason=no_prompt_after_30s\n"
         )
         .replace("/tmp/replace-me", &root.path().display().to_string()),
     )
@@ -3278,6 +3293,13 @@ fn session_review_aggregates_cross_harness_logs() {
     assert_eq!(json["claude_sessions"], 1);
     assert_eq!(json["codex_sessions"], 1);
     assert_eq!(json["agent_doc_logs"], 1);
+    assert!(
+        json["guardrails"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|guardrail| guardrail["kind"] == "restart_loop")
+    );
     assert!(
         json["commands"]
             .as_array()

@@ -7,6 +7,12 @@ use crate::runtime_churn::{RestartChurnState, RestartChurnSummary};
 
 const MAX_LARGEST_TURNS: usize = 5;
 const MAX_RUNTIME_EVENTS: usize = 8;
+const MAX_GUARDRAILS: usize = 8;
+const PROMPT_BUDGET_WARN_TOKENS: u64 = 100_000;
+const CACHED_RATIO_WARN_PERCENT: f64 = 90.0;
+const CACHED_RATIO_WARN_PROMPT_TOKENS: u64 = 50_000;
+const RESTART_LOOP_WARN_OCCURRENCES: usize = 3;
+const NOOP_CLOSEOUT_WARN_OCCURRENCES: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +60,27 @@ pub struct SessionCostRuntimeEvent {
     pub occurrences: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCostGuardrail {
+    pub kind: String,
+    pub severity: String,
+    pub message: String,
+    pub guidance: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionCostGuardrailInput {
+    pub largest_prompt_turn_tokens: u64,
+    pub largest_prompt_turn_label: Option<String>,
+    pub prompt_tokens: u64,
+    pub cached_input_ratio: Option<f64>,
+    pub fresh_restart_occurrences: usize,
+    pub auto_trigger_timeout_occurrences: usize,
+    pub ctrl_d_restart_loop_occurrences: usize,
+    pub noop_closeout_occurrences: usize,
+    pub max_restart_count: Option<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SessionCostReport {
     pub source: String,
@@ -77,6 +104,8 @@ pub struct SessionCostReport {
     pub runtime_events: Vec<SessionCostRuntimeEvent>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub restart_churn: Vec<RestartChurnSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub guardrails: Vec<SessionCostGuardrail>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
 }
@@ -167,6 +196,20 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
     let cached_input_ratio = (prompt_tokens > 0).then_some(
         ((cached_input_tokens as f64) / (prompt_tokens as f64) * 10_000.0).round() / 100.0,
     );
+    let largest_prompt_turn = state
+        .usage_turns
+        .iter()
+        .max_by(|left, right| {
+            left.prompt_tokens
+                .cmp(&right.prompt_tokens)
+                .then(left.label.cmp(&right.label))
+        })
+        .map(|turn| (turn.prompt_tokens, turn.label.clone()));
+    let noop_closeout_occurrences = state
+        .runtime_events
+        .get("commit_already_current")
+        .copied()
+        .unwrap_or(0);
 
     let mut largest_turns = state.usage_turns;
     largest_turns.sort_by(|left, right| {
@@ -193,6 +236,23 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
     runtime_events.truncate(MAX_RUNTIME_EVENTS);
     let restart_churn_groups = state.restart_churn.groups();
     let restart_churn = state.restart_churn.summaries();
+    let guardrails = derive_guardrails(&SessionCostGuardrailInput {
+        largest_prompt_turn_tokens: largest_prompt_turn.as_ref().map_or(0, |turn| turn.0),
+        largest_prompt_turn_label: largest_prompt_turn.as_ref().map(|turn| turn.1.clone()),
+        prompt_tokens,
+        cached_input_ratio,
+        fresh_restart_occurrences: count_restart_family(&restart_churn, "fresh_restart"),
+        auto_trigger_timeout_occurrences: count_restart_family(
+            &restart_churn,
+            "auto_trigger_timeout",
+        ),
+        ctrl_d_restart_loop_occurrences: count_restart_family(
+            &restart_churn,
+            "ctrl_d_restart_loop",
+        ),
+        noop_closeout_occurrences,
+        max_restart_count: state.max_restart_count,
+    });
 
     if usage_samples == 0 && runtime_event_groups == 0 {
         state
@@ -219,8 +279,98 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
         largest_turns,
         runtime_events,
         restart_churn,
+        guardrails,
         warnings: state.warnings,
     })
+}
+
+pub fn derive_guardrails(input: &SessionCostGuardrailInput) -> Vec<SessionCostGuardrail> {
+    let mut guardrails = Vec::new();
+
+    if input.largest_prompt_turn_tokens >= PROMPT_BUDGET_WARN_TOKENS {
+        let label = input
+            .largest_prompt_turn_label
+            .as_deref()
+            .map(|label| format!(" at {label}"))
+            .unwrap_or_default();
+        guardrails.push(SessionCostGuardrail {
+            kind: "prompt_budget".to_string(),
+            severity: "warn".to_string(),
+            message: format!(
+                "largest prompt turn reached {} tokens{label}",
+                input.largest_prompt_turn_tokens
+            ),
+            guidance:
+                "compact the session or split the task before another large turn resends the same context"
+                    .to_string(),
+        });
+    }
+
+    if input.prompt_tokens >= CACHED_RATIO_WARN_PROMPT_TOKENS
+        && input
+            .cached_input_ratio
+            .is_some_and(|ratio| ratio >= CACHED_RATIO_WARN_PERCENT)
+    {
+        guardrails.push(SessionCostGuardrail {
+            kind: "cache_resend".to_string(),
+            severity: "warn".to_string(),
+            message: format!(
+                "cached input ratio was {:.2}% across {} prompt tokens",
+                input.cached_input_ratio.unwrap_or_default(),
+                input.prompt_tokens
+            ),
+            guidance:
+                "compact or restart the session when most prompt spend is cached context instead of new work"
+                    .to_string(),
+        });
+    }
+
+    let restart_signal_count = input.fresh_restart_occurrences
+        + input.auto_trigger_timeout_occurrences
+        + input.ctrl_d_restart_loop_occurrences;
+    if restart_signal_count >= RESTART_LOOP_WARN_OCCURRENCES
+        || input.ctrl_d_restart_loop_occurrences > 0
+        || input.auto_trigger_timeout_occurrences > 0
+        || input.max_restart_count.is_some_and(|count| count >= 2)
+    {
+        let max_restart = input
+            .max_restart_count
+            .map(|count| format!(" max_restart={count}."))
+            .unwrap_or_default();
+        guardrails.push(SessionCostGuardrail {
+            kind: "restart_loop".to_string(),
+            severity: "warn".to_string(),
+            message: format!(
+                "restart churn detected: fresh_restart={} auto_trigger_timeout={} ctrl_d_restart_loop={}.{}",
+                input.fresh_restart_occurrences,
+                input.auto_trigger_timeout_occurrences,
+                input.ctrl_d_restart_loop_occurrences,
+                max_restart
+            )
+            .trim()
+            .to_string(),
+            guidance:
+                "fix the startup/retry issue before another restart, or compact and reopen cleanly instead of looping"
+                    .to_string(),
+        });
+    }
+
+    if input.noop_closeout_occurrences >= NOOP_CLOSEOUT_WARN_OCCURRENCES {
+        guardrails.push(SessionCostGuardrail {
+            kind: "noop_closeout".to_string(),
+            severity: "warn".to_string(),
+            message: format!(
+                "commit_already_current appeared {} times",
+                input.noop_closeout_occurrences
+            ),
+            guidance:
+                "compact the document or avoid reopening it without new edits when closeouts are mostly no-ops"
+                    .to_string(),
+        });
+    }
+
+    guardrails.truncate(MAX_GUARDRAILS);
+    guardrails
 }
 
 fn resolve_source(input: &str, source_hint: Option<&str>) -> Result<SessionCostSource> {
@@ -458,6 +608,13 @@ fn usage_u64(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
+fn count_restart_family(restart_churn: &[RestartChurnSummary], family: &str) -> usize {
+    restart_churn
+        .iter()
+        .find(|entry| entry.family == family)
+        .map_or(0, |entry| entry.occurrences)
+}
+
 fn extract_field<'a>(detail: &'a str, key: &str) -> Option<&'a str> {
     let needle = format!("{key}=");
     let start = detail.find(&needle)? + needle.len();
@@ -527,13 +684,16 @@ mod tests {
 [1776528582] claude_start mode=fresh_restart restart_count=2
 [1776528599] codex_start mode=continue restart_count=3
 [1776528601] user_quit_after_ctrl_d
+[1776528602] commit_already_current file=tasks/software/tsift.md basis=head
+[1776528603] commit_already_current file=tasks/software/tsift.md basis=head
+[1776528604] commit_already_current file=tasks/software/tsift.md basis=head
 ";
 
         let report = compute(input, Some("agent-doc-log")).unwrap();
         assert_eq!(report.source, "agent_doc_log");
         assert_eq!(report.usage_samples, 0);
-        assert_eq!(report.runtime_event_groups, 6);
-        assert_eq!(report.total_runtime_events, 7);
+        assert_eq!(report.runtime_event_groups, 7);
+        assert_eq!(report.total_runtime_events, 10);
         assert_eq!(report.restart_churn_groups, 4);
         assert_eq!(report.max_restart_count, Some(3));
         assert!(
@@ -565,6 +725,48 @@ mod tests {
                 .restart_churn
                 .iter()
                 .any(|entry| entry.family == "quit_after_eof" && entry.occurrences == 1)
+        );
+        assert!(
+            report
+                .guardrails
+                .iter()
+                .any(|guardrail| guardrail.kind == "restart_loop")
+        );
+        assert!(
+            report
+                .guardrails
+                .iter()
+                .any(|guardrail| guardrail.kind == "noop_closeout")
+        );
+    }
+
+    #[test]
+    fn derive_guardrails_flags_large_prompt_turns() {
+        let guardrails = derive_guardrails(&SessionCostGuardrailInput {
+            largest_prompt_turn_tokens: 140_000,
+            largest_prompt_turn_label: Some("2026-05-05T00:00:01Z".to_string()),
+            ..SessionCostGuardrailInput::default()
+        });
+
+        assert!(
+            guardrails
+                .iter()
+                .any(|guardrail| guardrail.kind == "prompt_budget")
+        );
+    }
+
+    #[test]
+    fn derive_guardrails_flags_cached_resend_ratio() {
+        let guardrails = derive_guardrails(&SessionCostGuardrailInput {
+            prompt_tokens: 80_000,
+            cached_input_ratio: Some(96.0),
+            ..SessionCostGuardrailInput::default()
+        });
+
+        assert!(
+            guardrails
+                .iter()
+                .any(|guardrail| guardrail.kind == "cache_resend")
         );
     }
 }

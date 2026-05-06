@@ -4146,6 +4146,14 @@ fn cmd_session_cost(
                 truncate_for_compact(&churn.sample, 100)
             );
         }
+        for guardrail in &report.guardrails {
+            println!(
+                "guardrail {} {} {}",
+                guardrail.severity,
+                guardrail.kind,
+                truncate_for_compact(&guardrail.message, 100)
+            );
+        }
         for warning in &report.warnings {
             println!("warning: {warning}");
         }
@@ -4222,6 +4230,17 @@ fn cmd_session_cost(
         }
     }
 
+    if !report.guardrails.is_empty() {
+        println!();
+        println!("Guardrails:");
+        for guardrail in &report.guardrails {
+            println!(
+                "  - [{}:{}] {} | guidance: {}",
+                guardrail.severity, guardrail.kind, guardrail.message, guardrail.guidance
+            );
+        }
+    }
+
     for warning in &report.warnings {
         println!("warning: {warning}");
     }
@@ -4281,6 +4300,14 @@ fn cmd_session_review(path: &Path, format: OutputFormat) -> Result<()> {
                 failure.kind,
                 failure.occurrences,
                 truncate_for_compact(&failure.message, 100)
+            );
+        }
+        for guardrail in &report.guardrails {
+            println!(
+                "guardrail {} {} {}",
+                guardrail.severity,
+                guardrail.kind,
+                truncate_for_compact(&guardrail.message, 100)
             );
         }
         for warning in &report.warnings {
@@ -4410,6 +4437,17 @@ fn cmd_session_review(path: &Path, format: OutputFormat) -> Result<()> {
                 turn.cached_input_tokens,
                 turn.output_tokens,
                 turn.reasoning_output_tokens
+            );
+        }
+    }
+
+    if !report.guardrails.is_empty() {
+        println!();
+        println!("Guardrails:");
+        for guardrail in &report.guardrails {
+            println!(
+                "  - [{}:{}] {} | guidance: {}",
+                guardrail.severity, guardrail.kind, guardrail.message, guardrail.guidance
             );
         }
     }

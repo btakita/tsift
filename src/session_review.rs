@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use crate::runtime_churn::RestartChurnSummary;
-use crate::{session_cost, session_digest};
+use crate::{
+    session_cost::{self, SessionCostGuardrail, SessionCostGuardrailInput},
+    session_digest,
+};
 
 const MAX_SESSIONS: usize = 12;
 const MAX_AGGREGATE_ITEMS: usize = 12;
@@ -123,6 +126,8 @@ pub struct SessionReviewReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_input_ratio: Option<f64>,
     pub largest_turn_total_tokens: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub guardrails: Vec<SessionCostGuardrail>,
     pub prompt_targets: Vec<SessionReviewPromptTarget>,
     pub commands: Vec<SessionReviewCommand>,
     pub touched_files: Vec<SessionReviewFileRef>,
@@ -290,6 +295,7 @@ pub fn compute_with_options(
     let mut runtime_events = BTreeMap::<String, usize>::new();
     let mut closeout = BTreeMap::<(String, String), usize>::new();
     let mut restart_churn = BTreeMap::<String, RestartChurnSummary>::new();
+    let mut aggregate_runtime_events = BTreeMap::<String, usize>::new();
     let mut largest_turns = Vec::<SessionReviewLargestTurn>::new();
     let mut session_rows = Vec::<SessionReviewSession>::new();
 
@@ -365,6 +371,9 @@ pub fn compute_with_options(
         }
         for event in &digest.runtime_events {
             *runtime_events.entry(event.event.clone()).or_default() += event.occurrences;
+            *aggregate_runtime_events
+                .entry(event.event.clone())
+                .or_default() += event.occurrences;
         }
         for entry in &digest.closeout {
             *closeout
@@ -454,6 +463,39 @@ pub fn compute_with_options(
     let cached_input_ratio = (prompt_tokens > 0).then_some(
         ((cached_input_tokens as f64) / (prompt_tokens as f64) * 10_000.0).round() / 100.0,
     );
+    let largest_prompt_turn = largest_turns
+        .iter()
+        .max_by(|left, right| {
+            left.prompt_tokens
+                .cmp(&right.prompt_tokens)
+                .then(left.label.cmp(&right.label))
+        })
+        .cloned();
+    let guardrails = session_cost::derive_guardrails(&SessionCostGuardrailInput {
+        largest_prompt_turn_tokens: largest_prompt_turn
+            .as_ref()
+            .map_or(0, |turn| turn.prompt_tokens),
+        largest_prompt_turn_label: largest_prompt_turn.as_ref().map(|turn| turn.label.clone()),
+        prompt_tokens,
+        cached_input_ratio,
+        fresh_restart_occurrences: restart_churn
+            .get("fresh_restart")
+            .map_or(0, |entry| entry.occurrences),
+        auto_trigger_timeout_occurrences: restart_churn
+            .get("auto_trigger_timeout")
+            .map_or(0, |entry| entry.occurrences),
+        ctrl_d_restart_loop_occurrences: restart_churn
+            .get("ctrl_d_restart_loop")
+            .map_or(0, |entry| entry.occurrences),
+        noop_closeout_occurrences: aggregate_runtime_events
+            .get("commit_already_current")
+            .copied()
+            .unwrap_or(0),
+        max_restart_count: restart_churn
+            .values()
+            .filter_map(|entry| entry.max_restart_count)
+            .max(),
+    });
 
     largest_turns.sort_by(|left, right| {
         right
@@ -495,6 +537,7 @@ pub fn compute_with_options(
         total_tokens,
         cached_input_ratio,
         largest_turn_total_tokens,
+        guardrails,
         prompt_targets: collect_strings(
             prompt_targets,
             MAX_AGGREGATE_ITEMS,
@@ -1023,6 +1066,12 @@ mod tests {
         assert_eq!(report.codex_sessions, 1);
         assert_eq!(report.agent_doc_logs, 1);
         assert!(report.prompt_tokens >= 1200);
+        assert!(
+            report
+                .guardrails
+                .iter()
+                .any(|guardrail| guardrail.kind == "restart_loop")
+        );
         assert!(
             report
                 .commands
