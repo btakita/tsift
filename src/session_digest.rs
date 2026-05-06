@@ -762,6 +762,9 @@ fn ingest_text_line(
     if trimmed.is_empty() {
         return Ok(());
     }
+    if looks_like_instruction_ballast(trimmed) {
+        return Ok(());
+    }
 
     let prompt_candidate = trimmed
         .strip_prefix("❯ ")
@@ -812,6 +815,14 @@ fn push_prompt_target(prompt: &str, targets: &mut Vec<String>) {
 fn looks_like_prompt_target(text: &str, user_bias: bool) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty()
+        || looks_like_markdown_heading(trimmed)
+        || looks_like_slash_command_example(trimmed)
+        || trimmed == "#"
+        || trimmed.starts_with("#!")
+        || trimmed.starts_with("#[")
+        || trimmed.starts_with("/**")
+        || trimmed.starts_with("*/")
+        || trimmed.starts_with("//")
         || trimmed.starts_with("###")
         || trimmed.starts_with("<!--")
         || trimmed.starts_with("- [")
@@ -822,7 +833,7 @@ fn looks_like_prompt_target(text: &str, user_bias: bool) -> bool {
 
     if trimmed.starts_with("do ")
         || trimmed.starts_with('#')
-        || trimmed.starts_with('/')
+        || looks_like_slash_prompt_target(trimmed)
         || trimmed.ends_with('?')
     {
         return true;
@@ -838,6 +849,81 @@ fn looks_like_prompt_target(text: &str, user_bias: bool) -> bool {
     }
 
     false
+}
+
+fn looks_like_instruction_ballast(text: &str) -> bool {
+    let trimmed = strip_common_prefixes(text.trim());
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    looks_like_markdown_heading(trimmed)
+        || looks_like_slash_command_example(trimmed)
+        || trimmed.starts_with("<!-- tsift:")
+        || trimmed.starts_with("<!-- /tsift:")
+        || looks_like_instruction_label(trimmed)
+}
+
+fn looks_like_markdown_heading(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let heading_level = trimmed.chars().take_while(|ch| *ch == '#').count();
+    heading_level > 0
+        && heading_level <= 6
+        && trimmed
+            .chars()
+            .nth(heading_level)
+            .is_some_and(|ch| ch.is_whitespace())
+}
+
+fn looks_like_slash_command_example(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with('/')
+        && trimmed.contains('<')
+        && trimmed.contains('>')
+        && !trimmed.contains('`')
+}
+
+fn looks_like_slash_prompt_target(text: &str) -> bool {
+    let Some(first_token) = text.split_whitespace().next() else {
+        return false;
+    };
+    first_token.starts_with('/') && !first_token[1..].contains('/')
+}
+
+fn looks_like_instruction_label(text: &str) -> bool {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("**") {
+        return false;
+    }
+    let Some(label_end) = trimmed[2..].find("**") else {
+        return false;
+    };
+    let label = &trimmed[..label_end + 4];
+    if label.len() <= 4 {
+        return false;
+    }
+    let remainder = trimmed[label_end + 4..]
+        .trim_start_matches([' ', ':', '-', '—'])
+        .trim_start();
+    if remainder.is_empty() {
+        return false;
+    }
+    let lower = remainder.to_ascii_lowercase();
+    matches!(
+        lower.split_whitespace().next(),
+        Some("run")
+            | Some("use")
+            | Some("treat")
+            | Some("respond")
+            | Some("print")
+            | Some("prefer")
+            | Some("preserve")
+            | Some("show")
+            | Some("complete")
+            | Some("append")
+            | Some("when")
+            | Some("if")
+    )
 }
 
 fn extract_commands(text: &str) -> Vec<String> {
@@ -1359,6 +1445,49 @@ do [#sessiondigest]. spec-test-build-install-commit-push
         );
         assert!(report.failures.iter().any(|failure| failure.kind == "exit"));
         assert!(report.closeout.iter().any(|entry| entry.kind == "push"));
+    }
+
+    #[test]
+    fn markdown_digest_ignores_copied_instruction_ballast() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = "\
+# agent-doc
+## Invocation
+/agent-doc <FILE>
+**Auto-update skill:** Run `agent-doc --version` and compare against `agent-doc-version`.
+- **Imperative edits are executable directives** — when the user writes `do #id`, `run tests`, `build + install`, or `commit + push`
+**Compound task steering:** if one directive mixes commit + push, normalize it before execution.
+/home/brian/work/btakita/agent-loop/src/boost-client
+#[test]
+//!
+/**
+#!/usr/bin/env bash
+#
+do [#sessiondigest]. spec-test-build-install-commit-push
+";
+
+        let report = compute(dir.path(), input, None).unwrap();
+        assert_eq!(
+            report.prompt_targets,
+            vec!["do [#sessiondigest]. spec-test-build-install-commit-push".to_string()]
+        );
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn codex_jsonl_digest_filters_instruction_blob_lines_but_keeps_user_directive() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = concat!(
+            r##"{"type":"event_msg","payload":{"type":"user_message","message":"# agent-doc\n## Workflow\n/agent-doc <FILE>\n**Auto-update skill:** Run `agent-doc --version` and compare against `agent-doc-version`.\ndo [#cdxlog]. spec-test-build-install-commit-push"}}"##,
+            "\n"
+        );
+
+        let report = compute(dir.path(), input, Some("codex-jsonl")).unwrap();
+        assert_eq!(
+            report.prompt_targets,
+            vec!["do [#cdxlog]. spec-test-build-install-commit-push".to_string()]
+        );
+        assert!(report.failures.is_empty());
     }
 
     #[test]

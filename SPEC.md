@@ -1033,7 +1033,8 @@ Behavior:
 1. Read captured session input from stdin by default, or from `--input <file>`.
 2. Auto-detect markdown, Claude JSONL, Codex JSONL, or `agent-doc` runtime logs unless `--source markdown|claude-jsonl|codex-jsonl|agent-doc-log` forces one parser.
 3. Extract bounded prompt targets, shell commands, touched file paths, symbol-like identifiers, failure lines, runtime-event churn, and closeout evidence such as verification/install/commit/push/version mentions.
-4. Keep the digest transcript-only: it summarizes what happened in the session, but it does not replay tool calls or attempt to reconstruct the full conversation.
+4. Ignore copied harness-instruction ballast such as markdown headings, placeholder slash-command examples, and bold imperative labels so prompt/failure hotspots stay focused on actual session work.
+5. Keep the digest transcript-only: it summarizes what happened in the session, but it does not replay tool calls or attempt to reconstruct the full conversation.
 
 `session-digest` is intentionally conservative. It favors bounded evidence over perfect transcript reconstruction so long agent sessions can be collapsed into compact handoff or review context.
 
@@ -1078,6 +1079,7 @@ Behavior:
 2. For document targets, read `agent_doc_session` from frontmatter when present and use the matching `.agent-doc/logs/<session>.log` to learn historic `file=` aliases before scanning other harness logs.
 3. Discover related Claude sessions under `~/.claude/projects/<cwd-slug>/`, Codex sessions under `~/.codex/sessions/`, and `agent-doc` runtime logs under `<root>/.agent-doc/logs/`.
 4. Match candidate logs by cwd plus document path/session aliases, then reuse the existing `session-digest` and `session-cost` parsers to aggregate prompt targets, commands, failures, closeout evidence, token totals, and restart churn into one bounded report.
+5. Session-review inherits session-digest's instruction-ballast filtering so copied harness docs do not dominate prompt/failure hotspots.
 
 `session-review` is intentionally bounded. It does not replay full conversations; it gives one cross-harness review surface so document-level session analysis stops depending on ad hoc file hunting and manual aggregation.
 
