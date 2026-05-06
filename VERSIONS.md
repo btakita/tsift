@@ -8,6 +8,9 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- Added `tsift session-review`, a cross-harness aggregate review for a document or repo path. It auto-discovers related Claude JSONL, Codex JSONL, and `agent-doc` runtime logs, then emits one bounded combined digest + cost report instead of requiring manual per-log review.
+- `session-review` reuses the existing `session-digest` and `session-cost` parsers, aggregates their bounded signals into one report, and matches document sessions by cwd/path plus `agent_doc_session` log aliases when available.
+- Regression coverage now locks the new command in direct/unit discovery tests, CLI parsing tests, and a compiled CLI integration test that exercises Claude/Codex/agent-doc auto-discovery through `HOME`.
 - `tsift session-cost` and `tsift session-digest` now derive bounded restart-churn families from `agent-doc` runtime logs, so `fresh_restart`, `auto_trigger_timeout`, ctrl-d restart loops, and quit-after-eof cycles are summarized directly instead of being buried in raw event counters.
 - Regression coverage now locks the new restart-churn summaries in both direct/unit tests and compiled CLI stdin tests for `session-cost` and `session-digest`.
 - `tsift init` now injects owning-root guidance into the Code Navigation section so harnesses switch to the relevant repo or submodule root before tsift/build/test work instead of accidentally carrying the superproject instruction surface into submodule tasks.

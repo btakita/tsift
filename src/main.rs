@@ -27,6 +27,7 @@ pub mod metric_digest;
 pub mod runtime_churn;
 pub mod session_cost;
 pub mod session_digest;
+pub mod session_review;
 pub mod status;
 pub mod summarize;
 pub mod test_digest;
@@ -439,6 +440,15 @@ enum Commands {
         /// Force the input source (`claude-jsonl`, `codex-jsonl`, or `agent-doc-log`)
         #[arg(long)]
         source: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Auto-discover related Claude/Codex/agent-doc logs for a document or repo path and aggregate one bounded review
+    SessionReview {
+        /// Target document or repo path to review (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -888,6 +898,16 @@ fn main() -> Result<()> {
         }) => cmd_session_cost(
             input.as_deref(),
             source.as_deref(),
+            OutputFormat {
+                json_output: json || terse || schema,
+                compact,
+                pretty,
+                terse,
+                schema,
+            },
+        ),
+        Some(Commands::SessionReview { path, json }) => cmd_session_review(
+            &path,
             OutputFormat {
                 json_output: json || terse || schema,
                 compact,
@@ -4199,6 +4219,198 @@ fn cmd_session_cost(
                     churn.family, churn.occurrences, churn.sample
                 ),
             }
+        }
+    }
+
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    Ok(())
+}
+
+fn cmd_session_review(path: &Path, format: OutputFormat) -> Result<()> {
+    let report = session_review::compute(path)?;
+    if format.json_output {
+        println!(
+            "{}",
+            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+        );
+        return Ok(());
+    }
+
+    if format.compact {
+        let cache_ratio = report
+            .cached_input_ratio
+            .map(|value| format!("{value:.2}%"))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "session-review target:{} kind:{} matched:{} claude:{} codex:{} agent_doc:{} prompt:{} cached:{} cache_ratio:{} output:{} total:{}",
+            report.target,
+            report.target_kind,
+            report.sessions_matched,
+            report.claude_sessions,
+            report.codex_sessions,
+            report.agent_doc_logs,
+            format_compact_count(report.prompt_tokens),
+            format_compact_count(report.cached_input_tokens),
+            cache_ratio,
+            format_compact_count(report.output_tokens),
+            format_compact_count(report.total_tokens)
+        );
+        for session in &report.sessions {
+            println!(
+                "session {} total:{} prompts:{} fails:{} matched_by:{} path:{}",
+                session.source,
+                format_compact_count(session.total_tokens),
+                session.prompt_target_count,
+                session.failure_groups,
+                session.matched_by.join(","),
+                truncate_for_compact(&session.path, 96)
+            );
+        }
+        for prompt in &report.prompt_targets {
+            println!(
+                "prompt count:{} {}",
+                prompt.occurrences,
+                truncate_for_compact(&prompt.text, 100)
+            );
+        }
+        for failure in &report.failures {
+            println!(
+                "fail {} count:{} {}",
+                failure.kind,
+                failure.occurrences,
+                truncate_for_compact(&failure.message, 100)
+            );
+        }
+        for warning in &report.warnings {
+            println!("warning: {warning}");
+        }
+        return Ok(());
+    }
+
+    println!("Session review ({})", report.target_kind);
+    println!("  root:                   {}", report.root);
+    println!("  target:                 {}", report.target);
+    println!("  sessions considered:    {}", report.sessions_considered);
+    println!("  sessions matched:       {}", report.sessions_matched);
+    println!("  Claude sessions:        {}", report.claude_sessions);
+    println!("  Codex sessions:         {}", report.codex_sessions);
+    println!("  agent-doc logs:         {}", report.agent_doc_logs);
+    println!("  prompt targets:         {}", report.prompt_target_count);
+    println!("  commands:               {}", report.command_groups);
+    println!("  touched files:          {}", report.file_groups);
+    println!("  touched symbols:        {}", report.symbol_groups);
+    println!("  failures:               {}", report.failure_groups);
+    println!("  runtime events:         {}", report.runtime_event_groups);
+    println!("  restart churn:          {}", report.restart_churn_groups);
+    println!("  closeout:               {}", report.closeout_groups);
+    println!("  usage samples:          {}", report.usage_samples);
+    println!("  prompt tokens:          {}", report.prompt_tokens);
+    println!("  cached input tokens:    {}", report.cached_input_tokens);
+    println!(
+        "  cache creation tokens:  {}",
+        report.cache_creation_input_tokens
+    );
+    println!("  output tokens:          {}", report.output_tokens);
+    println!(
+        "  reasoning output:       {}",
+        report.reasoning_output_tokens
+    );
+    println!("  total tokens:           {}", report.total_tokens);
+    if let Some(ratio) = report.cached_input_ratio {
+        println!("  cached input ratio:     {ratio:.2}%");
+    }
+    println!(
+        "  largest turn total:     {}",
+        report.largest_turn_total_tokens
+    );
+
+    if !report.sessions.is_empty() {
+        println!();
+        println!("Matched sessions:");
+        for session in &report.sessions {
+            println!(
+                "  - [{}] {} | total {} | prompts {} | failures {} | matched by {}",
+                session.source,
+                session.path,
+                session.total_tokens,
+                session.prompt_target_count,
+                session.failure_groups,
+                session.matched_by.join(", ")
+            );
+        }
+    }
+
+    if !report.prompt_targets.is_empty() {
+        println!();
+        println!("Prompt targets:");
+        for prompt in &report.prompt_targets {
+            println!("  - {} ({})", prompt.text, prompt.occurrences);
+        }
+    }
+
+    if !report.commands.is_empty() {
+        println!();
+        println!("Commands:");
+        for command in &report.commands {
+            println!("  - {} ({})", command.command, command.occurrences);
+        }
+    }
+
+    if !report.failures.is_empty() {
+        println!();
+        println!("Failures:");
+        for failure in &report.failures {
+            println!(
+                "  - [{}] {} ({})",
+                failure.kind, failure.message, failure.occurrences
+            );
+        }
+    }
+
+    if !report.restart_churn.is_empty() {
+        println!();
+        println!("Restart churn:");
+        for churn in &report.restart_churn {
+            match churn.max_restart_count {
+                Some(max_restart_count) => println!(
+                    "  - {} ({}) max_restart={} sample: {}",
+                    churn.family, churn.occurrences, max_restart_count, churn.sample
+                ),
+                None => println!(
+                    "  - {} ({}) sample: {}",
+                    churn.family, churn.occurrences, churn.sample
+                ),
+            }
+        }
+    }
+
+    if !report.closeout.is_empty() {
+        println!();
+        println!("Closeout evidence:");
+        for entry in &report.closeout {
+            println!(
+                "  - [{}] {} ({})",
+                entry.kind, entry.detail, entry.occurrences
+            );
+        }
+    }
+
+    if !report.largest_turns.is_empty() {
+        println!();
+        println!("Largest turns:");
+        for turn in &report.largest_turns {
+            println!(
+                "  - [{}] {}: total {} | prompt {} | cached {} | output {} | reasoning {}",
+                turn.source,
+                turn.label,
+                turn.total_tokens,
+                turn.prompt_tokens,
+                turn.cached_input_tokens,
+                turn.output_tokens,
+                turn.reasoning_output_tokens
+            );
         }
     }
 
@@ -9304,6 +9516,23 @@ tier = "private"
                 assert_eq!(source.as_deref(), Some("codex-jsonl"));
             }
             _ => panic!("expected SessionCost command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_session_review_command() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "session-review",
+            "tasks/software/tsift.md",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::SessionReview { json, path }) => {
+                assert!(json);
+                assert_eq!(path, PathBuf::from("tasks/software/tsift.md"));
+            }
+            _ => panic!("expected SessionReview command"),
         }
     }
 

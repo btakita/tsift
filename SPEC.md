@@ -88,6 +88,7 @@ tsift metric-digest < runs.json  # repeated metric-run digest: deltas, improveme
 tsift log-digest --path . < build.log  # bounded verbose-log digest from stdin or --input
 tsift session-digest --path . < session.md  # session transcript digest: prompt targets, commands, touched files/symbols, failures, closeout
 tsift session-cost < session.jsonl  # token/runtime cost digest: prompt totals, cache ratios, large-turn outliers, restart churn
+tsift session-review tasks/software/tsift.md  # auto-discover related Claude/Codex/agent-doc logs and aggregate one review
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
 tsift search --exact <query>    # literal text lookup via `rg -F`
 tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
@@ -1061,6 +1062,24 @@ Behavior:
 5. Derive bounded restart-churn families from `agent-doc` logs so the digest can call out `fresh_restart`, `auto_trigger_timeout`, ctrl-d restart loops, and quit-after-eof cycles without replaying the full raw event stream.
 
 `session-cost` is intentionally cost-focused. It does not reconstruct the full conversation or replay tool calls; it compresses token/runtime overhead into a bounded report you can paste into backlog triage, handoffs, or benchmark notes.
+
+## Session Review
+
+`tsift session-review` auto-discovers related Claude/Codex transcript logs plus `agent-doc` runtime logs for a document or repo path, then emits one bounded combined review.
+
+```bash
+tsift session-review tasks/software/tsift.md
+tsift session-review src/tsift --json
+```
+
+Behavior:
+
+1. Resolve the owning repo/submodule root for the target path.
+2. For document targets, read `agent_doc_session` from frontmatter when present and use the matching `.agent-doc/logs/<session>.log` to learn historic `file=` aliases before scanning other harness logs.
+3. Discover related Claude sessions under `~/.claude/projects/<cwd-slug>/`, Codex sessions under `~/.codex/sessions/`, and `agent-doc` runtime logs under `<root>/.agent-doc/logs/`.
+4. Match candidate logs by cwd plus document path/session aliases, then reuse the existing `session-digest` and `session-cost` parsers to aggregate prompt targets, commands, failures, closeout evidence, token totals, and restart churn into one bounded report.
+
+`session-review` is intentionally bounded. It does not replay full conversations; it gives one cross-harness review surface so document-level session analysis stops depending on ad hoc file hunting and manual aggregation.
 
 ## Hook Integration
 

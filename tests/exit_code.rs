@@ -3205,6 +3205,96 @@ fn session_digest_summarizes_agent_doc_restart_churn_from_stdin() {
 }
 
 #[test]
+fn session_review_aggregates_cross_harness_logs() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let target = root.path().join("tasks/software/tsift.md");
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(
+        &target,
+        "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n",
+    )
+    .unwrap();
+
+    let agent_doc_logs = root.path().join(".agent-doc/logs");
+    fs::create_dir_all(&agent_doc_logs).unwrap();
+    fs::write(
+        agent_doc_logs.join("tsift-v0.1.log"),
+        concat!(
+            "[1776712372] session_start file=tasks/software/tsift.md pane=%77 session=tsift-v0.1\n",
+            "[1776712373] cwd_resolved path=/tmp/replace-me source=project_root\n",
+            "[1776712374] codex_start mode=fresh_restart restart_count=1\n"
+        )
+        .replace("/tmp/replace-me", &root.path().display().to_string()),
+    )
+    .unwrap();
+
+    let claude_dir = home
+        .path()
+        .join(".claude/projects")
+        .join(root.path().display().to_string().replace('/', "-"));
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(
+        claude_dir.join("claude.jsonl"),
+        concat!(
+            r#"{"cwd":"/tmp/replace-me","message":{"role":"user","content":"agent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+            "\n",
+            r#"{"message":{"role":"assistant","id":"msg-1","usage":{"input_tokens":400,"cache_creation_input_tokens":40,"cache_read_input_tokens":360,"output_tokens":25},"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            "\n"
+        )
+        .replace("/tmp/replace-me", &root.path().display().to_string()),
+    )
+    .unwrap();
+
+    let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+    fs::create_dir_all(&codex_dir).unwrap();
+    fs::write(
+        codex_dir.join("rollout-1.jsonl"),
+        concat!(
+            r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"agent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo build --release\"}"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":10,"total_tokens":1050}}}}"#,
+            "\n"
+        )
+        .replace("/tmp/replace-me", &root.path().display().to_string()),
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["session-review", "--json", target.to_str().unwrap()])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "session-review should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["target_kind"], "file");
+    assert_eq!(json["sessions_matched"], 3);
+    assert_eq!(json["claude_sessions"], 1);
+    assert_eq!(json["codex_sessions"], 1);
+    assert_eq!(json["agent_doc_logs"], 1);
+    assert!(
+        json["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["command"] == "cargo test")
+    );
+    assert!(
+        json["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["command"] == "cargo build --release")
+    );
+}
+
+#[test]
 fn rewrite_routes_long_agent_doc_reads_to_session_digest() {
     let dir = tempfile::tempdir().unwrap();
     let session = dir.path().join("tsift.md");
