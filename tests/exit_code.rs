@@ -3385,6 +3385,124 @@ fn session_review_aggregates_cross_harness_logs() {
 }
 
 #[test]
+fn session_review_honors_historical_aliases_and_skips_noisy_records() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let target = root.path().join("tasks/software/tsift.md");
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(
+        &target,
+        "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n",
+    )
+    .unwrap();
+
+    let agent_doc_logs = root.path().join(".agent-doc/logs");
+    fs::create_dir_all(&agent_doc_logs).unwrap();
+    fs::write(
+        agent_doc_logs.join("tsift-v0.1.log"),
+        concat!(
+            "[1776712372] session_start file=tasks/tsift.md pane=%77 session=tsift-v0\n",
+            "[1776712373] session_start file=tasks/software/tsift.md pane=%78 session=tsift-v0.1\n",
+            "[1776712374] cwd_resolved path=/tmp/replace-me source=project_root\n"
+        )
+        .replace("/tmp/replace-me", &root.path().display().to_string()),
+    )
+    .unwrap();
+
+    let claude_dir = home
+        .path()
+        .join(".claude/projects")
+        .join(root.path().display().to_string().replace('/', "-"));
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(
+        claude_dir.join("claude-target.jsonl"),
+        concat!(
+            "not-json\n",
+            r#"{"cwd":"/tmp/replace-me","message":{"role":"user","content":"resume session tsift-v0\nagent-doc tasks/tsift.md"}}"#,
+            "\n",
+            r#"{"attachment":{"type":"hook_success","content":"tasks/software/tsift.md only in hook output"}}"#,
+            "\n"
+        )
+        .replace("/tmp/replace-me", &root.path().display().to_string()),
+    )
+    .unwrap();
+    fs::write(
+        claude_dir.join("claude-noisy.jsonl"),
+        concat!(
+            r#"{"cwd":"/tmp/replace-me","attachment":{"type":"hook_success","content":"tasks/software/tsift.md only in hook output"}}"#,
+            "\n"
+        )
+        .replace("/tmp/replace-me", &root.path().display().to_string()),
+    )
+    .unwrap();
+
+    let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+    fs::create_dir_all(&codex_dir).unwrap();
+    fs::write(
+        codex_dir.join("codex-target.jsonl"),
+        concat!(
+            "not-json\n",
+            r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"resume tsift-v0\nagent-doc tasks/tsift.md"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","output":"tasks/software/tsift.md only in output"}}"#,
+            "\n"
+        )
+        .replace("/tmp/replace-me", &root.path().display().to_string()),
+    )
+    .unwrap();
+    fs::write(
+        codex_dir.join("codex-noisy.jsonl"),
+        concat!(
+            r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","output":"tasks/software/tsift.md only in output"}}"#,
+            "\n"
+        )
+        .replace("/tmp/replace-me", &root.path().display().to_string()),
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["session-review", "--json", target.to_str().unwrap()])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "session-review should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["sessions_considered"], 5);
+    assert_eq!(json["sessions_matched"], 3);
+    assert_eq!(json["claude_sessions"], 1);
+    assert_eq!(json["codex_sessions"], 1);
+    assert!(json["sessions"].as_array().unwrap().iter().any(|session| {
+        session["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("claude-target.jsonl")
+            && session["matched_by"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == "agent_doc_session" || reason == "path:tasks/tsift.md")
+    }));
+    assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("skipping malformed Claude transcript jsonl line 1")
+    }));
+    assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("skipping malformed Codex transcript jsonl line 1")
+    }));
+}
+
+#[test]
 fn rewrite_routes_long_agent_doc_reads_to_session_digest() {
     let dir = tempfile::tempdir().unwrap();
     let session = dir.path().join("tsift.md");

@@ -2,7 +2,6 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -219,7 +218,20 @@ struct TargetContext {
     relative_target: Option<String>,
     kind: TargetKind,
     agent_doc_session: Option<String>,
-    aliases: BTreeSet<String>,
+    path_aliases: BTreeSet<String>,
+    session_aliases: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentDocAliases {
+    path_aliases: BTreeSet<String>,
+    session_aliases: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MatchSignals {
+    cwd: Option<PathBuf>,
+    snippets: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,9 +280,9 @@ pub fn compute_with_options(
         if session_log.is_file()
             && let Ok(text) = fs::read_to_string(&session_log)
         {
-            for alias in collect_agent_doc_aliases(&text, &context.root) {
-                context.aliases.insert(alias);
-            }
+            let aliases = collect_agent_doc_aliases(&text, &context.root);
+            context.path_aliases.extend(aliases.path_aliases);
+            context.session_aliases.extend(aliases.session_aliases);
         }
     }
 
@@ -666,16 +678,14 @@ fn build_target_context(target: &Path) -> Result<TargetContext> {
         .transpose()?
         .flatten();
 
-    let mut aliases = BTreeSet::new();
-    aliases.insert(canonical_target.display().to_string());
+    let mut path_aliases = BTreeSet::new();
+    path_aliases.insert(canonical_target.display().to_string());
     if let Some(relative) = &relative_target {
-        aliases.insert(relative.clone());
+        path_aliases.insert(relative.clone());
     }
-    if let Some(name) = canonical_target
-        .file_name()
-        .and_then(|value| value.to_str())
-    {
-        aliases.insert(name.to_string());
+    let mut session_aliases = BTreeSet::new();
+    if let Some(session) = &agent_doc_session {
+        session_aliases.insert(session.clone());
     }
 
     Ok(TargetContext {
@@ -684,7 +694,8 @@ fn build_target_context(target: &Path) -> Result<TargetContext> {
         relative_target,
         kind,
         agent_doc_session,
-        aliases,
+        path_aliases,
+        session_aliases,
     })
 }
 
@@ -789,15 +800,21 @@ fn claude_project_slug(root: &Path) -> String {
     root.display().to_string().replace('/', "-")
 }
 
-fn collect_agent_doc_aliases(text: &str, root: &Path) -> BTreeSet<String> {
-    let mut aliases = BTreeSet::new();
+fn collect_agent_doc_aliases(text: &str, root: &Path) -> AgentDocAliases {
+    let mut aliases = AgentDocAliases::default();
     for line in text.lines() {
         let Some((_, detail)) = line.split_once("] ") else {
             continue;
         };
         if let Some(raw) = extract_field(detail, "file") {
             let normalized = normalize_relative_path(raw, root);
-            aliases.insert(normalized);
+            aliases.path_aliases.insert(normalized);
+        }
+        if let Some(raw) = extract_field(detail, "session") {
+            let session = raw.trim_matches('"');
+            if !session.is_empty() {
+                aliases.session_aliases.insert(session.to_string());
+            }
         }
     }
     aliases
@@ -821,7 +838,7 @@ fn maybe_add_agent_doc_candidate(
             matched_by.push("cwd_resolved".to_string());
         }
     } else {
-        for alias in &context.aliases {
+        for alias in &context.path_aliases {
             if text.contains(&format!("file={alias}")) {
                 matched_by.push(format!("path:{alias}"));
             }
@@ -851,11 +868,11 @@ fn maybe_add_claude_candidate(
 ) -> Result<()> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading Claude session {}", path.display()))?;
-    let cwd = extract_claude_cwd(&text)?;
-    if !cwd_matches_target(context, cwd.as_deref()) {
+    let signals = extract_claude_match_signals(&text);
+    if !cwd_matches_target(context, signals.cwd.as_deref()) {
         return Ok(());
     }
-    let matched_by = match_reasons(context, &text, cwd.as_deref());
+    let matched_by = match_reasons(context, &signals, signals.cwd.as_deref());
     if matched_by.is_empty() {
         return Ok(());
     }
@@ -878,13 +895,13 @@ fn maybe_add_codex_candidate(
     context: &TargetContext,
     path: &Path,
 ) -> Result<()> {
-    let cwd = extract_codex_cwd(path)?;
-    if !cwd_matches_target(context, cwd.as_deref()) {
-        return Ok(());
-    }
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading Codex session {}", path.display()))?;
-    let matched_by = match_reasons(context, &text, cwd.as_deref());
+    let signals = extract_codex_match_signals(&text);
+    if !cwd_matches_target(context, signals.cwd.as_deref()) {
+        return Ok(());
+    }
+    let matched_by = match_reasons(context, &signals, signals.cwd.as_deref());
     if matched_by.is_empty() {
         return Ok(());
     }
@@ -902,42 +919,93 @@ fn maybe_add_codex_candidate(
     Ok(())
 }
 
-fn extract_claude_cwd(text: &str) -> Result<Option<PathBuf>> {
-    for (index, line) in text.lines().enumerate() {
+fn extract_claude_match_signals(text: &str) -> MatchSignals {
+    let mut signals = MatchSignals::default();
+    for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let value = serde_json::from_str::<serde_json::Value>(trimmed)
-            .with_context(|| format!("parsing Claude session jsonl line {}", index + 1))?;
-        if let Some(cwd) = value.get("cwd").and_then(serde_json::Value::as_str) {
-            return Ok(Some(PathBuf::from(cwd)));
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if signals.cwd.is_none()
+            && let Some(cwd) = value.get("cwd").and_then(serde_json::Value::as_str)
+        {
+            signals.cwd = Some(PathBuf::from(cwd));
         }
+        collect_claude_match_snippets(&value, &mut signals.snippets);
     }
-    Ok(None)
+    signals
 }
 
-fn extract_codex_cwd(path: &Path) -> Result<Option<PathBuf>> {
-    let file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let reader = BufReader::new(file);
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("reading {}", path.display()))?;
+fn extract_codex_match_signals(text: &str) -> MatchSignals {
+    let mut signals = MatchSignals::default();
+    for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let value = serde_json::from_str::<serde_json::Value>(trimmed)
-            .with_context(|| format!("parsing Codex session jsonl line {}", index + 1))?;
-        if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             continue;
+        };
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("session_meta") => {
+                if signals.cwd.is_none() {
+                    signals.cwd = value
+                        .get("payload")
+                        .and_then(|payload| payload.get("cwd"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(PathBuf::from);
+                }
+            }
+            Some("event_msg") => {
+                if let Some(payload) = value.get("payload")
+                    && payload.get("type").and_then(serde_json::Value::as_str)
+                        == Some("user_message")
+                    && let Some(message) =
+                        payload.get("message").and_then(serde_json::Value::as_str)
+                {
+                    signals.snippets.push(message.to_string());
+                }
+            }
+            Some("response_item") => {
+                if let Some(payload) = value.get("payload") {
+                    match payload.get("type").and_then(serde_json::Value::as_str) {
+                        Some("function_call") => {
+                            if let Some(arguments) =
+                                payload.get("arguments").and_then(serde_json::Value::as_str)
+                            {
+                                signals.snippets.push(arguments.to_string());
+                            }
+                        }
+                        Some("message") => {
+                            if payload.get("role").and_then(serde_json::Value::as_str)
+                                == Some("user")
+                                && let Some(content) =
+                                    payload.get("content").and_then(serde_json::Value::as_array)
+                            {
+                                for item in content {
+                                    if let Some(text) = item
+                                        .get("text")
+                                        .and_then(serde_json::Value::as_str)
+                                        .or_else(|| {
+                                            item.get("content").and_then(serde_json::Value::as_str)
+                                        })
+                                    {
+                                        signals.snippets.push(text.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
         }
-        return Ok(value
-            .get("payload")
-            .and_then(|payload| payload.get("cwd"))
-            .and_then(serde_json::Value::as_str)
-            .map(PathBuf::from));
     }
-    Ok(None)
+    signals
 }
 
 fn cwd_matches_target(context: &TargetContext, cwd: Option<&Path>) -> bool {
@@ -950,7 +1018,11 @@ fn cwd_matches_target(context: &TargetContext, cwd: Option<&Path>) -> bool {
     canonical_cwd.starts_with(&context.root) || context.root.starts_with(canonical_cwd)
 }
 
-fn match_reasons(context: &TargetContext, text: &str, cwd: Option<&Path>) -> Vec<String> {
+fn match_reasons(
+    context: &TargetContext,
+    signals: &MatchSignals,
+    cwd: Option<&Path>,
+) -> Vec<String> {
     let mut reasons = BTreeSet::new();
     match context.kind {
         TargetKind::Directory => {
@@ -959,15 +1031,17 @@ fn match_reasons(context: &TargetContext, text: &str, cwd: Option<&Path>) -> Vec
             }
         }
         TargetKind::File => {
-            for alias in &context.aliases {
-                if text.contains(alias) {
-                    reasons.insert(format!("path:{alias}"));
+            for snippet in &signals.snippets {
+                for alias in &context.path_aliases {
+                    if snippet.contains(alias) {
+                        reasons.insert(format!("path:{alias}"));
+                    }
                 }
-            }
-            if let Some(session_name) = &context.agent_doc_session
-                && text.contains(session_name)
-            {
-                reasons.insert("agent_doc_session".to_string());
+                for session_alias in &context.session_aliases {
+                    if snippet.contains(session_alias) {
+                        reasons.insert("agent_doc_session".to_string());
+                    }
+                }
             }
             if reasons.is_empty() {
                 return Vec::new();
@@ -978,6 +1052,53 @@ fn match_reasons(context: &TargetContext, text: &str, cwd: Option<&Path>) -> Vec
         }
     }
     reasons.into_iter().collect()
+}
+
+fn collect_claude_match_snippets(value: &serde_json::Value, out: &mut Vec<String>) {
+    if let Some(message) = value.get("message") {
+        collect_claude_message_snippets(message, out);
+        return;
+    }
+    if value.get("attachment").is_some() {
+        return;
+    }
+    collect_claude_message_snippets(value, out);
+}
+
+fn collect_claude_message_snippets(value: &serde_json::Value, out: &mut Vec<String>) {
+    if let Some(content) = value.get("content") {
+        match content {
+            serde_json::Value::String(text) => out.push(text.to_string()),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    match item.get("type").and_then(serde_json::Value::as_str) {
+                        Some("text") => {
+                            if let Some(text) = item
+                                .get("text")
+                                .and_then(serde_json::Value::as_str)
+                                .or_else(|| item.get("content").and_then(serde_json::Value::as_str))
+                            {
+                                out.push(text.to_string());
+                            }
+                        }
+                        Some("tool_use") => {
+                            if let Some(command) = item
+                                .get("input")
+                                .and_then(|input| input.get("command"))
+                                .and_then(serde_json::Value::as_str)
+                            {
+                                out.push(command.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    } else if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
+        out.push(text.to_string());
+    }
 }
 
 fn insert_candidate(candidates: &mut BTreeMap<String, PendingSession>, pending: PendingSession) {
@@ -1411,5 +1532,128 @@ mod tests {
                     .iter()
                     .any(|reason| reason == "agent_doc_session" || reason.starts_with("path:"))
         }));
+    }
+
+    #[test]
+    fn session_review_uses_historical_aliases_and_skips_noisy_transcript_records() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let target = root.path().join("tasks/software/tsift.md");
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(
+            &target,
+            "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n",
+        )
+        .unwrap();
+
+        let agent_doc_logs = root.path().join(".agent-doc/logs");
+        fs::create_dir_all(&agent_doc_logs).unwrap();
+        fs::write(
+            agent_doc_logs.join("tsift-v0.1.log"),
+            concat!(
+                "[1776712372] session_start file=tasks/tsift.md pane=%77 session=tsift-v0\n",
+                "[1776712373] session_start file=tasks/software/tsift.md pane=%78 session=tsift-v0.1\n",
+                "[1776712374] cwd_resolved path=/tmp/replace-me source=project_root\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let claude_dir = home
+            .path()
+            .join(".claude/projects")
+            .join(claude_project_slug(root.path()));
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("claude-target.jsonl"),
+            concat!(
+                "not-json\n",
+                r#"{"cwd":"/tmp/replace-me","message":{"role":"user","content":"resume session tsift-v0\nagent-doc tasks/tsift.md"}}"#,
+                "\n",
+                r#"{"attachment":{"type":"hook_success","content":"tasks/software/tsift.md from context index only"}}"#,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+        fs::write(
+            claude_dir.join("claude-noisy.jsonl"),
+            concat!(
+                r#"{"cwd":"/tmp/replace-me","attachment":{"type":"hook_success","content":"tasks/software/tsift.md only in hook output"}}"#,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("codex-target.jsonl"),
+            concat!(
+                "not-json\n",
+                r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"resume tsift-v0\nagent-doc tasks/tsift.md"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call_output","output":"tasks/software/tsift.md from stdout"}}"#,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+        fs::write(
+            codex_dir.join("codex-noisy.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call_output","output":"tasks/software/tsift.md only in output"}}"#,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let report = compute_with_options(
+            &target,
+            &SessionReviewOptions {
+                claude_projects_dir: Some(home.path().join(".claude/projects")),
+                codex_sessions_dir: Some(home.path().join(".codex/sessions")),
+                agent_doc_logs_dir: Some(agent_doc_logs),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.sessions_considered, 5);
+        assert_eq!(report.sessions_matched, 3);
+        assert_eq!(report.claude_sessions, 1);
+        assert_eq!(report.codex_sessions, 1);
+        assert_eq!(report.agent_doc_logs, 1);
+        assert!(report.sessions.iter().any(|session| {
+            session.path.ends_with("claude-target.jsonl")
+                && session
+                    .matched_by
+                    .iter()
+                    .any(|reason| reason == "agent_doc_session" || reason == "path:tasks/tsift.md")
+        }));
+        assert!(report.sessions.iter().any(|session| {
+            session.path.ends_with("codex-target.jsonl")
+                && session
+                    .matched_by
+                    .iter()
+                    .any(|reason| reason == "agent_doc_session" || reason == "path:tasks/tsift.md")
+        }));
+        assert!(
+            report.warnings.iter().any(
+                |warning| warning.contains("skipping malformed Claude transcript jsonl line 1")
+            )
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("skipping malformed Codex transcript jsonl line 1"))
+        );
     }
 }

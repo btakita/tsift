@@ -8,6 +8,12 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.35
+
+- `tsift session-review` now learns historical document path aliases plus prior `session=` aliases from the matching `agent-doc` runtime log before it scans Claude/Codex transcripts, so renamed task files and migrated session ids still collapse into one comparable review.
+- File-target session matching no longer relies on filename-only aliases or arbitrary raw transcript substrings. Claude/Codex candidates now match only against structured user/tool-input snippets, which prevents unrelated hook output or command stdout from pulling in the wrong session history.
+- Claude/Codex transcript parsing for `session-review` now skips malformed JSONL lines instead of failing the whole review, and Claude non-conversation attachment records are ignored without noisy warnings so cross-harness results stay comparable.
+
 ## 0.1.34
 
 - `tsift session-review` now includes a bounded `next_context` payload in its JSON report and supports `--next-context` to emit only the resumable handoff pack for a document or repo target.

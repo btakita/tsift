@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -349,15 +349,25 @@ fn ingest_claude_jsonl(root: &Path, input: &str, state: &mut DigestState) -> Res
         if trimmed.is_empty() {
             continue;
         }
-        let value = serde_json::from_str::<Value>(trimmed)
-            .with_context(|| format!("parsing transcript jsonl line {}", index + 1))?;
+        let value = match serde_json::from_str::<Value>(trimmed) {
+            Ok(value) => value,
+            Err(_) => {
+                state.warnings.push(format!(
+                    "skipping malformed Claude transcript jsonl line {}",
+                    index + 1
+                ));
+                continue;
+            }
+        };
         let mut blocks = Vec::new();
         collect_transcript_blocks(&value, &mut blocks);
         if blocks.is_empty() {
-            state.warnings.push(format!(
-                "jsonl line {} did not contain message content or tool_use blocks",
-                index + 1
-            ));
+            if !is_ignorable_claude_record(&value) {
+                state.warnings.push(format!(
+                    "jsonl line {} did not contain message content or tool_use blocks",
+                    index + 1
+                ));
+            }
             continue;
         }
         for block in blocks {
@@ -384,8 +394,16 @@ fn ingest_codex_jsonl(root: &Path, input: &str, state: &mut DigestState) -> Resu
         if trimmed.is_empty() {
             continue;
         }
-        let value = serde_json::from_str::<Value>(trimmed)
-            .with_context(|| format!("parsing Codex transcript jsonl line {}", index + 1))?;
+        let value = match serde_json::from_str::<Value>(trimmed) {
+            Ok(value) => value,
+            Err(_) => {
+                state.warnings.push(format!(
+                    "skipping malformed Codex transcript jsonl line {}",
+                    index + 1
+                ));
+                continue;
+            }
+        };
         match value.get("type").and_then(Value::as_str) {
             Some("response_item") => ingest_codex_response_item(root, &value, index + 1, state)?,
             Some("event_msg") => ingest_codex_event_msg(root, &value, index + 1, state)?,
@@ -454,6 +472,14 @@ fn ingest_agent_doc_log(root: &Path, input: &str, state: &mut DigestState) {
             }
         }
     }
+}
+
+fn is_ignorable_claude_record(value: &Value) -> bool {
+    value.get("attachment").is_some()
+        || value.get("toolUseResult").is_some()
+        || (value.get("message").is_none()
+            && value.get("content").is_none()
+            && value.get("text").is_none())
 }
 
 fn collect_transcript_blocks(value: &Value, out: &mut Vec<TranscriptBlock>) {

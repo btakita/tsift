@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -443,8 +443,16 @@ fn ingest_claude_jsonl(input: &str, state: &mut CostState) -> Result<()> {
         if trimmed.is_empty() {
             continue;
         }
-        let value = serde_json::from_str::<Value>(trimmed)
-            .with_context(|| format!("parsing Claude transcript jsonl line {}", index + 1))?;
+        let value = match serde_json::from_str::<Value>(trimmed) {
+            Ok(value) => value,
+            Err(_) => {
+                state.warnings.push(format!(
+                    "skipping malformed Claude transcript jsonl line {}",
+                    index + 1
+                ));
+                continue;
+            }
+        };
         let Some(message) = value.get("message") else {
             continue;
         };
@@ -502,8 +510,16 @@ fn ingest_codex_jsonl(input: &str, state: &mut CostState) -> Result<()> {
         if trimmed.is_empty() {
             continue;
         }
-        let value = serde_json::from_str::<Value>(trimmed)
-            .with_context(|| format!("parsing Codex transcript jsonl line {}", index + 1))?;
+        let value = match serde_json::from_str::<Value>(trimmed) {
+            Ok(value) => value,
+            Err(_) => {
+                state.warnings.push(format!(
+                    "skipping malformed Codex transcript jsonl line {}",
+                    index + 1
+                ));
+                continue;
+            }
+        };
         if value.get("type").and_then(Value::as_str) != Some("event_msg") {
             continue;
         }
