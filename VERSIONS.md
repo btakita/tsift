@@ -8,6 +8,12 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.36
+
+- `tsift session-cost` now emits bounded `loop_clusters` summaries for repeated prompt bodies, repeated command bundles, and repeated closeout churn across Claude JSONL, Codex JSONL, and `agent-doc` runtime logs.
+- `tsift session-review` now aggregates those loop clusters across matched sessions, so repeated verification bundles and no-op closeout churn become explicit review signals instead of hiding inside broad command/runtime totals.
+- Regression coverage now locks the new loop-cluster surface in direct/unit tests and compiled CLI integration tests for both `session-cost` and `session-review`.
+
 ## 0.1.35
 
 - `tsift session-review` now learns historical document path aliases plus prior `session=` aliases from the matching `agent-doc` runtime log before it scans Claude/Codex transcripts, so renamed task files and migrated session ids still collapse into one comparable review.

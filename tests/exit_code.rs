@@ -3503,6 +3503,88 @@ fn session_review_honors_historical_aliases_and_skips_noisy_records() {
 }
 
 #[test]
+fn session_review_json_surfaces_loop_clusters() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let target = root.path().join("tasks/software/tsift.md");
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(
+        &target,
+        "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n",
+    )
+    .unwrap();
+
+    let agent_doc_logs = root.path().join(".agent-doc/logs");
+    fs::create_dir_all(&agent_doc_logs).unwrap();
+    fs::write(
+        agent_doc_logs.join("tsift-v0.1.log"),
+        concat!(
+            "[1776712372] session_start file=tasks/software/tsift.md pane=%77 session=tsift-v0.1\n",
+            "[1776712373] cwd_resolved path=/tmp/replace-me source=project_root\n",
+            "[1776712374] commit_already_current file=tasks/software/tsift.md basis=head\n",
+            "[1776712375] commit_already_current file=tasks/software/tsift.md basis=head\n",
+            "[1776712376] commit_already_current file=tasks/software/tsift.md basis=head\n"
+        )
+        .replace("/tmp/replace-me", &root.path().display().to_string()),
+    )
+    .unwrap();
+
+    let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+    fs::create_dir_all(&codex_dir).unwrap();
+    fs::write(
+        codex_dir.join("rollout-1.jsonl"),
+        concat!(
+            r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#looprank]. spec-test-build-install-commit-push\nagent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo build --release\"}"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Committed and pushed in `src/tsift` as `abc123`."}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#looprank]. spec-test-build-install-commit-push"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo build --release\"}"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Committed and pushed in `src/tsift` as `abc123`."}}"#,
+            "\n"
+        )
+        .replace("/tmp/replace-me", &root.path().display().to_string()),
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["session-review", "--json", target.to_str().unwrap()])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "session-review should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let loop_clusters = json["loop_clusters"].as_array().unwrap();
+    assert!(loop_clusters.iter().any(|cluster| {
+        cluster["kind"] == "prompt_repeat"
+            && cluster["label"] == "do [#looprank]. spec-test-build-install-commit-push"
+            && cluster["occurrences"] == 2
+    }));
+    assert!(loop_clusters.iter().any(|cluster| {
+        cluster["kind"] == "command_bundle"
+            && cluster["label"] == "cargo test -> cargo build --release"
+            && cluster["occurrences"] == 2
+    }));
+    assert!(loop_clusters.iter().any(|cluster| {
+        cluster["kind"] == "closeout_churn"
+            && cluster["label"] == "commit_already_current"
+            && cluster["occurrences"] == 3
+    }));
+}
+
+#[test]
 fn rewrite_routes_long_agent_doc_reads_to_session_digest() {
     let dir = tempfile::tempdir().unwrap();
     let session = dir.path().join("tsift.md");

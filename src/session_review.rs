@@ -7,7 +7,7 @@ use std::time::UNIX_EPOCH;
 
 use crate::runtime_churn::RestartChurnSummary;
 use crate::{
-    session_cost::{self, SessionCostGuardrail, SessionCostGuardrailInput},
+    session_cost::{self, SessionCostGuardrail, SessionCostGuardrailInput, SessionCostLoopCluster},
     session_digest,
 };
 
@@ -15,6 +15,7 @@ const MAX_SESSIONS: usize = 12;
 const MAX_AGGREGATE_ITEMS: usize = 12;
 const MAX_LARGEST_TURNS: usize = 8;
 const MAX_WARNINGS: usize = 16;
+const MAX_LOOP_CLUSTERS: usize = 12;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionReviewSession {
@@ -144,6 +145,8 @@ pub struct SessionReviewReport {
     pub largest_turn_total_tokens: u64,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub guardrails: Vec<SessionCostGuardrail>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub loop_clusters: Vec<SessionCostLoopCluster>,
     pub prompt_targets: Vec<SessionReviewPromptTarget>,
     pub commands: Vec<SessionReviewCommand>,
     pub touched_files: Vec<SessionReviewFileRef>,
@@ -327,6 +330,7 @@ pub fn compute_with_options(
     let mut closeout = BTreeMap::<(String, String), usize>::new();
     let mut restart_churn = BTreeMap::<String, RestartChurnSummary>::new();
     let mut aggregate_runtime_events = BTreeMap::<String, usize>::new();
+    let mut loop_clusters = BTreeMap::<(String, String), (usize, usize)>::new();
     let mut largest_turns = Vec::<SessionReviewLargestTurn>::new();
     let mut session_rows = Vec::<SessionReviewSession>::new();
 
@@ -466,6 +470,13 @@ pub fn compute_with_options(
                     total_tokens: turn.total_tokens,
                 });
             }
+            for cluster in &cost.loop_clusters {
+                let entry = loop_clusters
+                    .entry((cluster.kind.clone(), cluster.label.clone()))
+                    .or_insert((0, 0));
+                entry.0 += cluster.occurrences;
+                entry.1 = entry.1.max(cluster.max_consecutive);
+            }
         }
 
         for warning in digest.warnings.iter().chain(
@@ -599,6 +610,7 @@ pub fn compute_with_options(
             occurrences,
         },
     );
+    let loop_clusters = collect_loop_clusters(loop_clusters, MAX_LOOP_CLUSTERS);
     let next_context = build_next_context(
         &context,
         &prompt_targets,
@@ -638,6 +650,7 @@ pub fn compute_with_options(
         cached_input_ratio,
         largest_turn_total_tokens,
         guardrails,
+        loop_clusters,
         prompt_targets,
         commands,
         touched_files,
@@ -1209,6 +1222,31 @@ fn collect_restart_churn(
     rows
 }
 
+fn collect_loop_clusters(
+    entries: BTreeMap<(String, String), (usize, usize)>,
+    max_items: usize,
+) -> Vec<SessionCostLoopCluster> {
+    let mut rows = entries
+        .into_iter()
+        .map(|((kind, label), (occurrences, max_consecutive))| SessionCostLoopCluster {
+            kind,
+            label,
+            occurrences,
+            max_consecutive,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .occurrences
+            .cmp(&left.occurrences)
+            .then(right.max_consecutive.cmp(&left.max_consecutive))
+            .then(left.kind.cmp(&right.kind))
+            .then(left.label.cmp(&right.label))
+    });
+    rows.truncate(max_items);
+    rows
+}
+
 fn shell_quote(text: &str) -> String {
     if text.chars().any(char::is_whitespace) {
         format!("{text:?}")
@@ -1433,6 +1471,98 @@ mod tests {
                 .unresolved_failures
                 .iter()
                 .any(|failure| failure.kind == "missing" || failure.kind == "error")
+        );
+    }
+
+    #[test]
+    fn session_review_aggregates_loop_clusters() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let target = root.path().join("tasks/software/tsift.md");
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(
+            &target,
+            "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n",
+        )
+        .unwrap();
+
+        let agent_doc_logs = root.path().join(".agent-doc/logs");
+        fs::create_dir_all(&agent_doc_logs).unwrap();
+        fs::write(
+            agent_doc_logs.join("tsift-v0.1.log"),
+            concat!(
+                "[1776712372] session_start file=tasks/software/tsift.md pane=%77 session=tsift-v0.1\n",
+                "[1776712373] cwd_resolved path=/tmp/replace-me source=project_root\n",
+                "[1776712374] commit_already_current file=tasks/software/tsift.md basis=head\n",
+                "[1776712375] commit_already_current file=tasks/software/tsift.md basis=head\n",
+                "[1776712376] commit_already_current file=tasks/software/tsift.md basis=head\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("rollout-1.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#looprank]. spec-test-build-install-commit-push\nagent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo build --release\"}"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Committed and pushed in `src/tsift` as `abc123`."}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#looprank]. spec-test-build-install-commit-push"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo build --release\"}"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Committed and pushed in `src/tsift` as `abc123`."}}"#,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let report = compute_with_options(
+            &target,
+            &SessionReviewOptions {
+                claude_projects_dir: Some(home.path().join(".claude/projects")),
+                codex_sessions_dir: Some(home.path().join(".codex/sessions")),
+                agent_doc_logs_dir: Some(agent_doc_logs),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            report
+                .loop_clusters
+                .iter()
+                .any(|cluster| cluster.kind == "prompt_repeat"
+                    && cluster.label == "do [#looprank]. spec-test-build-install-commit-push"
+                    && cluster.occurrences == 2)
+        );
+        assert!(
+            report
+                .loop_clusters
+                .iter()
+                .any(|cluster| cluster.kind == "command_bundle"
+                    && cluster.label == "cargo test -> cargo build --release"
+                    && cluster.occurrences == 2)
+        );
+        assert!(
+            report
+                .loop_clusters
+                .iter()
+                .any(|cluster| cluster.kind == "closeout_churn"
+                    && cluster.label == "commit_already_current"
+                    && cluster.occurrences == 3)
         );
     }
 

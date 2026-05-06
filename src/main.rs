@@ -4117,7 +4117,7 @@ fn cmd_session_cost(
             .map(|value| format!("{value:.2}%"))
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "session-cost src:{} samples:{} prompt:{} cached:{} cache_ratio:{} output:{} total:{} runtime:{} churn:{}",
+            "session-cost src:{} samples:{} prompt:{} cached:{} cache_ratio:{} output:{} total:{} runtime:{} churn:{} loops:{}",
             report.source,
             report.usage_samples,
             format_compact_count(report.prompt_tokens),
@@ -4126,7 +4126,8 @@ fn cmd_session_cost(
             format_compact_count(report.output_tokens),
             format_compact_count(report.total_tokens),
             report.total_runtime_events,
-            report.restart_churn_groups
+            report.restart_churn_groups,
+            report.loop_clusters.len()
         );
         for turn in &report.largest_turns {
             println!(
@@ -4152,6 +4153,15 @@ fn cmd_session_cost(
                 churn.occurrences,
                 suffix,
                 truncate_for_compact(&churn.sample, 100)
+            );
+        }
+        for cluster in &report.loop_clusters {
+            println!(
+                "loop {} count:{} streak:{} {}",
+                cluster.kind,
+                cluster.occurrences,
+                cluster.max_consecutive,
+                truncate_for_compact(&cluster.label, 100)
             );
         }
         for guardrail in &report.guardrails {
@@ -4193,6 +4203,7 @@ fn cmd_session_cost(
     println!("  runtime events:         {}", report.total_runtime_events);
     println!("  runtime groups:         {}", report.runtime_event_groups);
     println!("  restart churn groups:   {}", report.restart_churn_groups);
+    println!("  loop clusters:          {}", report.loop_clusters.len());
     if let Some(max_restart_count) = report.max_restart_count {
         println!("  max restart count:      {}", max_restart_count);
     }
@@ -4235,6 +4246,17 @@ fn cmd_session_cost(
                     churn.family, churn.occurrences, churn.sample
                 ),
             }
+        }
+    }
+
+    if !report.loop_clusters.is_empty() {
+        println!();
+        println!("Loop clusters:");
+        for cluster in &report.loop_clusters {
+            println!(
+                "  - [{}] {} ({}) max_consecutive={}",
+                cluster.kind, cluster.label, cluster.occurrences, cluster.max_consecutive
+            );
         }
     }
 
@@ -4355,7 +4377,7 @@ fn cmd_session_review(path: &Path, next_context: bool, format: OutputFormat) -> 
             .map(|value| format!("{value:.2}%"))
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "session-review target:{} kind:{} matched:{} claude:{} codex:{} agent_doc:{} prompt:{} cached:{} cache_ratio:{} output:{} total:{}",
+            "session-review target:{} kind:{} matched:{} claude:{} codex:{} agent_doc:{} prompt:{} cached:{} cache_ratio:{} output:{} total:{} loops:{}",
             report.target,
             report.target_kind,
             report.sessions_matched,
@@ -4366,7 +4388,8 @@ fn cmd_session_review(path: &Path, next_context: bool, format: OutputFormat) -> 
             format_compact_count(report.cached_input_tokens),
             cache_ratio,
             format_compact_count(report.output_tokens),
-            format_compact_count(report.total_tokens)
+            format_compact_count(report.total_tokens),
+            report.loop_clusters.len()
         );
         for session in &report.sessions {
             println!(
@@ -4392,6 +4415,15 @@ fn cmd_session_review(path: &Path, next_context: bool, format: OutputFormat) -> 
                 failure.kind,
                 failure.occurrences,
                 truncate_for_compact(&failure.message, 100)
+            );
+        }
+        for cluster in &report.loop_clusters {
+            println!(
+                "loop {} count:{} streak:{} {}",
+                cluster.kind,
+                cluster.occurrences,
+                cluster.max_consecutive,
+                truncate_for_compact(&cluster.label, 100)
             );
         }
         for guardrail in &report.guardrails {
@@ -4424,6 +4456,7 @@ fn cmd_session_review(path: &Path, next_context: bool, format: OutputFormat) -> 
     println!("  runtime events:         {}", report.runtime_event_groups);
     println!("  restart churn:          {}", report.restart_churn_groups);
     println!("  closeout:               {}", report.closeout_groups);
+    println!("  loop clusters:          {}", report.loop_clusters.len());
     println!("  usage samples:          {}", report.usage_samples);
     println!("  prompt tokens:          {}", report.prompt_tokens);
     println!("  cached input tokens:    {}", report.cached_input_tokens);
@@ -4512,6 +4545,17 @@ fn cmd_session_review(path: &Path, next_context: bool, format: OutputFormat) -> 
             println!(
                 "  - [{}] {} ({})",
                 entry.kind, entry.detail, entry.occurrences
+            );
+        }
+    }
+
+    if !report.loop_clusters.is_empty() {
+        println!();
+        println!("Loop clusters:");
+        for cluster in &report.loop_clusters {
+            println!(
+                "  - [{}] {} ({}) max_consecutive={}",
+                cluster.kind, cluster.label, cluster.occurrences, cluster.max_consecutive
             );
         }
     }

@@ -8,6 +8,8 @@ use crate::runtime_churn::{RestartChurnState, RestartChurnSummary};
 const MAX_LARGEST_TURNS: usize = 5;
 const MAX_RUNTIME_EVENTS: usize = 8;
 const MAX_GUARDRAILS: usize = 8;
+const MAX_LOOP_CLUSTERS: usize = 8;
+const MAX_COMMANDS_PER_BUNDLE: usize = 6;
 const PROMPT_BUDGET_WARN_TOKENS: u64 = 100_000;
 const CACHED_RATIO_WARN_PERCENT: f64 = 90.0;
 const CACHED_RATIO_WARN_PROMPT_TOKENS: u64 = 50_000;
@@ -68,6 +70,14 @@ pub struct SessionCostGuardrail {
     pub guidance: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCostLoopCluster {
+    pub kind: String,
+    pub label: String,
+    pub occurrences: usize,
+    pub max_consecutive: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionCostGuardrailInput {
     pub largest_prompt_turn_tokens: u64,
@@ -102,6 +112,8 @@ pub struct SessionCostReport {
     pub max_restart_count: Option<usize>,
     pub largest_turns: Vec<SessionCostTurn>,
     pub runtime_events: Vec<SessionCostRuntimeEvent>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub loop_clusters: Vec<SessionCostLoopCluster>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub restart_churn: Vec<RestartChurnSummary>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -157,6 +169,37 @@ struct CostState {
     total_runtime_events: usize,
     max_restart_count: Option<usize>,
     restart_churn: RestartChurnState,
+    pending_commands: Vec<String>,
+    loop_signals: Vec<LoopSignal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LoopSignal {
+    kind: LoopClusterKind,
+    label: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LoopClusterKind {
+    PromptRepeat,
+    CommandBundle,
+    CloseoutChurn,
+}
+
+impl LoopClusterKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PromptRepeat => "prompt_repeat",
+            Self::CommandBundle => "command_bundle",
+            Self::CloseoutChurn => "closeout_churn",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TranscriptBlock {
+    Text { role: Option<String>, text: String },
+    ToolUse { name: String, input: Value },
 }
 
 pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostReport> {
@@ -211,6 +254,8 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
         .get("commit_already_current")
         .copied()
         .unwrap_or(0);
+    flush_pending_commands(&mut state);
+    let loop_clusters = collect_loop_clusters(&state.loop_signals);
 
     let mut largest_turns = state.usage_turns;
     largest_turns.sort_by(|left, right| {
@@ -279,6 +324,7 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
         max_restart_count: state.max_restart_count,
         largest_turns,
         runtime_events,
+        loop_clusters,
         restart_churn,
         guardrails,
         warnings: state.warnings,
@@ -454,8 +500,10 @@ fn ingest_claude_jsonl(input: &str, state: &mut CostState) -> Result<()> {
             }
         };
         let Some(message) = value.get("message") else {
+            collect_claude_loop_signals(&value, state);
             continue;
         };
+        collect_claude_loop_signals(&value, state);
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
@@ -520,6 +568,11 @@ fn ingest_codex_jsonl(input: &str, state: &mut CostState) -> Result<()> {
                 continue;
             }
         };
+        match value.get("type").and_then(Value::as_str) {
+            Some("response_item") => collect_codex_response_item_loop_signals(&value, index + 1, state),
+            Some("event_msg") => collect_codex_event_msg_loop_signals(&value, index + 1, state),
+            _ => {}
+        }
         if value.get("type").and_then(Value::as_str) != Some("event_msg") {
             continue;
         }
@@ -599,9 +652,13 @@ fn ingest_agent_doc_log(input: &str, state: &mut CostState) {
             continue;
         };
         let normalized = normalize_runtime_event(event_name, detail);
+        let closeout_event = is_closeout_runtime_event(event_name, &normalized);
         if should_count_runtime_event(event_name, detail, &normalized, state) {
-            *state.runtime_events.entry(normalized).or_default() += 1;
+            *state.runtime_events.entry(normalized.clone()).or_default() += 1;
             state.total_runtime_events += 1;
+            if closeout_event {
+                push_closeout_signal(&normalized, state);
+            }
         }
         state.restart_churn.observe(event_name, detail);
         if let Some(restart_count) =
@@ -614,6 +671,626 @@ fn ingest_agent_doc_log(input: &str, state: &mut CostState) {
             );
         }
     }
+}
+
+fn collect_claude_loop_signals(value: &Value, state: &mut CostState) {
+    let mut blocks = Vec::new();
+    collect_transcript_blocks(value, &mut blocks);
+    if blocks.is_empty() && is_ignorable_claude_record(value) {
+        return;
+    }
+    for block in blocks {
+        match block {
+            TranscriptBlock::Text { role, text } => {
+                let user_bias = role
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("user"));
+                collect_text_loop_signals(&text, user_bias, state);
+            }
+            TranscriptBlock::ToolUse { name, input } => {
+                collect_tool_use_loop_signals(&name, &input, state);
+            }
+        }
+    }
+}
+
+fn collect_codex_response_item_loop_signals(
+    value: &Value,
+    line_number: usize,
+    state: &mut CostState,
+) {
+    let Some(payload) = value.get("payload") else {
+        return;
+    };
+    match payload.get("type").and_then(Value::as_str) {
+        Some("message") => {
+            let Some(content) = payload.get("content").and_then(Value::as_array) else {
+                return;
+            };
+            for item in content {
+                let Some(text) = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("content").and_then(Value::as_str))
+                else {
+                    continue;
+                };
+                collect_text_loop_signals(text, false, state);
+            }
+        }
+        Some("function_call") => {
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("function_call");
+            let Some(arguments) = payload.get("arguments").and_then(Value::as_str) else {
+                return;
+            };
+            let input = serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| {
+                state.warnings.push(format!(
+                    "codex function_call arguments on line {} were not valid JSON; loop extraction may be incomplete",
+                    line_number
+                ));
+                Value::String(arguments.to_string())
+            });
+            collect_tool_use_loop_signals(name, &input, state);
+        }
+        _ => {}
+    }
+}
+
+fn collect_codex_event_msg_loop_signals(value: &Value, _line_number: usize, state: &mut CostState) {
+    let Some(payload) = value.get("payload") else {
+        return;
+    };
+    match payload.get("type").and_then(Value::as_str) {
+        Some("user_message") => {
+            if let Some(message) = payload.get("message").and_then(Value::as_str) {
+                collect_text_loop_signals(message, true, state);
+            }
+        }
+        Some("agent_message") => {
+            if let Some(message) = payload.get("message").and_then(Value::as_str) {
+                collect_text_loop_signals(message, false, state);
+            }
+        }
+        Some("exec_command_end") => {
+            if let Some(command) = extract_codex_exec_command(payload) {
+                push_command(command, state);
+            }
+            if let Some(output) = payload
+                .get("aggregated_output")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("stdout").and_then(Value::as_str))
+            {
+                collect_text_loop_signals(output, false, state);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_tool_use_loop_signals(name: &str, input: &Value, state: &mut CostState) {
+    if let Some(command) = extract_tool_command(name, input) {
+        push_command(command, state);
+    }
+    if let Some(text) = extract_tool_text(input) {
+        collect_text_loop_signals(&text, false, state);
+    }
+}
+
+fn collect_text_loop_signals(text: &str, user_bias: bool, state: &mut CostState) {
+    for raw_line in text.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || looks_like_instruction_ballast(trimmed) {
+            continue;
+        }
+        let prompt_candidate = trimmed
+            .strip_prefix("❯ ")
+            .or_else(|| trimmed.strip_prefix("> "))
+            .unwrap_or(trimmed)
+            .trim();
+        if looks_like_prompt_target(prompt_candidate, user_bias || prompt_candidate != trimmed) {
+            push_prompt_signal(prompt_candidate, state);
+            continue;
+        }
+        for (kind, detail) in detect_closeout(trimmed) {
+            push_closeout_signal(&format!("{kind}: {detail}"), state);
+        }
+    }
+}
+
+fn push_prompt_signal(text: &str, state: &mut CostState) {
+    flush_pending_commands(state);
+    push_loop_signal(LoopClusterKind::PromptRepeat, text, state);
+}
+
+fn push_closeout_signal(text: &str, state: &mut CostState) {
+    flush_pending_commands(state);
+    push_loop_signal(LoopClusterKind::CloseoutChurn, text, state);
+}
+
+fn push_command(command: String, state: &mut CostState) {
+    let normalized = normalize_whitespace(&command);
+    if normalized.is_empty() {
+        return;
+    }
+    if state.pending_commands.last().is_some_and(|existing| existing == &normalized) {
+        return;
+    }
+    state.pending_commands.push(normalized);
+}
+
+fn flush_pending_commands(state: &mut CostState) {
+    if state.pending_commands.is_empty() {
+        return;
+    }
+    let label = truncate_detail(
+        &state
+            .pending_commands
+            .iter()
+            .take(MAX_COMMANDS_PER_BUNDLE)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" -> "),
+        220,
+    );
+    state.pending_commands.clear();
+    push_loop_signal(LoopClusterKind::CommandBundle, &label, state);
+}
+
+fn push_loop_signal(kind: LoopClusterKind, label: &str, state: &mut CostState) {
+    let normalized = truncate_detail(&normalize_whitespace(label), 220);
+    if normalized.is_empty() {
+        return;
+    }
+    state.loop_signals.push(LoopSignal {
+        kind,
+        label: normalized,
+    });
+}
+
+fn collect_loop_clusters(signals: &[LoopSignal]) -> Vec<SessionCostLoopCluster> {
+    let mut summary = BTreeMap::<(LoopClusterKind, String), (usize, usize)>::new();
+    let mut previous = None::<(LoopClusterKind, String)>;
+    let mut streak = 0_usize;
+
+    for signal in signals {
+        let key = (signal.kind, signal.label.clone());
+        let entry = summary.entry(key.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        if previous.as_ref() == Some(&key) {
+            streak += 1;
+        } else {
+            previous = Some(key.clone());
+            streak = 1;
+        }
+        entry.1 = entry.1.max(streak);
+    }
+
+    let mut clusters = summary
+        .into_iter()
+        .filter_map(|((kind, label), (occurrences, max_consecutive))| {
+            (occurrences >= 2).then_some(SessionCostLoopCluster {
+                kind: kind.as_str().to_string(),
+                label,
+                occurrences,
+                max_consecutive,
+            })
+        })
+        .collect::<Vec<_>>();
+    clusters.sort_by(|left, right| {
+        right
+            .occurrences
+            .cmp(&left.occurrences)
+            .then(right.max_consecutive.cmp(&left.max_consecutive))
+            .then(left.kind.cmp(&right.kind))
+            .then(left.label.cmp(&right.label))
+    });
+    clusters.truncate(MAX_LOOP_CLUSTERS);
+    clusters
+}
+
+fn is_ignorable_claude_record(value: &Value) -> bool {
+    value.get("attachment").is_some()
+        || value.get("toolUseResult").is_some()
+        || (value.get("message").is_none()
+            && value.get("content").is_none()
+            && value.get("text").is_none())
+}
+
+fn collect_transcript_blocks(value: &Value, out: &mut Vec<TranscriptBlock>) {
+    if let Some(message) = value.get("message") {
+        collect_message_blocks(message, out);
+        return;
+    }
+    collect_message_blocks(value, out);
+}
+
+fn collect_message_blocks(value: &Value, out: &mut Vec<TranscriptBlock>) {
+    let role = value
+        .get("role")
+        .and_then(Value::as_str)
+        .map(|value| value.to_string());
+    if let Some(content) = value.get("content") {
+        match content {
+            Value::String(text) => out.push(TranscriptBlock::Text {
+                role,
+                text: text.to_string(),
+            }),
+            Value::Array(items) => {
+                for item in items {
+                    collect_content_block(role.clone(), item, out);
+                }
+            }
+            _ => {}
+        }
+    } else if let Some(text) = value.get("text").and_then(Value::as_str) {
+        out.push(TranscriptBlock::Text {
+            role,
+            text: text.to_string(),
+        });
+    }
+}
+
+fn collect_content_block(role: Option<String>, value: &Value, out: &mut Vec<TranscriptBlock>) {
+    match value.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            if let Some(text) = value.get("text").and_then(Value::as_str) {
+                out.push(TranscriptBlock::Text {
+                    role,
+                    text: text.to_string(),
+                });
+            }
+        }
+        Some("tool_use") => {
+            let name = value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool_use")
+                .to_string();
+            let input = value.get("input").cloned().unwrap_or(Value::Null);
+            out.push(TranscriptBlock::ToolUse { name, input });
+        }
+        Some("tool_result") => match value.get("content") {
+            Some(Value::String(text)) => out.push(TranscriptBlock::Text {
+                role,
+                text: text.to_string(),
+            }),
+            Some(Value::Array(items)) => {
+                for item in items {
+                    collect_content_block(role.clone(), item, out);
+                }
+            }
+            _ => {}
+        },
+        _ => {
+            if let Some(text) = value.get("text").and_then(Value::as_str) {
+                out.push(TranscriptBlock::Text {
+                    role,
+                    text: text.to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn extract_tool_command(name: &str, input: &Value) -> Option<String> {
+    if !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "bash" | "exec_command" | "shell" | "terminal" | "sh"
+    ) {
+        return None;
+    }
+
+    match input {
+        Value::Object(map) => {
+            for key in ["command", "cmd", "shell_command"] {
+                if let Some(raw) = map.get(key).and_then(Value::as_str) {
+                    let normalized = normalize_whitespace(raw);
+                    if looks_like_command(&normalized) {
+                        return Some(normalized);
+                    }
+                }
+            }
+            None
+        }
+        Value::String(raw) => {
+            let normalized = normalize_whitespace(raw);
+            looks_like_command(&normalized).then_some(normalized)
+        }
+        _ => None,
+    }
+}
+
+fn extract_tool_text(input: &Value) -> Option<String> {
+    match input {
+        Value::Object(map) => {
+            for key in ["text", "output", "stderr", "stdout", "content", "message"] {
+                if let Some(raw) = map.get(key).and_then(Value::as_str) {
+                    return Some(raw.to_string());
+                }
+            }
+            None
+        }
+        Value::String(raw) => Some(raw.to_string()),
+        _ => None,
+    }
+}
+
+fn extract_codex_exec_command(payload: &Value) -> Option<String> {
+    if let Some(parsed) = payload.get("parsed_cmd").and_then(Value::as_array) {
+        for item in parsed {
+            if let Some(command) = item.get("cmd").and_then(Value::as_str) {
+                let normalized = normalize_whitespace(command);
+                if looks_like_command(&normalized) {
+                    return Some(normalized);
+                }
+            }
+        }
+    }
+
+    if let Some(command) = payload.get("command").and_then(Value::as_array)
+        && let Some(last) = command.last().and_then(Value::as_str)
+    {
+        let normalized = normalize_whitespace(last);
+        if looks_like_command(&normalized) {
+            return Some(normalized);
+        }
+    }
+    None
+}
+
+fn looks_like_prompt_target(text: &str, user_bias: bool) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty()
+        || looks_like_markdown_heading(trimmed)
+        || looks_like_slash_command_example(trimmed)
+        || trimmed == "#"
+        || trimmed.starts_with("#!")
+        || trimmed.starts_with("#[")
+        || trimmed.starts_with("/**")
+        || trimmed.starts_with("*/")
+        || trimmed.starts_with("//")
+        || trimmed.starts_with("###")
+        || trimmed.starts_with("<!--")
+        || trimmed.starts_with("- [")
+        || trimmed == "###"
+    {
+        return false;
+    }
+
+    if trimmed.starts_with("do ")
+        || trimmed.starts_with('#')
+        || looks_like_slash_prompt_target(trimmed)
+        || trimmed.ends_with('?')
+    {
+        return true;
+    }
+
+    if user_bias
+        && (trimmed.contains("commit + push")
+            || trimmed.contains("run tests")
+            || trimmed.contains("build + install")
+            || trimmed.contains("#spec-test"))
+    {
+        return true;
+    }
+
+    false
+}
+
+fn looks_like_instruction_ballast(text: &str) -> bool {
+    let trimmed = strip_common_prefixes(text.trim());
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    looks_like_markdown_heading(trimmed)
+        || looks_like_slash_command_example(trimmed)
+        || trimmed.starts_with("<!-- tsift:")
+        || trimmed.starts_with("<!-- /tsift:")
+        || looks_like_instruction_label(trimmed)
+}
+
+fn looks_like_markdown_heading(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let heading_level = trimmed.chars().take_while(|ch| *ch == '#').count();
+    heading_level > 0
+        && heading_level <= 6
+        && trimmed
+            .chars()
+            .nth(heading_level)
+            .is_some_and(|ch| ch.is_whitespace())
+}
+
+fn looks_like_slash_command_example(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with('/')
+        && trimmed.contains('<')
+        && trimmed.contains('>')
+        && !trimmed.contains('`')
+}
+
+fn looks_like_slash_prompt_target(text: &str) -> bool {
+    let Some(first_token) = text.split_whitespace().next() else {
+        return false;
+    };
+    first_token.starts_with('/') && !first_token[1..].contains('/')
+}
+
+fn looks_like_instruction_label(text: &str) -> bool {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("**") {
+        return false;
+    }
+    let Some(label_end) = trimmed[2..].find("**") else {
+        return false;
+    };
+    let label = &trimmed[..label_end + 4];
+    if label.len() <= 4 {
+        return false;
+    }
+    let remainder = trimmed[label_end + 4..]
+        .trim_start_matches([' ', ':', '-', '—'])
+        .trim_start();
+    if remainder.is_empty() {
+        return false;
+    }
+    let lower = remainder.to_ascii_lowercase();
+    matches!(
+        lower.split_whitespace().next(),
+        Some("run")
+            | Some("use")
+            | Some("treat")
+            | Some("respond")
+            | Some("print")
+            | Some("prefer")
+            | Some("preserve")
+            | Some("show")
+            | Some("complete")
+            | Some("append")
+            | Some("when")
+            | Some("if")
+    )
+}
+
+fn strip_common_prefixes(text: &str) -> &str {
+    text.strip_prefix("❯ ")
+        .or_else(|| text.strip_prefix("- "))
+        .or_else(|| text.strip_prefix("* "))
+        .or_else(|| text.strip_prefix("> "))
+        .unwrap_or(text)
+        .trim()
+}
+
+fn looks_like_command(text: &str) -> bool {
+    if text.is_empty()
+        || text.contains('\n')
+        || text.contains("://")
+        || text.starts_with('/')
+        || text.starts_with("###")
+    {
+        return false;
+    }
+
+    let head = text.split_whitespace().next().unwrap_or_default();
+    matches!(
+        head,
+        "agent-doc"
+            | "cargo"
+            | "git"
+            | "make"
+            | "pytest"
+            | "python"
+            | "uv"
+            | "tsift"
+            | "npm"
+            | "pnpm"
+            | "yarn"
+            | "bash"
+            | "zsh"
+            | "rg"
+            | "grep"
+            | "./scripts/run_benchmark.sh"
+    ) || head.starts_with("./")
+}
+
+fn detect_closeout(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let normalized = normalize_whitespace(strip_common_prefixes(text));
+    let lower = normalized.to_ascii_lowercase();
+
+    if normalized.starts_with("document_cycle ") {
+        let phase = extract_field(&normalized, "phase");
+        let event = extract_field(&normalized, "event");
+        if phase == Some("committed")
+            && let Some(event) = event
+        {
+            out.push((
+                "commit".to_string(),
+                format!("document_cycle phase=committed event={event}"),
+            ));
+        }
+        return dedupe_pairs(out);
+    }
+
+    if lower.contains("verification passed") || lower.starts_with("verification in ") {
+        out.push((
+            "verification".to_string(),
+            truncate_detail(&normalized, 220),
+        ));
+    }
+    if lower.contains("cargo build")
+        || lower.contains("make check")
+        || lower.contains("cargo test")
+        || lower.contains("pytest")
+    {
+        out.push((
+            "verification".to_string(),
+            truncate_detail(&normalized, 220),
+        ));
+    }
+    if lower.contains("cargo install") || lower.contains("installed") {
+        out.push(("install".to_string(), truncate_detail(&normalized, 220)));
+    }
+    if lower.contains("committed and pushed") {
+        out.push(("push".to_string(), truncate_detail(&normalized, 220)));
+    } else if lower.contains("committed") {
+        out.push(("commit".to_string(), truncate_detail(&normalized, 220)));
+    }
+    if lower.contains("tsift --version") || lower.contains("tsift v0.") {
+        out.push(("version".to_string(), truncate_detail(&normalized, 220)));
+    }
+    if lower.contains("agent-doc finalize") || lower.contains("session-check") {
+        out.push(("closeout".to_string(), truncate_detail(&normalized, 220)));
+    }
+
+    dedupe_pairs(out)
+}
+
+fn is_closeout_runtime_event(event_name: &str, normalized: &str) -> bool {
+    event_name == "document_cycle"
+        || matches!(
+            normalized,
+            "preflight_started"
+                | "response_captured"
+                | "commit_staging"
+                | "commit_success"
+                | "commit_already_current"
+                | "snapshot_save"
+                | "write_origin"
+                | "ipc_write_attempt"
+                | "ipc_write_consumed"
+                | "out_of_band_write"
+        )
+}
+
+fn dedupe_pairs(items: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for item in items {
+        if seen.insert(item.clone()) {
+            deduped.push(item);
+        }
+    }
+    deduped
+}
+
+fn normalize_whitespace(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_detail(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated = String::new();
+    for ch in text.chars().take(max_chars.saturating_sub(1)) {
+        truncated.push(ch);
+    }
+    truncated.push('…');
+    truncated
 }
 
 fn normalize_runtime_event(event_name: &str, detail: &str) -> String {
@@ -782,6 +1459,14 @@ mod tests {
                 .iter()
                 .any(|guardrail| guardrail.kind == "noop_closeout")
         );
+        assert!(
+            report
+                .loop_clusters
+                .iter()
+                .any(|cluster| cluster.kind == "closeout_churn"
+                    && cluster.label == "commit_already_current"
+                    && cluster.occurrences == 3)
+        );
     }
 
     #[test]
@@ -824,6 +1509,63 @@ mod tests {
                 .guardrails
                 .iter()
                 .any(|guardrail| guardrail.kind == "noop_closeout")
+        );
+        assert!(
+            report
+                .loop_clusters
+                .iter()
+                .any(|cluster| cluster.kind == "closeout_churn"
+                    && cluster.label == "commit_already_current"
+                    && cluster.occurrences == 3)
+        );
+    }
+
+    #[test]
+    fn codex_jsonl_surfaces_prompt_and_command_loop_clusters() {
+        let input = concat!(
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#looprank]. spec-test-build-install-commit-push"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo build --release\"}"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Committed and pushed in `src/tsift` as `abc123`."}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#looprank]. spec-test-build-install-commit-push"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo build --release\"}"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Committed and pushed in `src/tsift` as `abc123`."}}"#,
+            "\n"
+        );
+
+        let report = compute(input, Some("codex-jsonl")).unwrap();
+
+        assert!(
+            report
+                .loop_clusters
+                .iter()
+                .any(|cluster| cluster.kind == "prompt_repeat"
+                    && cluster.label == "do [#looprank]. spec-test-build-install-commit-push"
+                    && cluster.occurrences == 2)
+        );
+        assert!(
+            report
+                .loop_clusters
+                .iter()
+                .any(|cluster| cluster.kind == "command_bundle"
+                    && cluster.label == "cargo test -> cargo build --release"
+                    && cluster.occurrences == 2)
+        );
+        assert!(
+            report
+                .loop_clusters
+                .iter()
+                .any(|cluster| cluster.kind == "closeout_churn"
+                    && cluster.label.contains("Committed and pushed in `src/tsift`")
+                    && cluster.occurrences == 2)
         );
     }
 
