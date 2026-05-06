@@ -8,6 +8,14 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.34
+
+- `tsift session-review` now includes a bounded `next_context` payload in its JSON report and supports `--next-context` to emit only the resumable handoff pack for a document or repo target.
+- The new next-context pack carries only active prompt targets, the latest verification closeout state, touched files/symbols, unresolved failure hotspots, and the next digest commands to use instead of replaying raw session/transcript/log context.
+- Regression coverage now locks the new next-context surface in direct/unit tests, CLI parsing tests, and compiled CLI integration tests for both the full JSON review and the dedicated `--next-context` output.
+
+## 0.1.33
+
 - Added `tsift session-review`, a cross-harness aggregate review for a document or repo path. It auto-discovers related Claude JSONL, Codex JSONL, and `agent-doc` runtime logs, then emits one bounded combined digest + cost report instead of requiring manual per-log review.
 - `session-review` reuses the existing `session-digest` and `session-cost` parsers, aggregates their bounded signals into one report, and matches document sessions by cwd/path plus `agent_doc_session` log aliases when available.
 - File-target `session-review` matching now fails closed on shared-workspace cwd hits: Claude/Codex transcripts must also mention the target document path or `agent_doc_session` before they count as a matched session, while directory targets still use cwd matching.
@@ -24,9 +32,6 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 - Added `tsift session-cost`, a bounded token/runtime-cost digest for Claude JSONL, Codex JSONL, and `agent-doc` runtime logs. It reports prompt totals, cached-input ratios, output totals, largest turn outliers, and restart-churn counters without replaying the raw session.
 - `session-cost` normalizes Claude cache-read/cache-create usage and Codex cumulative `token_count` events into one report, dedupes repeated Claude assistant message ids, and skips duplicate Codex cumulative snapshots so token totals stay stable.
 - Regression coverage now locks the direct helper logic, CLI parsing, and compiled CLI stdin path for the new command.
-
-## 0.1.33
-
 - `tsift search` human-readable output now collapses repeated high-hit file matches into grouped file rows with hit counts before representative snippets, so broad exact/literal lookups stay usable without depending on RTK-only truncation.
 - `tsift explain` now applies the same file-level grouping idea to dense caller/callee sets in its default human output, while leaving JSON and tabular outputs unchanged.
 - Regression coverage now locks the grouped search/explain rendering in both direct/unit tests and compiled CLI integration tests.

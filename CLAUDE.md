@@ -25,7 +25,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift log-digest` | Bounded verbose-log digest from stdin or `--input`. Collapses repeated lines, groups warning/error signals, extracts file anchors and stack blocks, and adds read-only summary snippets when current cache rows exist. |
 | `tsift session-digest` | Bounded session transcript/log digest for markdown session docs, Claude JSONL, Codex JSONL, and agent-doc runtime logs. Extracts prompt targets, shell commands, touched files/symbols, failures, raw runtime events, derived restart-churn families, and closeout evidence without replaying the transcript. |
 | `tsift session-cost` | Bounded token/runtime-cost digest for Claude JSONL, Codex JSONL, and `agent-doc` runtime logs. Reports prompt/cached/output totals, largest cost outliers, raw runtime events, and derived restart-churn families without replaying the full transcript. |
-| `tsift session-review` | Cross-harness aggregate review for a document or repo path. Auto-discovers related Claude JSONL, Codex JSONL, and `agent-doc` runtime logs, then emits one bounded combined digest + cost report. File targets fail closed on cwd-only transcript matches and require a document path/session signal. |
+| `tsift session-review` | Cross-harness aggregate review for a document or repo path. Auto-discovers related Claude JSONL, Codex JSONL, and `agent-doc` runtime logs, then emits one bounded combined digest + cost report. `--next-context` emits only the resumable prompt/verification/failure/digest-command pack. File targets fail closed on cwd-only transcript matches and require a document path/session signal. |
 | `tsift lint` | Markdown lint: detect unannotated concepts (symbols, headings, bold terms) cross-referenced against graph entities. Auto-discovers live `index.db` files from the nearest `.tsift` root by default, and `--index` accepts a project root, `.tsift`, direct `index.db`, or `.tsift/indexes`. `--index <dir>` / `--entities-from <file>` / `--json` |
 | `tsift status` | Session health check: index freshness, instruction version, summary cache, recommended commands. Workspace roots treat scoped indexes under `.tsift/indexes/<scope>/index.db` as the authoritative status surface, even if a shared `.tsift/index.db` also exists; they surface configured-but-missing scopes instead of reporting false `fresh`, recommend `--workspace` rebuilds, and include summary-cache recovery diagnostics when status had to fall back to a snapshot. `--json` includes per-scope indexed status plus `missing_scopes`. |
 | `tsift locks` | Diagnose the OS-backed `index.lock` sidecar and `index.db-journal` state, and recommend the next recovery step. Stale sidecar metadata is reused automatically. `--scope <name>` / `--json` |
@@ -114,7 +114,7 @@ If copied skill instructions lag behind the installed binary, treat this file, `
 
 Private: `github.com/btakita/tsift`. Submodule at `src/tsift` in agent-loop.
 
-<!-- tsift:code-navigation v=0.1.33 -->
+<!-- tsift:code-navigation v=0.1.34 -->
 ## Code Navigation
 
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root.
@@ -126,7 +126,7 @@ Use the commands listed in its `use:` output:
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
 
 Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
-- `tsift session-digest <file>` / `tsift session-review <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
+- `tsift session-digest <file>` / `tsift session-review <path>` / `tsift session-review --next-context <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
 - `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
 - `tsift test-digest --path .` / `tsift log-digest --path .` for noisy test/build/install output, or let the rewrite/hooks wrap `cargo test`, `pytest`, and verbose cargo commands for you.
 

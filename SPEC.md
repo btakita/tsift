@@ -89,6 +89,7 @@ tsift log-digest --path . < build.log  # bounded verbose-log digest from stdin o
 tsift session-digest --path . < session.md  # session transcript digest: prompt targets, commands, touched files/symbols, failures, closeout
 tsift session-cost < session.jsonl  # token/runtime cost digest: prompt totals, cache ratios, large-turn outliers, restart churn
 tsift session-review tasks/software/tsift.md  # auto-discover related Claude/Codex/agent-doc logs and aggregate one review
+tsift session-review --next-context tasks/software/tsift.md  # emit only the resumable handoff pack
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
 tsift search --exact <query>    # literal text lookup via `rg -F`
 tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
@@ -723,7 +724,7 @@ Use the commands listed in its `use:` output:
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
 
 Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
-- `tsift session-digest <file>` / `tsift session-review <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
+- `tsift session-digest <file>` / `tsift session-review <path>` / `tsift session-review --next-context <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
 - `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
 - `tsift test-digest --path .` / `tsift log-digest --path .` for noisy test/build/install output, or let the rewrite/hooks wrap `cargo test`, `pytest`, and verbose cargo commands for you.
 
@@ -1077,6 +1078,7 @@ Behavior:
 
 ```bash
 tsift session-review tasks/software/tsift.md
+tsift session-review --next-context tasks/software/tsift.md
 tsift session-review src/tsift --json
 ```
 
@@ -1088,6 +1090,7 @@ Behavior:
 4. For directory targets, match candidate logs by cwd. For document targets, require a document-specific signal (`agent_doc_session` or a document path alias) before counting a Claude/Codex transcript; when cwd also matches, report it as supporting evidence instead of letting a shared workspace cwd count by itself. Reuse the existing `session-digest` and `session-cost` parsers to aggregate prompt targets, commands, failures, closeout evidence, token totals, and restart churn into one bounded report.
 5. Session-review inherits session-digest's instruction-ballast filtering so copied harness docs do not dominate prompt/failure hotspots.
 6. Session-review also carries forward aggregate session-cost guardrails so document-level reviews warn when token spend is mostly cached resend, restarts are looping, or closeouts are mostly no-ops. When the source is an `agent-doc` runtime log, normalize `document_cycle` closeout details to `phase + event` and count them once per cycle so the review reports distinct closeout cycles instead of raw repeated retries.
+7. `--next-context` emits only the bounded resumable handoff pack: active prompt targets, the last verification closeout state, touched files/symbols, unresolved failures, and the next digest commands to run instead of replaying raw session/log history.
 
 `session-review` is intentionally bounded. It does not replay full conversations; it gives one cross-harness review surface so document-level session analysis stops depending on ad hoc file hunting and manual aggregation.
 

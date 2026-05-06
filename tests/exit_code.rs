@@ -3253,9 +3253,9 @@ fn session_review_aggregates_cross_harness_logs() {
     fs::write(
         claude_dir.join("claude.jsonl"),
         concat!(
-            r#"{"cwd":"/tmp/replace-me","message":{"role":"user","content":"agent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+            r#"{"cwd":"/tmp/replace-me","message":{"role":"user","content":"do [#ctxpack]. spec-test-build-install-commit-push\nagent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
             "\n",
-            r#"{"message":{"role":"assistant","id":"msg-1","usage":{"input_tokens":400,"cache_creation_input_tokens":40,"cache_read_input_tokens":360,"output_tokens":25},"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            r#"{"message":{"role":"assistant","id":"msg-1","usage":{"input_tokens":400,"cache_creation_input_tokens":40,"cache_read_input_tokens":360,"output_tokens":25},"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}},{"type":"text","text":"Verification in `src/tsift`: `cargo test`\nError: Symbol `run_sync` not found in src/lib.rs:7:9"}]}}"#,
             "\n"
         )
         .replace("/tmp/replace-me", &root.path().display().to_string()),
@@ -3280,7 +3280,7 @@ fn session_review_aggregates_cross_harness_logs() {
         concat!(
             r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"user_message","message":"agent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#ctxpack]. spec-test-build-install-commit-push\nagent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
             "\n",
             r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo build --release\"}"}}"#,
             "\n",
@@ -3338,6 +3338,49 @@ fn session_review_aggregates_cross_harness_logs() {
             .unwrap()
             .iter()
             .any(|command| command["command"] == "cargo build --release")
+    );
+    assert_eq!(
+        json["next_context"]["last_verification"]["status"],
+        "passed"
+    );
+    assert!(
+        json["next_context"]["active_prompt_targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|prompt| prompt == "do [#ctxpack]. spec-test-build-install-commit-push")
+    );
+    assert!(
+        json["next_context"]["unresolved_failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|failure| failure["kind"] == "missing" || failure["kind"] == "error")
+    );
+
+    let next_context_output = tsift_bin()
+        .args([
+            "session-review",
+            "--next-context",
+            "--json",
+            target.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        next_context_output.status.success(),
+        "session-review --next-context should succeed"
+    );
+    let next_context_json: serde_json::Value =
+        serde_json::from_slice(&next_context_output.stdout).unwrap();
+    assert_eq!(
+        next_context_json["target"],
+        target.strip_prefix(root.path()).unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        next_context_json["next_digest_commands"][0],
+        "tsift session-review --next-context tasks/software/tsift.md"
     );
 }
 

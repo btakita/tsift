@@ -449,6 +449,9 @@ enum Commands {
         /// Target document or repo path to review (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Emit only the bounded resumable handoff pack instead of the full review
+        #[arg(long)]
+        next_context: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -906,8 +909,13 @@ fn main() -> Result<()> {
                 schema,
             },
         ),
-        Some(Commands::SessionReview { path, json }) => cmd_session_review(
+        Some(Commands::SessionReview {
+            path,
+            next_context,
+            json,
+        }) => cmd_session_review(
             &path,
+            next_context,
             OutputFormat {
                 json_output: json || terse || schema,
                 compact,
@@ -4247,8 +4255,92 @@ fn cmd_session_cost(
     Ok(())
 }
 
-fn cmd_session_review(path: &Path, format: OutputFormat) -> Result<()> {
+fn cmd_session_review(path: &Path, next_context: bool, format: OutputFormat) -> Result<()> {
     let report = session_review::compute(path)?;
+    if next_context {
+        if format.json_output {
+            println!(
+                "{}",
+                to_json_schema(
+                    &report.next_context,
+                    format.pretty,
+                    format.terse,
+                    format.schema
+                )?
+            );
+            return Ok(());
+        }
+
+        println!("Next context");
+        println!("  target:                 {}", report.next_context.target);
+        println!(
+            "  prompt targets:         {}",
+            report.next_context.active_prompt_targets.len()
+        );
+        println!(
+            "  touched files:          {}",
+            report.next_context.touched_files.len()
+        );
+        println!(
+            "  touched symbols:        {}",
+            report.next_context.touched_symbols.len()
+        );
+        println!(
+            "  unresolved failures:    {}",
+            report.next_context.unresolved_failures.len()
+        );
+        println!(
+            "  last verification:      {}",
+            report.next_context.last_verification.status
+        );
+        println!(
+            "  verification detail:    {}",
+            report.next_context.last_verification.detail
+        );
+
+        if !report.next_context.active_prompt_targets.is_empty() {
+            println!();
+            println!("Active prompt targets:");
+            for prompt in &report.next_context.active_prompt_targets {
+                println!("  - {}", prompt);
+            }
+        }
+
+        if !report.next_context.touched_files.is_empty() {
+            println!();
+            println!("Touched files:");
+            for path in &report.next_context.touched_files {
+                println!("  - {}", path);
+            }
+        }
+
+        if !report.next_context.touched_symbols.is_empty() {
+            println!();
+            println!("Touched symbols:");
+            for symbol in &report.next_context.touched_symbols {
+                println!("  - {}", symbol);
+            }
+        }
+
+        if !report.next_context.unresolved_failures.is_empty() {
+            println!();
+            println!("Unresolved failures:");
+            for failure in &report.next_context.unresolved_failures {
+                println!(
+                    "  - [{}] {} ({})",
+                    failure.kind, failure.message, failure.occurrences
+                );
+            }
+        }
+
+        println!();
+        println!("Next digest commands:");
+        for command in &report.next_context.next_digest_commands {
+            println!("  - {}", command);
+        }
+        return Ok(());
+    }
+
     if format.json_output {
         println!(
             "{}",
@@ -9563,11 +9655,17 @@ tier = "private"
             "tsift",
             "session-review",
             "tasks/software/tsift.md",
+            "--next-context",
             "--json",
         ]);
         match cli.command {
-            Some(Commands::SessionReview { json, path }) => {
+            Some(Commands::SessionReview {
+                json,
+                next_context,
+                path,
+            }) => {
                 assert!(json);
+                assert!(next_context);
                 assert_eq!(path, PathBuf::from("tasks/software/tsift.md"));
             }
             _ => panic!("expected SessionReview command"),

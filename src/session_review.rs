@@ -98,6 +98,23 @@ pub struct SessionReviewLargestTurn {
     pub total_tokens: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionReviewVerificationState {
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionReviewNextContext {
+    pub target: String,
+    pub active_prompt_targets: Vec<String>,
+    pub last_verification: SessionReviewVerificationState,
+    pub touched_files: Vec<String>,
+    pub touched_symbols: Vec<String>,
+    pub unresolved_failures: Vec<SessionReviewFailure>,
+    pub next_digest_commands: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionReviewReport {
     pub root: String,
@@ -139,6 +156,7 @@ pub struct SessionReviewReport {
     pub closeout: Vec<SessionReviewCloseout>,
     pub largest_turns: Vec<SessionReviewLargestTurn>,
     pub sessions: Vec<SessionReviewSession>,
+    pub next_context: SessionReviewNextContext,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
 }
@@ -198,6 +216,7 @@ impl TargetKind {
 struct TargetContext {
     root: PathBuf,
     canonical_target: PathBuf,
+    relative_target: Option<String>,
     kind: TargetKind,
     agent_doc_session: Option<String>,
     aliases: BTreeSet<String>,
@@ -318,6 +337,7 @@ pub fn compute_with_options(
     let mut reasoning_output_tokens = 0_u64;
     let mut total_tokens = 0_u64;
     let mut largest_turn_total_tokens = 0_u64;
+    let mut last_verification = None::<SessionReviewVerificationState>;
 
     for pending in sessions {
         let digest = session_digest::compute(
@@ -339,6 +359,18 @@ pub fn compute_with_options(
             ReviewSource::ClaudeJsonl => claude_sessions += 1,
             ReviewSource::CodexJsonl => codex_sessions += 1,
             ReviewSource::AgentDocLog => agent_doc_logs += 1,
+        }
+
+        if last_verification.is_none()
+            && let Some(entry) = digest
+                .closeout
+                .iter()
+                .find(|entry| entry.kind == "verification")
+        {
+            last_verification = Some(SessionReviewVerificationState {
+                status: "passed".to_string(),
+                detail: entry.detail.clone(),
+            });
         }
 
         prompt_target_count += digest.prompt_target_count;
@@ -511,6 +543,62 @@ pub fn compute_with_options(
     warnings.sort();
     warnings.truncate(MAX_WARNINGS);
 
+    let prompt_targets =
+        collect_strings(prompt_targets, MAX_AGGREGATE_ITEMS, |text, occurrences| {
+            SessionReviewPromptTarget { text, occurrences }
+        });
+    let commands = collect_strings(commands, MAX_AGGREGATE_ITEMS, |command, occurrences| {
+        SessionReviewCommand {
+            command,
+            occurrences,
+        }
+    });
+    let touched_files = collect_strings(touched_files, MAX_AGGREGATE_ITEMS, |path, occurrences| {
+        SessionReviewFileRef { path, occurrences }
+    });
+    let touched_symbols = collect_strings(
+        touched_symbols,
+        MAX_AGGREGATE_ITEMS,
+        |symbol, occurrences| SessionReviewSymbolRef {
+            symbol,
+            occurrences,
+        },
+    );
+    let failures = collect_pairs(
+        failures,
+        MAX_AGGREGATE_ITEMS,
+        |(kind, message), occurrences| SessionReviewFailure {
+            kind,
+            message,
+            occurrences,
+        },
+    );
+    let runtime_events =
+        collect_strings(runtime_events, MAX_AGGREGATE_ITEMS, |event, occurrences| {
+            SessionReviewRuntimeEvent { event, occurrences }
+        });
+    let restart_churn = collect_restart_churn(restart_churn, MAX_AGGREGATE_ITEMS);
+    let closeout = collect_pairs(
+        closeout,
+        MAX_AGGREGATE_ITEMS,
+        |(kind, detail), occurrences| SessionReviewCloseout {
+            kind,
+            detail,
+            occurrences,
+        },
+    );
+    let next_context = build_next_context(
+        &context,
+        &prompt_targets,
+        &touched_files,
+        &touched_symbols,
+        &failures,
+        last_verification.unwrap_or_else(|| SessionReviewVerificationState {
+            status: "missing".to_string(),
+            detail: "no verification closeout found in matched sessions".to_string(),
+        }),
+    );
+
     Ok(SessionReviewReport {
         root: context.root.display().to_string(),
         target: context.canonical_target.display().to_string(),
@@ -538,54 +626,17 @@ pub fn compute_with_options(
         cached_input_ratio,
         largest_turn_total_tokens,
         guardrails,
-        prompt_targets: collect_strings(
-            prompt_targets,
-            MAX_AGGREGATE_ITEMS,
-            |text, occurrences| SessionReviewPromptTarget { text, occurrences },
-        ),
-        commands: collect_strings(commands, MAX_AGGREGATE_ITEMS, |command, occurrences| {
-            SessionReviewCommand {
-                command,
-                occurrences,
-            }
-        }),
-        touched_files: collect_strings(touched_files, MAX_AGGREGATE_ITEMS, |path, occurrences| {
-            SessionReviewFileRef { path, occurrences }
-        }),
-        touched_symbols: collect_strings(
-            touched_symbols,
-            MAX_AGGREGATE_ITEMS,
-            |symbol, occurrences| SessionReviewSymbolRef {
-                symbol,
-                occurrences,
-            },
-        ),
-        failures: collect_pairs(
-            failures,
-            MAX_AGGREGATE_ITEMS,
-            |(kind, message), occurrences| SessionReviewFailure {
-                kind,
-                message,
-                occurrences,
-            },
-        ),
-        runtime_events: collect_strings(
-            runtime_events,
-            MAX_AGGREGATE_ITEMS,
-            |event, occurrences| SessionReviewRuntimeEvent { event, occurrences },
-        ),
-        restart_churn: collect_restart_churn(restart_churn, MAX_AGGREGATE_ITEMS),
-        closeout: collect_pairs(
-            closeout,
-            MAX_AGGREGATE_ITEMS,
-            |(kind, detail), occurrences| SessionReviewCloseout {
-                kind,
-                detail,
-                occurrences,
-            },
-        ),
+        prompt_targets,
+        commands,
+        touched_files,
+        touched_symbols,
+        failures,
+        runtime_events,
+        restart_churn,
+        closeout,
         largest_turns,
         sessions: session_rows,
+        next_context,
         warnings,
     })
 }
@@ -630,10 +681,56 @@ fn build_target_context(target: &Path) -> Result<TargetContext> {
     Ok(TargetContext {
         root,
         canonical_target,
+        relative_target,
         kind,
         agent_doc_session,
         aliases,
     })
+}
+
+fn build_next_context(
+    context: &TargetContext,
+    prompt_targets: &[SessionReviewPromptTarget],
+    touched_files: &[SessionReviewFileRef],
+    touched_symbols: &[SessionReviewSymbolRef],
+    failures: &[SessionReviewFailure],
+    last_verification: SessionReviewVerificationState,
+) -> SessionReviewNextContext {
+    let target = context
+        .relative_target
+        .clone()
+        .unwrap_or_else(|| context.canonical_target.display().to_string());
+    let session_target = match context.kind {
+        TargetKind::Directory => ".".to_string(),
+        TargetKind::File => target.clone(),
+    };
+
+    SessionReviewNextContext {
+        target,
+        active_prompt_targets: prompt_targets
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect(),
+        last_verification,
+        touched_files: touched_files
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect(),
+        touched_symbols: touched_symbols
+            .iter()
+            .map(|entry| entry.symbol.clone())
+            .collect(),
+        unresolved_failures: failures.to_vec(),
+        next_digest_commands: vec![
+            format!(
+                "tsift session-review --next-context {}",
+                shell_quote(&session_target)
+            ),
+            "tsift diff-digest .".to_string(),
+            "tsift test-digest --path . < test.log".to_string(),
+            "tsift log-digest --path . < build.log".to_string(),
+        ],
+    }
 }
 
 fn parse_agent_doc_session(path: &Path) -> Result<Option<String>> {
@@ -991,6 +1088,14 @@ fn collect_restart_churn(
     rows
 }
 
+fn shell_quote(text: &str) -> String {
+    if text.chars().any(char::is_whitespace) {
+        format!("{text:?}")
+    } else {
+        text.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1097,6 +1202,117 @@ mod tests {
                 .iter()
                 .any(|reason| reason == "agent_doc_session")
         }));
+        assert_eq!(
+            report.next_context.active_prompt_targets,
+            Vec::<String>::new()
+        );
+        assert_eq!(report.next_context.last_verification.status, "missing");
+        assert!(report.next_context.next_digest_commands.iter().any(
+            |command| command == "tsift session-review --next-context tasks/software/tsift.md"
+        ));
+    }
+
+    #[test]
+    fn session_review_next_context_tracks_prompts_verification_and_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let target = root.path().join("tasks/software/tsift.md");
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/lib.rs"), "fn run_sync() {}\n").unwrap();
+        fs::write(
+            &target,
+            "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n",
+        )
+        .unwrap();
+
+        let agent_doc_logs = root.path().join(".agent-doc/logs");
+        fs::create_dir_all(&agent_doc_logs).unwrap();
+        fs::write(
+            agent_doc_logs.join("tsift-v0.1.log"),
+            concat!(
+                "[1776712372] session_start file=tasks/software/tsift.md pane=%77 session=tsift-v0.1\n",
+                "[1776712373] cwd_resolved path=/tmp/replace-me source=project_root\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let claude_dir = home
+            .path()
+            .join(".claude/projects")
+            .join(claude_project_slug(root.path()));
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("claude.jsonl"),
+            concat!(
+                r#"{"cwd":"/tmp/replace-me","message":{"role":"user","content":"do [#ctxpack]. spec-test-build-install-commit-push\nagent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+                "\n",
+                r#"{"message":{"role":"assistant","id":"msg-1","usage":{"input_tokens":300,"cache_creation_input_tokens":30,"cache_read_input_tokens":250,"output_tokens":25},"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test --manifest-path Cargo.toml"}},{"type":"text","text":"Verification in `src/tsift`: `cargo test`\nError: Symbol `run_sync` not found in src/lib.rs:7:9"}]}}"#,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("rollout-1.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#ctxpack]. spec-test-build-install-commit-push\nagent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let report = compute_with_options(
+            &target,
+            &SessionReviewOptions {
+                claude_projects_dir: Some(home.path().join(".claude/projects")),
+                codex_sessions_dir: Some(home.path().join(".codex/sessions")),
+                agent_doc_logs_dir: Some(agent_doc_logs),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.next_context.active_prompt_targets,
+            vec!["do [#ctxpack]. spec-test-build-install-commit-push".to_string()]
+        );
+        assert_eq!(report.next_context.last_verification.status, "passed");
+        assert!(
+            report
+                .next_context
+                .last_verification
+                .detail
+                .contains("Verification in `src/tsift`")
+        );
+        assert!(
+            report
+                .next_context
+                .touched_files
+                .iter()
+                .any(|path| path == "Cargo.toml")
+        );
+        assert!(
+            report
+                .next_context
+                .touched_symbols
+                .iter()
+                .any(|symbol| symbol == "run_sync")
+        );
+        assert!(
+            report
+                .next_context
+                .unresolved_failures
+                .iter()
+                .any(|failure| failure.kind == "missing" || failure.kind == "error")
+        );
     }
 
     #[test]
