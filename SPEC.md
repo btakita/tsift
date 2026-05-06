@@ -674,7 +674,7 @@ Dynamic grammars use `tree_sitter::Language::from_path()`. The `Language` enum a
 
 ## Init (Project Setup)
 
-`tsift init` ensures the Code Navigation section is present in `AGENTS.md` for Codex-style harnesses and mirrors it into `CLAUDE.md` when that file exists, so local agent sessions prefer tsift over raw file reads.
+`tsift init` ensures the Code Navigation section is present in `AGENTS.md` for Codex-style harnesses and mirrors it into `CLAUDE.md` when that file exists, so local agent sessions prefer tsift navigation plus bounded digest surfaces over raw file reads, diffs, and verbose logs.
 
 ```bash
 tsift init                              # ensure AGENTS.md (and CLAUDE.md if present) in current directory
@@ -706,6 +706,7 @@ With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject
 6. With `--codex`: merges a `UserPromptSubmit` auto-reindex hook into `.codex/hooks.json` (creates the file and directory if needed, updates stale tsift commands in place, removes duplicate tsift hook entries, idempotent)
 7. When the resolved target has `.gitmodules`, the Codex hook automatically uses `tsift index --check --exit-code --workspace <root>` / `tsift index --workspace <root>` so one root hook covers initialized submodules. `--workspace` makes that root resolution explicit from inside a submodule.
 8. The injected Code Navigation section explicitly tells harnesses to switch to the owning repo or submodule root before running tsift/build/test commands, so submodule work does not inherit the wider superproject instruction surface by accident.
+9. The injected section also steers harnesses toward `session-digest`, `session-review`, `diff-digest`, `test-digest`, and `log-digest` instead of raw transcript replays, `git diff/show/log` patch dumps, or verbose build/test output reads.
 
 ### Injected Section
 
@@ -720,6 +721,11 @@ Use the commands listed in its `use:` output:
 - `tsift explain <symbol>` — callers, callees, community context
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
+
+Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
+- `tsift session-digest <file>` / `tsift session-review <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
+- `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
+- `tsift test-digest --path .` / `tsift log-digest --path .` for noisy test/build/install output, or let the rewrite/hooks wrap `cargo test`, `pytest`, and verbose cargo commands for you.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->

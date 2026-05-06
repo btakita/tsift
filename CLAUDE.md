@@ -29,7 +29,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift lint` | Markdown lint: detect unannotated concepts (symbols, headings, bold terms) cross-referenced against graph entities. Auto-discovers live `index.db` files from the nearest `.tsift` root by default, and `--index` accepts a project root, `.tsift`, direct `index.db`, or `.tsift/indexes`. `--index <dir>` / `--entities-from <file>` / `--json` |
 | `tsift status` | Session health check: index freshness, instruction version, summary cache, recommended commands. Workspace roots treat scoped indexes under `.tsift/indexes/<scope>/index.db` as the authoritative status surface, even if a shared `.tsift/index.db` also exists; they surface configured-but-missing scopes instead of reporting false `fresh`, recommend `--workspace` rebuilds, and include summary-cache recovery diagnostics when status had to fall back to a snapshot. `--json` includes per-scope indexed status plus `missing_scopes`. |
 | `tsift locks` | Diagnose the OS-backed `index.lock` sidecar and `index.db-journal` state, and recommend the next recovery step. Stale sidecar metadata is reused automatically. `--scope <name>` / `--json` |
-| `tsift init` | Project setup: ensure versioned Code Navigation section (`v=X.Y.Z`) in AGENTS.md and mirror it into CLAUDE.md when present. The injected section tells the harness to run from the owning repo/submodule root before tsift/build/test work. `--codex` injects or updates a repo-aware autoindex hook; `--workspace` resolves to the parent workspace root. Detects and refreshes stale/pre-versioned markers on re-run. |
+| `tsift init` | Project setup: ensure versioned Code Navigation section (`v=X.Y.Z`) in AGENTS.md and mirror it into CLAUDE.md when present. The injected section tells the harness to run from the owning repo/submodule root and prefer bounded digest surfaces (`session-digest`, `session-review`, `diff-digest`, `test-digest`, `log-digest`) over raw transcript, diff, and verbose-log reads. `--codex` injects or updates a repo-aware autoindex hook; `--workspace` resolves to the parent workspace root. Detects and refreshes stale/pre-versioned markers on re-run. |
 
 Global flags: `--compact` reduces human-readable output volume (abbreviated kind/match_type labels, shorter section headers like `syms`, `crs`, `ces`, `comm`). `--pretty` switches JSON output from compact (default) to indented format. `--terse` outputs JSON with abbreviated field names and inline schema (implies `--json`). `--schema` converts repeated object arrays to columnar `{"_c":[cols],"_r":[[vals],...]}` format (implies `--json`; combines with `--terse`). `--absolute` shows full filesystem paths instead of project-relative (relative is default for token savings). `--tabular` outputs repeated structures as TSV with header row (search, graph, communities, explain).
 
@@ -124,6 +124,11 @@ Use the commands listed in its `use:` output:
 - `tsift explain <symbol>` — callers, callees, community context
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
+
+Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
+- `tsift session-digest <file>` / `tsift session-review <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
+- `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
+- `tsift test-digest --path .` / `tsift log-digest --path .` for noisy test/build/install output, or let the rewrite/hooks wrap `cargo test`, `pytest`, and verbose cargo commands for you.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->

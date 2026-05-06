@@ -246,11 +246,11 @@ pub fn compute_with_options(
     let agent_doc_logs_dir = resolve_agent_doc_logs_dir(&context.root, options);
     if let Some(session_name) = &context.agent_doc_session {
         let session_log = agent_doc_logs_dir.join(format!("{session_name}.log"));
-        if session_log.is_file() {
-            if let Ok(text) = fs::read_to_string(&session_log) {
-                for alias in collect_agent_doc_aliases(&text, &context.root) {
-                    context.aliases.insert(alias);
-                }
+        if session_log.is_file()
+            && let Ok(text) = fs::read_to_string(&session_log)
+        {
+            for alias in collect_agent_doc_aliases(&text, &context.root) {
+                context.aliases.insert(alias);
             }
         }
     }

@@ -21,6 +21,11 @@ Use the commands listed in its `use:` output:
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
 
+Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
+- `tsift session-digest <file>` / `tsift session-review <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
+- `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
+- `tsift test-digest --path .` / `tsift log-digest --path .` for noisy test/build/install output, or let the rewrite/hooks wrap `cargo test`, `pytest`, and verbose cargo commands for you.
+
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->"#,
         version = TSIFT_VERSION
@@ -953,6 +958,10 @@ mod tests {
         let content = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
         let expected_marker = format!("<!-- tsift:code-navigation v={} -->", TSIFT_VERSION);
         assert!(content.contains(&expected_marker));
+        assert!(content.contains("tsift session-digest <file>"));
+        assert!(content.contains("tsift diff-digest [path]"));
+        assert!(content.contains("tsift test-digest --path ."));
+        assert!(content.contains("tsift log-digest --path ."));
     }
 
     #[test]
