@@ -855,11 +855,12 @@ fn cwd_matches_target(context: &TargetContext, cwd: Option<&Path>) -> bool {
 
 fn match_reasons(context: &TargetContext, text: &str, cwd: Option<&Path>) -> Vec<String> {
     let mut reasons = BTreeSet::new();
-    if cwd_matches_target(context, cwd) {
-        reasons.insert("cwd".to_string());
-    }
     match context.kind {
-        TargetKind::Directory => {}
+        TargetKind::Directory => {
+            if cwd_matches_target(context, cwd) {
+                reasons.insert("cwd".to_string());
+            }
+        }
         TargetKind::File => {
             for alias in &context.aliases {
                 if text.contains(alias) {
@@ -870,6 +871,12 @@ fn match_reasons(context: &TargetContext, text: &str, cwd: Option<&Path>) -> Vec
                 && text.contains(session_name)
             {
                 reasons.insert("agent_doc_session".to_string());
+            }
+            if reasons.is_empty() {
+                return Vec::new();
+            }
+            if cwd_matches_target(context, cwd) {
+                reasons.insert("cwd".to_string());
             }
         }
     }
@@ -1089,6 +1096,104 @@ mod tests {
                 .matched_by
                 .iter()
                 .any(|reason| reason == "agent_doc_session")
+        }));
+    }
+
+    #[test]
+    fn session_review_skips_cwd_only_harness_logs_for_doc_target() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let target = root.path().join("tasks/software/tsift.md");
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(
+            &target,
+            "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n",
+        )
+        .unwrap();
+
+        let agent_doc_logs = root.path().join(".agent-doc/logs");
+        fs::create_dir_all(&agent_doc_logs).unwrap();
+        fs::write(
+            agent_doc_logs.join("tsift-v0.1.log"),
+            concat!(
+                "[1776712372] session_start file=tasks/software/tsift.md pane=%77 session=tsift-v0.1\n",
+                "[1776712373] cwd_resolved path=/tmp/replace-me source=project_root\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let claude_dir = home
+            .path()
+            .join(".claude/projects")
+            .join(claude_project_slug(root.path()));
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("claude-target.jsonl"),
+            concat!(
+                r#"{"cwd":"/tmp/replace-me","message":{"role":"user","content":"agent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+        fs::write(
+            claude_dir.join("claude-cwd-only.jsonl"),
+            concat!(
+                r#"{"cwd":"/tmp/replace-me","message":{"role":"user","content":"help me inspect another task"}}"#,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("codex-target.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"agent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+        fs::write(
+            codex_dir.join("codex-cwd-only.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"open a different issue from this repo"}}"#,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let report = compute_with_options(
+            &target,
+            &SessionReviewOptions {
+                claude_projects_dir: Some(home.path().join(".claude/projects")),
+                codex_sessions_dir: Some(home.path().join(".codex/sessions")),
+                agent_doc_logs_dir: Some(agent_doc_logs),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.sessions_considered, 5);
+        assert_eq!(report.sessions_matched, 3);
+        assert_eq!(report.claude_sessions, 1);
+        assert_eq!(report.codex_sessions, 1);
+        assert_eq!(report.agent_doc_logs, 1);
+        assert!(report.sessions.iter().all(|session| {
+            session.source == "agent_doc_log"
+                || session
+                    .matched_by
+                    .iter()
+                    .any(|reason| reason == "agent_doc_session" || reason.starts_with("path:"))
         }));
     }
 }

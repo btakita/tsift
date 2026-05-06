@@ -3261,6 +3261,17 @@ fn session_review_aggregates_cross_harness_logs() {
         .replace("/tmp/replace-me", &root.path().display().to_string()),
     )
     .unwrap();
+    fs::write(
+        claude_dir.join("claude-cwd-only.jsonl"),
+        concat!(
+            r#"{"cwd":"/tmp/replace-me","message":{"role":"user","content":"inspect a different task in this repo"}}"#,
+            "\n",
+            r#"{"message":{"role":"assistant","id":"msg-2","usage":{"input_tokens":80,"cache_creation_input_tokens":0,"cache_read_input_tokens":60,"output_tokens":10},"content":[{"type":"text","text":"unrelated"}]}}"#,
+            "\n"
+        )
+        .replace("/tmp/replace-me", &root.path().display().to_string()),
+    )
+    .unwrap();
 
     let codex_dir = home.path().join(".codex/sessions/2026/05/05");
     fs::create_dir_all(&codex_dir).unwrap();
@@ -3279,6 +3290,19 @@ fn session_review_aggregates_cross_harness_logs() {
         .replace("/tmp/replace-me", &root.path().display().to_string()),
     )
     .unwrap();
+    fs::write(
+        codex_dir.join("rollout-cwd-only.jsonl"),
+        concat!(
+            r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"summarize another repo task"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"cached_input_tokens":150,"output_tokens":20,"reasoning_output_tokens":0,"total_tokens":220}}}}"#,
+            "\n"
+        )
+        .replace("/tmp/replace-me", &root.path().display().to_string()),
+    )
+    .unwrap();
 
     let output = tsift_bin()
         .args(["session-review", "--json", target.to_str().unwrap()])
@@ -3290,6 +3314,7 @@ fn session_review_aggregates_cross_harness_logs() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["target_kind"], "file");
     assert_eq!(json["sessions_matched"], 3);
+    assert_eq!(json["sessions_considered"], 5);
     assert_eq!(json["claude_sessions"], 1);
     assert_eq!(json["codex_sessions"], 1);
     assert_eq!(json["agent_doc_logs"], 1);
