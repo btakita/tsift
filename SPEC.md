@@ -83,6 +83,7 @@ tsift summarize --extract --diff  # re-extract only git-changed files within the
 tsift diff-digest [path]        # bounded worktree diff digest
 tsift diff-digest --cached .    # bounded staged-index diff digest
 tsift diff-digest --revision HEAD . # bounded single-revision/history digest
+tsift context-pack tasks/software/tsift.md --test-input test.log --log-input build.log
 tsift test-digest --path . < test.log  # bounded test-output digest from stdin or --input
 tsift metric-digest < runs.json  # repeated metric-run digest: deltas, improvements, news-ready table
 tsift log-digest --path . < build.log  # bounded verbose-log digest from stdin or --input
@@ -1112,6 +1113,26 @@ Behavior:
 8. `--next-context` emits only the bounded resumable handoff pack: active prompt targets, the last verification closeout state, touched files/symbols, unresolved failures, and the next digest commands to run instead of replaying raw session/log history.
 
 `session-review` is intentionally bounded. It does not replay full conversations; it gives one cross-harness review surface so document-level session analysis stops depending on ad hoc file hunting and manual aggregation.
+
+### `context-pack`
+
+`tsift context-pack <path>` turns the existing bounded session/diff/test/log surfaces into one resumable handoff payload for agent turns.
+
+Example:
+
+```bash
+tsift context-pack tasks/software/tsift.md --test-input test.log --log-input build.log --json
+```
+
+Behavior:
+
+1. Computes `session-review --next-context` for the target document or repo path.
+2. Computes the current worktree `diff-digest` for the resolved repo root.
+3. Optionally inlines `test-digest` when `--test-input <file>` is provided.
+4. Optionally inlines `log-digest` when `--log-input <file>` is provided.
+5. Emits the follow-up digest commands needed to refresh or expand the pack without replaying raw transcripts or verbose logs.
+
+`context-pack` is intentionally bounded by default: it emits preview-style lists plus counts rather than dumping the full underlying reports, and `--max-items` / `--max-bytes` further tighten the preview envelope for high-token-pressure turns.
 
 ## Hook Integration
 

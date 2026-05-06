@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- Added `tsift context-pack`, a single agent-facing handoff command that composes `session-review --next-context`, `diff-digest`, and optional `test-digest` / `log-digest` inputs into one bounded payload with resume commands.
+- `context-pack` is bounded by default and accepts `--max-items` / `--max-bytes` so callers can keep resumable context packs stable under token pressure without replaying raw transcripts, diffs, or verbose logs.
+- Regression coverage now locks the new command surface in CLI parsing, preview-builder unit tests, and a compiled end-to-end integration test that exercises the composed JSON payload.
+
 ## 0.1.37
 
 - `tsift rewrite` now supports `--run`, which executes the rewritten digest-first tsift command directly instead of only printing it for Claude hook integration.

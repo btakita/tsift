@@ -3385,6 +3385,101 @@ fn session_review_aggregates_cross_harness_logs() {
 }
 
 #[test]
+fn context_pack_json_composes_next_context_and_optional_digests() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("src")).unwrap();
+    fs::create_dir_all(root.path().join("tasks/software")).unwrap();
+    fs::create_dir_all(root.path().join(".agent-doc/logs")).unwrap();
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "pub fn alpha() {\n    beta();\n}\n\nfn beta() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("tasks/software/tsift.md"),
+        "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n❯ do [#ts1b]. spec-test-build-install-commit-push\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join(".agent-doc/logs/tsift-v0.1.log"),
+        format!(
+            concat!(
+                "[1776712372] session_start file=tasks/software/tsift.md pane=%77 session=tsift-v0.1\n",
+                "[1776712373] cwd_resolved path={} source=project_root\n",
+                "[1776712374] commit_completed file=tasks/software/tsift.md commit=abc123\n"
+            ),
+            root.path().display()
+        ),
+    )
+    .unwrap();
+    init_git_repo(root.path());
+
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "pub fn alpha() {\n    beta();\n    gamma();\n}\n\nfn beta() {}\nfn gamma() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("target-test.log"),
+        "running 2 tests\nthread 'suite::alpha_failure' panicked at src/lib.rs:3:5:\nassertion failed: left == right\nfailures:\n    suite::alpha_failure\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("target-build.log"),
+        "error: failed to compile fixture\nsrc/lib.rs:3:5: unresolved name gamma\nwarning: retrying build\nwarning: retrying build\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "context-pack",
+            "tasks/software/tsift.md",
+            "--json",
+            "--test-input",
+            "target-test.log",
+            "--runner",
+            "cargo",
+            "--log-input",
+            "target-build.log",
+            "--max-items",
+            "2",
+            "--max-bytes",
+            "96",
+        ])
+        .env("HOME", home.path())
+        .current_dir(root.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "context-pack should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        json["target"]
+            .as_str()
+            .unwrap()
+            .ends_with("tasks/software/tsift.md")
+    );
+    assert!(
+        json["next_context"]["target"]
+            .as_str()
+            .unwrap()
+            .ends_with("tasks/software/tsift.md")
+    );
+    assert!(
+        json["diff_digest"]["files_changed"].as_u64().unwrap() >= 1,
+        "expected at least one changed file in diff digest"
+    );
+    assert_eq!(json["test_digest"]["status"], "included");
+    assert_eq!(json["test_digest"]["report"]["runner"], "cargo");
+    assert_eq!(json["log_digest"]["status"], "included");
+    assert_eq!(
+        json["resume_commands"][0],
+        "tsift session-review --next-context tasks/software/tsift.md"
+    );
+}
+
+#[test]
 fn session_review_honors_historical_aliases_and_skips_noisy_records() {
     let root = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

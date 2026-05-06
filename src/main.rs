@@ -405,6 +405,30 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Compose session-review --next-context plus diff/test/log digests into one resumable handoff payload
+    ContextPack {
+        /// Target document or repo path to review (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Read captured test output from a file and inline its digest
+        #[arg(long)]
+        test_input: Option<PathBuf>,
+        /// Force the test parser (`cargo`, `pytest`, or `auto`) when --test-input is present
+        #[arg(long)]
+        runner: Option<String>,
+        /// Read captured build/install log output from a file and inline its digest
+        #[arg(long)]
+        log_input: Option<PathBuf>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Preview-mode item cap for token-budgeted responses
+        #[arg(long)]
+        max_items: Option<usize>,
+        /// Preview-mode per-field byte cap for token-budgeted responses
+        #[arg(long)]
+        max_bytes: Option<usize>,
+    },
     /// Summarize repeated metric runs into compact deltas and news-ready tables
     MetricDigest {
         /// Read metric-run JSON from a file instead of stdin
@@ -903,6 +927,28 @@ fn main() -> Result<()> {
                 terse,
                 schema,
             },
+        ),
+        Some(Commands::ContextPack {
+            path,
+            test_input,
+            runner,
+            log_input,
+            json,
+            max_items,
+            max_bytes,
+        }) => cmd_context_pack(
+            &path,
+            test_input.as_deref(),
+            runner.as_deref(),
+            log_input.as_deref(),
+            OutputFormat {
+                json_output: json || terse || schema,
+                compact,
+                pretty,
+                terse,
+                schema,
+            },
+            ResponseBudget::new(max_items, max_bytes),
         ),
         Some(Commands::MetricDigest {
             input,
@@ -3048,7 +3094,10 @@ fn build_explain_budget_report(
         .map(|entry| ExplainBudgetDefinitionPreview {
             handle: stable_handle(
                 "edef",
-                &format!("{}:{}:{}:{}", entry.kind, entry.name, entry.file, entry.line),
+                &format!(
+                    "{}:{}:{}:{}",
+                    entry.kind, entry.name, entry.file, entry.line
+                ),
             ),
             kind: entry.kind.clone(),
             name: truncate_for_budget(&entry.name, max_bytes),
@@ -3903,6 +3952,27 @@ fn cmd_log_digest(path: &Path, input_path: Option<&Path>, format: OutputFormat) 
     render_log_digest_from_input(path, &input, format)
 }
 
+fn cmd_context_pack(
+    path: &Path,
+    test_input: Option<&Path>,
+    runner: Option<&str>,
+    log_input: Option<&Path>,
+    format: OutputFormat,
+    budget: ResponseBudget,
+) -> Result<()> {
+    let report = build_context_pack_report(path, test_input, runner, log_input, budget)?;
+    if format.json_output {
+        println!(
+            "{}",
+            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+        );
+        return Ok(());
+    }
+
+    print_context_pack_human(&report, format.compact);
+    Ok(())
+}
+
 fn render_log_digest_from_input(path: &Path, input: &str, format: OutputFormat) -> Result<()> {
     let report = log_digest::compute(path, input)?;
     if format.json_output {
@@ -4618,11 +4688,7 @@ fn cmd_session_cost(
 }
 
 #[allow(dead_code)]
-fn cmd_session_review(
-    path: &Path,
-    next_context: bool,
-    format: OutputFormat,
-) -> Result<()> {
+fn cmd_session_review(path: &Path, next_context: bool, format: OutputFormat) -> Result<()> {
     cmd_session_review_with_budget(path, next_context, format, ResponseBudget::default())
 }
 
@@ -5036,6 +5102,137 @@ struct SessionReviewNextContextBudgetReport {
     next_digest_commands: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct ContextPackReport {
+    root: String,
+    target: String,
+    target_kind: String,
+    max_items: usize,
+    max_bytes: usize,
+    next_context: SessionReviewNextContextBudgetReport,
+    diff_digest: ContextPackDiffPreview,
+    test_digest: ContextPackOptionalSection<ContextPackTestPreview>,
+    log_digest: ContextPackOptionalSection<ContextPackLogPreview>,
+    resume_commands: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ContextPackOptionalSection<T> {
+    status: String,
+    command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    report: Option<T>,
+}
+
+#[derive(Serialize)]
+struct ContextPackDiffPreview {
+    mode: String,
+    files_changed: usize,
+    files_with_current_summaries: usize,
+    symbols_touched: usize,
+    call_edges_added: usize,
+    call_edges_removed: usize,
+    truncated: bool,
+    files: Vec<ContextPackDiffFilePreview>,
+}
+
+#[derive(Serialize)]
+struct ContextPackDiffFilePreview {
+    path: String,
+    status: String,
+    touched_symbols: Vec<String>,
+    summary_state: String,
+    added_call_edges: usize,
+    removed_call_edges: usize,
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ContextPackTestPreview {
+    runner: String,
+    failures: usize,
+    grouped_failures: usize,
+    counts: ContextPackTestCounts,
+    truncated: bool,
+    failure_groups: Vec<ContextPackTestFailurePreview>,
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ContextPackTestCounts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    passed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct ContextPackTestFailurePreview {
+    tests: Vec<String>,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<usize>,
+    occurrences: usize,
+    summary_state: String,
+}
+
+#[derive(Serialize)]
+struct ContextPackLogPreview {
+    total_lines: usize,
+    non_empty_lines: usize,
+    signal_groups: usize,
+    repeated_line_groups: usize,
+    file_ref_groups: usize,
+    symbol_ref_groups: usize,
+    stack_groups: usize,
+    truncated: bool,
+    signals: Vec<ContextPackLogSignalPreview>,
+    repeated_lines: Vec<ContextPackLogRepeatedLinePreview>,
+    file_refs: Vec<ContextPackLogFileRefPreview>,
+    symbol_refs: Vec<ContextPackLogSymbolRefPreview>,
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ContextPackLogSignalPreview {
+    severity: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<usize>,
+    occurrences: usize,
+    summary_state: String,
+}
+
+#[derive(Serialize)]
+struct ContextPackLogRepeatedLinePreview {
+    line: String,
+    occurrences: usize,
+}
+
+#[derive(Serialize)]
+struct ContextPackLogFileRefPreview {
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<usize>,
+    occurrences: usize,
+    summary_state: String,
+}
+
+#[derive(Serialize)]
+struct ContextPackLogSymbolRefPreview {
+    symbol: String,
+    occurrences: usize,
+    summary_state: String,
+}
+
 fn session_review_source_flag(source: &str) -> &'static str {
     match source {
         "claude_jsonl" => "claude-jsonl",
@@ -5051,7 +5248,10 @@ fn build_session_review_budget_report(
 ) -> SessionReviewBudgetReport {
     let max_items = budget.preview_items();
     let max_bytes = budget.preview_bytes();
-    let review_expand = format!("tsift session-review {} --json", shell_quote(&report.target));
+    let review_expand = format!(
+        "tsift session-review {} --json",
+        shell_quote(&report.target)
+    );
     let sessions = report
         .sessions
         .iter()
@@ -5288,6 +5488,432 @@ fn print_session_review_next_context_budget_human(report: &SessionReviewNextCont
             "budget truncated items:{} bytes:{}",
             report.max_items, report.max_bytes
         );
+    }
+}
+
+fn effective_context_budget(budget: ResponseBudget) -> ResponseBudget {
+    ResponseBudget::new(Some(budget.preview_items()), Some(budget.preview_bytes()))
+}
+
+fn build_context_pack_diff_preview(
+    report: &diff_digest::DiffDigestReport,
+    budget: ResponseBudget,
+) -> ContextPackDiffPreview {
+    let max_items = budget.preview_items();
+    let max_bytes = budget.preview_bytes();
+    ContextPackDiffPreview {
+        mode: diff_digest_mode_label(report.mode).to_string(),
+        files_changed: report.files_changed,
+        files_with_current_summaries: report.files_with_current_summaries,
+        symbols_touched: report.symbols_touched,
+        call_edges_added: report.call_edges_added,
+        call_edges_removed: report.call_edges_removed,
+        truncated: report.files.len() > max_items,
+        files: report
+            .files
+            .iter()
+            .take(max_items)
+            .map(|file| ContextPackDiffFilePreview {
+                path: truncate_for_budget(&file.path, max_bytes),
+                status: diff_digest_status_label(file.status).to_string(),
+                touched_symbols: file
+                    .touched_symbols
+                    .iter()
+                    .take(max_items)
+                    .map(|symbol| truncate_for_budget(symbol, max_bytes))
+                    .collect(),
+                summary_state: diff_digest_summary_label(file.summary_state).to_string(),
+                added_call_edges: file.added_call_edges.len(),
+                removed_call_edges: file.removed_call_edges.len(),
+                warnings: file
+                    .warnings
+                    .iter()
+                    .take(max_items)
+                    .map(|warning| truncate_for_budget(warning, max_bytes))
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+fn build_context_pack_test_preview(
+    report: &test_digest::TestDigestReport,
+    budget: ResponseBudget,
+) -> ContextPackTestPreview {
+    let max_items = budget.preview_items();
+    let max_bytes = budget.preview_bytes();
+    ContextPackTestPreview {
+        runner: report.runner.clone(),
+        failures: report.failures,
+        grouped_failures: report.grouped_failures,
+        counts: ContextPackTestCounts {
+            passed: report.counts.passed,
+            failed: report.counts.failed,
+            skipped: report.counts.skipped,
+        },
+        truncated: report.failure_groups.len() > max_items || report.warnings.len() > max_items,
+        failure_groups: report
+            .failure_groups
+            .iter()
+            .take(max_items)
+            .map(|failure| ContextPackTestFailurePreview {
+                tests: failure
+                    .tests
+                    .iter()
+                    .take(max_items)
+                    .map(|test| truncate_for_budget(test, max_bytes))
+                    .collect(),
+                message: truncate_for_budget(&failure.message, max_bytes),
+                path: failure
+                    .path
+                    .as_ref()
+                    .map(|path| truncate_for_budget(path, max_bytes)),
+                line: failure.line,
+                occurrences: failure.occurrences,
+                summary_state: test_digest_summary_label(failure.summary_state).to_string(),
+            })
+            .collect(),
+        warnings: report
+            .warnings
+            .iter()
+            .take(max_items)
+            .map(|warning| truncate_for_budget(warning, max_bytes))
+            .collect(),
+    }
+}
+
+fn build_context_pack_log_preview(
+    report: &log_digest::LogDigestReport,
+    budget: ResponseBudget,
+) -> ContextPackLogPreview {
+    let max_items = budget.preview_items();
+    let max_bytes = budget.preview_bytes();
+    ContextPackLogPreview {
+        total_lines: report.total_lines,
+        non_empty_lines: report.non_empty_lines,
+        signal_groups: report.signal_groups,
+        repeated_line_groups: report.repeated_line_groups,
+        file_ref_groups: report.file_ref_groups,
+        symbol_ref_groups: report.symbol_ref_groups,
+        stack_groups: report.stack_groups,
+        truncated: report.signals.len() > max_items
+            || report.repeated_lines.len() > max_items
+            || report.file_refs.len() > max_items
+            || report.symbol_refs.len() > max_items
+            || report.warnings.len() > max_items,
+        signals: report
+            .signals
+            .iter()
+            .take(max_items)
+            .map(|signal| ContextPackLogSignalPreview {
+                severity: signal.severity.clone(),
+                message: truncate_for_budget(&signal.message, max_bytes),
+                path: signal
+                    .path
+                    .as_ref()
+                    .map(|path| truncate_for_budget(path, max_bytes)),
+                line: signal.line,
+                occurrences: signal.occurrences,
+                summary_state: log_digest_summary_label(signal.summary_state).to_string(),
+            })
+            .collect(),
+        repeated_lines: report
+            .repeated_lines
+            .iter()
+            .take(max_items)
+            .map(|line| ContextPackLogRepeatedLinePreview {
+                line: truncate_for_budget(&line.line, max_bytes),
+                occurrences: line.occurrences,
+            })
+            .collect(),
+        file_refs: report
+            .file_refs
+            .iter()
+            .take(max_items)
+            .map(|file| ContextPackLogFileRefPreview {
+                path: truncate_for_budget(&file.path, max_bytes),
+                line: file.line,
+                occurrences: file.occurrences,
+                summary_state: log_digest_summary_label(file.summary_state).to_string(),
+            })
+            .collect(),
+        symbol_refs: report
+            .symbol_refs
+            .iter()
+            .take(max_items)
+            .map(|symbol| ContextPackLogSymbolRefPreview {
+                symbol: truncate_for_budget(&symbol.symbol, max_bytes),
+                occurrences: symbol.occurrences,
+                summary_state: log_digest_summary_label(symbol.summary_state).to_string(),
+            })
+            .collect(),
+        warnings: report
+            .warnings
+            .iter()
+            .take(max_items)
+            .map(|warning| truncate_for_budget(warning, max_bytes))
+            .collect(),
+    }
+}
+
+fn build_context_pack_report(
+    path: &Path,
+    test_input: Option<&Path>,
+    runner: Option<&str>,
+    log_input: Option<&Path>,
+    budget: ResponseBudget,
+) -> Result<ContextPackReport> {
+    let budget = effective_context_budget(budget);
+    let review = session_review::compute(path)?;
+    let root = PathBuf::from(&review.root);
+    let next_context = build_session_review_next_context_budget_report(&review, budget);
+    let diff_digest = build_context_pack_diff_preview(
+        &diff_digest::compute(
+            &root,
+            diff_digest::DiffDigestOptions {
+                cached: false,
+                revision: None,
+            },
+        )?,
+        budget,
+    );
+    let test_digest = match test_input {
+        Some(file_path) => {
+            let input = fs::read_to_string(file_path)
+                .with_context(|| format!("reading test output: {}", file_path.display()))?;
+            if input.trim().is_empty() {
+                bail!("no test output provided in {}", file_path.display());
+            }
+            let report = test_digest::compute(&root, &input, runner)?;
+            ContextPackOptionalSection {
+                status: "included".to_string(),
+                command: format!(
+                    "tsift test-digest --path . --input {}{}",
+                    shell_quote(file_path.to_str().unwrap_or_default()),
+                    runner
+                        .map(|value| format!(" --runner {}", shell_quote(value)))
+                        .unwrap_or_default()
+                ),
+                source: Some(file_path.display().to_string()),
+                report: Some(build_context_pack_test_preview(&report, budget)),
+            }
+        }
+        None => ContextPackOptionalSection {
+            status: "not_provided".to_string(),
+            command: "tsift test-digest --path . < test.log".to_string(),
+            source: None,
+            report: None,
+        },
+    };
+    let log_digest = match log_input {
+        Some(file_path) => {
+            let input = fs::read_to_string(file_path)
+                .with_context(|| format!("reading log output: {}", file_path.display()))?;
+            if input.trim().is_empty() {
+                bail!("no log output provided in {}", file_path.display());
+            }
+            let report = log_digest::compute(&root, &input)?;
+            ContextPackOptionalSection {
+                status: "included".to_string(),
+                command: format!(
+                    "tsift log-digest --path . --input {}",
+                    shell_quote(file_path.to_str().unwrap_or_default())
+                ),
+                source: Some(file_path.display().to_string()),
+                report: Some(build_context_pack_log_preview(&report, budget)),
+            }
+        }
+        None => ContextPackOptionalSection {
+            status: "not_provided".to_string(),
+            command: "tsift log-digest --path . < build.log".to_string(),
+            source: None,
+            report: None,
+        },
+    };
+
+    Ok(ContextPackReport {
+        root: review.root,
+        target: review.target,
+        target_kind: review.target_kind,
+        max_items: budget.preview_items(),
+        max_bytes: budget.preview_bytes(),
+        next_context,
+        diff_digest,
+        test_digest,
+        log_digest,
+        resume_commands: review.next_context.next_digest_commands,
+    })
+}
+
+fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
+    if compact {
+        println!(
+            "context-pack target:{} prompts:{}/{} diff:{}/{} test:{} log:{}",
+            shell_quote(&report.target),
+            report.next_context.prompt_targets.len(),
+            report.next_context.prompt_target_total,
+            report.diff_digest.files.len(),
+            report.diff_digest.files_changed,
+            report.test_digest.status,
+            report.log_digest.status
+        );
+        for prompt in &report.next_context.prompt_targets {
+            println!("prompt {prompt}");
+        }
+        for file in &report.diff_digest.files {
+            println!(
+                "diff {} status:{} syms:{}",
+                file.path,
+                file.status,
+                if file.touched_symbols.is_empty() {
+                    "-".to_string()
+                } else {
+                    file.touched_symbols.join(",")
+                }
+            );
+        }
+        if let Some(test) = &report.test_digest.report {
+            println!(
+                "test runner:{} failures:{} groups:{}",
+                test.runner, test.failures, test.grouped_failures
+            );
+        } else {
+            println!("test {}", report.test_digest.command);
+        }
+        if let Some(log) = &report.log_digest.report {
+            println!(
+                "log lines:{} signals:{} files:{} syms:{}",
+                log.non_empty_lines, log.signal_groups, log.file_ref_groups, log.symbol_ref_groups
+            );
+        } else {
+            println!("log {}", report.log_digest.command);
+        }
+        return;
+    }
+
+    println!("Context pack");
+    println!("  target:                 {}", report.target);
+    println!("  target kind:            {}", report.target_kind);
+    println!("  root:                   {}", report.root);
+    println!(
+        "  preview budget:         {} items / {} bytes",
+        report.max_items, report.max_bytes
+    );
+    println!();
+    println!("Next context");
+    println!(
+        "  prompt targets:         {}/{}",
+        report.next_context.prompt_targets.len(),
+        report.next_context.prompt_target_total
+    );
+    println!(
+        "  touched files:          {}/{}",
+        report.next_context.touched_files.len(),
+        report.next_context.touched_file_total
+    );
+    println!(
+        "  touched symbols:        {}/{}",
+        report.next_context.touched_symbols.len(),
+        report.next_context.touched_symbol_total
+    );
+    println!(
+        "  unresolved failures:    {}/{}",
+        report.next_context.unresolved_failures.len(),
+        report.next_context.unresolved_failure_total
+    );
+    if !report.next_context.prompt_targets.is_empty() {
+        for prompt in &report.next_context.prompt_targets {
+            println!("  - prompt: {prompt}");
+        }
+    }
+    if !report.next_context.touched_files.is_empty() {
+        for path in &report.next_context.touched_files {
+            println!("  - file: {path}");
+        }
+    }
+    if !report.next_context.touched_symbols.is_empty() {
+        for symbol in &report.next_context.touched_symbols {
+            println!("  - symbol: {symbol}");
+        }
+    }
+
+    println!();
+    println!("Diff digest");
+    println!("  mode:                   {}", report.diff_digest.mode);
+    println!(
+        "  files changed:          {}/{}",
+        report.diff_digest.files.len(),
+        report.diff_digest.files_changed
+    );
+    println!(
+        "  touched symbols:        {}",
+        report.diff_digest.symbols_touched
+    );
+    println!(
+        "  call edges:             +{} / -{}",
+        report.diff_digest.call_edges_added, report.diff_digest.call_edges_removed
+    );
+    for file in &report.diff_digest.files {
+        println!("  - {} [{}]", file.path, file.status);
+        if !file.touched_symbols.is_empty() {
+            println!("    symbols: {}", file.touched_symbols.join(", "));
+        }
+        if !file.warnings.is_empty() {
+            println!("    warnings: {}", file.warnings.join(" | "));
+        }
+    }
+
+    println!();
+    println!("Test digest");
+    println!("  status:                 {}", report.test_digest.status);
+    match &report.test_digest.report {
+        Some(test) => {
+            println!("  runner:                 {}", test.runner);
+            println!("  failures:               {}", test.failures);
+            println!("  failure groups:         {}", test.grouped_failures);
+            for failure in &test.failure_groups {
+                let location = match (&failure.path, failure.line) {
+                    (Some(path), Some(line)) => format!("{path}:{line}"),
+                    (Some(path), None) => path.clone(),
+                    _ => "(no file anchor)".to_string(),
+                };
+                println!(
+                    "  - {} count:{} msg:{}",
+                    location, failure.occurrences, failure.message
+                );
+            }
+        }
+        None => println!("  capture:                {}", report.test_digest.command),
+    }
+
+    println!();
+    println!("Log digest");
+    println!("  status:                 {}", report.log_digest.status);
+    match &report.log_digest.report {
+        Some(log) => {
+            println!("  non-empty lines:        {}", log.non_empty_lines);
+            println!("  signal groups:          {}", log.signal_groups);
+            println!("  file refs:              {}", log.file_ref_groups);
+            println!("  symbol refs:            {}", log.symbol_ref_groups);
+            for signal in &log.signals {
+                let location = match (&signal.path, signal.line) {
+                    (Some(path), Some(line)) => format!("{path}:{line}"),
+                    (Some(path), None) => path.clone(),
+                    _ => "(no file anchor)".to_string(),
+                };
+                println!(
+                    "  - {} {} count:{} msg:{}",
+                    location, signal.severity, signal.occurrences, signal.message
+                );
+            }
+        }
+        None => println!("  capture:                {}", report.log_digest.command),
+    }
+
+    println!();
+    println!("Resume commands:");
+    for command in &report.resume_commands {
+        println!("  - {}", command);
     }
 }
 
@@ -10764,6 +11390,46 @@ tier = "private"
     }
 
     #[test]
+    fn cli_parses_context_pack_command() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "context-pack",
+            "tasks/software/tsift.md",
+            "--test-input",
+            "target/test.log",
+            "--runner",
+            "cargo",
+            "--log-input",
+            "target/build.log",
+            "--max-items",
+            "3",
+            "--max-bytes",
+            "96",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::ContextPack {
+                path,
+                test_input,
+                runner,
+                log_input,
+                json,
+                max_items,
+                max_bytes,
+            }) => {
+                assert_eq!(path, PathBuf::from("tasks/software/tsift.md"));
+                assert_eq!(test_input, Some(PathBuf::from("target/test.log")));
+                assert_eq!(runner.as_deref(), Some("cargo"));
+                assert_eq!(log_input, Some(PathBuf::from("target/build.log")));
+                assert!(json);
+                assert_eq!(max_items, Some(3));
+                assert_eq!(max_bytes, Some(96));
+            }
+            _ => panic!("expected ContextPack command"),
+        }
+    }
+
+    #[test]
     fn search_budget_report_truncates_symbol_preview_and_emits_stable_handle() {
         let response = empty_search_response(Path::new("/repo"), "lexical");
         let symbol_hits = vec![index::SymbolHit {
@@ -10947,13 +11613,206 @@ tier = "private"
             warnings: vec![],
         };
 
-        let budget_report =
-            build_session_review_next_context_budget_report(&report, ResponseBudget::new(Some(1), Some(12)));
+        let budget_report = build_session_review_next_context_budget_report(
+            &report,
+            ResponseBudget::new(Some(1), Some(12)),
+        );
 
         assert!(budget_report.truncated);
         assert_eq!(budget_report.prompt_targets, vec!["do one"]);
         assert_eq!(budget_report.touched_files, vec!["src/lib.rs"]);
-        assert!(budget_report.unresolved_failures[0].handle.starts_with("snf-"));
+        assert!(
+            budget_report.unresolved_failures[0]
+                .handle
+                .starts_with("snf-")
+        );
+    }
+
+    #[test]
+    fn context_pack_diff_preview_limits_files_and_symbols() {
+        let report = diff_digest::DiffDigestReport {
+            root: "/repo".to_string(),
+            mode: diff_digest::DiffDigestMode::WorkingTree,
+            revision: None,
+            files_changed: 2,
+            files_with_current_summaries: 1,
+            symbols_touched: 3,
+            call_edges_added: 1,
+            call_edges_removed: 0,
+            files: vec![
+                diff_digest::DiffDigestFile {
+                    path: "src/lib.rs".to_string(),
+                    status: diff_digest::DiffDigestFileStatus::Modified,
+                    touched_symbols: vec!["alpha_helper".to_string(), "beta_helper".to_string()],
+                    summary_state: diff_digest::DiffDigestSummaryState::Current,
+                    current_summaries: vec![],
+                    added_call_edges: vec!["alpha->beta".to_string()],
+                    removed_call_edges: vec![],
+                    warnings: vec!["stale parse".to_string()],
+                },
+                diff_digest::DiffDigestFile {
+                    path: "src/main.rs".to_string(),
+                    status: diff_digest::DiffDigestFileStatus::Added,
+                    touched_symbols: vec!["main".to_string()],
+                    summary_state: diff_digest::DiffDigestSummaryState::Missing,
+                    current_summaries: vec![],
+                    added_call_edges: vec![],
+                    removed_call_edges: vec![],
+                    warnings: vec![],
+                },
+            ],
+        };
+
+        let preview =
+            build_context_pack_diff_preview(&report, ResponseBudget::new(Some(1), Some(11)));
+
+        assert!(preview.truncated);
+        assert_eq!(preview.files.len(), 1);
+        assert_eq!(preview.files[0].path, "src/lib.rs");
+        assert_eq!(preview.files[0].touched_symbols, vec!["alpha_he..."]);
+        assert_eq!(preview.files[0].warnings, vec!["stale parse"]);
+    }
+
+    #[test]
+    fn context_pack_test_preview_limits_failure_groups() {
+        let report = test_digest::TestDigestReport {
+            root: "/repo".to_string(),
+            runner: "cargo".to_string(),
+            failures: 2,
+            grouped_failures: 2,
+            counts: test_digest::TestDigestCounts {
+                passed: Some(8),
+                failed: Some(2),
+                skipped: Some(1),
+            },
+            failure_groups: vec![
+                test_digest::TestDigestFailure {
+                    tests: vec!["suite::alpha_failure".to_string()],
+                    message: "assertion failed".to_string(),
+                    path: Some("src/lib.rs".to_string()),
+                    line: Some(42),
+                    column: None,
+                    occurrences: 1,
+                    summary_state: test_digest::TestDigestSummaryState::Current,
+                    current_summaries: vec![],
+                },
+                test_digest::TestDigestFailure {
+                    tests: vec!["suite::beta_failure".to_string()],
+                    message: "panic".to_string(),
+                    path: Some("src/main.rs".to_string()),
+                    line: Some(7),
+                    column: None,
+                    occurrences: 1,
+                    summary_state: test_digest::TestDigestSummaryState::Missing,
+                    current_summaries: vec![],
+                },
+            ],
+            warnings: vec!["warning text".to_string()],
+        };
+
+        let preview =
+            build_context_pack_test_preview(&report, ResponseBudget::new(Some(1), Some(14)));
+
+        assert!(preview.truncated);
+        assert_eq!(preview.failure_groups.len(), 1);
+        assert_eq!(preview.failure_groups[0].tests, vec!["suite::alph..."]);
+        assert_eq!(preview.failure_groups[0].message, "assertion f...");
+        assert_eq!(preview.warnings, vec!["warning text"]);
+    }
+
+    #[test]
+    fn context_pack_log_preview_limits_signals_and_refs() {
+        let report = log_digest::LogDigestReport {
+            root: "/repo".to_string(),
+            total_lines: 12,
+            non_empty_lines: 10,
+            signal_groups: 2,
+            repeated_line_groups: 2,
+            repeated_line_occurrences: 3,
+            file_ref_groups: 2,
+            symbol_ref_groups: 2,
+            stack_groups: 1,
+            signals: vec![
+                log_digest::LogDigestSignal {
+                    severity: "error".to_string(),
+                    message: "src/lib.rs:42 boom".to_string(),
+                    path: Some("src/lib.rs".to_string()),
+                    line: Some(42),
+                    column: None,
+                    occurrences: 2,
+                    summary_state: log_digest::LogDigestSummaryState::Current,
+                    current_summaries: vec![],
+                },
+                log_digest::LogDigestSignal {
+                    severity: "warn".to_string(),
+                    message: "slow path".to_string(),
+                    path: None,
+                    line: None,
+                    column: None,
+                    occurrences: 1,
+                    summary_state: log_digest::LogDigestSummaryState::Unavailable,
+                    current_summaries: vec![],
+                },
+            ],
+            repeated_lines: vec![
+                log_digest::LogDigestRepeatedLine {
+                    line: "retrying work item alpha".to_string(),
+                    occurrences: 3,
+                },
+                log_digest::LogDigestRepeatedLine {
+                    line: "retrying work item beta".to_string(),
+                    occurrences: 2,
+                },
+            ],
+            file_refs: vec![
+                log_digest::LogDigestFileRef {
+                    path: "src/lib.rs".to_string(),
+                    line: Some(42),
+                    column: None,
+                    occurrences: 2,
+                    summary_state: log_digest::LogDigestSummaryState::Current,
+                    current_summaries: vec![],
+                },
+                log_digest::LogDigestFileRef {
+                    path: "src/main.rs".to_string(),
+                    line: Some(7),
+                    column: None,
+                    occurrences: 1,
+                    summary_state: log_digest::LogDigestSummaryState::Missing,
+                    current_summaries: vec![],
+                },
+            ],
+            symbol_refs: vec![
+                log_digest::LogDigestSymbolRef {
+                    symbol: "alpha_helper".to_string(),
+                    occurrences: 2,
+                    summary_state: log_digest::LogDigestSummaryState::Current,
+                    current_summaries: vec![],
+                },
+                log_digest::LogDigestSymbolRef {
+                    symbol: "beta_helper".to_string(),
+                    occurrences: 1,
+                    summary_state: log_digest::LogDigestSummaryState::Missing,
+                    current_summaries: vec![],
+                },
+            ],
+            stack_traces: vec![log_digest::LogDigestStackGroup {
+                frames: vec!["frame one".to_string()],
+                occurrences: 1,
+            }],
+            warnings: vec!["warning text".to_string()],
+        };
+
+        let preview =
+            build_context_pack_log_preview(&report, ResponseBudget::new(Some(1), Some(14)));
+
+        assert!(preview.truncated);
+        assert_eq!(preview.signals.len(), 1);
+        assert_eq!(preview.signals[0].message, "src/lib.rs:...");
+        assert_eq!(preview.repeated_lines[0].line, "retrying wo...");
+        assert_eq!(preview.file_refs.len(), 1);
+        assert_eq!(preview.symbol_refs[0].symbol, "alpha_helper");
+        assert_eq!(preview.warnings, vec!["warning text"]);
     }
 
     #[test]
