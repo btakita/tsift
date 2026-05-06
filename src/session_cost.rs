@@ -3,6 +3,8 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::runtime_churn::{RestartChurnState, RestartChurnSummary};
+
 const MAX_LARGEST_TURNS: usize = 5;
 const MAX_RUNTIME_EVENTS: usize = 8;
 
@@ -68,10 +70,13 @@ pub struct SessionCostReport {
     pub largest_turn_total_tokens: u64,
     pub runtime_event_groups: usize,
     pub total_runtime_events: usize,
+    pub restart_churn_groups: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_restart_count: Option<usize>,
     pub largest_turns: Vec<SessionCostTurn>,
     pub runtime_events: Vec<SessionCostRuntimeEvent>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub restart_churn: Vec<RestartChurnSummary>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
 }
@@ -121,11 +126,14 @@ struct CostState {
     runtime_events: BTreeMap<String, usize>,
     total_runtime_events: usize,
     max_restart_count: Option<usize>,
+    restart_churn: RestartChurnState,
 }
 
 pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostReport> {
     if input.trim().is_empty() {
-        bail!("no session-cost input provided; pass --input <file> or pipe transcript/log data on stdin");
+        bail!(
+            "no session-cost input provided; pass --input <file> or pipe transcript/log data on stdin"
+        );
     }
 
     let source = resolve_source(input, source_hint)?;
@@ -183,6 +191,8 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
     });
     let runtime_event_groups = runtime_events.len();
     runtime_events.truncate(MAX_RUNTIME_EVENTS);
+    let restart_churn_groups = state.restart_churn.groups();
+    let restart_churn = state.restart_churn.summaries();
 
     if usage_samples == 0 && runtime_event_groups == 0 {
         state
@@ -204,9 +214,11 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
         largest_turn_total_tokens,
         runtime_event_groups,
         total_runtime_events: state.total_runtime_events,
+        restart_churn_groups,
         max_restart_count: state.max_restart_count,
         largest_turns,
         runtime_events,
+        restart_churn,
         warnings: state.warnings,
     })
 }
@@ -222,7 +234,9 @@ fn resolve_source(input: &str, source_hint: Option<&str>) -> Result<SessionCostS
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
     if non_empty.is_empty() {
-        bail!("no session-cost input provided; pass --input <file> or pipe transcript/log data on stdin");
+        bail!(
+            "no session-cost input provided; pass --input <file> or pipe transcript/log data on stdin"
+        );
     }
 
     if non_empty
@@ -389,7 +403,9 @@ fn ingest_codex_jsonl(input: &str, state: &mut CostState) -> Result<()> {
             cache_creation_input_tokens: 0,
             output_tokens: delta.output_tokens,
             reasoning_output_tokens: delta.reasoning_output_tokens,
-            total_tokens: delta.total_tokens.max(delta.prompt_tokens + delta.output_tokens),
+            total_tokens: delta
+                .total_tokens
+                .max(delta.prompt_tokens + delta.output_tokens),
         });
     }
 
@@ -425,8 +441,9 @@ fn ingest_agent_doc_log(input: &str, state: &mut CostState) {
         }
         *state.runtime_events.entry(normalized).or_default() += 1;
         state.total_runtime_events += 1;
-        if let Some(restart_count) = extract_field(detail, "restart_count")
-            .and_then(|value| value.parse::<usize>().ok())
+        state.restart_churn.observe(event_name, detail);
+        if let Some(restart_count) =
+            extract_field(detail, "restart_count").and_then(|value| value.parse::<usize>().ok())
         {
             state.max_restart_count = Some(
                 state
@@ -445,7 +462,9 @@ fn extract_field<'a>(detail: &'a str, key: &str) -> Option<&'a str> {
     let needle = format!("{key}=");
     let start = detail.find(&needle)? + needle.len();
     let remainder = &detail[start..];
-    let end = remainder.find(char::is_whitespace).unwrap_or(remainder.len());
+    let end = remainder
+        .find(char::is_whitespace)
+        .unwrap_or(remainder.len());
     Some(remainder[..end].trim_matches('"'))
 }
 
@@ -504,15 +523,18 @@ mod tests {
 [1776452736] claude_start mode=fresh restart_count=0
 [1776528398] claude_start mode=fresh_restart restart_count=1
 [1776528446] auto_trigger_timeout (no prompt after 30s)
+[1776528450] ctrl_d_restart_fresh restart_count=2
 [1776528582] claude_start mode=fresh_restart restart_count=2
 [1776528599] codex_start mode=continue restart_count=3
+[1776528601] user_quit_after_ctrl_d
 ";
 
         let report = compute(input, Some("agent-doc-log")).unwrap();
         assert_eq!(report.source, "agent_doc_log");
         assert_eq!(report.usage_samples, 0);
-        assert_eq!(report.runtime_event_groups, 4);
-        assert_eq!(report.total_runtime_events, 5);
+        assert_eq!(report.runtime_event_groups, 6);
+        assert_eq!(report.total_runtime_events, 7);
+        assert_eq!(report.restart_churn_groups, 4);
         assert_eq!(report.max_restart_count, Some(3));
         assert!(
             report
@@ -525,6 +547,24 @@ mod tests {
                 .runtime_events
                 .iter()
                 .any(|event| event.event == "auto_trigger_timeout" && event.occurrences == 1)
+        );
+        assert!(
+            report
+                .restart_churn
+                .iter()
+                .any(|entry| entry.family == "fresh_restart" && entry.occurrences == 3)
+        );
+        assert!(
+            report
+                .restart_churn
+                .iter()
+                .any(|entry| entry.family == "ctrl_d_restart_loop" && entry.occurrences == 1)
+        );
+        assert!(
+            report
+                .restart_churn
+                .iter()
+                .any(|entry| entry.family == "quit_after_eof" && entry.occurrences == 1)
         );
     }
 }

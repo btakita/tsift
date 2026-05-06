@@ -3033,6 +3033,54 @@ fn session_cost_reads_codex_token_counts_from_stdin() {
 }
 
 #[test]
+fn session_cost_summarizes_agent_doc_restart_churn_from_stdin() {
+    let input = concat!(
+        "[1776528398] codex_start mode=fresh_restart restart_count=1\n",
+        "[1776528446] auto_trigger_timeout harness=codex reason=no_prompt_after_30s\n",
+        "[1776528450] ctrl_d_restart_fresh restart_count=2\n",
+        "[1776528451] user_quit_after_ctrl_d\n",
+        "[1776528452] supervisor_exit reason=user_quit_after_ctrl_d pane=%26 restart_count=2\n"
+    );
+
+    let mut child = tsift_bin()
+        .args(["session-cost", "--json", "--source", "agent-doc-log"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "session-cost should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["source"], "agent_doc_log");
+    assert_eq!(json["restart_churn_groups"], 4);
+    assert_eq!(json["max_restart_count"], 2);
+    assert!(
+        json["restart_churn"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["family"] == "fresh_restart" && entry["occurrences"] == 2)
+    );
+    assert!(
+        json["restart_churn"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["family"] == "quit_after_eof" && entry["occurrences"] == 2)
+    );
+}
+
+#[test]
 fn session_digest_reads_codex_jsonl_from_stdin() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -3095,6 +3143,64 @@ fn session_digest_reads_codex_jsonl_from_stdin() {
             .unwrap()
             .iter()
             .any(|failure| failure["kind"] == "exit")
+    );
+}
+
+#[test]
+fn session_digest_summarizes_agent_doc_restart_churn_from_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("tasks/software")).unwrap();
+    fs::write(dir.path().join("tasks/software/tsift.md"), "# tsift\n").unwrap();
+
+    let input = concat!(
+        "[1776452736] session_start file=tasks/software/tsift.md pane=%141 session=tsift-v0\n",
+        "[1776528398] codex_start mode=fresh_restart restart_count=1\n",
+        "[1776528446] auto_trigger_timeout harness=codex reason=no_prompt_after_30s\n",
+        "[1776528450] ctrl_d_restart_fresh restart_count=2\n",
+        "[1776528451] user_quit_after_ctrl_d\n"
+    );
+
+    let mut child = tsift_bin()
+        .args([
+            "session-digest",
+            "--json",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--source",
+            "agent-doc-log",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "session-digest should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["source"], "agent_doc_log");
+    assert_eq!(json["restart_churn_groups"], 4);
+    assert!(
+        json["restart_churn"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["family"] == "ctrl_d_restart_loop" && entry["occurrences"] == 1)
+    );
+    assert!(
+        json["restart_churn"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["family"] == "quit_after_eof" && entry["occurrences"] == 1)
     );
 }
 

@@ -1058,6 +1058,7 @@ Behavior:
 2. Auto-detect Claude JSONL, Codex JSONL, or `agent-doc` runtime logs unless `--source claude-jsonl|codex-jsonl|agent-doc-log` forces one parser.
 3. Normalize prompt-side totals, cached-input totals, output totals, and largest per-turn outliers so token-heavy sessions can be compared without ad hoc `jq` pipelines.
 4. For `agent-doc` runtime logs, summarize bounded churn counters such as `fresh_restart`, `continue`, and `auto_trigger_timeout`, including the highest observed `restart_count`.
+5. Derive bounded restart-churn families from `agent-doc` logs so the digest can call out `fresh_restart`, `auto_trigger_timeout`, ctrl-d restart loops, and quit-after-eof cycles without replaying the full raw event stream.
 
 `session-cost` is intentionally cost-focused. It does not reconstruct the full conversation or replay tool calls; it compresses token/runtime overhead into a bounded report you can paste into backlog triage, handoffs, or benchmark notes.
 

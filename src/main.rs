@@ -24,6 +24,7 @@ mod lang;
 pub mod lint;
 pub mod log_digest;
 pub mod metric_digest;
+pub mod runtime_churn;
 pub mod session_cost;
 pub mod session_digest;
 pub mod status;
@@ -3892,7 +3893,7 @@ fn cmd_session_digest(
 
     if format.compact {
         println!(
-            "session src:{} prompts:{} cmds:{} files:{} syms:{} fails:{} runtime:{} closeout:{}",
+            "session src:{} prompts:{} cmds:{} files:{} syms:{} fails:{} runtime:{} churn:{} closeout:{}",
             report.source,
             report.prompt_target_count,
             report.command_groups,
@@ -3900,6 +3901,7 @@ fn cmd_session_digest(
             report.symbol_groups,
             report.failure_groups,
             report.runtime_event_groups,
+            report.restart_churn_groups,
             report.closeout_groups
         );
         for prompt in &report.prompt_targets {
@@ -3927,6 +3929,19 @@ fn cmd_session_digest(
                 truncate_for_compact(&event.event, 100)
             );
         }
+        for churn in &report.restart_churn {
+            let suffix = churn
+                .max_restart_count
+                .map(|value| format!(" max_restart:{}", value))
+                .unwrap_or_default();
+            println!(
+                "churn {} count:{}{} {}",
+                churn.family,
+                churn.occurrences,
+                suffix,
+                truncate_for_compact(&churn.sample, 100)
+            );
+        }
         for entry in &report.closeout {
             println!(
                 "closeout {} count:{} {}",
@@ -3949,6 +3964,7 @@ fn cmd_session_digest(
     println!("  touched symbols:  {}", report.symbol_groups);
     println!("  failures:         {}", report.failure_groups);
     println!("  runtime events:   {}", report.runtime_event_groups);
+    println!("  restart churn:    {}", report.restart_churn_groups);
     println!("  closeout:         {}", report.closeout_groups);
 
     if !report.prompt_targets.is_empty() {
@@ -3999,6 +4015,23 @@ fn cmd_session_digest(
         println!("Runtime events:");
         for event in &report.runtime_events {
             println!("  - {} ({})", event.event, event.occurrences);
+        }
+    }
+
+    if !report.restart_churn.is_empty() {
+        println!();
+        println!("Restart churn:");
+        for churn in &report.restart_churn {
+            match churn.max_restart_count {
+                Some(max_restart_count) => println!(
+                    "  - {} ({}) max_restart={} sample: {}",
+                    churn.family, churn.occurrences, max_restart_count, churn.sample
+                ),
+                None => println!(
+                    "  - {} ({}) sample: {}",
+                    churn.family, churn.occurrences, churn.sample
+                ),
+            }
         }
     }
 
@@ -4056,7 +4089,7 @@ fn cmd_session_cost(
             .map(|value| format!("{value:.2}%"))
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "session-cost src:{} samples:{} prompt:{} cached:{} cache_ratio:{} output:{} total:{} runtime:{}",
+            "session-cost src:{} samples:{} prompt:{} cached:{} cache_ratio:{} output:{} total:{} runtime:{} churn:{}",
             report.source,
             report.usage_samples,
             format_compact_count(report.prompt_tokens),
@@ -4064,7 +4097,8 @@ fn cmd_session_cost(
             cache_ratio,
             format_compact_count(report.output_tokens),
             format_compact_count(report.total_tokens),
-            report.total_runtime_events
+            report.total_runtime_events,
+            report.restart_churn_groups
         );
         for turn in &report.largest_turns {
             println!(
@@ -4078,6 +4112,19 @@ fn cmd_session_cost(
         }
         for event in &report.runtime_events {
             println!("event count:{} {}", event.occurrences, event.event);
+        }
+        for churn in &report.restart_churn {
+            let suffix = churn
+                .max_restart_count
+                .map(|value| format!(" max_restart:{}", value))
+                .unwrap_or_default();
+            println!(
+                "churn {} count:{}{} {}",
+                churn.family,
+                churn.occurrences,
+                suffix,
+                truncate_for_compact(&churn.sample, 100)
+            );
         }
         for warning in &report.warnings {
             println!("warning: {warning}");
@@ -4109,6 +4156,7 @@ fn cmd_session_cost(
     );
     println!("  runtime events:         {}", report.total_runtime_events);
     println!("  runtime groups:         {}", report.runtime_event_groups);
+    println!("  restart churn groups:   {}", report.restart_churn_groups);
     if let Some(max_restart_count) = report.max_restart_count {
         println!("  max restart count:      {}", max_restart_count);
     }
@@ -4134,6 +4182,23 @@ fn cmd_session_cost(
         println!("Runtime churn:");
         for event in &report.runtime_events {
             println!("  - {} ({})", event.event, event.occurrences);
+        }
+    }
+
+    if !report.restart_churn.is_empty() {
+        println!();
+        println!("Restart churn:");
+        for churn in &report.restart_churn {
+            match churn.max_restart_count {
+                Some(max_restart_count) => println!(
+                    "  - {} ({}) max_restart={} sample: {}",
+                    churn.family, churn.occurrences, max_restart_count, churn.sample
+                ),
+                None => println!(
+                    "  - {} ({}) sample: {}",
+                    churn.family, churn.occurrences, churn.sample
+                ),
+            }
         }
     }
 

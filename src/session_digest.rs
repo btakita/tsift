@@ -4,6 +4,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::runtime_churn::{RestartChurnState, RestartChurnSummary};
+
 const MAX_PROMPT_TARGETS: usize = 8;
 const MAX_COMMANDS: usize = 12;
 const MAX_FILES: usize = 12;
@@ -103,6 +105,7 @@ pub struct SessionDigestReport {
     pub symbol_groups: usize,
     pub failure_groups: usize,
     pub runtime_event_groups: usize,
+    pub restart_churn_groups: usize,
     pub closeout_groups: usize,
     pub prompt_targets: Vec<String>,
     pub commands: Vec<SessionDigestCommand>,
@@ -110,6 +113,8 @@ pub struct SessionDigestReport {
     pub touched_symbols: Vec<SessionDigestSymbolRef>,
     pub failures: Vec<SessionDigestFailure>,
     pub runtime_events: Vec<SessionDigestRuntimeEvent>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub restart_churn: Vec<RestartChurnSummary>,
     pub closeout: Vec<SessionDigestCloseout>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
@@ -123,6 +128,7 @@ struct DigestState {
     symbols: BTreeMap<String, usize>,
     failures: BTreeMap<(String, String), usize>,
     runtime_events: BTreeMap<String, usize>,
+    restart_churn: RestartChurnState,
     closeout: BTreeMap<(String, String), usize>,
     warnings: Vec<String>,
     transcript_items: usize,
@@ -233,6 +239,8 @@ pub fn compute(path: &Path, input: &str, source_hint: Option<&str>) -> Result<Se
     });
     let runtime_event_groups = runtime_events.len();
     runtime_events.truncate(MAX_RUNTIME_EVENTS);
+    let restart_churn_groups = state.restart_churn.groups();
+    let restart_churn = state.restart_churn.summaries();
 
     let mut closeout = state
         .closeout
@@ -264,6 +272,7 @@ pub fn compute(path: &Path, input: &str, source_hint: Option<&str>) -> Result<Se
         symbol_groups,
         failure_groups,
         runtime_event_groups,
+        restart_churn_groups,
         closeout_groups,
         prompt_targets: state.prompt_targets,
         commands,
@@ -271,6 +280,7 @@ pub fn compute(path: &Path, input: &str, source_hint: Option<&str>) -> Result<Se
         touched_symbols,
         failures,
         runtime_events,
+        restart_churn,
         closeout,
         warnings: state.warnings,
     })
@@ -402,6 +412,7 @@ fn ingest_agent_doc_log(root: &Path, input: &str, state: &mut DigestState) {
             .runtime_events
             .entry(normalize_runtime_event(event_name, detail))
             .or_default() += 1;
+        state.restart_churn.observe(event_name, detail);
 
         for key in ["file", "path", "project_root"] {
             if let Some(path) = extract_field(detail, key) {
@@ -1360,12 +1371,15 @@ do [#sessiondigest]. spec-test-build-install-commit-push
 [1776452736] session_start file=tasks/software/tsift.md pane=%141 session=tsift-v0
 [1776528398] claude_start mode=fresh_restart restart_count=1
 [1776528446] auto_trigger_timeout (no prompt after 30s)
+[1776528450] ctrl_d_restart_fresh restart_count=2
 [1776528532] claude_exit code=1 restart_count=0
+[1776528534] user_quit_after_ctrl_d
 ";
 
         let report = compute(dir.path(), input, Some("agent-doc-log")).unwrap();
         assert_eq!(report.source, "agent_doc_log");
-        assert_eq!(report.runtime_event_groups, 4);
+        assert_eq!(report.runtime_event_groups, 6);
+        assert_eq!(report.restart_churn_groups, 4);
         assert!(
             report
                 .runtime_events
@@ -1385,5 +1399,23 @@ do [#sessiondigest]. spec-test-build-install-commit-push
                 .any(|failure| failure.kind == "timeout")
         );
         assert!(report.failures.iter().any(|failure| failure.kind == "exit"));
+        assert!(
+            report
+                .restart_churn
+                .iter()
+                .any(|entry| entry.family == "fresh_restart" && entry.occurrences == 2)
+        );
+        assert!(
+            report
+                .restart_churn
+                .iter()
+                .any(|entry| entry.family == "ctrl_d_restart_loop" && entry.occurrences == 1)
+        );
+        assert!(
+            report
+                .restart_churn
+                .iter()
+                .any(|entry| entry.family == "quit_after_eof" && entry.occurrences == 1)
+        );
     }
 }

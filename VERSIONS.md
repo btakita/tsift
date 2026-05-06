@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- `tsift session-cost` and `tsift session-digest` now derive bounded restart-churn families from `agent-doc` runtime logs, so `fresh_restart`, `auto_trigger_timeout`, ctrl-d restart loops, and quit-after-eof cycles are summarized directly instead of being buried in raw event counters.
+- Regression coverage now locks the new restart-churn summaries in both direct/unit tests and compiled CLI stdin tests for `session-cost` and `session-digest`.
 - `tsift init` now injects owning-root guidance into the Code Navigation section so harnesses switch to the relevant repo or submodule root before tsift/build/test work instead of accidentally carrying the superproject instruction surface into submodule tasks.
 - Harness-oriented digests (`session-digest`, `log-digest`, `test-digest`) now prefer the nearest owning git root over the outer workspace `.gitmodules` root, so transcript reads and digest enrichment stay scoped to `src/tsift` when the source file lives there.
 - `tsift rewrite` now anchors long transcript/log reads to that owning repo or submodule root before routing them into `session-digest`, and regression coverage now locks the new root-selection behavior in both direct/unit and compiled CLI rewrite tests.

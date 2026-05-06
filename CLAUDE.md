@@ -23,8 +23,8 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift diff-digest` | Code-aware digest for worktree, staged, and single-revision diffs. Supports the default working-tree view, `--cached` for staged-index review, and `--revision <rev>` for commit/history review while reporting changed files, touched symbols, current cached summary snippets when `summaries.db` matches the compared snapshot, and added/removed call edges without requiring a fresh `index.db`. |
 | `tsift metric-digest` | Generic metric-run digest for repeated benchmark/test/perf workflows. Reads JSON/NDJSON run history from stdin or `--input`, compares the latest run against a prior run or `--baseline`, classifies deltas, and emits compact output plus a markdown-ready history table. |
 | `tsift log-digest` | Bounded verbose-log digest from stdin or `--input`. Collapses repeated lines, groups warning/error signals, extracts file anchors and stack blocks, and adds read-only summary snippets when current cache rows exist. |
-| `tsift session-digest` | Bounded session transcript/log digest for markdown session docs, Claude JSONL, Codex JSONL, and agent-doc runtime logs. Extracts prompt targets, shell commands, touched files/symbols, failures, runtime churn, and closeout evidence without replaying the transcript. |
-| `tsift session-cost` | Bounded token/runtime-cost digest for Claude JSONL, Codex JSONL, and `agent-doc` runtime logs. Reports prompt/cached/output totals, largest cost outliers, and restart-churn signals without replaying the full transcript. |
+| `tsift session-digest` | Bounded session transcript/log digest for markdown session docs, Claude JSONL, Codex JSONL, and agent-doc runtime logs. Extracts prompt targets, shell commands, touched files/symbols, failures, raw runtime events, derived restart-churn families, and closeout evidence without replaying the transcript. |
+| `tsift session-cost` | Bounded token/runtime-cost digest for Claude JSONL, Codex JSONL, and `agent-doc` runtime logs. Reports prompt/cached/output totals, largest cost outliers, raw runtime events, and derived restart-churn families without replaying the full transcript. |
 | `tsift lint` | Markdown lint: detect unannotated concepts (symbols, headings, bold terms) cross-referenced against graph entities. Auto-discovers live `index.db` files from the nearest `.tsift` root by default, and `--index` accepts a project root, `.tsift`, direct `index.db`, or `.tsift/indexes`. `--index <dir>` / `--entities-from <file>` / `--json` |
 | `tsift status` | Session health check: index freshness, instruction version, summary cache, recommended commands. Workspace roots treat scoped indexes under `.tsift/indexes/<scope>/index.db` as the authoritative status surface, even if a shared `.tsift/index.db` also exists; they surface configured-but-missing scopes instead of reporting false `fresh`, recommend `--workspace` rebuilds, and include summary-cache recovery diagnostics when status had to fall back to a snapshot. `--json` includes per-scope indexed status plus `missing_scopes`. |
 | `tsift locks` | Diagnose the OS-backed `index.lock` sidecar and `index.db-journal` state, and recommend the next recovery step. Stale sidecar metadata is reused automatically. `--scope <name>` / `--json` |
@@ -113,7 +113,7 @@ If copied skill instructions lag behind the installed binary, treat this file, `
 
 Private: `github.com/btakita/tsift`. Submodule at `src/tsift` in agent-loop.
 
-<!-- tsift:code-navigation -->
+<!-- tsift:code-navigation v=0.1.33 -->
 ## Code Navigation
 
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root.
@@ -123,8 +123,6 @@ Use the commands listed in its `use:` output:
 - `tsift explain <symbol>` — callers, callees, community context
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
-
-If `tsift status` reports a stale index, run the exact rebuild command from its `run:` line first (`tsift index .` for single-project roots, `tsift index --workspace .` for workspace roots) or use `tsift search --autoindex ...`. If `tsift search` still times out after that, tsift now kills the timed-out helper search worker before returning; narrow the path/query or retry with a larger `--timeout`.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->
