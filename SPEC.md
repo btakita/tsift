@@ -227,7 +227,30 @@ Behavior:
 - `--max-items <n>` switches the command into preview mode and caps repeated result groups to `n` items per section.
 - `--max-bytes <n>` truncates long preview fields (snippets, messages, paths, labels) to `n` bytes with an ellipsis.
 - Preview mode emits deterministic expansion handles plus a concrete follow-up `expand` command for each preview item, so callers can request a narrower rerun without paying for the full original response.
-- JSON/terse/schema output in preview mode returns the same bounded preview envelope instead of the full raw payload; without these flags, the existing output formats remain unchanged.
+- JSON/terse/schema output in preview mode returns the same bounded preview report instead of the full raw payload; without these flags, the existing output formats remain unchanged.
+
+## Structured Envelopes
+
+`tsift --envelope` is a global JSON-mode wrapper for agent-facing preview and handoff commands. It currently applies to `search`, `explain`, `session-review`, and `context-pack`, and it implies `--json`.
+
+Example:
+
+```bash
+tsift --envelope search "alpha_helper" --max-items 3 --max-bytes 120
+tsift --envelope session-review tasks/software/tsift.md --next-context --max-items 4
+tsift --envelope context-pack tasks/software/tsift.md --test-input target/test.log
+```
+
+Envelope shape:
+
+- `tool`: command name (`search`, `explain`, `session-review`, `context-pack`)
+- `view`: report shape such as `preview`, `report`, `next-context`, or `handoff`
+- `summary`: terse display payload with `text` plus `metrics[{label,value}]`
+- `truncated`: whether the wrapped report is budget-trimmed
+- `follow_up`: concrete rerun or expansion commands callers can surface directly
+- `report`: the existing command-specific JSON payload
+
+Preview reports keep their item-level `handle` + `expand` fields inside `report`, so clients can render a top summary from the envelope and then request narrower follow-up expansion without falling back to prose-heavy defaults.
 
 ## Compact JSON Default
 

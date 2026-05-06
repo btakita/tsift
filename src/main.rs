@@ -64,6 +64,10 @@ struct Cli {
     #[arg(long, global = true)]
     schema: bool,
 
+    /// Wrap supported JSON responses in a common summary envelope (implies --json)
+    #[arg(long, global = true)]
+    envelope: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -548,6 +552,30 @@ struct OutputFormat {
     pretty: bool,
     terse: bool,
     schema: bool,
+    envelope: bool,
+}
+
+#[derive(Serialize)]
+struct ToolEnvelopeMetric {
+    label: String,
+    value: String,
+}
+
+#[derive(Serialize)]
+struct ToolEnvelopeSummary {
+    text: String,
+    metrics: Vec<ToolEnvelopeMetric>,
+}
+
+#[derive(Serialize)]
+struct ToolEnvelope<'a, T: Serialize> {
+    tool: &'a str,
+    view: &'a str,
+    summary: ToolEnvelopeSummary,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    follow_up: Vec<String>,
+    report: &'a T,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -633,6 +661,7 @@ fn main() -> Result<()> {
     let absolute = cli.absolute;
     let tabular = cli.tabular;
     let schema = cli.schema;
+    let envelope = cli.envelope;
     match cli.command {
         Some(Commands::Search {
             query,
@@ -659,7 +688,7 @@ fn main() -> Result<()> {
             },
             scope,
             federated,
-            json || terse || schema,
+            json || terse || schema || envelope,
             autoindex || !no_autoindex,
             timeout,
             compact,
@@ -668,6 +697,7 @@ fn main() -> Result<()> {
             absolute,
             tabular,
             schema,
+            envelope,
             ResponseBudget::new(max_items, max_bytes),
         ),
         Some(Commands::SearchWorker {
@@ -690,11 +720,12 @@ fn main() -> Result<()> {
             runner.as_deref(),
             &shell_command,
             OutputFormat {
-                json_output: json || terse || schema,
+                json_output: json || terse || schema || envelope,
                 compact,
                 pretty,
                 terse,
                 schema,
+                envelope,
             },
         ),
         Some(Commands::Edit { dry_run, file }) => {
@@ -719,7 +750,7 @@ fn main() -> Result<()> {
             quiet,
             workspace,
             submodule.as_deref(),
-            json || terse || schema,
+            json || terse || schema || envelope,
             compact,
             pretty,
             terse,
@@ -743,7 +774,7 @@ fn main() -> Result<()> {
             callees,
             scope.as_deref(),
             limit,
-            json || terse || schema,
+            json || terse || schema || envelope,
             compact,
             pretty,
             terse,
@@ -760,7 +791,7 @@ fn main() -> Result<()> {
             &db,
             query,
             table,
-            json || terse || schema,
+            json || terse || schema || envelope,
             compact,
             pretty,
             terse,
@@ -777,7 +808,7 @@ fn main() -> Result<()> {
             scope.as_deref(),
             min_size,
             limit,
-            json || terse || schema,
+            json || terse || schema || envelope,
             compact,
             pretty,
             terse,
@@ -795,7 +826,7 @@ fn main() -> Result<()> {
             &to,
             &path,
             scope.as_deref(),
-            json || terse || schema,
+            json || terse || schema || envelope,
             compact,
             pretty,
             terse,
@@ -814,13 +845,14 @@ fn main() -> Result<()> {
             &path,
             scope.as_deref(),
             limit,
-            json || terse || schema,
+            json || terse || schema || envelope,
             compact,
             pretty,
             terse,
             absolute,
             tabular,
             schema,
+            envelope,
             ResponseBudget::new(max_items, max_bytes),
         ),
         Some(Commands::Audit {
@@ -836,7 +868,7 @@ fn main() -> Result<()> {
             usage,
             cleanup,
             report,
-            json || terse || schema,
+            json || terse || schema || envelope,
             compact,
             pretty,
             terse,
@@ -856,7 +888,7 @@ fn main() -> Result<()> {
             &file,
             index,
             entities_from,
-            json || terse || schema,
+            json || terse || schema || envelope,
             compact,
             pretty,
             terse,
@@ -877,7 +909,7 @@ fn main() -> Result<()> {
             diff,
             stats,
             &path,
-            json || terse || schema,
+            json || terse || schema || envelope,
             compact,
             pretty,
             terse,
@@ -893,11 +925,12 @@ fn main() -> Result<()> {
             cached,
             revision.as_deref(),
             OutputFormat {
-                json_output: json || terse || schema,
+                json_output: json || terse || schema || envelope,
                 compact,
                 pretty,
                 terse,
                 schema,
+                envelope,
             },
         ),
         Some(Commands::TestDigest {
@@ -910,22 +943,24 @@ fn main() -> Result<()> {
             input.as_deref(),
             runner.as_deref(),
             OutputFormat {
-                json_output: json || terse || schema,
+                json_output: json || terse || schema || envelope,
                 compact,
                 pretty,
                 terse,
                 schema,
+                envelope,
             },
         ),
         Some(Commands::LogDigest { path, input, json }) => cmd_log_digest(
             &path,
             input.as_deref(),
             OutputFormat {
-                json_output: json || terse || schema,
+                json_output: json || terse || schema || envelope,
                 compact,
                 pretty,
                 terse,
                 schema,
+                envelope,
             },
         ),
         Some(Commands::ContextPack {
@@ -942,11 +977,12 @@ fn main() -> Result<()> {
             runner.as_deref(),
             log_input.as_deref(),
             OutputFormat {
-                json_output: json || terse || schema,
+                json_output: json || terse || schema || envelope,
                 compact,
                 pretty,
                 terse,
                 schema,
+                envelope,
             },
             ResponseBudget::new(max_items, max_bytes),
         ),
@@ -970,11 +1006,12 @@ fn main() -> Result<()> {
                 top,
             },
             OutputFormat {
-                json_output: json || terse || schema,
+                json_output: json || terse || schema || envelope,
                 compact,
                 pretty,
                 terse,
                 schema,
+                envelope,
             },
         ),
         Some(Commands::SessionDigest {
@@ -987,11 +1024,12 @@ fn main() -> Result<()> {
             input.as_deref(),
             source.as_deref(),
             OutputFormat {
-                json_output: json || terse || schema,
+                json_output: json || terse || schema || envelope,
                 compact,
                 pretty,
                 terse,
                 schema,
+                envelope,
             },
         ),
         Some(Commands::SessionCost {
@@ -1002,11 +1040,12 @@ fn main() -> Result<()> {
             input.as_deref(),
             source.as_deref(),
             OutputFormat {
-                json_output: json || terse || schema,
+                json_output: json || terse || schema || envelope,
                 compact,
                 pretty,
                 terse,
                 schema,
+                envelope,
             },
         ),
         Some(Commands::SessionReview {
@@ -1019,17 +1058,18 @@ fn main() -> Result<()> {
             &path,
             next_context,
             OutputFormat {
-                json_output: json || terse || schema,
+                json_output: json || terse || schema || envelope,
                 compact,
                 pretty,
                 terse,
                 schema,
+                envelope,
             },
             ResponseBudget::new(max_items, max_bytes),
         ),
         Some(Commands::Status { path, json }) => cmd_status(
             &path,
-            json || terse || schema,
+            json || terse || schema || envelope,
             compact,
             pretty,
             terse,
@@ -1038,7 +1078,7 @@ fn main() -> Result<()> {
         Some(Commands::Locks { path, scope, json }) => cmd_locks(
             &path,
             scope.as_deref(),
-            json || terse || schema,
+            json || terse || schema || envelope,
             compact,
             pretty,
             terse,
@@ -1145,6 +1185,55 @@ fn to_json_schema<T: serde::Serialize>(
     }
 }
 
+fn envelope_metric(label: &str, value: impl ToString) -> ToolEnvelopeMetric {
+    ToolEnvelopeMetric {
+        label: label.to_string(),
+        value: value.to_string(),
+    }
+}
+
+fn dedupe_preserve_order(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for value in values {
+        if seen.insert(value.clone()) {
+            deduped.push(value);
+        }
+    }
+    deduped
+}
+
+fn print_json_or_envelope<T: Serialize>(
+    report: &T,
+    format: &OutputFormat,
+    tool: &str,
+    view: &str,
+    summary: ToolEnvelopeSummary,
+    truncated: bool,
+    follow_up: Vec<String>,
+) -> Result<()> {
+    if format.envelope {
+        let envelope = ToolEnvelope {
+            tool,
+            view,
+            summary,
+            truncated,
+            follow_up: dedupe_preserve_order(follow_up),
+            report,
+        };
+        println!(
+            "{}",
+            to_json_schema(&envelope, format.pretty, format.terse, format.schema)?
+        );
+    } else {
+        println!(
+            "{}",
+            to_json_schema(report, format.pretty, format.terse, format.schema)?
+        );
+    }
+    Ok(())
+}
+
 fn terse_key(key: &str) -> &str {
     match key {
         "name" => "n",
@@ -1219,6 +1308,14 @@ fn terse_key(key: &str) -> &str {
         "file_path" => "fp",
         "content_hash" => "hsh",
         "summary" => "sum",
+        "tool" => "tl",
+        "view" => "vw",
+        "truncated" => "tr",
+        "follow_up" => "fu",
+        "report" => "rp",
+        "metrics" => "ms",
+        "label" => "lb",
+        "value" => "v",
         "entities" => "ent",
         "relationships" => "rel",
         "concept_labels" => "cls",
@@ -1439,6 +1536,14 @@ const TERSE_PAIRS: &[(&str, &str)] = &[
     ("file_path", "fp"),
     ("content_hash", "hsh"),
     ("summary", "sum"),
+    ("tool", "tl"),
+    ("view", "vw"),
+    ("truncated", "tr"),
+    ("follow_up", "fu"),
+    ("report", "rp"),
+    ("metrics", "ms"),
+    ("label", "lb"),
+    ("value", "v"),
     ("entities", "ent"),
     ("relationships", "rel"),
     ("concept_labels", "cls"),
@@ -2777,6 +2882,7 @@ fn cmd_explain(
         absolute,
         tabular,
         schema,
+        false,
         ResponseBudget::default(),
     )
 }
@@ -2794,9 +2900,18 @@ fn cmd_explain_with_budget(
     absolute: bool,
     tabular: bool,
     schema: bool,
+    envelope: bool,
     budget: ResponseBudget,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let format = OutputFormat {
+        json_output,
+        compact,
+        pretty,
+        terse,
+        schema,
+        envelope,
+    };
     let db = open_index_db(path, scope)?;
 
     let mut symbols = db.symbol_info(symbol)?;
@@ -2840,12 +2955,34 @@ fn cmd_explain_with_budget(
             community,
             budget,
         );
-        if json_output {
-            println!("{}", to_json_schema(&report, pretty, terse, schema)?);
+        if format.json_output {
+            print_json_or_envelope(
+                &report,
+                &format,
+                "explain",
+                "preview",
+                ToolEnvelopeSummary {
+                    text: format!("explain preview for {}", symbol),
+                    metrics: vec![
+                        envelope_metric("definitions", report.definition_total),
+                        envelope_metric("callers", report.callers_total),
+                        envelope_metric("callees", report.callees_total),
+                    ],
+                },
+                report.truncated,
+                vec![format!(
+                    "tsift explain {} --path {} --limit 0{}",
+                    shell_quote(symbol),
+                    shell_quote(path.to_string_lossy().as_ref()),
+                    scope
+                        .map(|value| format!(" --scope {}", shell_quote(value)))
+                        .unwrap_or_default()
+                )],
+            )?;
         } else {
             print_explain_budget_human(&report);
         }
-    } else if json_output {
+    } else if format.json_output {
         let out = serde_json::json!({
             "symbol": symbol,
             "definitions": symbols,
@@ -2857,7 +2994,29 @@ fn cmd_explain_with_budget(
             "callees_truncated": callees_truncated,
             "community": community,
         });
-        println!("{}", to_json_schema(&out, pretty, terse, schema)?);
+        print_json_or_envelope(
+            &out,
+            &format,
+            "explain",
+            "report",
+            ToolEnvelopeSummary {
+                text: format!("explain results for {}", symbol),
+                metrics: vec![
+                    envelope_metric("definitions", symbols.len()),
+                    envelope_metric("callers", callers_total),
+                    envelope_metric("callees", callees_total),
+                ],
+            },
+            callers_truncated || callees_truncated,
+            vec![format!(
+                "tsift explain {} --path {} --limit 0{}",
+                shell_quote(symbol),
+                shell_quote(path.to_string_lossy().as_ref()),
+                scope
+                    .map(|value| format!(" --scope {}", shell_quote(value)))
+                    .unwrap_or_default()
+            )],
+        )?;
     } else if tabular {
         if !symbols.is_empty() {
             println!("section\tkind\tname\tfile\tline");
@@ -3962,10 +4121,36 @@ fn cmd_context_pack(
 ) -> Result<()> {
     let report = build_context_pack_report(path, test_input, runner, log_input, budget)?;
     if format.json_output {
-        println!(
-            "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.schema)?
-        );
+        print_json_or_envelope(
+            &report,
+            &format,
+            "context-pack",
+            "handoff",
+            ToolEnvelopeSummary {
+                text: format!("context pack for {}", report.target),
+                metrics: vec![
+                    envelope_metric("prompt_targets", report.next_context.prompt_target_total),
+                    envelope_metric("files_changed", report.diff_digest.files_changed),
+                    envelope_metric("test", &report.test_digest.status),
+                    envelope_metric("log", &report.log_digest.status),
+                ],
+            },
+            report.next_context.truncated
+                || report.diff_digest.truncated
+                || report
+                    .test_digest
+                    .report
+                    .as_ref()
+                    .map(|entry| entry.truncated)
+                    .unwrap_or(false)
+                || report
+                    .log_digest
+                    .report
+                    .as_ref()
+                    .map(|entry| entry.truncated)
+                    .unwrap_or(false),
+            report.resume_commands.clone(),
+        )?;
         return Ok(());
     }
 
@@ -4703,20 +4888,53 @@ fn cmd_session_review_with_budget(
         if next_context {
             let budget_report = build_session_review_next_context_budget_report(&report, budget);
             if format.json_output {
-                println!(
-                    "{}",
-                    to_json_schema(&budget_report, format.pretty, format.terse, format.schema)?
-                );
+                print_json_or_envelope(
+                    &budget_report,
+                    &format,
+                    "session-review",
+                    "next-context-preview",
+                    ToolEnvelopeSummary {
+                        text: format!("next-context preview for {}", budget_report.target),
+                        metrics: vec![
+                            envelope_metric("prompt_targets", budget_report.prompt_target_total),
+                            envelope_metric("files", budget_report.touched_file_total),
+                            envelope_metric("symbols", budget_report.touched_symbol_total),
+                            envelope_metric("failures", budget_report.unresolved_failure_total),
+                        ],
+                    },
+                    budget_report.truncated,
+                    budget_report.next_digest_commands.clone(),
+                )?;
             } else {
                 print_session_review_next_context_budget_human(&budget_report);
             }
         } else {
             let budget_report = build_session_review_budget_report(&report, budget);
             if format.json_output {
-                println!(
-                    "{}",
-                    to_json_schema(&budget_report, format.pretty, format.terse, format.schema)?
-                );
+                let mut follow_up = vec![format!(
+                    "tsift session-review {} --next-context --json",
+                    shell_quote(&budget_report.target)
+                )];
+                if let Some(session) = budget_report.sessions.first() {
+                    follow_up.push(session.expand.clone());
+                }
+                print_json_or_envelope(
+                    &budget_report,
+                    &format,
+                    "session-review",
+                    "preview",
+                    ToolEnvelopeSummary {
+                        text: format!("session review preview for {}", budget_report.target),
+                        metrics: vec![
+                            envelope_metric("sessions", budget_report.sessions_matched),
+                            envelope_metric("prompt_targets", budget_report.prompt_targets.len()),
+                            envelope_metric("failures", budget_report.failures.len()),
+                            envelope_metric("total_tokens", budget_report.total_tokens),
+                        ],
+                    },
+                    budget_report.truncated,
+                    follow_up,
+                )?;
             } else {
                 print_session_review_budget_human(&budget_report);
             }
@@ -4725,15 +4943,26 @@ fn cmd_session_review_with_budget(
     }
     if next_context {
         if format.json_output {
-            println!(
-                "{}",
-                to_json_schema(
-                    &report.next_context,
-                    format.pretty,
-                    format.terse,
-                    format.schema
-                )?
-            );
+            print_json_or_envelope(
+                &report.next_context,
+                &format,
+                "session-review",
+                "next-context",
+                ToolEnvelopeSummary {
+                    text: format!("next-context for {}", report.next_context.target),
+                    metrics: vec![
+                        envelope_metric(
+                            "prompt_targets",
+                            report.next_context.active_prompt_targets.len(),
+                        ),
+                        envelope_metric("files", report.next_context.touched_files.len()),
+                        envelope_metric("symbols", report.next_context.touched_symbols.len()),
+                        envelope_metric("failures", report.next_context.unresolved_failures.len()),
+                    ],
+                },
+                false,
+                report.next_context.next_digest_commands.clone(),
+            )?;
             return Ok(());
         }
 
@@ -4808,10 +5037,28 @@ fn cmd_session_review_with_budget(
     }
 
     if format.json_output {
-        println!(
-            "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.schema)?
-        );
+        let mut follow_up = vec![format!(
+            "tsift session-review {} --next-context --json",
+            shell_quote(&report.target)
+        )];
+        follow_up.extend(report.next_context.next_digest_commands.clone());
+        print_json_or_envelope(
+            &report,
+            &format,
+            "session-review",
+            "report",
+            ToolEnvelopeSummary {
+                text: format!("session review for {}", report.target),
+                metrics: vec![
+                    envelope_metric("sessions", report.sessions_matched),
+                    envelope_metric("prompt_targets", report.prompt_target_count),
+                    envelope_metric("failures", report.failure_groups),
+                    envelope_metric("total_tokens", report.total_tokens),
+                ],
+            },
+            false,
+            follow_up,
+        )?;
         return Ok(());
     }
 
@@ -6635,6 +6882,7 @@ fn cmd_search(
         absolute,
         tabular,
         schema,
+        false,
         ResponseBudget::default(),
     )
 }
@@ -6656,9 +6904,18 @@ fn cmd_search_with_budget(
     absolute: bool,
     tabular: bool,
     schema: bool,
+    envelope: bool,
     budget: ResponseBudget,
 ) -> Result<()> {
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
+    let format = OutputFormat {
+        json_output,
+        compact,
+        pretty,
+        terse,
+        schema,
+        envelope,
+    };
     let root = lint::resolve_project_root_or_canonical_path(&base_path)?;
     let search_cache_dir = root.join(".tsift/search-cache");
     let requested_strategy = resolve_search_strategy(&query, strategy);
@@ -6759,12 +7016,40 @@ fn cmd_search_with_budget(
             absolute,
             budget,
         );
-        if json_output {
-            println!("{}", to_json_schema(&report, pretty, terse, schema)?);
+        if format.json_output {
+            let mut follow_up = vec![build_search_budget_follow_up(
+                &query,
+                &effective_strategy,
+                base_path.to_string_lossy().as_ref(),
+            )];
+            if let Some(symbol) = report.symbols.first() {
+                follow_up.push(symbol.expand.clone());
+            }
+            if let Some(hit) = report.hits.first() {
+                follow_up.push(hit.expand.clone());
+            }
+            print_json_or_envelope(
+                &report,
+                &format,
+                "search",
+                "preview",
+                ToolEnvelopeSummary {
+                    text: format!("search preview for {}", query),
+                    metrics: vec![
+                        envelope_metric("strategy", &report.strategy),
+                        envelope_metric("symbols", report.symbol_total),
+                        envelope_metric("hits", report.hit_total),
+                        envelope_metric("indexed", report.indexed_artifacts),
+                        envelope_metric("skipped", report.skipped_artifacts),
+                    ],
+                },
+                report.truncated,
+                follow_up,
+            )?;
         } else {
             print_search_budget_human(&report);
         }
-    } else if json_output {
+    } else if format.json_output {
         #[derive(Serialize)]
         struct CombinedResponse<'a> {
             symbols: &'a [index::SymbolHit],
@@ -6779,7 +7064,28 @@ fn cmd_search_with_budget(
             symbols: &symbol_hits,
             sift: &sift_value,
         };
-        println!("{}", to_json_schema(&combined, pretty, terse, schema)?);
+        print_json_or_envelope(
+            &combined,
+            &format,
+            "search",
+            "report",
+            ToolEnvelopeSummary {
+                text: format!("search results for {}", query),
+                metrics: vec![
+                    envelope_metric("strategy", &effective_strategy),
+                    envelope_metric("symbols", symbol_hits.len()),
+                    envelope_metric("hits", response.hits.len()),
+                    envelope_metric("indexed", response.indexed_artifacts),
+                    envelope_metric("skipped", response.skipped_artifacts),
+                ],
+            },
+            false,
+            vec![build_search_budget_follow_up(
+                &query,
+                &effective_strategy,
+                base_path.to_string_lossy().as_ref(),
+            )],
+        )?;
     } else if tabular {
         if !symbol_hits.is_empty() {
             println!("match_type\tkind\tname\tfile\tline\tscore");
@@ -11061,6 +11367,18 @@ tier = "private"
         let cli = Cli::parse_from(["tsift", "--schema", "search", "test"]);
         assert!(cli.schema);
         assert!(matches!(cli.command, Some(Commands::Search { .. })));
+    }
+
+    #[test]
+    fn cli_accepts_global_envelope_flag() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "--envelope",
+            "context-pack",
+            "tasks/software/tsift.md",
+        ]);
+        assert!(cli.envelope);
+        assert!(matches!(cli.command, Some(Commands::ContextPack { .. })));
     }
 
     #[test]

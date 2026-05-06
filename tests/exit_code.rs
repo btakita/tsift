@@ -3477,6 +3477,44 @@ fn context_pack_json_composes_next_context_and_optional_digests() {
         json["resume_commands"][0],
         "tsift session-review --next-context tasks/software/tsift.md"
     );
+
+    let envelope_output = tsift_bin()
+        .args([
+            "--envelope",
+            "context-pack",
+            "tasks/software/tsift.md",
+            "--json",
+            "--test-input",
+            "target-test.log",
+            "--runner",
+            "cargo",
+            "--log-input",
+            "target-build.log",
+            "--max-items",
+            "2",
+            "--max-bytes",
+            "96",
+        ])
+        .env("HOME", home.path())
+        .current_dir(root.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        envelope_output.status.success(),
+        "context-pack envelope should succeed"
+    );
+    let envelope_json: serde_json::Value = serde_json::from_slice(&envelope_output.stdout).unwrap();
+    assert_eq!(envelope_json["tool"], "context-pack");
+    assert_eq!(envelope_json["view"], "handoff");
+    assert_eq!(
+        envelope_json["summary"]["metrics"][0]["label"],
+        "prompt_targets"
+    );
+    assert_eq!(
+        envelope_json["report"]["resume_commands"][0],
+        "tsift session-review --next-context tasks/software/tsift.md"
+    );
 }
 
 #[test]
