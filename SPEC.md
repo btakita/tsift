@@ -1128,6 +1128,8 @@ The existing `tsift-rewrite.sh` hook intercepts high-token shell commands and si
 
 The digest-runner path preserves the wrapped command's original exit status while replacing raw stdout/stderr with a bounded digest, so failing tests/builds still fail closed instead of being laundered through a successful shell pipe. See `~/.claude/hooks/tsift-rewrite.sh`.
 
+Harnesses that do not expose Claude-style `PreToolUse` hooks can still reuse the same rewrite path manually via `tsift rewrite --run '<command>'`. In `--run` mode, tsift executes the rewritten command directly instead of only printing it, preserves the rewritten command's exit status, and applies native output caps for verbose `tsift search`, `tsift explain`, `tsift graph`, `tsift communities`, and `tsift index` human-readable output.
+
 ### RTK Output Filtering (`PreToolUse`)
 
 The `tsift-rewrite.sh` hook (phase 2) routes verbose tsift commands through RTK for output capping when RTK is installed. Commands routed: `communities`, `explain`, `graph`, `index`, `search`. Non-verbose commands (`status`, `init`, `route`, `sql`) pass through unchanged.
@@ -1145,6 +1147,8 @@ RTK TOML filters at `~/.config/rtk/filters.toml` define per-command caps:
 All filters also strip ANSI codes and blank lines. The `--compact` and `--pretty` global flag variants are matched.
 
 **Interaction with `--quiet`:** the `index` filter is a safety net for unqualified `tsift index` calls. When `--quiet` or `--exit-code` is passed, the binary already suppresses verbose output, making the RTK filter a no-op.
+
+Outside the Claude hook path, `tsift rewrite --run '<command>'` provides a built-in fallback for the same bounded-output policy. Structured `--json` / `--terse` / `--schema` / `--tabular` output stays untouched; only the default human-readable output is capped.
 
 ## What NOT to build
 

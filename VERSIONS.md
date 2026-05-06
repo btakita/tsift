@@ -8,6 +8,12 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.37
+
+- `tsift rewrite` now supports `--run`, which executes the rewritten digest-first tsift command directly instead of only printing it for Claude hook integration.
+- `rewrite --run` preserves the rewritten command's exit status and applies tsift-owned output caps for verbose human-readable `search`, `explain`, `graph`, `communities`, and `index` output, so Codex and other harnesses can stay bounded without depending on Claude `PreToolUse` hooks or RTK.
+- Updated the injected Code Navigation guidance, spec, and harness-facing docs to point non-Claude harnesses at `tsift rewrite --run '<command>'` as the manual bounded fallback.
+
 ## 0.1.36
 
 - `tsift session-cost` now emits bounded `loop_clusters` summaries for repeated prompt bodies, repeated command bundles, and repeated closeout churn across Claude JSONL, Codex JSONL, and `agent-doc` runtime logs.

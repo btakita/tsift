@@ -155,10 +155,13 @@ enum Commands {
         #[arg(long)]
         id: bool,
     },
-    /// Rewrite a shell command to use tsift (for Claude Code hook integration)
+    /// Rewrite a shell command to use tsift, or run the bounded tsift equivalent directly
     Rewrite {
         /// The shell command to potentially rewrite
         command: String,
+        /// Execute the rewritten tsift command instead of only printing it
+        #[arg(long)]
+        run: bool,
     },
     /// Build or update the file index (mtime-based incremental)
     Index {
@@ -651,7 +654,7 @@ fn main() -> Result<()> {
             absolute,
             schema,
         ),
-        Some(Commands::Rewrite { command }) => cmd_rewrite(&command),
+        Some(Commands::Rewrite { command, run }) => cmd_rewrite(&command, run),
         Some(Commands::Route { task, id }) => cmd_route(&task, id),
         Some(Commands::Graph {
             symbol,
@@ -6902,6 +6905,34 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_output_cap_detects_search_even_with_global_flag() {
+        let cap = rewrite_output_cap("tsift --compact search foo").expect("cap");
+        assert_eq!(cap.max_lines, 50);
+        assert_eq!(cap.strip_prefix, Some("Strategy:"));
+    }
+
+    #[test]
+    fn rewrite_output_cap_skips_structured_output() {
+        assert!(rewrite_output_cap("tsift search foo --json").is_none());
+        assert!(rewrite_output_cap("tsift --schema graph foo").is_none());
+    }
+
+    #[test]
+    fn output_cap_strips_search_header_and_truncates() {
+        let capped = apply_output_cap(
+            b"Strategy: exact | Indexed: 0 | Skipped: 0\n\nline1\nline2\nline3\n",
+            OutputCap {
+                max_lines: 2,
+                strip_prefix: Some("Strategy:"),
+            },
+        );
+        assert_eq!(
+            capped,
+            "line1\nline2\n... (+1 more lines; rerun the underlying tsift command directly for the full output)\n"
+        );
+    }
+
+    #[test]
     fn sql_schema_overview_lists_tables() {
         let (_tmp, conn) = setup_test_db();
         let tables = schema_overview(&conn).unwrap();
@@ -10279,21 +10310,152 @@ fn cmd_sql(
     Ok(())
 }
 
-// --- Command rewriting for Claude Code hooks ---
+// --- Command rewriting for hook integrations and manual bounded execution ---
 
 /// Exit codes for `tsift rewrite` (matches rtk protocol):
 ///   0 + stdout → rewrite found, auto-allow
 ///   1          → no tsift equivalent, pass through
-fn cmd_rewrite(command: &str) -> Result<()> {
-    match rewrite_command(command) {
-        Some(rewritten) => {
-            print!("{}", rewritten);
-            Ok(())
-        }
-        None => {
-            std::process::exit(1);
-        }
+fn cmd_rewrite(command: &str, run: bool) -> Result<()> {
+    let rewritten = match rewrite_command(command) {
+        Some(rewritten) => rewritten,
+        None => std::process::exit(1),
+    };
+
+    if !run {
+        print!("{}", rewritten);
+        return Ok(());
     }
+
+    let status_code = execute_rewritten_command(&rewritten)?;
+    std::process::exit(status_code);
+}
+
+#[derive(Clone, Copy)]
+struct OutputCap {
+    max_lines: usize,
+    strip_prefix: Option<&'static str>,
+}
+
+fn execute_rewritten_command(command: &str) -> Result<i32> {
+    let parts = shell_split(command);
+    let Some(program) = parts.first().map(|part| strip_shell_quotes(part)) else {
+        bail!("rewritten command was empty");
+    };
+    let args: Vec<String> = parts[1..]
+        .iter()
+        .map(|part| strip_shell_quotes(part).to_string())
+        .collect();
+    let output = Command::new(program)
+        .args(&args)
+        .output()
+        .with_context(|| format!("executing rewritten command `{command}`"))?;
+
+    let stdout = if let Some(cap) = rewrite_output_cap(command) {
+        apply_output_cap(&output.stdout, cap)
+    } else {
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    if !stdout.is_empty() {
+        print!("{stdout}");
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    Ok(output
+        .status
+        .code()
+        .unwrap_or_else(|| if output.status.success() { 0 } else { 1 }))
+}
+
+fn rewrite_output_cap(command: &str) -> Option<OutputCap> {
+    let parts = shell_split(command);
+    if strip_shell_quotes(parts.first()?) != "tsift" {
+        return None;
+    }
+    let structured = parts.iter().skip(1).any(|part| {
+        matches!(
+            strip_shell_quotes(part),
+            "--json" | "--terse" | "--schema" | "--tabular"
+        )
+    });
+    if structured {
+        return None;
+    }
+
+    let subcommand = parts
+        .iter()
+        .skip(1)
+        .map(|part| strip_shell_quotes(part))
+        .find(|part| !part.starts_with('-'))?;
+    match subcommand {
+        "communities" => Some(OutputCap {
+            max_lines: 80,
+            strip_prefix: None,
+        }),
+        "explain" => Some(OutputCap {
+            max_lines: 40,
+            strip_prefix: None,
+        }),
+        "graph" => Some(OutputCap {
+            max_lines: 50,
+            strip_prefix: None,
+        }),
+        "index" => Some(OutputCap {
+            max_lines: 30,
+            strip_prefix: None,
+        }),
+        "search" => Some(OutputCap {
+            max_lines: 50,
+            strip_prefix: Some("Strategy:"),
+        }),
+        _ => None,
+    }
+}
+
+fn apply_output_cap(stdout: &[u8], cap: OutputCap) -> String {
+    let cleaned = strip_ansi_codes(&String::from_utf8_lossy(stdout));
+    let mut lines: Vec<String> = cleaned
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            cap.strip_prefix
+                .map(|prefix| !line.starts_with(prefix))
+                .unwrap_or(true)
+        })
+        .map(ToOwned::to_owned)
+        .collect();
+    if lines.len() > cap.max_lines {
+        let hidden = lines.len() - cap.max_lines;
+        lines.truncate(cap.max_lines);
+        lines.push(format!(
+            "... (+{hidden} more lines; rerun the underlying tsift command directly for the full output)"
+        ));
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+fn strip_ansi_codes(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && matches!(chars.peek(), Some('[')) {
+            chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+            continue;
+        }
+        output.push(ch);
+    }
+    output
 }
 
 /// Attempt to rewrite a shell command to use tsift.

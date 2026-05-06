@@ -13,7 +13,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift graph` | Call-graph queries: `--callers` / `--callees` of a symbol. `--limit N` (default 20, 0=unlimited) / `--scope <name>` / `--json`. Workspace roots with only scoped `.tsift/indexes/*/index.db` state fail closed until the caller selects a scope. |
 | `tsift edit` | Batch file edits from JSON (stdin or `--file`), atomic validate-then-write |
 | `tsift route` | Classify task → model tier (haiku/sonnet/opus) |
-| `tsift rewrite` | Shell command → tsift equivalent (for Claude Code hook integration), including exact-search rewrites plus digest-routing for `git diff`, `git diff --cached`, `git show`, simple patch-style `git log -p -1 ...`, long session transcript reads (`cat` / `head` / `tail` / `sed -n` over agent-doc markdown, Claude JSONL, Codex JSONL, or agent-doc runtime logs), `cargo test` / `pytest`, and verbose cargo build/check/install flows |
+| `tsift rewrite` | Shell command → tsift equivalent. Default mode prints the rewrite for hook integration; `--run` executes the bounded tsift equivalent directly so Codex and other harnesses can reuse the same digest-first path without Claude `PreToolUse` hooks. Coverage includes exact-search rewrites plus digest-routing for `git diff`, `git diff --cached`, `git show`, simple patch-style `git log -p -1 ...`, long session transcript reads (`cat` / `head` / `tail` / `sed -n` over agent-doc markdown, Claude JSONL, Codex JSONL, or agent-doc runtime logs), `cargo test` / `pytest`, and verbose cargo build/check/install flows. |
 | `tsift sql` | SQLite introspection: schema overview, table detail, read-only query |
 | `tsift communities` | Louvain community detection over call graph. `--min-size N` / `--limit N` (default 10, 0=unlimited) / `--scope <name>` / `--json`. Workspace roots with scoped-only indexes require an explicit scope. |
 | `tsift path` | BFS shortest path between two symbols. `--scope <name>` / `--json`. Workspace roots with scoped-only indexes require an explicit scope. |
@@ -108,13 +108,14 @@ If copied skill instructions lag behind the installed binary, treat this file, `
 - **Inline lock diagnostics**: if `tsift search` autoindex or `tsift index` still loses a write race, stderr now includes the live `lock` / `journal` state, the exact reindex command, and the recommended next step without requiring a separate `tsift locks`.
 - **Search rewrite** (`PreToolUse`): `~/.claude/hooks/tsift-rewrite.sh` rewrites `rg`/`grep -r` to `tsift search --exact`, `git diff` / `git diff --cached` / `git show` / simple `git log -p -1 ...` history commands to `tsift diff-digest`, long transcript reads (`cat`, `bat`, `head -n`, `tail -n`, `sed -n`) over recognized agent-doc markdown sessions, Claude JSONL, Codex JSONL, or `agent-doc` runtime logs to `tsift session-digest` rooted at the transcript's owning repo/submodule when present, `cargo test` / `pytest` to the tsift test-digest wrapper, and verbose cargo build/check/clippy/install commands to the tsift log-digest wrapper.
 - **RTK output filtering** (`PreToolUse`): same hook routes verbose commands (`communities`, `explain`, `graph`, `index`, `search`) through RTK when installed. TOML filters at `~/.config/rtk/filters.toml` cap output lines.
+- **Cross-harness fallback**: when your harness does not offer Claude-style `PreToolUse` hooks, run `tsift rewrite --run '<command>'`. It executes the same digest-first rewrite directly and applies tsift-owned output caps for verbose `search`, `explain`, `graph`, `communities`, and `index` output, so Codex and other harnesses do not need RTK to stay bounded.
 - **Stale-session recovery**: if a resumed tmux or Codex session hits `tsift search timed out ... The index may be stale`, run `tsift index .` and retry the original tsift command.
 
 ## Repo
 
 Private: `github.com/btakita/tsift`. Submodule at `src/tsift` in agent-loop.
 
-<!-- tsift:code-navigation v=0.1.34 -->
+<!-- tsift:code-navigation v=0.1.37 -->
 ## Code Navigation
 
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root.
@@ -126,9 +127,10 @@ Use the commands listed in its `use:` output:
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
 
 Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
-- `tsift session-digest <file>` / `tsift session-review <path>` / `tsift session-review --next-context <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
+- `tsift session-digest <file>` / `tsift session-review <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
 - `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
 - `tsift test-digest --path .` / `tsift log-digest --path .` for noisy test/build/install output, or let the rewrite/hooks wrap `cargo test`, `pytest`, and verbose cargo commands for you.
+- If your harness does not support Claude-style `PreToolUse` hooks, run `tsift rewrite --run '<command>'` to execute the same digest-first/bounded tsift equivalent manually.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->

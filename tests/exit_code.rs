@@ -3669,6 +3669,53 @@ fn rewrite_routes_long_codex_jsonl_reads_to_session_digest() {
 }
 
 #[test]
+fn rewrite_run_caps_verbose_tsift_search_output() {
+    let dir = tempfile::tempdir().unwrap();
+    for idx in 0..80 {
+        fs::write(
+            dir.path().join(format!("match-{idx}.rs")),
+            format!("fn hookcaps_{idx}() {{}}\n// hookcaps\n"),
+        )
+        .unwrap();
+    }
+
+    let command = format!(
+        "tsift search hookcaps --exact --limit 80 --path {}",
+        dir.path().display()
+    );
+    let output = tsift_bin()
+        .args(["rewrite", "--run", &command])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "rewrite --run should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("Strategy:"));
+    assert!(
+        stdout.contains("... (+"),
+        "expected truncation note in capped output: {stdout}"
+    );
+    let nonempty_lines = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    assert!(
+        nonempty_lines <= 51,
+        "expected capped output, got {nonempty_lines} nonempty lines:\n{stdout}"
+    );
+}
+
+#[test]
+fn rewrite_run_fails_closed_when_no_rewrite_exists() {
+    let output = tsift_bin()
+        .args(["rewrite", "--run", "printf hello"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
 fn digest_runner_preserves_failing_test_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();

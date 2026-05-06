@@ -1228,12 +1228,14 @@ fn collect_loop_clusters(
 ) -> Vec<SessionCostLoopCluster> {
     let mut rows = entries
         .into_iter()
-        .map(|((kind, label), (occurrences, max_consecutive))| SessionCostLoopCluster {
-            kind,
-            label,
-            occurrences,
-            max_consecutive,
-        })
+        .map(
+            |((kind, label), (occurrences, max_consecutive))| SessionCostLoopCluster {
+                kind,
+                label,
+                occurrences,
+                max_consecutive,
+            },
+        )
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
         right

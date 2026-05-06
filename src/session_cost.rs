@@ -569,7 +569,9 @@ fn ingest_codex_jsonl(input: &str, state: &mut CostState) -> Result<()> {
             }
         };
         match value.get("type").and_then(Value::as_str) {
-            Some("response_item") => collect_codex_response_item_loop_signals(&value, index + 1, state),
+            Some("response_item") => {
+                collect_codex_response_item_loop_signals(&value, index + 1, state)
+            }
             Some("event_msg") => collect_codex_event_msg_loop_signals(&value, index + 1, state),
             _ => {}
         }
@@ -815,7 +817,11 @@ fn push_command(command: String, state: &mut CostState) {
     if normalized.is_empty() {
         return;
     }
-    if state.pending_commands.last().is_some_and(|existing| existing == &normalized) {
+    if state
+        .pending_commands
+        .last()
+        .is_some_and(|existing| existing == &normalized)
+    {
         return;
     }
     state.pending_commands.push(normalized);
@@ -1559,14 +1565,13 @@ mod tests {
                     && cluster.label == "cargo test -> cargo build --release"
                     && cluster.occurrences == 2)
         );
-        assert!(
-            report
-                .loop_clusters
-                .iter()
-                .any(|cluster| cluster.kind == "closeout_churn"
-                    && cluster.label.contains("Committed and pushed in `src/tsift`")
-                    && cluster.occurrences == 2)
-        );
+        assert!(report.loop_clusters.iter().any(|cluster| {
+            cluster.kind == "closeout_churn"
+                && cluster
+                    .label
+                    .contains("Committed and pushed in `src/tsift`")
+                && cluster.occurrences == 2
+        }));
     }
 
     #[test]
