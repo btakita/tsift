@@ -128,6 +128,8 @@ struct DigestState {
     symbols: BTreeMap<String, usize>,
     failures: BTreeMap<(String, String), usize>,
     runtime_events: BTreeMap<String, usize>,
+    seen_document_cycle_events: BTreeSet<(String, String)>,
+    seen_document_cycle_closeout: BTreeSet<(String, String, String)>,
     restart_churn: RestartChurnState,
     closeout: BTreeMap<(String, String), usize>,
     warnings: Vec<String>,
@@ -408,10 +410,10 @@ fn ingest_agent_doc_log(root: &Path, input: &str, state: &mut DigestState) {
         };
 
         state.transcript_items += 1;
-        *state
-            .runtime_events
-            .entry(normalize_runtime_event(event_name, detail))
-            .or_default() += 1;
+        let normalized_event = normalize_runtime_event(event_name, detail);
+        if should_count_runtime_event(event_name, detail, &normalized_event, state) {
+            *state.runtime_events.entry(normalized_event).or_default() += 1;
+        }
         state.restart_churn.observe(event_name, detail);
 
         for key in ["file", "path", "project_root"] {
@@ -447,7 +449,9 @@ fn ingest_agent_doc_log(root: &Path, input: &str, state: &mut DigestState) {
         }
 
         for (kind, closeout) in detect_closeout(detail) {
-            *state.closeout.entry((kind, closeout)).or_default() += 1;
+            if should_count_closeout(event_name, detail, &kind, &closeout, state) {
+                *state.closeout.entry((kind, closeout)).or_default() += 1;
+            }
         }
     }
 }
@@ -1192,6 +1196,20 @@ fn detect_closeout(text: &str) -> Vec<(String, String)> {
     let normalized = normalize_whitespace(strip_common_prefixes(text));
     let lower = normalized.to_ascii_lowercase();
 
+    if normalized.starts_with("document_cycle ") {
+        let phase = extract_field(&normalized, "phase");
+        let event = extract_field(&normalized, "event");
+        if phase == Some("committed")
+            && let Some(event) = event
+        {
+            out.push((
+                "commit".to_string(),
+                format!("document_cycle phase=committed event={event}"),
+            ));
+        }
+        return dedupe_pairs(out);
+    }
+
     if lower.contains("verification passed") || lower.starts_with("verification in ") {
         out.push((
             "verification".to_string(),
@@ -1227,6 +1245,11 @@ fn detect_closeout(text: &str) -> Vec<(String, String)> {
 }
 
 fn normalize_runtime_event(event_name: &str, detail: &str) -> String {
+    if event_name == "document_cycle"
+        && let Some(document_event) = extract_field(detail, "event")
+    {
+        return document_event.to_string();
+    }
     if matches!(
         event_name,
         "claude_start" | "codex_start" | "claude_restart" | "codex_restart"
@@ -1235,6 +1258,41 @@ fn normalize_runtime_event(event_name: &str, detail: &str) -> String {
         return format!("{event_name}:{mode}");
     }
     event_name.to_string()
+}
+
+fn should_count_runtime_event(
+    event_name: &str,
+    detail: &str,
+    normalized: &str,
+    state: &mut DigestState,
+) -> bool {
+    if event_name == "document_cycle"
+        && let Some(cycle) = extract_field(detail, "cycle")
+    {
+        return state
+            .seen_document_cycle_events
+            .insert((cycle.to_string(), normalized.to_string()));
+    }
+    true
+}
+
+fn should_count_closeout(
+    event_name: &str,
+    detail: &str,
+    kind: &str,
+    closeout: &str,
+    state: &mut DigestState,
+) -> bool {
+    if event_name == "document_cycle"
+        && let Some(cycle) = extract_field(detail, "cycle")
+    {
+        return state.seen_document_cycle_closeout.insert((
+            cycle.to_string(),
+            kind.to_string(),
+            closeout.to_string(),
+        ));
+    }
+    true
 }
 
 fn extract_field<'a>(detail: &'a str, key: &str) -> Option<&'a str> {
@@ -1546,5 +1604,38 @@ do [#sessiondigest]. spec-test-build-install-commit-push
                 .iter()
                 .any(|entry| entry.family == "quit_after_eof" && entry.occurrences == 1)
         );
+    }
+
+    #[test]
+    fn agent_doc_log_digest_dedupes_document_cycle_closeouts_by_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = "\
+[1777603275] document_cycle phase=response_captured cycle=cycle-1 event=response_captured capture_id=cycle-1
+[1777603276] document_cycle phase=committed cycle=cycle-1 event=commit_success capture_id=cycle-1
+[1777603403] document_cycle phase=committed cycle=cycle-1 event=commit_already_current capture_id=cycle-1
+[1777603404] document_cycle phase=committed cycle=cycle-1 event=commit_already_current capture_id=cycle-1
+[1777603600] document_cycle phase=committed cycle=cycle-2 event=commit_already_current
+[1777603601] document_cycle phase=committed cycle=cycle-2 event=commit_already_current
+[1777603700] document_cycle phase=committed cycle=cycle-3 event=commit_already_current
+";
+
+        let report = compute(dir.path(), input, Some("agent-doc-log")).unwrap();
+
+        assert!(
+            report
+                .runtime_events
+                .iter()
+                .any(|event| event.event == "commit_already_current" && event.occurrences == 3)
+        );
+        assert!(report.closeout.iter().any(|entry| {
+            entry.kind == "commit"
+                && entry.detail == "document_cycle phase=committed event=commit_already_current"
+                && entry.occurrences == 3
+        }));
+        assert!(report.closeout.iter().any(|entry| {
+            entry.kind == "commit"
+                && entry.detail == "document_cycle phase=committed event=commit_success"
+                && entry.occurrences == 1
+        }));
     }
 }

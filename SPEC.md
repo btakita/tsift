@@ -1061,7 +1061,7 @@ Behavior:
 3. Normalize prompt-side totals, cached-input totals, output totals, and largest per-turn outliers so token-heavy sessions can be compared without ad hoc `jq` pipelines.
 4. For `agent-doc` runtime logs, summarize bounded churn counters such as `fresh_restart`, `continue`, and `auto_trigger_timeout`, including the highest observed `restart_count`.
 5. Derive bounded restart-churn families from `agent-doc` logs so the digest can call out `fresh_restart`, `auto_trigger_timeout`, ctrl-d restart loops, and quit-after-eof cycles without replaying the full raw event stream.
-6. Emit guardrails when the session shows obvious budget risk: oversized prompt turns, very high cached-input resend ratios, restart-loop churn, or repeated `commit_already_current` no-op closeouts. Each guardrail includes actionable compact/restart guidance.
+6. Emit guardrails when the session shows obvious budget risk: oversized prompt turns, very high cached-input resend ratios, restart-loop churn, or repeated `commit_already_current` no-op closeouts. For newer `agent-doc` `document_cycle` logs, collapse repeated closeout lines to one occurrence per `(cycle, event)` before counting so retry noise does not swamp the summary. Each guardrail includes actionable compact/restart guidance.
 
 `session-cost` is intentionally cost-focused. It does not reconstruct the full conversation or replay tool calls; it compresses token/runtime overhead into a bounded report you can paste into backlog triage, handoffs, or benchmark notes.
 
@@ -1081,7 +1081,7 @@ Behavior:
 3. Discover related Claude sessions under `~/.claude/projects/<cwd-slug>/`, Codex sessions under `~/.codex/sessions/`, and `agent-doc` runtime logs under `<root>/.agent-doc/logs/`.
 4. Match candidate logs by cwd plus document path/session aliases, then reuse the existing `session-digest` and `session-cost` parsers to aggregate prompt targets, commands, failures, closeout evidence, token totals, and restart churn into one bounded report.
 5. Session-review inherits session-digest's instruction-ballast filtering so copied harness docs do not dominate prompt/failure hotspots.
-6. Session-review also carries forward aggregate session-cost guardrails so document-level reviews warn when token spend is mostly cached resend, restarts are looping, or closeouts are mostly no-ops.
+6. Session-review also carries forward aggregate session-cost guardrails so document-level reviews warn when token spend is mostly cached resend, restarts are looping, or closeouts are mostly no-ops. When the source is an `agent-doc` runtime log, normalize `document_cycle` closeout details to `phase + event` and count them once per cycle so the review reports distinct closeout cycles instead of raw repeated retries.
 
 `session-review` is intentionally bounded. It does not replay full conversations; it gives one cross-harness review surface so document-level session analysis stops depending on ad hoc file hunting and manual aggregation.
 

@@ -153,6 +153,7 @@ struct CostState {
     warnings: Vec<String>,
     usage_turns: Vec<SessionCostTurn>,
     runtime_events: BTreeMap<String, usize>,
+    seen_document_cycle_events: BTreeSet<(String, String)>,
     total_runtime_events: usize,
     max_restart_count: Option<usize>,
     restart_churn: RestartChurnState,
@@ -581,16 +582,11 @@ fn ingest_agent_doc_log(input: &str, state: &mut CostState) {
         let Some(event_name) = detail.split_whitespace().next() else {
             continue;
         };
-        let mut normalized = event_name.to_string();
-        if matches!(
-            event_name,
-            "claude_start" | "codex_start" | "claude_restart" | "codex_restart"
-        ) && let Some(mode) = extract_field(detail, "mode")
-        {
-            normalized = format!("{event_name}:{mode}");
+        let normalized = normalize_runtime_event(event_name, detail);
+        if should_count_runtime_event(event_name, detail, &normalized, state) {
+            *state.runtime_events.entry(normalized).or_default() += 1;
+            state.total_runtime_events += 1;
         }
-        *state.runtime_events.entry(normalized).or_default() += 1;
-        state.total_runtime_events += 1;
         state.restart_churn.observe(event_name, detail);
         if let Some(restart_count) =
             extract_field(detail, "restart_count").and_then(|value| value.parse::<usize>().ok())
@@ -602,6 +598,38 @@ fn ingest_agent_doc_log(input: &str, state: &mut CostState) {
             );
         }
     }
+}
+
+fn normalize_runtime_event(event_name: &str, detail: &str) -> String {
+    if event_name == "document_cycle"
+        && let Some(document_event) = extract_field(detail, "event")
+    {
+        return document_event.to_string();
+    }
+    if matches!(
+        event_name,
+        "claude_start" | "codex_start" | "claude_restart" | "codex_restart"
+    ) && let Some(mode) = extract_field(detail, "mode")
+    {
+        return format!("{event_name}:{mode}");
+    }
+    event_name.to_string()
+}
+
+fn should_count_runtime_event(
+    event_name: &str,
+    detail: &str,
+    normalized: &str,
+    state: &mut CostState,
+) -> bool {
+    if event_name == "document_cycle"
+        && let Some(cycle) = extract_field(detail, "cycle")
+    {
+        return state
+            .seen_document_cycle_events
+            .insert((cycle.to_string(), normalized.to_string()));
+    }
+    true
 }
 
 fn usage_u64(value: &Value, key: &str) -> u64 {
@@ -731,6 +759,49 @@ mod tests {
                 .guardrails
                 .iter()
                 .any(|guardrail| guardrail.kind == "restart_loop")
+        );
+        assert!(
+            report
+                .guardrails
+                .iter()
+                .any(|guardrail| guardrail.kind == "noop_closeout")
+        );
+    }
+
+    #[test]
+    fn agent_doc_log_dedupes_document_cycle_runtime_events_by_cycle() {
+        let input = "\
+[1777603275] document_cycle phase=response_captured cycle=cycle-1 event=response_captured capture_id=cycle-1
+[1777603276] document_cycle phase=committed cycle=cycle-1 event=commit_success capture_id=cycle-1
+[1777603403] document_cycle phase=committed cycle=cycle-1 event=commit_already_current capture_id=cycle-1
+[1777603404] document_cycle phase=committed cycle=cycle-1 event=commit_already_current capture_id=cycle-1
+[1777603405] document_cycle phase=committed cycle=cycle-1 event=commit_already_current capture_id=cycle-1
+[1777603500] document_cycle phase=preflight_started cycle=cycle-2 event=preflight_started
+[1777603600] document_cycle phase=committed cycle=cycle-2 event=commit_already_current
+[1777603601] document_cycle phase=committed cycle=cycle-2 event=commit_already_current
+[1777603700] document_cycle phase=committed cycle=cycle-3 event=commit_already_current
+";
+
+        let report = compute(input, Some("agent-doc-log")).unwrap();
+
+        assert_eq!(report.total_runtime_events, 6);
+        assert!(
+            report
+                .runtime_events
+                .iter()
+                .any(|event| event.event == "commit_already_current" && event.occurrences == 3)
+        );
+        assert!(
+            report
+                .runtime_events
+                .iter()
+                .any(|event| event.event == "commit_success" && event.occurrences == 1)
+        );
+        assert!(
+            report
+                .runtime_events
+                .iter()
+                .any(|event| event.event == "response_captured" && event.occurrences == 1)
         );
         assert!(
             report
