@@ -104,6 +104,12 @@ enum Commands {
         /// Timeout in seconds for the sift search engine (0 = no timeout)
         #[arg(long, default_value = "30")]
         timeout: u64,
+        /// Preview-mode item cap for token-budgeted responses
+        #[arg(long)]
+        max_items: Option<usize>,
+        /// Preview-mode per-field byte cap for token-budgeted responses
+        #[arg(long)]
+        max_bytes: Option<usize>,
     },
     #[command(hide = true, name = "__search-worker")]
     SearchWorker {
@@ -280,6 +286,12 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Preview-mode item cap for token-budgeted responses
+        #[arg(long)]
+        max_items: Option<usize>,
+        /// Preview-mode per-field byte cap for token-budgeted responses
+        #[arg(long)]
+        max_bytes: Option<usize>,
     },
     /// Audit installed Claude Code skills — scan directories, check health, compare against manifest
     Audit {
@@ -458,6 +470,12 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Preview-mode item cap for token-budgeted responses
+        #[arg(long)]
+        max_items: Option<usize>,
+        /// Preview-mode per-field byte cap for token-budgeted responses
+        #[arg(long)]
+        max_bytes: Option<usize>,
     },
     /// Report index + summary status and recommended commands for this session
     Status {
@@ -506,6 +524,33 @@ struct OutputFormat {
     pretty: bool,
     terse: bool,
     schema: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ResponseBudget {
+    max_items: Option<usize>,
+    max_bytes: Option<usize>,
+}
+
+impl ResponseBudget {
+    fn new(max_items: Option<usize>, max_bytes: Option<usize>) -> Self {
+        Self {
+            max_items,
+            max_bytes,
+        }
+    }
+
+    fn is_active(self) -> bool {
+        self.max_items.is_some() || self.max_bytes.is_some()
+    }
+
+    fn preview_items(self) -> usize {
+        self.max_items.unwrap_or(DEFAULT_BUDGET_ITEMS)
+    }
+
+    fn preview_bytes(self) -> usize {
+        self.max_bytes.unwrap_or(DEFAULT_BUDGET_BYTES)
+    }
 }
 
 struct MetricDigestOptions<'a> {
@@ -577,7 +622,9 @@ fn main() -> Result<()> {
             autoindex,
             no_autoindex,
             timeout,
-        }) => cmd_search(
+            max_items,
+            max_bytes,
+        }) => cmd_search_with_budget(
             query,
             path,
             limit,
@@ -597,6 +644,7 @@ fn main() -> Result<()> {
             absolute,
             tabular,
             schema,
+            ResponseBudget::new(max_items, max_bytes),
         ),
         Some(Commands::SearchWorker {
             path,
@@ -735,7 +783,9 @@ fn main() -> Result<()> {
             scope,
             limit,
             json,
-        }) => cmd_explain(
+            max_items,
+            max_bytes,
+        }) => cmd_explain_with_budget(
             &symbol,
             &path,
             scope.as_deref(),
@@ -747,6 +797,7 @@ fn main() -> Result<()> {
             absolute,
             tabular,
             schema,
+            ResponseBudget::new(max_items, max_bytes),
         ),
         Some(Commands::Audit {
             skills_dir,
@@ -916,7 +967,9 @@ fn main() -> Result<()> {
             path,
             next_context,
             json,
-        }) => cmd_session_review(
+            max_items,
+            max_bytes,
+        }) => cmd_session_review_with_budget(
             &path,
             next_context,
             OutputFormat {
@@ -926,6 +979,7 @@ fn main() -> Result<()> {
                 terse,
                 schema,
             },
+            ResponseBudget::new(max_items, max_bytes),
         ),
         Some(Commands::Status { path, json }) => cmd_status(
             &path,
@@ -1474,6 +1528,43 @@ fn compact_members(members: &[String], limit: usize) -> String {
         members[..limit].join(", "),
         members.len() - limit
     )
+}
+
+const DEFAULT_BUDGET_ITEMS: usize = 5;
+const DEFAULT_BUDGET_BYTES: usize = 160;
+
+fn stable_handle(prefix: &str, key: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(prefix.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(key.as_bytes());
+    let hex = hasher.finalize().to_hex();
+    format!("{prefix}-{}", &hex[..10])
+}
+
+fn truncate_for_budget(input: &str, max_bytes: usize) -> String {
+    let trimmed = input.trim();
+    if trimmed.len() <= max_bytes {
+        return trimmed.to_string();
+    }
+    if max_bytes <= 3 {
+        return ".".repeat(max_bytes);
+    }
+
+    let mut end = 0usize;
+    for (idx, ch) in trimmed.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > max_bytes.saturating_sub(3) {
+            break;
+        }
+        end = next;
+    }
+
+    if end == 0 {
+        "...".to_string()
+    } else {
+        format!("{}...", &trimmed[..end])
+    }
 }
 
 fn abbreviate_kind(kind: &str) -> &str {
@@ -2614,6 +2705,7 @@ fn cmd_path(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn cmd_explain(
     symbol: &str,
     path: &std::path::Path,
@@ -2626,6 +2718,37 @@ fn cmd_explain(
     absolute: bool,
     tabular: bool,
     schema: bool,
+) -> Result<()> {
+    cmd_explain_with_budget(
+        symbol,
+        path,
+        scope,
+        limit,
+        json_output,
+        compact,
+        pretty,
+        terse,
+        absolute,
+        tabular,
+        schema,
+        ResponseBudget::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_explain_with_budget(
+    symbol: &str,
+    path: &std::path::Path,
+    scope: Option<&str>,
+    limit: usize,
+    json_output: bool,
+    compact: bool,
+    pretty: bool,
+    terse: bool,
+    absolute: bool,
+    tabular: bool,
+    schema: bool,
+    budget: ResponseBudget,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     let db = open_index_db(path, scope)?;
@@ -2657,7 +2780,26 @@ fn cmd_explain(
         .iter()
         .find(|c| c.members.iter().any(|m| m == symbol));
 
-    if json_output {
+    if budget.is_active() {
+        let report = build_explain_budget_report(
+            symbol,
+            &root,
+            &symbols,
+            &callers,
+            callers_total,
+            callers_truncated,
+            &callees,
+            callees_total,
+            callees_truncated,
+            community,
+            budget,
+        );
+        if json_output {
+            println!("{}", to_json_schema(&report, pretty, terse, schema)?);
+        } else {
+            print_explain_budget_human(&report);
+        }
+    } else if json_output {
         let out = serde_json::json!({
             "symbol": symbol,
             "definitions": symbols,
@@ -2840,6 +2982,201 @@ fn cmd_explain(
         }
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct ExplainBudgetDefinitionPreview {
+    handle: String,
+    kind: String,
+    name: String,
+    file: String,
+    line: i64,
+    expand: String,
+}
+
+#[derive(Serialize)]
+struct ExplainBudgetEdgePreview {
+    handle: String,
+    name: String,
+    file: String,
+    line: i64,
+    expand: String,
+}
+
+#[derive(Serialize)]
+struct ExplainBudgetCommunityPreview {
+    size: usize,
+    members: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ExplainBudgetReport {
+    symbol: String,
+    max_items: usize,
+    max_bytes: usize,
+    definition_total: usize,
+    callers_total: usize,
+    callers_truncated_by_limit: bool,
+    callees_total: usize,
+    callees_truncated_by_limit: bool,
+    truncated: bool,
+    definitions: Vec<ExplainBudgetDefinitionPreview>,
+    callers: Vec<ExplainBudgetEdgePreview>,
+    callees: Vec<ExplainBudgetEdgePreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    community: Option<ExplainBudgetCommunityPreview>,
+}
+
+fn build_explain_budget_report(
+    symbol: &str,
+    _root: &Path,
+    symbols: &[index::StoredSymbol],
+    callers: &[index::StoredEdge],
+    callers_total: usize,
+    callers_truncated_by_limit: bool,
+    callees: &[index::StoredEdge],
+    callees_total: usize,
+    callees_truncated_by_limit: bool,
+    community: Option<&graph::Community>,
+    budget: ResponseBudget,
+) -> ExplainBudgetReport {
+    let max_items = budget.preview_items();
+    let max_bytes = budget.preview_bytes();
+    let definitions = symbols
+        .iter()
+        .take(max_items)
+        .map(|entry| ExplainBudgetDefinitionPreview {
+            handle: stable_handle(
+                "edef",
+                &format!("{}:{}:{}:{}", entry.kind, entry.name, entry.file, entry.line),
+            ),
+            kind: entry.kind.clone(),
+            name: truncate_for_budget(&entry.name, max_bytes),
+            file: truncate_for_budget(&entry.file, max_bytes),
+            line: entry.line,
+            expand: format!(
+                "tsift search {} --exact --path {} --limit 20",
+                shell_quote(&entry.name),
+                shell_quote(&entry.file)
+            ),
+        })
+        .collect();
+    let callers_preview: Vec<ExplainBudgetEdgePreview> = callers
+        .iter()
+        .take(max_items)
+        .map(|entry| ExplainBudgetEdgePreview {
+            handle: stable_handle(
+                "ecall",
+                &format!(
+                    "{}:{}:{}:{}",
+                    entry.caller_name, entry.caller_file, entry.call_site_line, symbol
+                ),
+            ),
+            name: truncate_for_budget(&entry.caller_name, max_bytes),
+            file: truncate_for_budget(&entry.caller_file, max_bytes),
+            line: entry.call_site_line,
+            expand: format!(
+                "tsift explain {} --path {} --limit 0",
+                shell_quote(&entry.caller_name),
+                shell_quote(&entry.caller_file)
+            ),
+        })
+        .collect();
+    let callees_preview: Vec<ExplainBudgetEdgePreview> = callees
+        .iter()
+        .take(max_items)
+        .map(|entry| ExplainBudgetEdgePreview {
+            handle: stable_handle(
+                "eces",
+                &format!(
+                    "{}:{}:{}:{}",
+                    entry.callee_name, entry.caller_file, entry.call_site_line, symbol
+                ),
+            ),
+            name: truncate_for_budget(&entry.callee_name, max_bytes),
+            file: truncate_for_budget(&entry.caller_file, max_bytes),
+            line: entry.call_site_line,
+            expand: format!(
+                "tsift explain {} --path {} --limit 0",
+                shell_quote(&entry.callee_name),
+                shell_quote(&entry.caller_file)
+            ),
+        })
+        .collect();
+    let community_preview = community.map(|entry| ExplainBudgetCommunityPreview {
+        size: entry.members.len(),
+        members: entry
+            .members
+            .iter()
+            .take(max_items)
+            .map(|member| truncate_for_budget(member, max_bytes))
+            .collect(),
+    });
+
+    ExplainBudgetReport {
+        symbol: symbol.to_string(),
+        max_items,
+        max_bytes,
+        definition_total: symbols.len(),
+        callers_total,
+        callers_truncated_by_limit,
+        callees_total,
+        callees_truncated_by_limit,
+        truncated: symbols.len() > max_items
+            || callers_total > callers_preview.len()
+            || callees_total > callees_preview.len()
+            || community
+                .map(|entry| entry.members.len() > max_items)
+                .unwrap_or(false),
+        definitions,
+        callers: callers_preview,
+        callees: callees_preview,
+        community: community_preview,
+    }
+}
+
+fn print_explain_budget_human(report: &ExplainBudgetReport) {
+    println!(
+        "explain-budget sym:{} defs:{}/{} crs:{}/{} ces:{}/{}",
+        shell_quote(&report.symbol),
+        report.definitions.len(),
+        report.definition_total,
+        report.callers.len(),
+        report.callers_total,
+        report.callees.len(),
+        report.callees_total
+    );
+    for entry in &report.definitions {
+        println!(
+            "def {} {} {} {}:{} expand:{}",
+            entry.handle, entry.kind, entry.name, entry.file, entry.line, entry.expand
+        );
+    }
+    for entry in &report.callers {
+        println!(
+            "caller {} {} {}:{} expand:{}",
+            entry.handle, entry.name, entry.file, entry.line, entry.expand
+        );
+    }
+    for entry in &report.callees {
+        println!(
+            "callee {} {} {}:{} expand:{}",
+            entry.handle, entry.name, entry.file, entry.line, entry.expand
+        );
+    }
+    if let Some(community) = &report.community {
+        println!(
+            "community size:{} members:{}",
+            community.size,
+            community.members.join(", ")
+        );
+    }
+    if report.truncated {
+        println!(
+            "budget truncated items:{} bytes:{}",
+            report.max_items, report.max_bytes
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4280,8 +4617,46 @@ fn cmd_session_cost(
     Ok(())
 }
 
-fn cmd_session_review(path: &Path, next_context: bool, format: OutputFormat) -> Result<()> {
+#[allow(dead_code)]
+fn cmd_session_review(
+    path: &Path,
+    next_context: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    cmd_session_review_with_budget(path, next_context, format, ResponseBudget::default())
+}
+
+fn cmd_session_review_with_budget(
+    path: &Path,
+    next_context: bool,
+    format: OutputFormat,
+    budget: ResponseBudget,
+) -> Result<()> {
     let report = session_review::compute(path)?;
+    if budget.is_active() {
+        if next_context {
+            let budget_report = build_session_review_next_context_budget_report(&report, budget);
+            if format.json_output {
+                println!(
+                    "{}",
+                    to_json_schema(&budget_report, format.pretty, format.terse, format.schema)?
+                );
+            } else {
+                print_session_review_next_context_budget_human(&budget_report);
+            }
+        } else {
+            let budget_report = build_session_review_budget_report(&report, budget);
+            if format.json_output {
+                println!(
+                    "{}",
+                    to_json_schema(&budget_report, format.pretty, format.terse, format.schema)?
+                );
+            } else {
+                print_session_review_budget_human(&budget_report);
+            }
+        }
+        return Ok(());
+    }
     if next_context {
         if format.json_output {
             println!(
@@ -4595,6 +4970,325 @@ fn cmd_session_review(path: &Path, next_context: bool, format: OutputFormat) -> 
         println!("warning: {warning}");
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct SessionReviewBudgetSessionPreview {
+    handle: String,
+    source: String,
+    path: String,
+    matched_by: Vec<String>,
+    total_tokens: u64,
+    prompt_targets: usize,
+    failures: usize,
+    expand: String,
+}
+
+#[derive(Serialize)]
+struct SessionReviewBudgetPromptPreview {
+    handle: String,
+    text: String,
+    occurrences: usize,
+    expand: String,
+}
+
+#[derive(Serialize)]
+struct SessionReviewBudgetFailurePreview {
+    handle: String,
+    kind: String,
+    message: String,
+    occurrences: usize,
+    expand: String,
+}
+
+#[derive(Serialize)]
+struct SessionReviewBudgetReport {
+    target: String,
+    target_kind: String,
+    max_items: usize,
+    max_bytes: usize,
+    sessions_matched: usize,
+    prompt_tokens: u64,
+    cached_input_tokens: u64,
+    total_tokens: u64,
+    truncated: bool,
+    sessions: Vec<SessionReviewBudgetSessionPreview>,
+    prompt_targets: Vec<SessionReviewBudgetPromptPreview>,
+    failures: Vec<SessionReviewBudgetFailurePreview>,
+    guardrails: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SessionReviewNextContextBudgetReport {
+    target: String,
+    max_items: usize,
+    max_bytes: usize,
+    prompt_target_total: usize,
+    touched_file_total: usize,
+    touched_symbol_total: usize,
+    unresolved_failure_total: usize,
+    truncated: bool,
+    prompt_targets: Vec<String>,
+    touched_files: Vec<String>,
+    touched_symbols: Vec<String>,
+    unresolved_failures: Vec<SessionReviewBudgetFailurePreview>,
+    next_digest_commands: Vec<String>,
+}
+
+fn session_review_source_flag(source: &str) -> &'static str {
+    match source {
+        "claude_jsonl" => "claude-jsonl",
+        "codex_jsonl" => "codex-jsonl",
+        "agent_doc_log" => "agent-doc-log",
+        _ => "markdown",
+    }
+}
+
+fn build_session_review_budget_report(
+    report: &session_review::SessionReviewReport,
+    budget: ResponseBudget,
+) -> SessionReviewBudgetReport {
+    let max_items = budget.preview_items();
+    let max_bytes = budget.preview_bytes();
+    let review_expand = format!("tsift session-review {} --json", shell_quote(&report.target));
+    let sessions = report
+        .sessions
+        .iter()
+        .take(max_items)
+        .map(|entry| SessionReviewBudgetSessionPreview {
+            handle: stable_handle(
+                "srev",
+                &format!("{}:{}:{}", entry.source, entry.path, entry.total_tokens),
+            ),
+            source: entry.source.clone(),
+            path: truncate_for_budget(&entry.path, max_bytes),
+            matched_by: entry
+                .matched_by
+                .iter()
+                .take(max_items)
+                .map(|value| truncate_for_budget(value, max_bytes))
+                .collect(),
+            total_tokens: entry.total_tokens,
+            prompt_targets: entry.prompt_target_count,
+            failures: entry.failure_groups,
+            expand: format!(
+                "tsift session-digest --path {} --input {} --source {}",
+                shell_quote(&report.root),
+                shell_quote(&entry.path),
+                session_review_source_flag(&entry.source)
+            ),
+        })
+        .collect();
+    let prompt_targets = report
+        .prompt_targets
+        .iter()
+        .take(max_items)
+        .map(|entry| SessionReviewBudgetPromptPreview {
+            handle: stable_handle("spt", &entry.text),
+            text: truncate_for_budget(&entry.text, max_bytes),
+            occurrences: entry.occurrences,
+            expand: review_expand.clone(),
+        })
+        .collect();
+    let failures = report
+        .failures
+        .iter()
+        .take(max_items)
+        .map(|entry| SessionReviewBudgetFailurePreview {
+            handle: stable_handle("sfl", &format!("{}:{}", entry.kind, entry.message)),
+            kind: entry.kind.clone(),
+            message: truncate_for_budget(&entry.message, max_bytes),
+            occurrences: entry.occurrences,
+            expand: review_expand.clone(),
+        })
+        .collect();
+    let guardrails = report
+        .guardrails
+        .iter()
+        .take(max_items)
+        .map(|entry| truncate_for_budget(&entry.message, max_bytes))
+        .collect();
+    let warnings = report
+        .warnings
+        .iter()
+        .take(max_items)
+        .map(|entry| truncate_for_budget(entry, max_bytes))
+        .collect();
+
+    SessionReviewBudgetReport {
+        target: report.target.clone(),
+        target_kind: report.target_kind.clone(),
+        max_items,
+        max_bytes,
+        sessions_matched: report.sessions_matched,
+        prompt_tokens: report.prompt_tokens,
+        cached_input_tokens: report.cached_input_tokens,
+        total_tokens: report.total_tokens,
+        truncated: report.sessions.len() > max_items
+            || report.prompt_targets.len() > max_items
+            || report.failures.len() > max_items
+            || report.guardrails.len() > max_items
+            || report.warnings.len() > max_items,
+        sessions,
+        prompt_targets,
+        failures,
+        guardrails,
+        warnings,
+    }
+}
+
+fn build_session_review_next_context_budget_report(
+    report: &session_review::SessionReviewReport,
+    budget: ResponseBudget,
+) -> SessionReviewNextContextBudgetReport {
+    let max_items = budget.preview_items();
+    let max_bytes = budget.preview_bytes();
+    SessionReviewNextContextBudgetReport {
+        target: report.next_context.target.clone(),
+        max_items,
+        max_bytes,
+        prompt_target_total: report.next_context.active_prompt_targets.len(),
+        touched_file_total: report.next_context.touched_files.len(),
+        touched_symbol_total: report.next_context.touched_symbols.len(),
+        unresolved_failure_total: report.next_context.unresolved_failures.len(),
+        truncated: report.next_context.active_prompt_targets.len() > max_items
+            || report.next_context.touched_files.len() > max_items
+            || report.next_context.touched_symbols.len() > max_items
+            || report.next_context.unresolved_failures.len() > max_items
+            || report.next_context.next_digest_commands.len() > max_items,
+        prompt_targets: report
+            .next_context
+            .active_prompt_targets
+            .iter()
+            .take(max_items)
+            .map(|entry| truncate_for_budget(entry, max_bytes))
+            .collect(),
+        touched_files: report
+            .next_context
+            .touched_files
+            .iter()
+            .take(max_items)
+            .map(|entry| truncate_for_budget(entry, max_bytes))
+            .collect(),
+        touched_symbols: report
+            .next_context
+            .touched_symbols
+            .iter()
+            .take(max_items)
+            .map(|entry| truncate_for_budget(entry, max_bytes))
+            .collect(),
+        unresolved_failures: report
+            .next_context
+            .unresolved_failures
+            .iter()
+            .take(max_items)
+            .map(|entry| SessionReviewBudgetFailurePreview {
+                handle: stable_handle("snf", &format!("{}:{}", entry.kind, entry.message)),
+                kind: entry.kind.clone(),
+                message: truncate_for_budget(&entry.message, max_bytes),
+                occurrences: entry.occurrences,
+                expand: format!(
+                    "tsift session-review {} --next-context --json",
+                    shell_quote(&report.target)
+                ),
+            })
+            .collect(),
+        next_digest_commands: report
+            .next_context
+            .next_digest_commands
+            .iter()
+            .take(max_items)
+            .map(|entry| truncate_for_budget(entry, max_bytes))
+            .collect(),
+    }
+}
+
+fn print_session_review_budget_human(report: &SessionReviewBudgetReport) {
+    println!(
+        "session-review-budget target:{} kind:{} sessions:{}/{} prompt:{} cached:{} total:{}",
+        shell_quote(&report.target),
+        report.target_kind,
+        report.sessions.len(),
+        report.sessions_matched,
+        format_compact_count(report.prompt_tokens),
+        format_compact_count(report.cached_input_tokens),
+        format_compact_count(report.total_tokens)
+    );
+    for session in &report.sessions {
+        println!(
+            "session {} {} total:{} prompts:{} fails:{} expand:{}",
+            session.handle,
+            session.path,
+            format_compact_count(session.total_tokens),
+            session.prompt_targets,
+            session.failures,
+            session.expand
+        );
+    }
+    for prompt in &report.prompt_targets {
+        println!(
+            "prompt {} count:{} {} expand:{}",
+            prompt.handle, prompt.occurrences, prompt.text, prompt.expand
+        );
+    }
+    for failure in &report.failures {
+        println!(
+            "fail {} {} count:{} {} expand:{}",
+            failure.handle, failure.kind, failure.occurrences, failure.message, failure.expand
+        );
+    }
+    for guardrail in &report.guardrails {
+        println!("guardrail {guardrail}");
+    }
+    for warning in &report.warnings {
+        println!("warning {warning}");
+    }
+    if report.truncated {
+        println!(
+            "budget truncated items:{} bytes:{}",
+            report.max_items, report.max_bytes
+        );
+    }
+}
+
+fn print_session_review_next_context_budget_human(report: &SessionReviewNextContextBudgetReport) {
+    println!(
+        "next-context-budget target:{} prompts:{}/{} files:{}/{} symbols:{}/{} failures:{}/{}",
+        shell_quote(&report.target),
+        report.prompt_targets.len(),
+        report.prompt_target_total,
+        report.touched_files.len(),
+        report.touched_file_total,
+        report.touched_symbols.len(),
+        report.touched_symbol_total,
+        report.unresolved_failures.len(),
+        report.unresolved_failure_total
+    );
+    for prompt in &report.prompt_targets {
+        println!("prompt {prompt}");
+    }
+    for file in &report.touched_files {
+        println!("file {file}");
+    }
+    for symbol in &report.touched_symbols {
+        println!("symbol {symbol}");
+    }
+    for failure in &report.unresolved_failures {
+        println!(
+            "fail {} {} count:{} {} expand:{}",
+            failure.handle, failure.kind, failure.occurrences, failure.message, failure.expand
+        );
+    }
+    for command in &report.next_digest_commands {
+        println!("next {command}");
+    }
+    if report.truncated {
+        println!(
+            "budget truncated items:{} bytes:{}",
+            report.max_items, report.max_bytes
+        );
+    }
 }
 
 fn format_compact_count(value: u64) -> String {
@@ -5281,6 +5975,7 @@ fn resolve_search_strategy(query: &str, strategy: Option<String>) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn cmd_search(
     query: String,
     path: Option<PathBuf>,
@@ -5297,6 +5992,45 @@ fn cmd_search(
     absolute: bool,
     tabular: bool,
     schema: bool,
+) -> Result<()> {
+    cmd_search_with_budget(
+        query,
+        path,
+        limit,
+        strategy,
+        scope,
+        federated,
+        json_output,
+        autoindex,
+        timeout_secs,
+        compact,
+        pretty,
+        terse,
+        absolute,
+        tabular,
+        schema,
+        ResponseBudget::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_search_with_budget(
+    query: String,
+    path: Option<PathBuf>,
+    limit: usize,
+    strategy: Option<String>,
+    scope: Option<String>,
+    federated: bool,
+    json_output: bool,
+    autoindex: bool,
+    timeout_secs: u64,
+    compact: bool,
+    pretty: bool,
+    terse: bool,
+    absolute: bool,
+    tabular: bool,
+    schema: bool,
+    budget: ResponseBudget,
 ) -> Result<()> {
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
     let root = lint::resolve_project_root_or_canonical_path(&base_path)?;
@@ -5389,7 +6123,22 @@ fn cmd_search(
         )?
     };
 
-    if json_output {
+    if budget.is_active() {
+        let report = build_search_budget_report(
+            &query,
+            &effective_strategy,
+            &root,
+            &response,
+            &symbol_hits,
+            absolute,
+            budget,
+        );
+        if json_output {
+            println!("{}", to_json_schema(&report, pretty, terse, schema)?);
+        } else {
+            print_search_budget_human(&report);
+        }
+    } else if json_output {
         #[derive(Serialize)]
         struct CombinedResponse<'a> {
             symbols: &'a [index::SymbolHit],
@@ -5579,6 +6328,200 @@ fn cmd_search(
         }
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct SearchBudgetSymbolPreview {
+    handle: String,
+    match_type: String,
+    kind: String,
+    name: String,
+    file: String,
+    line: i64,
+    score: f64,
+    expand: String,
+}
+
+#[derive(Serialize)]
+struct SearchBudgetHitPreview {
+    handle: String,
+    rank: usize,
+    path: String,
+    confidence: String,
+    score: f64,
+    preview: String,
+    expand: String,
+}
+
+#[derive(Serialize)]
+struct SearchBudgetReport {
+    query: String,
+    strategy: String,
+    indexed_artifacts: usize,
+    skipped_artifacts: usize,
+    max_items: usize,
+    max_bytes: usize,
+    symbol_total: usize,
+    hit_total: usize,
+    truncated: bool,
+    symbols: Vec<SearchBudgetSymbolPreview>,
+    hits: Vec<SearchBudgetHitPreview>,
+}
+
+fn build_search_budget_follow_up(query: &str, strategy: &str, path: &str) -> String {
+    let mut command = format!(
+        "tsift search {} --path {} --limit 20",
+        shell_quote(query),
+        shell_quote(path)
+    );
+    if strategy == "exact" {
+        command.push_str(" --exact");
+    } else if strategy != "lexical" {
+        command.push_str(&format!(" --strategy {}", shell_quote(strategy)));
+    }
+    command
+}
+
+fn build_search_budget_report(
+    query: &str,
+    strategy: &str,
+    root: &Path,
+    response: &sift::SearchResponse,
+    symbol_hits: &[index::SymbolHit],
+    absolute: bool,
+    budget: ResponseBudget,
+) -> SearchBudgetReport {
+    let max_items = budget.preview_items();
+    let max_bytes = budget.preview_bytes();
+    let symbol_total = symbol_hits.len();
+    let hit_total = response.hits.len();
+
+    let symbols = symbol_hits
+        .iter()
+        .take(max_items)
+        .map(|hit| {
+            let display_file = if absolute {
+                hit.file.clone()
+            } else {
+                relativize(&hit.file, root)
+            };
+            let key = format!(
+                "{}:{}:{}:{}:{}:{}",
+                hit.match_type, hit.kind, hit.name, display_file, hit.line, query
+            );
+            SearchBudgetSymbolPreview {
+                handle: stable_handle("ssym", &key),
+                match_type: hit.match_type.clone(),
+                kind: hit.kind.clone(),
+                name: truncate_for_budget(&hit.name, max_bytes),
+                file: truncate_for_budget(&display_file, max_bytes),
+                line: hit.line,
+                score: hit.score,
+                expand: format!(
+                    "tsift explain {} --path {} --limit 0",
+                    shell_quote(&hit.name),
+                    shell_quote(&display_file)
+                ),
+            }
+        })
+        .collect();
+
+    let hits = response
+        .hits
+        .iter()
+        .take(max_items)
+        .map(|hit| {
+            let display_path = if absolute {
+                hit.path.clone()
+            } else {
+                relativize(&hit.path, root)
+            };
+            let key = format!("{}:{}:{}:{}", display_path, hit.rank, hit.score, query);
+            let preview = compact_snippet(&hit.snippet)
+                .map(|snippet| truncate_for_budget(&snippet, max_bytes))
+                .unwrap_or_default();
+            SearchBudgetHitPreview {
+                handle: stable_handle("shit", &key),
+                rank: hit.rank,
+                path: truncate_for_budget(&display_path, max_bytes),
+                confidence: format!("{:?}", hit.confidence),
+                score: hit.score,
+                preview,
+                expand: build_search_budget_follow_up(query, strategy, &display_path),
+            }
+        })
+        .collect();
+
+    SearchBudgetReport {
+        query: query.to_string(),
+        strategy: strategy.to_string(),
+        indexed_artifacts: response.indexed_artifacts,
+        skipped_artifacts: response.skipped_artifacts,
+        max_items,
+        max_bytes,
+        symbol_total,
+        hit_total,
+        truncated: symbol_total > max_items || hit_total > max_items,
+        symbols,
+        hits,
+    }
+}
+
+fn print_search_budget_human(report: &SearchBudgetReport) {
+    println!(
+        "search-budget q:{} strategy:{} symbols:{}/{} hits:{}/{} indexed:{} skipped:{}",
+        shell_quote(&report.query),
+        report.strategy,
+        report.symbols.len(),
+        report.symbol_total,
+        report.hits.len(),
+        report.hit_total,
+        report.indexed_artifacts,
+        report.skipped_artifacts
+    );
+    for symbol in &report.symbols {
+        println!(
+            "sym {} [{}] {} {} {}:{} sc:{} expand:{}",
+            symbol.handle,
+            symbol.match_type,
+            symbol.kind,
+            symbol.name,
+            symbol.file,
+            symbol.line,
+            format_score(symbol.score, true),
+            symbol.expand
+        );
+    }
+    for hit in &report.hits {
+        if hit.preview.is_empty() {
+            println!(
+                "hit {} #{} {} [{} {}] expand:{}",
+                hit.handle,
+                hit.rank,
+                hit.path,
+                hit.confidence,
+                format_score(hit.score, true),
+                hit.expand
+            );
+        } else {
+            println!(
+                "hit {} #{} {} [{} {}] {} expand:{}",
+                hit.handle,
+                hit.rank,
+                hit.path,
+                hit.confidence,
+                format_score(hit.score, true),
+                hit.preview,
+                hit.expand
+            );
+        }
+    }
+    if report.truncated {
+        println!(
+            "budget truncated items:{} bytes:{}",
+            report.max_items, report.max_bytes
+        );
+    }
 }
 
 fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf>> {
@@ -9738,6 +10681,7 @@ tier = "private"
                 json,
                 next_context,
                 path,
+                ..
             }) => {
                 assert!(json);
                 assert!(next_context);
@@ -9745,6 +10689,271 @@ tier = "private"
             }
             _ => panic!("expected SessionReview command"),
         }
+    }
+
+    #[test]
+    fn cli_search_accepts_budget_flags() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "search",
+            "alpha_helper",
+            "--max-items",
+            "3",
+            "--max-bytes",
+            "96",
+        ]);
+        match cli.command {
+            Some(Commands::Search {
+                max_items,
+                max_bytes,
+                ..
+            }) => {
+                assert_eq!(max_items, Some(3));
+                assert_eq!(max_bytes, Some(96));
+            }
+            _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn cli_explain_accepts_budget_flags() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "explain",
+            "alpha_helper",
+            "--max-items",
+            "2",
+            "--max-bytes",
+            "80",
+        ]);
+        match cli.command {
+            Some(Commands::Explain {
+                max_items,
+                max_bytes,
+                ..
+            }) => {
+                assert_eq!(max_items, Some(2));
+                assert_eq!(max_bytes, Some(80));
+            }
+            _ => panic!("expected Explain command"),
+        }
+    }
+
+    #[test]
+    fn cli_session_review_accepts_budget_flags() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "session-review",
+            "tasks/software/tsift.md",
+            "--max-items",
+            "4",
+            "--max-bytes",
+            "120",
+        ]);
+        match cli.command {
+            Some(Commands::SessionReview {
+                max_items,
+                max_bytes,
+                ..
+            }) => {
+                assert_eq!(max_items, Some(4));
+                assert_eq!(max_bytes, Some(120));
+            }
+            _ => panic!("expected SessionReview command"),
+        }
+    }
+
+    #[test]
+    fn search_budget_report_truncates_symbol_preview_and_emits_stable_handle() {
+        let response = empty_search_response(Path::new("/repo"), "lexical");
+        let symbol_hits = vec![index::SymbolHit {
+            name: "alpha_helper_with_a_long_name".to_string(),
+            kind: "function".to_string(),
+            language: "rust".to_string(),
+            file: "/repo/src/lib.rs".to_string(),
+            line: 12,
+            end_line: None,
+            tags: None,
+            score: 0.98,
+            match_type: "exact_name".to_string(),
+        }];
+
+        let report = build_search_budget_report(
+            "alpha_helper_with_a_long_name",
+            "lexical",
+            Path::new("/repo"),
+            &response,
+            &symbol_hits,
+            false,
+            ResponseBudget::new(Some(1), Some(12)),
+        );
+
+        assert_eq!(report.symbols.len(), 1);
+        assert!(report.symbols[0].handle.starts_with("ssym-"));
+        assert_eq!(report.symbols[0].name, "alpha_hel...");
+        assert_eq!(report.symbols[0].file, "src/lib.rs");
+        assert!(report.symbols[0].expand.contains("tsift explain"));
+    }
+
+    #[test]
+    fn explain_budget_report_limits_edges_and_members() {
+        let symbols = vec![index::StoredSymbol {
+            name: "alpha_helper".to_string(),
+            kind: "function".to_string(),
+            language: "rust".to_string(),
+            signature: None,
+            file: "src/lib.rs".to_string(),
+            line: 10,
+            end_line: None,
+            parent_module: None,
+            visibility: None,
+            tags: None,
+        }];
+        let callers = vec![
+            index::StoredEdge {
+                caller_file: "src/main.rs".to_string(),
+                caller_name: "main".to_string(),
+                caller_line: 1,
+                callee_name: "alpha_helper".to_string(),
+                call_site_line: 3,
+            },
+            index::StoredEdge {
+                caller_file: "src/worker.rs".to_string(),
+                caller_name: "worker".to_string(),
+                caller_line: 5,
+                callee_name: "alpha_helper".to_string(),
+                call_site_line: 8,
+            },
+        ];
+        let community = graph::Community {
+            id: 1,
+            members: vec![
+                "alpha_helper".to_string(),
+                "main".to_string(),
+                "worker".to_string(),
+            ],
+            modularity_contribution: 0.5,
+        };
+
+        let report = build_explain_budget_report(
+            "alpha_helper",
+            Path::new("/repo"),
+            &symbols,
+            &callers,
+            2,
+            false,
+            &[],
+            0,
+            false,
+            Some(&community),
+            ResponseBudget::new(Some(1), Some(24)),
+        );
+
+        assert_eq!(report.definitions.len(), 1);
+        assert_eq!(report.callers.len(), 1);
+        assert!(report.truncated);
+        assert_eq!(report.community.as_ref().unwrap().members.len(), 1);
+        assert!(report.callers[0].handle.starts_with("ecall-"));
+    }
+
+    #[test]
+    fn session_review_next_context_budget_limits_lists() {
+        let report = session_review::SessionReviewReport {
+            root: "/repo".to_string(),
+            target: "tasks/software/tsift.md".to_string(),
+            target_kind: "file".to_string(),
+            sessions_considered: 1,
+            sessions_matched: 1,
+            claude_sessions: 1,
+            codex_sessions: 0,
+            agent_doc_logs: 0,
+            prompt_target_count: 2,
+            command_groups: 0,
+            file_groups: 2,
+            symbol_groups: 1,
+            failure_groups: 1,
+            runtime_event_groups: 0,
+            restart_churn_groups: 0,
+            closeout_groups: 0,
+            usage_samples: 1,
+            prompt_tokens: 120,
+            cached_input_tokens: 80,
+            cache_creation_input_tokens: 0,
+            output_tokens: 40,
+            reasoning_output_tokens: 0,
+            total_tokens: 240,
+            cached_input_ratio: Some(40.0),
+            largest_turn_total_tokens: 240,
+            guardrails: vec![],
+            loop_clusters: vec![],
+            prompt_targets: vec![
+                session_review::SessionReviewPromptTarget {
+                    text: "do one".to_string(),
+                    occurrences: 1,
+                },
+                session_review::SessionReviewPromptTarget {
+                    text: "do two".to_string(),
+                    occurrences: 1,
+                },
+            ],
+            commands: vec![],
+            touched_files: vec![],
+            touched_symbols: vec![],
+            failures: vec![],
+            runtime_events: vec![],
+            restart_churn: vec![],
+            closeout: vec![],
+            largest_turns: vec![],
+            sessions: vec![session_review::SessionReviewSession {
+                source: "claude_jsonl".to_string(),
+                path: "/tmp/session.jsonl".to_string(),
+                matched_by: vec!["path".to_string()],
+                modified_unix_secs: None,
+                prompt_target_count: 2,
+                command_groups: 0,
+                file_groups: 2,
+                symbol_groups: 1,
+                failure_groups: 1,
+                runtime_event_groups: 0,
+                restart_churn_groups: 0,
+                closeout_groups: 0,
+                usage_samples: 1,
+                prompt_tokens: 120,
+                cached_input_tokens: 80,
+                cache_creation_input_tokens: 0,
+                output_tokens: 40,
+                reasoning_output_tokens: 0,
+                total_tokens: 240,
+            }],
+            next_context: session_review::SessionReviewNextContext {
+                target: "tasks/software/tsift.md".to_string(),
+                active_prompt_targets: vec!["do one".to_string(), "do two".to_string()],
+                last_verification: session_review::SessionReviewVerificationState {
+                    status: "green".to_string(),
+                    detail: "cargo test".to_string(),
+                },
+                touched_files: vec!["src/lib.rs".to_string(), "src/main.rs".to_string()],
+                touched_symbols: vec!["alpha_helper".to_string(), "main".to_string()],
+                unresolved_failures: vec![session_review::SessionReviewFailure {
+                    kind: "timeout".to_string(),
+                    message: "search timed out".to_string(),
+                    occurrences: 1,
+                }],
+                next_digest_commands: vec![
+                    "tsift session-review --next-context tasks/software/tsift.md".to_string(),
+                    "tsift diff-digest .".to_string(),
+                ],
+            },
+            warnings: vec![],
+        };
+
+        let budget_report =
+            build_session_review_next_context_budget_report(&report, ResponseBudget::new(Some(1), Some(12)));
+
+        assert!(budget_report.truncated);
+        assert_eq!(budget_report.prompt_targets, vec!["do one"]);
+        assert_eq!(budget_report.touched_files, vec!["src/lib.rs"]);
+        assert!(budget_report.unresolved_failures[0].handle.starts_with("snf-"));
     }
 
     #[test]

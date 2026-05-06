@@ -211,6 +211,23 @@ Short kinds (`struct`, `trait`, `enum`, `const`, `static`, `mod`, `impl`, `alias
 
 `--compact` does not change `--json` formatting. Use `--pretty` for indented JSON.
 
+## Budget-Aware Preview Profiles
+
+`tsift search`, `tsift explain`, and `tsift session-review` now expose explicit preview-budget flags for agent-facing turns that need bounded follow-up surfaces instead of full prose dumps:
+
+```bash
+tsift search "alpha_helper" --max-items 3 --max-bytes 120
+tsift explain alpha_helper --max-items 2 --max-bytes 96
+tsift session-review tasks/software/tsift.md --max-items 4 --max-bytes 160 --json
+```
+
+Behavior:
+
+- `--max-items <n>` switches the command into preview mode and caps repeated result groups to `n` items per section.
+- `--max-bytes <n>` truncates long preview fields (snippets, messages, paths, labels) to `n` bytes with an ellipsis.
+- Preview mode emits deterministic expansion handles plus a concrete follow-up `expand` command for each preview item, so callers can request a narrower rerun without paying for the full original response.
+- JSON/terse/schema output in preview mode returns the same bounded preview envelope instead of the full raw payload; without these flags, the existing output formats remain unchanged.
+
 ## Compact JSON Default
 
 All `--json` output uses compact (single-line) serialization by default. This saves 30-50% of tokens compared to pretty-printed JSON.
