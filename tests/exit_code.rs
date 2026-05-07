@@ -4098,6 +4098,81 @@ fn digest_runner_captures_stderr_for_log_digest() {
 }
 
 #[test]
+#[cfg(unix)]
+fn digest_runner_delegates_supported_commands_to_rtk_and_keeps_envelope_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn helper() {}\n").unwrap();
+
+    let fake_bin = tempfile::tempdir().unwrap();
+    let rtk_path = fake_bin.path().join("rtk");
+    fs::write(
+        &rtk_path,
+        r#"#!/bin/sh
+if [ "$1" = "rewrite" ]; then
+  shift
+  if [ "$*" = "cargo build --quiet" ]; then
+    printf 'rtk cargo build --quiet'
+    exit 0
+  fi
+  exit 1
+fi
+if [ "$1" = "cargo" ] && [ "$2" = "build" ]; then
+  printf 'rtk compact build ok\n'
+  exit 0
+fi
+exit 2
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&rtk_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&rtk_path, permissions).unwrap();
+    let path = format!(
+        "{}:{}",
+        fake_bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = tsift_bin()
+        .env("PATH", path)
+        .args([
+            "--envelope",
+            "__digest-runner",
+            "--kind",
+            "log",
+            "--json",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--shell-command",
+            "cargo build --quiet",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "digest-runner");
+    assert_eq!(json["report"]["command"], "cargo build --quiet");
+    assert_eq!(
+        json["report"]["executed_command"],
+        "rtk cargo build --quiet"
+    );
+    assert_eq!(json["report"]["filter"]["tool"], "rtk");
+    assert_eq!(
+        json["report"]["filter"]["command"],
+        "rtk cargo build --quiet"
+    );
+    assert_eq!(json["summary"]["metrics"][1]["label"], "filter");
+    assert_eq!(json["summary"]["metrics"][1]["value"], "rtk");
+    let artifact_root = std::path::Path::new(json["report"]["digest"]["root"].as_str().unwrap());
+    let artifact_path = artifact_root.join(json["report"]["artifact"]["path"].as_str().unwrap());
+    assert!(artifact_path.exists(), "artifact should be written to disk");
+    let artifact_body = fs::read_to_string(&artifact_path).unwrap();
+    assert!(artifact_body.contains("rtk compact build ok"));
+}
+
+#[test]
 fn search_worker_uses_stable_tsift_cache_dir() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();

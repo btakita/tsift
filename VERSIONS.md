@@ -8,6 +8,12 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.40
+
+- `tsift --envelope __digest-runner ...` now probes `rtk rewrite` when RTK is installed, executes supported generic command families through RTK's compact filters, and records the chosen filter under `report.filter` while preserving the original command, exit code, digest payload, and artifact-backed transcript.
+- The digest-runner envelope summary now includes a `filter` metric, so harnesses can see whether a build/test/log surface was compressed by RTK or by tsift's built-in digest path alone.
+- Regression coverage now locks the RTK delegation path with a fake `rtk` binary, including envelope metadata and persisted filtered artifact content.
+
 ## 0.1.39
 
 - `tsift rewrite` now makes token-saving agent surfaces automatic: `rg` / recursive `grep` rewrites produce `tsift --envelope search ... --max-items 5 --max-bytes 160`, and cargo/pytest/build rewrites produce artifact-backed `tsift --envelope __digest-runner ...` commands by default.

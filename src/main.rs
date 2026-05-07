@@ -6555,16 +6555,18 @@ fn cmd_digest_runner(
 ) -> Result<()> {
     let digest_kind = DigestRunnerKind::parse(kind)?;
     let root = transcript_artifact_root(path)?;
-    let output = Command::new("sh")
-        .arg("-lc")
-        .arg(format!("({shell_command}) 2>&1"))
-        .stdout(Stdio::piped())
-        .output()
-        .with_context(|| format!("running digest-wrapped command: {shell_command}"))?;
-
+    let execution = run_digest_runner_command(shell_command)?;
+    let output = &execution.output;
     let captured = String::from_utf8_lossy(&output.stdout).into_owned();
     let exit_code = output.status.code().unwrap_or(-1);
     if format.json_output && format.envelope {
+        let artifact_key = format!(
+            "{}:{}:{}:{}",
+            digest_kind.as_str(),
+            shell_command,
+            execution.executed_command,
+            captured
+        );
         let artifact = if captured.trim().is_empty() {
             None
         } else {
@@ -6576,18 +6578,7 @@ fn cmd_digest_runner(
                         shell_quote(root.to_string_lossy().as_ref()),
                         shell_quote(
                             root.join(".tsift/artifacts")
-                                .join(format!(
-                                    "{}.test.log",
-                                    stable_handle(
-                                        "tart",
-                                        &format!(
-                                            "{}:{}:{}",
-                                            digest_kind.as_str(),
-                                            shell_command,
-                                            captured
-                                        )
-                                    )
-                                ))
+                                .join(format!("{}.test.log", stable_handle("tart", &artifact_key)))
                                 .to_string_lossy()
                                 .as_ref()
                         ),
@@ -6603,18 +6594,7 @@ fn cmd_digest_runner(
                         shell_quote(root.to_string_lossy().as_ref()),
                         shell_quote(
                             root.join(".tsift/artifacts")
-                                .join(format!(
-                                    "{}.log",
-                                    stable_handle(
-                                        "tart",
-                                        &format!(
-                                            "{}:{}:{}",
-                                            digest_kind.as_str(),
-                                            shell_command,
-                                            captured
-                                        )
-                                    )
-                                ))
+                                .join(format!("{}.log", stable_handle("tart", &artifact_key)))
                                 .to_string_lossy()
                                 .as_ref()
                         )
@@ -6625,11 +6605,12 @@ fn cmd_digest_runner(
                 &root,
                 "tart",
                 suffix,
-                &format!("{}:{}:{}", digest_kind.as_str(), shell_command, captured),
+                &artifact_key,
                 &captured,
                 expand,
             )?)
         };
+        let filter_report = execution.filter.as_ref().map(DigestRunnerFilter::to_json);
 
         match digest_kind {
             DigestRunnerKind::Test => {
@@ -6637,8 +6618,10 @@ fn cmd_digest_runner(
                 let report = serde_json::json!({
                     "kind": digest_kind.as_str(),
                     "command": shell_command,
+                    "executed_command": execution.executed_command,
                     "exit_code": exit_code,
                     "success": output.status.success(),
+                    "filter": filter_report,
                     "artifact": artifact,
                     "digest": digest_report,
                 });
@@ -6665,6 +6648,7 @@ fn cmd_digest_runner(
                         metrics: vec![
                             envelope_metric("runner", &digest_report.runner),
                             envelope_metric("exit_code", exit_code),
+                            envelope_metric("filter", execution.filter_label()),
                             envelope_metric("failures", digest_report.failures),
                             envelope_metric("groups", digest_report.grouped_failures),
                             envelope_metric(
@@ -6685,8 +6669,10 @@ fn cmd_digest_runner(
                 let report = serde_json::json!({
                     "kind": digest_kind.as_str(),
                     "command": shell_command,
+                    "executed_command": execution.executed_command,
                     "exit_code": exit_code,
                     "success": output.status.success(),
+                    "filter": filter_report,
                     "artifact": artifact,
                     "digest": digest_report,
                 });
@@ -6715,6 +6701,7 @@ fn cmd_digest_runner(
                         text: summary_text,
                         metrics: vec![
                             envelope_metric("exit_code", exit_code),
+                            envelope_metric("filter", execution.filter_label()),
                             envelope_metric("signals", digest_report.signal_groups),
                             envelope_metric("file_refs", digest_report.file_ref_groups),
                             envelope_metric(
@@ -6763,6 +6750,84 @@ fn cmd_digest_runner(
         std::process::exit(code);
     }
     bail!("digest-wrapped command terminated by signal: {shell_command}");
+}
+
+struct DigestRunnerExecution {
+    output: std::process::Output,
+    executed_command: String,
+    filter: Option<DigestRunnerFilter>,
+}
+
+impl DigestRunnerExecution {
+    fn filter_label(&self) -> &'static str {
+        self.filter
+            .as_ref()
+            .map(|filter| filter.tool)
+            .unwrap_or("none")
+    }
+}
+
+struct DigestRunnerFilter {
+    tool: &'static str,
+    command: String,
+}
+
+impl DigestRunnerFilter {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tool": self.tool,
+            "command": self.command,
+        })
+    }
+}
+
+fn run_digest_runner_command(shell_command: &str) -> Result<DigestRunnerExecution> {
+    let filter = rtk_rewrite_for_digest_runner(shell_command);
+    let executed_command = filter
+        .as_ref()
+        .map(|filter| filter.command.as_str())
+        .unwrap_or(shell_command);
+    let output = Command::new("sh")
+        .arg("-lc")
+        .arg(format!("({executed_command}) 2>&1"))
+        .stdout(Stdio::piped())
+        .output()
+        .with_context(|| format!("running digest-wrapped command: {executed_command}"))?;
+
+    Ok(DigestRunnerExecution {
+        output,
+        executed_command: executed_command.to_string(),
+        filter,
+    })
+}
+
+fn rtk_rewrite_for_digest_runner(shell_command: &str) -> Option<DigestRunnerFilter> {
+    if shell_command.trim_start().starts_with("rtk ") || find_command_on_path("rtk").is_none() {
+        return None;
+    }
+    let output = Command::new("rtk")
+        .arg("rewrite")
+        .arg(shell_command)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let rewritten = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if rewritten.is_empty() || rewritten == shell_command {
+        return None;
+    }
+    Some(DigestRunnerFilter {
+        tool: "rtk",
+        command: rewritten,
+    })
+}
+
+fn find_command_on_path(command: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(command))
+        .find(|candidate| candidate.is_file())
 }
 
 fn open_existing_summary_db_read_only(db_path: &Path) -> Result<summarize::SummaryDb> {

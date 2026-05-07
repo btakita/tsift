@@ -263,7 +263,8 @@ Preview reports keep their item-level `handle` + `expand` fields inside `report`
 Behavior:
 
 - The outer envelope stays terse (`tool: "digest-runner"`, `view: "test-run"` or `view: "command-run"`) and surfaces only the summary metrics callers need first, such as runner, exit code, failure count, or signal count.
-- The inner `report` carries command metadata plus the existing `test-digest` or `log-digest` payload under `digest`.
+- The inner `report` carries command metadata plus the existing `test-digest` or `log-digest` payload under `digest`. `report.command` remains the caller's original command, `report.executed_command` records the actual command tsift ran, and `report.filter` records delegated compression metadata when present.
+- When `rtk` is installed and `rtk rewrite <command>` supports the wrapped command family, digest-runner executes the RTK-filtered command and wraps that compact output in the same tsift envelope/artifact metadata. Unsupported commands or missing RTK fall back to tsift's built-in capture/digest path.
 - When captured stdout/stderr is non-empty, tsift persists it under `.tsift/artifacts/` and returns `report.artifact = {handle, path, bytes, lines, expand}`.
 - `handle` is stable for the captured transcript body and command identity, so clients can reference the artifact without inlining the raw output into context.
 - `expand` is a concrete replay command (`tsift test-digest ... --input <artifact>` or `tsift log-digest ... --input <artifact>`) that rehydrates the bounded digest from the stored artifact only when the caller explicitly wants details.
@@ -1205,7 +1206,7 @@ The existing `tsift-rewrite.sh` hook intercepts high-token shell commands and si
 - `cargo test ...`, `pytest ...`, `python -m pytest ...` → `tsift --envelope __digest-runner --kind test ...`
 - `cargo build ...`, `cargo check ...`, `cargo clippy ...`, `cargo install ...` → `tsift --envelope __digest-runner --kind log ...`
 
-The digest-runner path preserves the wrapped command's original exit status while replacing raw stdout/stderr with a summary-first envelope, bounded digest, and persisted transcript artifact, so failing tests/builds still fail closed and green runs do not inline raw logs. See `~/.claude/hooks/tsift-rewrite.sh`.
+The digest-runner path preserves the wrapped command's original exit status while replacing raw stdout/stderr with a summary-first envelope, bounded digest, and persisted transcript artifact, so failing tests/builds still fail closed and green runs do not inline raw logs. When RTK is installed, digest-runner probes `rtk rewrite <command>` and delegates supported generic command families to RTK's compact filters before wrapping the filtered output in tsift's envelope/artifact metadata. See `~/.claude/hooks/tsift-rewrite.sh`.
 
 Harnesses that do not expose Claude-style `PreToolUse` hooks can still reuse the same rewrite path manually via `tsift rewrite --run '<command>'`. In `--run` mode, tsift executes the rewritten command directly instead of only printing it, preserves the rewritten command's exit status, and emits the same envelope search previews and digest-runner artifact envelopes by default.
 
@@ -1215,7 +1216,7 @@ Global structured-output flags are forwarded into the rewritten tsift command an
 - `tsift --schema rewrite --run 'cargo build --manifest-path Cargo.toml'`
 - `tsift rewrite --run 'cargo install --path . --force'`
 
-Those commands emit the same `digest-runner` JSON envelope that `tsift --envelope __digest-runner ... --json` uses internally, so agent-doc or other harnesses get bounded execution output without depending on shell-hook rewriting.
+Those commands emit the same `digest-runner` JSON envelope that `tsift --envelope __digest-runner ... --json` uses internally, so agent-doc or other harnesses get bounded execution output without depending on shell-hook rewriting. If RTK is available and supports the wrapped command, `report.filter = {tool:"rtk", command:"..."}` identifies the delegated compact filter.
 
 ### RTK Output Filtering (`PreToolUse`)
 
