@@ -103,6 +103,40 @@ fn init_git_repo(path: &Path) {
     assert!(status.success(), "git commit failed");
 }
 
+fn init_rust_library_crate(path: &Path) {
+    fs::create_dir_all(path.join("src")).unwrap();
+    fs::write(
+        path.join("Cargo.toml"),
+        r#"[package]
+name = "tsift-runner-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        path.join("src/lib.rs"),
+        r#"pub fn add(left: i32, right: i32) -> i32 {
+    left + right
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add;
+
+    #[test]
+    fn adds_numbers() {
+        assert_eq!(add(1, 2), 3);
+    }
+}
+"#,
+    )
+    .unwrap();
+}
+
 fn build_cli_fixture(dir: &Path) {
     fs::write(
         dir.join("main.rs"),
@@ -3846,6 +3880,55 @@ fn rewrite_run_fails_closed_when_no_rewrite_exists() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn rewrite_run_envelopes_cargo_test_digest_output() {
+    let dir = tempfile::tempdir().unwrap();
+    init_rust_library_crate(dir.path());
+    let manifest = dir.path().join("Cargo.toml");
+    let command = format!("cargo test --manifest-path {}", manifest.display());
+
+    let output = tsift_bin()
+        .current_dir(dir.path())
+        .args(["--envelope", "rewrite", "--run", &command])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "rewrite --run should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "digest-runner");
+    assert_eq!(json["view"], "test-run");
+    assert_eq!(json["report"]["command"], command);
+    assert_eq!(json["report"]["success"], true);
+    assert_eq!(json["report"]["digest"]["failures"], 0);
+    assert_eq!(json["summary"]["text"], "test run passed for cargo");
+}
+
+#[test]
+fn rewrite_run_envelopes_cargo_build_digest_output() {
+    let dir = tempfile::tempdir().unwrap();
+    init_rust_library_crate(dir.path());
+    let manifest = dir.path().join("Cargo.toml");
+    let command = format!("cargo build --manifest-path {}", manifest.display());
+
+    let output = tsift_bin()
+        .current_dir(dir.path())
+        .args(["--envelope", "rewrite", "--run", &command])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "rewrite --run should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "digest-runner");
+    assert_eq!(json["view"], "command-run");
+    assert_eq!(json["report"]["command"], command);
+    assert_eq!(json["report"]["success"], true);
+    assert_eq!(json["report"]["digest"]["signal_groups"], 0);
+    assert_eq!(
+        json["summary"]["text"],
+        "command finished without log signals"
+    );
 }
 
 #[test]

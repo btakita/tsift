@@ -1204,6 +1204,14 @@ The digest-runner path preserves the wrapped command's original exit status whil
 
 Harnesses that do not expose Claude-style `PreToolUse` hooks can still reuse the same rewrite path manually via `tsift rewrite --run '<command>'`. In `--run` mode, tsift executes the rewritten command directly instead of only printing it, preserves the rewritten command's exit status, and applies native output caps for verbose `tsift search`, `tsift explain`, `tsift graph`, `tsift communities`, and `tsift index` human-readable output.
 
+Global structured-output flags are forwarded into the rewritten tsift command. That means callers can explicitly opt into summary-first execution output for cargo rewrites, for example:
+
+- `tsift --envelope rewrite --run 'cargo test --manifest-path Cargo.toml'`
+- `tsift --envelope rewrite --run 'cargo build --manifest-path Cargo.toml'`
+- `tsift --envelope rewrite --run 'cargo install --path . --force'`
+
+Those commands emit the same `digest-runner` JSON envelope that `tsift --envelope __digest-runner ... --json` uses internally, so agent-doc or other harnesses can request bounded execution output without depending on shell-hook rewriting.
+
 ### RTK Output Filtering (`PreToolUse`)
 
 The `tsift-rewrite.sh` hook (phase 2) routes verbose tsift commands through RTK for output capping when RTK is installed. Commands routed: `communities`, `explain`, `graph`, `index`, `search`. Non-verbose commands (`status`, `init`, `route`, `sql`) pass through unchanged.

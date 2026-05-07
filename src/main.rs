@@ -546,6 +546,7 @@ struct EditOp {
     replace_all: bool,
 }
 
+#[derive(Clone, Copy)]
 struct OutputFormat {
     json_output: bool,
     compact: bool,
@@ -766,7 +767,18 @@ fn main() -> Result<()> {
             absolute,
             schema,
         ),
-        Some(Commands::Rewrite { command, run }) => cmd_rewrite(&command, run),
+        Some(Commands::Rewrite { command, run }) => cmd_rewrite(
+            &command,
+            run,
+            OutputFormat {
+                json_output: terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                schema,
+                envelope,
+            },
+        ),
         Some(Commands::Route { task, id }) => cmd_route(&task, id),
         Some(Commands::Graph {
             symbol,
@@ -9050,6 +9062,17 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_cargo_install_to_log_digest_runner() {
+        let result = rewrite_command("cargo install --path . --force");
+        assert_eq!(
+            result,
+            Some(
+                "tsift __digest-runner --kind \"log\" --path \".\" --shell-command \"cargo install --path . --force\"".to_string()
+            )
+        );
+    }
+
+    #[test]
     fn rewrite_metacharacter_command_passthrough() {
         let result = rewrite_command("cargo test | head");
         assert_eq!(result, None);
@@ -9066,6 +9089,47 @@ mod tests {
     fn rewrite_output_cap_skips_structured_output() {
         assert!(rewrite_output_cap("tsift search foo --json").is_none());
         assert!(rewrite_output_cap("tsift --schema graph foo").is_none());
+        assert!(rewrite_output_cap("tsift --envelope search foo").is_none());
+    }
+
+    #[test]
+    fn rewrite_output_format_forwards_envelope_to_digest_runner() {
+        let command = rewrite_command("cargo test --lib").expect("rewrite");
+        let forwarded = apply_rewrite_output_format(
+            &command,
+            OutputFormat {
+                json_output: true,
+                compact: false,
+                pretty: false,
+                terse: false,
+                schema: false,
+                envelope: true,
+            },
+        );
+        assert_eq!(
+            forwarded,
+            "tsift --envelope __digest-runner --kind \"test\" --path \".\" --shell-command \"cargo test --lib\" --runner \"cargo\""
+        );
+    }
+
+    #[test]
+    fn rewrite_output_format_forwards_json_when_requested() {
+        let command = rewrite_command("cargo build --release").expect("rewrite");
+        let forwarded = apply_rewrite_output_format(
+            &command,
+            OutputFormat {
+                json_output: true,
+                compact: false,
+                pretty: true,
+                terse: false,
+                schema: false,
+                envelope: false,
+            },
+        );
+        assert_eq!(
+            forwarded,
+            "tsift --pretty --json __digest-runner --kind \"log\" --path \".\" --shell-command \"cargo build --release\""
+        );
     }
 
     #[test]
@@ -12977,11 +13041,12 @@ fn cmd_sql(
 /// Exit codes for `tsift rewrite` (matches rtk protocol):
 ///   0 + stdout → rewrite found, auto-allow
 ///   1          → no tsift equivalent, pass through
-fn cmd_rewrite(command: &str, run: bool) -> Result<()> {
+fn cmd_rewrite(command: &str, run: bool, format: OutputFormat) -> Result<()> {
     let rewritten = match rewrite_command(command) {
         Some(rewritten) => rewritten,
         None => std::process::exit(1),
     };
+    let rewritten = apply_rewrite_output_format(&rewritten, format);
 
     if !run {
         print!("{}", rewritten);
@@ -13052,6 +13117,43 @@ fn effective_rewrite_run_command(command: &str) -> String {
     }
 }
 
+fn apply_rewrite_output_format(command: &str, format: OutputFormat) -> String {
+    let trimmed = command.trim_start();
+    let Some(rest) = trimmed.strip_prefix("tsift") else {
+        return command.to_string();
+    };
+
+    let mut flags = Vec::new();
+    if format.compact {
+        flags.push("--compact");
+    }
+    if format.pretty {
+        flags.push("--pretty");
+    }
+    if format.terse {
+        flags.push("--terse");
+    }
+    if format.schema {
+        flags.push("--schema");
+    }
+    if format.envelope {
+        flags.push("--envelope");
+    } else if format.json_output {
+        flags.push("--json");
+    }
+
+    if flags.is_empty() {
+        return command.to_string();
+    }
+
+    let forwarded = flags.join(" ");
+    if rest.trim().is_empty() {
+        format!("tsift {forwarded}")
+    } else {
+        format!("tsift {forwarded}{rest}")
+    }
+}
+
 fn rewrite_output_cap(command: &str) -> Option<OutputCap> {
     let parts = shell_split(command);
     if strip_shell_quotes(parts.first()?) != "tsift" {
@@ -13060,7 +13162,7 @@ fn rewrite_output_cap(command: &str) -> Option<OutputCap> {
     let structured = parts.iter().skip(1).any(|part| {
         matches!(
             strip_shell_quotes(part),
-            "--json" | "--terse" | "--schema" | "--tabular"
+            "--json" | "--terse" | "--schema" | "--tabular" | "--envelope"
         )
     });
     if structured {
