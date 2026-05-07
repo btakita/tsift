@@ -73,7 +73,7 @@ tsift graph --callers <symbol>  # who calls this function?
 tsift graph --callees <symbol>  # what does this function call?
 tsift communities [--path]      # Louvain community detection over call graph
 tsift path <from> <to>          # BFS shortest path between symbols
-tsift --envelope explain <symbol> --max-items 5 --max-bytes 160 # bounded agent preview
+tsift --envelope explain <symbol> --budget normal # bounded agent preview
 tsift edit < edits.json         # staged multi-file search/replace batch
 tsift audit                     # scan installed skills, check health
 tsift audit --manifest <file>   # compare against expected skill list
@@ -89,8 +89,8 @@ tsift metric-digest < runs.json  # repeated metric-run digest: deltas, improveme
 tsift log-digest --path . < build.log  # bounded verbose-log digest from stdin or --input
 tsift session-digest --path . < session.md  # session transcript digest: prompt targets, commands, touched files/symbols, failures, closeout
 tsift session-cost < session.jsonl  # token/runtime cost digest: prompt totals, cache ratios, large-turn outliers, restart churn
-tsift --envelope session-review tasks/software/tsift.md --max-items 5 --max-bytes 160
-tsift --envelope session-review --next-context tasks/software/tsift.md --max-items 5 --max-bytes 160
+tsift --envelope session-review tasks/software/tsift.md --budget normal
+tsift --envelope session-review --next-context tasks/software/tsift.md --budget normal
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
 tsift search --exact <query>    # literal text lookup via `rg -F`
 tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
@@ -215,16 +215,19 @@ Short kinds (`struct`, `trait`, `enum`, `const`, `static`, `mod`, `impl`, `alias
 
 ## Budget-Aware Preview Profiles
 
-`tsift search`, `tsift explain`, and `tsift session-review` now expose explicit preview-budget flags for agent-facing turns that need bounded follow-up surfaces instead of full prose dumps:
+`tsift search`, `tsift explain`, `tsift session-review`, and `tsift context-pack` expose preview budgets for agent-facing turns that need bounded follow-up surfaces instead of full prose dumps:
 
 ```bash
-tsift search "alpha_helper" --max-items 3 --max-bytes 120
-tsift explain alpha_helper --max-items 2 --max-bytes 96
-tsift session-review tasks/software/tsift.md --max-items 4 --max-bytes 160 --json
+tsift search "alpha_helper" --budget small
+tsift explain alpha_helper --budget normal
+tsift session-review tasks/software/tsift.md --budget deep --json
 ```
 
 Behavior:
 
+- `--budget <small|normal|deep|auto>` applies named presets. `small` uses 3 items / 120 bytes, `normal` uses 5 items / 160 bytes, and `deep` uses 10 items / 240 bytes.
+- `--budget auto` chooses a preset from `TSIFT_CONTEXT_WINDOW`, `CODEX_CONTEXT_WINDOW`, or `CLAUDE_CONTEXT_WINDOW` when one is present: windows at or below 64k use `small`, windows at or above 200k use `deep`, and the fallback is `normal`.
+- `tsift --envelope` turns on the adaptive budget by default for these preview-capable commands. Explicit `--budget`, `--max-items`, or `--max-bytes` still wins.
 - `--max-items <n>` switches the command into preview mode and caps repeated result groups to `n` items per section.
 - `--max-bytes <n>` truncates long preview fields (snippets, messages, paths, labels) to `n` bytes with an ellipsis.
 - Preview mode emits deterministic expansion handles plus a concrete follow-up `expand` command for each preview item, so callers can request a narrower rerun without paying for the full original response.
@@ -240,9 +243,9 @@ Behavior:
 Example:
 
 ```bash
-tsift --envelope search "alpha_helper" --max-items 3 --max-bytes 120
-tsift --envelope session-review tasks/software/tsift.md --next-context --max-items 4
-tsift --envelope context-pack tasks/software/tsift.md --test-input target/test.log
+tsift --envelope search "alpha_helper" --budget small
+tsift --envelope session-review tasks/software/tsift.md --next-context --budget normal
+tsift --envelope context-pack tasks/software/tsift.md --test-input target/test.log --budget auto
 ```
 
 Envelope shape:
@@ -771,19 +774,19 @@ With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject
 ### Injected Section
 
 ```markdown
-<!-- tsift:code-navigation v=0.1.39 -->
+<!-- tsift:code-navigation v=0.1.41 -->
 ## Code Navigation
 
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root.
 
 Use the commands listed in its `use:` output:
-- `tsift --envelope search <query> --max-items 5 --max-bytes 160` — AST-aware hybrid search preview (prefer over grep/rg)
-- `tsift --envelope explain <symbol> --max-items 5 --max-bytes 160` — callers, callees, community preview
+- `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)
+- `tsift --envelope explain <symbol> --budget normal` — callers, callees, community preview
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
 
 Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
-- `tsift --envelope session-review <path> --next-context --max-items 5 --max-bytes 160` or `tsift --envelope context-pack <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
+- `tsift --envelope session-review <path> --next-context --budget normal` or `tsift --envelope context-pack <path> --budget normal` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
 - `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
 - `tsift --envelope __digest-runner --kind test --path . --shell-command '<test command>'` / `tsift --envelope __digest-runner --kind log --path . --shell-command '<build command>'` for noisy test/build/install output, or let the rewrite/hooks create those artifact-backed envelopes for `cargo test`, `pytest`, and verbose cargo commands.
 - If your harness does not support Claude-style `PreToolUse` hooks, run `tsift rewrite --run '<command>'` to execute the same envelope-first, artifact-backed tsift equivalent manually.
@@ -1200,7 +1203,7 @@ The hook resolves the git root first, then runs `tsift index --check --exit-code
 
 The existing `tsift-rewrite.sh` hook intercepts high-token shell commands and silently rewrites them to lower-context tsift flows:
 
-- `rg ...` / `grep -r ...` → `tsift --envelope search ... --exact --max-items 5 --max-bytes 160`
+- `rg ...` / `grep -r ...` → `tsift --envelope search ... --exact --budget normal`
 - `git diff`, `git diff --cached`, `git show`, and simple `git log -p -1 ...` history review → `tsift diff-digest ...`
 - long transcript reads (`cat`, `bat`, `head -n`, `tail -n`, `sed -n`) over recognized agent-doc markdown sessions, Claude JSONL, Codex JSONL, or `agent-doc` runtime logs → `tsift session-digest ...`, anchored to the transcript's owning repo or submodule root when the file lives under one
 - `cargo test ...`, `pytest ...`, `python -m pytest ...` → `tsift --envelope __digest-runner --kind test ...`

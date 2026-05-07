@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sift::{SearchInput, SearchOptions, Sift};
@@ -115,6 +115,9 @@ enum Commands {
         /// Preview-mode per-field byte cap for token-budgeted responses
         #[arg(long)]
         max_bytes: Option<usize>,
+        /// Named preview budget preset (auto adapts from context-window env vars)
+        #[arg(long, value_enum)]
+        budget: Option<ResponseBudgetPreset>,
     },
     #[command(hide = true, name = "__search-worker")]
     SearchWorker {
@@ -297,6 +300,9 @@ enum Commands {
         /// Preview-mode per-field byte cap for token-budgeted responses
         #[arg(long)]
         max_bytes: Option<usize>,
+        /// Named preview budget preset (auto adapts from context-window env vars)
+        #[arg(long, value_enum)]
+        budget: Option<ResponseBudgetPreset>,
     },
     /// Audit installed Claude Code skills — scan directories, check health, compare against manifest
     Audit {
@@ -433,6 +439,9 @@ enum Commands {
         /// Preview-mode per-field byte cap for token-budgeted responses
         #[arg(long)]
         max_bytes: Option<usize>,
+        /// Named preview budget preset (auto adapts from context-window env vars)
+        #[arg(long, value_enum)]
+        budget: Option<ResponseBudgetPreset>,
     },
     /// Summarize repeated metric runs into compact deltas and news-ready tables
     MetricDigest {
@@ -505,6 +514,9 @@ enum Commands {
         /// Preview-mode per-field byte cap for token-budgeted responses
         #[arg(long)]
         max_bytes: Option<usize>,
+        /// Named preview budget preset (auto adapts from context-window env vars)
+        #[arg(long, value_enum)]
+        budget: Option<ResponseBudgetPreset>,
     },
     /// Report index + summary status and recommended commands for this session
     Status {
@@ -595,12 +607,38 @@ struct ResponseBudget {
     max_bytes: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ResponseBudgetPreset {
+    Small,
+    Normal,
+    Deep,
+    Auto,
+}
+
 impl ResponseBudget {
     fn new(max_items: Option<usize>, max_bytes: Option<usize>) -> Self {
         Self {
             max_items,
             max_bytes,
         }
+    }
+
+    fn from_cli(
+        max_items: Option<usize>,
+        max_bytes: Option<usize>,
+        preset: Option<ResponseBudgetPreset>,
+        envelope: bool,
+    ) -> Self {
+        let preset = preset.or_else(|| envelope.then_some(ResponseBudgetPreset::Auto));
+        let Some(preset) = preset else {
+            return Self::new(max_items, max_bytes);
+        };
+
+        let defaults = preset.resolve();
+        Self::new(
+            max_items.or(defaults.max_items),
+            max_bytes.or(defaults.max_bytes),
+        )
     }
 
     fn is_active(self) -> bool {
@@ -613,6 +651,39 @@ impl ResponseBudget {
 
     fn preview_bytes(self) -> usize {
         self.max_bytes.unwrap_or(DEFAULT_BUDGET_BYTES)
+    }
+}
+
+impl ResponseBudgetPreset {
+    fn resolve(self) -> ResponseBudget {
+        match self {
+            ResponseBudgetPreset::Small => ResponseBudget::new(Some(3), Some(120)),
+            ResponseBudgetPreset::Normal => {
+                ResponseBudget::new(Some(DEFAULT_BUDGET_ITEMS), Some(DEFAULT_BUDGET_BYTES))
+            }
+            ResponseBudgetPreset::Deep => ResponseBudget::new(Some(10), Some(240)),
+            ResponseBudgetPreset::Auto => adaptive_response_budget(),
+        }
+    }
+}
+
+fn adaptive_response_budget() -> ResponseBudget {
+    let context_window = [
+        "TSIFT_CONTEXT_WINDOW",
+        "CODEX_CONTEXT_WINDOW",
+        "CLAUDE_CONTEXT_WINDOW",
+    ]
+    .iter()
+    .find_map(|key| {
+        std::env::var(key)
+            .ok()
+            .and_then(|value| value.replace('_', "").parse::<usize>().ok())
+    });
+
+    match context_window {
+        Some(window) if window <= 64_000 => ResponseBudgetPreset::Small.resolve(),
+        Some(window) if window >= 200_000 => ResponseBudgetPreset::Deep.resolve(),
+        _ => ResponseBudgetPreset::Normal.resolve(),
     }
 }
 
@@ -688,6 +759,7 @@ fn main() -> Result<()> {
             timeout,
             max_items,
             max_bytes,
+            budget,
         }) => cmd_search_with_budget(
             query,
             path,
@@ -709,7 +781,7 @@ fn main() -> Result<()> {
             tabular,
             schema,
             envelope,
-            ResponseBudget::new(max_items, max_bytes),
+            ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
         ),
         Some(Commands::SearchWorker {
             path,
@@ -862,6 +934,7 @@ fn main() -> Result<()> {
             json,
             max_items,
             max_bytes,
+            budget,
         }) => cmd_explain_with_budget(
             &symbol,
             &path,
@@ -875,7 +948,7 @@ fn main() -> Result<()> {
             tabular,
             schema,
             envelope,
-            ResponseBudget::new(max_items, max_bytes),
+            ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
         ),
         Some(Commands::Audit {
             skills_dir,
@@ -993,6 +1066,7 @@ fn main() -> Result<()> {
             json,
             max_items,
             max_bytes,
+            budget,
         }) => cmd_context_pack(
             &path,
             test_input.as_deref(),
@@ -1006,7 +1080,7 @@ fn main() -> Result<()> {
                 schema,
                 envelope,
             },
-            ResponseBudget::new(max_items, max_bytes),
+            ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
         ),
         Some(Commands::MetricDigest {
             input,
@@ -1076,6 +1150,7 @@ fn main() -> Result<()> {
             json,
             max_items,
             max_bytes,
+            budget,
         }) => cmd_session_review_with_budget(
             &path,
             next_context,
@@ -1087,7 +1162,7 @@ fn main() -> Result<()> {
                 schema,
                 envelope,
             },
-            ResponseBudget::new(max_items, max_bytes),
+            ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
         ),
         Some(Commands::Status { path, json }) => cmd_status(
             &path,
@@ -9347,10 +9422,7 @@ mod tests {
         let result = rewrite_command("rg authenticate");
         assert_eq!(
             result,
-            Some(
-                "tsift --envelope search \"authenticate\" --exact --max-items 5 --max-bytes 160"
-                    .to_string(),
-            )
+            Some("tsift --envelope search \"authenticate\" --exact --budget normal".to_string(),)
         );
     }
 
@@ -9359,7 +9431,10 @@ mod tests {
         let result = rewrite_command("rg authenticate src/");
         assert_eq!(
             result,
-            Some("tsift --envelope search \"authenticate\" --exact --max-items 5 --max-bytes 160 --path \"src/\"".to_string())
+            Some(
+                "tsift --envelope search \"authenticate\" --exact --budget normal --path \"src/\""
+                    .to_string()
+            )
         );
     }
 
@@ -9368,7 +9443,10 @@ mod tests {
         let result = rewrite_command("rg -i authenticate src/");
         assert_eq!(
             result,
-            Some("tsift --envelope search \"authenticate\" --exact --max-items 5 --max-bytes 160 --path \"src/\"".to_string())
+            Some(
+                "tsift --envelope search \"authenticate\" --exact --budget normal --path \"src/\""
+                    .to_string()
+            )
         );
     }
 
@@ -9378,10 +9456,7 @@ mod tests {
         let result = rewrite_command("rg -t rs authenticate");
         assert_eq!(
             result,
-            Some(
-                "tsift --envelope search \"authenticate\" --exact --max-items 5 --max-bytes 160"
-                    .to_string()
-            )
+            Some("tsift --envelope search \"authenticate\" --exact --budget normal".to_string())
         );
     }
 
@@ -9397,7 +9472,10 @@ mod tests {
         let result = rewrite_command("grep -r authenticate src/");
         assert_eq!(
             result,
-            Some("tsift --envelope search \"authenticate\" --exact --max-items 5 --max-bytes 160 --path \"src/\"".to_string())
+            Some(
+                "tsift --envelope search \"authenticate\" --exact --budget normal --path \"src/\""
+                    .to_string()
+            )
         );
     }
 
@@ -9444,10 +9522,7 @@ mod tests {
         let result = rewrite_command("rg \"fn main\"");
         assert_eq!(
             result,
-            Some(
-                "tsift --envelope search \"fn main\" --exact --max-items 5 --max-bytes 160"
-                    .to_string()
-            )
+            Some("tsift --envelope search \"fn main\" --exact --budget normal".to_string())
         );
     }
 
@@ -12694,6 +12769,32 @@ tier = "private"
     }
 
     #[test]
+    fn cli_search_accepts_budget_preset() {
+        let cli = Cli::parse_from(["tsift", "search", "alpha_helper", "--budget", "small"]);
+        match cli.command {
+            Some(Commands::Search { budget, .. }) => {
+                assert_eq!(budget, Some(ResponseBudgetPreset::Small));
+            }
+            _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn response_budget_presets_fill_defaults_and_preserve_explicit_caps() {
+        let small = ResponseBudget::from_cli(None, None, Some(ResponseBudgetPreset::Small), false);
+        assert_eq!(small.preview_items(), 3);
+        assert_eq!(small.preview_bytes(), 120);
+
+        let overridden =
+            ResponseBudget::from_cli(Some(7), None, Some(ResponseBudgetPreset::Small), false);
+        assert_eq!(overridden.preview_items(), 7);
+        assert_eq!(overridden.preview_bytes(), 120);
+
+        let envelope_default = ResponseBudget::from_cli(None, None, None, true);
+        assert!(envelope_default.is_active());
+    }
+
+    #[test]
     fn cli_explain_accepts_budget_flags() {
         let cli = Cli::parse_from([
             "tsift",
@@ -12768,6 +12869,7 @@ tier = "private"
                 json,
                 max_items,
                 max_bytes,
+                budget,
             }) => {
                 assert_eq!(path, PathBuf::from("tasks/software/tsift.md"));
                 assert_eq!(test_input, Some(PathBuf::from("target/test.log")));
@@ -12776,6 +12878,7 @@ tier = "private"
                 assert!(json);
                 assert_eq!(max_items, Some(3));
                 assert_eq!(max_bytes, Some(96));
+                assert!(budget.is_none());
             }
             _ => panic!("expected ContextPack command"),
         }
@@ -14211,10 +14314,8 @@ fn rewrite_grep(cmd: &str) -> Option<String> {
 
 fn build_agent_search_preview_command(pattern: &str, path: Option<&str>) -> String {
     let mut result = format!(
-        "tsift --envelope search {} --exact --max-items {} --max-bytes {}",
-        shell_quote(pattern),
-        DEFAULT_BUDGET_ITEMS,
-        DEFAULT_BUDGET_BYTES
+        "tsift --envelope search {} --exact --budget normal",
+        shell_quote(pattern)
     );
     if let Some(p) = path {
         result.push_str(&format!(" --path {}", shell_quote(p)));

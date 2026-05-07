@@ -8,6 +8,12 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.41
+
+- Added `--budget <small|normal|deep|auto>` to the agent-facing preview surfaces for `search`, `explain`, `session-review`, and `context-pack`.
+- `tsift --envelope` now applies the adaptive budget by default when callers do not pass explicit caps, with `auto` reading `TSIFT_CONTEXT_WINDOW`, `CODEX_CONTEXT_WINDOW`, or `CLAUDE_CONTEXT_WINDOW` to select small/normal/deep defaults.
+- `tsift rewrite` now emits `tsift --envelope search ... --exact --budget normal` for `rg` and recursive `grep` rewrites, keeping hook output compact while avoiding hard-coded numeric caps in the command surface.
+
 ## 0.1.40
 
 - `tsift --envelope __digest-runner ...` now probes `rtk rewrite` when RTK is installed, executes supported generic command families through RTK's compact filters, and records the chosen filter under `report.filter` while preserving the original command, exit code, digest payload, and artifact-backed transcript.
