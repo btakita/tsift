@@ -6,7 +6,7 @@ use sift::{SearchInput, SearchOptions, Sift};
 #[cfg(test)]
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -7887,6 +7887,11 @@ struct SearchBudgetSymbolPreview {
     file: String,
     line: i64,
     score: f64,
+    match_count: usize,
+    surface_count: usize,
+    file_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    surface_examples: Vec<String>,
     expand: String,
 }
 
@@ -7910,10 +7915,79 @@ struct SearchBudgetReport {
     max_items: usize,
     max_bytes: usize,
     symbol_total: usize,
+    raw_symbol_total: usize,
     hit_total: usize,
     truncated: bool,
     symbols: Vec<SearchBudgetSymbolPreview>,
     hits: Vec<SearchBudgetHitPreview>,
+}
+
+const SEARCH_BUDGET_SURFACE_PREVIEW_LIMIT: usize = 3;
+
+struct SearchBudgetSymbolFamily {
+    canonical_tag_alias: Option<String>,
+    representative_name: String,
+    representative_kind: String,
+    representative_match_type: String,
+    representative_file: String,
+    representative_line: i64,
+    representative_score: f64,
+    seen_surfaces: HashSet<String>,
+    seen_files: HashSet<String>,
+    surface_examples: Vec<String>,
+    match_count: usize,
+}
+
+fn search_budget_family_query(tag_alias: Option<&str>, fallback_name: &str) -> String {
+    if let Some(alias) = tag_alias {
+        let query = alias
+            .split(['/', '.'])
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !query.is_empty() {
+            return query;
+        }
+    }
+    fallback_name.to_string()
+}
+
+fn build_search_budget_family_expand(
+    strategy: &str,
+    path: &str,
+    tag_alias: Option<&str>,
+    fallback_name: &str,
+) -> String {
+    let query = search_budget_family_query(tag_alias, fallback_name);
+    let effective_strategy = if strategy == "exact" {
+        "lexical"
+    } else {
+        strategy
+    };
+    build_search_budget_follow_up(&query, effective_strategy, path)
+}
+
+fn format_search_budget_symbol_name(name: &str, surface_count: usize, max_bytes: usize) -> String {
+    let preview = if surface_count > 1 {
+        let extra = surface_count - 1;
+        let label = if extra == 1 { "variant" } else { "variants" };
+        format!("{name} (+{extra} {label})")
+    } else {
+        name.to_string()
+    };
+    truncate_for_budget(&preview, max_bytes)
+}
+
+fn format_search_budget_symbol_file(file: &str, file_count: usize, max_bytes: usize) -> String {
+    let preview = if file_count > 1 {
+        let extra = file_count - 1;
+        let label = if extra == 1 { "file" } else { "files" };
+        format!("{file} (+{extra} {label})")
+    } else {
+        file.to_string()
+    };
+    truncate_for_budget(&preview, max_bytes)
 }
 
 fn build_search_budget_follow_up(query: &str, strategy: &str, path: &str) -> String {
@@ -7941,37 +8015,98 @@ fn build_search_budget_report(
 ) -> SearchBudgetReport {
     let max_items = budget.preview_items();
     let max_bytes = budget.preview_bytes();
-    let symbol_total = symbol_hits.len();
+    let raw_symbol_total = symbol_hits.len();
     let hit_total = response.hits.len();
+    let mut family_positions = HashMap::new();
+    let mut families = Vec::new();
 
-    let symbols = symbol_hits
-        .iter()
+    for hit in symbol_hits {
+        let display_file = if absolute {
+            hit.file.clone()
+        } else {
+            relativize(&hit.file, root)
+        };
+        let canonical_tag_alias = tag_alias_from_tags(&hit.name, hit.tags.as_deref());
+        let family_key = canonical_tag_alias
+            .clone()
+            .unwrap_or_else(|| hit.name.clone());
+        let position = *family_positions.entry(family_key).or_insert_with(|| {
+            families.push(SearchBudgetSymbolFamily {
+                canonical_tag_alias: canonical_tag_alias.clone(),
+                representative_name: hit.name.clone(),
+                representative_kind: hit.kind.clone(),
+                representative_match_type: hit.match_type.clone(),
+                representative_file: display_file.clone(),
+                representative_line: hit.line,
+                representative_score: hit.score,
+                seen_surfaces: HashSet::new(),
+                seen_files: HashSet::new(),
+                surface_examples: Vec::new(),
+                match_count: 0,
+            });
+            families.len() - 1
+        });
+
+        let family = &mut families[position];
+        family.match_count += 1;
+        if family.seen_surfaces.insert(hit.name.clone())
+            && family.surface_examples.len() < SEARCH_BUDGET_SURFACE_PREVIEW_LIMIT
+        {
+            family
+                .surface_examples
+                .push(truncate_for_budget(&hit.name, max_bytes));
+        }
+        family.seen_files.insert(display_file);
+    }
+
+    let symbol_total = families.len();
+    let symbols = families
+        .into_iter()
         .take(max_items)
-        .map(|hit| {
-            let display_file = if absolute {
-                hit.file.clone()
-            } else {
-                relativize(&hit.file, root)
-            };
+        .map(|family| {
+            let file_count = family.seen_files.len();
+            let surface_count = family.seen_surfaces.len();
             let key = format!(
                 "{}:{}:{}:{}:{}:{}",
-                hit.match_type, hit.kind, hit.name, display_file, hit.line, query
+                family
+                    .canonical_tag_alias
+                    .as_deref()
+                    .unwrap_or(&family.representative_name),
+                family.representative_kind,
+                family.representative_file,
+                family.representative_line,
+                query,
+                strategy
             );
-            let symbol_ref =
-                build_compact_symbol_ref("ssym", &key, &hit.name, hit.tags.as_deref(), max_bytes);
             SearchBudgetSymbolPreview {
-                handle: symbol_ref.handle,
-                tag_alias: symbol_ref.tag_alias,
-                match_type: hit.match_type.clone(),
-                kind: hit.kind.clone(),
-                name: symbol_ref.name,
-                file: truncate_for_budget(&display_file, max_bytes),
-                line: hit.line,
-                score: hit.score,
-                expand: format!(
-                    "tsift explain {} --path {} --limit 0",
-                    shell_quote(&hit.name),
-                    shell_quote(&display_file)
+                handle: stable_handle("sfam", &key),
+                tag_alias: family
+                    .canonical_tag_alias
+                    .as_deref()
+                    .map(|alias| truncate_for_budget(alias, max_bytes)),
+                match_type: family.representative_match_type,
+                kind: family.representative_kind,
+                name: format_search_budget_symbol_name(
+                    &family.representative_name,
+                    surface_count,
+                    max_bytes,
+                ),
+                file: format_search_budget_symbol_file(
+                    &family.representative_file,
+                    file_count,
+                    max_bytes,
+                ),
+                line: family.representative_line,
+                score: family.representative_score,
+                match_count: family.match_count,
+                surface_count,
+                file_count,
+                surface_examples: family.surface_examples,
+                expand: build_search_budget_family_expand(
+                    strategy,
+                    root.to_string_lossy().as_ref(),
+                    family.canonical_tag_alias.as_deref(),
+                    &family.representative_name,
                 ),
             }
         })
@@ -8011,6 +8146,7 @@ fn build_search_budget_report(
         max_items,
         max_bytes,
         symbol_total,
+        raw_symbol_total,
         hit_total,
         truncated: symbol_total > max_items || hit_total > max_items,
         symbols,
@@ -8020,25 +8156,34 @@ fn build_search_budget_report(
 
 fn print_search_budget_human(report: &SearchBudgetReport) {
     println!(
-        "search-budget q:{} strategy:{} symbols:{}/{} hits:{}/{} indexed:{} skipped:{}",
+        "search-budget q:{} strategy:{} symbols:{}/{} raw-symbols:{} hits:{}/{} indexed:{} skipped:{}",
         shell_quote(&report.query),
         report.strategy,
         report.symbols.len(),
         report.symbol_total,
+        report.raw_symbol_total,
         report.hits.len(),
         report.hit_total,
         report.indexed_artifacts,
         report.skipped_artifacts
     );
     for symbol in &report.symbols {
+        let variants = if symbol.surface_examples.is_empty() {
+            String::new()
+        } else {
+            format!(" variants:{}", symbol.surface_examples.join(", "))
+        };
         println!(
-            "sym {} [{}] {} {}:{} sc:{} expand:{}",
+            "sym {} [{}] {} {}:{} sc:{} matches:{} files:{}{} expand:{}",
             format_symbol_preview_line(&symbol.handle, &symbol.name, symbol.tag_alias.as_deref()),
             symbol.match_type,
             symbol.kind,
             symbol.file,
             symbol.line,
             format_score(symbol.score, true),
+            symbol.match_count,
+            symbol.file_count,
+            variants,
             symbol.expand
         );
     }
@@ -12499,11 +12644,77 @@ tier = "private"
         );
 
         assert_eq!(report.symbols.len(), 1);
-        assert!(report.symbols[0].handle.starts_with("ssym-"));
+        assert!(report.symbols[0].handle.starts_with("sfam-"));
         assert_eq!(report.symbols[0].tag_alias.as_deref(), Some("alpha/hel..."));
         assert_eq!(report.symbols[0].name, "alpha_hel...");
         assert_eq!(report.symbols[0].file, "src/lib.rs");
-        assert!(report.symbols[0].expand.contains("tsift explain"));
+        assert!(report.symbols[0].expand.contains("tsift search"));
+    }
+
+    #[test]
+    fn search_budget_report_groups_repeated_symbols_by_canonical_tag_family() {
+        let response = empty_search_response(Path::new("/repo"), "lexical");
+        let symbol_hits = vec![
+            index::SymbolHit {
+                name: "alpha_helper".to_string(),
+                kind: "function".to_string(),
+                language: "rust".to_string(),
+                file: "/repo/src/lib.rs".to_string(),
+                line: 12,
+                end_line: None,
+                tags: Some("alpha,helper".to_string()),
+                score: 0.98,
+                match_type: "exact_name".to_string(),
+            },
+            index::SymbolHit {
+                name: "alphaHelper".to_string(),
+                kind: "method".to_string(),
+                language: "rust".to_string(),
+                file: "/repo/src/main.rs".to_string(),
+                line: 34,
+                end_line: None,
+                tags: Some("alpha,helper".to_string()),
+                score: 0.93,
+                match_type: "tag_overlap".to_string(),
+            },
+            index::SymbolHit {
+                name: "alpha_helper".to_string(),
+                kind: "function".to_string(),
+                language: "rust".to_string(),
+                file: "/repo/src/worker.rs".to_string(),
+                line: 56,
+                end_line: None,
+                tags: Some("alpha,helper".to_string()),
+                score: 0.91,
+                match_type: "tag_overlap".to_string(),
+            },
+        ];
+
+        let report = build_search_budget_report(
+            "alpha helper",
+            "lexical",
+            Path::new("/repo"),
+            &response,
+            &symbol_hits,
+            false,
+            ResponseBudget::new(Some(5), Some(48)),
+        );
+
+        assert_eq!(report.symbol_total, 1);
+        assert_eq!(report.raw_symbol_total, 3);
+        assert_eq!(report.symbols.len(), 1);
+        assert_eq!(report.symbols[0].tag_alias.as_deref(), Some("alpha/helper"));
+        assert_eq!(report.symbols[0].match_count, 3);
+        assert_eq!(report.symbols[0].surface_count, 2);
+        assert_eq!(report.symbols[0].file_count, 3);
+        assert_eq!(
+            report.symbols[0].surface_examples,
+            vec!["alpha_helper".to_string(), "alphaHelper".to_string()]
+        );
+        assert!(report.symbols[0].name.contains("(+1 variant)"));
+        assert!(report.symbols[0].file.contains("(+2 files)"));
+        assert!(report.symbols[0].expand.contains("tsift search"));
+        assert!(report.symbols[0].expand.contains("alpha helper"));
     }
 
     #[test]

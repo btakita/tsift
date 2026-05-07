@@ -230,6 +230,7 @@ Behavior:
 - Preview mode emits deterministic expansion handles plus a concrete follow-up `expand` command for each preview item, so callers can request a narrower rerun without paying for the full original response.
 - Before lexical or hybrid fallback, `tsift search` also normalizes free-text agent queries through `tagpath`-style token splitting, so phrases like `user profile getter` or `profile user get` still resolve against symbol tags for identifiers such as `get_user_profile` / `getUserProfile`.
 - Symbol-bearing preview items also expose a canonical `tag_alias` derived from `tagpath` tags (for example `alpha/helper`) so agents can reuse one semantic reference across search, explain, and handoff flows without repeating every surface spelling.
+- When search preview mode sees repeated symbol hits that collapse to the same canonical `tag_alias`, it emits one family summary row with match/file counts plus a follow-up `expand` command keyed to that canonical tag family instead of repeating every surface spelling inline.
 - JSON/terse/schema output in preview mode returns the same bounded preview report instead of the full raw payload; without these flags, the existing output formats remain unchanged.
 
 ## Structured Envelopes
