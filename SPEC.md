@@ -240,6 +240,8 @@ Behavior:
 
 `tsift token-savings --fixture <path>` is a CI-friendly report surface for preview compression contracts. The fixture lists per-command cases with raw symbol rows, compact tagpath families, and minimum savings thresholds; tsift serializes the raw rows and the compact envelope rows, then reports byte deltas, estimated token deltas using `ceil(utf8_bytes / 4)`, savings percentages, and pass/fail status per command. `--json` emits the report as structured data, `--fail-under` exits non-zero when any case misses its fixture threshold, and `tsift --envelope token-savings ...` wraps the same report in the common summary envelope.
 
+`tests/exit_code.rs` runs the compiled `tsift token-savings --fixture ../tagpath/fixtures/tsift-token-savings.json --fail-under --json` path against tagpath's shared fixture and locks the current preview contract to `search`, `explain`, and `session-review`. Keep `context-pack` out of that fixture-backed gate until its compression thresholds are intentionally added to the shared fixture.
+
 ## Structured Envelopes
 
 `tsift --envelope` is a global JSON-mode wrapper for agent-facing preview and handoff commands. It currently applies to `search`, `explain`, `session-review`, and `context-pack`, and it implies `--json`.
