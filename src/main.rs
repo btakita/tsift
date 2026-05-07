@@ -12,7 +12,7 @@ use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tagpath::{ontology as tagpath_ontology, parser as tagpath_parser};
+use tagpath::{family as tagpath_family, ontology as tagpath_ontology};
 use tempfile::NamedTempFile;
 
 pub mod audit;
@@ -2142,44 +2142,81 @@ fn stable_handle(prefix: &str, key: &str) -> String {
     format!("{prefix}-{}", &hex[..10])
 }
 
-fn tag_alias_from_name(name: &str) -> Option<String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CanonicalTagFamily {
+    canonical: String,
+    tag_alias: String,
+}
+
+fn canonical_family_from_tagpath_family(
+    family: tagpath_family::TagFamily,
+) -> Option<CanonicalTagFamily> {
+    let tag_alias = if family.dimensions.is_empty() {
+        family.tags.join("/")
+    } else {
+        family
+            .dimensions
+            .iter()
+            .filter(|dimension| !dimension.tags.is_empty())
+            .map(|dimension| dimension.tags.join("."))
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+
+    if tag_alias.is_empty() {
+        None
+    } else {
+        Some(CanonicalTagFamily {
+            canonical: family.canonical,
+            tag_alias,
+        })
+    }
+}
+
+fn canonical_tag_family_from_name(name: &str) -> Option<CanonicalTagFamily> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    let convention = tagpath_parser::detect_convention(trimmed);
-    let parsed = tagpath_parser::parse(trimmed, convention);
-    if !parsed.namespaces.is_empty() {
-        let alias = parsed
-            .namespaces
-            .iter()
-            .filter(|dimension| !dimension.is_empty())
-            .map(|dimension| dimension.join("."))
-            .collect::<Vec<_>>()
-            .join("/");
-        if alias.is_empty() { None } else { Some(alias) }
-    } else if parsed.tags.is_empty() {
+    canonical_family_from_tagpath_family(tagpath_family::generate_family(trimmed))
+}
+
+fn canonical_tag_family_from_tags(tags: &str) -> Option<CanonicalTagFamily> {
+    let canonical = tags
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if canonical.is_empty() {
         None
     } else {
-        Some(parsed.tags.join("/"))
+        canonical_family_from_tagpath_family(tagpath_family::generate_family(&canonical))
     }
 }
 
-fn tag_alias_from_tags(name: &str, tags: Option<&str>) -> Option<String> {
-    if let Some(tags) = tags {
-        let alias = tags
-            .split(',')
-            .map(str::trim)
-            .filter(|tag| !tag.is_empty())
-            .collect::<Vec<_>>()
-            .join("/");
-        if !alias.is_empty() {
-            return Some(alias);
-        }
-    }
+fn canonical_tag_family_from_symbol(name: &str, tags: Option<&str>) -> Option<CanonicalTagFamily> {
+    tags.and_then(canonical_tag_family_from_tags)
+        .or_else(|| canonical_tag_family_from_name(name))
+}
 
-    tag_alias_from_name(name)
+fn tag_alias_from_name(name: &str) -> Option<String> {
+    canonical_tag_family_from_name(name).map(|family| family.tag_alias)
+}
+
+fn tag_alias_from_tags(name: &str, tags: Option<&str>) -> Option<String> {
+    canonical_tag_family_from_symbol(name, tags).map(|family| family.tag_alias)
+}
+
+fn family_query_from_tag_alias(tag_alias: &str) -> Option<String> {
+    let query = tag_alias
+        .split(['/', '.'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if query.is_empty() { None } else { Some(query) }
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -8789,6 +8826,7 @@ struct SearchBudgetReport {
 const SEARCH_BUDGET_SURFACE_PREVIEW_LIMIT: usize = 3;
 
 struct SearchBudgetSymbolFamily {
+    canonical_family: Option<String>,
     canonical_tag_alias: Option<String>,
     representative_name: String,
     representative_kind: String,
@@ -8803,16 +8841,10 @@ struct SearchBudgetSymbolFamily {
 }
 
 fn search_budget_family_query(tag_alias: Option<&str>, fallback_name: &str) -> String {
-    if let Some(alias) = tag_alias {
-        let query = alias
-            .split(['/', '.'])
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if !query.is_empty() {
-            return query;
-        }
+    if let Some(alias) = tag_alias
+        && let Some(query) = family_query_from_tag_alias(alias)
+    {
+        return query;
     }
     fallback_name.to_string()
 }
@@ -8890,13 +8922,19 @@ fn build_search_budget_report(
         } else {
             relativize(&hit.file, root)
         };
-        let canonical_tag_alias = tag_alias_from_tags(&hit.name, hit.tags.as_deref());
-        let family_key = canonical_tag_alias
-            .clone()
+        let canonical_family = canonical_tag_family_from_symbol(&hit.name, hit.tags.as_deref());
+        let family_key = canonical_family
+            .as_ref()
+            .map(|family| family.canonical.clone())
             .unwrap_or_else(|| hit.name.clone());
         let position = *family_positions.entry(family_key).or_insert_with(|| {
             families.push(SearchBudgetSymbolFamily {
-                canonical_tag_alias: canonical_tag_alias.clone(),
+                canonical_family: canonical_family
+                    .as_ref()
+                    .map(|family| family.canonical.clone()),
+                canonical_tag_alias: canonical_family
+                    .as_ref()
+                    .map(|family| family.tag_alias.clone()),
                 representative_name: hit.name.clone(),
                 representative_kind: hit.kind.clone(),
                 representative_match_type: hit.match_type.clone(),
@@ -8931,11 +8969,13 @@ fn build_search_budget_report(
             let file_count = family.seen_files.len();
             let surface_count = family.seen_surfaces.len();
             let key = format!(
-                "{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}",
                 family
-                    .canonical_tag_alias
+                    .canonical_family
                     .as_deref()
+                    .or(family.canonical_tag_alias.as_deref())
                     .unwrap_or(&family.representative_name),
+                family.canonical_tag_alias.as_deref().unwrap_or(""),
                 family.representative_kind,
                 family.representative_file,
                 family.representative_line,

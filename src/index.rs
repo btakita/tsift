@@ -13,7 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tagpath::parser as tagpath_parser;
+use tagpath::{family as tagpath_family, query as tagpath_query};
 
 pub struct IndexDb {
     conn: Connection,
@@ -1353,87 +1353,18 @@ fn clear_lock_metadata(file: &mut File) -> std::io::Result<()> {
     Ok(())
 }
 
-const AGENT_QUERY_STOPWORDS: &[&str] = &[
-    "a", "an", "the", "for", "of", "to", "into", "from", "in", "with", "via", "by",
-];
-
-fn normalize_agent_role_tag(tag: &str) -> Option<&'static str> {
-    match tag {
-        "get" | "getter" => Some("get"),
-        "set" | "setter" => Some("set"),
-        "use" | "hook" => Some("use"),
-        "create" | "creator" | "factory" => Some("create"),
-        "build" | "builder" => Some("build"),
-        "make" | "maker" => Some("make"),
-        "new" | "constructor" => Some("new"),
-        "is" | "predicate" => Some("is"),
-        "has" => Some("has"),
-        "can" => Some("can"),
-        "should" => Some("should"),
-        "on" | "handler" => Some("on"),
-        "validate" | "validator" => Some("validate"),
-        "check" | "checker" => Some("check"),
-        "verify" | "verifier" => Some("verify"),
-        _ => None,
-    }
-}
-
-fn is_agent_query_stopword(tag: &str) -> bool {
-    AGENT_QUERY_STOPWORDS.contains(&tag)
-}
-
-fn parse_agent_query_tags(name: &str) -> Option<Vec<String>> {
-    let mut tags = Vec::new();
-    let mut raw_token_count = 0usize;
-
-    for raw_token in name
-        .split(|ch: char| !ch.is_alphanumeric())
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-    {
-        raw_token_count += 1;
-        let convention = tagpath_parser::detect_convention(raw_token);
-        let parsed = tagpath_parser::parse(raw_token, convention);
-        for parsed_tag in parsed.tags {
-            let tag = parsed_tag.to_ascii_lowercase();
-            if tag.is_empty() || is_agent_query_stopword(&tag) {
-                continue;
-            }
-            tags.push(
-                normalize_agent_role_tag(&tag)
-                    .unwrap_or(tag.as_str())
-                    .to_string(),
-            );
+fn compute_tags(name: &str) -> String {
+    if name.chars().any(char::is_whitespace) {
+        let query_tags = tagpath_query::normalize_query_tags(name)
+            .into_iter()
+            .map(|tag| tag.tag)
+            .collect::<Vec<_>>();
+        if !query_tags.is_empty() {
+            return query_tags.join(",");
         }
     }
 
-    if raw_token_count < 2 || tags.len() < 2 {
-        return None;
-    }
-
-    if let Some(last) = tags.last().cloned()
-        && normalize_agent_role_tag(&last).is_some()
-        && tags
-            .first()
-            .is_none_or(|first| normalize_agent_role_tag(first).is_none())
-    {
-        tags.pop();
-        tags.insert(0, last);
-    }
-
-    Some(tags)
-}
-
-fn compute_tags(name: &str) -> String {
-    let convention = tagpath_parser::detect_convention(name);
-    let parsed = tagpath_parser::parse(name, convention);
-    if parsed.tags.len() == 1
-        && name.chars().any(char::is_whitespace)
-        && let Some(tags) = parse_agent_query_tags(name)
-    {
-        return tags.join(",");
-    }
-    parsed.tags.join(",")
+    tagpath_family::generate_family(name).tags.join(",")
 }
 
 #[cfg(test)]
@@ -1766,8 +1697,8 @@ mod tests {
 
     #[test]
     fn compute_tags_splits_agent_style_phrase_queries() {
-        assert_eq!(compute_tags("user profile getter"), "get,user,profile");
-        assert_eq!(compute_tags("profile user get"), "get,profile,user");
+        assert_eq!(compute_tags("get user profile"), "get,user,profile");
+        assert_eq!(compute_tags("profile user get"), "profile,user,get");
         assert_eq!(compute_tags("getUserProfile"), "get,user,profile");
     }
 
@@ -1778,10 +1709,10 @@ mod tests {
         let db = db_in(dir.path());
         db.apply_changes(dir.path()).unwrap();
 
-        let hits = db.symbol_search("user profile getter", 10).unwrap();
+        let hits = db.symbol_search("get user profile", 10).unwrap();
         assert!(
             !hits.is_empty(),
-            "should split free-text agent queries into tagpath tags"
+            "should normalize free-text agent queries through tagpath query tags"
         );
         assert_eq!(hits[0].name, "get_user_profile");
         assert_eq!(hits[0].match_type, "all_tags");

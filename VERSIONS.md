@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- `tsift search` now delegates free-text query normalization to the `tagpath` v0.6.1 query API, while search/explain/session-review/context-pack preview refs derive canonical `tag_alias` values from the shared `tagpath` family API instead of local parser helpers.
 - `context-pack` now loads tagpath ontology docs from `.naming/tags/*.md` and attaches compact ontology references to visible symbol refs, summary refs, and the top-level handoff payload so stable tag docs can be referenced by handle/path without repeating ontology prose.
 - Regression coverage now locks ontology refs in both preview-builder unit tests and the compiled `context-pack --json` integration path.
 
