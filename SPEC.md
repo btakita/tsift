@@ -221,6 +221,7 @@ Short kinds (`struct`, `trait`, `enum`, `const`, `static`, `mod`, `impl`, `alias
 tsift search "alpha_helper" --budget small
 tsift explain alpha_helper --budget normal
 tsift session-review tasks/software/tsift.md --budget deep --json
+tsift token-savings --fixture fixtures/tsift-token-savings.json --fail-under --json
 ```
 
 Behavior:
@@ -235,6 +236,8 @@ Behavior:
 - Symbol-bearing preview items also expose a canonical `tag_alias` derived from `tagpath` tags (for example `alpha/helper`) so agents can reuse one semantic reference across search, explain, and handoff flows without repeating every surface spelling.
 - When search preview mode sees repeated symbol hits that collapse to the same canonical `tag_alias`, it emits one family summary row with match/file counts plus a follow-up `expand` command keyed to that canonical tag family instead of repeating every surface spelling inline.
 - JSON/terse/schema output in preview mode returns the same bounded preview report instead of the full raw payload; without these flags, the existing output formats remain unchanged.
+
+`tsift token-savings --fixture <path>` is a CI-friendly report surface for preview compression contracts. The fixture lists per-command cases with raw symbol rows, compact tagpath families, and minimum savings thresholds; tsift serializes the raw rows and the compact envelope rows, then reports byte deltas, estimated token deltas using `ceil(utf8_bytes / 4)`, savings percentages, and pass/fail status per command. `--json` emits the report as structured data, `--fail-under` exits non-zero when any case misses its fixture threshold, and `tsift --envelope token-savings ...` wraps the same report in the common summary envelope.
 
 ## Structured Envelopes
 

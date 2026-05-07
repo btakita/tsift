@@ -443,6 +443,18 @@ enum Commands {
         #[arg(long, value_enum)]
         budget: Option<ResponseBudgetPreset>,
     },
+    /// Compare raw symbol output with compact tag-family preview envelopes
+    TokenSavings {
+        /// Fixture describing raw symbols, tagpath families, and minimum savings thresholds
+        #[arg(long)]
+        fixture: PathBuf,
+        /// Exit non-zero when any case misses its fixture threshold
+        #[arg(long)]
+        fail_under: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Summarize repeated metric runs into compact deltas and news-ready tables
     MetricDigest {
         /// Read metric-run JSON from a file instead of stdin
@@ -1082,6 +1094,22 @@ fn main() -> Result<()> {
             },
             ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
         ),
+        Some(Commands::TokenSavings {
+            fixture,
+            fail_under,
+            json,
+        }) => cmd_token_savings(
+            &fixture,
+            fail_under,
+            OutputFormat {
+                json_output: json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                schema,
+                envelope,
+            },
+        ),
         Some(Commands::MetricDigest {
             input,
             baseline,
@@ -1327,6 +1355,262 @@ fn print_json_or_envelope<T: Serialize>(
             "{}",
             to_json_schema(report, format.pretty, format.terse, format.schema)?
         );
+    }
+    Ok(())
+}
+
+#[derive(Deserialize, Serialize)]
+struct TokenSavingsFixture {
+    schema_version: u64,
+    #[serde(default)]
+    description: String,
+    token_estimate: String,
+    cases: Vec<TokenSavingsFixtureCase>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct TokenSavingsFixtureCase {
+    name: String,
+    surface: String,
+    minimum_savings_percent: f64,
+    raw_symbols: Vec<TokenSavingsRawSymbol>,
+    tagpath_families: Vec<TokenSavingsFamily>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct TokenSavingsRawSymbol {
+    identifier: String,
+    file: String,
+    line: u64,
+    context: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct TokenSavingsFamily {
+    canonical: String,
+    count: usize,
+    #[serde(default)]
+    aliases: BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct TokenSavingsEnvelopeFamily {
+    handle: String,
+    tag_alias: String,
+    count: usize,
+    expand: String,
+}
+
+#[derive(Serialize)]
+struct TokenSavingsCaseReport {
+    name: String,
+    surface: String,
+    raw_symbol_count: usize,
+    family_count: usize,
+    raw_bytes: usize,
+    envelope_bytes: usize,
+    byte_delta: usize,
+    raw_estimated_tokens: usize,
+    envelope_estimated_tokens: usize,
+    estimated_token_delta: usize,
+    savings_percent: f64,
+    minimum_savings_percent: f64,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct TokenSavingsTotals {
+    cases: usize,
+    raw_bytes: usize,
+    envelope_bytes: usize,
+    byte_delta: usize,
+    raw_estimated_tokens: usize,
+    envelope_estimated_tokens: usize,
+    estimated_token_delta: usize,
+    savings_percent: f64,
+}
+
+#[derive(Serialize)]
+struct TokenSavingsReport {
+    schema_version: u64,
+    token_estimate: String,
+    pass: bool,
+    totals: TokenSavingsTotals,
+    cases: Vec<TokenSavingsCaseReport>,
+}
+
+fn estimated_tokens_from_bytes(bytes: usize) -> usize {
+    bytes.div_ceil(4)
+}
+
+fn savings_percent(raw_bytes: usize, envelope_bytes: usize) -> f64 {
+    if raw_bytes == 0 || envelope_bytes >= raw_bytes {
+        0.0
+    } else {
+        ((raw_bytes - envelope_bytes) as f64 / raw_bytes as f64) * 100.0
+    }
+}
+
+fn token_savings_expand_command(surface: &str, canonical: &str) -> String {
+    let query = canonical.replace('_', " ");
+    match surface {
+        "explain" => format!(
+            "tsift --envelope explain {} --budget normal",
+            shell_quote(canonical)
+        ),
+        "session-review" => format!("tsift summarize {}", shell_quote(canonical)),
+        _ => format!(
+            "tsift --envelope search {} --budget normal",
+            shell_quote(&query)
+        ),
+    }
+}
+
+fn token_savings_envelope_families(
+    case: &TokenSavingsFixtureCase,
+) -> Vec<TokenSavingsEnvelopeFamily> {
+    case.tagpath_families
+        .iter()
+        .map(|family| {
+            let key = format!("{}:{}:{}", case.surface, case.name, family.canonical);
+            TokenSavingsEnvelopeFamily {
+                handle: stable_handle("tfam", &key),
+                tag_alias: family.canonical.replace('_', "/"),
+                count: family.count,
+                expand: token_savings_expand_command(&case.surface, &family.canonical),
+            }
+        })
+        .collect()
+}
+
+fn build_token_savings_report(fixture: &TokenSavingsFixture) -> Result<TokenSavingsReport> {
+    let mut cases = Vec::new();
+    let mut total_raw_bytes = 0;
+    let mut total_envelope_bytes = 0;
+
+    for case in &fixture.cases {
+        let raw_bytes = serde_json::to_vec(&case.raw_symbols)?.len();
+        let envelope = token_savings_envelope_families(case);
+        let envelope_bytes = serde_json::to_vec(&envelope)?.len();
+        let byte_delta = raw_bytes.saturating_sub(envelope_bytes);
+        let raw_estimated_tokens = estimated_tokens_from_bytes(raw_bytes);
+        let envelope_estimated_tokens = estimated_tokens_from_bytes(envelope_bytes);
+        let estimated_token_delta = raw_estimated_tokens.saturating_sub(envelope_estimated_tokens);
+        let savings_percent = savings_percent(raw_bytes, envelope_bytes);
+        let pass = savings_percent >= case.minimum_savings_percent;
+
+        total_raw_bytes += raw_bytes;
+        total_envelope_bytes += envelope_bytes;
+        cases.push(TokenSavingsCaseReport {
+            name: case.name.clone(),
+            surface: case.surface.clone(),
+            raw_symbol_count: case.raw_symbols.len(),
+            family_count: case.tagpath_families.len(),
+            raw_bytes,
+            envelope_bytes,
+            byte_delta,
+            raw_estimated_tokens,
+            envelope_estimated_tokens,
+            estimated_token_delta,
+            savings_percent,
+            minimum_savings_percent: case.minimum_savings_percent,
+            status: if pass { "pass" } else { "fail" }.to_string(),
+        });
+    }
+
+    let total_byte_delta = total_raw_bytes.saturating_sub(total_envelope_bytes);
+    let total_raw_estimated_tokens = estimated_tokens_from_bytes(total_raw_bytes);
+    let total_envelope_estimated_tokens = estimated_tokens_from_bytes(total_envelope_bytes);
+    let total_estimated_token_delta =
+        total_raw_estimated_tokens.saturating_sub(total_envelope_estimated_tokens);
+    let pass = cases.iter().all(|case| case.status == "pass");
+
+    Ok(TokenSavingsReport {
+        schema_version: fixture.schema_version,
+        token_estimate: fixture.token_estimate.clone(),
+        pass,
+        totals: TokenSavingsTotals {
+            cases: cases.len(),
+            raw_bytes: total_raw_bytes,
+            envelope_bytes: total_envelope_bytes,
+            byte_delta: total_byte_delta,
+            raw_estimated_tokens: total_raw_estimated_tokens,
+            envelope_estimated_tokens: total_envelope_estimated_tokens,
+            estimated_token_delta: total_estimated_token_delta,
+            savings_percent: savings_percent(total_raw_bytes, total_envelope_bytes),
+        },
+        cases,
+    })
+}
+
+fn print_token_savings_human(report: &TokenSavingsReport) {
+    println!(
+        "surface\tcase\traw_bytes\tenvelope_bytes\tbyte_delta\traw_tokens\tenvelope_tokens\ttoken_delta\tsavings_percent\tminimum_percent\tstatus"
+    );
+    for case in &report.cases {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t{:.1}\t{}",
+            case.surface,
+            case.name,
+            case.raw_bytes,
+            case.envelope_bytes,
+            case.byte_delta,
+            case.raw_estimated_tokens,
+            case.envelope_estimated_tokens,
+            case.estimated_token_delta,
+            case.savings_percent,
+            case.minimum_savings_percent,
+            case.status
+        );
+    }
+    println!(
+        "total\tall\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}\t-\t{}",
+        report.totals.raw_bytes,
+        report.totals.envelope_bytes,
+        report.totals.byte_delta,
+        report.totals.raw_estimated_tokens,
+        report.totals.envelope_estimated_tokens,
+        report.totals.estimated_token_delta,
+        report.totals.savings_percent,
+        if report.pass { "pass" } else { "fail" }
+    );
+}
+
+fn cmd_token_savings(fixture_path: &Path, fail_under: bool, format: OutputFormat) -> Result<()> {
+    let fixture_body = fs::read_to_string(fixture_path)
+        .with_context(|| format!("reading token-savings fixture: {}", fixture_path.display()))?;
+    let fixture: TokenSavingsFixture = serde_json::from_str(&fixture_body)
+        .with_context(|| format!("parsing token-savings fixture: {}", fixture_path.display()))?;
+    let report = build_token_savings_report(&fixture)?;
+
+    if format.json_output {
+        print_json_or_envelope(
+            &report,
+            &format,
+            "token-savings",
+            "report",
+            ToolEnvelopeSummary {
+                text: "token-savings report".to_string(),
+                metrics: vec![
+                    envelope_metric("cases", report.totals.cases),
+                    envelope_metric("raw_tokens", report.totals.raw_estimated_tokens),
+                    envelope_metric("envelope_tokens", report.totals.envelope_estimated_tokens),
+                    envelope_metric("token_delta", report.totals.estimated_token_delta),
+                    envelope_metric(
+                        "savings_percent",
+                        format!("{:.1}", report.totals.savings_percent),
+                    ),
+                ],
+            },
+            false,
+            vec![],
+        )?;
+    } else {
+        print_token_savings_human(&report);
+    }
+
+    if fail_under && !report.pass {
+        bail!("token-savings threshold failed");
     }
     Ok(())
 }
@@ -13045,6 +13329,90 @@ tier = "private"
             }
             _ => panic!("expected ContextPack command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_token_savings_command() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "token-savings",
+            "--fixture",
+            "fixtures/tsift-token-savings.json",
+            "--fail-under",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::TokenSavings {
+                fixture,
+                fail_under,
+                json,
+            }) => {
+                assert_eq!(fixture, PathBuf::from("fixtures/tsift-token-savings.json"));
+                assert!(fail_under);
+                assert!(json);
+            }
+            _ => panic!("expected TokenSavings command"),
+        }
+    }
+
+    #[test]
+    fn token_savings_report_records_fixture_thresholds() {
+        let raw_symbols = [
+            "validate_user",
+            "validateUser",
+            "ValidateUser",
+            "validate-user",
+            "VALIDATE_USER",
+            "Validate_User",
+            "raw_symbol",
+            "rawSymbol",
+            "RawSymbol",
+            "raw-symbol",
+            "RAW_SYMBOL",
+            "Raw_Symbol",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(idx, identifier)| TokenSavingsRawSymbol {
+            identifier: (*identifier).to_string(),
+            file: format!("src/example_{idx}.rs"),
+            line: (idx + 1) as u64,
+            context: "function".to_string(),
+        })
+        .collect();
+        let fixture = TokenSavingsFixture {
+            schema_version: 1,
+            description: "fixture".to_string(),
+            token_estimate: "ceil(utf8_bytes / 4)".to_string(),
+            cases: vec![TokenSavingsFixtureCase {
+                name: "search-preview".to_string(),
+                surface: "search".to_string(),
+                minimum_savings_percent: 40.0,
+                raw_symbols,
+                tagpath_families: vec![
+                    TokenSavingsFamily {
+                        canonical: "validate_user".to_string(),
+                        count: 6,
+                        aliases: BTreeMap::new(),
+                    },
+                    TokenSavingsFamily {
+                        canonical: "raw_symbol".to_string(),
+                        count: 6,
+                        aliases: BTreeMap::new(),
+                    },
+                ],
+            }],
+        };
+
+        let report = build_token_savings_report(&fixture).unwrap();
+
+        assert!(report.pass);
+        assert_eq!(report.cases[0].raw_symbol_count, 12);
+        assert_eq!(report.cases[0].family_count, 2);
+        assert_eq!(report.cases[0].status, "pass");
+        assert!(report.cases[0].byte_delta > 0);
+        assert!(report.cases[0].raw_estimated_tokens > report.cases[0].envelope_estimated_tokens);
+        assert!(report.cases[0].savings_percent >= 40.0);
     }
 
     #[test]
