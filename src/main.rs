@@ -6037,6 +6037,47 @@ fn build_context_pack_diff_preview(
     }
 }
 
+fn enrich_next_context_with_diff_symbols(
+    next_context: &mut SessionReviewNextContextBudgetReport,
+    diff_digest: &ContextPackDiffPreview,
+) {
+    let mut symbols = next_context.touched_symbols.clone();
+    for file in &diff_digest.files {
+        for symbol in &file.touched_symbol_refs {
+            if !symbols.iter().any(|existing| existing == &symbol.name) {
+                symbols.push(symbol.name.clone());
+            }
+        }
+    }
+
+    if symbols.is_empty() {
+        return;
+    }
+
+    let max_items = next_context.max_items;
+    let max_bytes = next_context.max_bytes;
+    next_context.touched_symbol_total = next_context.touched_symbol_total.max(symbols.len());
+    next_context.truncated |= symbols.len() > max_items;
+    next_context.touched_symbols = symbols
+        .iter()
+        .take(max_items)
+        .map(|entry| truncate_for_budget(entry, max_bytes))
+        .collect();
+    next_context.touched_symbol_refs = symbols
+        .iter()
+        .take(max_items)
+        .map(|entry| {
+            build_compact_symbol_ref(
+                "ncsym",
+                &format!("{}:{}", next_context.target, entry),
+                entry,
+                None,
+                max_bytes,
+            )
+        })
+        .collect();
+}
+
 fn build_context_pack_test_preview(
     report: &test_digest::TestDigestReport,
     budget: ResponseBudget,
@@ -6160,6 +6201,43 @@ fn build_context_pack_log_preview(
     }
 }
 
+fn enrich_log_preview_with_diff_symbols(
+    log_preview: &mut ContextPackLogPreview,
+    diff_digest: &ContextPackDiffPreview,
+) {
+    if !log_preview.symbol_refs.is_empty() {
+        return;
+    }
+
+    let mut symbols = Vec::new();
+    for file in &diff_digest.files {
+        for symbol in &file.touched_symbol_refs {
+            if !symbols
+                .iter()
+                .any(|existing: &String| existing == &symbol.name)
+            {
+                symbols.push(symbol.name.clone());
+            }
+        }
+    }
+
+    if symbols.is_empty() {
+        return;
+    }
+
+    log_preview.symbol_ref_groups = log_preview.symbol_ref_groups.max(symbols.len());
+    log_preview.symbol_refs = symbols
+        .into_iter()
+        .map(|symbol| ContextPackLogSymbolRefPreview {
+            handle: stable_handle("clsym", &symbol),
+            symbol: symbol.clone(),
+            tag_alias: tag_alias_from_name(&symbol),
+            occurrences: 1,
+            summary_state: "unavailable".to_string(),
+        })
+        .collect();
+}
+
 fn build_context_pack_report(
     path: &Path,
     test_input: Option<&Path>,
@@ -6170,7 +6248,7 @@ fn build_context_pack_report(
     let budget = effective_context_budget(budget);
     let review = session_review::compute(path)?;
     let root = PathBuf::from(&review.root);
-    let next_context = build_session_review_next_context_budget_report(&review, budget);
+    let mut next_context = build_session_review_next_context_budget_report(&review, budget);
     let diff_digest = build_context_pack_diff_preview(
         &diff_digest::compute(
             &root,
@@ -6181,6 +6259,7 @@ fn build_context_pack_report(
         )?,
         budget,
     );
+    enrich_next_context_with_diff_symbols(&mut next_context, &diff_digest);
     let test_digest = match test_input {
         Some(file_path) => {
             let input = fs::read_to_string(file_path)
@@ -6217,6 +6296,8 @@ fn build_context_pack_report(
                 bail!("no log output provided in {}", file_path.display());
             }
             let report = log_digest::compute(&root, &input)?;
+            let mut preview = build_context_pack_log_preview(&report, budget);
+            enrich_log_preview_with_diff_symbols(&mut preview, &diff_digest);
             ContextPackOptionalSection {
                 status: "included".to_string(),
                 command: format!(
@@ -6224,7 +6305,7 @@ fn build_context_pack_report(
                     shell_quote(file_path.to_str().unwrap_or_default())
                 ),
                 source: Some(file_path.display().to_string()),
-                report: Some(build_context_pack_log_preview(&report, budget)),
+                report: Some(preview),
             }
         }
         None => ContextPackOptionalSection {
@@ -7597,7 +7678,12 @@ fn cmd_search_with_budget(
         if federated && scope.is_none() {
             federated_exact_search(&root, &query, limit, timeout_secs)?
         } else {
-            run_exact_search_with_timeout(&sift_path, &query, limit, timeout_secs)?
+            let exact_path = if requested_exact_search && scope.is_none() {
+                &base_path
+            } else {
+                &sift_path
+            };
+            run_exact_search_with_timeout(exact_path, &query, limit, timeout_secs)?
         }
     } else if federated && scope.is_none() {
         federated_sift_search(
@@ -9196,7 +9282,10 @@ mod tests {
         let result = rewrite_command("rg authenticate");
         assert_eq!(
             result,
-            Some("tsift search \"authenticate\" --exact".to_string())
+            Some(
+                "tsift --envelope search \"authenticate\" --exact --max-items 5 --max-bytes 160"
+                    .to_string(),
+            )
         );
     }
 
@@ -9205,7 +9294,7 @@ mod tests {
         let result = rewrite_command("rg authenticate src/");
         assert_eq!(
             result,
-            Some("tsift search \"authenticate\" --exact --path \"src/\"".to_string())
+            Some("tsift --envelope search \"authenticate\" --exact --max-items 5 --max-bytes 160 --path \"src/\"".to_string())
         );
     }
 
@@ -9214,7 +9303,7 @@ mod tests {
         let result = rewrite_command("rg -i authenticate src/");
         assert_eq!(
             result,
-            Some("tsift search \"authenticate\" --exact --path \"src/\"".to_string())
+            Some("tsift --envelope search \"authenticate\" --exact --max-items 5 --max-bytes 160 --path \"src/\"".to_string())
         );
     }
 
@@ -9224,7 +9313,10 @@ mod tests {
         let result = rewrite_command("rg -t rs authenticate");
         assert_eq!(
             result,
-            Some("tsift search \"authenticate\" --exact".to_string())
+            Some(
+                "tsift --envelope search \"authenticate\" --exact --max-items 5 --max-bytes 160"
+                    .to_string()
+            )
         );
     }
 
@@ -9240,7 +9332,7 @@ mod tests {
         let result = rewrite_command("grep -r authenticate src/");
         assert_eq!(
             result,
-            Some("tsift search \"authenticate\" --exact --path \"src/\"".to_string())
+            Some("tsift --envelope search \"authenticate\" --exact --max-items 5 --max-bytes 160 --path \"src/\"".to_string())
         );
     }
 
@@ -9285,7 +9377,13 @@ mod tests {
     #[test]
     fn rewrite_rg_quoted_pattern() {
         let result = rewrite_command("rg \"fn main\"");
-        assert_eq!(result, Some("tsift search \"fn main\" --exact".to_string()));
+        assert_eq!(
+            result,
+            Some(
+                "tsift --envelope search \"fn main\" --exact --max-items 5 --max-bytes 160"
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -9518,7 +9616,7 @@ mod tests {
         assert_eq!(
             result,
             Some(
-                "tsift __digest-runner --kind \"test\" --path \".\" --shell-command \"cargo test --lib\" --runner \"cargo\"".to_string()
+                "tsift --envelope __digest-runner --kind \"test\" --path \".\" --shell-command \"cargo test --lib\" --runner \"cargo\"".to_string()
             )
         );
     }
@@ -9529,7 +9627,7 @@ mod tests {
         assert_eq!(
             result,
             Some(
-                "tsift __digest-runner --kind \"test\" --path \".\" --shell-command \"pytest -q tests/test_cli.py\" --runner \"pytest\"".to_string()
+                "tsift --envelope __digest-runner --kind \"test\" --path \".\" --shell-command \"pytest -q tests/test_cli.py\" --runner \"pytest\"".to_string()
             )
         );
     }
@@ -9540,7 +9638,7 @@ mod tests {
         assert_eq!(
             result,
             Some(
-                "tsift __digest-runner --kind \"test\" --path \".\" --shell-command \"python -m pytest tests/test_cli.py\" --runner \"pytest\"".to_string()
+                "tsift --envelope __digest-runner --kind \"test\" --path \".\" --shell-command \"python -m pytest tests/test_cli.py\" --runner \"pytest\"".to_string()
             )
         );
     }
@@ -9551,7 +9649,7 @@ mod tests {
         assert_eq!(
             result,
             Some(
-                "tsift __digest-runner --kind \"log\" --path \".\" --shell-command \"cargo build --release\"".to_string()
+                "tsift --envelope __digest-runner --kind \"log\" --path \".\" --shell-command \"cargo build --release\"".to_string()
             )
         );
     }
@@ -9562,7 +9660,7 @@ mod tests {
         assert_eq!(
             result,
             Some(
-                "tsift __digest-runner --kind \"log\" --path \".\" --shell-command \"cargo install --path . --force\"".to_string()
+                "tsift --envelope __digest-runner --kind \"log\" --path \".\" --shell-command \"cargo install --path . --force\"".to_string()
             )
         );
     }
@@ -9623,7 +9721,7 @@ mod tests {
         );
         assert_eq!(
             forwarded,
-            "tsift --pretty --json __digest-runner --kind \"log\" --path \".\" --shell-command \"cargo build --release\""
+            "tsift --pretty --envelope __digest-runner --kind \"log\" --path \".\" --shell-command \"cargo build --release\""
         );
     }
 
@@ -13694,7 +13792,12 @@ fn execute_rewritten_command(command: &str) -> Result<i32> {
         .iter()
         .map(|part| strip_shell_quotes(part).to_string())
         .collect();
-    let output = Command::new(program)
+    let mut command = if program == "tsift" {
+        Command::new(std::env::current_exe().context("resolving current tsift executable")?)
+    } else {
+        Command::new(program)
+    };
+    let output = command
         .args(&args)
         .output()
         .with_context(|| format!("executing rewritten command `{effective_command}`"))?;
@@ -13743,23 +13846,29 @@ fn apply_rewrite_output_format(command: &str, format: OutputFormat) -> String {
     let Some(rest) = trimmed.strip_prefix("tsift") else {
         return command.to_string();
     };
+    let existing_parts = shell_split(rest);
 
     let mut flags = Vec::new();
-    if format.compact {
+    if format.compact && !rewrite_has_global_flag(&existing_parts, "--compact") {
         flags.push("--compact");
     }
-    if format.pretty {
+    if format.pretty && !rewrite_has_global_flag(&existing_parts, "--pretty") {
         flags.push("--pretty");
     }
-    if format.terse {
+    if format.terse && !rewrite_has_global_flag(&existing_parts, "--terse") {
         flags.push("--terse");
     }
-    if format.schema {
+    if format.schema && !rewrite_has_global_flag(&existing_parts, "--schema") {
         flags.push("--schema");
     }
     if format.envelope {
-        flags.push("--envelope");
-    } else if format.json_output {
+        if !rewrite_has_global_flag(&existing_parts, "--envelope") {
+            flags.push("--envelope");
+        }
+    } else if format.json_output
+        && !rewrite_has_global_flag(&existing_parts, "--json")
+        && !rewrite_has_global_flag(&existing_parts, "--envelope")
+    {
         flags.push("--json");
     }
 
@@ -13773,6 +13882,16 @@ fn apply_rewrite_output_format(command: &str, format: OutputFormat) -> String {
     } else {
         format!("tsift {forwarded}{rest}")
     }
+}
+
+fn rewrite_has_global_flag(parts: &[&str], flag: &str) -> bool {
+    parts
+        .iter()
+        .take_while(|part| {
+            let value = strip_shell_quotes(part);
+            value.starts_with('-') || value == "tsift"
+        })
+        .any(|part| strip_shell_quotes(part) == flag)
 }
 
 fn rewrite_output_cap(command: &str) -> Option<OutputCap> {
@@ -13973,12 +14092,7 @@ fn rewrite_rg(cmd: &str) -> Option<String> {
         }
     }
 
-    let pattern = pattern?;
-    let mut result = format!("tsift search {} --exact", shell_quote(pattern));
-    if let Some(p) = path {
-        result.push_str(&format!(" --path {}", shell_quote(p)));
-    }
-    Some(result)
+    Some(build_agent_search_preview_command(pattern?, path))
 }
 
 /// Rewrite `grep -r` commands to tsift search.
@@ -14027,12 +14141,20 @@ fn rewrite_grep(cmd: &str) -> Option<String> {
         }
     }
 
-    let pattern = pattern?;
-    let mut result = format!("tsift search {} --exact", shell_quote(pattern));
+    Some(build_agent_search_preview_command(pattern?, path))
+}
+
+fn build_agent_search_preview_command(pattern: &str, path: Option<&str>) -> String {
+    let mut result = format!(
+        "tsift --envelope search {} --exact --max-items {} --max-bytes {}",
+        shell_quote(pattern),
+        DEFAULT_BUDGET_ITEMS,
+        DEFAULT_BUDGET_BYTES
+    );
     if let Some(p) = path {
         result.push_str(&format!(" --path {}", shell_quote(p)));
     }
-    Some(result)
+    result
 }
 
 fn rewrite_git_diff(cmd: &str) -> Option<String> {
@@ -14501,7 +14623,7 @@ fn build_digest_runner_command(
     shell_command: &str,
 ) -> String {
     let mut result = format!(
-        "tsift __digest-runner --kind {} --path {} --shell-command {}",
+        "tsift --envelope __digest-runner --kind {} --path {} --shell-command {}",
         shell_quote(kind),
         shell_quote(path),
         shell_quote(shell_command)

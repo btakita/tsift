@@ -8,7 +8,12 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
-- `tsift rewrite` now forwards global structured-output flags into rewritten tsift commands, so `tsift --envelope rewrite --run 'cargo test ...'`, `cargo build ...`, and `cargo install ...` emit the summary-first `digest-runner` envelope instead of falling back to raw human-readable output.
+## 0.1.39
+
+- `tsift rewrite` now makes token-saving agent surfaces automatic: `rg` / recursive `grep` rewrites produce `tsift --envelope search ... --max-items 5 --max-bytes 160`, and cargo/pytest/build rewrites produce artifact-backed `tsift --envelope __digest-runner ...` commands by default.
+- `tsift init` now injects envelope-first Code Navigation guidance for `search`, `explain`, `session-review`, `context-pack`, and digest-runner test/build artifacts, so Codex and other non-Claude harnesses get the same bounded workflow through `tsift rewrite --run '<command>'`.
+- Regression coverage now locks the default rewrite shapes plus end-to-end `rewrite --run` envelope execution without requiring callers to pass a global `--envelope` flag.
+- `tsift rewrite` now forwards and deduplicates global structured-output flags into rewritten tsift commands, so callers can layer `--pretty`, `--terse`, or `--schema` onto the default summary-first `digest-runner` envelope.
 - Regression coverage now locks the forwarded rewrite shape for `cargo install` plus end-to-end `rewrite --run` envelope execution for real `cargo test` and `cargo build` commands on a temp crate.
 - `tsift --envelope __digest-runner ... --json` now returns a summary-first command/test-run envelope with command metadata, exit status, the existing bounded `test-digest` or `log-digest` payload under `report.digest`, and a persisted transcript artifact reference under `report.artifact`.
 - Captured runner/build output is now written to `.tsift/artifacts/` with a stable handle plus a concrete replay command (`expand`) so green runs can stay terse in context while still offering an opt-in path back to the bounded digest.

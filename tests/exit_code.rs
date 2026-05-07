@@ -3938,7 +3938,7 @@ fn rewrite_run_fails_closed_when_no_rewrite_exists() {
 }
 
 #[test]
-fn rewrite_run_envelopes_cargo_test_digest_output() {
+fn rewrite_run_envelopes_cargo_test_digest_output_by_default() {
     let dir = tempfile::tempdir().unwrap();
     init_rust_library_crate(dir.path());
     let manifest = dir.path().join("Cargo.toml");
@@ -3946,7 +3946,7 @@ fn rewrite_run_envelopes_cargo_test_digest_output() {
 
     let output = tsift_bin()
         .current_dir(dir.path())
-        .args(["--envelope", "rewrite", "--run", &command])
+        .args(["rewrite", "--run", &command])
         .output()
         .unwrap();
 
@@ -3961,7 +3961,7 @@ fn rewrite_run_envelopes_cargo_test_digest_output() {
 }
 
 #[test]
-fn rewrite_run_envelopes_cargo_build_digest_output() {
+fn rewrite_run_envelopes_cargo_build_digest_output_by_default() {
     let dir = tempfile::tempdir().unwrap();
     init_rust_library_crate(dir.path());
     let manifest = dir.path().join("Cargo.toml");
@@ -3969,7 +3969,7 @@ fn rewrite_run_envelopes_cargo_build_digest_output() {
 
     let output = tsift_bin()
         .current_dir(dir.path())
-        .args(["--envelope", "rewrite", "--run", &command])
+        .args(["rewrite", "--run", &command])
         .output()
         .unwrap();
 

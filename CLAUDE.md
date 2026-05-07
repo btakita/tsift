@@ -13,7 +13,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift graph` | Call-graph queries: `--callers` / `--callees` of a symbol. `--limit N` (default 20, 0=unlimited) / `--scope <name>` / `--json`. Workspace roots with only scoped `.tsift/indexes/*/index.db` state fail closed until the caller selects a scope. |
 | `tsift edit` | Batch file edits from JSON (stdin or `--file`), atomic validate-then-write |
 | `tsift route` | Classify task → model tier (haiku/sonnet/opus) |
-| `tsift rewrite` | Shell command → tsift equivalent. Default mode prints the rewrite for hook integration; `--run` executes the bounded tsift equivalent directly so Codex and other harnesses can reuse the same digest-first path without Claude `PreToolUse` hooks. Coverage includes exact-search rewrites plus digest-routing for `git diff`, `git diff --cached`, `git show`, simple patch-style `git log -p -1 ...`, long session transcript reads (`cat` / `head` / `tail` / `sed -n` over agent-doc markdown, Claude JSONL, Codex JSONL, or agent-doc runtime logs), `cargo test` / `pytest`, and verbose cargo build/check/install flows. |
+| `tsift rewrite` | Shell command → tsift equivalent. Default mode prints the rewrite for hook integration; `--run` executes the bounded tsift equivalent directly so Codex and other harnesses can reuse the same envelope-first path without Claude `PreToolUse` hooks. Coverage includes exact-search envelope previews, digest-routing for `git diff`, `git diff --cached`, `git show`, simple patch-style `git log -p -1 ...`, long session transcript reads (`cat` / `head` / `tail` / `sed -n` over agent-doc markdown, Claude JSONL, Codex JSONL, or agent-doc runtime logs), and artifact-backed digest-runner envelopes for `cargo test` / `pytest` plus verbose cargo build/check/install flows. |
 | `tsift sql` | SQLite introspection: schema overview, table detail, read-only query |
 | `tsift communities` | Louvain community detection over call graph. `--min-size N` / `--limit N` (default 10, 0=unlimited) / `--scope <name>` / `--json`. Workspace roots with scoped-only indexes require an explicit scope. |
 | `tsift path` | BFS shortest path between two symbols. `--scope <name>` / `--json`. Workspace roots with scoped-only indexes require an explicit scope. |
@@ -30,9 +30,9 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift lint` | Markdown lint: detect unannotated concepts (symbols, headings, bold terms) cross-referenced against graph entities. Auto-discovers live `index.db` files from the nearest `.tsift` root by default, and `--index` accepts a project root, `.tsift`, direct `index.db`, or `.tsift/indexes`. `--index <dir>` / `--entities-from <file>` / `--json` |
 | `tsift status` | Session health check: index freshness, instruction version, summary cache, recommended commands. Workspace roots treat scoped indexes under `.tsift/indexes/<scope>/index.db` as the authoritative status surface, even if a shared `.tsift/index.db` also exists; they surface configured-but-missing scopes instead of reporting false `fresh`, recommend `--workspace` rebuilds, and include summary-cache recovery diagnostics when status had to fall back to a snapshot. `--json` includes per-scope indexed status plus `missing_scopes`. |
 | `tsift locks` | Diagnose the OS-backed `index.lock` sidecar and `index.db-journal` state, and recommend the next recovery step. Stale sidecar metadata is reused automatically. `--scope <name>` / `--json` |
-| `tsift init` | Project setup: ensure versioned Code Navigation section (`v=X.Y.Z`) in AGENTS.md and mirror it into CLAUDE.md when present. The injected section tells the harness to run from the owning repo/submodule root and prefer bounded digest surfaces (`session-digest`, `session-review`, `diff-digest`, `test-digest`, `log-digest`) over raw transcript, diff, and verbose-log reads. `--codex` injects or updates a repo-aware autoindex hook; `--workspace` resolves to the parent workspace root. Detects and refreshes stale/pre-versioned markers on re-run. |
+| `tsift init` | Project setup: ensure versioned Code Navigation section (`v=X.Y.Z`) in AGENTS.md and mirror it into CLAUDE.md when present. The injected section tells the harness to run from the owning repo/submodule root and prefer envelope previews plus artifact-backed digest surfaces over raw transcript, diff, and verbose-log reads. `--codex` injects or updates a repo-aware autoindex hook; `--workspace` resolves to the parent workspace root. Detects and refreshes stale/pre-versioned markers on re-run. |
 
-Global flags: `--compact` reduces human-readable output volume (abbreviated kind/match_type labels, shorter section headers like `syms`, `crs`, `ces`, `comm`). `--pretty` switches JSON output from compact (default) to indented format. `--terse` outputs JSON with abbreviated field names and inline schema (implies `--json`). `--schema` converts repeated object arrays to columnar `{"_c":[cols],"_r":[[vals],...]}` format (implies `--json`; combines with `--terse`). `--absolute` shows full filesystem paths instead of project-relative (relative is default for token savings). `--tabular` outputs repeated structures as TSV with header row (search, graph, communities, explain).
+Global flags: `--compact` reduces human-readable output volume (abbreviated kind/match_type labels, shorter section headers like `syms`, `crs`, `ces`, `comm`). `--envelope` wraps supported agent-facing JSON responses in a summary-first envelope. `--pretty` switches JSON output from compact (default) to indented format. `--terse` outputs JSON with abbreviated field names and inline schema (implies `--json`). `--schema` converts repeated object arrays to columnar `{"_c":[cols],"_r":[[vals],...]}` format (implies `--json`; combines with `--terse`). `--absolute` shows full filesystem paths instead of project-relative (relative is default for token savings). `--tabular` outputs repeated structures as TSV with header row (search, graph, communities, explain).
 
 ## Graph Module (`src/graph.rs`)
 
@@ -108,31 +108,31 @@ If copied skill instructions lag behind the installed binary, treat this file, `
 - **Scoped indexing fails closed**: `tsift index --submodule <name>` now shares that strict scope resolution, so unknown or ambiguous workspace selectors do not create unreachable `.tsift/indexes/<name>/index.db` state.
 - **Duplicate scope ids stay unique**: when `.gitmodules` contains duplicate trailing directory names, tsift promotes those workspace scopes to their full submodule paths so `.tsift/indexes/<scope>/index.db` and `--scope` / `--submodule` selectors cannot collide.
 - **Inline lock diagnostics**: if `tsift search` autoindex or `tsift index` still loses a write race, stderr now includes the live `lock` / `journal` state, the exact reindex command, and the recommended next step without requiring a separate `tsift locks`.
-- **Search rewrite** (`PreToolUse`): `~/.claude/hooks/tsift-rewrite.sh` rewrites `rg`/`grep -r` to `tsift search --exact`, `git diff` / `git diff --cached` / `git show` / simple `git log -p -1 ...` history commands to `tsift diff-digest`, long transcript reads (`cat`, `bat`, `head -n`, `tail -n`, `sed -n`) over recognized agent-doc markdown sessions, Claude JSONL, Codex JSONL, or `agent-doc` runtime logs to `tsift session-digest` rooted at the transcript's owning repo/submodule when present, `cargo test` / `pytest` to the tsift test-digest wrapper, and verbose cargo build/check/clippy/install commands to the tsift log-digest wrapper.
+- **Search rewrite** (`PreToolUse`): `~/.claude/hooks/tsift-rewrite.sh` rewrites `rg`/`grep -r` to `tsift --envelope search ... --exact --max-items 5 --max-bytes 160`, `git diff` / `git diff --cached` / `git show` / simple `git log -p -1 ...` history commands to `tsift diff-digest`, long transcript reads (`cat`, `bat`, `head -n`, `tail -n`, `sed -n`) over recognized agent-doc markdown sessions, Claude JSONL, Codex JSONL, or `agent-doc` runtime logs to `tsift session-digest` rooted at the transcript's owning repo/submodule when present, `cargo test` / `pytest` to `tsift --envelope __digest-runner --kind test ...`, and verbose cargo build/check/clippy/install commands to `tsift --envelope __digest-runner --kind log ...`.
 - **RTK output filtering** (`PreToolUse`): same hook routes verbose commands (`communities`, `explain`, `graph`, `index`, `search`) through RTK when installed. TOML filters at `~/.config/rtk/filters.toml` cap output lines.
-- **Cross-harness fallback**: when your harness does not offer Claude-style `PreToolUse` hooks, run `tsift rewrite --run '<command>'`. It executes the same digest-first rewrite directly and applies tsift-owned output caps for verbose `search`, `explain`, `graph`, `communities`, and `index` output, so Codex and other harnesses do not need RTK to stay bounded.
+- **Cross-harness fallback**: when your harness does not offer Claude-style `PreToolUse` hooks, run `tsift rewrite --run '<command>'`. It executes the same envelope-first rewrite directly, including search preview budgets and digest-runner artifact envelopes, so Codex and other harnesses do not need RTK to stay bounded.
 - **Stale-session recovery**: if a resumed tmux or Codex session hits `tsift search timed out ... The index may be stale`, run `tsift index .` and retry the original tsift command.
 
 ## Repo
 
 Private: `github.com/btakita/tsift`. Submodule at `src/tsift` in agent-loop.
 
-<!-- tsift:code-navigation v=0.1.38 -->
+<!-- tsift:code-navigation v=0.1.39 -->
 ## Code Navigation
 
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root.
 
 Use the commands listed in its `use:` output:
-- `tsift search <query>` — AST-aware hybrid search (prefer over grep/rg)
-- `tsift explain <symbol>` — callers, callees, community context
+- `tsift --envelope search <query> --max-items 5 --max-bytes 160` — AST-aware hybrid search preview (prefer over grep/rg)
+- `tsift --envelope explain <symbol> --max-items 5 --max-bytes 160` — callers, callees, community preview
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
 
 Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
-- `tsift session-digest <file>` / `tsift session-review <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
+- `tsift --envelope session-review <path> --next-context --max-items 5 --max-bytes 160` or `tsift --envelope context-pack <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
 - `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
-- `tsift test-digest --path .` / `tsift log-digest --path .` for noisy test/build/install output, or let the rewrite/hooks wrap `cargo test`, `pytest`, and verbose cargo commands for you.
-- If your harness does not support Claude-style `PreToolUse` hooks, run `tsift rewrite --run '<command>'` to execute the same digest-first/bounded tsift equivalent manually.
+- `tsift --envelope __digest-runner --kind test --path . --shell-command '<test command>'` / `tsift --envelope __digest-runner --kind log --path . --shell-command '<build command>'` for noisy test/build/install output, or let the rewrite/hooks create those artifact-backed envelopes for `cargo test`, `pytest`, and verbose cargo commands.
+- If your harness does not support Claude-style `PreToolUse` hooks, run `tsift rewrite --run '<command>'` to execute the same envelope-first, artifact-backed tsift equivalent manually.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->

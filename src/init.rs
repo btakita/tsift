@@ -16,16 +16,16 @@ fn versioned_section() -> String {
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root.
 
 Use the commands listed in its `use:` output:
-- `tsift search <query>` — AST-aware hybrid search (prefer over grep/rg)
-- `tsift explain <symbol>` — callers, callees, community context
+- `tsift --envelope search <query> --max-items 5 --max-bytes 160` — AST-aware hybrid search preview (prefer over grep/rg)
+- `tsift --envelope explain <symbol> --max-items 5 --max-bytes 160` — callers, callees, community preview
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
 
 Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
-- `tsift session-digest <file>` / `tsift session-review <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
+- `tsift --envelope session-review <path> --next-context --max-items 5 --max-bytes 160` or `tsift --envelope context-pack <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
 - `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
-- `tsift test-digest --path .` / `tsift log-digest --path .` for noisy test/build/install output, or let the rewrite/hooks wrap `cargo test`, `pytest`, and verbose cargo commands for you.
-- If your harness does not support Claude-style `PreToolUse` hooks, run `tsift rewrite --run '<command>'` to execute the same digest-first/bounded tsift equivalent manually.
+- `tsift --envelope __digest-runner --kind test --path . --shell-command '<test command>'` / `tsift --envelope __digest-runner --kind log --path . --shell-command '<build command>'` for noisy test/build/install output, or let the rewrite/hooks create those artifact-backed envelopes for `cargo test`, `pytest`, and verbose cargo commands.
+- If your harness does not support Claude-style `PreToolUse` hooks, run `tsift rewrite --run '<command>'` to execute the same envelope-first, artifact-backed tsift equivalent manually.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->"#,
@@ -437,7 +437,7 @@ mod tests {
         assert_eq!(result.updates[0].file.file_name().unwrap(), "AGENTS.md");
         let content = std::fs::read_to_string(&result.updates[0].file).unwrap();
         assert!(content.contains(SECTION_MARKER_PREFIX));
-        assert!(content.contains("tsift search"));
+        assert!(content.contains("tsift --envelope search"));
     }
 
     #[test]
@@ -521,7 +521,7 @@ mod tests {
         let result = init(dir.path(), false, false).unwrap();
         assert!(matches!(result.updates[0].action, InitAction::Updated));
         let content = std::fs::read_to_string(&agents).unwrap();
-        assert!(content.contains("tsift search"));
+        assert!(content.contains("tsift --envelope search"));
         assert!(!content.contains("Old content here."));
         assert_eq!(content.matches(SECTION_MARKER_PREFIX).count(), 1);
     }
@@ -959,10 +959,11 @@ mod tests {
         let content = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
         let expected_marker = format!("<!-- tsift:code-navigation v={} -->", TSIFT_VERSION);
         assert!(content.contains(&expected_marker));
-        assert!(content.contains("tsift session-digest <file>"));
+        assert!(content.contains("tsift --envelope session-review <path> --next-context"));
+        assert!(content.contains("tsift --envelope context-pack <path>"));
         assert!(content.contains("tsift diff-digest [path]"));
-        assert!(content.contains("tsift test-digest --path ."));
-        assert!(content.contains("tsift log-digest --path ."));
+        assert!(content.contains("tsift --envelope __digest-runner --kind test"));
+        assert!(content.contains("tsift --envelope __digest-runner --kind log"));
     }
 
     #[test]

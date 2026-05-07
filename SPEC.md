@@ -73,7 +73,7 @@ tsift graph --callers <symbol>  # who calls this function?
 tsift graph --callees <symbol>  # what does this function call?
 tsift communities [--path]      # Louvain community detection over call graph
 tsift path <from> <to>          # BFS shortest path between symbols
-tsift explain <symbol>          # full symbol context: callers, callees, community
+tsift --envelope explain <symbol> --max-items 5 --max-bytes 160 # bounded agent preview
 tsift edit < edits.json         # staged multi-file search/replace batch
 tsift audit                     # scan installed skills, check health
 tsift audit --manifest <file>   # compare against expected skill list
@@ -83,14 +83,14 @@ tsift summarize --extract --diff  # re-extract only git-changed files within the
 tsift diff-digest [path]        # bounded worktree diff digest
 tsift diff-digest --cached .    # bounded staged-index diff digest
 tsift diff-digest --revision HEAD . # bounded single-revision/history digest
-tsift context-pack tasks/software/tsift.md --test-input test.log --log-input build.log
+tsift --envelope context-pack tasks/software/tsift.md --test-input test.log --log-input build.log
 tsift test-digest --path . < test.log  # bounded test-output digest from stdin or --input
 tsift metric-digest < runs.json  # repeated metric-run digest: deltas, improvements, news-ready table
 tsift log-digest --path . < build.log  # bounded verbose-log digest from stdin or --input
 tsift session-digest --path . < session.md  # session transcript digest: prompt targets, commands, touched files/symbols, failures, closeout
 tsift session-cost < session.jsonl  # token/runtime cost digest: prompt totals, cache ratios, large-turn outliers, restart churn
-tsift session-review tasks/software/tsift.md  # auto-discover related Claude/Codex/agent-doc logs and aggregate one review
-tsift session-review --next-context tasks/software/tsift.md  # emit only the resumable handoff pack
+tsift --envelope session-review tasks/software/tsift.md --max-items 5 --max-bytes 160
+tsift --envelope session-review --next-context tasks/software/tsift.md --max-items 5 --max-bytes 160
 tsift search <query>            # lexical by default; gains AST-aware ranking when index exists
 tsift search --exact <query>    # literal text lookup via `rg -F`
 tsift search --autoindex <query> # opt-in: build/rebuild the local index before search
@@ -733,7 +733,7 @@ Dynamic grammars use `tree_sitter::Language::from_path()`. The `Language` enum a
 
 ## Init (Project Setup)
 
-`tsift init` ensures the Code Navigation section is present in `AGENTS.md` for Codex-style harnesses and mirrors it into `CLAUDE.md` when that file exists, so local agent sessions prefer tsift navigation plus bounded digest surfaces over raw file reads, diffs, and verbose logs.
+`tsift init` ensures the Code Navigation section is present in `AGENTS.md` for Codex-style harnesses and mirrors it into `CLAUDE.md` when that file exists, so local agent sessions prefer envelope previews plus artifact-backed digest surfaces over raw file reads, diffs, and verbose logs.
 
 ```bash
 tsift init                              # ensure AGENTS.md (and CLAUDE.md if present) in current directory
@@ -765,26 +765,27 @@ With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject
 6. With `--codex`: merges a `UserPromptSubmit` auto-reindex hook into `.codex/hooks.json` (creates the file and directory if needed, updates stale tsift commands in place, removes duplicate tsift hook entries, idempotent)
 7. When the resolved target has `.gitmodules`, the Codex hook automatically uses `tsift index --check --exit-code --workspace <root>` / `tsift index --workspace <root>` so one root hook covers initialized submodules. `--workspace` makes that root resolution explicit from inside a submodule.
 8. The injected Code Navigation section explicitly tells harnesses to switch to the owning repo or submodule root before running tsift/build/test commands, so submodule work does not inherit the wider superproject instruction surface by accident.
-9. The injected section also steers harnesses toward `session-digest`, `session-review`, `diff-digest`, `test-digest`, and `log-digest` instead of raw transcript replays, `git diff/show/log` patch dumps, or verbose build/test output reads.
+9. The injected section also steers harnesses toward envelope-backed `search`, `explain`, `session-review`, `context-pack`, and digest-runner artifacts instead of raw transcript replays, `git diff/show/log` patch dumps, or verbose build/test output reads.
 
 ### Injected Section
 
 ```markdown
-<!-- tsift:code-navigation v=0.1.0 -->
+<!-- tsift:code-navigation v=0.1.39 -->
 ## Code Navigation
 
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root.
 
 Use the commands listed in its `use:` output:
-- `tsift search <query>` — AST-aware hybrid search (prefer over grep/rg)
-- `tsift explain <symbol>` — callers, callees, community context
+- `tsift --envelope search <query> --max-items 5 --max-bytes 160` — AST-aware hybrid search preview (prefer over grep/rg)
+- `tsift --envelope explain <symbol> --max-items 5 --max-bytes 160` — callers, callees, community preview
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
 
 Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
-- `tsift session-digest <file>` / `tsift session-review <path>` / `tsift session-review --next-context <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
+- `tsift --envelope session-review <path> --next-context --max-items 5 --max-bytes 160` or `tsift --envelope context-pack <path>` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
 - `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
-- `tsift test-digest --path .` / `tsift log-digest --path .` for noisy test/build/install output, or let the rewrite/hooks wrap `cargo test`, `pytest`, and verbose cargo commands for you.
+- `tsift --envelope __digest-runner --kind test --path . --shell-command '<test command>'` / `tsift --envelope __digest-runner --kind log --path . --shell-command '<build command>'` for noisy test/build/install output, or let the rewrite/hooks create those artifact-backed envelopes for `cargo test`, `pytest`, and verbose cargo commands.
+- If your harness does not support Claude-style `PreToolUse` hooks, run `tsift rewrite --run '<command>'` to execute the same envelope-first, artifact-backed tsift equivalent manually.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->
@@ -1198,23 +1199,23 @@ The hook resolves the git root first, then runs `tsift index --check --exit-code
 
 The existing `tsift-rewrite.sh` hook intercepts high-token shell commands and silently rewrites them to lower-context tsift flows:
 
-- `rg ...` / `grep -r ...` → `tsift search --exact ...`
+- `rg ...` / `grep -r ...` → `tsift --envelope search ... --exact --max-items 5 --max-bytes 160`
 - `git diff`, `git diff --cached`, `git show`, and simple `git log -p -1 ...` history review → `tsift diff-digest ...`
 - long transcript reads (`cat`, `bat`, `head -n`, `tail -n`, `sed -n`) over recognized agent-doc markdown sessions, Claude JSONL, Codex JSONL, or `agent-doc` runtime logs → `tsift session-digest ...`, anchored to the transcript's owning repo or submodule root when the file lives under one
-- `cargo test ...`, `pytest ...`, `python -m pytest ...` → `tsift __digest-runner --kind test ...`
-- `cargo build ...`, `cargo check ...`, `cargo clippy ...`, `cargo install ...` → `tsift __digest-runner --kind log ...`
+- `cargo test ...`, `pytest ...`, `python -m pytest ...` → `tsift --envelope __digest-runner --kind test ...`
+- `cargo build ...`, `cargo check ...`, `cargo clippy ...`, `cargo install ...` → `tsift --envelope __digest-runner --kind log ...`
 
-The digest-runner path preserves the wrapped command's original exit status while replacing raw stdout/stderr with a bounded digest, so failing tests/builds still fail closed instead of being laundered through a successful shell pipe. See `~/.claude/hooks/tsift-rewrite.sh`.
+The digest-runner path preserves the wrapped command's original exit status while replacing raw stdout/stderr with a summary-first envelope, bounded digest, and persisted transcript artifact, so failing tests/builds still fail closed and green runs do not inline raw logs. See `~/.claude/hooks/tsift-rewrite.sh`.
 
-Harnesses that do not expose Claude-style `PreToolUse` hooks can still reuse the same rewrite path manually via `tsift rewrite --run '<command>'`. In `--run` mode, tsift executes the rewritten command directly instead of only printing it, preserves the rewritten command's exit status, and applies native output caps for verbose `tsift search`, `tsift explain`, `tsift graph`, `tsift communities`, and `tsift index` human-readable output.
+Harnesses that do not expose Claude-style `PreToolUse` hooks can still reuse the same rewrite path manually via `tsift rewrite --run '<command>'`. In `--run` mode, tsift executes the rewritten command directly instead of only printing it, preserves the rewritten command's exit status, and emits the same envelope search previews and digest-runner artifact envelopes by default.
 
-Global structured-output flags are forwarded into the rewritten tsift command. That means callers can explicitly opt into summary-first execution output for cargo rewrites, for example:
+Global structured-output flags are forwarded into the rewritten tsift command and deduplicated when the rewrite already chose an envelope. That means callers can still layer `--pretty`, `--terse`, or `--schema` onto the default summary-first execution output, for example:
 
-- `tsift --envelope rewrite --run 'cargo test --manifest-path Cargo.toml'`
-- `tsift --envelope rewrite --run 'cargo build --manifest-path Cargo.toml'`
-- `tsift --envelope rewrite --run 'cargo install --path . --force'`
+- `tsift --pretty rewrite --run 'cargo test --manifest-path Cargo.toml'`
+- `tsift --schema rewrite --run 'cargo build --manifest-path Cargo.toml'`
+- `tsift rewrite --run 'cargo install --path . --force'`
 
-Those commands emit the same `digest-runner` JSON envelope that `tsift --envelope __digest-runner ... --json` uses internally, so agent-doc or other harnesses can request bounded execution output without depending on shell-hook rewriting.
+Those commands emit the same `digest-runner` JSON envelope that `tsift --envelope __digest-runner ... --json` uses internally, so agent-doc or other harnesses get bounded execution output without depending on shell-hook rewriting.
 
 ### RTK Output Filtering (`PreToolUse`)
 
@@ -1234,7 +1235,7 @@ All filters also strip ANSI codes and blank lines. The `--compact` and `--pretty
 
 **Interaction with `--quiet`:** the `index` filter is a safety net for unqualified `tsift index` calls. When `--quiet` or `--exit-code` is passed, the binary already suppresses verbose output, making the RTK filter a no-op.
 
-Outside the Claude hook path, `tsift rewrite --run '<command>'` provides a built-in fallback for the same bounded-output policy. Structured `--json` / `--terse` / `--schema` / `--tabular` output stays untouched; only the default human-readable output is capped.
+Outside the Claude hook path, `tsift rewrite --run '<command>'` provides a built-in fallback for the same bounded-output policy. Structured `--json` / `--terse` / `--schema` / `--tabular` output stays untouched; remaining human-readable passthrough output is capped only for already-tsift verbose commands that do not have an envelope/structured rewrite form.
 
 ## What NOT to build
 
