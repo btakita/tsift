@@ -118,6 +118,7 @@ Default behavior:
 Opt-in recovery:
 
 - `tsift search --autoindex ...` mirrors the hook behavior for unhooked sessions: if the local or scoped index is missing or stale, tsift incrementally builds it before searching
+- if that autoindex pass only loses the coarse `index.lock` race to another live tsift writer, search now degrades instead of failing closed: stale indexes continue with the current read-only index snapshot, missing indexes fall back to exact live-file search, and stderr includes one concise retry hint for fresh symbol/index results after the writer finishes
 - `tsift search --scope <submod> --autoindex ...` rebuilds only that submodule's index
 - `tsift search --federated --autoindex ...` rebuilds stale/missing federated submodule indexes before aggregating symbol hits, and its lexical/vector/hybrid sift pass only searches the same federated scope roots instead of the whole workspace
 - `tsift search --scope <submod> ...` now fails closed when the named submodule does not exist, and reports the available scope ids instead of silently searching the workspace root

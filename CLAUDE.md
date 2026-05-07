@@ -101,6 +101,7 @@ If copied skill instructions lag behind the installed binary, treat this file, `
 
 - **Auto-reindex** (`UserPromptSubmit`): `examples/hooks/tsift-autoindex.sh` resolves the git root, runs `tsift index --check --exit-code <root>`, and automatically switches to `--workspace` when the root has `.gitmodules`, so one hook covers initialized submodules. Install via `.claude/settings.json`.
 - **Unhooked fallback**: `tsift search` now autoindexes missing or stale indexes by default. Use `--no-autoindex` when you want the old fail-fast stale check instead of a write.
+- **Active writer degraded search**: if `tsift search --autoindex` loses the coarse `index.lock` race to another live tsift writer, it now skips the write, emits one concise retry hint, and keeps searching in degraded mode instead of failing: stale indexes continue with the current read-only index snapshot, while missing indexes fall back to exact live-file search until the writer finishes.
 - **Locked freshness prechecks**: search stale checks now use the same rollback-journal snapshot fallback as `tsift status` / `tsift index --check`, so `--scope`, `--federated`, and `--no-autoindex` do not regress back to raw `database is locked` failures.
 - **Scoped search fails closed**: `tsift search --scope <name>` now errors before lexical fallback when the submodule name is unknown, instead of silently searching the workspace root with the wrong scope.
 - **Nested query paths promote to the owning root**: `tsift status`, `tsift search`, and the read-only graph/query commands now walk ancestors for an existing `.tsift/` root before opening indexes, so running from `repo/src/` reuses `repo/.tsift` instead of synthesizing `repo/src/.tsift/index.db`.
@@ -116,7 +117,7 @@ If copied skill instructions lag behind the installed binary, treat this file, `
 
 Private: `github.com/btakita/tsift`. Submodule at `src/tsift` in agent-loop.
 
-<!-- tsift:code-navigation v=0.1.37 -->
+<!-- tsift:code-navigation v=0.1.38 -->
 ## Code Navigation
 
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root.

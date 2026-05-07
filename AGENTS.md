@@ -1,4 +1,4 @@
-<!-- tsift:code-navigation v=0.1.37 -->
+<!-- tsift:code-navigation v=0.1.38 -->
 ## Code Navigation
 
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root.

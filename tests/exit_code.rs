@@ -703,7 +703,7 @@ fn search_no_autoindex_fails_fast_when_index_is_stale() {
 }
 
 #[test]
-fn search_autoindex_fails_fast_when_writer_lock_exists() {
+fn search_autoindex_degrades_to_read_only_when_writer_lock_exists() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
 
@@ -732,14 +732,51 @@ fn search_autoindex_fails_fast_when_writer_lock_exists() {
         .output()
         .unwrap();
 
-    assert!(!output.status.success());
+    assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("another tsift index writer is already active"));
-    assert!(stderr.contains("lock diagnostics:"));
-    assert!(stderr.contains("lock: live pid:"));
-    assert!(stderr.contains("journal: absent"));
-    assert!(stderr.contains("next: wait for the active tsift writer"));
-    assert!(stderr.contains("search --autoindex"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stderr.contains("active tsift writer detected"));
+    assert!(stderr.contains("Continuing with read-only search"));
+    assert!(stderr.contains("Retry `tsift index"));
+    assert!(stdout.contains("helper"));
+}
+
+#[test]
+fn search_autoindex_degrades_to_exact_when_writer_lock_blocks_missing_index() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("notes.md"),
+        "workspace anchor: live-writer-fallback\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join(".tsift")).unwrap();
+    let _lock = hold_writer_lock(&dir.path().join(".tsift/index.lock"));
+
+    let output = tsift_bin()
+        .args([
+            "search",
+            "--autoindex",
+            "--strategy",
+            "lexical",
+            "--json",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "live-writer-fallback",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("active tsift writer detected"));
+    assert!(stderr.contains("Continuing with exact live-file search"));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["strategy"], "exact");
+    assert_eq!(json["hits"].as_array().unwrap().len(), 1);
+    assert!(
+        !dir.path().join(".tsift/index.db").exists(),
+        "fallback exact search should not synthesize a new index"
+    );
 }
 
 #[test]

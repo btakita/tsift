@@ -21,6 +21,12 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 - `context-pack` is bounded by default and accepts `--max-items` / `--max-bytes` so callers can keep resumable context packs stable under token pressure without replaying raw transcripts, diffs, or verbose logs.
 - Regression coverage now locks the new command surface in CLI parsing, preview-builder unit tests, and a compiled end-to-end integration test that exercises the composed JSON payload.
 
+## 0.1.38
+
+- `tsift search --autoindex` now degrades instead of failing when a live tsift `index.lock` holder is already refreshing the target index: stale indexes continue through a read-only search path, and missing indexes fall back to exact live-file search until the writer finishes.
+- The degraded success path emits one concise retry hint on stderr so callers know why symbol hits may lag or why exact search was used, without requiring a separate `tsift locks` run.
+- Regression coverage now locks both the in-process and compiled CLI behavior for stale-index read-only fallback plus missing-index exact fallback under a live writer lock, while keeping rollback-journal lock failures fail-closed.
+
 ## 0.1.37
 
 - `tsift rewrite` now supports `--run`, which executes the rewritten digest-first tsift command directly instead of only printing it for Claude hook integration.

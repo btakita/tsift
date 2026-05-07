@@ -6949,6 +6949,44 @@ enum RebuildSearchReason {
     Stale { stale_files: usize },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DegradedSearchTarget {
+    label: String,
+    reason: RebuildSearchReason,
+    reindex_cmd: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DegradedSearchMode {
+    ReadOnly,
+    Exact,
+}
+
+#[derive(Debug)]
+struct SearchPrecheck {
+    targets: Vec<SearchIndexTarget>,
+    degraded_targets: Vec<DegradedSearchTarget>,
+}
+
+fn is_active_writer_lock_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("another tsift index writer is already active")
+    })
+}
+
+fn degraded_search_target(
+    target: &SearchIndexTarget,
+    reason: RebuildSearchReason,
+) -> DegradedSearchTarget {
+    DegradedSearchTarget {
+        label: target.label.clone(),
+        reason,
+        reindex_cmd: target.reindex_cmd.clone(),
+    }
+}
+
 fn apply_search_index_update(root: &Path, target: &SearchIndexTarget) -> Result<()> {
     run_index_update(
         &target.db_path,
@@ -7029,21 +7067,38 @@ fn precheck_search_indexes(
     scope: Option<&str>,
     federated: bool,
     autoindex: bool,
-) -> Result<Vec<SearchIndexTarget>> {
+) -> Result<SearchPrecheck> {
     let targets = resolve_search_index_targets(root, path_hint, scope, federated)?;
     let mut stale_targets = Vec::new();
+    let mut degraded_targets = Vec::new();
 
     for target in &targets {
         match inspect_search_index(target)? {
             SearchIndexState::Missing => {
                 if autoindex {
-                    apply_search_index_update(root, target)?;
+                    if let Err(err) = apply_search_index_update(root, target) {
+                        if is_active_writer_lock_error(&err) {
+                            degraded_targets
+                                .push(degraded_search_target(target, RebuildSearchReason::Missing));
+                        } else {
+                            return Err(err);
+                        }
+                    }
                 }
             }
             SearchIndexState::Fresh => {}
             SearchIndexState::Stale { stale_files } => {
                 if autoindex {
-                    apply_search_index_update(root, target)?;
+                    if let Err(err) = apply_search_index_update(root, target) {
+                        if is_active_writer_lock_error(&err) {
+                            degraded_targets.push(degraded_search_target(
+                                target,
+                                RebuildSearchReason::Stale { stale_files },
+                            ));
+                        } else {
+                            return Err(err);
+                        }
+                    }
                 } else {
                     stale_targets.push(RebuildSearchTarget {
                         label: target.label.clone(),
@@ -7056,7 +7111,10 @@ fn precheck_search_indexes(
     }
 
     if stale_targets.is_empty() {
-        return Ok(targets);
+        return Ok(SearchPrecheck {
+            targets,
+            degraded_targets,
+        });
     }
 
     bail!(
@@ -7064,6 +7122,72 @@ fn precheck_search_indexes(
          or re-run without `--no-autoindex`.",
         rebuild_search_targets_message(&stale_targets),
     );
+}
+
+fn degraded_search_mode(targets: &[DegradedSearchTarget]) -> Option<DegradedSearchMode> {
+    if targets.is_empty() {
+        return None;
+    }
+
+    if targets
+        .iter()
+        .all(|target| matches!(target.reason, RebuildSearchReason::Missing))
+    {
+        Some(DegradedSearchMode::Exact)
+    } else {
+        Some(DegradedSearchMode::ReadOnly)
+    }
+}
+
+fn degraded_search_targets_summary(targets: &[DegradedSearchTarget]) -> String {
+    if targets.len() == 1 {
+        let target = &targets[0];
+        return match target.reason {
+            RebuildSearchReason::Missing => format!("{} is missing", target.label),
+            RebuildSearchReason::Stale { stale_files } => {
+                let file_suffix = if stale_files == 1 { "" } else { "s" };
+                format!(
+                    "{} is stale ({} file{})",
+                    target.label, stale_files, file_suffix
+                )
+            }
+        };
+    }
+
+    let missing = targets
+        .iter()
+        .filter(|target| matches!(target.reason, RebuildSearchReason::Missing))
+        .count();
+    let stale = targets.len().saturating_sub(missing);
+    let mut parts = Vec::new();
+    if stale > 0 {
+        let suffix = if stale == 1 { "" } else { "es" };
+        parts.push(format!("{stale} stale index{suffix}"));
+    }
+    if missing > 0 {
+        let suffix = if missing == 1 { "" } else { "es" };
+        parts.push(format!("{missing} missing index{suffix}"));
+    }
+    parts.join(", ")
+}
+
+fn emit_degraded_search_note(targets: &[DegradedSearchTarget], mode: DegradedSearchMode) {
+    let summary = degraded_search_targets_summary(targets);
+    let reindex_cmd = &targets[0].reindex_cmd;
+    match mode {
+        DegradedSearchMode::ReadOnly => eprintln!(
+            "note: active tsift writer detected; skipping autoindex because {}. \
+             Continuing with read-only search and the current index snapshot; symbol hits may lag. \
+             Retry `{}` after the active writer finishes for fresh index results.",
+            summary, reindex_cmd
+        ),
+        DegradedSearchMode::Exact => eprintln!(
+            "note: active tsift writer detected; skipping autoindex because {}. \
+             Continuing with exact live-file search. Retry `{}` after the active writer finishes \
+             for indexed symbol hits.",
+            summary, reindex_cmd
+        ),
+    }
 }
 
 fn search_timeout_message(
@@ -7187,19 +7311,41 @@ fn cmd_search_with_budget(
     let root = lint::resolve_project_root_or_canonical_path(&base_path)?;
     let search_cache_dir = root.join(".tsift/search-cache");
     let requested_strategy = resolve_search_strategy(&query, strategy);
-    let exact_search = requested_strategy == "exact";
+    let requested_exact_search = requested_strategy == "exact";
+    let precheck = if requested_exact_search {
+        None
+    } else {
+        Some(precheck_search_indexes(
+            &root,
+            &base_path,
+            scope.as_deref(),
+            federated,
+            autoindex,
+        )?)
+    };
+    let degraded_mode = precheck
+        .as_ref()
+        .and_then(|precheck| degraded_search_mode(&precheck.degraded_targets));
+    let exact_search = requested_exact_search || degraded_mode == Some(DegradedSearchMode::Exact);
     let effective_strategy = if exact_search {
         "exact".to_string()
     } else {
         requested_strategy
     };
-    let search_targets = if exact_search {
+    let search_targets = if requested_exact_search {
         Vec::new()
+    } else if let Some(precheck) = precheck.as_ref() {
+        if let Some(mode) = degraded_mode {
+            emit_degraded_search_note(&precheck.degraded_targets, mode);
+        }
+        if exact_search {
+            Vec::new()
+        } else {
+            maybe_apply_search_post_precheck_test_hooks()?;
+            precheck.targets.clone()
+        }
     } else {
-        let targets =
-            precheck_search_indexes(&root, &base_path, scope.as_deref(), federated, autoindex)?;
-        maybe_apply_search_post_precheck_test_hooks()?;
-        targets
+        Vec::new()
     };
 
     let inferred_scope = if scope.is_none() && !federated {
@@ -10604,7 +10750,43 @@ tier = "private"
     }
 
     #[test]
-    fn search_cmd_autoindex_reports_lock_diagnostics_when_root_writer_is_blocked() {
+    fn search_cmd_keeps_read_only_results_when_active_writer_blocks_autoindex() {
+        let dir = setup_graph_index();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() { println!(\"updated\"); }\nfn main() { helper(); Vec::new(); }",
+        )
+        .unwrap();
+        let _lock = hold_writer_lock(&dir.path().join(".tsift/index.lock"));
+
+        let result = cmd_search(
+            "helper".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            None,
+            false,
+            false,
+            true,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+
+        let db = index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
+        let summary = db.compute_changes(dir.path()).unwrap();
+        assert_eq!(summary.modified, 1);
+    }
+
+    #[test]
+    fn search_cmd_autoindex_reports_lock_diagnostics_when_rollback_journal_blocks_writer() {
         let dir = setup_graph_index();
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(
