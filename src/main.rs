@@ -1928,6 +1928,19 @@ fn format_symbol_preview_line(handle: &str, name: &str, tag_alias: Option<&str>)
     }
 }
 
+fn format_summary_ref_line(summary: &ContextPackSummaryRefPreview) -> String {
+    match summary.tag_alias.as_deref() {
+        Some(alias) => format!(
+            "{} {} tag:{} expand:{}",
+            summary.handle, summary.symbol, alias, summary.expand
+        ),
+        None => format!(
+            "{} {} expand:{}",
+            summary.handle, summary.symbol, summary.expand
+        ),
+    }
+}
+
 fn compact_symbol_ref_token(symbol: &CompactSymbolRefPreview) -> String {
     match symbol.tag_alias.as_deref() {
         Some(alias) => format!("{}@{}", symbol.handle, alias),
@@ -5673,9 +5686,21 @@ struct ContextPackDiffFilePreview {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     touched_symbol_refs: Vec<CompactSymbolRefPreview>,
     summary_state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    summary_refs: Vec<ContextPackSummaryRefPreview>,
     added_call_edges: usize,
     removed_call_edges: usize,
     warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ContextPackSummaryRefPreview {
+    handle: String,
+    symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag_alias: Option<String>,
+    summary: String,
+    expand: String,
 }
 
 #[derive(Serialize)]
@@ -5709,6 +5734,8 @@ struct ContextPackTestFailurePreview {
     line: Option<usize>,
     occurrences: usize,
     summary_state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    summary_refs: Vec<ContextPackSummaryRefPreview>,
 }
 
 #[derive(Serialize)]
@@ -5738,6 +5765,8 @@ struct ContextPackLogSignalPreview {
     line: Option<usize>,
     occurrences: usize,
     summary_state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    summary_refs: Vec<ContextPackSummaryRefPreview>,
 }
 
 #[derive(Serialize)]
@@ -5753,6 +5782,8 @@ struct ContextPackLogFileRefPreview {
     line: Option<usize>,
     occurrences: usize,
     summary_state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    summary_refs: Vec<ContextPackSummaryRefPreview>,
 }
 
 #[derive(Serialize)]
@@ -5763,6 +5794,8 @@ struct ContextPackLogSymbolRefPreview {
     tag_alias: Option<String>,
     occurrences: usize,
     summary_state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    summary_refs: Vec<ContextPackSummaryRefPreview>,
 }
 
 fn session_review_source_flag(source: &str) -> &'static str {
@@ -6057,6 +6090,34 @@ fn effective_context_budget(budget: ResponseBudget) -> ResponseBudget {
     ResponseBudget::new(Some(budget.preview_items()), Some(budget.preview_bytes()))
 }
 
+fn build_context_summary_refs<'a>(
+    prefix: &str,
+    key_scope: &str,
+    file_path: Option<&str>,
+    snippets: impl Iterator<Item = (&'a str, &'a str)>,
+    budget: ResponseBudget,
+) -> Vec<ContextPackSummaryRefPreview> {
+    let max_items = budget.preview_items();
+    let max_bytes = budget.preview_bytes();
+    snippets
+        .take(max_items)
+        .map(|(symbol, summary)| {
+            let expand = match file_path {
+                Some(path) => format!("tsift summarize --file {}", shell_quote(path)),
+                None => format!("tsift summarize {}", shell_quote(symbol)),
+            };
+            ContextPackSummaryRefPreview {
+                handle: stable_handle(prefix, &format!("{key_scope}:{symbol}:{summary}")),
+                symbol: truncate_for_budget(symbol, max_bytes),
+                tag_alias: tag_alias_from_name(symbol)
+                    .map(|alias| truncate_for_budget(&alias, max_bytes)),
+                summary: truncate_for_budget(summary, max_bytes),
+                expand,
+            }
+        })
+        .collect()
+}
+
 fn build_context_pack_diff_preview(
     report: &diff_digest::DiffDigestReport,
     budget: ResponseBudget,
@@ -6099,6 +6160,15 @@ fn build_context_pack_diff_preview(
                     })
                     .collect(),
                 summary_state: diff_digest_summary_label(file.summary_state).to_string(),
+                summary_refs: build_context_summary_refs(
+                    "cdsum",
+                    &file.path,
+                    Some(&file.path),
+                    file.current_summaries
+                        .iter()
+                        .map(|snippet| (snippet.symbol.as_str(), snippet.summary.as_str())),
+                    budget,
+                ),
                 added_call_edges: file.added_call_edges.len(),
                 removed_call_edges: file.removed_call_edges.len(),
                 warnings: file
@@ -6188,6 +6258,16 @@ fn build_context_pack_test_preview(
                 line: failure.line,
                 occurrences: failure.occurrences,
                 summary_state: test_digest_summary_label(failure.summary_state).to_string(),
+                summary_refs: build_context_summary_refs(
+                    "ctsum",
+                    failure.path.as_deref().unwrap_or("test-failure"),
+                    failure.path.as_deref(),
+                    failure
+                        .current_summaries
+                        .iter()
+                        .map(|snippet| (snippet.symbol.as_str(), snippet.summary.as_str())),
+                    budget,
+                ),
             })
             .collect(),
         warnings: report
@@ -6232,6 +6312,16 @@ fn build_context_pack_log_preview(
                 line: signal.line,
                 occurrences: signal.occurrences,
                 summary_state: log_digest_summary_label(signal.summary_state).to_string(),
+                summary_refs: build_context_summary_refs(
+                    "clsum",
+                    signal.path.as_deref().unwrap_or("log-signal"),
+                    signal.path.as_deref(),
+                    signal
+                        .current_summaries
+                        .iter()
+                        .map(|snippet| (snippet.symbol.as_str(), snippet.summary.as_str())),
+                    budget,
+                ),
             })
             .collect(),
         repeated_lines: report
@@ -6252,6 +6342,15 @@ fn build_context_pack_log_preview(
                 line: file.line,
                 occurrences: file.occurrences,
                 summary_state: log_digest_summary_label(file.summary_state).to_string(),
+                summary_refs: build_context_summary_refs(
+                    "clfsum",
+                    &file.path,
+                    Some(&file.path),
+                    file.current_summaries
+                        .iter()
+                        .map(|snippet| (snippet.symbol.as_str(), snippet.summary.as_str())),
+                    budget,
+                ),
             })
             .collect(),
         symbol_refs: report
@@ -6265,6 +6364,16 @@ fn build_context_pack_log_preview(
                     .map(|alias| truncate_for_budget(&alias, max_bytes)),
                 occurrences: symbol.occurrences,
                 summary_state: log_digest_summary_label(symbol.summary_state).to_string(),
+                summary_refs: build_context_summary_refs(
+                    "clssum",
+                    &symbol.symbol,
+                    None,
+                    symbol
+                        .current_summaries
+                        .iter()
+                        .map(|snippet| (snippet.symbol.as_str(), snippet.summary.as_str())),
+                    budget,
+                ),
             })
             .collect(),
         warnings: report
@@ -6309,6 +6418,7 @@ fn enrich_log_preview_with_diff_symbols(
             tag_alias: tag_alias_from_name(&symbol),
             occurrences: 1,
             summary_state: "unavailable".to_string(),
+            summary_refs: Vec::new(),
         })
         .collect();
 }
@@ -6331,7 +6441,8 @@ fn build_context_pack_report(
                 cached: false,
                 revision: None,
             },
-        )?,
+        )
+        .with_context(|| format!("computing context-pack diff digest for {}", root.display()))?,
         budget,
     );
     enrich_next_context_with_diff_symbols(&mut next_context, &diff_digest);
@@ -6422,7 +6533,7 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
         }
         for file in &report.diff_digest.files {
             println!(
-                "diff {} status:{} syms:{}",
+                "diff {} status:{} syms:{} sums:{}",
                 file.path,
                 file.status,
                 if file.touched_symbol_refs.is_empty() {
@@ -6431,6 +6542,15 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
                     file.touched_symbol_refs
                         .iter()
                         .map(compact_symbol_ref_token)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                },
+                if file.summary_refs.is_empty() {
+                    "-".to_string()
+                } else {
+                    file.summary_refs
+                        .iter()
+                        .map(|summary| summary.handle.as_str())
                         .collect::<Vec<_>>()
                         .join(",")
                 }
@@ -6543,6 +6663,16 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
         if !file.warnings.is_empty() {
             println!("    warnings: {}", file.warnings.join(" | "));
         }
+        if !file.summary_refs.is_empty() {
+            println!(
+                "    summaries: {}",
+                file.summary_refs
+                    .iter()
+                    .map(format_summary_ref_line)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+        }
     }
 
     println!();
@@ -6563,6 +6693,17 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
                     "  - {} count:{} msg:{}",
                     location, failure.occurrences, failure.message
                 );
+                if !failure.summary_refs.is_empty() {
+                    println!(
+                        "    summaries: {}",
+                        failure
+                            .summary_refs
+                            .iter()
+                            .map(format_summary_ref_line)
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    );
+                }
             }
         }
         None => println!("  capture:                {}", report.test_digest.command),
@@ -6587,6 +6728,17 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
                     "  - {} {} count:{} msg:{}",
                     location, signal.severity, signal.occurrences, signal.message
                 );
+                if !signal.summary_refs.is_empty() {
+                    println!(
+                        "    summaries: {}",
+                        signal
+                            .summary_refs
+                            .iter()
+                            .map(format_summary_ref_line)
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    );
+                }
             }
             for symbol in &log.symbol_refs {
                 println!(
@@ -6599,6 +6751,17 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
                     symbol.occurrences,
                     symbol.summary_state
                 );
+                if !symbol.summary_refs.is_empty() {
+                    println!(
+                        "    summaries: {}",
+                        symbol
+                            .summary_refs
+                            .iter()
+                            .map(format_summary_ref_line)
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    );
+                }
             }
         }
         None => println!("  capture:                {}", report.log_digest.command),
@@ -13181,7 +13344,10 @@ tier = "private"
                     status: diff_digest::DiffDigestFileStatus::Modified,
                     touched_symbols: vec!["alpha_helper".to_string(), "beta_helper".to_string()],
                     summary_state: diff_digest::DiffDigestSummaryState::Current,
-                    current_summaries: vec![],
+                    current_summaries: vec![diff_digest::DiffDigestSummarySnippet {
+                        symbol: "alpha_helper".to_string(),
+                        summary: "alpha helper handles the main alpha workflow".to_string(),
+                    }],
                     added_call_edges: vec!["alpha->beta".to_string()],
                     removed_call_edges: vec![],
                     warnings: vec!["stale parse".to_string()],
@@ -13215,6 +13381,20 @@ tier = "private"
             preview.files[0].touched_symbol_refs[0].tag_alias.as_deref(),
             Some("alpha/he...")
         );
+        assert!(
+            preview.files[0].summary_refs[0]
+                .handle
+                .starts_with("cdsum-")
+        );
+        assert_eq!(
+            preview.files[0].summary_refs[0].tag_alias.as_deref(),
+            Some("alpha/he...")
+        );
+        assert_eq!(preview.files[0].summary_refs[0].summary, "alpha he...");
+        assert_eq!(
+            preview.files[0].summary_refs[0].expand,
+            "tsift summarize --file \"src/lib.rs\""
+        );
         assert_eq!(preview.files[0].warnings, vec!["stale parse"]);
     }
 
@@ -13239,7 +13419,10 @@ tier = "private"
                     column: None,
                     occurrences: 1,
                     summary_state: test_digest::TestDigestSummaryState::Current,
-                    current_summaries: vec![],
+                    current_summaries: vec![test_digest::TestDigestSummarySnippet {
+                        symbol: "alpha_failure".to_string(),
+                        summary: "failure summary for alpha test".to_string(),
+                    }],
                 },
                 test_digest::TestDigestFailure {
                     tests: vec!["suite::beta_failure".to_string()],
@@ -13262,6 +13445,15 @@ tier = "private"
         assert_eq!(preview.failure_groups.len(), 1);
         assert_eq!(preview.failure_groups[0].tests, vec!["suite::alph..."]);
         assert_eq!(preview.failure_groups[0].message, "assertion f...");
+        assert!(
+            preview.failure_groups[0].summary_refs[0]
+                .handle
+                .starts_with("ctsum-")
+        );
+        assert_eq!(
+            preview.failure_groups[0].summary_refs[0].expand,
+            "tsift summarize --file \"src/lib.rs\""
+        );
         assert_eq!(preview.warnings, vec!["warning text"]);
     }
 
@@ -13286,7 +13478,10 @@ tier = "private"
                     column: None,
                     occurrences: 2,
                     summary_state: log_digest::LogDigestSummaryState::Current,
-                    current_summaries: vec![],
+                    current_summaries: vec![log_digest::LogDigestSummarySnippet {
+                        symbol: "alpha_helper".to_string(),
+                        summary: "alpha helper cached log summary".to_string(),
+                    }],
                 },
                 log_digest::LogDigestSignal {
                     severity: "warn".to_string(),
@@ -13316,7 +13511,10 @@ tier = "private"
                     column: None,
                     occurrences: 2,
                     summary_state: log_digest::LogDigestSummaryState::Current,
-                    current_summaries: vec![],
+                    current_summaries: vec![log_digest::LogDigestSummarySnippet {
+                        symbol: "alpha_helper".to_string(),
+                        summary: "alpha helper cached file summary".to_string(),
+                    }],
                 },
                 log_digest::LogDigestFileRef {
                     path: "src/main.rs".to_string(),
@@ -13332,7 +13530,10 @@ tier = "private"
                     symbol: "alpha_helper".to_string(),
                     occurrences: 2,
                     summary_state: log_digest::LogDigestSummaryState::Current,
-                    current_summaries: vec![],
+                    current_summaries: vec![log_digest::LogDigestSummarySnippet {
+                        symbol: "alpha_helper".to_string(),
+                        summary: "alpha helper cached symbol summary".to_string(),
+                    }],
                 },
                 log_digest::LogDigestSymbolRef {
                     symbol: "beta_helper".to_string(),
@@ -13357,6 +13558,29 @@ tier = "private"
         assert_eq!(preview.repeated_lines[0].line, "retrying wo...");
         assert_eq!(preview.file_refs.len(), 1);
         assert_eq!(preview.symbol_refs[0].symbol, "alpha_helper");
+        assert!(
+            preview.signals[0].summary_refs[0]
+                .handle
+                .starts_with("clsum-")
+        );
+        assert!(
+            preview.file_refs[0].summary_refs[0]
+                .handle
+                .starts_with("clfsum-")
+        );
+        assert!(
+            preview.symbol_refs[0].summary_refs[0]
+                .handle
+                .starts_with("clssum-")
+        );
+        assert_eq!(
+            preview.symbol_refs[0].summary_refs[0].tag_alias.as_deref(),
+            Some("alpha/helper")
+        );
+        assert_eq!(
+            preview.symbol_refs[0].summary_refs[0].expand,
+            "tsift summarize \"alpha_helper\""
+        );
         assert_eq!(preview.warnings, vec!["warning text"]);
     }
 

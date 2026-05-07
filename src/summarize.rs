@@ -990,7 +990,8 @@ fn git_has_head_commit(root: &Path) -> Result<bool> {
     if !inside_work_tree.status.success() {
         let stderr = String::from_utf8_lossy(&inside_work_tree.stderr);
         bail!(
-            "git rev-parse --is-inside-work-tree failed: {}",
+            "git rev-parse --is-inside-work-tree failed in {}: {}",
+            root.display(),
             stderr.trim()
         );
     }

@@ -161,9 +161,16 @@ fn guess_annotation_kind(entity: &str) -> AnnotationKind {
 
 fn project_root_from_canonical_path(canonical: &Path) -> Option<PathBuf> {
     let start = canonical_path_start_dir(canonical);
+    let temp_root = std::env::temp_dir().canonicalize().ok();
 
     for ancestor in start.ancestors() {
-        if ancestor.join(".tsift").is_dir() || ancestor.join(".gitmodules").is_file() {
+        let ambient_temp_root = temp_root.as_deref() == Some(ancestor) && ancestor != start;
+        if (ancestor.join(".tsift").is_dir() || ancestor.join(".gitmodules").is_file())
+            && !ambient_temp_root
+        {
+            return Some(ancestor.to_path_buf());
+        }
+        if ancestor.join(".git").exists() && !ambient_temp_root {
             return Some(ancestor.to_path_buf());
         }
     }
@@ -579,6 +586,20 @@ mod tests {
         let root = resolve_project_root_or_canonical_path(&nested).unwrap();
 
         assert_eq!(root, dir.path());
+    }
+
+    #[test]
+    fn resolve_project_root_or_canonical_path_stops_at_nested_git_root_before_parent_tsift() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".tsift")).unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let nested = repo.join("src/nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        let root = resolve_project_root_or_canonical_path(&nested).unwrap();
+
+        assert_eq!(root, repo);
     }
 
     #[test]
