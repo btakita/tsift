@@ -12,7 +12,7 @@ use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tagpath::parser as tagpath_parser;
+use tagpath::{ontology as tagpath_ontology, parser as tagpath_parser};
 use tempfile::NamedTempFile;
 
 pub mod audit;
@@ -2183,11 +2183,30 @@ fn tag_alias_from_tags(name: &str, tags: Option<&str>) -> Option<String> {
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+struct CompactOntologyRefPreview {
+    handle: String,
+    tag: String,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    domain: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct TagOntologyPreviewContext {
+    project_root: PathBuf,
+    tags: BTreeMap<String, tagpath_ontology::OntologyTag>,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 struct CompactSymbolRefPreview {
     handle: String,
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     tag_alias: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    ontology_refs: Vec<CompactOntologyRefPreview>,
 }
 
 fn build_compact_symbol_ref(
@@ -2197,12 +2216,81 @@ fn build_compact_symbol_ref(
     tags: Option<&str>,
     max_bytes: usize,
 ) -> CompactSymbolRefPreview {
+    build_compact_symbol_ref_with_ontology(prefix, key, name, tags, max_bytes, None)
+}
+
+fn build_compact_symbol_ref_with_ontology(
+    prefix: &str,
+    key: &str,
+    name: &str,
+    tags: Option<&str>,
+    max_bytes: usize,
+    ontology: Option<&TagOntologyPreviewContext>,
+) -> CompactSymbolRefPreview {
+    let tag_alias = tag_alias_from_tags(name, tags);
+    let ontology_refs = tag_alias
+        .as_deref()
+        .map(|alias| ontology_refs_for_alias(ontology, alias))
+        .unwrap_or_default();
     CompactSymbolRefPreview {
         handle: stable_handle(prefix, key),
         name: truncate_for_budget(name, max_bytes),
-        tag_alias: tag_alias_from_tags(name, tags)
-            .map(|alias| truncate_for_budget(&alias, max_bytes)),
+        tag_alias: tag_alias.map(|alias| truncate_for_budget(&alias, max_bytes)),
+        ontology_refs,
     }
+}
+
+fn load_tag_ontology_preview_context(root: &Path) -> Option<TagOntologyPreviewContext> {
+    let report = tagpath_ontology::load_project(root).ok()?;
+    if report.tags.is_empty() {
+        return None;
+    }
+    Some(TagOntologyPreviewContext {
+        project_root: report.project_path,
+        tags: report
+            .tags
+            .into_iter()
+            .map(|tag| (tag.tag.clone(), tag))
+            .collect(),
+    })
+}
+
+fn ontology_refs_for_alias(
+    ontology: Option<&TagOntologyPreviewContext>,
+    alias: &str,
+) -> Vec<CompactOntologyRefPreview> {
+    let Some(ontology) = ontology else {
+        return Vec::new();
+    };
+    let mut seen = BTreeSet::new();
+    alias
+        .split('/')
+        .flat_map(|part| part.split('.'))
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .filter_map(|tag| {
+            let key = tag.to_ascii_lowercase();
+            if !seen.insert(key.clone()) {
+                return None;
+            }
+            let ontology_tag = ontology.tags.get(&key)?;
+            let path = relativize_ontology_path(&ontology_tag.path, &ontology.project_root);
+            Some(CompactOntologyRefPreview {
+                handle: stable_handle("tont", &format!("{}:{path}", ontology_tag.tag)),
+                tag: ontology_tag.tag.clone(),
+                path,
+                title: ontology_tag.title.clone(),
+                domain: ontology_tag.domain.clone(),
+            })
+        })
+        .collect()
+}
+
+fn relativize_ontology_path(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn format_symbol_preview_line(handle: &str, name: &str, tag_alias: Option<&str>) -> String {
@@ -5461,7 +5549,8 @@ fn cmd_session_review_with_budget(
     let report = session_review::compute(path)?;
     if budget.is_active() {
         if next_context {
-            let budget_report = build_session_review_next_context_budget_report(&report, budget);
+            let budget_report =
+                build_session_review_next_context_budget_report(&report, budget, None);
             if format.json_output {
                 print_json_or_envelope(
                     &budget_report,
@@ -5933,6 +6022,8 @@ struct ContextPackReport {
     target_kind: String,
     max_items: usize,
     max_bytes: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    ontology_refs: Vec<CompactOntologyRefPreview>,
     next_context: SessionReviewNextContextBudgetReport,
     diff_digest: ContextPackDiffPreview,
     test_digest: ContextPackOptionalSection<ContextPackTestPreview>,
@@ -5983,6 +6074,8 @@ struct ContextPackSummaryRefPreview {
     symbol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     tag_alias: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    ontology_refs: Vec<CompactOntologyRefPreview>,
     summary: String,
     expand: String,
 }
@@ -6076,6 +6169,8 @@ struct ContextPackLogSymbolRefPreview {
     symbol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     tag_alias: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    ontology_refs: Vec<CompactOntologyRefPreview>,
     occurrences: usize,
     summary_state: String,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -6190,6 +6285,7 @@ fn build_session_review_budget_report(
 fn build_session_review_next_context_budget_report(
     report: &session_review::SessionReviewReport,
     budget: ResponseBudget,
+    ontology: Option<&TagOntologyPreviewContext>,
 ) -> SessionReviewNextContextBudgetReport {
     let max_items = budget.preview_items();
     let max_bytes = budget.preview_bytes();
@@ -6233,12 +6329,13 @@ fn build_session_review_next_context_budget_report(
             .iter()
             .take(max_items)
             .map(|entry| {
-                build_compact_symbol_ref(
+                build_compact_symbol_ref_with_ontology(
                     "ncsym",
                     &format!("{}:{}", report.next_context.target, entry),
                     entry,
                     None,
                     max_bytes,
+                    ontology,
                 )
             })
             .collect(),
@@ -6380,12 +6477,18 @@ fn build_context_summary_refs<'a>(
     file_path: Option<&str>,
     snippets: impl Iterator<Item = (&'a str, &'a str)>,
     budget: ResponseBudget,
+    ontology: Option<&TagOntologyPreviewContext>,
 ) -> Vec<ContextPackSummaryRefPreview> {
     let max_items = budget.preview_items();
     let max_bytes = budget.preview_bytes();
     snippets
         .take(max_items)
         .map(|(symbol, summary)| {
+            let tag_alias = tag_alias_from_name(symbol);
+            let ontology_refs = tag_alias
+                .as_deref()
+                .map(|alias| ontology_refs_for_alias(ontology, alias))
+                .unwrap_or_default();
             let expand = match file_path {
                 Some(path) => format!("tsift summarize --file {}", shell_quote(path)),
                 None => format!("tsift summarize {}", shell_quote(symbol)),
@@ -6393,8 +6496,8 @@ fn build_context_summary_refs<'a>(
             ContextPackSummaryRefPreview {
                 handle: stable_handle(prefix, &format!("{key_scope}:{symbol}:{summary}")),
                 symbol: truncate_for_budget(symbol, max_bytes),
-                tag_alias: tag_alias_from_name(symbol)
-                    .map(|alias| truncate_for_budget(&alias, max_bytes)),
+                tag_alias: tag_alias.map(|alias| truncate_for_budget(&alias, max_bytes)),
+                ontology_refs,
                 summary: truncate_for_budget(summary, max_bytes),
                 expand,
             }
@@ -6405,6 +6508,7 @@ fn build_context_summary_refs<'a>(
 fn build_context_pack_diff_preview(
     report: &diff_digest::DiffDigestReport,
     budget: ResponseBudget,
+    ontology: Option<&TagOntologyPreviewContext>,
 ) -> ContextPackDiffPreview {
     let max_items = budget.preview_items();
     let max_bytes = budget.preview_bytes();
@@ -6434,12 +6538,13 @@ fn build_context_pack_diff_preview(
                     .iter()
                     .take(max_items)
                     .map(|symbol| {
-                        build_compact_symbol_ref(
+                        build_compact_symbol_ref_with_ontology(
                             "cdsym",
                             &format!("{}:{}", file.path, symbol),
                             symbol,
                             None,
                             max_bytes,
+                            ontology,
                         )
                     })
                     .collect(),
@@ -6452,6 +6557,7 @@ fn build_context_pack_diff_preview(
                         .iter()
                         .map(|snippet| (snippet.symbol.as_str(), snippet.summary.as_str())),
                     budget,
+                    ontology,
                 ),
                 added_call_edges: file.added_call_edges.len(),
                 removed_call_edges: file.removed_call_edges.len(),
@@ -6469,6 +6575,7 @@ fn build_context_pack_diff_preview(
 fn enrich_next_context_with_diff_symbols(
     next_context: &mut SessionReviewNextContextBudgetReport,
     diff_digest: &ContextPackDiffPreview,
+    ontology: Option<&TagOntologyPreviewContext>,
 ) {
     let mut symbols = next_context.touched_symbols.clone();
     for file in &diff_digest.files {
@@ -6496,12 +6603,13 @@ fn enrich_next_context_with_diff_symbols(
         .iter()
         .take(max_items)
         .map(|entry| {
-            build_compact_symbol_ref(
+            build_compact_symbol_ref_with_ontology(
                 "ncsym",
                 &format!("{}:{}", next_context.target, entry),
                 entry,
                 None,
                 max_bytes,
+                ontology,
             )
         })
         .collect();
@@ -6510,6 +6618,7 @@ fn enrich_next_context_with_diff_symbols(
 fn build_context_pack_test_preview(
     report: &test_digest::TestDigestReport,
     budget: ResponseBudget,
+    ontology: Option<&TagOntologyPreviewContext>,
 ) -> ContextPackTestPreview {
     let max_items = budget.preview_items();
     let max_bytes = budget.preview_bytes();
@@ -6551,6 +6660,7 @@ fn build_context_pack_test_preview(
                         .iter()
                         .map(|snippet| (snippet.symbol.as_str(), snippet.summary.as_str())),
                     budget,
+                    ontology,
                 ),
             })
             .collect(),
@@ -6566,6 +6676,7 @@ fn build_context_pack_test_preview(
 fn build_context_pack_log_preview(
     report: &log_digest::LogDigestReport,
     budget: ResponseBudget,
+    ontology: Option<&TagOntologyPreviewContext>,
 ) -> ContextPackLogPreview {
     let max_items = budget.preview_items();
     let max_bytes = budget.preview_bytes();
@@ -6605,6 +6716,7 @@ fn build_context_pack_log_preview(
                         .iter()
                         .map(|snippet| (snippet.symbol.as_str(), snippet.summary.as_str())),
                     budget,
+                    ontology,
                 ),
             })
             .collect(),
@@ -6634,6 +6746,7 @@ fn build_context_pack_log_preview(
                         .iter()
                         .map(|snippet| (snippet.symbol.as_str(), snippet.summary.as_str())),
                     budget,
+                    ontology,
                 ),
             })
             .collect(),
@@ -6646,6 +6759,10 @@ fn build_context_pack_log_preview(
                 symbol: truncate_for_budget(&symbol.symbol, max_bytes),
                 tag_alias: tag_alias_from_name(&symbol.symbol)
                     .map(|alias| truncate_for_budget(&alias, max_bytes)),
+                ontology_refs: tag_alias_from_name(&symbol.symbol)
+                    .as_deref()
+                    .map(|alias| ontology_refs_for_alias(ontology, alias))
+                    .unwrap_or_default(),
                 occurrences: symbol.occurrences,
                 summary_state: log_digest_summary_label(symbol.summary_state).to_string(),
                 summary_refs: build_context_summary_refs(
@@ -6657,6 +6774,7 @@ fn build_context_pack_log_preview(
                         .iter()
                         .map(|snippet| (snippet.symbol.as_str(), snippet.summary.as_str())),
                     budget,
+                    ontology,
                 ),
             })
             .collect(),
@@ -6672,6 +6790,7 @@ fn build_context_pack_log_preview(
 fn enrich_log_preview_with_diff_symbols(
     log_preview: &mut ContextPackLogPreview,
     diff_digest: &ContextPackDiffPreview,
+    ontology: Option<&TagOntologyPreviewContext>,
 ) {
     if !log_preview.symbol_refs.is_empty() {
         return;
@@ -6700,11 +6819,71 @@ fn enrich_log_preview_with_diff_symbols(
             handle: stable_handle("clsym", &symbol),
             symbol: symbol.clone(),
             tag_alias: tag_alias_from_name(&symbol),
+            ontology_refs: tag_alias_from_name(&symbol)
+                .as_deref()
+                .map(|alias| ontology_refs_for_alias(ontology, alias))
+                .unwrap_or_default(),
             occurrences: 1,
             summary_state: "unavailable".to_string(),
             summary_refs: Vec::new(),
         })
         .collect();
+}
+
+fn insert_ontology_refs(
+    refs: &mut BTreeMap<String, CompactOntologyRefPreview>,
+    candidates: &[CompactOntologyRefPreview],
+) {
+    for candidate in candidates {
+        refs.entry(candidate.handle.clone())
+            .or_insert_with(|| candidate.clone());
+    }
+}
+
+fn collect_context_pack_ontology_refs(
+    next_context: &SessionReviewNextContextBudgetReport,
+    diff_digest: &ContextPackDiffPreview,
+    test_digest: &ContextPackOptionalSection<ContextPackTestPreview>,
+    log_digest: &ContextPackOptionalSection<ContextPackLogPreview>,
+) -> Vec<CompactOntologyRefPreview> {
+    let mut refs = BTreeMap::new();
+    for symbol in &next_context.touched_symbol_refs {
+        insert_ontology_refs(&mut refs, &symbol.ontology_refs);
+    }
+    for file in &diff_digest.files {
+        for symbol in &file.touched_symbol_refs {
+            insert_ontology_refs(&mut refs, &symbol.ontology_refs);
+        }
+        for summary in &file.summary_refs {
+            insert_ontology_refs(&mut refs, &summary.ontology_refs);
+        }
+    }
+    if let Some(test) = &test_digest.report {
+        for failure in &test.failure_groups {
+            for summary in &failure.summary_refs {
+                insert_ontology_refs(&mut refs, &summary.ontology_refs);
+            }
+        }
+    }
+    if let Some(log) = &log_digest.report {
+        for signal in &log.signals {
+            for summary in &signal.summary_refs {
+                insert_ontology_refs(&mut refs, &summary.ontology_refs);
+            }
+        }
+        for file in &log.file_refs {
+            for summary in &file.summary_refs {
+                insert_ontology_refs(&mut refs, &summary.ontology_refs);
+            }
+        }
+        for symbol in &log.symbol_refs {
+            insert_ontology_refs(&mut refs, &symbol.ontology_refs);
+            for summary in &symbol.summary_refs {
+                insert_ontology_refs(&mut refs, &summary.ontology_refs);
+            }
+        }
+    }
+    refs.into_values().collect()
 }
 
 fn build_context_pack_report(
@@ -6717,7 +6896,10 @@ fn build_context_pack_report(
     let budget = effective_context_budget(budget);
     let review = session_review::compute(path)?;
     let root = PathBuf::from(&review.root);
-    let mut next_context = build_session_review_next_context_budget_report(&review, budget);
+    let ontology = load_tag_ontology_preview_context(&root);
+    let ontology_ref = ontology.as_ref();
+    let mut next_context =
+        build_session_review_next_context_budget_report(&review, budget, ontology_ref);
     let diff_digest = build_context_pack_diff_preview(
         &diff_digest::compute(
             &root,
@@ -6728,8 +6910,9 @@ fn build_context_pack_report(
         )
         .with_context(|| format!("computing context-pack diff digest for {}", root.display()))?,
         budget,
+        ontology_ref,
     );
-    enrich_next_context_with_diff_symbols(&mut next_context, &diff_digest);
+    enrich_next_context_with_diff_symbols(&mut next_context, &diff_digest, ontology_ref);
     let test_digest = match test_input {
         Some(file_path) => {
             let input = fs::read_to_string(file_path)
@@ -6748,7 +6931,11 @@ fn build_context_pack_report(
                         .unwrap_or_default()
                 ),
                 source: Some(file_path.display().to_string()),
-                report: Some(build_context_pack_test_preview(&report, budget)),
+                report: Some(build_context_pack_test_preview(
+                    &report,
+                    budget,
+                    ontology_ref,
+                )),
             }
         }
         None => ContextPackOptionalSection {
@@ -6766,8 +6953,8 @@ fn build_context_pack_report(
                 bail!("no log output provided in {}", file_path.display());
             }
             let report = log_digest::compute(&root, &input)?;
-            let mut preview = build_context_pack_log_preview(&report, budget);
-            enrich_log_preview_with_diff_symbols(&mut preview, &diff_digest);
+            let mut preview = build_context_pack_log_preview(&report, budget, ontology_ref);
+            enrich_log_preview_with_diff_symbols(&mut preview, &diff_digest, ontology_ref);
             ContextPackOptionalSection {
                 status: "included".to_string(),
                 command: format!(
@@ -6786,12 +6973,16 @@ fn build_context_pack_report(
         },
     };
 
+    let ontology_refs =
+        collect_context_pack_ontology_refs(&next_context, &diff_digest, &test_digest, &log_digest);
+
     Ok(ContextPackReport {
         root: review.root,
         target: review.target,
         target_kind: review.target_kind,
         max_items: budget.preview_items(),
         max_bytes: budget.preview_bytes(),
+        ontology_refs,
         next_context,
         diff_digest,
         test_digest,
@@ -13674,6 +13865,7 @@ tier = "private"
         let budget_report = build_session_review_next_context_budget_report(
             &report,
             ResponseBudget::new(Some(1), Some(12)),
+            None,
         );
 
         assert!(budget_report.truncated);
@@ -13734,7 +13926,7 @@ tier = "private"
         };
 
         let preview =
-            build_context_pack_diff_preview(&report, ResponseBudget::new(Some(1), Some(11)));
+            build_context_pack_diff_preview(&report, ResponseBudget::new(Some(1), Some(11)), None);
 
         assert!(preview.truncated);
         assert_eq!(preview.files.len(), 1);
@@ -13764,6 +13956,58 @@ tier = "private"
             "tsift summarize --file \"src/lib.rs\""
         );
         assert_eq!(preview.files[0].warnings, vec!["stale parse"]);
+    }
+
+    #[test]
+    fn context_pack_diff_preview_attaches_tag_ontology_refs() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".naming/tags")).unwrap();
+        fs::write(
+            root.path().join(".naming/tags/alpha.md"),
+            "+++\ntag = \"alpha\"\ntitle = \"Alpha Domain\"\ndomain = \"fixture\"\n+++\n\nAlpha definition.\n",
+        )
+        .unwrap();
+        let ontology = load_tag_ontology_preview_context(root.path()).unwrap();
+        let report = diff_digest::DiffDigestReport {
+            root: root.path().display().to_string(),
+            mode: diff_digest::DiffDigestMode::WorkingTree,
+            revision: None,
+            files_changed: 1,
+            files_with_current_summaries: 1,
+            symbols_touched: 1,
+            call_edges_added: 0,
+            call_edges_removed: 0,
+            files: vec![diff_digest::DiffDigestFile {
+                path: "src/lib.rs".to_string(),
+                status: diff_digest::DiffDigestFileStatus::Modified,
+                touched_symbols: vec!["alpha_helper".to_string()],
+                summary_state: diff_digest::DiffDigestSummaryState::Current,
+                current_summaries: vec![diff_digest::DiffDigestSummarySnippet {
+                    symbol: "alpha_helper".to_string(),
+                    summary: "alpha helper summary".to_string(),
+                }],
+                added_call_edges: vec![],
+                removed_call_edges: vec![],
+                warnings: vec![],
+            }],
+        };
+
+        let preview = build_context_pack_diff_preview(
+            &report,
+            ResponseBudget::new(Some(1), Some(80)),
+            Some(&ontology),
+        );
+
+        let symbol_ref = &preview.files[0].touched_symbol_refs[0].ontology_refs[0];
+        assert!(symbol_ref.handle.starts_with("tont-"));
+        assert_eq!(symbol_ref.tag, "alpha");
+        assert_eq!(symbol_ref.path, ".naming/tags/alpha.md");
+        assert_eq!(symbol_ref.title.as_deref(), Some("Alpha Domain"));
+        assert_eq!(symbol_ref.domain.as_deref(), Some("fixture"));
+        assert_eq!(
+            preview.files[0].summary_refs[0].ontology_refs[0].path,
+            ".naming/tags/alpha.md"
+        );
     }
 
     #[test]
@@ -13807,7 +14051,7 @@ tier = "private"
         };
 
         let preview =
-            build_context_pack_test_preview(&report, ResponseBudget::new(Some(1), Some(14)));
+            build_context_pack_test_preview(&report, ResponseBudget::new(Some(1), Some(14)), None);
 
         assert!(preview.truncated);
         assert_eq!(preview.failure_groups.len(), 1);
@@ -13918,7 +14162,7 @@ tier = "private"
         };
 
         let preview =
-            build_context_pack_log_preview(&report, ResponseBudget::new(Some(1), Some(14)));
+            build_context_pack_log_preview(&report, ResponseBudget::new(Some(1), Some(14)), None);
 
         assert!(preview.truncated);
         assert_eq!(preview.signals.len(), 1);

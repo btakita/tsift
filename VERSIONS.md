@@ -8,6 +8,9 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- `context-pack` now loads tagpath ontology docs from `.naming/tags/*.md` and attaches compact ontology references to visible symbol refs, summary refs, and the top-level handoff payload so stable tag docs can be referenced by handle/path without repeating ontology prose.
+- Regression coverage now locks ontology refs in both preview-builder unit tests and the compiled `context-pack --json` integration path.
+
 ## 0.1.41
 
 - Added `--budget <small|normal|deep|auto>` to the agent-facing preview surfaces for `search`, `explain`, `session-review`, and `context-pack`.

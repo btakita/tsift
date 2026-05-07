@@ -3462,6 +3462,12 @@ fn context_pack_json_composes_next_context_and_optional_digests() {
     fs::create_dir_all(root.path().join("src")).unwrap();
     fs::create_dir_all(root.path().join("tasks/software")).unwrap();
     fs::create_dir_all(root.path().join(".agent-doc/logs")).unwrap();
+    fs::create_dir_all(root.path().join(".naming/tags")).unwrap();
+    fs::write(
+        root.path().join(".naming/tags/alpha.md"),
+        "+++\ntag = \"alpha\"\ntitle = \"Alpha Domain\"\ndomain = \"fixture\"\n+++\n\nAlpha definition.\n",
+    )
+    .unwrap();
     fs::write(
         root.path().join("src/lib.rs"),
         "pub fn alpha() {\n    beta();\n}\n\nfn beta() {}\n",
@@ -3555,6 +3561,12 @@ fn context_pack_json_composes_next_context_and_optional_digests() {
             .as_str()
             .unwrap()
             .starts_with("cdsym-")
+    );
+    assert_eq!(json["ontology_refs"][0]["tag"], "alpha");
+    assert_eq!(json["ontology_refs"][0]["path"], ".naming/tags/alpha.md");
+    assert_eq!(
+        json["diff_digest"]["files"][0]["touched_symbol_refs"][0]["ontology_refs"][0]["tag"],
+        "alpha"
     );
     assert!(
         json["log_digest"]["report"]["symbol_refs"][0]["handle"]
