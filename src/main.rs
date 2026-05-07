@@ -578,6 +578,15 @@ struct ToolEnvelope<'a, T: Serialize> {
     report: &'a T,
 }
 
+#[derive(Serialize)]
+struct TranscriptArtifactRef {
+    handle: String,
+    path: String,
+    bytes: usize,
+    lines: usize,
+    expand: String,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct ResponseBudget {
     max_items: Option<usize>,
@@ -1234,6 +1243,36 @@ fn print_json_or_envelope<T: Serialize>(
     Ok(())
 }
 
+fn persist_transcript_artifact(
+    root: &Path,
+    prefix: &str,
+    suffix: &str,
+    key: &str,
+    body: &str,
+    expand: String,
+) -> Result<TranscriptArtifactRef> {
+    let handle = stable_handle(prefix, key);
+    let artifacts_dir = root.join(".tsift/artifacts");
+    fs::create_dir_all(&artifacts_dir).with_context(|| {
+        format!(
+            "creating transcript artifacts dir: {}",
+            artifacts_dir.display()
+        )
+    })?;
+    let file_name = format!("{handle}.{suffix}");
+    let artifact_path = artifacts_dir.join(file_name);
+    fs::write(&artifact_path, body)
+        .with_context(|| format!("writing transcript artifact: {}", artifact_path.display()))?;
+    let rel_path = relativize_pathbuf(&artifact_path, root);
+    Ok(TranscriptArtifactRef {
+        handle,
+        path: rel_path.display().to_string(),
+        bytes: body.len(),
+        lines: body.lines().count(),
+        expand,
+    })
+}
+
 fn terse_key(key: &str) -> &str {
     match key {
         "name" => "n",
@@ -1316,6 +1355,14 @@ fn terse_key(key: &str) -> &str {
         "metrics" => "ms",
         "label" => "lb",
         "value" => "v",
+        "command" => "cmd",
+        "exit_code" => "xc",
+        "success" => "ok",
+        "artifact" => "art",
+        "digest" => "dg",
+        "bytes" => "bt",
+        "lines" => "lns",
+        "expand" => "xp",
         "entities" => "ent",
         "relationships" => "rel",
         "concept_labels" => "cls",
@@ -1544,6 +1591,14 @@ const TERSE_PAIRS: &[(&str, &str)] = &[
     ("metrics", "ms"),
     ("label", "lb"),
     ("value", "v"),
+    ("command", "cmd"),
+    ("exit_code", "xc"),
+    ("success", "ok"),
+    ("artifact", "art"),
+    ("digest", "dg"),
+    ("bytes", "bt"),
+    ("lines", "lns"),
+    ("expand", "xp"),
     ("entities", "ent"),
     ("relationships", "rel"),
     ("concept_labels", "cls"),
@@ -1589,6 +1644,28 @@ fn relativize(path: &str, root: &std::path::Path) -> String {
     let root_str = root.to_string_lossy();
     let prefix = format!("{}/", root_str.trim_end_matches('/'));
     path.strip_prefix(&prefix).unwrap_or(path).to_string()
+}
+
+fn transcript_artifact_root(path: &Path) -> Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", path.display()))?;
+    let start = if canonical.is_dir() {
+        canonical.clone()
+    } else {
+        canonical
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| canonical.clone())
+    };
+
+    for ancestor in start.ancestors() {
+        if ancestor.join(".git").exists() || ancestor.join(".gitmodules").is_file() {
+            return Ok(ancestor.to_path_buf());
+        }
+    }
+
+    Ok(start)
 }
 
 fn relativize_pathbuf(path: &std::path::Path, root: &std::path::Path) -> PathBuf {
@@ -6182,6 +6259,7 @@ fn cmd_digest_runner(
     format: OutputFormat,
 ) -> Result<()> {
     let digest_kind = DigestRunnerKind::parse(kind)?;
+    let root = transcript_artifact_root(path)?;
     let output = Command::new("sh")
         .arg("-lc")
         .arg(format!("({shell_command}) 2>&1"))
@@ -6190,6 +6268,184 @@ fn cmd_digest_runner(
         .with_context(|| format!("running digest-wrapped command: {shell_command}"))?;
 
     let captured = String::from_utf8_lossy(&output.stdout).into_owned();
+    let exit_code = output.status.code().unwrap_or(-1);
+    if format.json_output && format.envelope {
+        let artifact = if captured.trim().is_empty() {
+            None
+        } else {
+            let (suffix, expand) = match digest_kind {
+                DigestRunnerKind::Test => (
+                    "test.log",
+                    format!(
+                        "tsift test-digest --path {} --input {}{} --json",
+                        shell_quote(root.to_string_lossy().as_ref()),
+                        shell_quote(
+                            root.join(".tsift/artifacts")
+                                .join(format!(
+                                    "{}.test.log",
+                                    stable_handle(
+                                        "tart",
+                                        &format!(
+                                            "{}:{}:{}",
+                                            digest_kind.as_str(),
+                                            shell_command,
+                                            captured
+                                        )
+                                    )
+                                ))
+                                .to_string_lossy()
+                                .as_ref()
+                        ),
+                        runner
+                            .map(|value| format!(" --runner {}", shell_quote(value)))
+                            .unwrap_or_default()
+                    ),
+                ),
+                DigestRunnerKind::Log => (
+                    "log",
+                    format!(
+                        "tsift log-digest --path {} --input {} --json",
+                        shell_quote(root.to_string_lossy().as_ref()),
+                        shell_quote(
+                            root.join(".tsift/artifacts")
+                                .join(format!(
+                                    "{}.log",
+                                    stable_handle(
+                                        "tart",
+                                        &format!(
+                                            "{}:{}:{}",
+                                            digest_kind.as_str(),
+                                            shell_command,
+                                            captured
+                                        )
+                                    )
+                                ))
+                                .to_string_lossy()
+                                .as_ref()
+                        )
+                    ),
+                ),
+            };
+            Some(persist_transcript_artifact(
+                &root,
+                "tart",
+                suffix,
+                &format!("{}:{}:{}", digest_kind.as_str(), shell_command, captured),
+                &captured,
+                expand,
+            )?)
+        };
+
+        match digest_kind {
+            DigestRunnerKind::Test => {
+                let digest_report = test_digest::compute(path, &captured, runner)?;
+                let report = serde_json::json!({
+                    "kind": digest_kind.as_str(),
+                    "command": shell_command,
+                    "exit_code": exit_code,
+                    "success": output.status.success(),
+                    "artifact": artifact,
+                    "digest": digest_report,
+                });
+                let mut follow_up = artifact
+                    .as_ref()
+                    .map(|entry| vec![entry.expand.clone()])
+                    .unwrap_or_default();
+                follow_up.push(format!(
+                    "tsift rewrite --run {}",
+                    shell_quote(shell_command)
+                ));
+                let summary_text = if output.status.success() && digest_report.failures == 0 {
+                    format!("test run passed for {}", runner.unwrap_or("auto"))
+                } else {
+                    format!("test run captured {} failure(s)", digest_report.failures)
+                };
+                print_json_or_envelope(
+                    &report,
+                    &format,
+                    "digest-runner",
+                    "test-run",
+                    ToolEnvelopeSummary {
+                        text: summary_text,
+                        metrics: vec![
+                            envelope_metric("runner", &digest_report.runner),
+                            envelope_metric("exit_code", exit_code),
+                            envelope_metric("failures", digest_report.failures),
+                            envelope_metric("groups", digest_report.grouped_failures),
+                            envelope_metric(
+                                "artifact",
+                                artifact
+                                    .as_ref()
+                                    .map(|entry| entry.handle.as_str())
+                                    .unwrap_or("-"),
+                            ),
+                        ],
+                    },
+                    false,
+                    follow_up,
+                )?;
+            }
+            DigestRunnerKind::Log => {
+                let digest_report = log_digest::compute(path, &captured)?;
+                let report = serde_json::json!({
+                    "kind": digest_kind.as_str(),
+                    "command": shell_command,
+                    "exit_code": exit_code,
+                    "success": output.status.success(),
+                    "artifact": artifact,
+                    "digest": digest_report,
+                });
+                let mut follow_up = artifact
+                    .as_ref()
+                    .map(|entry| vec![entry.expand.clone()])
+                    .unwrap_or_default();
+                follow_up.push(format!(
+                    "tsift rewrite --run {}",
+                    shell_quote(shell_command)
+                ));
+                let summary_text = if output.status.success() && digest_report.signal_groups == 0 {
+                    "command finished without log signals".to_string()
+                } else {
+                    format!(
+                        "command emitted {} log signal group(s)",
+                        digest_report.signal_groups
+                    )
+                };
+                print_json_or_envelope(
+                    &report,
+                    &format,
+                    "digest-runner",
+                    "command-run",
+                    ToolEnvelopeSummary {
+                        text: summary_text,
+                        metrics: vec![
+                            envelope_metric("exit_code", exit_code),
+                            envelope_metric("signals", digest_report.signal_groups),
+                            envelope_metric("file_refs", digest_report.file_ref_groups),
+                            envelope_metric(
+                                "artifact",
+                                artifact
+                                    .as_ref()
+                                    .map(|entry| entry.handle.as_str())
+                                    .unwrap_or("-"),
+                            ),
+                        ],
+                    },
+                    false,
+                    follow_up,
+                )?;
+            }
+        }
+
+        if output.status.success() {
+            return Ok(());
+        }
+        if let Some(code) = output.status.code() {
+            std::process::exit(code);
+        }
+        bail!("digest-wrapped command terminated by signal: {shell_command}");
+    }
+
     if captured.trim().is_empty() {
         let label = match digest_kind {
             DigestRunnerKind::Test => "test",
@@ -8491,6 +8747,26 @@ mod tests {
     fn rewrite_tsift_passthrough() {
         let result = rewrite_command("tsift search \"foo\"");
         assert_eq!(result, Some("tsift search \"foo\"".to_string()));
+    }
+
+    #[test]
+    fn rewrite_run_tsift_search_disables_timeout_by_default() {
+        let result = effective_rewrite_run_command("tsift search hookcaps --exact --path /tmp/x");
+        assert_eq!(
+            result,
+            "tsift search hookcaps --exact --path /tmp/x --timeout 0"
+        );
+    }
+
+    #[test]
+    fn rewrite_run_preserves_explicit_search_timeout() {
+        let result = effective_rewrite_run_command(
+            "tsift search hookcaps --exact --path /tmp/x --timeout 5",
+        );
+        assert_eq!(
+            result,
+            "tsift search hookcaps --exact --path /tmp/x --timeout 5"
+        );
     }
 
     #[test]
@@ -12723,7 +12999,8 @@ struct OutputCap {
 }
 
 fn execute_rewritten_command(command: &str) -> Result<i32> {
-    let parts = shell_split(command);
+    let effective_command = effective_rewrite_run_command(command);
+    let parts = shell_split(&effective_command);
     let Some(program) = parts.first().map(|part| strip_shell_quotes(part)) else {
         bail!("rewritten command was empty");
     };
@@ -12734,9 +13011,9 @@ fn execute_rewritten_command(command: &str) -> Result<i32> {
     let output = Command::new(program)
         .args(&args)
         .output()
-        .with_context(|| format!("executing rewritten command `{command}`"))?;
+        .with_context(|| format!("executing rewritten command `{effective_command}`"))?;
 
-    let stdout = if let Some(cap) = rewrite_output_cap(command) {
+    let stdout = if let Some(cap) = rewrite_output_cap(&effective_command) {
         apply_output_cap(&output.stdout, cap)
     } else {
         String::from_utf8_lossy(&output.stdout).into_owned()
@@ -12752,6 +13029,27 @@ fn execute_rewritten_command(command: &str) -> Result<i32> {
         .status
         .code()
         .unwrap_or_else(|| if output.status.success() { 0 } else { 1 }))
+}
+
+fn effective_rewrite_run_command(command: &str) -> String {
+    let parts = shell_split(command);
+    if parts.first().map(|part| strip_shell_quotes(part)) != Some("tsift") {
+        return command.to_string();
+    }
+    let structured = parts
+        .iter()
+        .skip(1)
+        .any(|part| strip_shell_quotes(part) == "--timeout");
+    let subcommand = parts
+        .iter()
+        .skip(1)
+        .map(|part| strip_shell_quotes(part))
+        .find(|part| !part.starts_with('-'));
+    if matches!(subcommand, Some("search")) && !structured {
+        format!("{command} --timeout 0")
+    } else {
+        command.to_string()
+    }
 }
 
 fn rewrite_output_cap(command: &str) -> Option<OutputCap> {
@@ -13525,6 +13823,13 @@ impl DigestRunnerKind {
             "test" => Ok(Self::Test),
             "log" => Ok(Self::Log),
             other => bail!("unsupported digest runner kind `{other}`; expected test or log"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Log => "log",
         }
     }
 }

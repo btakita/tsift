@@ -3888,6 +3888,52 @@ exit 7"#;
 }
 
 #[test]
+fn digest_runner_envelope_persists_artifact_for_green_test_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn helper() {}\n").unwrap();
+
+    let shell_command = "printf 'running 1 test\\ntest tests::alpha ... ok\\n\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\\n'";
+
+    let output = tsift_bin()
+        .args([
+            "--envelope",
+            "__digest-runner",
+            "--kind",
+            "test",
+            "--runner",
+            "cargo",
+            "--json",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--shell-command",
+            shell_command,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "digest-runner");
+    assert_eq!(json["view"], "test-run");
+    assert_eq!(json["report"]["success"], true);
+    assert_eq!(json["report"]["digest"]["failures"], 0);
+    assert_eq!(json["summary"]["text"], "test run passed for cargo");
+    let artifact_root = std::path::Path::new(json["report"]["digest"]["root"].as_str().unwrap());
+    let artifact_path = artifact_root.join(json["report"]["artifact"]["path"].as_str().unwrap());
+    assert!(artifact_path.exists(), "artifact should be written to disk");
+    let artifact_body = fs::read_to_string(&artifact_path).unwrap();
+    assert!(artifact_body.contains("test result: ok."));
+    assert!(
+        json["follow_up"][0]
+            .as_str()
+            .unwrap()
+            .contains("tsift test-digest")
+    );
+    assert!(json["follow_up"][0].as_str().unwrap().contains("--runner"));
+}
+
+#[test]
 fn digest_runner_captures_stderr_for_log_digest() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();

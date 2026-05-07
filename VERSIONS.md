@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- `tsift --envelope __digest-runner ... --json` now returns a summary-first command/test-run envelope with command metadata, exit status, the existing bounded `test-digest` or `log-digest` payload under `report.digest`, and a persisted transcript artifact reference under `report.artifact`.
+- Captured runner/build output is now written to `.tsift/artifacts/` with a stable handle plus a concrete replay command (`expand`) so green runs can stay terse in context while still offering an opt-in path back to the bounded digest.
+- `tsift rewrite --run` now disables the default timeout when it is executing an already-tsift `search` command that did not specify `--timeout`, so capped exact-search passthroughs do not fail spuriously on broader scans.
+- Regression coverage now exercises the new digest-runner envelope end to end, including persisted artifact creation for a passing test run.
 - Added a global `tsift --envelope` wrapper for the bounded agent-facing `search`, `explain`, `session-review`, and `context-pack` JSON surfaces. The envelope carries a terse cross-command `tool`/`view`/`summary`/`follow_up` header while preserving the existing command-specific payload under `report`.
 - Preview and handoff commands now expose one consistent machine-readable summary layer plus concrete follow-up commands, so MCP or CLI clients can render terse summaries and trigger narrower expansions without depending on prose formatting.
 - Regression coverage now locks the new flag in CLI parsing tests and exercises the wrapped `context-pack` JSON output end-to-end.

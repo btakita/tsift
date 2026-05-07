@@ -252,6 +252,19 @@ Envelope shape:
 
 Preview reports keep their item-level `handle` + `expand` fields inside `report`, so clients can render a top summary from the envelope and then request narrower follow-up expansion without falling back to prose-heavy defaults.
 
+### Command/Test-Run Envelopes
+
+`tsift --envelope __digest-runner ... --json` now wraps command-execution digests in a summary-first envelope for `test` and `log` runs.
+
+Behavior:
+
+- The outer envelope stays terse (`tool: "digest-runner"`, `view: "test-run"` or `view: "command-run"`) and surfaces only the summary metrics callers need first, such as runner, exit code, failure count, or signal count.
+- The inner `report` carries command metadata plus the existing `test-digest` or `log-digest` payload under `digest`.
+- When captured stdout/stderr is non-empty, tsift persists it under `.tsift/artifacts/` and returns `report.artifact = {handle, path, bytes, lines, expand}`.
+- `handle` is stable for the captured transcript body and command identity, so clients can reference the artifact without inlining the raw output into context.
+- `expand` is a concrete replay command (`tsift test-digest ... --input <artifact>` or `tsift log-digest ... --input <artifact>`) that rehydrates the bounded digest from the stored artifact only when the caller explicitly wants details.
+- Successful/green runs therefore stay summary-first by default: callers can report the pass/build outcome from the envelope and keep the raw transcript behind the artifact handle instead of replaying it into the turn.
+
 ## Compact JSON Default
 
 All `--json` output uses compact (single-line) serialization by default. This saves 30-50% of tokens compared to pretty-printed JSON.
