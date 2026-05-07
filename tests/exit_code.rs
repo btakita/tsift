@@ -3544,6 +3544,24 @@ fn context_pack_json_composes_next_context_and_optional_digests() {
     assert_eq!(json["test_digest"]["status"], "included");
     assert_eq!(json["test_digest"]["report"]["runner"], "cargo");
     assert_eq!(json["log_digest"]["status"], "included");
+    assert!(
+        json["next_context"]["touched_symbol_refs"][0]["handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("ncsym-")
+    );
+    assert!(
+        json["diff_digest"]["files"][0]["touched_symbol_refs"][0]["handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("cdsym-")
+    );
+    assert!(
+        json["log_digest"]["report"]["symbol_refs"][0]["handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("clsym-")
+    );
     assert_eq!(
         json["resume_commands"][0],
         "tsift session-review --next-context tasks/software/tsift.md"

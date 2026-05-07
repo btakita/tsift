@@ -228,6 +228,7 @@ Behavior:
 - `--max-items <n>` switches the command into preview mode and caps repeated result groups to `n` items per section.
 - `--max-bytes <n>` truncates long preview fields (snippets, messages, paths, labels) to `n` bytes with an ellipsis.
 - Preview mode emits deterministic expansion handles plus a concrete follow-up `expand` command for each preview item, so callers can request a narrower rerun without paying for the full original response.
+- Symbol-bearing preview items also expose a canonical `tag_alias` derived from `tagpath` tags (for example `alpha/helper`) so agents can reuse one semantic reference across search, explain, and handoff flows without repeating every surface spelling.
 - JSON/terse/schema output in preview mode returns the same bounded preview report instead of the full raw payload; without these flags, the existing output formats remain unchanged.
 
 ## Structured Envelopes
@@ -1169,7 +1170,7 @@ Behavior:
 4. Optionally inlines `log-digest` when `--log-input <file>` is provided.
 5. Emits the follow-up digest commands needed to refresh or expand the pack without replaying raw transcripts or verbose logs.
 
-`context-pack` is intentionally bounded by default: it emits preview-style lists plus counts rather than dumping the full underlying reports, and `--max-items` / `--max-bytes` further tighten the preview envelope for high-token-pressure turns.
+`context-pack` is intentionally bounded by default: it emits preview-style lists plus counts rather than dumping the full underlying reports, and `--max-items` / `--max-bytes` further tighten the preview envelope for high-token-pressure turns. Its symbol-bearing preview lists keep the raw `touched_symbols` strings for compatibility while also adding compact symbol-ref objects with stable `handle` ids and canonical `tag_alias` values for `next_context`, diff previews, and log symbol references.
 
 ## Hook Integration
 

@@ -12,6 +12,7 @@ use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tagpath::parser as tagpath_parser;
 use tempfile::NamedTempFile;
 
 pub mod audit;
@@ -1782,6 +1783,83 @@ fn stable_handle(prefix: &str, key: &str) -> String {
     format!("{prefix}-{}", &hex[..10])
 }
 
+fn tag_alias_from_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let convention = tagpath_parser::detect_convention(trimmed);
+    let parsed = tagpath_parser::parse(trimmed, convention);
+    if !parsed.namespaces.is_empty() {
+        let alias = parsed
+            .namespaces
+            .iter()
+            .filter(|dimension| !dimension.is_empty())
+            .map(|dimension| dimension.join("."))
+            .collect::<Vec<_>>()
+            .join("/");
+        if alias.is_empty() { None } else { Some(alias) }
+    } else if parsed.tags.is_empty() {
+        None
+    } else {
+        Some(parsed.tags.join("/"))
+    }
+}
+
+fn tag_alias_from_tags(name: &str, tags: Option<&str>) -> Option<String> {
+    if let Some(tags) = tags {
+        let alias = tags
+            .split(',')
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+        if !alias.is_empty() {
+            return Some(alias);
+        }
+    }
+
+    tag_alias_from_name(name)
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+struct CompactSymbolRefPreview {
+    handle: String,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag_alias: Option<String>,
+}
+
+fn build_compact_symbol_ref(
+    prefix: &str,
+    key: &str,
+    name: &str,
+    tags: Option<&str>,
+    max_bytes: usize,
+) -> CompactSymbolRefPreview {
+    CompactSymbolRefPreview {
+        handle: stable_handle(prefix, key),
+        name: truncate_for_budget(name, max_bytes),
+        tag_alias: tag_alias_from_tags(name, tags)
+            .map(|alias| truncate_for_budget(&alias, max_bytes)),
+    }
+}
+
+fn format_symbol_preview_line(handle: &str, name: &str, tag_alias: Option<&str>) -> String {
+    match tag_alias {
+        Some(alias) => format!("{handle} {name} tag:{alias}"),
+        None => format!("{handle} {name}"),
+    }
+}
+
+fn compact_symbol_ref_token(symbol: &CompactSymbolRefPreview) -> String {
+    match symbol.tag_alias.as_deref() {
+        Some(alias) => format!("{}@{}", symbol.handle, alias),
+        None => format!("{}@{}", symbol.handle, symbol.name),
+    }
+}
+
 fn truncate_for_budget(input: &str, max_bytes: usize) -> String {
     let trimmed = input.trim();
     if trimmed.len() <= max_bytes {
@@ -3281,6 +3359,8 @@ fn cmd_explain_with_budget(
 #[derive(Serialize)]
 struct ExplainBudgetDefinitionPreview {
     handle: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag_alias: Option<String>,
     kind: String,
     name: String,
     file: String,
@@ -3291,6 +3371,8 @@ struct ExplainBudgetDefinitionPreview {
 #[derive(Serialize)]
 struct ExplainBudgetEdgePreview {
     handle: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag_alias: Option<String>,
     name: String,
     file: String,
     line: i64,
@@ -3321,6 +3403,7 @@ struct ExplainBudgetReport {
     community: Option<ExplainBudgetCommunityPreview>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_explain_budget_report(
     symbol: &str,
     _root: &Path,
@@ -3339,65 +3422,86 @@ fn build_explain_budget_report(
     let definitions = symbols
         .iter()
         .take(max_items)
-        .map(|entry| ExplainBudgetDefinitionPreview {
-            handle: stable_handle(
+        .map(|entry| {
+            let symbol_ref = build_compact_symbol_ref(
                 "edef",
                 &format!(
                     "{}:{}:{}:{}",
                     entry.kind, entry.name, entry.file, entry.line
                 ),
-            ),
-            kind: entry.kind.clone(),
-            name: truncate_for_budget(&entry.name, max_bytes),
-            file: truncate_for_budget(&entry.file, max_bytes),
-            line: entry.line,
-            expand: format!(
-                "tsift search {} --exact --path {} --limit 20",
-                shell_quote(&entry.name),
-                shell_quote(&entry.file)
-            ),
+                &entry.name,
+                entry.tags.as_deref(),
+                max_bytes,
+            );
+            ExplainBudgetDefinitionPreview {
+                handle: symbol_ref.handle,
+                tag_alias: symbol_ref.tag_alias,
+                kind: entry.kind.clone(),
+                name: symbol_ref.name,
+                file: truncate_for_budget(&entry.file, max_bytes),
+                line: entry.line,
+                expand: format!(
+                    "tsift search {} --exact --path {} --limit 20",
+                    shell_quote(&entry.name),
+                    shell_quote(&entry.file)
+                ),
+            }
         })
         .collect();
     let callers_preview: Vec<ExplainBudgetEdgePreview> = callers
         .iter()
         .take(max_items)
-        .map(|entry| ExplainBudgetEdgePreview {
-            handle: stable_handle(
+        .map(|entry| {
+            let symbol_ref = build_compact_symbol_ref(
                 "ecall",
                 &format!(
                     "{}:{}:{}:{}",
                     entry.caller_name, entry.caller_file, entry.call_site_line, symbol
                 ),
-            ),
-            name: truncate_for_budget(&entry.caller_name, max_bytes),
-            file: truncate_for_budget(&entry.caller_file, max_bytes),
-            line: entry.call_site_line,
-            expand: format!(
-                "tsift explain {} --path {} --limit 0",
-                shell_quote(&entry.caller_name),
-                shell_quote(&entry.caller_file)
-            ),
+                &entry.caller_name,
+                None,
+                max_bytes,
+            );
+            ExplainBudgetEdgePreview {
+                handle: symbol_ref.handle,
+                tag_alias: symbol_ref.tag_alias,
+                name: symbol_ref.name,
+                file: truncate_for_budget(&entry.caller_file, max_bytes),
+                line: entry.call_site_line,
+                expand: format!(
+                    "tsift explain {} --path {} --limit 0",
+                    shell_quote(&entry.caller_name),
+                    shell_quote(&entry.caller_file)
+                ),
+            }
         })
         .collect();
     let callees_preview: Vec<ExplainBudgetEdgePreview> = callees
         .iter()
         .take(max_items)
-        .map(|entry| ExplainBudgetEdgePreview {
-            handle: stable_handle(
+        .map(|entry| {
+            let symbol_ref = build_compact_symbol_ref(
                 "eces",
                 &format!(
                     "{}:{}:{}:{}",
                     entry.callee_name, entry.caller_file, entry.call_site_line, symbol
                 ),
-            ),
-            name: truncate_for_budget(&entry.callee_name, max_bytes),
-            file: truncate_for_budget(&entry.caller_file, max_bytes),
-            line: entry.call_site_line,
-            expand: format!(
-                "tsift explain {} --path {} --limit 0",
-                shell_quote(&entry.callee_name),
-                shell_quote(&entry.caller_file)
-            ),
+                &entry.callee_name,
+                None,
+                max_bytes,
+            );
+            ExplainBudgetEdgePreview {
+                handle: symbol_ref.handle,
+                tag_alias: symbol_ref.tag_alias,
+                name: symbol_ref.name,
+                file: truncate_for_budget(&entry.caller_file, max_bytes),
+                line: entry.call_site_line,
+                expand: format!(
+                    "tsift explain {} --path {} --limit 0",
+                    shell_quote(&entry.callee_name),
+                    shell_quote(&entry.caller_file)
+                ),
+            }
         })
         .collect();
     let community_preview = community.map(|entry| ExplainBudgetCommunityPreview {
@@ -3445,20 +3549,30 @@ fn print_explain_budget_human(report: &ExplainBudgetReport) {
     );
     for entry in &report.definitions {
         println!(
-            "def {} {} {} {}:{} expand:{}",
-            entry.handle, entry.kind, entry.name, entry.file, entry.line, entry.expand
+            "def {} {} {}:{} expand:{}",
+            format_symbol_preview_line(&entry.handle, &entry.name, entry.tag_alias.as_deref()),
+            entry.kind,
+            entry.file,
+            entry.line,
+            entry.expand
         );
     }
     for entry in &report.callers {
         println!(
-            "caller {} {} {}:{} expand:{}",
-            entry.handle, entry.name, entry.file, entry.line, entry.expand
+            "caller {} {}:{} expand:{}",
+            format_symbol_preview_line(&entry.handle, &entry.name, entry.tag_alias.as_deref()),
+            entry.file,
+            entry.line,
+            entry.expand
         );
     }
     for entry in &report.callees {
         println!(
-            "callee {} {} {}:{} expand:{}",
-            entry.handle, entry.name, entry.file, entry.line, entry.expand
+            "callee {} {}:{} expand:{}",
+            format_symbol_preview_line(&entry.handle, &entry.name, entry.tag_alias.as_deref()),
+            entry.file,
+            entry.line,
+            entry.expand
         );
     }
     if let Some(community) = &report.community {
@@ -5434,6 +5548,8 @@ struct SessionReviewNextContextBudgetReport {
     prompt_targets: Vec<String>,
     touched_files: Vec<String>,
     touched_symbols: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    touched_symbol_refs: Vec<CompactSymbolRefPreview>,
     unresolved_failures: Vec<SessionReviewBudgetFailurePreview>,
     next_digest_commands: Vec<String>,
 }
@@ -5479,6 +5595,8 @@ struct ContextPackDiffFilePreview {
     path: String,
     status: String,
     touched_symbols: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    touched_symbol_refs: Vec<CompactSymbolRefPreview>,
     summary_state: String,
     added_call_edges: usize,
     removed_call_edges: usize,
@@ -5564,7 +5682,10 @@ struct ContextPackLogFileRefPreview {
 
 #[derive(Serialize)]
 struct ContextPackLogSymbolRefPreview {
+    handle: String,
     symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag_alias: Option<String>,
     occurrences: usize,
     summary_state: String,
 }
@@ -5714,6 +5835,21 @@ fn build_session_review_next_context_budget_report(
             .take(max_items)
             .map(|entry| truncate_for_budget(entry, max_bytes))
             .collect(),
+        touched_symbol_refs: report
+            .next_context
+            .touched_symbols
+            .iter()
+            .take(max_items)
+            .map(|entry| {
+                build_compact_symbol_ref(
+                    "ncsym",
+                    &format!("{}:{}", report.next_context.target, entry),
+                    entry,
+                    None,
+                    max_bytes,
+                )
+            })
+            .collect(),
         unresolved_failures: report
             .next_context
             .unresolved_failures
@@ -5808,7 +5944,22 @@ fn print_session_review_next_context_budget_human(report: &SessionReviewNextCont
         println!("file {file}");
     }
     for symbol in &report.touched_symbols {
-        println!("symbol {symbol}");
+        if let Some(symbol_ref) = report
+            .touched_symbol_refs
+            .iter()
+            .find(|entry| entry.name == *symbol)
+        {
+            println!(
+                "symbol {}",
+                format_symbol_preview_line(
+                    &symbol_ref.handle,
+                    &symbol_ref.name,
+                    symbol_ref.tag_alias.as_deref()
+                )
+            );
+        } else {
+            println!("symbol {symbol}");
+        }
     }
     for failure in &report.unresolved_failures {
         println!(
@@ -5857,6 +6008,20 @@ fn build_context_pack_diff_preview(
                     .iter()
                     .take(max_items)
                     .map(|symbol| truncate_for_budget(symbol, max_bytes))
+                    .collect(),
+                touched_symbol_refs: file
+                    .touched_symbols
+                    .iter()
+                    .take(max_items)
+                    .map(|symbol| {
+                        build_compact_symbol_ref(
+                            "cdsym",
+                            &format!("{}:{}", file.path, symbol),
+                            symbol,
+                            None,
+                            max_bytes,
+                        )
+                    })
                     .collect(),
                 summary_state: diff_digest_summary_label(file.summary_state).to_string(),
                 added_call_edges: file.added_call_edges.len(),
@@ -5978,7 +6143,10 @@ fn build_context_pack_log_preview(
             .iter()
             .take(max_items)
             .map(|symbol| ContextPackLogSymbolRefPreview {
+                handle: stable_handle("clsym", &symbol.symbol),
                 symbol: truncate_for_budget(&symbol.symbol, max_bytes),
+                tag_alias: tag_alias_from_name(&symbol.symbol)
+                    .map(|alias| truncate_for_budget(&alias, max_bytes)),
                 occurrences: symbol.occurrences,
                 summary_state: log_digest_summary_label(symbol.summary_state).to_string(),
             })
@@ -6101,10 +6269,14 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
                 "diff {} status:{} syms:{}",
                 file.path,
                 file.status,
-                if file.touched_symbols.is_empty() {
+                if file.touched_symbol_refs.is_empty() {
                     "-".to_string()
                 } else {
-                    file.touched_symbols.join(",")
+                    file.touched_symbol_refs
+                        .iter()
+                        .map(compact_symbol_ref_token)
+                        .collect::<Vec<_>>()
+                        .join(",")
                 }
             );
         }
@@ -6168,8 +6340,15 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
         }
     }
     if !report.next_context.touched_symbols.is_empty() {
-        for symbol in &report.next_context.touched_symbols {
-            println!("  - symbol: {symbol}");
+        for symbol in &report.next_context.touched_symbol_refs {
+            println!(
+                "  - symbol: {}",
+                format_symbol_preview_line(
+                    &symbol.handle,
+                    &symbol.name,
+                    symbol.tag_alias.as_deref()
+                )
+            );
         }
     }
 
@@ -6191,8 +6370,19 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
     );
     for file in &report.diff_digest.files {
         println!("  - {} [{}]", file.path, file.status);
-        if !file.touched_symbols.is_empty() {
-            println!("    symbols: {}", file.touched_symbols.join(", "));
+        if !file.touched_symbol_refs.is_empty() {
+            println!(
+                "    symbols: {}",
+                file.touched_symbol_refs
+                    .iter()
+                    .map(|symbol| format_symbol_preview_line(
+                        &symbol.handle,
+                        &symbol.name,
+                        symbol.tag_alias.as_deref()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
         }
         if !file.warnings.is_empty() {
             println!("    warnings: {}", file.warnings.join(" | "));
@@ -6240,6 +6430,18 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
                 println!(
                     "  - {} {} count:{} msg:{}",
                     location, signal.severity, signal.occurrences, signal.message
+                );
+            }
+            for symbol in &log.symbol_refs {
+                println!(
+                    "  - symbol: {} count:{} state:{}",
+                    format_symbol_preview_line(
+                        &symbol.handle,
+                        &symbol.symbol,
+                        symbol.tag_alias.as_deref()
+                    ),
+                    symbol.occurrences,
+                    symbol.summary_state
                 );
             }
         }
@@ -7075,14 +7277,12 @@ fn precheck_search_indexes(
     for target in &targets {
         match inspect_search_index(target)? {
             SearchIndexState::Missing => {
-                if autoindex {
-                    if let Err(err) = apply_search_index_update(root, target) {
-                        if is_active_writer_lock_error(&err) {
-                            degraded_targets
-                                .push(degraded_search_target(target, RebuildSearchReason::Missing));
-                        } else {
-                            return Err(err);
-                        }
+                if autoindex && let Err(err) = apply_search_index_update(root, target) {
+                    if is_active_writer_lock_error(&err) {
+                        degraded_targets
+                            .push(degraded_search_target(target, RebuildSearchReason::Missing));
+                    } else {
+                        return Err(err);
                     }
                 }
             }
@@ -7679,6 +7879,8 @@ fn cmd_search_with_budget(
 #[derive(Serialize)]
 struct SearchBudgetSymbolPreview {
     handle: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag_alias: Option<String>,
     match_type: String,
     kind: String,
     name: String,
@@ -7755,11 +7957,14 @@ fn build_search_budget_report(
                 "{}:{}:{}:{}:{}:{}",
                 hit.match_type, hit.kind, hit.name, display_file, hit.line, query
             );
+            let symbol_ref =
+                build_compact_symbol_ref("ssym", &key, &hit.name, hit.tags.as_deref(), max_bytes);
             SearchBudgetSymbolPreview {
-                handle: stable_handle("ssym", &key),
+                handle: symbol_ref.handle,
+                tag_alias: symbol_ref.tag_alias,
                 match_type: hit.match_type.clone(),
                 kind: hit.kind.clone(),
-                name: truncate_for_budget(&hit.name, max_bytes),
+                name: symbol_ref.name,
                 file: truncate_for_budget(&display_file, max_bytes),
                 line: hit.line,
                 score: hit.score,
@@ -7827,11 +8032,10 @@ fn print_search_budget_human(report: &SearchBudgetReport) {
     );
     for symbol in &report.symbols {
         println!(
-            "sym {} [{}] {} {} {}:{} sc:{} expand:{}",
-            symbol.handle,
+            "sym {} [{}] {} {}:{} sc:{} expand:{}",
+            format_symbol_preview_line(&symbol.handle, &symbol.name, symbol.tag_alias.as_deref()),
             symbol.match_type,
             symbol.kind,
-            symbol.name,
             symbol.file,
             symbol.line,
             format_score(symbol.score, true),
@@ -12296,6 +12500,7 @@ tier = "private"
 
         assert_eq!(report.symbols.len(), 1);
         assert!(report.symbols[0].handle.starts_with("ssym-"));
+        assert_eq!(report.symbols[0].tag_alias.as_deref(), Some("alpha/hel..."));
         assert_eq!(report.symbols[0].name, "alpha_hel...");
         assert_eq!(report.symbols[0].file, "src/lib.rs");
         assert!(report.symbols[0].expand.contains("tsift explain"));
@@ -12359,7 +12564,12 @@ tier = "private"
         assert_eq!(report.callers.len(), 1);
         assert!(report.truncated);
         assert_eq!(report.community.as_ref().unwrap().members.len(), 1);
+        assert_eq!(
+            report.definitions[0].tag_alias.as_deref(),
+            Some("alpha/helper")
+        );
         assert!(report.callers[0].handle.starts_with("ecall-"));
+        assert_eq!(report.callers[0].tag_alias.as_deref(), Some("main"));
     }
 
     #[test]
@@ -12462,6 +12672,15 @@ tier = "private"
         assert_eq!(budget_report.prompt_targets, vec!["do one"]);
         assert_eq!(budget_report.touched_files, vec!["src/lib.rs"]);
         assert!(
+            budget_report.touched_symbol_refs[0]
+                .handle
+                .starts_with("ncsym-")
+        );
+        assert_eq!(
+            budget_report.touched_symbol_refs[0].tag_alias.as_deref(),
+            Some("alpha/helper")
+        );
+        assert!(
             budget_report.unresolved_failures[0]
                 .handle
                 .starts_with("snf-")
@@ -12510,6 +12729,15 @@ tier = "private"
         assert_eq!(preview.files.len(), 1);
         assert_eq!(preview.files[0].path, "src/lib.rs");
         assert_eq!(preview.files[0].touched_symbols, vec!["alpha_he..."]);
+        assert!(
+            preview.files[0].touched_symbol_refs[0]
+                .handle
+                .starts_with("cdsym-")
+        );
+        assert_eq!(
+            preview.files[0].touched_symbol_refs[0].tag_alias.as_deref(),
+            Some("alpha/he...")
+        );
         assert_eq!(preview.files[0].warnings, vec!["stale parse"]);
     }
 
