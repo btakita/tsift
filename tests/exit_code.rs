@@ -3646,7 +3646,7 @@ fn token_savings_accepts_tagpath_preview_fixture() {
     );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(json["pass"].as_bool().unwrap());
-    assert_eq!(json["totals"]["cases"], 3);
+    assert_eq!(json["totals"]["cases"], 4);
     assert_eq!(
         json["cases"]
             .as_array()
@@ -3654,7 +3654,18 @@ fn token_savings_accepts_tagpath_preview_fixture() {
             .iter()
             .map(|case| case["surface"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["search", "explain", "session-review"]
+        vec!["search", "explain", "session-review", "context-pack"]
+    );
+    let context_pack = json["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["surface"] == "context-pack")
+        .expect("context-pack fixture case should be present");
+    assert_eq!(context_pack["status"], "pass");
+    assert!(
+        context_pack["estimated_token_delta"].as_u64().unwrap() > 0,
+        "context-pack fixture should prove compact preview savings"
     );
     assert!(
         json["cases"]

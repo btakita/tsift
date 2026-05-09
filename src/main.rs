@@ -1375,6 +1375,8 @@ struct TokenSavingsFixtureCase {
     minimum_savings_percent: f64,
     raw_symbols: Vec<TokenSavingsRawSymbol>,
     tagpath_families: Vec<TokenSavingsFamily>,
+    #[serde(default)]
+    context_pack_inputs: Option<TokenSavingsContextPackInputs>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1393,10 +1395,26 @@ struct TokenSavingsFamily {
     aliases: BTreeMap<String, String>,
 }
 
+#[derive(Deserialize, Serialize)]
+struct TokenSavingsContextPackInputs {
+    next_context: Vec<serde_json::Value>,
+    diff: Vec<serde_json::Value>,
+    test: Vec<serde_json::Value>,
+    log: Vec<serde_json::Value>,
+}
+
 #[derive(Serialize)]
 struct TokenSavingsEnvelopeFamily {
     handle: String,
     tag_alias: String,
+    count: usize,
+    expand: String,
+}
+
+#[derive(Serialize)]
+struct TokenSavingsContextPackEnvelope<'a> {
+    section: &'a str,
+    handle: String,
     count: usize,
     expand: String,
 }
@@ -1459,6 +1477,10 @@ fn token_savings_expand_command(surface: &str, canonical: &str) -> String {
             shell_quote(canonical)
         ),
         "session-review" => format!("tsift summarize {}", shell_quote(canonical)),
+        "context-pack" => {
+            "tsift --envelope context-pack <target> --test-input <test.log> --log-input <build.log> --budget normal"
+                .to_string()
+        }
         _ => format!(
             "tsift --envelope search {} --budget normal",
             shell_quote(&query)
@@ -1483,15 +1505,58 @@ fn token_savings_envelope_families(
         .collect()
 }
 
+fn token_savings_context_pack_raw_bytes(inputs: &TokenSavingsContextPackInputs) -> Result<usize> {
+    Ok(serde_json::to_vec(inputs)?.len())
+}
+
+fn token_savings_context_pack_envelope(
+    case: &TokenSavingsFixtureCase,
+    inputs: &TokenSavingsContextPackInputs,
+) -> Vec<TokenSavingsContextPackEnvelope<'static>> {
+    let mut rows = vec![
+        TokenSavingsContextPackEnvelope {
+            section: "next_context",
+            handle: stable_handle("tcp", &format!("{}:next_context", case.name)),
+            count: inputs.next_context.len(),
+            expand: "tsift session-review --next-context <target> --json".to_string(),
+        },
+        TokenSavingsContextPackEnvelope {
+            section: "diff",
+            handle: stable_handle("tcp", &format!("{}:diff", case.name)),
+            count: inputs.diff.len(),
+            expand: "tsift diff-digest . --json".to_string(),
+        },
+        TokenSavingsContextPackEnvelope {
+            section: "test",
+            handle: stable_handle("tcp", &format!("{}:test", case.name)),
+            count: inputs.test.len(),
+            expand: "tsift test-digest --path . < test.log".to_string(),
+        },
+        TokenSavingsContextPackEnvelope {
+            section: "log",
+            handle: stable_handle("tcp", &format!("{}:log", case.name)),
+            count: inputs.log.len(),
+            expand: "tsift log-digest --path . < build.log".to_string(),
+        },
+    ];
+    rows.retain(|row| row.count > 0);
+    rows
+}
+
 fn build_token_savings_report(fixture: &TokenSavingsFixture) -> Result<TokenSavingsReport> {
     let mut cases = Vec::new();
     let mut total_raw_bytes = 0;
     let mut total_envelope_bytes = 0;
 
     for case in &fixture.cases {
-        let raw_bytes = serde_json::to_vec(&case.raw_symbols)?.len();
+        let mut raw_bytes = serde_json::to_vec(&case.raw_symbols)?.len();
         let envelope = token_savings_envelope_families(case);
-        let envelope_bytes = serde_json::to_vec(&envelope)?.len();
+        let mut envelope_bytes = serde_json::to_vec(&envelope)?.len();
+        if let Some(inputs) = &case.context_pack_inputs {
+            raw_bytes += token_savings_context_pack_raw_bytes(inputs)?;
+            envelope_bytes +=
+                serde_json::to_vec(&token_savings_context_pack_envelope(case, inputs))?.len();
+        }
         let byte_delta = raw_bytes.saturating_sub(envelope_bytes);
         let raw_estimated_tokens = estimated_tokens_from_bytes(raw_bytes);
         let envelope_estimated_tokens = estimated_tokens_from_bytes(envelope_bytes);
@@ -13632,6 +13697,7 @@ tier = "private"
                         aliases: BTreeMap::new(),
                     },
                 ],
+                context_pack_inputs: None,
             }],
         };
 
