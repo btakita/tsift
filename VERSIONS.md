@@ -8,9 +8,15 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
-- `tsift search` now delegates free-text query normalization to the `tagpath` v0.6.1 query API, while search/explain/session-review/context-pack preview refs derive canonical `tag_alias` values from the shared `tagpath` family API instead of local parser helpers.
+- `tsift search` now delegates free-text query normalization to the `tagpath` v0.6.2 query API, while search/explain/session-review/context-pack preview refs derive canonical `tag_alias` values from the shared `tagpath` family API instead of local parser helpers.
 - `context-pack` now loads tagpath ontology docs from `.naming/tags/*.md` and attaches compact ontology references to visible symbol refs, summary refs, and the top-level handoff payload so stable tag docs can be referenced by handle/path without repeating ontology prose.
 - Regression coverage now locks ontology refs in both preview-builder unit tests and the compiled `context-pack --json` integration path.
+
+## 0.1.42
+
+- Added `tsift status --fix`, which applies safe local status recommendations before reporting: refreshes stale/missing root indexes, refreshes existing workspace scoped indexes when stale, and updates stale/missing Code Navigation instructions through the existing `tsift init` path.
+- The injected Code Navigation instructions now tell agents to run `tsift status --fix` before relying on stale/missing tsift results when writes are allowed, or ask the user to run the printed `run:` command when writes are not allowed.
+- Regression coverage now locks `status --fix` in both the in-process status command and the compiled CLI JSON path.
 
 ## 0.1.41
 

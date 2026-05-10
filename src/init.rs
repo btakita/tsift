@@ -13,7 +13,7 @@ fn versioned_section() -> String {
         r#"<!-- tsift:code-navigation v={version} -->
 ## Code Navigation
 
-Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root.
+Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead. Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`.
 
 Use the commands listed in its `use:` output:
 - `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)
@@ -439,6 +439,7 @@ mod tests {
         let content = std::fs::read_to_string(&result.updates[0].file).unwrap();
         assert!(content.contains(SECTION_MARKER_PREFIX));
         assert!(content.contains("tsift --envelope search"));
+        assert!(content.contains("tsift status --fix"));
     }
 
     #[test]

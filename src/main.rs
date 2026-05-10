@@ -535,6 +535,9 @@ enum Commands {
         /// Path to the codebase (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Apply safe local fixes before reporting: refresh tsift instructions and rebuild stale/missing indexes
+        #[arg(long)]
+        fix: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -1192,8 +1195,9 @@ fn main() -> Result<()> {
             },
             ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
         ),
-        Some(Commands::Status { path, json }) => cmd_status(
+        Some(Commands::Status { path, fix, json }) => cmd_status(
             &path,
+            fix,
             json || terse || schema || envelope,
             compact,
             pretty,
@@ -7654,6 +7658,7 @@ fn open_existing_summary_db_read_only(db_path: &Path) -> Result<summarize::Summa
 
 fn cmd_status(
     path: &std::path::Path,
+    fix: bool,
     json_output: bool,
     compact: bool,
     pretty: bool,
@@ -7666,11 +7671,77 @@ fn cmd_status(
         autoindex_missing_workspace_scopes(&root, &report)?;
         report = status::check_status(&root)?;
     }
+    if fix {
+        apply_status_fixes(&root, &report)?;
+        report = status::check_status(&root)?;
+        if status_missing_workspace_scopes(&report) {
+            autoindex_missing_workspace_scopes(&root, &report)?;
+            report = status::check_status(&root)?;
+        }
+    }
     if json_output {
         println!("{}", to_json_schema(&report, pretty, terse, schema)?);
     } else {
         print!("{}", status::format_human(&report, compact));
     }
+    Ok(())
+}
+
+fn status_index_needs_fix(report: &status::StatusReport) -> bool {
+    !matches!(report.index, status::IndexStatus::Fresh { .. })
+}
+
+fn status_instructions_need_fix(report: &status::StatusReport) -> bool {
+    !matches!(report.instructions, init::InstructionStatus::Current { .. })
+}
+
+fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> Result<()> {
+    if status_instructions_need_fix(report) {
+        eprintln!("status fix: refreshing tsift instructions");
+        init::init(root, false, false)?;
+    }
+
+    if !status_index_needs_fix(report) {
+        return Ok(());
+    }
+
+    let scopes = config::Config::submodule_dirs(root)?;
+    if scopes.is_empty() {
+        eprintln!("status fix: refreshing index");
+        run_index_update(
+            &root.join(".tsift/index.db"),
+            root,
+            "status --fix refreshing index".to_string(),
+            root,
+            None,
+            false,
+            false,
+        )?;
+        return Ok(());
+    }
+
+    let cfg = config::Config::load(root)?;
+    for scope in scopes {
+        if !scope.source_root.exists() {
+            eprintln!(
+                "status fix: skipping missing submodule `{}` ({})",
+                scope.id,
+                scope.source_root.display()
+            );
+            continue;
+        }
+        eprintln!("status fix: refreshing submodule `{}` index", scope.id);
+        run_index_update(
+            &cfg.db_path_for(root, &scope.id),
+            &scope.source_root,
+            format!("status --fix refreshing submodule `{}` index", scope.id),
+            root,
+            Some(scope.id.as_str()),
+            false,
+            false,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -12379,7 +12450,7 @@ tier = "private"
         let beta_db_path = cfg.db_path_for(dir.path(), "beta");
         assert!(!beta_db_path.exists());
 
-        cmd_status(dir.path(), true, false, false, false, false).unwrap();
+        cmd_status(dir.path(), false, true, false, false, false, false).unwrap();
 
         assert!(beta_db_path.exists());
         let report = status::check_status(dir.path()).unwrap();
@@ -12391,10 +12462,29 @@ tier = "private"
         let dir = setup_workspace();
         let cfg = config::Config::load(dir.path()).unwrap();
 
-        cmd_status(dir.path(), true, false, false, false, false).unwrap();
+        cmd_status(dir.path(), false, true, false, false, false, false).unwrap();
 
         assert!(cfg.db_path_for(dir.path(), "alpha").exists());
         assert!(cfg.db_path_for(dir.path(), "beta").exists());
+        let report = status::check_status(dir.path()).unwrap();
+        assert!(matches!(report.index, status::IndexStatus::Fresh { .. }));
+    }
+
+    #[test]
+    fn status_cmd_fix_refreshes_stale_index() {
+        let dir = setup_graph_index();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() { println!(\"updated\"); }\nfn main() { helper(); Vec::new(); }\n",
+        )
+        .unwrap();
+
+        let report = status::check_status(dir.path()).unwrap();
+        assert!(matches!(report.index, status::IndexStatus::Stale { .. }));
+
+        cmd_status(dir.path(), true, true, false, false, false, false).unwrap();
+
         let report = status::check_status(dir.path()).unwrap();
         assert!(matches!(report.index, status::IndexStatus::Fresh { .. }));
     }

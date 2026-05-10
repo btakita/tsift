@@ -1,6 +1,6 @@
 [package]
 name = "tsift"
-version = "0.1.41"
+version = "0.1.42"
 edition = "2024"
 description = "Token-efficient CLI plugin for Claude Code — Sift-powered search + native tool routing"
 license = "MIT"
@@ -19,7 +19,7 @@ toml = "0.8"
 blake3 = "1"
 ureq = { version = "3", features = ["json"] }
 sift = { git = "https://github.com/rupurt/sift" }
-tagpath = { version = "0.6.1", path = "../tagpath", default-features = false }
+tagpath = { version = "0.6.2", path = "../tagpath", default-features = false }
 tree-sitter = "0.25"
 
 # Language grammars (optional, behind feature flags)

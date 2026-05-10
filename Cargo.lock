@@ -2766,7 +2766,7 @@ dependencies = [
 
 [[package]]
 name = "tagpath"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "clap",
  "petgraph",
@@ -3182,7 +3182,7 @@ dependencies = [
 
 [[package]]
 name = "tsift"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "anyhow",
  "blake3",

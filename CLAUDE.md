@@ -28,7 +28,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift session-cost` | Bounded token/runtime-cost digest for Claude JSONL, Codex JSONL, and `agent-doc` runtime logs. Reports prompt/cached/output totals, largest cost outliers, raw runtime events, and derived restart-churn families without replaying the full transcript. |
 | `tsift session-review` | Cross-harness aggregate review for a document or repo path. Auto-discovers related Claude JSONL, Codex JSONL, and `agent-doc` runtime logs, then emits one bounded combined digest + cost report. `--next-context` emits only the resumable prompt/verification/failure/digest-command pack. File targets fail closed on cwd-only transcript matches and require a document path/session signal. |
 | `tsift lint` | Markdown lint: detect unannotated concepts (symbols, headings, bold terms) cross-referenced against graph entities. Auto-discovers live `index.db` files from the nearest `.tsift` root by default, and `--index` accepts a project root, `.tsift`, direct `index.db`, or `.tsift/indexes`. `--index <dir>` / `--entities-from <file>` / `--json` |
-| `tsift status` | Session health check: index freshness, instruction version, summary cache, recommended commands. Workspace roots treat scoped indexes under `.tsift/indexes/<scope>/index.db` as the authoritative status surface, even if a shared `.tsift/index.db` also exists; they surface configured-but-missing scopes instead of reporting false `fresh`, recommend `--workspace` rebuilds, and include summary-cache recovery diagnostics when status had to fall back to a snapshot. `--json` includes per-scope indexed status plus `missing_scopes`. |
+| `tsift status` | Session health check: index freshness, instruction version, summary cache, recommended commands. Workspace roots treat scoped indexes under `.tsift/indexes/<scope>/index.db` as the authoritative status surface, even if a shared `.tsift/index.db` also exists; they surface configured-but-missing scopes instead of reporting false `fresh`, recommend `--workspace` rebuilds, and include summary-cache recovery diagnostics when status had to fall back to a snapshot. `--fix` applies safe local index/instruction refreshes before reporting. `--json` includes per-scope indexed status plus `missing_scopes`. |
 | `tsift locks` | Diagnose the OS-backed `index.lock` sidecar and `index.db-journal` state, and recommend the next recovery step. Stale sidecar metadata is reused automatically. `--scope <name>` / `--json` |
 | `tsift init` | Project setup: ensure versioned Code Navigation section (`v=X.Y.Z`) in AGENTS.md and mirror it into CLAUDE.md when present. The injected section tells the harness to run from the owning repo/submodule root and prefer envelope previews plus artifact-backed digest surfaces over raw transcript, diff, and verbose-log reads. `--codex` injects or updates a repo-aware autoindex hook; `--workspace` resolves to the parent workspace root. Detects and refreshes stale/pre-versioned markers on re-run. |
 
@@ -117,10 +117,10 @@ If copied skill instructions lag behind the installed binary, treat this file, `
 
 Private: `github.com/btakita/tsift`. Submodule at `src/tsift` in agent-loop.
 
-<!-- tsift:code-navigation v=0.1.41 -->
+<!-- tsift:code-navigation v=0.1.42 -->
 ## Code Navigation
 
-Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root.
+Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead. Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`.
 
 Use the commands listed in its `use:` output:
 - `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)
