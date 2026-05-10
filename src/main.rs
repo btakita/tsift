@@ -667,6 +667,10 @@ impl ResponseBudget {
     fn preview_bytes(self) -> usize {
         self.max_bytes.unwrap_or(DEFAULT_BUDGET_BYTES)
     }
+
+    fn follow_up_items(self) -> usize {
+        self.preview_items().max(DEFAULT_FOLLOW_UP_ITEMS)
+    }
 }
 
 impl ResponseBudgetPreset {
@@ -2292,6 +2296,7 @@ fn compact_members(members: &[String], limit: usize) -> String {
 
 const DEFAULT_BUDGET_ITEMS: usize = 5;
 const DEFAULT_BUDGET_BYTES: usize = 160;
+const DEFAULT_FOLLOW_UP_ITEMS: usize = 4;
 
 fn stable_handle(prefix: &str, key: &str) -> String {
     let mut hasher = blake3::Hasher::new();
@@ -6486,6 +6491,7 @@ fn build_session_review_next_context_budget_report(
 ) -> SessionReviewNextContextBudgetReport {
     let max_items = budget.preview_items();
     let max_bytes = budget.preview_bytes();
+    let follow_up_items = budget.follow_up_items();
     SessionReviewNextContextBudgetReport {
         target: report.next_context.target.clone(),
         max_items,
@@ -6498,7 +6504,7 @@ fn build_session_review_next_context_budget_report(
             || report.next_context.touched_files.len() > max_items
             || report.next_context.touched_symbols.len() > max_items
             || report.next_context.unresolved_failures.len() > max_items
-            || report.next_context.next_digest_commands.len() > max_items,
+            || report.next_context.next_digest_commands.len() > follow_up_items,
         prompt_targets: report
             .next_context
             .active_prompt_targets
@@ -6556,8 +6562,8 @@ fn build_session_review_next_context_budget_report(
             .next_context
             .next_digest_commands
             .iter()
-            .take(max_items)
-            .map(|entry| truncate_for_budget(entry, max_bytes))
+            .take(follow_up_items)
+            .cloned()
             .collect(),
     }
 }
@@ -13708,11 +13714,13 @@ tier = "private"
         let small = ResponseBudget::from_cli(None, None, Some(ResponseBudgetPreset::Small), false);
         assert_eq!(small.preview_items(), 3);
         assert_eq!(small.preview_bytes(), 120);
+        assert_eq!(small.follow_up_items(), 4);
 
         let overridden =
             ResponseBudget::from_cli(Some(7), None, Some(ResponseBudgetPreset::Small), false);
         assert_eq!(overridden.preview_items(), 7);
         assert_eq!(overridden.preview_bytes(), 120);
+        assert_eq!(overridden.follow_up_items(), 7);
 
         let envelope_default = ResponseBudget::from_cli(None, None, None, true);
         assert!(envelope_default.is_active());
@@ -14145,6 +14153,8 @@ tier = "private"
                 next_digest_commands: vec![
                     "tsift session-review --next-context tasks/software/tsift.md".to_string(),
                     "tsift diff-digest .".to_string(),
+                    "tsift test-digest --path . < target/very-long-test-output-file-name-that-must-remain-executable.log".to_string(),
+                    "tsift log-digest --path . < target/very-long-build-output-file-name-that-must-remain-executable.log".to_string(),
                 ],
             },
             warnings: vec![],
@@ -14172,6 +14182,11 @@ tier = "private"
             budget_report.unresolved_failures[0]
                 .handle
                 .starts_with("snf-")
+        );
+        assert_eq!(budget_report.next_digest_commands.len(), 4);
+        assert_eq!(
+            budget_report.next_digest_commands[2],
+            "tsift test-digest --path . < target/very-long-test-output-file-name-that-must-remain-executable.log"
         );
     }
 
