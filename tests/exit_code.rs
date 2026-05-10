@@ -3725,6 +3725,57 @@ fn token_savings_accepts_tagpath_preview_fixture() {
 }
 
 #[test]
+fn token_savings_accepts_real_session_fixture() {
+    let fixture_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/real-session-token-savings.json");
+    assert!(
+        fixture_path.exists(),
+        "real-session token-savings fixture should exist at {}",
+        fixture_path.display()
+    );
+
+    let output = tsift_bin()
+        .args([
+            "token-savings",
+            "--fixture",
+            fixture_path.to_str().unwrap(),
+            "--fail-under",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "real-session token-savings fixture should pass thresholds: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["pass"].as_bool().unwrap());
+    assert_eq!(json["totals"]["cases"], 2);
+    assert_eq!(
+        json["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|case| case["surface"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["session-review", "context-pack"]
+    );
+    assert!(
+        json["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|case| case["estimated_token_delta"].as_u64().unwrap() > 0)
+    );
+    assert!(
+        json["totals"]["estimated_token_delta"].as_u64().unwrap() > 1000,
+        "real-session fixture should prove a large token delta"
+    );
+}
+
+#[test]
 fn session_review_honors_historical_aliases_and_skips_noisy_records() {
     let root = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

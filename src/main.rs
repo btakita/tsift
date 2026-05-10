@@ -1380,6 +1380,8 @@ struct TokenSavingsFixtureCase {
     raw_symbols: Vec<TokenSavingsRawSymbol>,
     tagpath_families: Vec<TokenSavingsFamily>,
     #[serde(default)]
+    session_review_inputs: Option<TokenSavingsSessionReviewInputs>,
+    #[serde(default)]
     context_pack_inputs: Option<TokenSavingsContextPackInputs>,
 }
 
@@ -1400,6 +1402,18 @@ struct TokenSavingsFamily {
 }
 
 #[derive(Deserialize, Serialize)]
+struct TokenSavingsSessionReviewInputs {
+    prompt_targets: Vec<serde_json::Value>,
+    sessions: Vec<serde_json::Value>,
+    commands: Vec<serde_json::Value>,
+    touched_files: Vec<serde_json::Value>,
+    touched_symbols: Vec<serde_json::Value>,
+    failures: Vec<serde_json::Value>,
+    guardrails: Vec<serde_json::Value>,
+    largest_turns: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize, Serialize)]
 struct TokenSavingsContextPackInputs {
     next_context: Vec<serde_json::Value>,
     diff: Vec<serde_json::Value>,
@@ -1411,6 +1425,14 @@ struct TokenSavingsContextPackInputs {
 struct TokenSavingsEnvelopeFamily {
     handle: String,
     tag_alias: String,
+    count: usize,
+    expand: String,
+}
+
+#[derive(Serialize)]
+struct TokenSavingsSessionReviewEnvelope<'a> {
+    section: &'a str,
+    handle: String,
     count: usize,
     expand: String,
 }
@@ -1513,6 +1535,70 @@ fn token_savings_context_pack_raw_bytes(inputs: &TokenSavingsContextPackInputs) 
     Ok(serde_json::to_vec(inputs)?.len())
 }
 
+fn token_savings_session_review_raw_bytes(
+    inputs: &TokenSavingsSessionReviewInputs,
+) -> Result<usize> {
+    Ok(serde_json::to_vec(inputs)?.len())
+}
+
+fn token_savings_session_review_envelope(
+    case: &TokenSavingsFixtureCase,
+    inputs: &TokenSavingsSessionReviewInputs,
+) -> Vec<TokenSavingsSessionReviewEnvelope<'static>> {
+    let mut rows = vec![
+        TokenSavingsSessionReviewEnvelope {
+            section: "prompt_targets",
+            handle: stable_handle("tsr", &format!("{}:prompt_targets", case.name)),
+            count: inputs.prompt_targets.len(),
+            expand: "tsift session-review <target> --json".to_string(),
+        },
+        TokenSavingsSessionReviewEnvelope {
+            section: "sessions",
+            handle: stable_handle("tsr", &format!("{}:sessions", case.name)),
+            count: inputs.sessions.len(),
+            expand: "tsift session-review <target> --json".to_string(),
+        },
+        TokenSavingsSessionReviewEnvelope {
+            section: "commands",
+            handle: stable_handle("tsr", &format!("{}:commands", case.name)),
+            count: inputs.commands.len(),
+            expand: "tsift session-digest --source auto --input <transcript> --json".to_string(),
+        },
+        TokenSavingsSessionReviewEnvelope {
+            section: "files",
+            handle: stable_handle("tsr", &format!("{}:files", case.name)),
+            count: inputs.touched_files.len(),
+            expand: "tsift session-review <target> --json".to_string(),
+        },
+        TokenSavingsSessionReviewEnvelope {
+            section: "symbols",
+            handle: stable_handle("tsr", &format!("{}:symbols", case.name)),
+            count: inputs.touched_symbols.len(),
+            expand: "tsift --envelope search <symbol> --budget normal".to_string(),
+        },
+        TokenSavingsSessionReviewEnvelope {
+            section: "failures",
+            handle: stable_handle("tsr", &format!("{}:failures", case.name)),
+            count: inputs.failures.len(),
+            expand: "tsift session-review <target> --json".to_string(),
+        },
+        TokenSavingsSessionReviewEnvelope {
+            section: "guardrails",
+            handle: stable_handle("tsr", &format!("{}:guardrails", case.name)),
+            count: inputs.guardrails.len(),
+            expand: "tsift session-cost --input <transcript> --json".to_string(),
+        },
+        TokenSavingsSessionReviewEnvelope {
+            section: "largest_turns",
+            handle: stable_handle("tsr", &format!("{}:largest_turns", case.name)),
+            count: inputs.largest_turns.len(),
+            expand: "tsift session-cost --input <transcript> --json".to_string(),
+        },
+    ];
+    rows.retain(|row| row.count > 0);
+    rows
+}
+
 fn token_savings_context_pack_envelope(
     case: &TokenSavingsFixtureCase,
     inputs: &TokenSavingsContextPackInputs,
@@ -1556,6 +1642,11 @@ fn build_token_savings_report(fixture: &TokenSavingsFixture) -> Result<TokenSavi
         let mut raw_bytes = serde_json::to_vec(&case.raw_symbols)?.len();
         let envelope = token_savings_envelope_families(case);
         let mut envelope_bytes = serde_json::to_vec(&envelope)?.len();
+        if let Some(inputs) = &case.session_review_inputs {
+            raw_bytes += token_savings_session_review_raw_bytes(inputs)?;
+            envelope_bytes +=
+                serde_json::to_vec(&token_savings_session_review_envelope(case, inputs))?.len();
+        }
         if let Some(inputs) = &case.context_pack_inputs {
             raw_bytes += token_savings_context_pack_raw_bytes(inputs)?;
             envelope_bytes +=
@@ -13788,6 +13879,7 @@ tier = "private"
                     },
                 ],
                 context_pack_inputs: None,
+                session_review_inputs: None,
             }],
         };
 

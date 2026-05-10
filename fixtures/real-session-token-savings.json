@@ -1,0 +1,381 @@
+{
+  "schema_version": 1,
+  "description": "Real-session token-savings benchmark derived from recent tsift/agent-doc work on session-review and context-pack preview surfaces.",
+  "token_estimate": "ceil(utf8_bytes / 4)",
+  "cases": [
+    {
+      "name": "real-tsift-session-review",
+      "surface": "session-review",
+      "minimum_savings_percent": 65.0,
+      "raw_symbols": [
+        { "identifier": "build_session_review_budget_report", "file": "src/main.rs", "line": 6295, "context": "preview_builder" },
+        { "identifier": "buildSessionReviewBudgetReport", "file": "src/session_review.ts", "line": 41, "context": "preview_builder" },
+        { "identifier": "session_review_next_context", "file": "src/session_review.rs", "line": 84, "context": "handoff_payload" },
+        { "identifier": "sessionReviewNextContext", "file": "src/session_review.ts", "line": 59, "context": "handoff_payload" },
+        { "identifier": "session_cost_guardrail", "file": "src/session_cost.rs", "line": 344, "context": "budget_guardrail" },
+        { "identifier": "sessionCostGuardrail", "file": "src/session_cost.ts", "line": 73, "context": "budget_guardrail" }
+      ],
+      "tagpath_families": [
+        {
+          "canonical": "build_session_review_budget_report",
+          "count": 2,
+          "aliases": {
+            "snake_case": "build_session_review_budget_report",
+            "camelCase": "buildSessionReviewBudgetReport"
+          }
+        },
+        {
+          "canonical": "session_review_next_context",
+          "count": 2,
+          "aliases": {
+            "snake_case": "session_review_next_context",
+            "camelCase": "sessionReviewNextContext"
+          }
+        },
+        {
+          "canonical": "session_cost_guardrail",
+          "count": 2,
+          "aliases": {
+            "snake_case": "session_cost_guardrail",
+            "camelCase": "sessionCostGuardrail"
+          }
+        }
+      ],
+      "session_review_inputs": {
+        "prompt_targets": [
+          {
+            "text": "do [#ctxp]. spec-test-build-install-commit-push",
+            "occurrences": 2,
+            "raw_excerpt": "User asked the agent-doc session to extend token-savings coverage for context-pack, then run spec, tests, build, install, commit, and push. The raw transcript repeats the session summary, active backlog, command outputs, and closeout reminders before the final assistant response."
+          },
+          {
+            "text": "do [#qont]. spec-test-build-install-commit-push",
+            "occurrences": 1,
+            "raw_excerpt": "Follow-up work expanded the fixture with normalize-query and ontology refs. The raw session body contained the full fixture JSON, spec paragraphs, test assertions, build output, install output, and git push status even though the resumable context only needed the target and verification result."
+          },
+          {
+            "text": "do [#real]. spec-test-build-install-commit-push",
+            "occurrences": 1,
+            "raw_excerpt": "Current benchmark request asks for real-session measurements from recent tsift and agent-doc transcripts, specifically session-review and context-pack paths that dominate prompt volume. The compact preview should keep counts, handles, and expansion commands instead of replaying the whole exchange tail."
+          }
+        ],
+        "sessions": [
+          {
+            "source": "agent_doc_log",
+            "path": ".agent-doc/archives/55560c2f12047b1a846ebab88214cfbaa57574433d92d6c9900e3a05507a01aa-20260509-222243.md",
+            "matched_by": ["agent_doc_session:tagpath-v0.1", "document_path:tasks/software/tagpath.md", "prompt_target:#ctxp"],
+            "prompt_tokens": 160648,
+            "cached_input_tokens": 154912,
+            "output_tokens": 4659,
+            "summary_excerpt": "Implemented context-pack fixture coverage, updated tagpath and tsift tests, ran cargo test, cargo build --release, cargo install --path ., and pushed both tagpath and tsift commits."
+          },
+          {
+            "source": "agent_doc_log",
+            "path": ".agent-doc/archives/55560c2f12047b1a846ebab88214cfbaa57574433d92d6c9900e3a05507a01aa-20260510-034519.md",
+            "matched_by": ["prompt_target:#qont", "token-savings", "ontology_refs"],
+            "prompt_tokens": 94612,
+            "cached_input_tokens": 91204,
+            "output_tokens": 3211,
+            "summary_excerpt": "Added normalize-query and ontology-refs compactness fixture cases, verified expected normalized query tags, ontology handle/path shape, source handle preservation, and compact previews that keep ontology refs as handles."
+          },
+          {
+            "source": "agent_doc_log",
+            "path": ".agent-doc/archives/53cc65443c45f7b49f5e6ace54e3f6bafe4077ade57924422b5eb3baf4dbd23c-20260507-210623.md",
+            "matched_by": ["document_path:tasks/software/tsift.md", "session-review", "context-pack"],
+            "prompt_tokens": 122944,
+            "cached_input_tokens": 118013,
+            "output_tokens": 3898,
+            "summary_excerpt": "Implemented context-pack summary refs and documented the downstream fixture work: search, explain, and session-review already had measurable savings; context-pack and real transcript measurements remained the next gap."
+          },
+          {
+            "source": "codex_jsonl",
+            "path": ".codex/sessions/2026/05/05/rollout-2026-05-05T16-50-50-019df9e8-6687-7332-92d0-5e4fd2916ac2.jsonl",
+            "matched_by": ["cwd:<workspace>/agent-loop", "document_path:tasks/software/tsift.md"],
+            "prompt_tokens": 245112,
+            "cached_input_tokens": 240917,
+            "output_tokens": 2716,
+            "summary_excerpt": "Long Codex session with repeated preflight, planning, build, test, and closeout output. This row anchors the real-session benchmark to cached resend pressure instead of synthetic symbol-only samples."
+          }
+        ],
+        "commands": [
+          {
+            "command": "cargo test",
+            "occurrences": 5,
+            "raw_excerpt": "The raw session captured full Rust test harness output repeatedly, including hundreds of unit-test names, compiled integration binary status, doc-test banners, warning-free completion lines, and rerun commentary."
+          },
+          {
+            "command": "cargo build --release",
+            "occurrences": 3,
+            "raw_excerpt": "Release build output included dependency freshness, compile status, target directory paths, and elapsed timing. The handoff only needed success/failure, artifact handle, and expansion command."
+          },
+          {
+            "command": "cargo install --path .",
+            "occurrences": 3,
+            "raw_excerpt": "Install output repeated crate version, binary install path, compile profile, and finished status. The compact benchmark collapses this into command count plus an expansion path."
+          },
+          {
+            "command": "git push origin main",
+            "occurrences": 3,
+            "raw_excerpt": "Push output included remote object enumeration, delta compression, branch tracking, and commit hashes for tagpath or tsift. Session-review only needs that closeout reached pushed."
+          }
+        ],
+        "touched_files": [
+          { "path": "src/tsift/src/main.rs", "occurrences": 8, "raw_excerpt": "Token-savings report builder, budget preview structs, context-pack report assembly, envelope output, CLI parsing, and unit tests." },
+          { "path": "src/tsift/tests/exit_code.rs", "occurrences": 6, "raw_excerpt": "Compiled binary integration tests for context-pack, session-review, token-savings fixtures, and envelope JSON." },
+          { "path": "src/tsift/SPEC.md", "occurrences": 5, "raw_excerpt": "Spec paragraphs documenting token-savings fixtures, session-review, context-pack, budget presets, and handoff preview contracts." },
+          { "path": "src/tagpath/fixtures/tsift-token-savings.json", "occurrences": 4, "raw_excerpt": "Shared synthetic fixture used by tsift to lock cross-project search, explain, session-review, context-pack, normalize-query, and ontology-ref savings contracts." },
+          { "path": "tasks/software/tsift.md", "occurrences": 4, "raw_excerpt": "Agent-doc session document containing active backlog, completed items, and the user directive for real-session token-savings coverage." }
+        ],
+        "touched_symbols": [
+          { "symbol": "build_token_savings_report", "occurrences": 7, "raw_excerpt": "Aggregates raw bytes, envelope bytes, estimated token deltas, pass/fail status, and per-case threshold checks." },
+          { "symbol": "token_savings_context_pack_envelope", "occurrences": 5, "raw_excerpt": "Collapses next_context, diff, test, and log raw rows into compact section handles with expansion commands." },
+          { "symbol": "build_session_review_next_context_budget_report", "occurrences": 4, "raw_excerpt": "Turns full session-review reports into bounded resumable next-context previews with files, symbols, failures, and digest commands." },
+          { "symbol": "build_context_pack_report", "occurrences": 4, "raw_excerpt": "Composes session-review, diff-digest, optional test-digest, and optional log-digest into one context-pack payload." },
+          { "symbol": "SessionCostGuardrail", "occurrences": 3, "raw_excerpt": "Carries prompt-budget, cache-ratio, restart-loop, and closeout-churn warnings that dominate real transcript review volume." }
+        ],
+        "failures": [
+          {
+            "kind": "test",
+            "message": "context_pack_json_composes_next_context_and_optional_digests reproduced touched_symbol_total = 0 before the summary-ref enrichment fix.",
+            "occurrences": 1,
+            "raw_excerpt": "The failure transcript included the full JSON payload and panic message, but a compact row only needs the failure class, message, count, and expansion command."
+          },
+          {
+            "kind": "verification",
+            "message": "TMPDIR isolation was required because ambient /tmp/.tsift and /tmp/.git markers changed project-root resolution during tests.",
+            "occurrences": 1,
+            "raw_excerpt": "The raw session explained environment-specific temp-root leakage, rerun commands, and resolved status across several paragraphs."
+          }
+        ],
+        "guardrails": [
+          {
+            "kind": "prompt_budget",
+            "severity": "warn",
+            "message": "largest sampled prompt turns exceeded 90k tokens, so prefer session-review/context-pack handles over raw transcript replay.",
+            "raw_excerpt": "Claude Code tsift sessions repeatedly spent about 62k to 160k cached input tokens per assistant turn before producing comparatively small outputs."
+          },
+          {
+            "kind": "cached_resend",
+            "severity": "warn",
+            "message": "cached input ratio above 97 percent indicates repeated context resend dominates cost.",
+            "raw_excerpt": "Long session summaries called out Claude at about 3.68M total tokens with 97.66 percent cached input and Codex at about 25.13M total tokens with 98.41 percent cached input."
+          },
+          {
+            "kind": "closeout_churn",
+            "severity": "info",
+            "message": "agent-doc closeout repeats preflight, finalize, session-check, and commit-already-current lines across cycles.",
+            "raw_excerpt": "The session logs contain repeated closeout and no-op commit records that should count once per cycle instead of inflating review output."
+          }
+        ],
+        "largest_turns": [
+          {
+            "source": "codex_jsonl",
+            "label": "rollout-2026-05-05T16-50-50",
+            "prompt_tokens": 245112,
+            "cached_input_tokens": 240917,
+            "output_tokens": 2716,
+            "raw_excerpt": "Large Codex turn dominated by cached context resend and command output from repo inspection, tests, install, git commit, push, and agent-doc finalization."
+          },
+          {
+            "source": "claude_jsonl",
+            "label": "fcf730fe-7580-494c-bbf8-b3175c90350a",
+            "prompt_tokens": 160648,
+            "cached_input_tokens": 156881,
+            "output_tokens": 4659,
+            "raw_excerpt": "Claude turn from a long tsift session with repeated active document, exchange tail, backlog, and verification output."
+          },
+          {
+            "source": "agent_doc_log",
+            "label": "tsift-v0.1 document_cycle",
+            "prompt_tokens": 94612,
+            "cached_input_tokens": 91204,
+            "output_tokens": 3211,
+            "raw_excerpt": "Agent-doc runtime cycle with preflight, plan, repo work, full suite verification, write-back commit, and post-commit session-check status."
+          }
+        ]
+      }
+    },
+    {
+      "name": "real-tsift-context-pack",
+      "surface": "context-pack",
+      "minimum_savings_percent": 70.0,
+      "raw_symbols": [
+        { "identifier": "context_pack_report", "file": "src/main.rs", "line": 7000, "context": "pack_report" },
+        { "identifier": "contextPackReport", "file": "src/context.ts", "line": 44, "context": "pack_report" },
+        { "identifier": "session_review_next_context", "file": "src/main.rs", "line": 6391, "context": "next_context" },
+        { "identifier": "sessionReviewNextContext", "file": "src/context.ts", "line": 58, "context": "next_context" },
+        { "identifier": "digest_runner_artifact", "file": "src/main.rs", "line": 1600, "context": "artifact_ref" },
+        { "identifier": "digestRunnerArtifact", "file": "src/context.ts", "line": 69, "context": "artifact_ref" }
+      ],
+      "tagpath_families": [
+        {
+          "canonical": "context_pack_report",
+          "count": 2,
+          "aliases": {
+            "snake_case": "context_pack_report",
+            "camelCase": "contextPackReport"
+          }
+        },
+        {
+          "canonical": "session_review_next_context",
+          "count": 2,
+          "aliases": {
+            "snake_case": "session_review_next_context",
+            "camelCase": "sessionReviewNextContext"
+          }
+        },
+        {
+          "canonical": "digest_runner_artifact",
+          "count": 2,
+          "aliases": {
+            "snake_case": "digest_runner_artifact",
+            "camelCase": "digestRunnerArtifact"
+          }
+        }
+      ],
+      "context_pack_inputs": {
+        "next_context": [
+          {
+            "prompt_target": "do [#real]. spec-test-build-install-commit-push",
+            "last_verification": {
+              "status": "pending",
+              "detail": "Spec, tests, build, install, commit, push, and agent-doc finalize remain in progress for the current managed cycle."
+            },
+            "touched_files": ["src/tsift/src/main.rs", "src/tsift/tests/exit_code.rs", "src/tsift/SPEC.md", "src/tsift/fixtures/real-session-token-savings.json"],
+            "touched_symbols": ["build_token_savings_report", "token_savings_session_review_envelope", "token_savings_context_pack_envelope", "build_context_pack_report"],
+            "symbol_refs": [
+              {
+                "handle": "sym-build-token-savings-report",
+                "name": "build_token_savings_report",
+                "file": "src/main.rs",
+                "line": 1550,
+                "tag_alias": "build/token/savings/report",
+                "summary_refs": [
+                  {
+                    "handle": "sum-build-token-savings-report",
+                    "path": ".tsift/summaries.db",
+                    "expand": "tsift summarize build_token_savings_report",
+                    "summary_preview": "Aggregates raw-vs-envelope byte counts, token estimates, threshold status, and totals for each fixture case."
+                  }
+                ],
+                "ontology_refs": [
+                  {
+                    "handle": "ont-session",
+                    "tag": "session",
+                    "path": ".naming/tags/session.md",
+                    "title": "Session",
+                    "domain": "agent-doc",
+                    "summary": "Long-form domain notes about compact session handoffs, prompt targets, verification state, and restart boundaries."
+                  }
+                ]
+              }
+            ],
+            "expand": "tsift session-review tasks/software/tsift.md --next-context --json"
+          },
+          {
+            "prompt_target": "do [#ctxp]. spec-test-build-install-commit-push",
+            "last_verification": {
+              "status": "passed",
+              "detail": "cargo test, cargo build --release, cargo install --path ., git commit, and git push completed."
+            },
+            "touched_files": ["src/tagpath/fixtures/tsift-token-savings.json", "src/tsift/src/main.rs", "src/tsift/tests/exit_code.rs"],
+            "touched_symbols": ["token_savings_context_pack_envelope", "ContextPackReport", "ContextPackDiffPreview"],
+            "expand": "tsift session-review tasks/software/tagpath.md --next-context --json"
+          }
+        ],
+        "diff": [
+          {
+            "path": "src/tsift/src/main.rs",
+            "status": "modified",
+            "symbols": ["TokenSavingsSessionReviewInputs", "token_savings_session_review_envelope", "build_token_savings_report"],
+            "summary_refs": [
+              {
+                "handle": "sum-main-token-savings",
+                "path": ".tsift/summaries.db",
+                "expand": "tsift summarize --file src/main.rs",
+                "summary_preview": "The main CLI owns token-savings fixture parsing, report aggregation, budgeted previews, and envelope printing."
+              }
+            ],
+            "raw_excerpt": "Diff digest would otherwise include the full struct definitions, helper functions, changed aggregation block, and test literal updates."
+          },
+          {
+            "path": "src/tsift/tests/exit_code.rs",
+            "status": "modified",
+            "symbols": ["token_savings_accepts_real_session_fixture"],
+            "summary_refs": [
+              {
+                "handle": "sum-exit-code-token-savings",
+                "path": ".tsift/summaries.db",
+                "expand": "tsift summarize --file tests/exit_code.rs",
+                "summary_preview": "Compiled binary tests execute real tsift CLI paths against fixtures and assert JSON contracts."
+              }
+            ],
+            "raw_excerpt": "The full integration diff includes fixture path setup, command invocation, status diagnostics, JSON parsing, surface assertions, and savings checks."
+          },
+          {
+            "path": "src/tsift/SPEC.md",
+            "status": "modified",
+            "symbols": ["token-savings", "session-review", "context-pack"],
+            "raw_excerpt": "Spec diff documents session_review_inputs, real-session fixture coverage, and the expectation that raw transcripts collapse into handles and expansion commands."
+          }
+        ],
+        "test": [
+          {
+            "runner": "cargo",
+            "command": "cargo test",
+            "signals": ["token_savings_accepts_real_session_fixture", "token_savings_accepts_tagpath_preview_fixture", "context_pack_json_composes_next_context_and_optional_digests"],
+            "artifact": {
+              "handle": "art-cargo-test-real-session-token-savings",
+              "path": ".tsift/artifacts/cargo-test-real-session-token-savings.log",
+              "expand": "tsift test-digest --path . --input .tsift/artifacts/cargo-test-real-session-token-savings.log"
+            },
+            "raw_excerpt": "The full cargo test log lists unit suites, integration tests, temporary fixtures, binary invocations, and elapsed time; context-pack should keep the digest behind an artifact handle."
+          },
+          {
+            "runner": "cargo",
+            "command": "cargo test token_savings_accepts_real_session_fixture --test exit_code",
+            "signals": ["real-session fixture", "session-review threshold", "context-pack threshold"],
+            "artifact": {
+              "handle": "art-targeted-real-session-token-savings",
+              "path": ".tsift/artifacts/targeted-real-session-token-savings.log",
+              "expand": "tsift test-digest --path . --input .tsift/artifacts/targeted-real-session-token-savings.log"
+            },
+            "raw_excerpt": "Targeted rerun verifies the new fixture before the full suite, but the handoff only needs success state and the expansion command."
+          }
+        ],
+        "log": [
+          {
+            "command": "cargo build --release",
+            "signals": ["build_token_savings_report", "TokenSavingsSessionReviewInputs", "TokenSavingsContextPackEnvelope"],
+            "artifact": {
+              "handle": "art-build-release-real-session-token-savings",
+              "path": ".tsift/artifacts/build-release-real-session-token-savings.log",
+              "expand": "tsift log-digest --path . --input .tsift/artifacts/build-release-real-session-token-savings.log"
+            },
+            "raw_excerpt": "Release build output contains dependency compilation, profile details, target paths, and elapsed timing that do not belong inline in a resume prompt."
+          },
+          {
+            "command": "cargo install --path .",
+            "signals": ["installed binary", "local testing"],
+            "artifact": {
+              "handle": "art-install-real-session-token-savings",
+              "path": ".tsift/artifacts/install-real-session-token-savings.log",
+              "expand": "tsift log-digest --path . --input .tsift/artifacts/install-real-session-token-savings.log"
+            },
+            "raw_excerpt": "Install output repeats package metadata, binary path, and compile status; compact context only needs the command and handle."
+          },
+          {
+            "command": "git push origin main",
+            "signals": ["commit pushed", "origin/main updated"],
+            "artifact": {
+              "handle": "art-push-real-session-token-savings",
+              "path": ".tsift/artifacts/push-real-session-token-savings.log",
+              "expand": "tsift log-digest --path . --input .tsift/artifacts/push-real-session-token-savings.log"
+            },
+            "raw_excerpt": "Push output can include object counts, compression details, remote refs, and commit hashes. The resumable context should retain a concise pushed-state row."
+          }
+        ]
+      }
+    }
+  ]
+}
