@@ -3605,6 +3605,43 @@ fn session_cost_summarizes_agent_doc_restart_churn_from_stdin() {
 }
 
 #[test]
+fn session_cost_does_not_warn_restart_loop_for_continue_restart_count() {
+    let input = concat!(
+        "[1776528398] codex_start mode=continue restart_count=1\n",
+        "[1776528450] codex_start mode=continue restart_count=3\n"
+    );
+
+    let mut child = tsift_bin()
+        .args(["session-cost", "--json", "--source", "agent-doc-log"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "session-cost should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["source"], "agent_doc_log");
+    assert_eq!(json["max_restart_count"], 3);
+    if let Some(guardrails) = json["guardrails"].as_array() {
+        assert!(
+            guardrails
+                .iter()
+                .all(|guardrail| guardrail["kind"] != "restart_loop")
+        );
+    }
+}
+
+#[test]
 fn session_digest_reads_codex_jsonl_from_stdin() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();

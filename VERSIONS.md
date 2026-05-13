@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- `session-cost` no longer emits `restart_loop` guardrails from `max_restart_count` alone; restart-loop warnings now require actual restart-churn families such as fresh restarts, auto-trigger timeouts, or ctrl-d restart loops, with max restart count kept as contextual detail.
 - Codex JSONL `session-digest` file-reference extraction now rejects shell redirection fragments and slash-separated conversational labels such as `agent-doc/tsift`, `digest/session`, `progress/CI-status`, and `version/preflight` unless they resolve to real files or carry recognized file names/extensions.
 - `tsift rewrite` now leaves file-listing commands such as `rg --files`, `rg --type-list`, and `find ...` on the no-rewrite passthrough path so listing roots and predicates are not misread as exact search patterns.
 - `session-digest` and `session-review` now filter assistant progress and assessment prose about failure-classification false positives, unresolved failure groups, and red/check CI-status commentary instead of reporting those meta lines as failures.

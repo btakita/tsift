@@ -405,7 +405,6 @@ pub fn derive_guardrails(input: &SessionCostGuardrailInput) -> Vec<SessionCostGu
     if restart_signal_count >= RESTART_LOOP_WARN_OCCURRENCES
         || input.ctrl_d_restart_loop_occurrences > 0
         || input.auto_trigger_timeout_occurrences > 0
-        || input.max_restart_count.is_some_and(|count| count >= 2)
     {
         let max_restart = input
             .max_restart_count
@@ -2119,6 +2118,20 @@ mod tests {
             guardrails
                 .iter()
                 .any(|guardrail| guardrail.kind == "cache_resend")
+        );
+    }
+
+    #[test]
+    fn derive_guardrails_ignores_restart_count_without_churn() {
+        let guardrails = derive_guardrails(&SessionCostGuardrailInput {
+            max_restart_count: Some(3),
+            ..SessionCostGuardrailInput::default()
+        });
+
+        assert!(
+            guardrails
+                .iter()
+                .all(|guardrail| guardrail.kind != "restart_loop")
         );
     }
 }
