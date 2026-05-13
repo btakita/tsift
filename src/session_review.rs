@@ -963,14 +963,12 @@ fn extract_codex_match_signals(text: &str) -> MatchSignals {
             continue;
         };
         match value.get("type").and_then(serde_json::Value::as_str) {
-            Some("session_meta") => {
-                if signals.cwd.is_none() {
-                    signals.cwd = value
-                        .get("payload")
-                        .and_then(|payload| payload.get("cwd"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(PathBuf::from);
-                }
+            Some("session_meta") if signals.cwd.is_none() => {
+                signals.cwd = value
+                    .get("payload")
+                    .and_then(|payload| payload.get("cwd"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(PathBuf::from);
             }
             Some("event_msg") => {
                 if let Some(payload) = value.get("payload")

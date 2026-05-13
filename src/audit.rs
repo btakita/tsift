@@ -395,7 +395,7 @@ pub fn generate_cleanup(audit: &mut AuditResult) {
         }
     }
 
-    entries.sort_by(|a, b| b.token_estimate.cmp(&a.token_estimate));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.token_estimate));
     audit.cleanup = Some(entries);
 }
 
