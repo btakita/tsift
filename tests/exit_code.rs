@@ -4304,7 +4304,7 @@ fn token_savings_accepts_real_session_fixture() {
     );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(json["pass"].as_bool().unwrap());
-    assert_eq!(json["totals"]["cases"], 2);
+    assert_eq!(json["totals"]["cases"], 3);
     assert_eq!(
         json["cases"]
             .as_array()
@@ -4312,7 +4312,18 @@ fn token_savings_accepts_real_session_fixture() {
             .iter()
             .map(|case| case["surface"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["session-review", "context-pack"]
+        vec!["session-review", "context-pack", "source-read"]
+    );
+    let source_read = json["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["surface"] == "source-read")
+        .expect("source-read fixture case should be present");
+    assert_eq!(source_read["status"], "pass");
+    assert!(
+        source_read["estimated_token_delta"].as_u64().unwrap() > 0,
+        "source-read fixture should prove bounded read savings"
     );
     assert!(
         json["cases"]

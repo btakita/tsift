@@ -1645,6 +1645,8 @@ struct TokenSavingsFixtureCase {
     session_review_inputs: Option<TokenSavingsSessionReviewInputs>,
     #[serde(default)]
     context_pack_inputs: Option<TokenSavingsContextPackInputs>,
+    #[serde(default)]
+    source_read_inputs: Option<TokenSavingsSourceReadInputs>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1683,6 +1685,23 @@ struct TokenSavingsContextPackInputs {
     log: Vec<serde_json::Value>,
 }
 
+#[derive(Deserialize, Serialize)]
+struct TokenSavingsSourceReadInputs {
+    reads: Vec<TokenSavingsSourceReadInput>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct TokenSavingsSourceReadInput {
+    command: String,
+    file: String,
+    raw_start: u64,
+    raw_lines: u64,
+    raw_excerpt: String,
+    envelope_start: u64,
+    envelope_lines: u64,
+    required_line_anchors: Vec<u64>,
+}
+
 #[derive(Serialize)]
 struct TokenSavingsEnvelopeFamily {
     handle: String,
@@ -1704,6 +1723,16 @@ struct TokenSavingsContextPackEnvelope<'a> {
     section: &'a str,
     handle: String,
     count: usize,
+    expand: String,
+}
+
+#[derive(Serialize)]
+struct TokenSavingsSourceReadEnvelope {
+    handle: String,
+    file: String,
+    start: u64,
+    lines: u64,
+    required_line_anchors: Vec<u64>,
     expand: String,
 }
 
@@ -1803,6 +1832,10 @@ fn token_savings_session_review_raw_bytes(
     Ok(serde_json::to_vec(inputs)?.len())
 }
 
+fn token_savings_source_read_raw_bytes(inputs: &TokenSavingsSourceReadInputs) -> Result<usize> {
+    Ok(serde_json::to_vec(&inputs.reads)?.len())
+}
+
 fn token_savings_session_review_envelope(
     case: &TokenSavingsFixtureCase,
     inputs: &TokenSavingsSessionReviewInputs,
@@ -1895,6 +1928,54 @@ fn token_savings_context_pack_envelope(
     rows
 }
 
+fn token_savings_source_read_envelope(
+    case: &TokenSavingsFixtureCase,
+    inputs: &TokenSavingsSourceReadInputs,
+) -> Result<Vec<TokenSavingsSourceReadEnvelope>> {
+    inputs
+        .reads
+        .iter()
+        .map(|read| {
+            if read.envelope_lines == 0 {
+                bail!(
+                    "source-read fixture {} has an empty envelope window for {}",
+                    case.name,
+                    read.command
+                );
+            }
+            let envelope_end = read
+                .envelope_start
+                .saturating_add(read.envelope_lines)
+                .saturating_sub(1);
+            for anchor in &read.required_line_anchors {
+                if *anchor < read.envelope_start || *anchor > envelope_end {
+                    bail!(
+                        "source-read fixture {} hides required line anchor {} for {} outside {}-{}",
+                        case.name,
+                        anchor,
+                        read.command,
+                        read.envelope_start,
+                        envelope_end
+                    );
+                }
+            }
+            Ok(TokenSavingsSourceReadEnvelope {
+                handle: stable_handle("tsrc", &format!("{}:{}", case.name, read.command)),
+                file: read.file.clone(),
+                start: read.envelope_start,
+                lines: read.envelope_lines,
+                required_line_anchors: read.required_line_anchors.clone(),
+                expand: format!(
+                    "tsift --envelope source-read {} --start {} --lines {} --budget normal",
+                    shell_quote(&read.file),
+                    read.envelope_start,
+                    read.envelope_lines
+                ),
+            })
+        })
+        .collect()
+}
+
 fn build_token_savings_report(fixture: &TokenSavingsFixture) -> Result<TokenSavingsReport> {
     let mut cases = Vec::new();
     let mut total_raw_bytes = 0;
@@ -1913,6 +1994,11 @@ fn build_token_savings_report(fixture: &TokenSavingsFixture) -> Result<TokenSavi
             raw_bytes += token_savings_context_pack_raw_bytes(inputs)?;
             envelope_bytes +=
                 serde_json::to_vec(&token_savings_context_pack_envelope(case, inputs))?.len();
+        }
+        if let Some(inputs) = &case.source_read_inputs {
+            raw_bytes += token_savings_source_read_raw_bytes(inputs)?;
+            envelope_bytes +=
+                serde_json::to_vec(&token_savings_source_read_envelope(case, inputs)?)?.len();
         }
         let byte_delta = raw_bytes.saturating_sub(envelope_bytes);
         let raw_estimated_tokens = estimated_tokens_from_bytes(raw_bytes);
@@ -15282,6 +15368,7 @@ tier = "private"
                 ],
                 context_pack_inputs: None,
                 session_review_inputs: None,
+                source_read_inputs: None,
             }],
         };
 
@@ -15294,6 +15381,79 @@ tier = "private"
         assert!(report.cases[0].byte_delta > 0);
         assert!(report.cases[0].raw_estimated_tokens > report.cases[0].envelope_estimated_tokens);
         assert!(report.cases[0].savings_percent >= 40.0);
+    }
+
+    #[test]
+    fn token_savings_source_read_inputs_preserve_required_anchors() {
+        let fixture = TokenSavingsFixture {
+            schema_version: 1,
+            description: "fixture".to_string(),
+            token_estimate: "ceil(utf8_bytes / 4)".to_string(),
+            cases: vec![TokenSavingsFixtureCase {
+                name: "source-read".to_string(),
+                surface: "source-read".to_string(),
+                minimum_savings_percent: 40.0,
+                raw_symbols: Vec::new(),
+                tagpath_families: Vec::new(),
+                context_pack_inputs: None,
+                session_review_inputs: None,
+                source_read_inputs: Some(TokenSavingsSourceReadInputs {
+                    reads: vec![TokenSavingsSourceReadInput {
+                        command: "sed -n '40,160p' src/main.rs".to_string(),
+                        file: "src/main.rs".to_string(),
+                        raw_start: 40,
+                        raw_lines: 121,
+                        raw_excerpt: "line 40\n".repeat(121),
+                        envelope_start: 40,
+                        envelope_lines: 121,
+                        required_line_anchors: vec![40, 120, 160],
+                    }],
+                }),
+            }],
+        };
+
+        let report = build_token_savings_report(&fixture).unwrap();
+
+        assert!(report.pass);
+        assert_eq!(report.cases[0].surface, "source-read");
+        assert!(report.cases[0].savings_percent >= 40.0);
+    }
+
+    #[test]
+    fn token_savings_source_read_inputs_fail_when_anchor_is_hidden() {
+        let fixture = TokenSavingsFixture {
+            schema_version: 1,
+            description: "fixture".to_string(),
+            token_estimate: "ceil(utf8_bytes / 4)".to_string(),
+            cases: vec![TokenSavingsFixtureCase {
+                name: "source-read".to_string(),
+                surface: "source-read".to_string(),
+                minimum_savings_percent: 40.0,
+                raw_symbols: Vec::new(),
+                tagpath_families: Vec::new(),
+                context_pack_inputs: None,
+                session_review_inputs: None,
+                source_read_inputs: Some(TokenSavingsSourceReadInputs {
+                    reads: vec![TokenSavingsSourceReadInput {
+                        command: "cat src/main.rs".to_string(),
+                        file: "src/main.rs".to_string(),
+                        raw_start: 1,
+                        raw_lines: 200,
+                        raw_excerpt: "line\n".repeat(200),
+                        envelope_start: 1,
+                        envelope_lines: 80,
+                        required_line_anchors: vec![120],
+                    }],
+                }),
+            }],
+        };
+
+        let err = match build_token_savings_report(&fixture) {
+            Ok(_) => panic!("hidden anchor should fail the source-read fixture"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("hides required line anchor 120"));
     }
 
     #[test]

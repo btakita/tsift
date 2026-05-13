@@ -376,6 +376,67 @@
           }
         ]
       }
+    },
+    {
+      "name": "real-tsift-source-read-rewrites",
+      "surface": "source-read",
+      "minimum_savings_percent": 70.0,
+      "raw_symbols": [],
+      "tagpath_families": [],
+      "source_read_inputs": {
+        "reads": [
+          {
+            "command": "cat src/main.rs",
+            "file": "src/main.rs",
+            "raw_start": 1,
+            "raw_lines": 520,
+            "raw_excerpt": "Full-file cat replay from a long tsift turn: lines 1-80 define CLI parsing, imports, Commands variants, OutputFormat routing, and envelope defaults. Lines 81-220 continue through workflow, search, explain, source-read, token-savings, and digest subcommands. Lines 221-360 include budget parsing, command dispatch, JSON/envelope printing, and error handling. Lines 361-520 continue into helper structs and report builders. The raw transcript repeated this body during inspection, then repeated it again after tests and closeout commentary even though the follow-up only needed the first bounded source-read window plus explicit expansion handles for later lines.",
+            "envelope_start": 1,
+            "envelope_lines": 80,
+            "required_line_anchors": [1, 44, 80]
+          },
+          {
+            "command": "bat src/session_cost.rs",
+            "file": "src/session_cost.rs",
+            "raw_start": 1,
+            "raw_lines": 480,
+            "raw_excerpt": "Full-file bat replay with decoration removed for measurement: the session-cost parser starts with transcript event structs, token usage rows, read diagnostics, and guardrail aggregation. The middle of the file walks Claude native Read blocks, Codex shell commands, sed/head/tail windows, duplicate-token estimates, and source-read follow-up command construction. The raw session also carried syntax-highlighted path gutters and repeated nearby assertions. A compact source-read envelope only needs the opening line anchors for the parser definitions and can defer the rest to targeted source-read or summarize commands.",
+            "envelope_start": 1,
+            "envelope_lines": 80,
+            "required_line_anchors": [3, 51, 80]
+          },
+          {
+            "command": "sed -n '40,160p' src/session_review.rs",
+            "file": "src/session_review.rs",
+            "raw_start": 40,
+            "raw_lines": 121,
+            "raw_excerpt": "Oversized sed replay from lines 40-160: the raw output included session matching structs, document alias handling, aggregate token fields, repeated file-read summaries, and next-context scaffolding. The user-visible work only required anchors around line 40 where the report rows begin, line 84 where repeated source-read diagnostics are carried forward, and line 160 where the next-context fields resume. Keeping the exact requested sed range as one bounded source-read window preserves every referenced anchor without dumping unrelated earlier or later file content.",
+            "envelope_start": 40,
+            "envelope_lines": 121,
+            "required_line_anchors": [40, 84, 160]
+          },
+          {
+            "command": "head -n 150 src/main.rs",
+            "file": "src/main.rs",
+            "raw_start": 1,
+            "raw_lines": 150,
+            "raw_excerpt": "Oversized head replay for src/main.rs: lines 1-150 included imports, global flags, command enums, the SourceRead command, TokenSavings command arguments, and several unrelated CLI variants. The compact rewrite preserves the from-start anchor because line 1 proves the module imports, line 120 anchors the relevant command option block, and line 150 closes the inspected enum region. The source-read window is still explicit and resumable, but it avoids treating a generic head command as an instruction to keep replaying the same opening block in every prompt.",
+            "envelope_start": 1,
+            "envelope_lines": 150,
+            "required_line_anchors": [1, 120, 150]
+          },
+          {
+            "command": "tail -n 120 src/main.rs",
+            "file": "src/main.rs",
+            "raw_start": 401,
+            "raw_lines": 120,
+            "raw_excerpt": "Oversized tail replay for a 520-line inspected slice: the raw transcript carried the final 120 lines, including fixture tests, rewrite assertions, helper construction, and closing braces. The important anchors were the first line of the tail window, the assertion block around line 460, and the final line 520 used to verify the caller was reading the actual end of the slice. The bounded source-read envelope preserves the tail-derived start at 401 and the 120-line span, so those anchors remain visible while the command becomes a structured, expandable row.",
+            "envelope_start": 401,
+            "envelope_lines": 120,
+            "required_line_anchors": [401, 460, 520]
+          }
+        ]
+      }
     }
   ]
 }
