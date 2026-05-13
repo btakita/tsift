@@ -4756,11 +4756,6 @@ fn session_review_separates_aggregate_and_latest_session_cost() {
     fs::create_dir_all(&codex_dir).unwrap();
     let root_text = root.path().display().to_string();
     fs::write(
-        codex_dir.join("bb-older-high-cache.jsonl"),
-        codex_transcript(&root_text, &[1_000_000]),
-    )
-    .unwrap();
-    fs::write(
         codex_dir.join("aa-latest-lower-cost.jsonl"),
         codex_transcript(
             &root_text,
@@ -4770,6 +4765,15 @@ fn session_review_separates_aggregate_and_latest_session_cost() {
         ),
     )
     .unwrap();
+    let mut older_turns = vec![186_897; 305];
+    older_turns.push(93_427);
+    for (index, chunk) in older_turns.chunks(28).enumerate() {
+        fs::write(
+            codex_dir.join(format!("bb-older-high-cache-{index:02}.jsonl")),
+            codex_transcript(&root_text, chunk),
+        )
+        .unwrap();
+    }
 
     let output = tsift_bin()
         .args(["session-review", "--json", target.to_str().unwrap()])
@@ -4779,17 +4783,16 @@ fn session_review_separates_aggregate_and_latest_session_cost() {
 
     assert!(output.status.success(), "session-review should succeed");
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["sessions_matched"], 2);
+    assert_eq!(json["sessions_matched"], 12);
     assert_eq!(json["aggregate_cost"]["scope"], "bounded_matched_sessions");
-    assert_eq!(json["aggregate_cost"]["total_tokens"], 1_518_391);
-    assert_eq!(
-        json["aggregate_cost"]["largest_turn_total_tokens"],
-        1_000_000
-    );
+    assert_eq!(json["aggregate_cost"]["sessions"], 12);
+    assert_eq!(json["aggregate_cost"]["total_tokens"], 57_615_403);
+    assert_eq!(json["aggregate_cost"]["largest_turn_total_tokens"], 186_897);
     assert_eq!(
         json["latest_session_cost"]["scope"],
         "latest_matched_session"
     );
+    assert_eq!(json["latest_session_cost"]["sessions"], 1);
     assert_eq!(json["latest_session_cost"]["total_tokens"], 518_391);
     assert_eq!(
         json["latest_session_cost"]["largest_turn_total_tokens"],
