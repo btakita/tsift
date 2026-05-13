@@ -9,12 +9,15 @@ const MAX_LARGEST_TURNS: usize = 5;
 const MAX_RUNTIME_EVENTS: usize = 8;
 const MAX_GUARDRAILS: usize = 8;
 const MAX_LOOP_CLUSTERS: usize = 8;
+const MAX_FILE_READ_DIAGNOSTICS: usize = 8;
 const MAX_COMMANDS_PER_BUNDLE: usize = 6;
 const PROMPT_BUDGET_WARN_TOKENS: u64 = 100_000;
 const CACHED_RATIO_WARN_PERCENT: f64 = 90.0;
 const CACHED_RATIO_WARN_PROMPT_TOKENS: u64 = 50_000;
 const RESTART_LOOP_WARN_OCCURRENCES: usize = 3;
 const NOOP_CLOSEOUT_WARN_OCCURRENCES: usize = 3;
+const DEFAULT_FULL_FILE_READ_TOKENS: u64 = 4_000;
+const ESTIMATED_TOKENS_PER_SOURCE_LINE: u64 = 18;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +81,16 @@ pub struct SessionCostLoopCluster {
     pub max_consecutive: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCostFileReadDiagnostic {
+    pub path: String,
+    pub range: String,
+    pub occurrences: usize,
+    pub estimated_tokens: u64,
+    pub duplicate_estimated_tokens: u64,
+    pub follow_up_commands: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionCostGuardrailInput {
     pub largest_prompt_turn_tokens: u64,
@@ -114,6 +127,8 @@ pub struct SessionCostReport {
     pub runtime_events: Vec<SessionCostRuntimeEvent>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub loop_clusters: Vec<SessionCostLoopCluster>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub file_read_diagnostics: Vec<SessionCostFileReadDiagnostic>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub restart_churn: Vec<RestartChurnSummary>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -171,12 +186,22 @@ struct CostState {
     restart_churn: RestartChurnState,
     pending_commands: Vec<String>,
     loop_signals: Vec<LoopSignal>,
+    file_read_signals: Vec<FileReadSignal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct LoopSignal {
     kind: LoopClusterKind,
     label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileReadSignal {
+    path: String,
+    range: String,
+    start: Option<usize>,
+    lines: Option<usize>,
+    estimated_tokens: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -256,6 +281,7 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
         .unwrap_or(0);
     flush_pending_commands(&mut state);
     let loop_clusters = collect_loop_clusters(&state.loop_signals);
+    let file_read_diagnostics = collect_file_read_diagnostics(&state.file_read_signals);
 
     let mut largest_turns = state.usage_turns;
     largest_turns.sort_by(|left, right| {
@@ -325,6 +351,7 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
         largest_turns,
         runtime_events,
         loop_clusters,
+        file_read_diagnostics,
         restart_churn,
         guardrails,
         warnings: state.warnings,
@@ -761,6 +788,9 @@ fn collect_codex_event_msg_loop_signals(value: &Value, _line_number: usize, stat
             }
         }
         Some("exec_command_end") => {
+            if let Some(command) = extract_raw_codex_exec_command(payload) {
+                collect_file_read_command_signals(&command, state);
+            }
             if let Some(command) = extract_codex_exec_command(payload) {
                 push_command(command, state);
             }
@@ -777,12 +807,364 @@ fn collect_codex_event_msg_loop_signals(value: &Value, _line_number: usize, stat
 }
 
 fn collect_tool_use_loop_signals(name: &str, input: &Value, state: &mut CostState) {
+    collect_file_read_tool_signals(name, input, state);
+    if let Some(command) = extract_raw_tool_command(name, input) {
+        collect_file_read_command_signals(&command, state);
+    }
     if let Some(command) = extract_tool_command(name, input) {
         push_command(command, state);
     }
     if let Some(text) = extract_tool_text(input) {
         collect_text_loop_signals(&text, false, state);
     }
+}
+
+fn collect_file_read_tool_signals(name: &str, input: &Value, state: &mut CostState) {
+    let lower = name.to_ascii_lowercase();
+    if !matches!(lower.as_str(), "read" | "file_read" | "read_file") {
+        return;
+    }
+    let Value::Object(map) = input else {
+        return;
+    };
+    let Some(path) = ["file_path", "path"]
+        .iter()
+        .find_map(|key| map.get(*key).and_then(Value::as_str))
+        .map(normalize_file_read_path)
+        .filter(|path| !path.is_empty())
+    else {
+        return;
+    };
+    let start = ["offset", "start", "line"]
+        .iter()
+        .find_map(|key| map.get(*key).and_then(Value::as_u64))
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0);
+    let lines = ["limit", "lines", "line_count"]
+        .iter()
+        .find_map(|key| map.get(*key).and_then(Value::as_u64))
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0);
+    push_file_read_signal(path, start, lines, state);
+}
+
+fn collect_file_read_command_signals(command: &str, state: &mut CostState) {
+    if let Some(signal) = parse_file_read_command(command) {
+        state.file_read_signals.push(signal);
+    }
+}
+
+fn parse_file_read_command(command: &str) -> Option<FileReadSignal> {
+    let tokens = shell_words(command);
+    let head = tokens.first()?.as_str();
+    match head {
+        "cat" | "bat" | "batcat" | "nl" => {
+            let path = first_non_option_arg(&tokens[1..])?;
+            Some(file_read_signal(
+                normalize_file_read_path(path),
+                "full".to_string(),
+                None,
+                None,
+            ))
+        }
+        "sed" => parse_sed_file_read(&tokens),
+        "head" => parse_head_file_read(&tokens),
+        "tail" => parse_tail_file_read(&tokens),
+        _ => None,
+    }
+}
+
+fn parse_sed_file_read(tokens: &[String]) -> Option<FileReadSignal> {
+    let mut expr = None::<String>;
+    let mut path = None::<String>;
+    let mut skip_next = false;
+    for token in tokens.iter().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if token == "-n" {
+            continue;
+        }
+        if token == "-e" {
+            skip_next = true;
+            continue;
+        }
+        if expr.is_none() && parse_sed_range(token).is_some() {
+            expr = Some(token.clone());
+            continue;
+        }
+        if !token.starts_with('-') {
+            path = Some(token.clone());
+        }
+    }
+    let expr = expr?;
+    let path = path?;
+    let (start, lines) = parse_sed_range(&expr)?;
+    Some(file_read_signal(
+        normalize_file_read_path(&path),
+        format!("{}-{}", start, start + lines - 1),
+        Some(start),
+        Some(lines),
+    ))
+}
+
+fn parse_sed_range(expr: &str) -> Option<(usize, usize)> {
+    let trimmed = expr.trim_matches(['\'', '"']).trim();
+    let body = trimmed.strip_suffix('p')?;
+    let (start_raw, end_raw) = body.split_once(',')?;
+    let start = start_raw.trim().parse::<usize>().ok()?;
+    let lines = if let Some(relative) = end_raw.trim().strip_prefix('+') {
+        relative.trim().parse::<usize>().ok()?.saturating_add(1)
+    } else {
+        let end = end_raw.trim().parse::<usize>().ok()?;
+        end.checked_sub(start)?.saturating_add(1)
+    };
+    (lines > 0).then_some((start, lines))
+}
+
+fn parse_head_file_read(tokens: &[String]) -> Option<FileReadSignal> {
+    let mut lines = 10_usize;
+    let mut path = None::<String>;
+    let mut index = 1_usize;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if token == "-n" || token == "--lines" {
+            index += 1;
+            lines = tokens.get(index)?.parse::<usize>().ok()?;
+        } else if let Some(value) = token.strip_prefix("-n") {
+            lines = value.parse::<usize>().ok()?;
+        } else if token.starts_with('-') && token[1..].chars().all(|ch| ch.is_ascii_digit()) {
+            lines = token[1..].parse::<usize>().ok()?;
+        } else if !token.starts_with('-') {
+            path = Some(token.clone());
+        }
+        index += 1;
+    }
+    let path = path?;
+    Some(file_read_signal(
+        normalize_file_read_path(&path),
+        format!("head:{lines}"),
+        Some(1),
+        Some(lines),
+    ))
+}
+
+fn parse_tail_file_read(tokens: &[String]) -> Option<FileReadSignal> {
+    let mut lines = 10_usize;
+    let mut path = None::<String>;
+    let mut index = 1_usize;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if token == "-n" || token == "--lines" {
+            index += 1;
+            lines = tokens.get(index)?.parse::<usize>().ok()?;
+        } else if let Some(value) = token.strip_prefix("-n") {
+            lines = value.trim_start_matches('+').parse::<usize>().ok()?;
+        } else if token.starts_with('-') && token[1..].chars().all(|ch| ch.is_ascii_digit()) {
+            lines = token[1..].parse::<usize>().ok()?;
+        } else if !token.starts_with('-') {
+            path = Some(token.clone());
+        }
+        index += 1;
+    }
+    let path = path?;
+    Some(file_read_signal(
+        normalize_file_read_path(&path),
+        format!("tail:{lines}"),
+        None,
+        Some(lines),
+    ))
+}
+
+fn first_non_option_arg(tokens: &[String]) -> Option<&str> {
+    tokens
+        .iter()
+        .find(|token| !token.starts_with('-'))
+        .map(String::as_str)
+}
+
+fn push_file_read_signal(
+    path: String,
+    start: Option<usize>,
+    lines: Option<usize>,
+    state: &mut CostState,
+) {
+    let range = match (start, lines) {
+        (Some(start), Some(lines)) => format!("{}-{}", start, start + lines - 1),
+        (Some(start), None) => format!("{start}-end"),
+        (None, Some(lines)) => format!("window:{lines}"),
+        (None, None) => "full".to_string(),
+    };
+    state
+        .file_read_signals
+        .push(file_read_signal(path, range, start, lines));
+}
+
+fn file_read_signal(
+    path: String,
+    range: String,
+    start: Option<usize>,
+    lines: Option<usize>,
+) -> FileReadSignal {
+    FileReadSignal {
+        path,
+        range,
+        start,
+        lines,
+        estimated_tokens: estimate_file_read_tokens(lines),
+    }
+}
+
+fn estimate_file_read_tokens(lines: Option<usize>) -> u64 {
+    lines
+        .map(|lines| (lines as u64).saturating_mul(ESTIMATED_TOKENS_PER_SOURCE_LINE))
+        .unwrap_or(DEFAULT_FULL_FILE_READ_TOKENS)
+        .max(80)
+}
+
+fn collect_file_read_diagnostics(signals: &[FileReadSignal]) -> Vec<SessionCostFileReadDiagnostic> {
+    let mut grouped = BTreeMap::<(String, String), FileReadDiagnosticBuilder>::new();
+    for signal in signals {
+        let entry = grouped
+            .entry((signal.path.clone(), signal.range.clone()))
+            .or_insert_with(|| FileReadDiagnosticBuilder {
+                path: signal.path.clone(),
+                range: signal.range.clone(),
+                start: signal.start,
+                lines: signal.lines,
+                occurrences: 0,
+                estimated_tokens: 0,
+                max_single_read_tokens: 0,
+            });
+        entry.occurrences += 1;
+        entry.estimated_tokens = entry
+            .estimated_tokens
+            .saturating_add(signal.estimated_tokens);
+        entry.max_single_read_tokens = entry.max_single_read_tokens.max(signal.estimated_tokens);
+        entry.start = entry.start.or(signal.start);
+        entry.lines = entry.lines.or(signal.lines);
+    }
+
+    let mut diagnostics = grouped
+        .into_values()
+        .filter(|entry| entry.occurrences >= 2)
+        .map(|entry| {
+            let duplicate_estimated_tokens = entry
+                .estimated_tokens
+                .saturating_sub(entry.max_single_read_tokens);
+            SessionCostFileReadDiagnostic {
+                path: entry.path.clone(),
+                range: entry.range.clone(),
+                occurrences: entry.occurrences,
+                estimated_tokens: entry.estimated_tokens,
+                duplicate_estimated_tokens,
+                follow_up_commands: file_read_follow_up_commands(
+                    &entry.path,
+                    entry.start,
+                    entry.lines,
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    diagnostics.sort_by(|left, right| {
+        right
+            .duplicate_estimated_tokens
+            .cmp(&left.duplicate_estimated_tokens)
+            .then(right.occurrences.cmp(&left.occurrences))
+            .then(left.path.cmp(&right.path))
+            .then(left.range.cmp(&right.range))
+    });
+    diagnostics.truncate(MAX_FILE_READ_DIAGNOSTICS);
+    diagnostics
+}
+
+#[derive(Debug)]
+struct FileReadDiagnosticBuilder {
+    path: String,
+    range: String,
+    start: Option<usize>,
+    lines: Option<usize>,
+    occurrences: usize,
+    estimated_tokens: u64,
+    max_single_read_tokens: u64,
+}
+
+fn file_read_follow_up_commands(
+    path: &str,
+    start: Option<usize>,
+    lines: Option<usize>,
+) -> Vec<String> {
+    let start = start.unwrap_or(1);
+    let lines = lines.unwrap_or(120).max(1);
+    vec![
+        format!(
+            "tsift source-read {} --start {} --lines {} --budget normal",
+            shell_quote(path),
+            start,
+            lines
+        ),
+        format!("tsift summarize --file {}", shell_quote(path)),
+    ]
+}
+
+fn normalize_file_read_path(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(['\'', '"'])
+        .trim_start_matches("./")
+        .to_string()
+}
+
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None::<char>;
+    let mut escaped = false;
+
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(quote_ch) = quote {
+            if ch == quote_ch {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':'))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn collect_text_loop_signals(text: &str, user_bias: bool, state: &mut CostState) {
@@ -986,6 +1368,11 @@ fn collect_content_block(role: Option<String>, value: &Value, out: &mut Vec<Tran
 }
 
 fn extract_tool_command(name: &str, input: &Value) -> Option<String> {
+    let normalized = extract_raw_tool_command(name, input)?;
+    looks_like_command(&normalized).then_some(normalized)
+}
+
+fn extract_raw_tool_command(name: &str, input: &Value) -> Option<String> {
     if !matches!(
         name.to_ascii_lowercase().as_str(),
         "bash" | "exec_command" | "shell" | "terminal" | "sh"
@@ -998,7 +1385,7 @@ fn extract_tool_command(name: &str, input: &Value) -> Option<String> {
             for key in ["command", "cmd", "shell_command"] {
                 if let Some(raw) = map.get(key).and_then(Value::as_str) {
                     let normalized = normalize_whitespace(raw);
-                    if looks_like_command(&normalized) {
+                    if !normalized.is_empty() {
                         return Some(normalized);
                     }
                 }
@@ -1007,7 +1394,7 @@ fn extract_tool_command(name: &str, input: &Value) -> Option<String> {
         }
         Value::String(raw) => {
             let normalized = normalize_whitespace(raw);
-            looks_like_command(&normalized).then_some(normalized)
+            (!normalized.is_empty()).then_some(normalized)
         }
         _ => None,
     }
@@ -1029,11 +1416,16 @@ fn extract_tool_text(input: &Value) -> Option<String> {
 }
 
 fn extract_codex_exec_command(payload: &Value) -> Option<String> {
+    let normalized = extract_raw_codex_exec_command(payload)?;
+    looks_like_command(&normalized).then_some(normalized)
+}
+
+fn extract_raw_codex_exec_command(payload: &Value) -> Option<String> {
     if let Some(parsed) = payload.get("parsed_cmd").and_then(Value::as_array) {
         for item in parsed {
             if let Some(command) = item.get("cmd").and_then(Value::as_str) {
                 let normalized = normalize_whitespace(command);
-                if looks_like_command(&normalized) {
+                if !normalized.is_empty() {
                     return Some(normalized);
                 }
             }
@@ -1044,7 +1436,7 @@ fn extract_codex_exec_command(payload: &Value) -> Option<String> {
         && let Some(last) = command.last().and_then(Value::as_str)
     {
         let normalized = normalize_whitespace(last);
-        if looks_like_command(&normalized) {
+        if !normalized.is_empty() {
             return Some(normalized);
         }
     }
@@ -1640,6 +2032,63 @@ mod tests {
                     .label
                     .contains("Committed and pushed in `src/tsift`")
                 && cluster.occurrences == 2
+        }));
+    }
+
+    #[test]
+    fn codex_jsonl_surfaces_repeated_file_read_diagnostics() {
+        let input = concat!(
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"sed -n '1,220p' src/session_cost.rs\"}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"sed -n '1,220p' src/session_cost.rs\"}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cat src/main.rs\"}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cat src/main.rs\"}"}}"#,
+            "\n"
+        );
+
+        let report = compute(input, Some("codex-jsonl")).unwrap();
+
+        assert!(report.file_read_diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "src/session_cost.rs"
+                && diagnostic.range == "1-220"
+                && diagnostic.occurrences == 2
+                && diagnostic.duplicate_estimated_tokens == 3_960
+                && diagnostic.follow_up_commands.iter().any(|command| {
+                    command == "tsift source-read src/session_cost.rs --start 1 --lines 220 --budget normal"
+                })
+        }));
+        assert!(report.file_read_diagnostics.iter().any(|diagnostic| {
+            diagnostic.path == "src/main.rs"
+                && diagnostic.range == "full"
+                && diagnostic.duplicate_estimated_tokens == 4_000
+                && diagnostic
+                    .follow_up_commands
+                    .iter()
+                    .any(|command| command == "tsift summarize --file src/main.rs")
+        }));
+    }
+
+    #[test]
+    fn claude_jsonl_surfaces_repeated_native_read_tool_diagnostics() {
+        let input = concat!(
+            r#"{"message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"src/lib.rs","offset":40,"limit":80}}]}}"#,
+            "\n",
+            r#"{"message":{"role":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"src/lib.rs","offset":40,"limit":80}}]}}"#,
+            "\n"
+        );
+
+        let report = compute(input, Some("claude-jsonl")).unwrap();
+
+        assert_eq!(report.file_read_diagnostics.len(), 1);
+        let diagnostic = &report.file_read_diagnostics[0];
+        assert_eq!(diagnostic.path, "src/lib.rs");
+        assert_eq!(diagnostic.range, "40-119");
+        assert_eq!(diagnostic.occurrences, 2);
+        assert_eq!(diagnostic.duplicate_estimated_tokens, 1_440);
+        assert!(diagnostic.follow_up_commands.iter().any(|command| {
+            command == "tsift source-read src/lib.rs --start 40 --lines 80 --budget normal"
         }));
     }
 

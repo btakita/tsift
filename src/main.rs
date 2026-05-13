@@ -6382,7 +6382,7 @@ fn cmd_session_cost(
             .map(|value| format!("{value:.2}%"))
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "session-cost src:{} samples:{} prompt:{} cached:{} cache_ratio:{} output:{} total:{} runtime:{} churn:{} loops:{}",
+            "session-cost src:{} samples:{} prompt:{} cached:{} cache_ratio:{} output:{} total:{} runtime:{} churn:{} loops:{} file_reads:{}",
             report.source,
             report.usage_samples,
             format_compact_count(report.prompt_tokens),
@@ -6392,7 +6392,8 @@ fn cmd_session_cost(
             format_compact_count(report.total_tokens),
             report.total_runtime_events,
             report.restart_churn_groups,
-            report.loop_clusters.len()
+            report.loop_clusters.len(),
+            report.file_read_diagnostics.len()
         );
         for turn in &report.largest_turns {
             println!(
@@ -6427,6 +6428,21 @@ fn cmd_session_cost(
                 cluster.occurrences,
                 cluster.max_consecutive,
                 truncate_for_compact(&cluster.label, 100)
+            );
+        }
+        for diagnostic in &report.file_read_diagnostics {
+            println!(
+                "file-read count:{} duplicate_tokens:{} range:{} path:{} follow_up:{}",
+                diagnostic.occurrences,
+                format_compact_count(diagnostic.duplicate_estimated_tokens),
+                diagnostic.range,
+                truncate_for_compact(&diagnostic.path, 80),
+                diagnostic
+                    .follow_up_commands
+                    .iter()
+                    .map(|command| truncate_for_compact(command, 100))
+                    .collect::<Vec<_>>()
+                    .join(" || ")
             );
         }
         for guardrail in &report.guardrails {
@@ -6469,6 +6485,10 @@ fn cmd_session_cost(
     println!("  runtime groups:         {}", report.runtime_event_groups);
     println!("  restart churn groups:   {}", report.restart_churn_groups);
     println!("  loop clusters:          {}", report.loop_clusters.len());
+    println!(
+        "  repeated file reads:    {}",
+        report.file_read_diagnostics.len()
+    );
     if let Some(max_restart_count) = report.max_restart_count {
         println!("  max restart count:      {}", max_restart_count);
     }
@@ -6522,6 +6542,23 @@ fn cmd_session_cost(
                 "  - [{}] {} ({}) max_consecutive={}",
                 cluster.kind, cluster.label, cluster.occurrences, cluster.max_consecutive
             );
+        }
+    }
+
+    if !report.file_read_diagnostics.is_empty() {
+        println!();
+        println!("Repeated file reads:");
+        for diagnostic in &report.file_read_diagnostics {
+            println!(
+                "  - {} {} ({}) duplicate tokens ~{}",
+                diagnostic.path,
+                diagnostic.range,
+                diagnostic.occurrences,
+                diagnostic.duplicate_estimated_tokens
+            );
+            for command in &diagnostic.follow_up_commands {
+                println!("    follow-up: {command}");
+            }
         }
     }
 
@@ -6736,6 +6773,7 @@ fn cmd_session_review_with_budget(
                     envelope_metric("sessions", report.sessions_matched),
                     envelope_metric("prompt_targets", report.prompt_target_count),
                     envelope_metric("failures", report.failure_groups),
+                    envelope_metric("file_reads", report.file_read_diagnostics.len()),
                     envelope_metric("total_tokens", report.total_tokens),
                 ],
             },
@@ -6751,7 +6789,7 @@ fn cmd_session_review_with_budget(
             .map(|value| format!("{value:.2}%"))
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "session-review target:{} kind:{} matched:{} claude:{} codex:{} agent_doc:{} prompt:{} cached:{} cache_ratio:{} output:{} total:{} loops:{}",
+            "session-review target:{} kind:{} matched:{} claude:{} codex:{} agent_doc:{} prompt:{} cached:{} cache_ratio:{} output:{} total:{} loops:{} file_reads:{}",
             report.target,
             report.target_kind,
             report.sessions_matched,
@@ -6763,7 +6801,8 @@ fn cmd_session_review_with_budget(
             cache_ratio,
             format_compact_count(report.output_tokens),
             format_compact_count(report.total_tokens),
-            report.loop_clusters.len()
+            report.loop_clusters.len(),
+            report.file_read_diagnostics.len()
         );
         for session in &report.sessions {
             println!(
@@ -6810,6 +6849,21 @@ fn cmd_session_review_with_budget(
                 truncate_for_compact(&cluster.label, 100)
             );
         }
+        for diagnostic in &report.file_read_diagnostics {
+            println!(
+                "file-read count:{} duplicate_tokens:{} range:{} path:{} follow_up:{}",
+                diagnostic.occurrences,
+                format_compact_count(diagnostic.duplicate_estimated_tokens),
+                diagnostic.range,
+                truncate_for_compact(&diagnostic.path, 80),
+                diagnostic
+                    .follow_up_commands
+                    .iter()
+                    .map(|command| truncate_for_compact(command, 100))
+                    .collect::<Vec<_>>()
+                    .join(" || ")
+            );
+        }
         for guardrail in &report.guardrails {
             println!(
                 "guardrail {} {} {}",
@@ -6841,6 +6895,10 @@ fn cmd_session_review_with_budget(
     println!("  restart churn:          {}", report.restart_churn_groups);
     println!("  closeout:               {}", report.closeout_groups);
     println!("  loop clusters:          {}", report.loop_clusters.len());
+    println!(
+        "  repeated file reads:    {}",
+        report.file_read_diagnostics.len()
+    );
     println!("  usage samples:          {}", report.usage_samples);
     println!("  prompt tokens:          {}", report.prompt_tokens);
     println!("  cached input tokens:    {}", report.cached_input_tokens);
@@ -6953,6 +7011,23 @@ fn cmd_session_review_with_budget(
                 "  - [{}] {} ({}) max_consecutive={}",
                 cluster.kind, cluster.label, cluster.occurrences, cluster.max_consecutive
             );
+        }
+    }
+
+    if !report.file_read_diagnostics.is_empty() {
+        println!();
+        println!("Repeated file reads:");
+        for diagnostic in &report.file_read_diagnostics {
+            println!(
+                "  - {} {} ({}) duplicate tokens ~{}",
+                diagnostic.path,
+                diagnostic.range,
+                diagnostic.occurrences,
+                diagnostic.duplicate_estimated_tokens
+            );
+            for command in &diagnostic.follow_up_commands {
+                println!("    follow-up: {command}");
+            }
         }
     }
 
@@ -15374,6 +15449,7 @@ tier = "private"
             largest_turn_total_tokens: 240,
             guardrails: vec![],
             loop_clusters: vec![],
+            file_read_diagnostics: vec![],
             prompt_targets: vec![
                 session_review::SessionReviewPromptTarget {
                     text: "do one".to_string(),

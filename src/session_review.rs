@@ -7,7 +7,10 @@ use std::time::UNIX_EPOCH;
 
 use crate::runtime_churn::RestartChurnSummary;
 use crate::{
-    session_cost::{self, SessionCostGuardrail, SessionCostGuardrailInput, SessionCostLoopCluster},
+    session_cost::{
+        self, SessionCostFileReadDiagnostic, SessionCostGuardrail, SessionCostGuardrailInput,
+        SessionCostLoopCluster,
+    },
     session_digest,
 };
 
@@ -151,6 +154,8 @@ pub struct SessionReviewReport {
     pub guardrails: Vec<SessionCostGuardrail>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub loop_clusters: Vec<SessionCostLoopCluster>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub file_read_diagnostics: Vec<SessionCostFileReadDiagnostic>,
     pub prompt_targets: Vec<SessionReviewPromptTarget>,
     pub commands: Vec<SessionReviewCommand>,
     pub touched_files: Vec<SessionReviewFileRef>,
@@ -282,6 +287,16 @@ impl PendingSession {
     }
 }
 
+#[derive(Debug, Clone)]
+struct FileReadDiagnosticAggregate {
+    path: String,
+    range: String,
+    occurrences: usize,
+    estimated_tokens: u64,
+    duplicate_estimated_tokens: u64,
+    follow_up_commands: BTreeSet<String>,
+}
+
 pub fn compute(target: &Path) -> Result<SessionReviewReport> {
     compute_with_options(target, &SessionReviewOptions::default())
 }
@@ -350,6 +365,8 @@ pub fn compute_with_options(
     let mut restart_churn = BTreeMap::<String, RestartChurnSummary>::new();
     let mut aggregate_runtime_events = BTreeMap::<String, usize>::new();
     let mut loop_clusters = BTreeMap::<(String, String), (usize, usize)>::new();
+    let mut file_read_diagnostics =
+        BTreeMap::<(String, String), FileReadDiagnosticAggregate>::new();
     let mut largest_turns = Vec::<SessionReviewLargestTurn>::new();
     let mut session_rows = Vec::<SessionReviewSession>::new();
 
@@ -501,6 +518,28 @@ pub fn compute_with_options(
                 entry.0 += cluster.occurrences;
                 entry.1 = entry.1.max(cluster.max_consecutive);
             }
+            for diagnostic in &cost.file_read_diagnostics {
+                let entry = file_read_diagnostics
+                    .entry((diagnostic.path.clone(), diagnostic.range.clone()))
+                    .or_insert_with(|| FileReadDiagnosticAggregate {
+                        path: diagnostic.path.clone(),
+                        range: diagnostic.range.clone(),
+                        occurrences: 0,
+                        estimated_tokens: 0,
+                        duplicate_estimated_tokens: 0,
+                        follow_up_commands: BTreeSet::new(),
+                    });
+                entry.occurrences += diagnostic.occurrences;
+                entry.estimated_tokens = entry
+                    .estimated_tokens
+                    .saturating_add(diagnostic.estimated_tokens);
+                entry.duplicate_estimated_tokens = entry
+                    .duplicate_estimated_tokens
+                    .saturating_add(diagnostic.duplicate_estimated_tokens);
+                entry
+                    .follow_up_commands
+                    .extend(diagnostic.follow_up_commands.iter().cloned());
+            }
         }
 
         for warning in digest.warnings.iter().chain(
@@ -634,6 +673,8 @@ pub fn compute_with_options(
         },
     );
     let loop_clusters = collect_loop_clusters(loop_clusters, MAX_LOOP_CLUSTERS);
+    let file_read_diagnostics =
+        collect_file_read_diagnostics(file_read_diagnostics, MAX_AGGREGATE_ITEMS);
     let document_active_context = match collect_document_active_context(&context) {
         Ok(active_context) => active_context,
         Err(error) => {
@@ -705,6 +746,7 @@ pub fn compute_with_options(
         largest_turn_total_tokens,
         guardrails,
         loop_clusters,
+        file_read_diagnostics,
         prompt_targets,
         commands,
         touched_files,
@@ -1387,6 +1429,33 @@ fn collect_loop_clusters(
     rows
 }
 
+fn collect_file_read_diagnostics(
+    entries: BTreeMap<(String, String), FileReadDiagnosticAggregate>,
+    max_items: usize,
+) -> Vec<SessionCostFileReadDiagnostic> {
+    let mut rows = entries
+        .into_values()
+        .map(|entry| SessionCostFileReadDiagnostic {
+            path: entry.path,
+            range: entry.range,
+            occurrences: entry.occurrences,
+            estimated_tokens: entry.estimated_tokens,
+            duplicate_estimated_tokens: entry.duplicate_estimated_tokens,
+            follow_up_commands: entry.follow_up_commands.into_iter().collect(),
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .duplicate_estimated_tokens
+            .cmp(&left.duplicate_estimated_tokens)
+            .then(right.occurrences.cmp(&left.occurrences))
+            .then(left.path.cmp(&right.path))
+            .then(left.range.cmp(&right.range))
+    });
+    rows.truncate(max_items);
+    rows
+}
+
 fn shell_quote(text: &str) -> String {
     if text.chars().any(char::is_whitespace) {
         format!("{text:?}")
@@ -1836,6 +1905,10 @@ do [#active]. spec-test-build-install-commit-push
                 "\n",
                 r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo build --release\"}"}}"#,
                 "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"sed -n '1,80p' src/session_review.rs\"}"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"sed -n '1,80p' src/session_review.rs\"}"}}"#,
+                "\n",
                 r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Committed and pushed in `src/tsift` as `abc123`."}}"#,
                 "\n",
                 r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#looprank]. spec-test-build-install-commit-push"}}"#,
@@ -1884,6 +1957,19 @@ do [#active]. spec-test-build-install-commit-push
                 .any(|cluster| cluster.kind == "closeout_churn"
                     && cluster.label == "commit_already_current"
                     && cluster.occurrences == 3)
+        );
+        assert!(
+            report
+                .file_read_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path == "src/session_review.rs"
+                    && diagnostic.range == "1-80"
+                    && diagnostic.occurrences == 2
+                    && diagnostic.duplicate_estimated_tokens == 1_440
+                    && diagnostic.follow_up_commands.iter().any(|command| {
+                        command
+                            == "tsift source-read src/session_review.rs --start 1 --lines 80 --budget normal"
+                    }))
         );
     }
 
