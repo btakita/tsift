@@ -122,7 +122,7 @@ pub struct SessionCostReport {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct UsageTotals {
     prompt_tokens: u64,
     cached_input_tokens: u64,
@@ -552,6 +552,7 @@ fn ingest_claude_jsonl(input: &str, state: &mut CostState) -> Result<()> {
 
 fn ingest_codex_jsonl(input: &str, state: &mut CostState) -> Result<()> {
     let mut previous = UsageTotals::default();
+    let mut seen_cumulative_snapshots = BTreeSet::<UsageTotals>::new();
     let mut saw_token_count = false;
     for (index, raw_line) in input.lines().enumerate() {
         let trimmed = raw_line.trim();
@@ -596,15 +597,18 @@ fn ingest_codex_jsonl(input: &str, state: &mut CostState) -> Result<()> {
             ));
             continue;
         };
-        let cumulative = UsageTotals {
-            prompt_tokens: usage_u64(total, "input_tokens"),
-            cached_input_tokens: usage_u64(total, "cached_input_tokens"),
-            cache_creation_input_tokens: 0,
-            output_tokens: usage_u64(total, "output_tokens"),
-            reasoning_output_tokens: usage_u64(total, "reasoning_output_tokens"),
-            total_tokens: usage_u64(total, "total_tokens"),
-        };
-        let delta = if previous.is_zero() {
+        let cumulative = codex_usage_totals(total);
+        let duplicate_snapshot = !seen_cumulative_snapshots.insert(cumulative);
+        let delta = if duplicate_snapshot {
+            UsageTotals::default()
+        } else if let Some(last) = payload
+            .get("info")
+            .and_then(|info| info.get("last_token_usage"))
+            .map(codex_usage_totals)
+            .filter(|last| !last.is_zero())
+        {
+            last
+        } else if previous.is_zero() {
             cumulative
         } else {
             cumulative.delta_from(previous)
@@ -1364,6 +1368,17 @@ fn usage_u64(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
+fn codex_usage_totals(value: &Value) -> UsageTotals {
+    UsageTotals {
+        prompt_tokens: usage_u64(value, "input_tokens"),
+        cached_input_tokens: usage_u64(value, "cached_input_tokens"),
+        cache_creation_input_tokens: 0,
+        output_tokens: usage_u64(value, "output_tokens"),
+        reasoning_output_tokens: usage_u64(value, "reasoning_output_tokens"),
+        total_tokens: usage_u64(value, "total_tokens"),
+    }
+}
+
 fn count_restart_family(restart_churn: &[RestartChurnSummary], family: &str) -> usize {
     restart_churn
         .iter()
@@ -1428,6 +1443,31 @@ mod tests {
         assert_eq!(report.largest_turn_total_tokens, 1050);
         assert_eq!(report.largest_turns[0].total_tokens, 1050);
         assert_eq!(report.largest_turns[1].total_tokens, 640);
+    }
+
+    #[test]
+    fn codex_jsonl_prefers_last_usage_for_interleaved_cumulative_streams() {
+        let input = concat!(
+            r#"{"timestamp":"2026-05-05T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":10,"total_tokens":1050},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":10,"total_tokens":1050}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":450,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":520},"last_token_usage":{"input_tokens":500,"cached_input_tokens":450,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":520}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1600,"cached_input_tokens":1400,"output_tokens":90,"reasoning_output_tokens":20,"total_tokens":1690},"last_token_usage":{"input_tokens":600,"cached_input_tokens":500,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":640}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900,"cached_input_tokens":800,"output_tokens":45,"reasoning_output_tokens":10,"total_tokens":945},"last_token_usage":{"input_tokens":400,"cached_input_tokens":350,"output_tokens":25,"reasoning_output_tokens":5,"total_tokens":425}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900,"cached_input_tokens":800,"output_tokens":45,"reasoning_output_tokens":10,"total_tokens":945},"last_token_usage":{"input_tokens":400,"cached_input_tokens":350,"output_tokens":25,"reasoning_output_tokens":5,"total_tokens":425}}}}"#,
+            "\n"
+        );
+
+        let report = compute(input, Some("codex-jsonl")).unwrap();
+        assert_eq!(report.usage_samples, 4);
+        assert_eq!(report.prompt_tokens, 2500);
+        assert_eq!(report.cached_input_tokens, 2200);
+        assert_eq!(report.output_tokens, 135);
+        assert_eq!(report.reasoning_output_tokens, 30);
+        assert_eq!(report.total_tokens, 2635);
+        assert_eq!(report.largest_turn_total_tokens, 1050);
     }
 
     #[test]

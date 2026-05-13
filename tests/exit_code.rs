@@ -3345,6 +3345,49 @@ fn session_cost_reads_codex_token_counts_from_stdin() {
 }
 
 #[test]
+fn session_cost_reads_codex_last_usage_when_cumulative_streams_interleave() {
+    let input = concat!(
+        r#"{"timestamp":"2026-05-05T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":10,"total_tokens":1050},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":10,"total_tokens":1050}}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-05-05T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":450,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":520},"last_token_usage":{"input_tokens":500,"cached_input_tokens":450,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":520}}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-05-05T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1600,"cached_input_tokens":1400,"output_tokens":90,"reasoning_output_tokens":20,"total_tokens":1690},"last_token_usage":{"input_tokens":600,"cached_input_tokens":500,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":640}}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-05-05T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900,"cached_input_tokens":800,"output_tokens":45,"reasoning_output_tokens":10,"total_tokens":945},"last_token_usage":{"input_tokens":400,"cached_input_tokens":350,"output_tokens":25,"reasoning_output_tokens":5,"total_tokens":425}}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-05-05T00:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900,"cached_input_tokens":800,"output_tokens":45,"reasoning_output_tokens":10,"total_tokens":945},"last_token_usage":{"input_tokens":400,"cached_input_tokens":350,"output_tokens":25,"reasoning_output_tokens":5,"total_tokens":425}}}}"#,
+        "\n"
+    );
+
+    let mut child = tsift_bin()
+        .args(["session-cost", "--json"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "session-cost should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["usage_samples"], 4);
+    assert_eq!(json["prompt_tokens"], 2500);
+    assert_eq!(json["cached_input_tokens"], 2200);
+    assert_eq!(json["output_tokens"], 135);
+    assert_eq!(json["reasoning_output_tokens"], 30);
+    assert_eq!(json["total_tokens"], 2635);
+    assert_eq!(json["largest_turn_total_tokens"], 1050);
+}
+
+#[test]
 fn session_cost_summarizes_agent_doc_restart_churn_from_stdin() {
     let input = concat!(
         "[1776528398] codex_start mode=fresh_restart restart_count=1\n",
@@ -4290,6 +4333,16 @@ fn session_review_json_surfaces_loop_clusters() {
             r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo build --release\"}"}}"#,
             "\n",
             r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Committed and pushed in `src/tsift` as `abc123`."}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":10,"total_tokens":1050},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":10,"total_tokens":1050}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":450,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":520},"last_token_usage":{"input_tokens":500,"cached_input_tokens":450,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":520}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1600,"cached_input_tokens":1400,"output_tokens":90,"reasoning_output_tokens":20,"total_tokens":1690},"last_token_usage":{"input_tokens":600,"cached_input_tokens":500,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":640}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900,"cached_input_tokens":800,"output_tokens":45,"reasoning_output_tokens":10,"total_tokens":945},"last_token_usage":{"input_tokens":400,"cached_input_tokens":350,"output_tokens":25,"reasoning_output_tokens":5,"total_tokens":425}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900,"cached_input_tokens":800,"output_tokens":45,"reasoning_output_tokens":10,"total_tokens":945},"last_token_usage":{"input_tokens":400,"cached_input_tokens":350,"output_tokens":25,"reasoning_output_tokens":5,"total_tokens":425}}}}"#,
             "\n"
         )
         .replace("/tmp/replace-me", &root.path().display().to_string()),
@@ -4304,6 +4357,10 @@ fn session_review_json_surfaces_loop_clusters() {
 
     assert!(output.status.success(), "session-review should succeed");
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["usage_samples"], 4);
+    assert_eq!(json["prompt_tokens"], 2500);
+    assert_eq!(json["total_tokens"], 2635);
+    assert_eq!(json["largest_turn_total_tokens"], 1050);
     let loop_clusters = json["loop_clusters"].as_array().unwrap();
     assert!(loop_clusters.iter().any(|cluster| {
         cluster["kind"] == "prompt_repeat"
@@ -4319,6 +4376,73 @@ fn session_review_json_surfaces_loop_clusters() {
         cluster["kind"] == "closeout_churn"
             && cluster["label"] == "commit_already_current"
             && cluster["occurrences"] == 3
+    }));
+}
+
+#[test]
+fn session_review_aggregates_only_visible_bounded_session_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let target = root.path().join("tasks/software/tsift.md");
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(
+        &target,
+        "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n",
+    )
+    .unwrap();
+
+    let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let root_text = root.path().display().to_string();
+    let old_transcript = concat!(
+        r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"user_message","message":"agent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-05-05T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000000,"cached_input_tokens":900000,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":1000001},"last_token_usage":{"input_tokens":1000000,"cached_input_tokens":900000,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":1000001}}}}"#,
+        "\n"
+    )
+    .replace("/tmp/replace-me", &root_text);
+    fs::write(codex_dir.join("zz-old-high-token.jsonl"), old_transcript).unwrap();
+
+    for index in 0..12 {
+        let transcript = concat!(
+            r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"agent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"reasoning_output_tokens":0,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"reasoning_output_tokens":0,"total_tokens":110}}}}"#,
+            "\n"
+        )
+        .replace("/tmp/replace-me", &root_text);
+        fs::write(
+            codex_dir.join(format!("aa-current-{index:02}.jsonl")),
+            transcript,
+        )
+        .unwrap();
+    }
+
+    let output = tsift_bin()
+        .args(["session-review", "--json", target.to_str().unwrap()])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "session-review should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["sessions_considered"], 13);
+    assert_eq!(json["sessions_matched"], 12);
+    assert_eq!(json["codex_sessions"], 12);
+    assert_eq!(json["usage_samples"], 12);
+    assert_eq!(json["prompt_tokens"], 1200);
+    assert_eq!(json["total_tokens"], 1320);
+    assert_eq!(json["largest_turn_total_tokens"], 110);
+    assert!(!json["sessions"].as_array().unwrap().iter().any(|session| {
+        session["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("zz-old-high-token.jsonl")
     }));
 }
 

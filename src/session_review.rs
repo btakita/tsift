@@ -338,6 +338,7 @@ pub fn compute_with_options(
             .cmp(&left.modified_unix_secs)
             .then_with(|| left.path.cmp(&right.path))
     });
+    sessions.truncate(MAX_SESSIONS);
 
     let mut prompt_targets = BTreeMap::<String, usize>::new();
     let mut commands = BTreeMap::<String, usize>::new();
