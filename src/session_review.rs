@@ -1774,7 +1774,7 @@ do [#active]. spec-test-build-install-commit-push
             report
                 .touched_files
                 .iter()
-                .any(|file_ref| file_ref.path == "/!")
+                .all(|file_ref| file_ref.path != "/!")
         );
         assert!(
             report

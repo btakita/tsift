@@ -1168,7 +1168,7 @@ fn normalize_file_token(raw: &str, root: &Path) -> Option<String> {
     if candidate.is_empty() || candidate == "." {
         return None;
     }
-    if !looks_like_file_path(candidate) {
+    if contains_shell_redirection(candidate) || !looks_like_file_path(candidate, root) {
         return None;
     }
     if path_points_to_existing_directory(root, candidate) {
@@ -1180,6 +1180,10 @@ fn normalize_file_token(raw: &str, root: &Path) -> Option<String> {
         return None;
     }
     Some(display_path)
+}
+
+fn contains_shell_redirection(token: &str) -> bool {
+    token.contains('>') || token.contains('<')
 }
 
 fn strip_line_suffix(token: &str) -> &str {
@@ -1203,31 +1207,57 @@ fn strip_line_suffix(token: &str) -> &str {
     &token[..cut]
 }
 
-fn looks_like_file_path(token: &str) -> bool {
+fn looks_like_file_path(token: &str, root: &Path) -> bool {
     if token.starts_with("--") || token.starts_with('#') {
         return false;
     }
 
     if token.contains('/') {
-        return true;
+        return path_points_to_existing_file(root, token)
+            || token_file_name(token)
+                .is_some_and(|name| is_known_file_name(name) || has_known_file_extension(name));
     }
 
     let lower = token.to_ascii_lowercase();
+    is_known_file_name(&lower) || has_known_file_extension(&lower)
+}
+
+fn token_file_name(token: &str) -> Option<&str> {
+    token.rsplit('/').find(|part| !part.is_empty())
+}
+
+fn is_known_file_name(lower_name: &str) -> bool {
     matches!(
-        lower.as_str(),
+        lower_name,
         "cargo.toml"
             | "cargo.lock"
+            | "makefile"
+            | "dockerfile"
             | "readme.md"
             | "agents.md"
             | "claude.md"
             | "spec.md"
             | "versions.md"
-    ) || [
+    )
+}
+
+fn has_known_file_extension(lower_name: &str) -> bool {
+    [
         ".rs", ".md", ".toml", ".json", ".jsonl", ".yaml", ".yml", ".txt", ".py", ".ts", ".tsx",
-        ".js", ".jsx", ".sh", ".zsh", ".sql", ".db",
+        ".js", ".jsx", ".sh", ".zsh", ".sql", ".db", ".log",
     ]
     .iter()
-    .any(|suffix| lower.ends_with(suffix))
+    .any(|suffix| lower_name.ends_with(suffix))
+}
+
+fn path_points_to_existing_file(root: &Path, raw_path: &str) -> bool {
+    let path = Path::new(raw_path);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    candidate.is_file()
 }
 
 fn path_points_to_existing_directory(root: &Path, raw_path: &str) -> bool {
@@ -1808,6 +1838,43 @@ do [#sessiondigest]. spec-test-build-install-commit-push
             failure.message == "cargo test exited with code 1"
                 && failure.command.as_deref() == Some("cargo test")
         }));
+    }
+
+    #[test]
+    fn codex_jsonl_digest_filters_conversational_file_fragments_and_shell_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn run_sync() {}\n").unwrap();
+        std::fs::write(dir.path().join("SPEC.md"), "# spec\n").unwrap();
+
+        let input = concat!(
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"I checked agent-doc/tsift, digest/session, progress/CI-status, and version/preflight while running a shell fallback like 2>/dev/null."}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"exec_command_end","exit_code":0,"aggregated_output":"ok: src/lib.rs:1 and SPEC.md were inspected; noisy shell syntax 2>/dev/null was not a file","parsed_cmd":[{"type":"unknown","cmd":"sed -n '1,20p' src/lib.rs 2>/dev/null"}]}}"#,
+            "\n"
+        );
+
+        let report = compute(dir.path(), input, Some("codex-jsonl")).unwrap();
+        let paths = report
+            .touched_files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(paths.contains("src/lib.rs"));
+        assert!(paths.contains("SPEC.md"));
+        for bogus in [
+            "2>/dev/null",
+            "agent-doc/tsift",
+            "digest/session",
+            "progress/CI-status",
+            "version/preflight",
+        ] {
+            assert!(
+                !paths.contains(bogus),
+                "conversational fragment `{bogus}` should not be a touched file"
+            );
+        }
     }
 
     #[test]

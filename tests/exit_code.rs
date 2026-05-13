@@ -3671,6 +3671,69 @@ fn session_digest_reads_codex_jsonl_from_stdin() {
 }
 
 #[test]
+fn session_digest_filters_codex_jsonl_bogus_file_refs_from_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn run_sync() {}\n").unwrap();
+    fs::write(dir.path().join("SPEC.md"), "# spec\n").unwrap();
+
+    let input = concat!(
+        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"false paths included 2>/dev/null, agent-doc/tsift, digest/session, progress/CI-status, and version/preflight."}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"exec_command_end","exit_code":0,"aggregated_output":"read src/lib.rs:1 and SPEC.md","parsed_cmd":[{"type":"unknown","cmd":"sed -n '1,20p' src/lib.rs 2>/dev/null"}]}}"#,
+        "\n"
+    );
+
+    let mut child = tsift_bin()
+        .args([
+            "session-digest",
+            "--json",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--source",
+            "codex-jsonl",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "session-digest should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let paths = json["touched_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert!(paths.contains("src/lib.rs"));
+    assert!(paths.contains("SPEC.md"));
+    for bogus in [
+        "2>/dev/null",
+        "agent-doc/tsift",
+        "digest/session",
+        "progress/CI-status",
+        "version/preflight",
+    ] {
+        assert!(
+            !paths.contains(bogus),
+            "conversational fragment `{bogus}` should not be a touched file"
+        );
+    }
+}
+
+#[test]
 fn session_digest_summarizes_agent_doc_restart_churn_from_stdin() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("tasks/software")).unwrap();

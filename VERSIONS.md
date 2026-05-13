@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- Codex JSONL `session-digest` file-reference extraction now rejects shell redirection fragments and slash-separated conversational labels such as `agent-doc/tsift`, `digest/session`, `progress/CI-status`, and `version/preflight` unless they resolve to real files or carry recognized file names/extensions.
 - `tsift rewrite` now leaves file-listing commands such as `rg --files`, `rg --type-list`, and `find ...` on the no-rewrite passthrough path so listing roots and predicates are not misread as exact search patterns.
 - `session-digest` and `session-review` now filter assistant progress and assessment prose about failure-classification false positives, unresolved failure groups, and red/check CI-status commentary instead of reporting those meta lines as failures.
 - `token-savings` fixtures now support source-read rewrite rows with required line-anchor validation, and the real-session fixture covers full-file `cat`/`bat` plus oversized `sed`/`head`/`tail` reads under a fail-under threshold.
