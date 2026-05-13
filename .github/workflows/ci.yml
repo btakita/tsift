@@ -13,9 +13,19 @@ jobs:
   check:
     name: clippy + test
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tsift
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: tsift
+
+      - uses: actions/checkout@v4
+        with:
+          repository: btakita/tagpath
+          path: tagpath
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -28,7 +38,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
+            tsift/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-

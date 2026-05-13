@@ -21,9 +21,19 @@ jobs:
   verify:
     name: verify release inputs
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tsift
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: tsift
+
+      - uses: actions/checkout@v4
+        with:
+          repository: btakita/tagpath
+          path: tagpath
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -55,6 +65,9 @@ jobs:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     needs: verify
+    defaults:
+      run:
+        working-directory: tsift
     strategy:
       fail-fast: false
       matrix:
@@ -74,6 +87,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: tsift
+
+      - uses: actions/checkout@v4
+        with:
+          repository: btakita/tagpath
+          path: tagpath
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -110,7 +130,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
-          path: dist/*
+          path: tsift/dist/*
           if-no-files-found: error
 
   github-release:
@@ -137,6 +157,9 @@ jobs:
   publish-crate:
     name: publish crates.io package
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tsift
     needs:
       - verify
       - build
@@ -144,6 +167,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: tsift
+
+      - uses: actions/checkout@v4
+        with:
+          repository: btakita/tagpath
+          path: tagpath
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable

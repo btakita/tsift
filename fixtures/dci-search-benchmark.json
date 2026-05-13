@@ -1,0 +1,90 @@
+{
+  "description": "Recorded DCI-style search benchmark for multi-hop tsift code/repo localization tasks.",
+  "tasks": [
+    {
+      "id": "rewrite-digest-route",
+      "label": "Find the rewrite path that routes long test/build commands into digest-runner envelopes",
+      "target": "src/main.rs:15300",
+      "runs": [
+        {
+          "strategy": "exact_chained_rg",
+          "localized": true,
+          "tool_calls": 3,
+          "latency_ms": 155,
+          "estimated_tokens": 610,
+          "notes": "rg for digest-runner, then narrow to rewrite output and runner command construction"
+        },
+        {
+          "strategy": "lexical_bm25",
+          "localized": true,
+          "tool_calls": 5,
+          "latency_ms": 920,
+          "estimated_tokens": 1080
+        },
+        {
+          "strategy": "hybrid",
+          "localized": true,
+          "tool_calls": 4,
+          "latency_ms": 2250,
+          "estimated_tokens": 930
+        }
+      ]
+    },
+    {
+      "id": "summary-cache-lock-fallback",
+      "label": "Locate summary-cache read-only snapshot fallback behavior from status and summarize surfaces",
+      "target": "src/summarize.rs",
+      "runs": [
+        {
+          "strategy": "exact_chained_rg",
+          "localized": true,
+          "tool_calls": 4,
+          "latency_ms": 185,
+          "estimated_tokens": 740
+        },
+        {
+          "strategy": "lexical_bm25",
+          "localized": false,
+          "tool_calls": 6,
+          "latency_ms": 1010,
+          "estimated_tokens": 1280
+        },
+        {
+          "strategy": "hybrid",
+          "localized": true,
+          "tool_calls": 4,
+          "latency_ms": 2380,
+          "estimated_tokens": 980
+        }
+      ]
+    },
+    {
+      "id": "search-scope-fail-closed",
+      "label": "Find the fail-closed path for unknown or ambiguous workspace scope selectors",
+      "target": "src/config.rs",
+      "runs": [
+        {
+          "strategy": "exact_chained_rg",
+          "localized": true,
+          "tool_calls": 5,
+          "latency_ms": 210,
+          "estimated_tokens": 820
+        },
+        {
+          "strategy": "lexical_bm25",
+          "localized": true,
+          "tool_calls": 5,
+          "latency_ms": 880,
+          "estimated_tokens": 1120
+        },
+        {
+          "strategy": "hybrid",
+          "localized": true,
+          "tool_calls": 3,
+          "latency_ms": 2410,
+          "estimated_tokens": 880
+        }
+      ]
+    }
+  ]
+}

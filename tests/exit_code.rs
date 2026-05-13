@@ -3029,6 +3029,51 @@ fn metric_digest_reads_run_history_from_stdin() {
 }
 
 #[test]
+fn dci_benchmark_summarizes_recorded_strategy_fixture() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/dci-search-benchmark.json");
+    assert!(
+        fixture.exists(),
+        "DCI benchmark fixture should exist at {}",
+        fixture.display()
+    );
+
+    let output = tsift_bin()
+        .args([
+            "dci-benchmark",
+            "--fixture",
+            fixture.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "dci-benchmark should pass: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tasks_loaded"], 3);
+    assert_eq!(json["strategies_compared"], 3);
+    assert_eq!(
+        json["strategy_summaries"][0]["strategy"],
+        "exact_chained_rg"
+    );
+    assert_eq!(json["strategy_summaries"][0]["localized"], 3);
+    assert!(json["task_rows"].as_array().unwrap().iter().all(|row| {
+        row["best_localization"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|strategy| strategy == "exact_chained_rg")
+    }));
+    assert!(
+        json.get("warnings")
+            .is_none_or(|value| value.as_array().unwrap().is_empty())
+    );
+}
+
+#[test]
 fn session_digest_reads_markdown_session_from_stdin() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();

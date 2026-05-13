@@ -17,6 +17,7 @@ use tempfile::NamedTempFile;
 
 pub mod audit;
 pub mod config;
+pub mod dci_benchmark;
 pub mod diff_digest;
 pub mod graph;
 pub mod index;
@@ -478,6 +479,15 @@ enum Commands {
         /// Number of top improvements/regressions to emit
         #[arg(long, default_value = "3")]
         top: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare recorded DCI search workflows across exact, lexical, and hybrid strategies
+    DciBenchmark {
+        /// Fixture describing multi-hop tasks and recorded strategy metrics
+        #[arg(long)]
+        fixture: PathBuf,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -1136,6 +1146,17 @@ fn main() -> Result<()> {
                 history,
                 top,
             },
+            OutputFormat {
+                json_output: json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                schema,
+                envelope,
+            },
+        ),
+        Some(Commands::DciBenchmark { fixture, json }) => cmd_dci_benchmark(
+            &fixture,
             OutputFormat {
                 json_output: json || terse || schema || envelope,
                 compact,
@@ -5341,6 +5362,92 @@ fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: OutputFormat) -> 
         println!();
         println!("News-ready table:");
         println!("{}", report.news_table_markdown);
+    }
+
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    Ok(())
+}
+
+fn cmd_dci_benchmark(fixture_path: &Path, format: OutputFormat) -> Result<()> {
+    let input = fs::read_to_string(fixture_path)
+        .with_context(|| format!("reading dci-benchmark fixture: {}", fixture_path.display()))?;
+    let report = dci_benchmark::compute(&input)?;
+
+    if format.json_output {
+        println!(
+            "{}",
+            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+        );
+        return Ok(());
+    }
+
+    if format.compact {
+        println!(
+            "dci tasks:{} strategies:{} warnings:{}",
+            report.tasks_loaded,
+            report.strategies_compared,
+            report.warnings.len()
+        );
+        for summary in &report.strategy_summaries {
+            println!(
+                "{} rank:{} loc:{}/{} rate:{} calls:{} latency_ms:{} tokens:{}",
+                summary.strategy,
+                summary.rank,
+                summary.localized,
+                summary.task_runs,
+                dci_benchmark::format_number(summary.localization_rate * 100.0),
+                dci_benchmark::format_number(summary.avg_tool_calls),
+                dci_benchmark::format_number(summary.avg_latency_ms),
+                dci_benchmark::format_number(summary.avg_estimated_tokens)
+            );
+        }
+        for warning in &report.warnings {
+            println!("warning: {warning}");
+        }
+        return Ok(());
+    }
+
+    println!("DCI benchmark");
+    if let Some(description) = &report.description {
+        println!("  description: {}", description);
+    }
+    println!("  tasks loaded:        {}", report.tasks_loaded);
+    println!("  strategies compared: {}", report.strategies_compared);
+
+    println!();
+    println!("Strategy summary:");
+    for summary in &report.strategy_summaries {
+        println!(
+            "  #{} {}: localization {}/{} ({:.1}%), avg calls {}, avg latency {}ms, avg tokens {}",
+            summary.rank,
+            summary.strategy,
+            summary.localized,
+            summary.task_runs,
+            summary.localization_rate * 100.0,
+            dci_benchmark::format_number(summary.avg_tool_calls),
+            dci_benchmark::format_number(summary.avg_latency_ms),
+            dci_benchmark::format_number(summary.avg_estimated_tokens)
+        );
+    }
+
+    println!();
+    println!("Task winners:");
+    for row in &report.task_rows {
+        let label = row
+            .label
+            .as_ref()
+            .map(|value| format!(" ({value})"))
+            .unwrap_or_default();
+        println!("  {}{}", row.task_id, label);
+        println!("    localized: {}", row.best_localization.join(", "));
+        println!(
+            "    lowest calls: {}, lowest latency: {}, lowest tokens: {}",
+            row.lowest_tool_calls.as_deref().unwrap_or("-"),
+            row.lowest_latency.as_deref().unwrap_or("-"),
+            row.lowest_token_budget.as_deref().unwrap_or("-")
+        );
     }
 
     for warning in &report.warnings {
@@ -13593,6 +13700,24 @@ tier = "private"
                 assert_eq!(top, 2);
             }
             _ => panic!("expected MetricDigest command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_dci_benchmark_command() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "dci-benchmark",
+            "--fixture",
+            "fixtures/dci-search-benchmark.json",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::DciBenchmark { fixture, json }) => {
+                assert!(json);
+                assert_eq!(fixture, PathBuf::from("fixtures/dci-search-benchmark.json"));
+            }
+            _ => panic!("expected DciBenchmark command"),
         }
     }
 

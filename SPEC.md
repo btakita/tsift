@@ -86,6 +86,7 @@ tsift diff-digest --revision HEAD . # bounded single-revision/history digest
 tsift --envelope context-pack tasks/software/tsift.md --test-input test.log --log-input build.log
 tsift test-digest --path . < test.log  # bounded test-output digest from stdin or --input
 tsift metric-digest < runs.json  # repeated metric-run digest: deltas, improvements, news-ready table
+tsift dci-benchmark --fixture fixtures/dci-search-benchmark.json  # recorded multi-hop DCI search comparison
 tsift log-digest --path . < build.log  # bounded verbose-log digest from stdin or --input
 tsift session-digest --path . < session.md  # session transcript digest: prompt targets, commands, touched files/symbols, failures, closeout
 tsift session-cost < session.jsonl  # token/runtime cost digest: prompt totals, cache ratios, large-turn outliers, restart churn
@@ -1069,6 +1070,18 @@ Behavior:
 4. Emit bounded per-metric deltas, top improvements/regressions, and a markdown-ready history table suitable for session notes or news updates.
 
 `metric-digest` is intentionally schema-light. It does not execute the underlying benchmark/test/perf workflow, and it avoids hard-coding session-share-specific parsers so different run producers can feed the same digest surface.
+
+## DCI Benchmark
+
+`tsift dci-benchmark --fixture <path>` summarizes recorded Direct Corpus Interaction search runs for multi-hop repo/code tasks. The benchmark fixture compares the three strategy lanes tsift cares about after the DCI paper review:
+
+- `exact_chained_rg`: literal `rg -F` / `tsift search --exact` narrowing with local context expansion
+- `lexical_bm25`: the default sift/BM25 search path
+- `hybrid`: slower BM25 + vector-assisted search
+
+Each task records whether the strategy localized the intended edit/review target plus `tool_calls`, `latency_ms`, and `estimated_tokens`. The report aggregates localization rate, average tool calls, average latency, and average token budget per strategy, then ranks strategies by localization first and agent budget second. Missing expected lanes are warnings, not hard failures, so partial experiments can still be digested while making gaps visible.
+
+The checked-in `fixtures/dci-search-benchmark.json` is a seed benchmark for tsift's own multi-hop workflows: rewrite/digest routing, summary-cache lock fallback, and workspace scope fail-closed localization. It is intentionally recorded-run based rather than a live runner, so CI stays deterministic and hybrid/vector model downloads do not gate normal verification. Live benchmark scripts can append new task records and use `tsift dci-benchmark --json` as the stable summarizer.
 
 ## Log Digest
 
