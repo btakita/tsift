@@ -78,6 +78,8 @@ pub struct SessionDigestFailure {
     pub kind: String,
     pub message: String,
     pub occurrences: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -126,7 +128,7 @@ struct DigestState {
     commands: BTreeMap<String, usize>,
     files: BTreeMap<String, usize>,
     symbols: BTreeMap<String, usize>,
-    failures: BTreeMap<(String, String), usize>,
+    failures: BTreeMap<(String, String, Option<String>), usize>,
     runtime_events: BTreeMap<String, usize>,
     seen_document_cycle_events: BTreeSet<(String, String)>,
     seen_document_cycle_closeout: BTreeSet<(String, String, String)>,
@@ -139,6 +141,7 @@ struct DigestState {
 #[derive(Debug, Clone)]
 enum TranscriptBlock {
     Text { role: Option<String>, text: String },
+    ToolResult { text: String },
     ToolUse { name: String, input: Value },
 }
 
@@ -212,11 +215,14 @@ pub fn compute(path: &Path, input: &str, source_hint: Option<&str>) -> Result<Se
     let mut failures = state
         .failures
         .into_iter()
-        .map(|((kind, message), occurrences)| SessionDigestFailure {
-            kind,
-            message,
-            occurrences,
-        })
+        .map(
+            |((kind, message, command), occurrences)| SessionDigestFailure {
+                kind,
+                message,
+                occurrences,
+                command,
+            },
+        )
         .collect::<Vec<_>>();
     failures.sort_by(|left, right| {
         right
@@ -355,7 +361,7 @@ fn ingest_markdown(root: &Path, input: &str, state: &mut DigestState) -> Result<
             continue;
         }
         state.transcript_items += 1;
-        ingest_text_line(root, line, false, state)?;
+        ingest_text_line(root, line, false, None, state)?;
     }
     Ok(())
 }
@@ -387,17 +393,22 @@ fn ingest_claude_jsonl(root: &Path, input: &str, state: &mut DigestState) -> Res
             }
             continue;
         }
+        let mut last_tool_command = None::<String>;
         for block in blocks {
             match block {
                 TranscriptBlock::Text { role, text } => {
                     let user_bias = role
                         .as_deref()
                         .is_some_and(|value| value.eq_ignore_ascii_case("user"));
-                    ingest_text_block(root, &text, user_bias, state)?;
+                    ingest_text_block(root, &text, user_bias, None, state)?;
+                }
+                TranscriptBlock::ToolResult { text } => {
+                    ingest_text_block(root, &text, false, last_tool_command.as_deref(), state)?;
+                    last_tool_command = None;
                 }
                 TranscriptBlock::ToolUse { name, input } => {
                     state.transcript_items += 1;
-                    ingest_tool_use(root, &name, &input, state)?;
+                    last_tool_command = ingest_tool_use(root, &name, &input, state)?;
                 }
             }
         }
@@ -472,14 +483,14 @@ fn ingest_agent_doc_log(root: &Path, input: &str, state: &mut DigestState) {
             );
             *state
                 .failures
-                .entry(("exit".to_string(), message))
+                .entry(("exit".to_string(), message, None))
                 .or_default() += 1;
         }
 
         if event_name.contains("timeout") {
             *state
                 .failures
-                .entry(("timeout".to_string(), truncate_detail(detail, 220)))
+                .entry(("timeout".to_string(), truncate_detail(detail, 220), None))
                 .or_default() += 1;
         }
 
@@ -562,7 +573,7 @@ fn ingest_codex_response_item(
                 else {
                     continue;
                 };
-                ingest_text_block(root, text, false, state)?;
+                ingest_text_block(root, text, false, None, state)?;
             }
         }
         Some("function_call") => {
@@ -581,7 +592,7 @@ fn ingest_codex_response_item(
                 Value::String(arguments.to_string())
             });
             state.transcript_items += 1;
-            ingest_tool_use(root, name, &input, state)?;
+            let _ = ingest_tool_use(root, name, &input, state)?;
         }
         _ => {}
     }
@@ -600,22 +611,23 @@ fn ingest_codex_event_msg(
     match payload.get("type").and_then(Value::as_str) {
         Some("user_message") => {
             if let Some(message) = payload.get("message").and_then(Value::as_str) {
-                ingest_text_block(root, message, true, state)?;
+                ingest_text_block(root, message, true, None, state)?;
             }
         }
         Some("agent_message") => {
             if let Some(message) = payload.get("message").and_then(Value::as_str) {
-                ingest_text_block(root, message, false, state)?;
+                ingest_text_block(root, message, false, None, state)?;
             }
         }
         Some("exec_command_end") => {
             state.transcript_items += 1;
-            if let Some(command) = extract_codex_exec_command(payload) {
+            let command = extract_codex_exec_command(payload);
+            if let Some(command) = &command {
                 *state.commands.entry(command.clone()).or_default() += 1;
-                for path in extract_file_refs(&command, root) {
+                for path in extract_file_refs(command, root) {
                     *state.files.entry(path).or_default() += 1;
                 }
-                for symbol in extract_symbol_refs(&command) {
+                for symbol in extract_symbol_refs(command) {
                     *state.symbols.entry(symbol).or_default() += 1;
                 }
             }
@@ -625,7 +637,7 @@ fn ingest_codex_event_msg(
                 .or_else(|| payload.get("stdout").and_then(Value::as_str))
             {
                 for line in output.lines() {
-                    ingest_text_line(root, line, false, state)?;
+                    ingest_text_line(root, line, false, command.as_deref(), state)?;
                 }
             }
             if payload
@@ -633,9 +645,9 @@ fn ingest_codex_event_msg(
                 .and_then(Value::as_i64)
                 .unwrap_or(0)
                 != 0
+                && command.is_some()
             {
-                let command =
-                    extract_codex_exec_command(payload).unwrap_or_else(|| "command".to_string());
+                let command = command.as_deref().unwrap();
                 let message = truncate_detail(
                     &format!(
                         "{} exited with code {}",
@@ -649,7 +661,7 @@ fn ingest_codex_event_msg(
                 );
                 *state
                     .failures
-                    .entry(("exit".to_string(), message))
+                    .entry(("exit".to_string(), message, Some(command.to_string())))
                     .or_default() += 1;
             }
         }
@@ -679,13 +691,12 @@ fn collect_content_block(role: Option<String>, value: &Value, out: &mut Vec<Tran
             out.push(TranscriptBlock::ToolUse { name, input });
         }
         Some("tool_result") => match value.get("content") {
-            Some(Value::String(text)) => out.push(TranscriptBlock::Text {
-                role,
+            Some(Value::String(text)) => out.push(TranscriptBlock::ToolResult {
                 text: text.to_string(),
             }),
             Some(Value::Array(items)) => {
                 for item in items {
-                    collect_content_block(role.clone(), item, out);
+                    collect_tool_result_block(item, out);
                 }
             }
             _ => {}
@@ -701,34 +712,53 @@ fn collect_content_block(role: Option<String>, value: &Value, out: &mut Vec<Tran
     }
 }
 
-fn ingest_tool_use(root: &Path, name: &str, input: &Value, state: &mut DigestState) -> Result<()> {
-    if let Some(command) = extract_tool_command(name, input) {
+fn collect_tool_result_block(value: &Value, out: &mut Vec<TranscriptBlock>) {
+    if let Some(text) = value
+        .get("text")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("content").and_then(Value::as_str))
+    {
+        out.push(TranscriptBlock::ToolResult {
+            text: text.to_string(),
+        });
+    }
+}
+
+fn ingest_tool_use(
+    root: &Path,
+    name: &str,
+    input: &Value,
+    state: &mut DigestState,
+) -> Result<Option<String>> {
+    let command = extract_tool_command(name, input);
+    if let Some(command) = &command {
         *state.commands.entry(command.clone()).or_default() += 1;
-        for path in extract_file_refs(&command, root) {
+        for path in extract_file_refs(command, root) {
             *state.files.entry(path).or_default() += 1;
         }
-        for symbol in extract_symbol_refs(&command) {
+        for symbol in extract_symbol_refs(command) {
             *state.symbols.entry(symbol).or_default() += 1;
         }
     }
 
     if let Some(text) = extract_tool_text(input) {
         for line in text.lines() {
-            ingest_text_line(root, line, false, state)?;
+            ingest_text_line(root, line, false, command.as_deref(), state)?;
         }
     }
-    Ok(())
+    Ok(command)
 }
 
 fn ingest_text_block(
     root: &Path,
     text: &str,
     user_bias: bool,
+    command_anchor: Option<&str>,
     state: &mut DigestState,
 ) -> Result<()> {
     state.transcript_items += 1;
     for line in text.lines() {
-        ingest_text_line(root, line, user_bias, state)?;
+        ingest_text_line(root, line, user_bias, command_anchor, state)?;
     }
     Ok(())
 }
@@ -803,6 +833,7 @@ fn ingest_text_line(
     root: &Path,
     raw_line: &str,
     user_bias: bool,
+    command_anchor: Option<&str>,
     state: &mut DigestState,
 ) -> Result<()> {
     let trimmed = raw_line.trim();
@@ -818,7 +849,9 @@ fn ingest_text_line(
         .or_else(|| trimmed.strip_prefix("> "))
         .unwrap_or(trimmed)
         .trim();
-    if looks_like_prompt_target(prompt_candidate, user_bias || prompt_candidate != trimmed) {
+    let is_prompt_target =
+        looks_like_prompt_target(prompt_candidate, user_bias || prompt_candidate != trimmed);
+    if is_prompt_target {
         push_prompt_target(prompt_candidate, &mut state.prompt_targets);
     }
 
@@ -839,8 +872,12 @@ fn ingest_text_line(
         *state.symbols.entry(symbol).or_default() += 1;
     }
 
-    if let Some((kind, message)) = classify_failure(trimmed) {
-        *state.failures.entry((kind, message)).or_default() += 1;
+    if !is_prompt_target
+        && !user_bias
+        && let Some((kind, message)) = classify_failure(trimmed)
+    {
+        let command = command_anchor.map(normalize_whitespace);
+        *state.failures.entry((kind, message, command)).or_default() += 1;
     }
     for (kind, detail) in detect_closeout(trimmed) {
         *state.closeout.entry((kind, detail)).or_default() += 1;
@@ -1263,7 +1300,10 @@ fn looks_like_symbol(candidate: &str) -> bool {
 
 fn classify_failure(text: &str) -> Option<(String, String)> {
     let normalized = normalize_whitespace(strip_common_prefixes(text));
-    if is_non_failure_summary(&normalized) {
+    if is_non_failure_summary(&normalized)
+        || looks_like_failure_instruction(&normalized)
+        || looks_like_source_code_snippet(&normalized)
+    {
         return None;
     }
     let lower = normalized.to_ascii_lowercase();
@@ -1271,7 +1311,11 @@ fn classify_failure(text: &str) -> Option<(String, String)> {
         "timeout"
     } else if lower.starts_with("error") || lower.contains(" error:") || lower.contains("error:") {
         "error"
-    } else if lower.contains("panicked") || lower.contains("panic") {
+    } else if lower.contains("panicked")
+        || lower.starts_with("panic:")
+        || lower.contains(" panic:")
+        || lower.contains("panic at")
+    {
         "panic"
     } else if lower.contains("not found")
         || lower.contains(" is missing")
@@ -1284,6 +1328,43 @@ fn classify_failure(text: &str) -> Option<(String, String)> {
         return None;
     };
     Some((kind.to_string(), truncate_detail(&normalized, 220)))
+}
+
+fn looks_like_failure_instruction(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let first = lower.split_whitespace().next().unwrap_or_default();
+    if matches!(
+        first,
+        "after" | "before" | "when" | "while" | "preserve" | "report" | "tighten" | "avoid"
+    ) && (lower.contains(" should ")
+        || lower.contains(" must ")
+        || lower.contains(" not ")
+        || lower.contains(" preserve ")
+        || lower.contains(" reports "))
+    {
+        return true;
+    }
+    false
+}
+
+fn looks_like_source_code_snippet(text: &str) -> bool {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("panic!(") || lower.contains("bail!(") || lower.contains("anyhow!(") {
+        return true;
+    }
+    matches!(
+        lower.split_whitespace().next(),
+        Some("fn")
+            | Some("pub")
+            | Some("impl")
+            | Some("let")
+            | Some("return")
+            | Some("assert!")
+            | Some("assert_eq!")
+            | Some("assert_ne!")
+            | Some("debug_assert!")
+    ) && (trimmed.contains('{') || trimmed.contains(';') || trimmed.contains("=>"))
 }
 
 fn is_non_failure_summary(text: &str) -> bool {
@@ -1630,7 +1711,44 @@ do [#sessiondigest]. spec-test-build-install-commit-push
                 .any(|failure| matches!(failure.kind.as_str(), "error" | "missing"))
         );
         assert!(report.failures.iter().any(|failure| failure.kind == "exit"));
+        assert!(report.failures.iter().any(|failure| {
+            failure.command.as_deref() == Some("cargo test --manifest-path Cargo.toml")
+        }));
         assert!(report.closeout.iter().any(|entry| entry.kind == "push"));
+    }
+
+    #[test]
+    fn codex_jsonl_digest_anchors_command_failures_and_filters_instruction_snippets() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = concat!(
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#sfail]. Tighten failure extraction so it reports command failures, not instruction text or panic snippets."}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"exec_command_end","exit_code":1,"aggregated_output":"After finalize, panic snippets and generic command exited with code 1 should not become failures.\npanic!(\"expected simulated swap failure\");\nthread 'suite::alpha_failure' panicked at src/lib.rs:3:5:\nassertion failed: left == right\n","parsed_cmd":[{"type":"unknown","cmd":"cargo test"}]}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"exec_command_end","exit_code":1,"aggregated_output":"opaque wrapper failed without a parsed command"}}"#,
+            "\n"
+        );
+
+        let report = compute(dir.path(), input, Some("codex-jsonl")).unwrap();
+        assert!(
+            report
+                .failures
+                .iter()
+                .all(|failure| !failure.message.contains("After finalize")
+                    && !failure.message.contains("panic!(")
+                    && failure.message != "command exited with code 1")
+        );
+        assert!(report.failures.iter().any(|failure| {
+            failure.kind == "panic" && failure.command.as_deref() == Some("cargo test")
+        }));
+        assert!(report.failures.iter().any(|failure| {
+            failure.message.contains("assertion failed")
+                && failure.command.as_deref() == Some("cargo test")
+        }));
+        assert!(report.failures.iter().any(|failure| {
+            failure.message == "cargo test exited with code 1"
+                && failure.command.as_deref() == Some("cargo test")
+        }));
     }
 
     #[test]

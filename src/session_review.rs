@@ -70,6 +70,10 @@ pub struct SessionReviewFailure {
     pub kind: String,
     pub message: String,
     pub occurrences: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -339,7 +343,7 @@ pub fn compute_with_options(
     let mut commands = BTreeMap::<String, usize>::new();
     let mut touched_files = BTreeMap::<String, usize>::new();
     let mut touched_symbols = BTreeMap::<String, usize>::new();
-    let mut failures = BTreeMap::<(String, String), usize>::new();
+    let mut failures = BTreeMap::<(String, String, Option<String>, Option<String>), usize>::new();
     let mut runtime_events = BTreeMap::<String, usize>::new();
     let mut closeout = BTreeMap::<(String, String), usize>::new();
     let mut restart_churn = BTreeMap::<String, RestartChurnSummary>::new();
@@ -428,7 +432,12 @@ pub fn compute_with_options(
         }
         for failure in &digest.failures {
             *failures
-                .entry((failure.kind.clone(), failure.message.clone()))
+                .entry((
+                    failure.kind.clone(),
+                    failure.message.clone(),
+                    failure.command.clone(),
+                    Some(pending.path.display().to_string()),
+                ))
                 .or_default() += failure.occurrences;
         }
         for event in &digest.runtime_events {
@@ -601,10 +610,12 @@ pub fn compute_with_options(
     let failures = collect_pairs(
         failures,
         MAX_AGGREGATE_ITEMS,
-        |(kind, message), occurrences| SessionReviewFailure {
+        |(kind, message, command, session_path), occurrences| SessionReviewFailure {
             kind,
             message,
             occurrences,
+            command,
+            session_path,
         },
     );
     let runtime_events =
@@ -836,6 +847,11 @@ fn collect_document_active_context(context: &TargetContext) -> Result<DocumentAc
                 kind: entry.kind,
                 message: entry.message,
                 occurrences: entry.occurrences,
+                command: entry.command,
+                session_path: context
+                    .relative_target
+                    .clone()
+                    .or_else(|| Some(context.canonical_target.display().to_string())),
             })
             .collect(),
     })
@@ -1704,6 +1720,78 @@ do [#active]. spec-test-build-install-commit-push
                 .all(|path| path != "/!")
         );
         assert!(report.next_context.unresolved_failures.is_empty());
+    }
+
+    #[test]
+    fn session_review_failure_rows_keep_command_and_session_anchors() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let target = root.path().join("tasks/software/tsift.md");
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(
+            &target,
+            "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n",
+        )
+        .unwrap();
+
+        let agent_doc_logs = root.path().join(".agent-doc/logs");
+        fs::create_dir_all(&agent_doc_logs).unwrap();
+        fs::write(
+            agent_doc_logs.join("tsift-v0.1.log"),
+            concat!(
+                "[1776712372] session_start file=tasks/software/tsift.md pane=%77 session=tsift-v0.1\n",
+                "[1776712373] cwd_resolved path=/tmp/replace-me source=project_root\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let rollout_path = codex_dir.join("rollout-failure.jsonl");
+        fs::write(
+            &rollout_path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#sfail]. Tighten failure extraction.\nagent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"exec_command_end","exit_code":1,"aggregated_output":"After finalize, panic snippets and generic command exited with code 1 should not become failures.\npanic!(\"expected simulated swap failure\");\nthread 'suite::alpha_failure' panicked at src/lib.rs:3:5:\nassertion failed: left == right\n","parsed_cmd":[{"type":"unknown","cmd":"cargo test"}]}}"#,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let report = compute_with_options(
+            &target,
+            &SessionReviewOptions {
+                claude_projects_dir: Some(home.path().join(".claude/projects")),
+                codex_sessions_dir: Some(home.path().join(".codex/sessions")),
+                agent_doc_logs_dir: Some(agent_doc_logs),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            report
+                .failures
+                .iter()
+                .all(|failure| !failure.message.contains("After finalize")
+                    && !failure.message.contains("panic!(")
+                    && failure.message != "command exited with code 1")
+        );
+        assert!(report.failures.iter().any(|failure| {
+            failure.message == "cargo test exited with code 1"
+                && failure.command.as_deref() == Some("cargo test")
+                && failure.session_path.as_deref() == Some(rollout_path.to_str().unwrap())
+        }));
+        assert!(report.failures.iter().any(|failure| {
+            failure.message.contains("assertion failed")
+                && failure.command.as_deref() == Some("cargo test")
+                && failure.session_path.as_deref() == Some(rollout_path.to_str().unwrap())
+        }));
     }
 
     #[test]

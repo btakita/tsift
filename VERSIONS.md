@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- `session-digest` and `session-review` failure rows now carry parsed command/session anchors, filter active prompt directives and source snippets out of failure extraction, and preserve real assertion/panic evidence plus named command exits such as `cargo test exited with code 1`.
 - `tsift search` now delegates free-text query normalization to the `tagpath` v0.6.2 query API, while search/explain/session-review/context-pack preview refs derive canonical `tag_alias` values from the shared `tagpath` family API instead of local parser helpers.
 - `context-pack` now loads tagpath ontology docs from `.naming/tags/*.md` and attaches compact ontology references to visible symbol refs, summary refs, and the top-level handoff payload so stable tag docs can be referenced by handle/path without repeating ontology prose.
 - Regression coverage now locks ontology refs in both preview-builder unit tests and the compiled `context-pack --json` integration path.

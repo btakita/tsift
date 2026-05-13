@@ -6171,8 +6171,20 @@ fn cmd_session_review_with_budget(
             println!("Unresolved failures:");
             for failure in &report.next_context.unresolved_failures {
                 println!(
-                    "  - [{}] {} ({})",
-                    failure.kind, failure.message, failure.occurrences
+                    "  - [{}] {} ({}){}{}",
+                    failure.kind,
+                    failure.message,
+                    failure.occurrences,
+                    failure
+                        .command
+                        .as_ref()
+                        .map(|command| format!(" command: {command}"))
+                        .unwrap_or_default(),
+                    failure
+                        .session_path
+                        .as_ref()
+                        .map(|path| format!(" session: {path}"))
+                        .unwrap_or_default()
                 );
             }
         }
@@ -6251,10 +6263,20 @@ fn cmd_session_review_with_budget(
         }
         for failure in &report.failures {
             println!(
-                "fail {} count:{} {}",
+                "fail {} count:{} {}{}{}",
                 failure.kind,
                 failure.occurrences,
-                truncate_for_compact(&failure.message, 100)
+                truncate_for_compact(&failure.message, 100),
+                failure
+                    .command
+                    .as_ref()
+                    .map(|command| format!(" command:{}", truncate_for_compact(command, 80)))
+                    .unwrap_or_default(),
+                failure
+                    .session_path
+                    .as_ref()
+                    .map(|path| format!(" session:{}", truncate_for_compact(path, 80)))
+                    .unwrap_or_default()
             );
         }
         for cluster in &report.loop_clusters {
@@ -6355,8 +6377,20 @@ fn cmd_session_review_with_budget(
         println!("Failures:");
         for failure in &report.failures {
             println!(
-                "  - [{}] {} ({})",
-                failure.kind, failure.message, failure.occurrences
+                "  - [{}] {} ({}){}{}",
+                failure.kind,
+                failure.message,
+                failure.occurrences,
+                failure
+                    .command
+                    .as_ref()
+                    .map(|command| format!(" command: {command}"))
+                    .unwrap_or_default(),
+                failure
+                    .session_path
+                    .as_ref()
+                    .map(|path| format!(" session: {path}"))
+                    .unwrap_or_default()
             );
         }
     }
@@ -6460,6 +6494,10 @@ struct SessionReviewBudgetFailurePreview {
     kind: String,
     message: String,
     occurrences: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_path: Option<String>,
     expand: String,
 }
 
@@ -6729,6 +6767,14 @@ fn build_session_review_budget_report(
             kind: entry.kind.clone(),
             message: truncate_for_budget(&entry.message, max_bytes),
             occurrences: entry.occurrences,
+            command: entry
+                .command
+                .as_ref()
+                .map(|command| truncate_for_budget(command, max_bytes)),
+            session_path: entry
+                .session_path
+                .as_ref()
+                .map(|path| truncate_for_budget(path, max_bytes)),
             expand: review_expand.clone(),
         })
         .collect();
@@ -6835,6 +6881,14 @@ fn build_session_review_next_context_budget_report(
                 kind: entry.kind.clone(),
                 message: truncate_for_budget(&entry.message, max_bytes),
                 occurrences: entry.occurrences,
+                command: entry
+                    .command
+                    .as_ref()
+                    .map(|command| truncate_for_budget(command, max_bytes)),
+                session_path: entry
+                    .session_path
+                    .as_ref()
+                    .map(|path| truncate_for_budget(path, max_bytes)),
                 expand: format!(
                     "tsift session-review {} --next-context --json",
                     shell_quote(&report.target)
@@ -6881,8 +6935,22 @@ fn print_session_review_budget_human(report: &SessionReviewBudgetReport) {
     }
     for failure in &report.failures {
         println!(
-            "fail {} {} count:{} {} expand:{}",
-            failure.handle, failure.kind, failure.occurrences, failure.message, failure.expand
+            "fail {} {} count:{} {}{}{} expand:{}",
+            failure.handle,
+            failure.kind,
+            failure.occurrences,
+            failure.message,
+            failure
+                .command
+                .as_ref()
+                .map(|command| format!(" command:{command}"))
+                .unwrap_or_default(),
+            failure
+                .session_path
+                .as_ref()
+                .map(|path| format!(" session:{path}"))
+                .unwrap_or_default(),
+            failure.expand
         );
     }
     for guardrail in &report.guardrails {
@@ -6938,8 +7006,22 @@ fn print_session_review_next_context_budget_human(report: &SessionReviewNextCont
     }
     for failure in &report.unresolved_failures {
         println!(
-            "fail {} {} count:{} {} expand:{}",
-            failure.handle, failure.kind, failure.occurrences, failure.message, failure.expand
+            "fail {} {} count:{} {}{}{} expand:{}",
+            failure.handle,
+            failure.kind,
+            failure.occurrences,
+            failure.message,
+            failure
+                .command
+                .as_ref()
+                .map(|command| format!(" command:{command}"))
+                .unwrap_or_default(),
+            failure
+                .session_path
+                .as_ref()
+                .map(|path| format!(" session:{path}"))
+                .unwrap_or_default(),
+            failure.expand
         );
     }
     for command in &report.next_digest_commands {
@@ -14719,6 +14801,8 @@ tier = "private"
                     kind: "timeout".to_string(),
                     message: "search timed out".to_string(),
                     occurrences: 1,
+                    command: None,
+                    session_path: None,
                 }],
                 next_digest_commands: vec![
                     "tsift session-review --next-context tasks/software/tsift.md".to_string(),
