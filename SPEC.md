@@ -837,6 +837,7 @@ The opening marker embeds the tsift version (`v=X.Y.Z`) that generated it. When 
 - Pre-versioned markers (no `v=` attribute) are treated as stale
 
 This ensures agent sessions always use instructions matching the installed binary.
+Release-bump regressions are covered through the compiled CLI path: a stale Code Navigation marker from the previous binary version must be rewritten by `tsift status --fix --json`, and the final JSON report must show `instructions.state=current` for the installed version.
 
 ## Status (Session Health Check)
 

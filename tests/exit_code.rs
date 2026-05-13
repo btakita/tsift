@@ -1104,6 +1104,58 @@ fn status_fix_refreshes_stale_index_before_reporting_json() {
 }
 
 #[test]
+fn status_fix_refreshes_stale_instructions_after_version_bump_in_json() {
+    let dir = indexed_cli_fixture();
+    fs::write(
+        dir.path().join("AGENTS.md"),
+        "<!-- tsift:code-navigation v=0.1.41 -->\n## Code Navigation\nOld guidance.\n<!-- /tsift:code-navigation -->\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["status", "--fix", "--json", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"instructions\":{\"state\":\"current\""),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"state\":\"stale\""),
+        "stdout was: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("status fix: refreshing tsift instructions"),
+        "stderr was: {stderr}"
+    );
+
+    let agents = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+    assert!(
+        agents.contains(&format!(
+            "<!-- tsift:code-navigation v={} -->",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "AGENTS.md was: {agents}"
+    );
+    assert!(
+        !agents.contains("v=0.1.41") && !agents.contains("Old guidance."),
+        "AGENTS.md was: {agents}"
+    );
+}
+
+#[test]
 fn status_autoindexes_missing_workspace_scopes_even_when_root_index_exists_in_json() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(

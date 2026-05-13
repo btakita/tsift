@@ -15,6 +15,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 - Added a tsift-local deterministic SimWorld for session prompt extraction, rewrite routing, and status recommendation edge coverage. The fast corpus runs in normal `cargo test`; the wider ignored corpus runs in GitHub Actions through `make ci-full`.
 - The generated Code Navigation guidance now tells agents to run local `make check`, then inspect the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1` and fix red CI before calling work complete.
 - `tsift log-digest` now treats structured agent-doc runtime fields as anchors: `file=...` and `path=...` become file refs without requiring line numbers, while timestamped event names plus `event=...`, `pane=...`, and `session=...` become structured symbol refs.
+- Added a compiled-CLI regression proving `tsift status --fix --json` refreshes stale Code Navigation instructions from the prior binary version and reports the upgraded instructions as current.
 
 ## 0.1.42
 

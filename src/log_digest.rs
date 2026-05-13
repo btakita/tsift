@@ -645,10 +645,8 @@ fn extract_agent_doc_log_fields(line: &str) -> AgentDocLogFields {
             continue;
         }
         match key {
-            "file" | "path" => {
-                if looks_like_path(value) {
-                    fields.file_paths.push(value.to_string());
-                }
+            "file" | "path" if looks_like_path(value) => {
+                fields.file_paths.push(value.to_string());
             }
             "event" => fields.symbol_refs.push(format!("event:{value}")),
             "pane" => fields.symbol_refs.push(format!("pane:{value}")),
