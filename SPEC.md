@@ -87,6 +87,7 @@ tsift --envelope context-pack tasks/software/tsift.md --test-input test.log --lo
 tsift test-digest --path . < test.log  # bounded test-output digest from stdin or --input
 tsift metric-digest < runs.json  # repeated metric-run digest: deltas, improvements, news-ready table
 tsift dci-benchmark --fixture fixtures/dci-search-benchmark.json  # recorded multi-hop DCI search comparison
+tsift workflow search          # handle-preserving search/explain/summarize/digest recipe
 tsift log-digest --path . < build.log  # bounded verbose-log digest from stdin or --input
 tsift session-digest --path . < session.md  # session transcript digest: prompt targets, commands, touched files/symbols, failures, closeout
 tsift session-cost < session.jsonl  # token/runtime cost digest: prompt totals, cache ratios, large-turn outliers, restart churn
@@ -147,6 +148,18 @@ When an exact or otherwise high-hit search returns repeated matches from the sam
 Because that auto-exact routing closes the main literal-lookup gap after the stable search cache work, tsift still defers any native content/FTS table inside `.tsift/index.db`. Broad prose retrieval remains sift's job; exact content lookups stay on ripgrep unless real usage proves that rg-backed exact search leaves an important gap.
 
 `tsift explain` keeps the full JSON/tabular edge list, but the default human-readable caller/callee sections now collapse dense same-file edge sets into grouped file rows with counts. That reduces token volume for highly-connected symbols while preserving the concrete caller/callee names in the grouped summary.
+
+## Handle-Preserving Search Workflow
+
+`tsift workflow search` prints a composable recipe for agents that need to move from literal lookup to broader retrieval without losing stable handles. The JSON and envelope forms (`tsift --envelope workflow search`, `tsift workflow search --json`) list ordered steps for:
+
+- exact anchors: `tsift --envelope search "<literal>" --exact --path . --budget normal`
+- semantic broadening: `tsift --envelope search "<concept>" --strategy hybrid --path . --budget normal`
+- graph expansion: `tsift --envelope explain "<symbol>" --path . --budget normal`
+- summary reads: `tsift summarize "<symbol>" --path . --json`
+- digest expansion: `tsift --envelope context-pack <path> --test-input test.log --log-input build.log --budget normal`
+
+The contract is to keep every emitted handle with its originating command, query, path, and strategy, then use each result's `expand`, `follow_up`, or `resume_commands` field for the next command while citing the parent handle. Search previews preserve `sfam-*` and `shit-*` handles, explain previews preserve `edef-*`, `ecall-*`, and `eces-*` handles, and digest/context-pack outputs preserve artifact and touched-symbol handles across diff, test, log, and session expansions.
 
 When an index is present, the AST symbol-ranking prepass is now bounded: SQLite only pulls exact-name rows and overlapping-tag candidates, orders them by exact/tag overlap, and caps that candidate scan to the requested search `--limit` instead of loading the full `symbols` table into memory first.
 

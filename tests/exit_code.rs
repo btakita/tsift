@@ -4468,6 +4468,56 @@ fn exact_search_human_output_collapses_repeated_hits_by_file() {
 }
 
 #[test]
+fn workflow_search_json_documents_handle_preserving_recipe() {
+    let output = tsift_bin()
+        .args(["workflow", "search", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "workflow should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["topic"], "search");
+    let steps = json["steps"].as_array().unwrap();
+    let names: Vec<&str> = steps
+        .iter()
+        .map(|step| step["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "exact-anchor",
+            "semantic-search",
+            "explain-symbol",
+            "summarize-selection",
+            "digest-expansion"
+        ]
+    );
+    assert!(
+        json["handle_contract"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str().unwrap().contains("originating command")),
+        "{json}"
+    );
+    assert!(
+        steps.iter().any(|step| step["command"]
+            .as_str()
+            .unwrap()
+            .contains("tsift --envelope explain")),
+        "{json}"
+    );
+    assert!(
+        steps.iter().any(|step| step["preserves"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str().unwrap().contains("artifact handles"))),
+        "{json}"
+    );
+}
+
+#[test]
 fn explain_human_output_collapses_dense_edges_by_file() {
     let dir = indexed_cli_fixture();
 

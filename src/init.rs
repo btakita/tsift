@@ -20,6 +20,7 @@ Use the commands listed in its `use:` output:
 - `tsift --envelope explain <symbol> --budget normal` — callers, callees, community preview
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
+- `tsift workflow search` — ordered exact/search/explain/summarize/digest recipe that preserves result handles across expansions
 
 Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
 - `tsift --envelope session-review <path> --next-context --budget normal` or `tsift --envelope context-pack <path> --budget normal` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.

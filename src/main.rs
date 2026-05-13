@@ -492,6 +492,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Print composable agent workflows that preserve tsift result handles
+    Workflow {
+        /// Workflow topic to print
+        #[arg(default_value = "search")]
+        topic: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Summarize session transcripts into prompt targets, commands, touched code, failures, and closeout evidence
     SessionDigest {
         /// Path to the codebase (defaults to current directory)
@@ -1166,6 +1175,17 @@ fn main() -> Result<()> {
                 envelope,
             },
         ),
+        Some(Commands::Workflow { topic, json }) => cmd_workflow(
+            &topic,
+            OutputFormat {
+                json_output: json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                schema,
+                envelope,
+            },
+        ),
         Some(Commands::SessionDigest {
             path,
             input,
@@ -1386,6 +1406,159 @@ fn print_json_or_envelope<T: Serialize>(
         );
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct WorkflowStep {
+    name: &'static str,
+    goal: &'static str,
+    command: &'static str,
+    preserves: Vec<&'static str>,
+    next: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct WorkflowRecipe {
+    topic: &'static str,
+    summary: &'static str,
+    handle_contract: Vec<&'static str>,
+    steps: Vec<WorkflowStep>,
+}
+
+fn search_workflow_recipe() -> WorkflowRecipe {
+    WorkflowRecipe {
+        topic: "search",
+        summary: "Chain exact search, semantic search, explain, summarize, and digest commands without dropping the stable handles emitted by each envelope.",
+        handle_contract: vec![
+            "Keep every handle with its originating command, query, path, and strategy.",
+            "Use each step's expand command for deeper context, but cite the parent handle in notes and follow-up prompts.",
+            "Prefer --envelope plus --budget normal when handing results to an agent so handles, follow_up commands, and truncation state stay machine-readable.",
+        ],
+        steps: vec![
+            WorkflowStep {
+                name: "exact-anchor",
+                goal: "Start from a literal identifier, file path, error text, or prior handle label.",
+                command: "tsift --envelope search \"<literal>\" --exact --path . --budget normal",
+                preserves: vec![
+                    "summary.handle",
+                    "report.symbols[].handle",
+                    "report.hits[].handle",
+                ],
+                next: vec![
+                    "Run the matching report.symbols[].expand or report.hits[].expand command before broadening the query.",
+                ],
+            },
+            WorkflowStep {
+                name: "semantic-search",
+                goal: "Broaden from the exact anchor to lexical, vector, or hybrid retrieval while keeping search-family handles.",
+                command: "tsift --envelope search \"<concept>\" --path . --strategy hybrid --budget normal",
+                preserves: vec![
+                    "sfam-* symbol-family handles",
+                    "shit-* content-hit handles",
+                    "follow_up[]",
+                ],
+                next: vec![
+                    "Use a symbol-family expand command for more search results, or pass the selected symbol name to explain.",
+                ],
+            },
+            WorkflowStep {
+                name: "explain-symbol",
+                goal: "Expand a selected symbol into definitions, callers, callees, and community context.",
+                command: "tsift --envelope explain \"<symbol>\" --path . --budget normal",
+                preserves: vec![
+                    "edef-* definition handles",
+                    "ecall-* caller handles",
+                    "eces-* callee handles",
+                ],
+                next: vec![
+                    "Run edge expand commands for neighboring symbols, or summarize the selected symbol/file when the cache is available.",
+                ],
+            },
+            WorkflowStep {
+                name: "summarize-selection",
+                goal: "Read cached summaries for the selected symbol or file without mutating the summary cache.",
+                command: "tsift summarize \"<symbol>\" --path . --json",
+                preserves: vec![
+                    "summary refs emitted by search, explain, test-digest, log-digest, diff-digest, and context-pack",
+                ],
+                next: vec![
+                    "If summaries are missing, run the status-recommended summarize --extract command outside the read-only query path.",
+                ],
+            },
+            WorkflowStep {
+                name: "digest-expansion",
+                goal: "Expand from code navigation into changed files, tests, logs, or session context while retaining digest artifact handles.",
+                command: "tsift --envelope context-pack <path> --test-input test.log --log-input build.log --budget normal",
+                preserves: vec![
+                    "artifact handles",
+                    "touched symbol handles",
+                    "digest summary handles",
+                    "resume_commands[]",
+                ],
+                next: vec![
+                    "Use resume_commands[] or each digest entry's expand command, and carry forward the original search/explain handle that motivated the digest.",
+                ],
+            },
+        ],
+    }
+}
+
+fn workflow_recipe(topic: &str) -> Result<WorkflowRecipe> {
+    match topic {
+        "search" | "search-handles" | "search-workflow" => Ok(search_workflow_recipe()),
+        other => bail!("unknown workflow `{other}`; available workflows: search"),
+    }
+}
+
+fn print_workflow_human(recipe: &WorkflowRecipe, compact: bool) {
+    if compact {
+        println!("workflow:{} steps:{}", recipe.topic, recipe.steps.len());
+        for step in &recipe.steps {
+            println!("  {} cmd:{}", step.name, step.command);
+        }
+        return;
+    }
+
+    println!("Workflow: {}", recipe.topic);
+    println!("{}", recipe.summary);
+    println!();
+    println!("Handle contract:");
+    for item in &recipe.handle_contract {
+        println!("  - {item}");
+    }
+    println!();
+    println!("Steps:");
+    for (index, step) in recipe.steps.iter().enumerate() {
+        println!("  {}. {} - {}", index + 1, step.name, step.goal);
+        println!("     cmd: {}", step.command);
+        println!("     preserves: {}", step.preserves.join(", "));
+        println!("     next: {}", step.next.join(" "));
+    }
+}
+
+fn cmd_workflow(topic: &str, format: OutputFormat) -> Result<()> {
+    let recipe = workflow_recipe(topic)?;
+    if format.json_output {
+        print_json_or_envelope(
+            &recipe,
+            &format,
+            "workflow",
+            recipe.topic,
+            ToolEnvelopeSummary {
+                text: recipe.summary.to_string(),
+                metrics: vec![envelope_metric("steps", recipe.steps.len())],
+            },
+            false,
+            recipe
+                .steps
+                .iter()
+                .map(|step| step.command.to_string())
+                .collect(),
+        )
+    } else {
+        print_workflow_human(&recipe, format.compact);
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -13371,6 +13544,58 @@ tier = "private"
             false,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn cli_workflow_defaults_to_search_topic() {
+        let cli = Cli::parse_from(["tsift", "workflow"]);
+        match cli.command {
+            Some(Commands::Workflow { topic, json }) => {
+                assert_eq!(topic, "search");
+                assert!(!json);
+            }
+            _ => panic!("expected Workflow command"),
+        }
+    }
+
+    #[test]
+    fn search_workflow_recipe_preserves_handles_across_expansions() {
+        let recipe = search_workflow_recipe();
+        let step_names: Vec<&str> = recipe.steps.iter().map(|step| step.name).collect();
+        assert_eq!(
+            step_names,
+            vec![
+                "exact-anchor",
+                "semantic-search",
+                "explain-symbol",
+                "summarize-selection",
+                "digest-expansion"
+            ]
+        );
+        assert!(
+            recipe
+                .handle_contract
+                .iter()
+                .any(|item| item.contains("originating command"))
+        );
+        assert!(
+            recipe.steps[1]
+                .preserves
+                .iter()
+                .any(|item| item.contains("sfam-*"))
+        );
+        assert!(
+            recipe.steps[2]
+                .preserves
+                .iter()
+                .any(|item| item.contains("ecall-*"))
+        );
+        assert!(
+            recipe.steps[4]
+                .preserves
+                .iter()
+                .any(|item| item.contains("artifact handles"))
+        );
     }
 
     // --- JSON compact vs pretty ---
