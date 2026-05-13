@@ -44,6 +44,7 @@ enum Step {
     RewriteTestCommand,
     RewriteLogCommand,
     RewriteDiffCommand,
+    RewriteFileListingPassthrough,
     RewriteMetacharacterPassthrough,
     StatusMissingInstructions,
     StatusStaleInstructions,
@@ -52,7 +53,7 @@ enum Step {
 
 impl Step {
     fn from_index(index: u64) -> Self {
-        match index % 13 {
+        match index % 14 {
             0 => Self::SessionLivePrompt,
             1 => Self::SessionInstructionBallast,
             2 => Self::RewriteLongSessionRead,
@@ -62,9 +63,10 @@ impl Step {
             6 => Self::RewriteTestCommand,
             7 => Self::RewriteLogCommand,
             8 => Self::RewriteDiffCommand,
-            9 => Self::RewriteMetacharacterPassthrough,
-            10 => Self::StatusMissingInstructions,
-            11 => Self::StatusStaleInstructions,
+            9 => Self::RewriteFileListingPassthrough,
+            10 => Self::RewriteMetacharacterPassthrough,
+            11 => Self::StatusMissingInstructions,
+            12 => Self::StatusStaleInstructions,
             _ => Self::StatusCurrentInstructions,
         }
     }
@@ -129,6 +131,7 @@ impl SimWorld {
             Step::RewriteTestCommand => self.rewrite_test_command(),
             Step::RewriteLogCommand => self.rewrite_log_command(),
             Step::RewriteDiffCommand => self.rewrite_diff_command(),
+            Step::RewriteFileListingPassthrough => self.rewrite_file_listing_passthrough(),
             Step::RewriteMetacharacterPassthrough => self.rewrite_metacharacter_passthrough(),
             Step::StatusMissingInstructions => self.status_missing_instructions(),
             Step::StatusStaleInstructions => self.status_stale_instructions(),
@@ -224,6 +227,15 @@ do [#t275]. spec-test-build-install-commit-push
             Some("tsift diff-digest --cached .".to_string())
         );
         self.coverage.mark("rewrite/diff_digest");
+    }
+
+    fn rewrite_file_listing_passthrough(&mut self) {
+        assert_eq!(rewrite_command("rg --files src .agent-doc logs"), None);
+        assert_eq!(
+            rewrite_command("find src .agent-doc -type f -name '*.rs'"),
+            None
+        );
+        self.coverage.mark("rewrite/file_listing_passthrough");
     }
 
     fn rewrite_metacharacter_passthrough(&mut self) {
@@ -330,6 +342,7 @@ fn required_coverage() -> &'static [&'static str] {
         "rewrite/test_digest",
         "rewrite/log_digest",
         "rewrite/diff_digest",
+        "rewrite/file_listing_passthrough",
         "rewrite/metacharacter_passthrough",
         "status/missing_instructions",
         "status/stale_instructions",
@@ -349,6 +362,7 @@ fn sim_world_named_edge_trace_covers_session_rewrite_status_edges() {
         Step::RewriteTestCommand,
         Step::RewriteLogCommand,
         Step::RewriteDiffCommand,
+        Step::RewriteFileListingPassthrough,
         Step::RewriteMetacharacterPassthrough,
         Step::StatusMissingInstructions,
         Step::StatusStaleInstructions,

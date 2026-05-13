@@ -4751,6 +4751,26 @@ fn rewrite_run_fails_closed_when_no_rewrite_exists() {
 }
 
 #[test]
+fn rewrite_rg_files_fails_closed_for_passthrough() {
+    let output = tsift_bin()
+        .args(["rewrite", "rg --files src/tsift .agent-doc logs"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn rewrite_find_fails_closed_for_passthrough() {
+    let output = tsift_bin()
+        .args(["rewrite", "find src/tsift .agent-doc -type f -name '*.rs'"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
 fn rewrite_run_envelopes_cargo_test_digest_output_by_default() {
     let dir = tempfile::tempdir().unwrap();
     init_rust_library_crate(dir.path());

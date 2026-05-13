@@ -11594,6 +11594,18 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_rg_files_passthrough() {
+        let result = rewrite_command("rg --files src/tsift .agent-doc logs");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn rewrite_find_passthrough() {
+        let result = rewrite_command("find src/tsift .agent-doc -type f -name '*.rs'");
+        assert_eq!(result, None);
+    }
+
+    #[test]
     fn rewrite_grep_recursive() {
         let result = rewrite_command("grep -r authenticate src/");
         assert_eq!(
@@ -16976,6 +16988,16 @@ fn rewrite_rg(cmd: &str) -> Option<String> {
         return None;
     }
 
+    // File-listing forms do not have a search pattern. Leave them to the
+    // original command so roots, globs, and ignore rules keep rg semantics.
+    if parts
+        .iter()
+        .skip(1)
+        .any(|part| matches!(*part, "--files" | "--type-list"))
+    {
+        return None;
+    }
+
     // Skip if rg is used with complex flags we can't translate
     // (pipe chains, output redirection, --replace, --count, etc.)
     if cmd.contains('|')
@@ -16984,6 +17006,7 @@ fn rewrite_rg(cmd: &str) -> Option<String> {
         || cmd.contains("--count")
         || cmd.contains("-c")
         || cmd.contains("--files-with-matches")
+        || cmd.contains("--files-without-match")
         || cmd.contains("-l")
     {
         return None;

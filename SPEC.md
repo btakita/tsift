@@ -1287,6 +1287,8 @@ The existing `tsift-rewrite.sh` hook intercepts high-token shell commands and si
 - `cargo test ...`, `pytest ...`, `python -m pytest ...` → `tsift --envelope __digest-runner --kind test ...`
 - `cargo build ...`, `cargo check ...`, `cargo clippy ...`, `cargo install ...` → `tsift --envelope __digest-runner --kind log ...`
 
+File-listing commands are not search rewrites. `rg --files ...`, `rg --type-list`, and `find ...` pass through so multiple roots, glob/predicate semantics, shell safety, ignore rules, and the original listing behavior are preserved instead of treating a root path as an exact search pattern. In hook/manual `tsift rewrite` protocol terms this is a no-rewrite exit, so the caller can run the original command unchanged.
+
 The digest-runner path preserves the wrapped command's original exit status while replacing raw stdout/stderr with a summary-first envelope, bounded digest, and persisted transcript artifact, so failing tests/builds still fail closed and green runs do not inline raw logs. When RTK is installed, digest-runner probes `rtk rewrite <command>` and delegates supported generic command families to RTK's compact filters before wrapping the filtered output in tsift's envelope/artifact metadata. See `~/.claude/hooks/tsift-rewrite.sh`.
 
 Harnesses that do not expose Claude-style `PreToolUse` hooks can still reuse the same rewrite path manually via `tsift rewrite --run '<command>'`. In `--run` mode, tsift executes the rewritten command directly instead of only printing it, preserves the rewritten command's exit status, and emits the same envelope search previews and digest-runner artifact envelopes by default.
