@@ -268,6 +268,7 @@ struct MatchSignals {
 
 #[derive(Debug, Clone, Default)]
 struct DocumentActiveContext {
+    has_live_tail: bool,
     prompt_targets: Vec<String>,
     touched_files: Vec<SessionReviewFileRef>,
     touched_symbols: Vec<SessionReviewSymbolRef>,
@@ -275,8 +276,12 @@ struct DocumentActiveContext {
 }
 
 impl DocumentActiveContext {
-    fn has_live_prompts(&self) -> bool {
-        !self.prompt_targets.is_empty()
+    fn should_scope_next_context(&self) -> bool {
+        self.has_live_tail
+            || !self.prompt_targets.is_empty()
+            || !self.touched_files.is_empty()
+            || !self.touched_symbols.is_empty()
+            || !self.failures.is_empty()
     }
 }
 
@@ -741,7 +746,7 @@ pub fn compute_with_options(
         }
     };
     let (active_prompt_targets, next_context_files, next_context_symbols, next_context_failures) =
-        if document_active_context.has_live_prompts() {
+        if document_active_context.should_scope_next_context() {
             (
                 document_active_context.prompt_targets,
                 document_active_context.touched_files,
@@ -922,8 +927,18 @@ fn collect_document_active_context(context: &TargetContext) -> Result<DocumentAc
     };
     let tail = active_exchange_tail(exchange);
     let digest = session_digest::compute(&context.root, &tail, Some("markdown"))?;
+    let fallback_prompt_targets = if digest.prompt_targets.is_empty() {
+        collect_live_tail_prompt_lines(&tail)
+    } else {
+        Vec::new()
+    };
     Ok(DocumentActiveContext {
-        prompt_targets: digest.prompt_targets,
+        has_live_tail: has_meaningful_live_tail(&tail),
+        prompt_targets: if digest.prompt_targets.is_empty() {
+            fallback_prompt_targets
+        } else {
+            digest.prompt_targets
+        },
         touched_files: digest
             .touched_files
             .into_iter()
@@ -955,6 +970,48 @@ fn collect_document_active_context(context: &TargetContext) -> Result<DocumentAc
             })
             .collect(),
     })
+}
+
+fn collect_live_tail_prompt_lines(tail: &str) -> Vec<String> {
+    let mut prompts = Vec::new();
+    let mut buffer = Vec::new();
+    for raw_line in tail.lines() {
+        let Some(line) = meaningful_live_tail_line(raw_line) else {
+            if !buffer.is_empty() {
+                prompts.push(buffer.join(" "));
+                buffer.clear();
+            }
+            continue;
+        };
+        buffer.push(line.to_string());
+    }
+    if !buffer.is_empty() {
+        prompts.push(buffer.join(" "));
+    }
+    prompts
+}
+
+fn has_meaningful_live_tail(tail: &str) -> bool {
+    tail.lines()
+        .any(|line| meaningful_live_tail_line(line).is_some())
+}
+
+fn meaningful_live_tail_line(line: &str) -> Option<&str> {
+    let trimmed = line
+        .trim()
+        .strip_prefix("❯ ")
+        .or_else(|| line.trim().strip_prefix("> "))
+        .unwrap_or_else(|| line.trim())
+        .trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("<!--")
+        || trimmed.starts_with("###")
+        || trimmed == "#"
+        || trimmed == "---"
+    {
+        return None;
+    }
+    Some(trimmed)
 }
 
 fn extract_agent_component<'a>(content: &'a str, name: &str) -> Option<&'a str> {
@@ -1846,6 +1903,83 @@ do [#active]. spec-test-build-install-commit-push
                 .iter()
                 .all(|path| path != "/!")
         );
+        assert!(report.next_context.unresolved_failures.is_empty());
+    }
+
+    #[test]
+    fn session_review_next_context_scopes_freeform_live_exchange_tail() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let target = root.path().join("tasks/software/tsift.md");
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(
+            &target,
+            "\
+---
+agent_doc_session: tsift-v0.1
+agent_doc_format: template
+---
+
+## Exchange
+
+<!-- agent:exchange patch=append -->
+### Session Summary
+
+*Compacted. Content archived to `/tmp/archive.md`*
+
+Compacted content:
+- Archived 1 response topic(s): prior review
+<!-- agent:boundary:freeform -->
+Evaluate the logs for tsift effectiveness and bugs. #next-steps
+<!-- /agent:exchange -->
+",
+        )
+        .unwrap();
+
+        let agent_doc_logs = root.path().join(".agent-doc/logs");
+        fs::create_dir_all(&agent_doc_logs).unwrap();
+        fs::write(
+            agent_doc_logs.join("tsift-v0.1.log"),
+            concat!(
+                "[1776712372] session_start file=tasks/software/tsift.md pane=%77 session=tsift-v0.1\n",
+                "[1776712373] cwd_resolved path=/tmp/replace-me source=project_root\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("rollout-stale.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#stale]. spec-test-build-install-commit-push\nagent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+                "\n",
+                r####"{"type":"event_msg","payload":{"type":"agent_message","message":"### Re: stale work\nError: old unresolved failure at /!\n`/!` should not be active context"}}"####,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let report = compute_with_options(
+            &target,
+            &SessionReviewOptions {
+                claude_projects_dir: Some(home.path().join(".claude/projects")),
+                codex_sessions_dir: Some(home.path().join(".codex/sessions")),
+                agent_doc_logs_dir: Some(agent_doc_logs),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.next_context.active_prompt_targets,
+            vec!["Evaluate the logs for tsift effectiveness and bugs. #next-steps".to_string()]
+        );
+        assert!(report.next_context.touched_files.is_empty());
         assert!(report.next_context.unresolved_failures.is_empty());
     }
 
