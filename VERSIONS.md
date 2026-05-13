@@ -14,6 +14,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 - Budgeted `session-review --next-context` now keeps follow-up digest commands on an independent 4-command floor and preserves them verbatim, so small previews do not hide or corrupt the resume commands measured by the real-session token-savings fixture.
 - Added a tsift-local deterministic SimWorld for session prompt extraction, rewrite routing, and status recommendation edge coverage. The fast corpus runs in normal `cargo test`; the wider ignored corpus runs in GitHub Actions through `make ci-full`.
 - The generated Code Navigation guidance now tells agents to run local `make check`, then inspect the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1` and fix red CI before calling work complete.
+- `tsift log-digest` now treats structured agent-doc runtime fields as anchors: `file=...` and `path=...` become file refs without requiring line numbers, while timestamped event names plus `event=...`, `pane=...`, and `session=...` become structured symbol refs.
 
 ## 0.1.42
 

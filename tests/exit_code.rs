@@ -2982,6 +2982,67 @@ at src/lib.rs:1:1
 }
 
 #[test]
+fn log_digest_reads_agent_doc_structured_runtime_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("tasks/software")).unwrap();
+    fs::write(dir.path().join("tasks/software/tsift.md"), "# tsift\n").unwrap();
+
+    let input = "\
+[1778646072] route_dispatch_start_proven file=tasks/software/tsift.md pane=%31 harness=codex proof=consumed timeout_secs=10
+[1778646078] document_cycle phase=committed cycle=cycle-1778644920810 event=commit_success session=tsift-v0.1 pane=%31
+";
+
+    let mut child = tsift_bin()
+        .args([
+            "log-digest",
+            "--json",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "log-digest should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["file_ref_groups"], 1);
+    assert_eq!(json["file_refs"][0]["path"], "tasks/software/tsift.md");
+    assert!(json["file_refs"][0]["line"].is_null());
+    assert!(
+        json["symbol_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["symbol"] == "event:commit_success")
+    );
+    assert!(
+        json["symbol_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["symbol"] == "pane:%31")
+    );
+    assert!(
+        !json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning == "no file anchors detected")
+    );
+}
+
+#[test]
 fn metric_digest_reads_run_history_from_stdin() {
     let input = r#"{
   "runs": [

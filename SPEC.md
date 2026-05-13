@@ -1131,7 +1131,7 @@ Behavior:
 
 1. Read captured log output from stdin by default, or from `--input <file>`.
 2. Collapse repeated lines, group warning/error signal lines, and count repeated stack blocks so noisy transcripts stay bounded.
-3. Extract file anchors and symbol-like tokens from the transcript for quick follow-up lookups.
+3. Extract file anchors and symbol-like tokens from the transcript for quick follow-up lookups. Agent-doc runtime-style `file=...` and `path=...` fields count as file anchors even when they do not carry line numbers; timestamped event names plus `event=...`, `pane=...`, and `session=...` fields are retained as structured symbol refs.
 4. When `.tsift/summaries.db` already has current rows for anchored files or extracted symbols, include up to two cached summary snippets; otherwise report `missing`, `stale`, or `unavailable` without mutating the cache.
 
 `log-digest` is intentionally transcript-only. It does not execute the underlying command, and it keeps summary enrichment read-only so digesting verbose output never contends with `tsift summarize --extract`.

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 const MAX_REPEATED_LINES: usize = 8;
 const MAX_SIGNALS: usize = 12;
 const MAX_FILE_REFS: usize = 8;
-const MAX_SYMBOL_REFS: usize = 8;
+const MAX_SYMBOL_REFS: usize = 16;
 const MAX_STACK_GROUPS: usize = 4;
 const MAX_SUMMARY_SNIPPETS: usize = 2;
 
@@ -162,23 +162,21 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
 
         let anchor = extract_anchor(trimmed);
         if let Some(anchor) = &anchor {
-            let display_path = normalize_display_path(&root, &anchor.path)?;
-            let key = format!(
-                "{}:{}:{}",
-                display_path,
-                anchor.line,
-                anchor.column.unwrap_or_default()
-            );
-            let entry = file_refs.entry(key).or_insert_with(|| FileRefBuilder {
-                path: display_path.clone(),
-                line: Some(anchor.line),
-                column: anchor.column,
-                occurrences: 0,
-            });
-            entry.path = display_path;
-            entry.line = Some(anchor.line);
-            entry.column = anchor.column;
-            entry.occurrences += 1;
+            record_file_ref(
+                &mut file_refs,
+                &root,
+                &anchor.path,
+                Some(anchor.line),
+                anchor.column,
+            )?;
+        }
+
+        let structured_fields = extract_agent_doc_log_fields(trimmed);
+        for path in &structured_fields.file_paths {
+            record_file_ref(&mut file_refs, &root, path, None, None)?;
+        }
+        for symbol in structured_fields.symbol_refs {
+            *symbol_counts.entry(symbol).or_default() += 1;
         }
 
         if let Some((severity, message)) = classify_signal(trimmed) {
@@ -188,6 +186,8 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
                     Some(anchor.line),
                     anchor.column,
                 )
+            } else if let Some(raw_path) = structured_fields.file_paths.first() {
+                (Some(normalize_display_path(&root, raw_path)?), None, None)
             } else {
                 (None, None, None)
             };
@@ -511,6 +511,36 @@ fn normalize_display_path(root: &Path, raw: &str) -> Result<String> {
     Ok(summarize::normalize_summary_file_key(path))
 }
 
+fn record_file_ref(
+    file_refs: &mut BTreeMap<String, FileRefBuilder>,
+    root: &Path,
+    raw_path: &str,
+    line: Option<usize>,
+    column: Option<usize>,
+) -> Result<()> {
+    if raw_path.is_empty() || !looks_like_path(raw_path) {
+        return Ok(());
+    }
+    let display_path = normalize_display_path(root, raw_path)?;
+    let key = format!(
+        "{}:{}:{}",
+        display_path,
+        line.unwrap_or_default(),
+        column.unwrap_or_default()
+    );
+    let entry = file_refs.entry(key).or_insert_with(|| FileRefBuilder {
+        path: display_path.clone(),
+        line,
+        column,
+        occurrences: 0,
+    });
+    entry.path = display_path;
+    entry.line = line;
+    entry.column = column;
+    entry.occurrences += 1;
+    Ok(())
+}
+
 fn normalize_line(line: &str) -> String {
     line.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -590,6 +620,64 @@ fn extract_anchor(line: &str) -> Option<Anchor> {
         }
     }
     None
+}
+
+#[derive(Debug, Default)]
+struct AgentDocLogFields {
+    file_paths: Vec<String>,
+    symbol_refs: Vec<String>,
+}
+
+fn extract_agent_doc_log_fields(line: &str) -> AgentDocLogFields {
+    let mut fields = AgentDocLogFields::default();
+
+    if let Some(event) = event_name_from_timestamped_line(line) {
+        fields.symbol_refs.push(format!("event:{event}"));
+    }
+
+    for token in line.split_whitespace() {
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = clean_structured_value(value);
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            "file" | "path" => {
+                if looks_like_path(value) {
+                    fields.file_paths.push(value.to_string());
+                }
+            }
+            "event" => fields.symbol_refs.push(format!("event:{value}")),
+            "pane" => fields.symbol_refs.push(format!("pane:{value}")),
+            "session" => fields.symbol_refs.push(format!("session:{value}")),
+            _ => {}
+        }
+    }
+
+    fields.file_paths.sort();
+    fields.file_paths.dedup();
+    fields.symbol_refs.sort();
+    fields.symbol_refs.dedup();
+    fields
+}
+
+fn event_name_from_timestamped_line(line: &str) -> Option<&str> {
+    let tail = line.strip_prefix('[')?;
+    let (_, rest) = tail.split_once(']')?;
+    let event = rest.split_whitespace().next()?;
+    if event.is_empty() || event.contains('=') {
+        return None;
+    }
+    Some(event)
+}
+
+fn clean_structured_value(value: &str) -> &str {
+    value
+        .trim_matches(['"', '\'', ',', ';', ')', ']', '}'])
+        .trim_start_matches(['"', '\'', '(', '[', '{'])
 }
 
 fn parse_python_anchor(line: &str) -> Option<Anchor> {
@@ -819,6 +907,59 @@ RuntimeError: boom
                 .symbol_refs
                 .iter()
                 .any(|symbol| symbol.symbol == "test_fail")
+        );
+    }
+
+    #[test]
+    fn log_digest_parses_agent_doc_structured_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tasks/software")).unwrap();
+        std::fs::write(dir.path().join("tasks/software/tsift.md"), "# tsift\n").unwrap();
+        std::fs::write(dir.path().join("tasks/software/absolute.md"), "# abs\n").unwrap();
+
+        let input = format!(
+            "\
+[1778646072] route_dispatch_start_proven file=tasks/software/tsift.md pane=%31 harness=codex proof=consumed timeout_secs=10
+[1778646078] document_cycle phase=committed cycle=cycle-1778644920810 event=commit_success session=tsift-v0.1 pane=%31
+[1778646078] commit_staging file={} snap_len=4616 file_len=4664
+",
+            dir.path().join("tasks/software/absolute.md").display()
+        );
+
+        let report = compute(dir.path(), &input).unwrap();
+        assert_eq!(report.file_ref_groups, 2);
+        assert!(
+            report
+                .file_refs
+                .iter()
+                .any(|file_ref| file_ref.path == "tasks/software/tsift.md"
+                    && file_ref.line.is_none())
+        );
+        assert!(
+            report
+                .file_refs
+                .iter()
+                .any(|file_ref| file_ref.path.ends_with("tasks/software/absolute.md"))
+        );
+        for expected in [
+            "event:route_dispatch_start_proven",
+            "event:commit_success",
+            "pane:%31",
+            "session:tsift-v0.1",
+        ] {
+            assert!(
+                report
+                    .symbol_refs
+                    .iter()
+                    .any(|symbol| symbol.symbol == expected),
+                "missing structured symbol {expected}"
+            );
+        }
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning == "no file anchors detected")
         );
     }
 }
