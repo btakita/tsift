@@ -770,6 +770,7 @@ pub fn compute_with_options(
         &next_context_files,
         &next_context_symbols,
         &next_context_failures,
+        &guardrails,
         last_verification.unwrap_or_else(|| SessionReviewVerificationState {
             status: "missing".to_string(),
             detail: "no verification closeout found in matched sessions".to_string(),
@@ -876,6 +877,7 @@ fn build_next_context(
     touched_files: &[SessionReviewFileRef],
     touched_symbols: &[SessionReviewSymbolRef],
     failures: &[SessionReviewFailure],
+    guardrails: &[SessionCostGuardrail],
     last_verification: SessionReviewVerificationState,
 ) -> SessionReviewNextContext {
     let target = context
@@ -886,6 +888,9 @@ fn build_next_context(
         TargetKind::Directory => ".".to_string(),
         TargetKind::File => target.clone(),
     };
+
+    let mut unresolved_failures = failures.to_vec();
+    unresolved_failures.extend(guardrail_next_context_failures(guardrails));
 
     SessionReviewNextContext {
         target,
@@ -899,7 +904,7 @@ fn build_next_context(
             .iter()
             .map(|entry| entry.symbol.clone())
             .collect(),
-        unresolved_failures: failures.to_vec(),
+        unresolved_failures,
         next_digest_commands: vec![
             format!(
                 "tsift session-review --next-context {}",
@@ -910,6 +915,18 @@ fn build_next_context(
             "tsift log-digest --path . < build.log".to_string(),
         ],
     }
+}
+
+fn guardrail_next_context_failures(
+    guardrails: &[SessionCostGuardrail],
+) -> impl Iterator<Item = SessionReviewFailure> + '_ {
+    guardrails.iter().map(|guardrail| SessionReviewFailure {
+        kind: format!("guardrail:{}", guardrail.kind),
+        message: format!("{} Guidance: {}", guardrail.message, guardrail.guidance),
+        occurrences: 1,
+        command: None,
+        session_path: None,
+    })
 }
 
 fn collect_document_active_context(context: &TargetContext) -> Result<DocumentActiveContext> {
@@ -1665,6 +1682,14 @@ mod tests {
                 .guardrails
                 .iter()
                 .any(|guardrail| guardrail.kind == "restart_loop")
+        );
+        assert!(
+            report
+                .next_context
+                .unresolved_failures
+                .iter()
+                .any(|failure| failure.kind == "guardrail:restart_loop"
+                    && failure.message.contains("restart churn detected"))
         );
         assert!(
             report

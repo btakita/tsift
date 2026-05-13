@@ -4004,6 +4004,16 @@ fn session_review_aggregates_cross_harness_logs() {
             .any(|guardrail| guardrail["kind"] == "restart_loop")
     );
     assert!(
+        json["next_context"]["unresolved_failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|failure| failure["kind"] == "guardrail:restart_loop"
+                && failure["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("restart churn detected")))
+    );
+    assert!(
         json["commands"]
             .as_array()
             .unwrap()
