@@ -9,6 +9,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 ## Unreleased
 
 - `tsift rewrite` now leaves file-listing commands such as `rg --files`, `rg --type-list`, and `find ...` on the no-rewrite passthrough path so listing roots and predicates are not misread as exact search patterns.
+- `session-digest` and `session-review` now filter assistant progress and assessment prose about failure-classification false positives, unresolved failure groups, and red/check CI-status commentary instead of reporting those meta lines as failures.
 - `token-savings` fixtures now support source-read rewrite rows with required line-anchor validation, and the real-session fixture covers full-file `cat`/`bat` plus oversized `sed`/`head`/`tail` reads under a fail-under threshold.
 - `session-cost` now reports repeated source-file read diagnostics for Claude/Codex transcripts, grouping native `Read` and common shell reads by path/range with duplicate-token estimates and concrete `tsift source-read` / `tsift summarize --file` follow-ups; `session-review` aggregates the same diagnostics across matched sessions.
 - `log-digest` and `session-digest` now filter agent-doc runtime path fields that normalize to empty display paths or existing directories, preventing project-root `cwd_resolved` events from polluting file anchors and next-context file lists.

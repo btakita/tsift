@@ -1793,6 +1793,76 @@ do [#active]. spec-test-build-install-commit-push
     }
 
     #[test]
+    fn session_review_ignores_assistant_failure_meta_progress() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let target = root.path().join("tasks/software/tsift.md");
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(
+            &target,
+            "\
+---
+agent_doc_session: tsift-v0.1
+agent_doc_format: template
+---
+
+## Exchange
+
+<!-- agent:exchange patch=append -->
+### Session Summary
+
+Prior summary without active failures.
+<!-- agent:boundary:abc123 -->
+<!-- /agent:exchange -->
+",
+        )
+        .unwrap();
+
+        let agent_doc_logs = root.path().join(".agent-doc/logs");
+        fs::create_dir_all(&agent_doc_logs).unwrap();
+        fs::write(
+            agent_doc_logs.join("tsift-v0.1.log"),
+            concat!(
+                "[1776712372] session_start file=tasks/software/tsift.md pane=%77 session=tsift-v0.1\n",
+                "[1776712373] cwd_resolved path=/tmp/replace-me source=project_root\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("rollout-progress.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"agent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"agent_message","message":"I’m checking the session-review failure groups because --next-context reports zero unresolved failures.\nThe previous assessment sentence mentioned failure false positives and prior status updates around red CI checks.\nCI status prose from the progress update should not become a failure row."}}"#,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let report = compute_with_options(
+            &target,
+            &SessionReviewOptions {
+                claude_projects_dir: Some(home.path().join(".claude/projects")),
+                codex_sessions_dir: Some(home.path().join(".codex/sessions")),
+                agent_doc_logs_dir: Some(agent_doc_logs),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.sessions_matched, 2);
+        assert!(report.failures.is_empty());
+        assert!(report.next_context.unresolved_failures.is_empty());
+    }
+
+    #[test]
     fn session_review_failure_rows_keep_command_and_session_anchors() {
         let root = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();

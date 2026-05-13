@@ -1319,6 +1319,7 @@ fn classify_failure(text: &str) -> Option<(String, String)> {
     let normalized = normalize_whitespace(strip_common_prefixes(text));
     if is_non_failure_summary(&normalized)
         || looks_like_failure_instruction(&normalized)
+        || looks_like_failure_meta_discussion(&normalized)
         || looks_like_source_code_snippet(&normalized)
     {
         return None;
@@ -1352,7 +1353,7 @@ fn looks_like_failure_instruction(text: &str) -> bool {
     let first = lower.split_whitespace().next().unwrap_or_default();
     if matches!(
         first,
-        "after" | "before" | "when" | "while" | "preserve" | "report" | "tighten" | "avoid"
+        "after" | "before" | "when" | "while" | "if" | "preserve" | "report" | "tighten" | "avoid"
     ) && (lower.contains(" should ")
         || lower.contains(" must ")
         || lower.contains(" not ")
@@ -1361,7 +1362,48 @@ fn looks_like_failure_instruction(text: &str) -> bool {
     {
         return true;
     }
+    if lower.contains(" should not ") && lower.contains("failure") {
+        return true;
+    }
     false
+}
+
+fn looks_like_failure_meta_discussion(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let mentions_failure = lower.contains("failure") || lower.contains("failed");
+    if !mentions_failure {
+        return false;
+    }
+
+    if lower.contains("false positive")
+        || lower.contains("failure group")
+        || lower.contains("failure classifier")
+        || lower.contains("failure classification")
+        || lower.contains("failure extraction")
+        || lower.contains("unresolved failure")
+        || lower.contains("next-context")
+    {
+        return true;
+    }
+
+    if lower.contains("ci")
+        && (lower.contains("status") || lower.contains("check") || lower.contains("red"))
+        && (lower.contains("prose") || lower.contains("progress") || lower.contains("prior status"))
+    {
+        return true;
+    }
+
+    let first = lower.split_whitespace().next().unwrap_or_default();
+    matches!(
+        first,
+        "i'm" | "i’m" | "i" | "i'll" | "i’ll" | "the" | "this" | "current" | "previous"
+    ) && (lower.contains("checking")
+        || lower.contains("inspecting")
+        || lower.contains("reviewing")
+        || lower.contains("classified")
+        || lower.contains("classifier")
+        || lower.contains("assessment")
+        || lower.contains("progress"))
 }
 
 fn looks_like_source_code_snippet(text: &str) -> bool {
@@ -1853,6 +1895,20 @@ pytest summary: 4 passed, 0 failed in 0.02s
 ";
 
         let report = compute(dir.path(), input, None).unwrap();
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn codex_jsonl_digest_ignores_assistant_failure_meta_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = concat!(
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"agent-doc /tmp/tasks/software/tsift.md"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"I’m checking the session-review failure groups because --next-context reports zero unresolved failures.\nThe previous assessment sentence mentioned failure false positives and prior status updates around red CI checks.\nCI status prose from the progress update should not become a failure row."}}"#,
+            "\n"
+        );
+
+        let report = compute(dir.path(), input, Some("codex-jsonl")).unwrap();
         assert!(report.failures.is_empty());
     }
 
