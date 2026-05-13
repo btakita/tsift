@@ -308,6 +308,38 @@ enum Commands {
         #[arg(long, value_enum)]
         budget: Option<ResponseBudgetPreset>,
     },
+    /// Read a bounded source-file line window with expansion handles and index refs
+    SourceRead {
+        /// Source file to preview (relative to --path/root unless absolute)
+        file: PathBuf,
+        /// Path to the indexed codebase (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// First line to include (1-based)
+        #[arg(long, default_value = "1")]
+        start: usize,
+        /// Number of lines to include
+        #[arg(long, default_value = "80", conflicts_with = "end")]
+        lines: usize,
+        /// Last line to include (1-based, inclusive)
+        #[arg(long)]
+        end: Option<usize>,
+        /// Restrict index refs to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Preview-mode item cap for symbol/summary refs
+        #[arg(long)]
+        max_items: Option<usize>,
+        /// Preview-mode per-field byte cap for snippets and summaries
+        #[arg(long)]
+        max_bytes: Option<usize>,
+        /// Named preview budget preset (auto adapts from context-window env vars)
+        #[arg(long, value_enum)]
+        budget: Option<ResponseBudgetPreset>,
+    },
     /// Audit installed Claude Code skills — scan directories, check health, compare against manifest
     Audit {
         /// Path to the skills directory
@@ -989,6 +1021,35 @@ fn main() -> Result<()> {
             tabular,
             schema,
             envelope,
+            ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
+        ),
+        Some(Commands::SourceRead {
+            file,
+            path,
+            start,
+            lines,
+            end,
+            scope,
+            json,
+            max_items,
+            max_bytes,
+            budget,
+        }) => cmd_source_read(
+            &file,
+            &path,
+            start,
+            lines,
+            end,
+            scope.as_deref(),
+            OutputFormat {
+                json_output: json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                schema,
+                envelope,
+            },
+            absolute,
             ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
         ),
         Some(Commands::Audit {
@@ -3811,6 +3872,467 @@ fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::I
         );
     }
     index::IndexDb::open_read_only_resilient(&db_path)
+}
+
+#[derive(Serialize)]
+struct SourceLinePreview {
+    line: usize,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct SourceRangePreview {
+    start: usize,
+    end: usize,
+    total_lines: usize,
+    truncated_before: bool,
+    truncated_after: bool,
+}
+
+#[derive(Serialize)]
+struct SourceExpandCommands {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after: Option<String>,
+    file: String,
+}
+
+#[derive(Serialize)]
+struct SourceSymbolRef {
+    handle: String,
+    name: String,
+    kind: String,
+    language: String,
+    file: String,
+    line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
+    expand: String,
+}
+
+#[derive(Serialize)]
+struct SourceSummaryRef {
+    handle: String,
+    symbol_name: String,
+    file_path: String,
+    summary: String,
+    expand: String,
+}
+
+#[derive(Serialize)]
+struct SourceReadReport {
+    handle: String,
+    root: String,
+    file: String,
+    range: SourceRangePreview,
+    preview: Vec<SourceLinePreview>,
+    symbols: Vec<SourceSymbolRef>,
+    summaries: Vec<SourceSummaryRef>,
+    expand: SourceExpandCommands,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+fn resolve_source_file(root: &Path, file: &Path) -> Result<PathBuf> {
+    let candidate = if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        root.join(file)
+    };
+    let canonical = candidate
+        .canonicalize()
+        .with_context(|| format!("canonicalizing source file {}", candidate.display()))?;
+    if !canonical.is_file() {
+        bail!("source file is not a regular file: {}", canonical.display());
+    }
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing project root {}", root.display()))?;
+    if !canonical.starts_with(&canonical_root) {
+        bail!(
+            "source file {} is outside project root {}",
+            canonical.display(),
+            canonical_root.display()
+        );
+    }
+    Ok(canonical)
+}
+
+fn source_read_command(root: &Path, file: &str, start: usize, lines: usize) -> String {
+    format!(
+        "tsift source-read {} --path {} --start {} --lines {} --budget normal",
+        shell_quote(file),
+        shell_quote(&root.to_string_lossy()),
+        start,
+        lines
+    )
+}
+
+fn source_symbol_expand_command(root: &Path, symbol: &str) -> String {
+    format!(
+        "tsift --envelope explain {} --path {} --budget normal",
+        shell_quote(symbol),
+        shell_quote(&root.to_string_lossy())
+    )
+}
+
+fn source_summary_expand_command(root: &Path, symbol: &str) -> String {
+    format!(
+        "tsift summarize {} --path {} --json",
+        shell_quote(symbol),
+        shell_quote(&root.to_string_lossy())
+    )
+}
+
+fn source_symbol_line(symbol: &index::StoredSymbol) -> usize {
+    usize::try_from(symbol.line)
+        .ok()
+        .and_then(|line| line.checked_add(1))
+        .unwrap_or(1)
+}
+
+fn source_symbol_end_line(symbol: &index::StoredSymbol) -> Option<usize> {
+    symbol
+        .end_line
+        .and_then(|line| usize::try_from(line).ok())
+        .and_then(|line| line.checked_add(1))
+}
+
+fn source_symbol_intersects(symbol: &index::StoredSymbol, start: usize, end: usize) -> bool {
+    if end == 0 {
+        return false;
+    }
+    let symbol_start = source_symbol_line(symbol);
+    let symbol_end = source_symbol_end_line(symbol).unwrap_or(symbol_start);
+    symbol_start <= end && symbol_end >= start
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_source_symbols(
+    root: &Path,
+    file_abs: &Path,
+    file_display: &str,
+    scope: Option<&str>,
+    start: usize,
+    end: usize,
+    limit: usize,
+    max_bytes: usize,
+    warnings: &mut Vec<String>,
+) -> Vec<SourceSymbolRef> {
+    let db_path = match resolve_query_db_path(root, file_abs, scope) {
+        Ok(path) => path,
+        Err(err) => {
+            warnings.push(format!("index refs unavailable: {err:#}"));
+            return Vec::new();
+        }
+    };
+    if !db_path.exists() {
+        warnings.push(format!(
+            "index refs unavailable: no index found at {}",
+            db_path.display()
+        ));
+        return Vec::new();
+    }
+
+    let db = match index::IndexDb::open_read_only_resilient(&db_path) {
+        Ok(db) => db,
+        Err(err) => {
+            warnings.push(format!("index refs unavailable: {err:#}"));
+            return Vec::new();
+        }
+    };
+
+    let file_key = file_abs.to_string_lossy().to_string();
+    let symbols = match db.symbols_for_file(&file_key) {
+        Ok(symbols) => symbols,
+        Err(err) => {
+            warnings.push(format!("symbol refs unavailable: {err:#}"));
+            return Vec::new();
+        }
+    };
+
+    symbols
+        .into_iter()
+        .filter(|symbol| source_symbol_intersects(symbol, start, end))
+        .take(limit)
+        .map(|symbol| {
+            let line = source_symbol_line(&symbol);
+            let end_line = source_symbol_end_line(&symbol);
+            let handle = stable_handle(
+                "ssym",
+                &format!("{}:{}:{}", file_display, symbol.name, line),
+            );
+            SourceSymbolRef {
+                handle,
+                name: truncate_for_budget(&symbol.name, max_bytes),
+                kind: symbol.kind,
+                language: symbol.language,
+                file: file_display.to_string(),
+                line,
+                end_line,
+                signature: symbol
+                    .signature
+                    .map(|signature| truncate_for_budget(&signature, max_bytes)),
+                expand: source_symbol_expand_command(root, &symbol.name),
+            }
+        })
+        .collect()
+}
+
+fn load_source_summaries(
+    root: &Path,
+    file_display: &str,
+    limit: usize,
+    max_bytes: usize,
+    warnings: &mut Vec<String>,
+) -> Vec<SourceSummaryRef> {
+    let db_path = root.join(".tsift/summaries.db");
+    if !db_path.exists() {
+        return Vec::new();
+    }
+    let db = match summarize::SummaryDb::open_read_only_resilient(&db_path) {
+        Ok(db) => db,
+        Err(err) => {
+            warnings.push(format!("summary refs unavailable: {err:#}"));
+            return Vec::new();
+        }
+    };
+    let summaries = match db.get_by_file(file_display) {
+        Ok(summaries) => summaries,
+        Err(err) => {
+            warnings.push(format!("summary refs unavailable: {err:#}"));
+            return Vec::new();
+        }
+    };
+
+    summaries
+        .into_iter()
+        .take(limit)
+        .map(|summary| SourceSummaryRef {
+            handle: stable_handle(
+                "sum",
+                &format!(
+                    "{}:{}:{}",
+                    summary.file_path, summary.symbol_name, summary.id
+                ),
+            ),
+            symbol_name: truncate_for_budget(&summary.symbol_name, max_bytes),
+            file_path: summary.file_path,
+            summary: truncate_for_budget(&summary.summary, max_bytes),
+            expand: source_summary_expand_command(root, &summary.symbol_name),
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_source_read(
+    file: &Path,
+    path: &Path,
+    start: usize,
+    lines: usize,
+    end: Option<usize>,
+    scope: Option<&str>,
+    format: OutputFormat,
+    absolute: bool,
+    budget: ResponseBudget,
+) -> Result<()> {
+    if start == 0 {
+        bail!("--start is 1-based and must be greater than zero");
+    }
+    if lines == 0 {
+        bail!("--lines must be greater than zero");
+    }
+    if let Some(end) = end
+        && end < start
+    {
+        bail!("--end must be greater than or equal to --start");
+    }
+
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let file_abs = resolve_source_file(&root, file)?;
+    let file_display = if absolute {
+        file_abs.to_string_lossy().to_string()
+    } else {
+        relativize_pathbuf(&file_abs, &root)
+            .to_string_lossy()
+            .to_string()
+    };
+
+    let source = fs::read(&file_abs).with_context(|| format!("reading {}", file_abs.display()))?;
+    let text = String::from_utf8_lossy(&source);
+    let all_lines: Vec<&str> = text.lines().collect();
+    let total_lines = all_lines.len();
+    if total_lines > 0 && start > total_lines {
+        bail!(
+            "--start {} is beyond end of {} ({} lines)",
+            start,
+            file_display,
+            total_lines
+        );
+    }
+    let requested_end = end.unwrap_or_else(|| start.saturating_add(lines).saturating_sub(1));
+    let end_line = requested_end.min(total_lines);
+    let max_bytes = budget.preview_bytes();
+    let preview = if total_lines == 0 {
+        Vec::new()
+    } else {
+        all_lines[(start - 1)..end_line]
+            .iter()
+            .enumerate()
+            .map(|(idx, line)| SourceLinePreview {
+                line: start + idx,
+                text: truncate_for_budget(line, max_bytes),
+            })
+            .collect()
+    };
+
+    let mut warnings = Vec::new();
+    let max_items = budget.preview_items();
+    let symbols = load_source_symbols(
+        &root,
+        &file_abs,
+        &file_display,
+        scope,
+        start,
+        end_line,
+        max_items,
+        max_bytes,
+        &mut warnings,
+    );
+    let summaries =
+        load_source_summaries(&root, &file_display, max_items, max_bytes, &mut warnings);
+
+    let effective_lines = end_line.saturating_sub(start).saturating_add(1).max(1);
+    let expand = SourceExpandCommands {
+        before: (start > 1).then(|| {
+            let before_start = start.saturating_sub(lines).max(1);
+            source_read_command(&root, &file_display, before_start, start - before_start)
+        }),
+        after: (end_line < total_lines)
+            .then(|| source_read_command(&root, &file_display, end_line + 1, lines)),
+        file: source_read_command(&root, &file_display, 1, total_lines.max(effective_lines)),
+    };
+
+    let report = SourceReadReport {
+        handle: stable_handle("swin", &format!("{file_display}:{start}:{end_line}")),
+        root: root.to_string_lossy().to_string(),
+        file: file_display,
+        range: SourceRangePreview {
+            start,
+            end: end_line,
+            total_lines,
+            truncated_before: start > 1,
+            truncated_after: end_line < total_lines,
+        },
+        preview,
+        symbols,
+        summaries,
+        expand,
+        warnings,
+    };
+
+    if format.json_output {
+        let truncated = report.range.truncated_before || report.range.truncated_after;
+        let follow_up = [
+            report.expand.before.clone(),
+            report.expand.after.clone(),
+            Some(report.expand.file.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        print_json_or_envelope(
+            &report,
+            &format,
+            "source-read",
+            "window",
+            ToolEnvelopeSummary {
+                text: format!(
+                    "source window {}:{}-{}",
+                    report.file, report.range.start, report.range.end
+                ),
+                metrics: vec![
+                    envelope_metric("lines", report.preview.len()),
+                    envelope_metric("symbols", report.symbols.len()),
+                    envelope_metric("summaries", report.summaries.len()),
+                ],
+            },
+            truncated,
+            follow_up,
+        )?;
+    } else if format.compact {
+        println!(
+            "source {}:{}-{} / {} handle:{}",
+            report.file,
+            report.range.start,
+            report.range.end,
+            report.range.total_lines,
+            report.handle
+        );
+        for line in &report.preview {
+            println!("{:>5} {}", line.line, line.text);
+        }
+        if !report.symbols.is_empty() {
+            println!("syms[{}]:", report.symbols.len());
+            for symbol in &report.symbols {
+                println!("  {} {}:{}", symbol.name, symbol.file, symbol.line);
+            }
+        }
+        if report.range.truncated_before || report.range.truncated_after {
+            println!("expand: {}", report.expand.file);
+        }
+    } else {
+        println!(
+            "Source window `{}` lines {}-{} of {} ({})",
+            report.file,
+            report.range.start,
+            report.range.end,
+            report.range.total_lines,
+            report.handle
+        );
+        for line in &report.preview {
+            println!("{:>5} | {}", line.line, line.text);
+        }
+        if !report.symbols.is_empty() {
+            println!();
+            println!("Symbol refs:");
+            for symbol in &report.symbols {
+                println!(
+                    "  {} `{}` {}:{} — {}",
+                    symbol.handle, symbol.name, symbol.file, symbol.line, symbol.expand
+                );
+            }
+        }
+        if !report.summaries.is_empty() {
+            println!();
+            println!("Summary refs:");
+            for summary in &report.summaries {
+                println!(
+                    "  {} `{}` — {}",
+                    summary.handle, summary.symbol_name, summary.expand
+                );
+            }
+        }
+        if report.range.truncated_before || report.range.truncated_after {
+            println!();
+            println!("Expand:");
+            if let Some(before) = &report.expand.before {
+                println!("  before: {}", before);
+            }
+            if let Some(after) = &report.expand.after {
+                println!("  after: {}", after);
+            }
+            println!("  file:   {}", report.expand.file);
+        }
+        for warning in &report.warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

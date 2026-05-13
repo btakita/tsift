@@ -639,6 +639,168 @@ fn explain_json_combines_definition_edges_and_community() {
     assert!(community_members.iter().any(|member| member == "gamma"));
 }
 
+#[test]
+fn source_read_json_reports_bounded_window_handles_and_expansion_commands() {
+    let dir = indexed_cli_fixture();
+
+    let output = tsift_bin()
+        .args([
+            "--envelope",
+            "source-read",
+            "main.rs",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--start",
+            "1",
+            "--lines",
+            "8",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "source-read stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "source-read");
+    assert_eq!(json["view"], "window");
+    assert!(
+        json["report"]["handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("swin-")
+    );
+    assert_eq!(json["report"]["file"], "main.rs");
+    assert_eq!(json["report"]["range"]["start"], 1);
+    assert_eq!(json["report"]["range"]["end"], 8);
+    assert!(
+        json["report"]["range"]["truncated_after"]
+            .as_bool()
+            .unwrap()
+    );
+    assert_eq!(json["report"]["preview"].as_array().unwrap().len(), 8);
+    assert!(
+        json["report"]["preview"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("fn main")
+    );
+    assert!(
+        json["report"]["expand"]["after"]
+            .as_str()
+            .unwrap()
+            .contains("--start 9")
+    );
+    assert!(
+        json["follow_up"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cmd| cmd.as_str().unwrap().contains("tsift source-read"))
+    );
+
+    let symbols = json["report"]["symbols"].as_array().unwrap();
+    assert!(
+        symbols.iter().any(|symbol| {
+            symbol["handle"].as_str().unwrap().starts_with("ssym-")
+                && symbol["name"] == "main"
+                && symbol["expand"]
+                    .as_str()
+                    .unwrap()
+                    .contains("tsift --envelope explain")
+        }),
+        "expected main symbol ref: {json}"
+    );
+}
+
+#[test]
+fn source_read_json_includes_cached_summary_refs_for_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn main() {\n    helper();\n}\n\nfn helper() {}\n",
+    )
+    .unwrap();
+    let status = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    fs::create_dir_all(dir.path().join(".tsift")).unwrap();
+    let conn = Connection::open(dir.path().join(".tsift/summaries.db")).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE summaries (
+             id INTEGER PRIMARY KEY,
+             symbol_name TEXT NOT NULL,
+             file_path TEXT NOT NULL,
+             content_hash TEXT NOT NULL,
+             summary TEXT NOT NULL,
+             entities TEXT,
+             relationships TEXT,
+             concept_labels TEXT,
+             extracted_at TEXT NOT NULL,
+             model TEXT NOT NULL,
+             tokens_input INTEGER,
+             tokens_output INTEGER
+         );",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO summaries (
+            symbol_name, file_path, content_hash, summary, entities, relationships,
+            concept_labels, extracted_at, model, tokens_input, tokens_output
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![
+            "helper",
+            "main.rs",
+            "hash",
+            "helper summary for bounded source reads",
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            "1700000000",
+            "claude-haiku-4-5-20251001",
+            12_i64,
+            4_i64
+        ],
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "source-read",
+            "main.rs",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--start",
+            "1",
+            "--lines",
+            "5",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "source-read stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let summaries = json["summaries"].as_array().unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert!(summaries[0]["handle"].as_str().unwrap().starts_with("sum-"));
+    assert_eq!(summaries[0]["symbol_name"], "helper");
+    assert!(
+        summaries[0]["expand"]
+            .as_str()
+            .unwrap()
+            .contains("tsift summarize")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn index_logs_warning_when_file_read_fails() {

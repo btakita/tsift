@@ -74,6 +74,7 @@ tsift graph --callees <symbol>  # what does this function call?
 tsift communities [--path]      # Louvain community detection over call graph
 tsift path <from> <to>          # BFS shortest path between symbols
 tsift --envelope explain <symbol> --budget normal # bounded agent preview
+tsift --envelope source-read src/main.rs --start 1 --lines 80 --budget normal # bounded source-file preview with expansion handles
 tsift edit < edits.json         # staged multi-file search/replace batch
 tsift audit                     # scan installed skills, check health
 tsift audit --manifest <file>   # compare against expected skill list
@@ -150,6 +151,20 @@ When an exact or otherwise high-hit search returns repeated matches from the sam
 Because that auto-exact routing closes the main literal-lookup gap after the stable search cache work, tsift still defers any native content/FTS table inside `.tsift/index.db`. Broad prose retrieval remains sift's job; exact content lookups stay on ripgrep unless real usage proves that rg-backed exact search leaves an important gap.
 
 `tsift explain` keeps the full JSON/tabular edge list, but the default human-readable caller/callee sections now collapse dense same-file edge sets into grouped file rows with counts. That reduces token volume for highly-connected symbols while preserving the concrete caller/callee names in the grouped summary.
+
+## Bounded Source-File Reads
+
+`tsift source-read <file>` returns a bounded 1-based line window for source inspection. It is intended for agent workflows that would otherwise re-read whole files after search results or diagnostics. Relative file arguments resolve inside the nearest project/workspace root discovered from `--path`, and paths outside that root fail closed.
+
+The JSON and envelope forms (`tsift --envelope source-read src/main.rs --start 40 --lines 80 --budget normal`) emit:
+
+- a stable `swin-*` window handle for the file/range
+- line-numbered preview rows capped by the response budget
+- `ssym-*` symbol refs for indexed symbols intersecting the window, each with an `explain` expansion command
+- cached `sum-*` summary refs for the file when `.tsift/summaries.db` is present, each with a `summarize` expansion command
+- explicit `before`, `after`, and full-file expansion commands so the next read can expand incrementally instead of falling back to `cat`/large `sed` windows
+
+The command still returns the source preview when index or summary stores are missing; those enrichment failures are reported as warnings. `--scope` restricts index refs for workspace submodule indexes, and nested paths infer the matching workspace scope when possible.
 
 ## Handle-Preserving Search Workflow
 
