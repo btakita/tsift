@@ -12605,6 +12605,54 @@ tier = "private"
         conn
     }
 
+    fn hold_wal_database_lock(db_path: &std::path::Path) -> Connection {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE IF NOT EXISTS wal_lock_probe (id INTEGER PRIMARY KEY);
+             INSERT INTO wal_lock_probe DEFAULT VALUES;
+             PRAGMA locking_mode=EXCLUSIVE;
+             BEGIN EXCLUSIVE;",
+        )
+        .unwrap();
+        assert!(index::wal_sidecar_path(db_path).exists());
+        conn
+    }
+
+    #[test]
+    fn index_cmd_reports_wal_sidecar_diagnostics_without_tsift_writer_lock() {
+        let dir = setup_graph_index();
+        let db_path = dir.path().join(".tsift/index.db");
+        let _lock = hold_wal_database_lock(&db_path);
+
+        let err = cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("indexing"));
+        assert!(msg.contains("lock diagnostics:"));
+        assert!(msg.contains("lock: absent"));
+        assert!(msg.contains("wal: present") || msg.contains("shm: present"));
+        assert!(msg.contains("wedged writer holding live WAL sidecars"));
+        assert!(msg.contains("snapshot fallback"));
+    }
+
     #[test]
     fn search_cmd_succeeds_while_writer_lock_is_held() {
         let dir = setup_graph_index();
@@ -12636,6 +12684,32 @@ tier = "private"
     fn search_cmd_uses_snapshot_fallback_when_rollback_journal_lock_appears_after_precheck() {
         let dir = setup_graph_index();
         let _hook = install_search_post_precheck_lock(dir.path().join(".tsift/index.db"));
+
+        let result = cmd_search(
+            "main".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            None,
+            false,
+            false,
+            false,
+            0,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn search_cmd_uses_wal_snapshot_fallback_when_lock_appears_after_precheck() {
+        let dir = setup_graph_index();
+        let _hook = install_search_post_precheck_wal_lock(dir.path().join(".tsift/index.db"));
 
         let result = cmd_search(
             "main".to_string(),
@@ -13099,6 +13173,35 @@ tier = "private"
 
         let report = status::check_status(dir.path()).unwrap();
         assert!(matches!(report.index, status::IndexStatus::Fresh { .. }));
+    }
+
+    #[test]
+    fn status_cmd_reports_wal_snapshot_recovery_without_tsift_writer_lock() {
+        let dir = setup_graph_index();
+        let db_path = dir.path().join(".tsift/index.db");
+        let _lock = hold_wal_database_lock(&db_path);
+
+        cmd_status(dir.path(), false, true, false, false, false, false).unwrap();
+
+        let report = status::check_status(dir.path()).unwrap();
+        assert!(matches!(
+            report.index,
+            status::IndexStatus::Fresh {
+                recovery: Some(index::ReadOnlyRecovery::SnapshotFallbackWal),
+                ..
+            }
+        ));
+        let locks = status::check_locks(dir.path(), None, None).unwrap();
+        assert!(matches!(
+            locks.writer_lock,
+            status::WriterLockStatus::Absent { .. }
+        ));
+        assert!(locks.wal_sidecar.present || locks.shared_memory_sidecar.present);
+        assert!(
+            locks
+                .recommended_action
+                .contains("wedged writer holding live WAL sidecars")
+        );
     }
 
     #[test]
@@ -17267,7 +17370,19 @@ fn maybe_apply_search_worker_test_hooks() -> Result<()> {
 
 #[cfg(test)]
 thread_local! {
-    static SEARCH_POST_PRECHECK_LOCK_PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    static SEARCH_POST_PRECHECK_LOCK_HOOK: RefCell<Option<SearchPostPrecheckLockHook>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+enum SearchPostPrecheckLockMode {
+    RollbackJournal,
+    Wal,
+}
+
+#[cfg(test)]
+struct SearchPostPrecheckLockHook {
+    db_path: PathBuf,
+    mode: SearchPostPrecheckLockMode,
 }
 
 #[cfg(test)]
@@ -17276,44 +17391,73 @@ struct SearchPostPrecheckLockGuard;
 #[cfg(test)]
 impl Drop for SearchPostPrecheckLockGuard {
     fn drop(&mut self) {
-        SEARCH_POST_PRECHECK_LOCK_PATH.with(|path| {
-            path.borrow_mut().take();
+        SEARCH_POST_PRECHECK_LOCK_HOOK.with(|hook| {
+            hook.borrow_mut().take();
         });
     }
 }
 
 #[cfg(test)]
 fn install_search_post_precheck_lock(db_path: PathBuf) -> SearchPostPrecheckLockGuard {
-    SEARCH_POST_PRECHECK_LOCK_PATH.with(|path| {
+    install_search_post_precheck_lock_hook(db_path, SearchPostPrecheckLockMode::RollbackJournal)
+}
+
+#[cfg(test)]
+fn install_search_post_precheck_wal_lock(db_path: PathBuf) -> SearchPostPrecheckLockGuard {
+    install_search_post_precheck_lock_hook(db_path, SearchPostPrecheckLockMode::Wal)
+}
+
+#[cfg(test)]
+fn install_search_post_precheck_lock_hook(
+    db_path: PathBuf,
+    mode: SearchPostPrecheckLockMode,
+) -> SearchPostPrecheckLockGuard {
+    SEARCH_POST_PRECHECK_LOCK_HOOK.with(|hook| {
         assert!(
-            path.borrow().is_none(),
+            hook.borrow().is_none(),
             "search post-precheck lock hook already installed"
         );
-        *path.borrow_mut() = Some(db_path);
+        *hook.borrow_mut() = Some(SearchPostPrecheckLockHook { db_path, mode });
     });
     SearchPostPrecheckLockGuard
 }
 
 #[cfg(test)]
 fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
-    let Some(db_path) = SEARCH_POST_PRECHECK_LOCK_PATH.with(|path| path.borrow_mut().take()) else {
+    let Some(hook) = SEARCH_POST_PRECHECK_LOCK_HOOK.with(|hook| hook.borrow_mut().take()) else {
         return Ok(());
     };
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let conn = Connection::open(&db_path).expect("opening db for rollback-journal hook");
-        conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
-            .expect("acquiring rollback-journal hook lock");
-        fs::write(index::rollback_journal_path(&db_path), "locked")
-            .expect("writing rollback journal marker");
-        ready_tx.send(()).expect("signaling rollback-journal hook");
+        let conn = Connection::open(&hook.db_path).expect("opening db for search lock hook");
+        match hook.mode {
+            SearchPostPrecheckLockMode::RollbackJournal => {
+                conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+                    .expect("acquiring rollback-journal hook lock");
+                fs::write(index::rollback_journal_path(&hook.db_path), "locked")
+                    .expect("writing rollback journal marker");
+            }
+            SearchPostPrecheckLockMode::Wal => {
+                conn.execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     PRAGMA wal_autocheckpoint=0;
+                     CREATE TABLE IF NOT EXISTS search_wal_lock_probe (id INTEGER PRIMARY KEY);
+                     INSERT INTO search_wal_lock_probe DEFAULT VALUES;
+                     PRAGMA locking_mode=EXCLUSIVE;
+                     BEGIN EXCLUSIVE;",
+                )
+                .expect("acquiring WAL hook lock");
+                assert!(index::wal_sidecar_path(&hook.db_path).exists());
+            }
+        }
+        ready_tx.send(()).expect("signaling search lock hook");
         std::thread::sleep(Duration::from_millis(200));
         drop(conn);
-        let _ = fs::remove_file(index::rollback_journal_path(&db_path));
+        let _ = fs::remove_file(index::rollback_journal_path(&hook.db_path));
     });
     ready_rx
         .recv_timeout(Duration::from_secs(1))
-        .context("waiting for search post-precheck rollback-journal hook")?;
+        .context("waiting for search post-precheck lock hook")?;
     Ok(())
 }
 

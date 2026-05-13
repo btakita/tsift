@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- Added deterministic lock-contention regressions for direct `index`, `search`, and `status` paths when SQLite WAL/SHM sidecars are live without a tsift-owned `index.lock`, preserving WAL-aware snapshot fallback and recovery guidance instead of raw lock errors.
 - `session-cost` now prefers Codex `last_token_usage` records when cumulative `total_token_usage` streams interleave in one rollout, while still skipping duplicate cumulative snapshots and preserving the cumulative-delta fallback for older transcripts; `session-review` inherits the corrected totals and largest-turn outliers.
 - `session-review` now aggregates token, command, failure, guardrail, and loop-cluster totals over the same bounded newest matched session rows it emits, so older hidden transcript matches cannot inflate a 12-row review into cross-session billion-token totals.
 - `session-digest` and `session-review` failure rows now carry parsed command/session anchors, filter active prompt directives and source snippets out of failure extraction, and preserve real assertion/panic evidence plus named command exits such as `cargo test exited with code 1`.
