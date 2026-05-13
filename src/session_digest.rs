@@ -1197,6 +1197,9 @@ fn looks_like_symbol(candidate: &str) -> bool {
 
 fn classify_failure(text: &str) -> Option<(String, String)> {
     let normalized = normalize_whitespace(strip_common_prefixes(text));
+    if is_non_failure_summary(&normalized) {
+        return None;
+    }
     let lower = normalized.to_ascii_lowercase();
     let kind = if lower.contains("timed out") {
         "timeout"
@@ -1215,6 +1218,39 @@ fn classify_failure(text: &str) -> Option<(String, String)> {
         return None;
     };
     Some((kind.to_string(), truncate_detail(&normalized, 220)))
+}
+
+fn is_non_failure_summary(text: &str) -> bool {
+    let normalized = text.trim();
+    if normalized.is_empty() {
+        return false;
+    }
+    let lower = normalized.to_ascii_lowercase();
+    let compact = lower.trim_matches(['.', ':', ';', ',']).trim();
+    if matches!(
+        compact,
+        "failure" | "failures" | "failure summary" | "failure summaries"
+    ) {
+        return true;
+    }
+    if lower.starts_with("no failures detected")
+        || lower.starts_with("no failure detected")
+        || lower.starts_with("no unresolved failures")
+    {
+        return true;
+    }
+    if lower.starts_with("test result: ok.") || lower.starts_with("test result: ok;") {
+        return true;
+    }
+    if lower.contains("0 failed")
+        && (lower.contains(" passed") || lower.contains(" ok") || lower.contains("filtered out"))
+        && !lower.contains("failed to")
+        && !lower.contains("assertion failed")
+        && !lower.contains("test result: failed")
+    {
+        return true;
+    }
+    false
 }
 
 fn detect_closeout(text: &str) -> Vec<(String, String)> {
@@ -1556,6 +1592,50 @@ do [#sessiondigest]. spec-test-build-install-commit-push
             vec!["do [#sessiondigest]. spec-test-build-install-commit-push".to_string()]
         );
         assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn markdown_digest_ignores_successful_test_summaries_and_failure_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = "\
+failures:
+No failures detected (runner: cargo).
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out
+pytest summary: 4 passed, 0 failed in 0.02s
+";
+
+        let report = compute(dir.path(), input, None).unwrap();
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn markdown_digest_keeps_real_failure_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = "\
+thread 'suite::alpha_failure' panicked at src/lib.rs:3:5:
+assertion failed: left == right
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+";
+
+        let report = compute(dir.path(), input, None).unwrap();
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.kind == "panic")
+        );
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.message.contains("assertion failed"))
+        );
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.message.contains("test result: FAILED"))
+        );
     }
 
     #[test]

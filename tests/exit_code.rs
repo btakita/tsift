@@ -3145,6 +3145,46 @@ do [#sessiondigest]. spec-test-build-install-commit-push
 }
 
 #[test]
+fn session_digest_ignores_successful_test_summaries_from_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = "\
+failures:
+No failures detected (runner: cargo).
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+pytest summary: 4 passed, 0 failed in 0.02s
+";
+
+    let mut child = tsift_bin()
+        .args([
+            "session-digest",
+            "--json",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "session-digest should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["failures"].as_array().unwrap(),
+        &Vec::<serde_json::Value>::new()
+    );
+}
+
+#[test]
 fn session_cost_reads_codex_token_counts_from_stdin() {
     let input = concat!(
         r#"{"timestamp":"2026-05-05T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":24000,"cached_input_tokens":23000,"output_tokens":300,"reasoning_output_tokens":100,"total_tokens":24300}}}}"#,
@@ -3533,6 +3573,57 @@ fn session_review_aggregates_cross_harness_logs() {
     assert_eq!(
         next_context_json["next_digest_commands"][0],
         "tsift session-review --next-context tasks/software/tsift.md"
+    );
+}
+
+#[test]
+fn session_review_next_context_ignores_successful_test_summaries() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let target = root.path().join("tasks/software/tsift.md");
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(
+        &target,
+        "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n",
+    )
+    .unwrap();
+
+    let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+    fs::create_dir_all(&codex_dir).unwrap();
+    fs::write(
+        codex_dir.join("rollout-success.jsonl"),
+        concat!(
+            r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#sflt]. spec-test-build-install-commit-push\nagent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"failures:\nNo failures detected (runner: cargo).\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s\nVerification in `src/tsift`: `cargo test` passed."}}"#,
+            "\n"
+        )
+        .replace("/tmp/replace-me", &root.path().display().to_string()),
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "session-review",
+            "--next-context",
+            "--json",
+            target.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "session-review --next-context should succeed"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["unresolved_failures"].as_array().unwrap(),
+        &Vec::<serde_json::Value>::new()
     );
 }
 
