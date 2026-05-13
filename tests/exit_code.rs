@@ -3257,6 +3257,74 @@ fn log_digest_reads_agent_doc_structured_runtime_fields() {
 }
 
 #[test]
+fn log_digest_classifies_agent_doc_runtime_events_as_signals() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("tasks/software")).unwrap();
+    fs::write(dir.path().join("tasks/software/tsift.md"), "# tsift\n").unwrap();
+
+    let input = "\
+[1776528398] claude_start mode=fresh_restart restart_count=1 file=tasks/software/tsift.md
+[1776528446] auto_trigger_timeout harness=codex reason=no_prompt_after_30s
+[1776528450] ctrl_d_restart_fresh restart_count=2 file=tasks/software/tsift.md
+[1776528532] claude_exit code=1 restart_count=0
+[1777603403] document_cycle phase=committed cycle=cycle-1 event=commit_already_current
+[1777603404] document_cycle phase=committed cycle=cycle-2 event=commit_already_current
+";
+
+    let mut child = tsift_bin()
+        .args([
+            "log-digest",
+            "--json",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "log-digest should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["signal_groups"], 6);
+    let signals = json["signals"].as_array().unwrap();
+    assert!(signals.iter().any(|signal| {
+        signal["severity"] == "error" && signal["message"] == "agent-doc exit: claude_exit code=1"
+    }));
+    assert!(
+        signals
+            .iter()
+            .any(|signal| signal["message"] == "agent-doc timeout: auto_trigger_timeout")
+    );
+    assert!(signals.iter().any(|signal| {
+        signal["message"] == "agent-doc restart churn: fresh_restart" && signal["occurrences"] == 2
+    }));
+    assert!(
+        signals
+            .iter()
+            .any(|signal| { signal["message"] == "agent-doc restart churn: auto_trigger_timeout" })
+    );
+    assert!(
+        signals
+            .iter()
+            .any(|signal| { signal["message"] == "agent-doc restart churn: ctrl_d_restart_loop" })
+    );
+    assert!(signals.iter().any(|signal| {
+        signal["message"] == "agent-doc closeout churn: commit_already_current"
+            && signal["occurrences"] == 2
+    }));
+}
+
+#[test]
 fn metric_digest_reads_run_history_from_stdin() {
     let input = r#"{
   "runs": [

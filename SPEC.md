@@ -1151,7 +1151,7 @@ tsift log-digest --input target/build.log --json
 Behavior:
 
 1. Read captured log output from stdin by default, or from `--input <file>`.
-2. Collapse repeated lines, group warning/error signal lines, and count repeated stack blocks so noisy transcripts stay bounded.
+2. Collapse repeated lines, group warning/error signal lines, classify agent-doc runtime failures/restart churn/closeout churn as signals, and count repeated stack blocks so noisy transcripts stay bounded.
 3. Extract file anchors and symbol-like tokens from the transcript for quick follow-up lookups. Agent-doc runtime-style `file=...` and `path=...` fields count as file anchors even when they do not carry line numbers, but project-root/directory paths that normalize to an empty display path are ignored; timestamped event names plus `event=...`, `pane=...`, and `session=...` fields are retained as structured symbol refs.
 4. When `.tsift/summaries.db` already has current rows for anchored files or extracted symbols, include up to two cached summary snippets; otherwise report `missing`, `stale`, or `unavailable` without mutating the cache.
 

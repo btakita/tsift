@@ -1,3 +1,4 @@
+use crate::runtime_churn;
 use crate::summarize::{self, SummaryDb};
 use anyhow::Result;
 use serde::Serialize;
@@ -183,7 +184,7 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
             *symbol_counts.entry(symbol).or_default() += 1;
         }
 
-        if let Some((severity, message)) = classify_signal(trimmed) {
+        for (severity, message) in classify_signals(trimmed) {
             let (path, line, column) = if let Some(anchor) = &anchor {
                 (
                     Some(normalize_display_path(&root, &anchor.path)?),
@@ -580,7 +581,18 @@ fn normalize_line(line: &str) -> String {
     line.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn classify_signal(line: &str) -> Option<(&'static str, String)> {
+fn classify_signals(line: &str) -> Vec<(&'static str, String)> {
+    let mut signals = Vec::new();
+    if let Some(signal) = classify_generic_signal(line) {
+        signals.push(signal);
+    }
+    signals.extend(classify_agent_doc_runtime_signals(line));
+    signals.sort();
+    signals.dedup();
+    signals
+}
+
+fn classify_generic_signal(line: &str) -> Option<(&'static str, String)> {
     let trimmed = line.trim();
     let lower = trimmed.to_ascii_lowercase();
     if lower.starts_with("traceback")
@@ -604,6 +616,44 @@ fn classify_signal(line: &str) -> Option<(&'static str, String)> {
         return Some(("warning", trimmed.to_string()));
     }
     None
+}
+
+fn classify_agent_doc_runtime_signals(line: &str) -> Vec<(&'static str, String)> {
+    let Some(event_name) = event_name_from_timestamped_line(line) else {
+        return Vec::new();
+    };
+
+    let mut signals = Vec::new();
+    if matches!(event_name, "claude_exit" | "codex_exit")
+        && structured_field(line, "code").is_some_and(|code| code != "0")
+    {
+        signals.push((
+            "error",
+            format!(
+                "agent-doc exit: {event_name} code={}",
+                structured_field(line, "code").unwrap_or("?")
+            ),
+        ));
+    }
+
+    if event_name.contains("timeout") {
+        signals.push(("warning", format!("agent-doc timeout: {event_name}")));
+    }
+
+    for family in runtime_churn::classify_restart_churn_families(event_name, line) {
+        signals.push(("warning", format!("agent-doc restart churn: {family}")));
+    }
+
+    if event_name == "document_cycle"
+        && structured_field(line, "event") == Some("commit_already_current")
+    {
+        signals.push((
+            "warning",
+            "agent-doc closeout churn: commit_already_current".to_string(),
+        ));
+    }
+
+    signals
 }
 
 fn is_stack_frame_line(line: &str) -> bool {
@@ -711,6 +761,17 @@ fn clean_structured_value(value: &str) -> &str {
     value
         .trim_matches(['"', '\'', ',', ';', ')', ']', '}'])
         .trim_start_matches(['"', '\'', '(', '[', '{'])
+}
+
+fn structured_field<'a>(detail: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("{key}=");
+    let start = detail.find(&needle)? + needle.len();
+    let remainder = &detail[start..];
+    let end = remainder
+        .find(char::is_whitespace)
+        .unwrap_or(remainder.len());
+    let value = clean_structured_value(&remainder[..end]);
+    (!value.is_empty()).then_some(value)
 }
 
 fn parse_python_anchor(line: &str) -> Option<Anchor> {
@@ -1003,5 +1064,53 @@ RuntimeError: boom
                 .iter()
                 .any(|warning| warning == "no file anchors detected")
         );
+    }
+
+    #[test]
+    fn log_digest_classifies_agent_doc_runtime_churn_as_signals() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tasks/software")).unwrap();
+        std::fs::write(dir.path().join("tasks/software/tsift.md"), "# tsift\n").unwrap();
+
+        let input = "\
+[1776528398] claude_start mode=fresh_restart restart_count=1 file=tasks/software/tsift.md
+[1776528446] auto_trigger_timeout harness=codex reason=no_prompt_after_30s
+[1776528450] ctrl_d_restart_fresh restart_count=2 file=tasks/software/tsift.md
+[1776528532] claude_exit code=1 restart_count=0
+[1777603403] document_cycle phase=committed cycle=cycle-1 event=commit_already_current
+[1777603404] document_cycle phase=committed cycle=cycle-2 event=commit_already_current
+";
+
+        let report = compute(dir.path(), input).unwrap();
+        assert_eq!(report.signal_groups, 6);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning == "no warning/error signal lines detected")
+        );
+        assert!(report.signals.iter().any(|signal| {
+            signal.severity == "error"
+                && signal.message == "agent-doc exit: claude_exit code=1"
+                && signal.occurrences == 1
+        }));
+        assert!(report.signals.iter().any(|signal| {
+            signal.message == "agent-doc timeout: auto_trigger_timeout" && signal.occurrences == 1
+        }));
+        assert!(report.signals.iter().any(|signal| {
+            signal.message == "agent-doc restart churn: fresh_restart" && signal.occurrences == 2
+        }));
+        assert!(report.signals.iter().any(|signal| {
+            signal.message == "agent-doc restart churn: auto_trigger_timeout"
+                && signal.occurrences == 1
+        }));
+        assert!(report.signals.iter().any(|signal| {
+            signal.message == "agent-doc restart churn: ctrl_d_restart_loop"
+                && signal.occurrences == 1
+        }));
+        assert!(report.signals.iter().any(|signal| {
+            signal.message == "agent-doc closeout churn: commit_already_current"
+                && signal.occurrences == 2
+        }));
     }
 }

@@ -23,13 +23,18 @@ impl RestartChurnState {
     pub fn observe(&mut self, event_name: &str, detail: &str) {
         let restart_count = extract_field(detail, "restart_count").and_then(parse_usize);
         let sample = truncate_detail(detail, 140);
-        for family in classify_restart_churn(event_name, detail) {
-            *self.counts.entry(family.clone()).or_default() += 1;
+        for family in classify_restart_churn_families(event_name, detail) {
+            *self.counts.entry(family.to_string()).or_default() += 1;
             if let Some(count) = restart_count {
-                let entry = self.max_restart_counts.entry(family.clone()).or_default();
+                let entry = self
+                    .max_restart_counts
+                    .entry(family.to_string())
+                    .or_default();
                 *entry = (*entry).max(count);
             }
-            self.samples.entry(family).or_insert_with(|| sample.clone());
+            self.samples
+                .entry(family.to_string())
+                .or_insert_with(|| sample.clone());
         }
     }
 
@@ -59,20 +64,20 @@ impl RestartChurnState {
     }
 }
 
-fn classify_restart_churn(event_name: &str, detail: &str) -> Vec<String> {
+pub fn classify_restart_churn_families(event_name: &str, detail: &str) -> Vec<&'static str> {
     let mut families = Vec::new();
 
     if is_fresh_restart(event_name, detail) {
-        families.push("fresh_restart".to_string());
+        families.push("fresh_restart");
     }
     if event_name == "auto_trigger_timeout" {
-        families.push("auto_trigger_timeout".to_string());
+        families.push("auto_trigger_timeout");
     }
     if is_ctrl_d_restart_loop(event_name) {
-        families.push("ctrl_d_restart_loop".to_string());
+        families.push("ctrl_d_restart_loop");
     }
     if is_quit_after_eof(event_name, detail) {
-        families.push("quit_after_eof".to_string());
+        families.push("quit_after_eof");
     }
 
     families
