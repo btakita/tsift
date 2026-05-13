@@ -1134,7 +1134,7 @@ Behavior:
 
 1. Read captured log output from stdin by default, or from `--input <file>`.
 2. Collapse repeated lines, group warning/error signal lines, and count repeated stack blocks so noisy transcripts stay bounded.
-3. Extract file anchors and symbol-like tokens from the transcript for quick follow-up lookups. Agent-doc runtime-style `file=...` and `path=...` fields count as file anchors even when they do not carry line numbers; timestamped event names plus `event=...`, `pane=...`, and `session=...` fields are retained as structured symbol refs.
+3. Extract file anchors and symbol-like tokens from the transcript for quick follow-up lookups. Agent-doc runtime-style `file=...` and `path=...` fields count as file anchors even when they do not carry line numbers, but project-root/directory paths that normalize to an empty display path are ignored; timestamped event names plus `event=...`, `pane=...`, and `session=...` fields are retained as structured symbol refs.
 4. When `.tsift/summaries.db` already has current rows for anchored files or extracted symbols, include up to two cached summary snippets; otherwise report `missing`, `stale`, or `unavailable` without mutating the cache.
 
 `log-digest` is intentionally transcript-only. It does not execute the underlying command, and it keeps summary enrichment read-only so digesting verbose output never contends with `tsift summarize --extract`.
@@ -1161,7 +1161,7 @@ Behavior:
 
 1. Read captured session input from stdin by default, or from `--input <file>`.
 2. Auto-detect markdown, Claude JSONL, Codex JSONL, or `agent-doc` runtime logs unless `--source markdown|claude-jsonl|codex-jsonl|agent-doc-log` forces one parser.
-3. Extract bounded prompt targets, shell commands, touched file paths, symbol-like identifiers, failure lines, runtime-event churn, and closeout evidence such as verification/install/commit/push/version mentions.
+3. Extract bounded prompt targets, shell commands, touched file paths, symbol-like identifiers, failure lines, runtime-event churn, and closeout evidence such as verification/install/commit/push/version mentions. Runtime log path fields that point at the session root or another existing directory are not reported as touched files, so project-root `cwd_resolved` events cannot produce empty file anchors.
 4. Ignore copied harness-instruction ballast such as markdown headings, placeholder slash-command examples, and bold imperative labels so prompt/failure hotspots stay focused on actual session work.
 5. Treat successful test summaries, prompt directives, source-code snippets, and bare section labels as non-failures: lines such as `failures:`, `No failures detected`, `test result: ok. ... 0 failed`, `4 passed, 0 failed`, `do [#id] ... failure extraction ...`, and source lines like `panic!(...)` must not appear in session-digest failures or session-review unresolved failures, while real panic/assertion/error/exit evidence is preserved with its command/session anchors. Exit failures from command transcripts must name the parsed command, for example `cargo test exited with code 1`, instead of a generic `command exited with code 1`.
 6. Keep the digest transcript-only: it summarizes what happened in the session, but it does not replay tool calls or attempt to reconstruct the full conversation.

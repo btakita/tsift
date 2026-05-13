@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- `log-digest` and `session-digest` now filter agent-doc runtime path fields that normalize to empty display paths or existing directories, preventing project-root `cwd_resolved` events from polluting file anchors and next-context file lists.
 - Added deterministic lock-contention regressions for direct `index`, `search`, and `status` paths when SQLite WAL/SHM sidecars are live without a tsift-owned `index.lock`, preserving WAL-aware snapshot fallback and recovery guidance instead of raw lock errors.
 - `session-cost` now prefers Codex `last_token_usage` records when cumulative `total_token_usage` streams interleave in one rollout, while still skipping duplicate cumulative snapshots and preserving the cumulative-delta fallback for older transcripts; `session-review` inherits the corrected totals and largest-turn outliers.
 - `session-review` now aggregates token, command, failure, guardrail, and loop-cluster totals over the same bounded newest matched session rows it emits, so older hidden transcript matches cannot inflate a 12-row review into cross-session billion-token totals.

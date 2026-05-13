@@ -172,8 +172,12 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
         }
 
         let structured_fields = extract_agent_doc_log_fields(trimmed);
+        let mut structured_file_paths = Vec::new();
         for path in &structured_fields.file_paths {
-            record_file_ref(&mut file_refs, &root, path, None, None)?;
+            if let Some(display_path) = normalize_file_ref_path(&root, path)? {
+                record_display_file_ref(&mut file_refs, display_path.clone(), None, None);
+                structured_file_paths.push(display_path);
+            }
         }
         for symbol in structured_fields.symbol_refs {
             *symbol_counts.entry(symbol).or_default() += 1;
@@ -186,8 +190,8 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
                     Some(anchor.line),
                     anchor.column,
                 )
-            } else if let Some(raw_path) = structured_fields.file_paths.first() {
-                (Some(normalize_display_path(&root, raw_path)?), None, None)
+            } else if let Some(path) = structured_file_paths.first() {
+                (Some(path.clone()), None, None)
             } else {
                 (None, None, None)
             };
@@ -518,10 +522,42 @@ fn record_file_ref(
     line: Option<usize>,
     column: Option<usize>,
 ) -> Result<()> {
-    if raw_path.is_empty() || !looks_like_path(raw_path) {
-        return Ok(());
+    if let Some(display_path) = normalize_file_ref_path(root, raw_path)? {
+        record_display_file_ref(file_refs, display_path, line, column);
+    }
+    Ok(())
+}
+
+fn normalize_file_ref_path(root: &Path, raw_path: &str) -> Result<Option<String>> {
+    if raw_path.is_empty()
+        || !looks_like_path(raw_path)
+        || path_points_to_existing_directory(root, raw_path)
+    {
+        return Ok(None);
     }
     let display_path = normalize_display_path(root, raw_path)?;
+    if display_path.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(display_path))
+}
+
+fn path_points_to_existing_directory(root: &Path, raw_path: &str) -> bool {
+    let path = Path::new(raw_path);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    candidate.is_dir()
+}
+
+fn record_display_file_ref(
+    file_refs: &mut BTreeMap<String, FileRefBuilder>,
+    display_path: String,
+    line: Option<usize>,
+    column: Option<usize>,
+) {
     let key = format!(
         "{}:{}:{}",
         display_path,
@@ -538,7 +574,6 @@ fn record_file_ref(
     entry.line = line;
     entry.column = column;
     entry.occurrences += 1;
-    Ok(())
 }
 
 fn normalize_line(line: &str) -> String {
@@ -918,9 +953,11 @@ RuntimeError: boom
         let input = format!(
             "\
 [1778646072] route_dispatch_start_proven file=tasks/software/tsift.md pane=%31 harness=codex proof=consumed timeout_secs=10
+[1778646073] cwd_resolved path={} source=project_root
 [1778646078] document_cycle phase=committed cycle=cycle-1778644920810 event=commit_success session=tsift-v0.1 pane=%31
 [1778646078] commit_staging file={} snap_len=4616 file_len=4664
 ",
+            dir.path().display(),
             dir.path().join("tasks/software/absolute.md").display()
         );
 
@@ -939,8 +976,15 @@ RuntimeError: boom
                 .iter()
                 .any(|file_ref| file_ref.path.ends_with("tasks/software/absolute.md"))
         );
+        assert!(
+            !report
+                .file_refs
+                .iter()
+                .any(|file_ref| file_ref.path.is_empty())
+        );
         for expected in [
             "event:route_dispatch_start_proven",
+            "event:cwd_resolved",
             "event:commit_success",
             "pane:%31",
             "session:tsift-v0.1",

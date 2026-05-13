@@ -1171,8 +1171,15 @@ fn normalize_file_token(raw: &str, root: &Path) -> Option<String> {
     if !looks_like_file_path(candidate) {
         return None;
     }
+    if path_points_to_existing_directory(root, candidate) {
+        return None;
+    }
 
-    Some(normalize_display_path(root, candidate))
+    let display_path = normalize_display_path(root, candidate);
+    if display_path.is_empty() {
+        return None;
+    }
+    Some(display_path)
 }
 
 fn strip_line_suffix(token: &str) -> &str {
@@ -1221,6 +1228,16 @@ fn looks_like_file_path(token: &str) -> bool {
     ]
     .iter()
     .any(|suffix| lower.ends_with(suffix))
+}
+
+fn path_points_to_existing_directory(root: &Path, raw_path: &str) -> bool {
+    let path = Path::new(raw_path);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    candidate.is_dir()
 }
 
 fn normalize_display_path(root: &Path, raw: &str) -> String {
@@ -1891,18 +1908,22 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
         std::fs::create_dir_all(dir.path().join("tasks/software")).unwrap();
         std::fs::write(dir.path().join("tasks/software/tsift.md"), "# tsift\n").unwrap();
 
-        let input = "\
+        let input = format!(
+            "\
 [1776452736] session_start file=tasks/software/tsift.md pane=%141 session=tsift-v0
+[1776452737] cwd_resolved path={} source=project_root
 [1776528398] claude_start mode=fresh_restart restart_count=1
 [1776528446] auto_trigger_timeout (no prompt after 30s)
 [1776528450] ctrl_d_restart_fresh restart_count=2
 [1776528532] claude_exit code=1 restart_count=0
 [1776528534] user_quit_after_ctrl_d
-";
+",
+            dir.path().display()
+        );
 
-        let report = compute(dir.path(), input, Some("agent-doc-log")).unwrap();
+        let report = compute(dir.path(), &input, Some("agent-doc-log")).unwrap();
         assert_eq!(report.source, "agent_doc_log");
-        assert_eq!(report.runtime_event_groups, 6);
+        assert_eq!(report.runtime_event_groups, 7);
         assert_eq!(report.restart_churn_groups, 4);
         assert!(
             report
@@ -1916,6 +1937,8 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
                 .iter()
                 .any(|path| path.path == "tasks/software/tsift.md")
         );
+        assert_eq!(report.file_groups, 1);
+        assert!(!report.touched_files.iter().any(|path| path.path.is_empty()));
         assert!(
             report
                 .failures
