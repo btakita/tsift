@@ -4755,6 +4755,15 @@ fn session_review_separates_aggregate_and_latest_session_cost() {
     let codex_dir = home.path().join(".codex/sessions/2026/05/05");
     fs::create_dir_all(&codex_dir).unwrap();
     let root_text = root.path().display().to_string();
+    let mut older_turns = vec![186_897; 305];
+    older_turns.push(93_427);
+    for (index, chunk) in older_turns.chunks(28).enumerate() {
+        fs::write(
+            codex_dir.join(format!("bb-older-high-cache-{index:02}.jsonl")),
+            codex_transcript(&root_text, chunk),
+        )
+        .unwrap();
+    }
     fs::write(
         codex_dir.join("aa-latest-lower-cost.jsonl"),
         codex_transcript(
@@ -4765,15 +4774,6 @@ fn session_review_separates_aggregate_and_latest_session_cost() {
         ),
     )
     .unwrap();
-    let mut older_turns = vec![186_897; 305];
-    older_turns.push(93_427);
-    for (index, chunk) in older_turns.chunks(28).enumerate() {
-        fs::write(
-            codex_dir.join(format!("bb-older-high-cache-{index:02}.jsonl")),
-            codex_transcript(&root_text, chunk),
-        )
-        .unwrap();
-    }
 
     let output = tsift_bin()
         .args(["session-review", "--json", target.to_str().unwrap()])
@@ -4931,6 +4931,15 @@ fn rewrite_run_fails_closed_when_no_rewrite_exists() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no supported tsift rewrite matched this command"),
+        "expected no-rewrite reason, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("`--run` executes only rewritten commands"),
+        "expected --run guidance, got: {stderr}"
+    );
 }
 
 #[test]
@@ -4941,6 +4950,15 @@ fn rewrite_rg_files_fails_closed_for_passthrough() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("file-listing commands keep original shell/find/rg semantics"),
+        "expected file-listing no-rewrite reason, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("run the original command unchanged"),
+        "expected passthrough guidance, got: {stderr}"
+    );
 }
 
 #[test]
@@ -4951,6 +4969,32 @@ fn rewrite_find_fails_closed_for_passthrough() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("file-listing commands keep original shell/find/rg semantics"),
+        "expected find no-rewrite reason, got: {stderr}"
+    );
+}
+
+#[test]
+fn rewrite_redirection_fails_closed_with_reason() {
+    let output = tsift_bin()
+        .args(["rewrite", "rg authenticate > matches.txt"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "shell metacharacters such as pipes, redirection, or background operators are not rewritten"
+        ),
+        "expected shell-metacharacter no-rewrite reason, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("run the original command unchanged"),
+        "expected passthrough guidance, got: {stderr}"
+    );
 }
 
 #[test]

@@ -16782,11 +16782,14 @@ fn cmd_sql(
 
 /// Exit codes for `tsift rewrite` (matches rtk protocol):
 ///   0 + stdout → rewrite found, auto-allow
-///   1          → no tsift equivalent, pass through
+///   1 + stderr → no tsift equivalent, pass through
 fn cmd_rewrite(command: &str, run: bool, format: OutputFormat) -> Result<()> {
     let rewritten = match rewrite_command(command) {
         Some(rewritten) => rewritten,
-        None => std::process::exit(1),
+        None => {
+            eprintln!("{}", no_rewrite_message(command, run));
+            std::process::exit(1);
+        }
     };
     let rewritten = apply_rewrite_output_format(&rewritten, format);
 
@@ -17061,6 +17064,37 @@ pub(crate) fn rewrite_command(command: &str) -> Option<String> {
     None
 }
 
+fn no_rewrite_message(command: &str, run: bool) -> String {
+    let trimmed = command.trim();
+    let parts = shell_split(trimmed);
+    let reason = if trimmed.is_empty() {
+        "empty command"
+    } else if has_shell_metacharacters(trimmed) {
+        "shell metacharacters such as pipes, redirection, or background operators are not rewritten"
+    } else if is_file_listing_command(&parts) {
+        "file-listing commands keep original shell/find/rg semantics"
+    } else {
+        "no supported tsift rewrite matched this command"
+    };
+    let action = if run {
+        "`--run` executes only rewritten commands; run the original command directly if intended"
+    } else {
+        "run the original command unchanged"
+    };
+    format!("tsift rewrite: no rewrite: {reason}; {action}")
+}
+
+fn is_file_listing_command(parts: &[&str]) -> bool {
+    match parts.first().copied() {
+        Some("find") => true,
+        Some("rg") => parts
+            .iter()
+            .skip(1)
+            .any(|part| matches!(*part, "--files" | "--type-list")),
+        _ => false,
+    }
+}
+
 /// Rewrite `rg` (ripgrep) commands to tsift search.
 fn rewrite_rg(cmd: &str) -> Option<String> {
     let parts: Vec<&str> = shell_split(cmd);
@@ -17070,11 +17104,7 @@ fn rewrite_rg(cmd: &str) -> Option<String> {
 
     // File-listing forms do not have a search pattern. Leave them to the
     // original command so roots, globs, and ignore rules keep rg semantics.
-    if parts
-        .iter()
-        .skip(1)
-        .any(|part| matches!(*part, "--files" | "--type-list"))
-    {
+    if is_file_listing_command(&parts) {
         return None;
     }
 
