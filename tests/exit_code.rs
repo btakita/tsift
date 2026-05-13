@@ -3741,6 +3741,104 @@ fn session_review_next_context_ignores_successful_test_summaries() {
 }
 
 #[test]
+fn session_review_next_context_scopes_live_tail_over_stale_transcript_context() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let target = root.path().join("tasks/software/tsift.md");
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(
+        &target,
+        "\
+---
+agent_doc_session: tsift-v0.1
+agent_doc_format: template
+prompt_presets:
+  '#spec-test-build-install-commit-push': update spec + tests. build + install for local testing. commit + push
+---
+
+## Exchange
+
+<!-- agent:exchange patch=append -->
+### Session Summary
+
+Compacted content:
+- Archived old response with do [#stale]. spec-test-build-install-commit-push
+<!-- agent:boundary:abc123 -->
+do [#active]. spec-test-build-install-commit-push
+<!-- /agent:exchange -->
+
+## Completed / Reaped
+
+<!-- agent:done -->
+- 2026-05-12 [#stale] do [#stale]. spec-test-build-install-commit-push
+<!-- /agent:done -->
+",
+    )
+    .unwrap();
+
+    let agent_doc_logs = root.path().join(".agent-doc/logs");
+    fs::create_dir_all(&agent_doc_logs).unwrap();
+    fs::write(
+        agent_doc_logs.join("tsift-v0.1.log"),
+        concat!(
+            "[1776712372] session_start file=tasks/software/tsift.md pane=%77 session=tsift-v0.1\n",
+            "[1776712373] cwd_resolved path=/tmp/replace-me source=project_root\n"
+        )
+        .replace("/tmp/replace-me", &root.path().display().to_string()),
+    )
+    .unwrap();
+
+    let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+    fs::create_dir_all(&codex_dir).unwrap();
+    fs::write(
+        codex_dir.join("rollout-stale.jsonl"),
+        concat!(
+            r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#stale]. spec-test-build-install-commit-push\nagent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+            "\n",
+            r####"{"type":"event_msg","payload":{"type":"agent_message","message":"### Re: stale work\nError: old unresolved failure at /!\n`/!` should not be active context"}}"####,
+            "\n"
+        )
+        .replace("/tmp/replace-me", &root.path().display().to_string()),
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "session-review",
+            "--next-context",
+            "--json",
+            target.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "session-review --next-context should succeed"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["active_prompt_targets"],
+        serde_json::json!(["do [#active]. spec-test-build-install-commit-push"])
+    );
+    assert!(
+        json["touched_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|path| path != "/!")
+    );
+    assert_eq!(
+        json["unresolved_failures"].as_array().unwrap(),
+        &Vec::<serde_json::Value>::new()
+    );
+}
+
+#[test]
 fn context_pack_json_composes_next_context_and_optional_digests() {
     let root = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

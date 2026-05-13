@@ -237,6 +237,20 @@ struct MatchSignals {
     snippets: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct DocumentActiveContext {
+    prompt_targets: Vec<String>,
+    touched_files: Vec<SessionReviewFileRef>,
+    touched_symbols: Vec<SessionReviewSymbolRef>,
+    failures: Vec<SessionReviewFailure>,
+}
+
+impl DocumentActiveContext {
+    fn has_live_prompts(&self) -> bool {
+        !self.prompt_targets.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingSession {
     source: ReviewSource,
@@ -608,30 +622,41 @@ pub fn compute_with_options(
         },
     );
     let loop_clusters = collect_loop_clusters(loop_clusters, MAX_LOOP_CLUSTERS);
-    let document_active_prompt_targets = match collect_document_active_prompt_targets(&context) {
-        Ok(targets) => targets,
+    let document_active_context = match collect_document_active_context(&context) {
+        Ok(active_context) => active_context,
         Err(error) => {
             warnings.push(format!(
-                "{}: could not extract live document prompt targets: {error:#}",
+                "{}: could not extract live document active context: {error:#}",
                 context.canonical_target.display()
             ));
-            Vec::new()
+            DocumentActiveContext::default()
         }
     };
-    let active_prompt_targets = if document_active_prompt_targets.is_empty() {
-        prompt_targets
-            .iter()
-            .map(|entry| entry.text.clone())
-            .collect()
-    } else {
-        document_active_prompt_targets
-    };
+    let (active_prompt_targets, next_context_files, next_context_symbols, next_context_failures) =
+        if document_active_context.has_live_prompts() {
+            (
+                document_active_context.prompt_targets,
+                document_active_context.touched_files,
+                document_active_context.touched_symbols,
+                document_active_context.failures,
+            )
+        } else {
+            (
+                prompt_targets
+                    .iter()
+                    .map(|entry| entry.text.clone())
+                    .collect(),
+                touched_files.clone(),
+                touched_symbols.clone(),
+                failures.clone(),
+            )
+        };
     let next_context = build_next_context(
         &context,
         active_prompt_targets,
-        &touched_files,
-        &touched_symbols,
-        &failures,
+        &next_context_files,
+        &next_context_symbols,
+        &next_context_failures,
         last_verification.unwrap_or_else(|| SessionReviewVerificationState {
             status: "missing".to_string(),
             detail: "no verification closeout found in matched sessions".to_string(),
@@ -771,9 +796,9 @@ fn build_next_context(
     }
 }
 
-fn collect_document_active_prompt_targets(context: &TargetContext) -> Result<Vec<String>> {
+fn collect_document_active_context(context: &TargetContext) -> Result<DocumentActiveContext> {
     if context.kind != TargetKind::File {
-        return Ok(Vec::new());
+        return Ok(DocumentActiveContext::default());
     }
     let content = fs::read_to_string(&context.canonical_target).with_context(|| {
         format!(
@@ -782,12 +807,38 @@ fn collect_document_active_prompt_targets(context: &TargetContext) -> Result<Vec
         )
     })?;
     let Some(exchange) = extract_agent_component(&content, "exchange") else {
-        return Ok(Vec::new());
+        return Ok(DocumentActiveContext::default());
     };
     let tail = active_exchange_tail(exchange);
-    Ok(session_digest::extract_prompt_targets_from_text_block(
-        &tail, false,
-    ))
+    let digest = session_digest::compute(&context.root, &tail, Some("markdown"))?;
+    Ok(DocumentActiveContext {
+        prompt_targets: digest.prompt_targets,
+        touched_files: digest
+            .touched_files
+            .into_iter()
+            .map(|entry| SessionReviewFileRef {
+                path: entry.path,
+                occurrences: entry.occurrences,
+            })
+            .collect(),
+        touched_symbols: digest
+            .touched_symbols
+            .into_iter()
+            .map(|entry| SessionReviewSymbolRef {
+                symbol: entry.symbol,
+                occurrences: entry.occurrences,
+            })
+            .collect(),
+        failures: digest
+            .failures
+            .into_iter()
+            .map(|entry| SessionReviewFailure {
+                kind: entry.kind,
+                message: entry.message,
+                occurrences: entry.occurrences,
+            })
+            .collect(),
+    })
 }
 
 fn extract_agent_component<'a>(content: &'a str, name: &str) -> Option<&'a str> {
@@ -1605,6 +1656,8 @@ do [#active]. spec-test-build-install-commit-push
                 r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#old1]. spec-test-build-install-commit-push\nagent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
                 "\n",
                 r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#old1]. spec-test-build-install-commit-push"}}"#,
+                "\n",
+                r####"{"type":"event_msg","payload":{"type":"agent_message","message":"### Re: old work\nError: stale failure at /!\n`/!` should not become active handoff context"}}"####,
                 "\n"
             )
             .replace("/tmp/replace-me", &root.path().display().to_string()),
@@ -1631,6 +1684,26 @@ do [#active]. spec-test-build-install-commit-push
             report.next_context.active_prompt_targets,
             vec!["do [#active]. spec-test-build-install-commit-push".to_string()]
         );
+        assert!(
+            report
+                .touched_files
+                .iter()
+                .any(|file_ref| file_ref.path == "/!")
+        );
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.message.contains("stale failure"))
+        );
+        assert!(
+            report
+                .next_context
+                .touched_files
+                .iter()
+                .all(|path| path != "/!")
+        );
+        assert!(report.next_context.unresolved_failures.is_empty());
     }
 
     #[test]

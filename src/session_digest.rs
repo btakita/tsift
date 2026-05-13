@@ -859,6 +859,7 @@ fn push_prompt_target(prompt: &str, targets: &mut Vec<String>) {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn extract_prompt_targets_from_text_block(input: &str, user_bias: bool) -> Vec<String> {
     let mut targets = Vec::new();
     for raw_line in input.lines() {
