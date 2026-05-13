@@ -39,6 +39,8 @@ enum Step {
     SessionInstructionBallast,
     RewriteLongSessionRead,
     RewriteShortSessionRead,
+    RewriteLongSourceRead,
+    RewriteShortSourceRead,
     RewriteTestCommand,
     RewriteLogCommand,
     RewriteDiffCommand,
@@ -50,17 +52,19 @@ enum Step {
 
 impl Step {
     fn from_index(index: u64) -> Self {
-        match index % 11 {
+        match index % 13 {
             0 => Self::SessionLivePrompt,
             1 => Self::SessionInstructionBallast,
             2 => Self::RewriteLongSessionRead,
             3 => Self::RewriteShortSessionRead,
-            4 => Self::RewriteTestCommand,
-            5 => Self::RewriteLogCommand,
-            6 => Self::RewriteDiffCommand,
-            7 => Self::RewriteMetacharacterPassthrough,
-            8 => Self::StatusMissingInstructions,
-            9 => Self::StatusStaleInstructions,
+            4 => Self::RewriteLongSourceRead,
+            5 => Self::RewriteShortSourceRead,
+            6 => Self::RewriteTestCommand,
+            7 => Self::RewriteLogCommand,
+            8 => Self::RewriteDiffCommand,
+            9 => Self::RewriteMetacharacterPassthrough,
+            10 => Self::StatusMissingInstructions,
+            11 => Self::StatusStaleInstructions,
             _ => Self::StatusCurrentInstructions,
         }
     }
@@ -120,6 +124,8 @@ impl SimWorld {
             Step::SessionInstructionBallast => self.session_instruction_ballast(),
             Step::RewriteLongSessionRead => self.rewrite_long_session_read(),
             Step::RewriteShortSessionRead => self.rewrite_short_session_read(),
+            Step::RewriteLongSourceRead => self.rewrite_long_source_read(),
+            Step::RewriteShortSourceRead => self.rewrite_short_source_read(),
             Step::RewriteTestCommand => self.rewrite_test_command(),
             Step::RewriteLogCommand => self.rewrite_log_command(),
             Step::RewriteDiffCommand => self.rewrite_diff_command(),
@@ -176,6 +182,21 @@ do [#t275]. spec-test-build-install-commit-push
         let rewritten = rewrite_command(&format!("cat {}", session.display()));
         assert_eq!(rewritten, None);
         self.coverage.mark("rewrite/short_session_passthrough");
+    }
+
+    fn rewrite_long_source_read(&mut self) {
+        let source = self.write_source_file("source-long", 120);
+        let rewritten = rewrite_command(&format!("cat {}", source.display())).unwrap();
+        assert!(rewritten.contains("tsift --envelope source-read"));
+        assert!(rewritten.contains("--start 1 --lines 80"));
+        self.coverage.mark("rewrite/long_source_read");
+    }
+
+    fn rewrite_short_source_read(&mut self) {
+        let source = self.write_source_file("source-short", 120);
+        let rewritten = rewrite_command(&format!("head -n 20 {}", source.display()));
+        assert_eq!(rewritten, None);
+        self.coverage.mark("rewrite/short_source_passthrough");
     }
 
     fn rewrite_test_command(&mut self) {
@@ -261,6 +282,19 @@ do [#t275]. spec-test-build-install-commit-push
         path
     }
 
+    fn write_source_file(&mut self, label: &str, lines: usize) -> PathBuf {
+        let dir = self.empty_project_dir(label);
+        fs::create_dir_all(dir.join(".tsift")).unwrap();
+        fs::write(dir.join(".tsift/index.db"), "").unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        let source = dir.join("src/lib.rs");
+        let body = std::iter::repeat_n("fn demo() {}", lines)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&source, format!("{body}\n")).unwrap();
+        source
+    }
+
     fn empty_project_dir(&mut self, label: &str) -> PathBuf {
         let path = self.next_path(label, "dir");
         fs::create_dir_all(&path).unwrap();
@@ -291,6 +325,8 @@ fn required_coverage() -> &'static [&'static str] {
         "session/instruction_ballast",
         "rewrite/long_session_read",
         "rewrite/short_session_passthrough",
+        "rewrite/long_source_read",
+        "rewrite/short_source_passthrough",
         "rewrite/test_digest",
         "rewrite/log_digest",
         "rewrite/diff_digest",
@@ -308,6 +344,8 @@ fn sim_world_named_edge_trace_covers_session_rewrite_status_edges() {
         Step::SessionInstructionBallast,
         Step::RewriteLongSessionRead,
         Step::RewriteShortSessionRead,
+        Step::RewriteLongSourceRead,
+        Step::RewriteShortSourceRead,
         Step::RewriteTestCommand,
         Step::RewriteLogCommand,
         Step::RewriteDiffCommand,

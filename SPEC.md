@@ -832,6 +832,7 @@ When a search envelope includes `report.scale_guard`, run one of its `narrow_com
 
 Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
 - `tsift --envelope session-review <path> --next-context --budget normal` or `tsift --envelope context-pack <path> --budget normal` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
+- `tsift --envelope source-read <file> --path . --start 1 --lines 80 --budget normal` instead of large whole-file source reads. `tsift rewrite` automatically routes full-file `cat`/`bat` reads and oversized `head`/`tail`/`sed -n` source windows to this surface when the file lives inside an indexed tsift project, while leaving small explicit windows and non-source files untouched.
 - `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
 - `tsift --envelope __digest-runner --kind test --path . --shell-command '<test command>'` / `tsift --envelope __digest-runner --kind log --path . --shell-command '<build command>'` for noisy test/build/install output, or let the rewrite/hooks create those artifact-backed envelopes for `cargo test`, `pytest`, and verbose cargo commands.
 - If RTK is installed, digest-runner delegates supported generic command families through `rtk rewrite` and records the chosen compact filter in `report.filter` while preserving tsift artifact handles.
@@ -1131,7 +1132,7 @@ The checked-in `fixtures/dci-search-benchmark.json` is a seed benchmark for tsif
 The model currently covers:
 
 - session prompt-target extraction, including live exchange prompts versus copied instruction/frontmatter/archive ballast;
-- rewrite routing for long session reads, short passthrough reads, test/build digest-runner wrappers, diff-digest routing, and shell metacharacter passthrough;
+- rewrite routing for long session reads, large indexed source reads, short passthrough reads, test/build digest-runner wrappers, diff-digest routing, and shell metacharacter passthrough;
 - status recommendation transitions for missing, stale, and current Code Navigation instructions.
 
 Coverage counters are explicit and fail closed when a named edge class disappears from the corpus. This mirrors the agent-doc pattern of replacing expensive live tmux edge sweeps with deterministic model coverage first, while keeping wider ignored simulation budgets in CI rather than the local development loop.

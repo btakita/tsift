@@ -10695,6 +10695,23 @@ mod tests {
         assert!(status.success(), "git commit failed");
     }
 
+    fn write_empty_root_index(root: &Path) {
+        let index_dir = root.join(".tsift");
+        fs::create_dir_all(&index_dir).unwrap();
+        fs::write(index_dir.join("index.db"), "").unwrap();
+    }
+
+    fn write_repeated_lines(path: &Path, line: &str, lines: usize) -> PathBuf {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let body = std::iter::repeat_n(line, lines)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, format!("{body}\n")).unwrap();
+        path.to_path_buf()
+    }
+
     // --- classify_task ---
 
     #[test]
@@ -11770,6 +11787,98 @@ mod tests {
         fs::write(&readme, format!("{body}\n")).unwrap();
 
         let result = rewrite_command(&format!("cat {}", shell_quote(readme.to_str().unwrap())));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn rewrite_cat_large_source_to_source_read_in_indexed_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        write_empty_root_index(dir.path());
+        let source = write_repeated_lines(&dir.path().join("src/lib.rs"), "fn demo() {}", 120);
+
+        let result = rewrite_command(&format!("cat {}", shell_quote(source.to_str().unwrap())));
+
+        assert_eq!(
+            result,
+            Some(format!(
+                "tsift --envelope source-read \"src/lib.rs\" --path {} --start 1 --lines 80 --budget normal",
+                shell_quote(&dir.path().to_string_lossy())
+            ))
+        );
+    }
+
+    #[test]
+    fn rewrite_head_small_source_window_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        write_empty_root_index(dir.path());
+        let source = write_repeated_lines(&dir.path().join("src/lib.rs"), "fn demo() {}", 120);
+
+        let result = rewrite_command(&format!(
+            "head -n 20 {}",
+            shell_quote(source.to_str().unwrap())
+        ));
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn rewrite_sed_large_source_range_to_source_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write_empty_root_index(dir.path());
+        let source = write_repeated_lines(&dir.path().join("src/lib.rs"), "fn demo() {}", 200);
+
+        let result = rewrite_command(&format!(
+            "sed -n '40,160p' {}",
+            shell_quote(source.to_str().unwrap())
+        ));
+
+        assert_eq!(
+            result,
+            Some(format!(
+                "tsift --envelope source-read \"src/lib.rs\" --path {} --start 40 --lines 121 --budget normal",
+                shell_quote(&dir.path().to_string_lossy())
+            ))
+        );
+    }
+
+    #[test]
+    fn rewrite_tail_large_source_window_preserves_tail_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        write_empty_root_index(dir.path());
+        let source = write_repeated_lines(&dir.path().join("src/lib.rs"), "fn demo() {}", 200);
+
+        let result = rewrite_command(&format!(
+            "tail -n 120 {}",
+            shell_quote(source.to_str().unwrap())
+        ));
+
+        assert_eq!(
+            result,
+            Some(format!(
+                "tsift --envelope source-read \"src/lib.rs\" --path {} --start 81 --lines 120 --budget normal",
+                shell_quote(&dir.path().to_string_lossy())
+            ))
+        );
+    }
+
+    #[test]
+    fn rewrite_large_non_source_read_passthrough_even_when_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_empty_root_index(dir.path());
+        let text = write_repeated_lines(&dir.path().join("notes.txt"), "plain text", 120);
+
+        let result = rewrite_command(&format!("cat {}", shell_quote(text.to_str().unwrap())));
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn rewrite_large_source_read_passthrough_without_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = write_repeated_lines(&dir.path().join("src/lib.rs"), "fn demo() {}", 120);
+
+        let result = rewrite_command(&format!("cat {}", shell_quote(source.to_str().unwrap())));
+
         assert_eq!(result, None);
     }
 
@@ -16682,6 +16791,11 @@ pub(crate) fn rewrite_command(command: &str) -> Option<String> {
         return Some(rewritten);
     }
 
+    // large source-file reads inside indexed repos → tsift source-read windows
+    if let Some(rewritten) = rewrite_source_read_command(trimmed) {
+        return Some(rewritten);
+    }
+
     // cargo test / pytest → tsift-owned test digest wrapper that preserves exit status
     if let Some(rewritten) = rewrite_test_command(trimmed) {
         return Some(rewritten);
@@ -16972,10 +17086,20 @@ fn build_diff_digest_command(path: &str, cached: bool, revision: Option<&str>) -
 }
 
 const SESSION_READ_LINE_THRESHOLD: usize = 80;
+const SOURCE_READ_LINE_THRESHOLD: usize = 80;
 
-struct SessionReadTarget {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileReadWindow {
+    FullFile,
+    FromStart { lines: usize },
+    FromEnd { lines: usize },
+    Range { start: usize, lines: usize },
+}
+
+struct FileReadTarget {
     input: String,
     requested_lines: Option<usize>,
+    window: FileReadWindow,
 }
 
 fn rewrite_session_read_command(cmd: &str) -> Option<String> {
@@ -16983,7 +17107,7 @@ fn rewrite_session_read_command(cmd: &str) -> Option<String> {
         return None;
     }
 
-    let target = parse_session_read_target(cmd)?;
+    let target = parse_file_read_target(cmd)?;
     let input_path = Path::new(&target.input);
     let source = detect_session_digest_source(input_path)?;
 
@@ -17003,18 +17127,55 @@ fn rewrite_session_read_command(cmd: &str) -> Option<String> {
     ))
 }
 
-fn parse_session_read_target(cmd: &str) -> Option<SessionReadTarget> {
+fn rewrite_source_read_command(cmd: &str) -> Option<String> {
+    if has_shell_metacharacters(cmd) {
+        return None;
+    }
+
+    let target = parse_file_read_target(cmd)?;
+    let input_path = Path::new(&target.input);
+    if !file_is_supported_source(input_path) {
+        return None;
+    }
+
+    if let Some(requested_lines) = target.requested_lines {
+        if requested_lines < SOURCE_READ_LINE_THRESHOLD {
+            return None;
+        }
+    } else if !file_has_at_least_lines(input_path, SOURCE_READ_LINE_THRESHOLD) {
+        return None;
+    }
+
+    let root = lint::find_project_root_for_path(input_path).ok()??;
+    if !project_has_index(&root) {
+        return None;
+    }
+    let file_abs = input_path.canonicalize().ok()?;
+    let file_display = relativize_pathbuf(&file_abs, &root)
+        .to_string_lossy()
+        .to_string();
+    let total_lines = count_file_lines(&file_abs)?;
+    let (start, lines) = source_window_for_read(target.window, total_lines)?;
+    Some(build_source_read_rewrite_command(
+        &root,
+        &file_display,
+        start,
+        lines,
+    ))
+}
+
+fn parse_file_read_target(cmd: &str) -> Option<FileReadTarget> {
     let parts: Vec<&str> = shell_split(cmd);
     let head = parts.first().copied()?;
     match head {
-        "cat" | "bat" | "batcat" => parse_cat_like_session_target(&parts),
-        "head" | "tail" => parse_head_tail_session_target(&parts),
-        "sed" => parse_sed_session_target(&parts),
+        "cat" | "bat" | "batcat" => parse_cat_like_read_target(&parts),
+        "head" | "tail" => parse_head_tail_read_target(&parts),
+        "sed" => parse_sed_read_target(&parts),
         _ => None,
     }
 }
 
-fn parse_cat_like_session_target(parts: &[&str]) -> Option<SessionReadTarget> {
+fn parse_cat_like_read_target(parts: &[&str]) -> Option<FileReadTarget> {
     let mut input = None;
     for part in &parts[1..] {
         if part.starts_with('-') {
@@ -17024,13 +17185,14 @@ fn parse_cat_like_session_target(parts: &[&str]) -> Option<SessionReadTarget> {
             return None;
         }
     }
-    Some(SessionReadTarget {
+    Some(FileReadTarget {
         input: input?.to_string(),
         requested_lines: None,
+        window: FileReadWindow::FullFile,
     })
 }
 
-fn parse_head_tail_session_target(parts: &[&str]) -> Option<SessionReadTarget> {
+fn parse_head_tail_read_target(parts: &[&str]) -> Option<FileReadTarget> {
     let mut requested_lines = 10;
     let mut input = None;
     let mut index = 1;
@@ -17066,21 +17228,33 @@ fn parse_head_tail_session_target(parts: &[&str]) -> Option<SessionReadTarget> {
         index += 1;
     }
 
-    Some(SessionReadTarget {
+    let window = match parts[0] {
+        "head" => FileReadWindow::FromStart {
+            lines: requested_lines,
+        },
+        "tail" => FileReadWindow::FromEnd {
+            lines: requested_lines,
+        },
+        _ => return None,
+    };
+
+    Some(FileReadTarget {
         input: input?.to_string(),
         requested_lines: Some(requested_lines),
+        window,
     })
 }
 
-fn parse_sed_session_target(parts: &[&str]) -> Option<SessionReadTarget> {
+fn parse_sed_read_target(parts: &[&str]) -> Option<FileReadTarget> {
     if parts.len() != 4 || parts[1] != "-n" {
         return None;
     }
 
-    let requested_lines = parse_sed_print_range(parts[2])?;
-    Some(SessionReadTarget {
+    let (start, lines) = parse_sed_print_window(parts[2])?;
+    Some(FileReadTarget {
         input: strip_shell_quotes(parts[3]).to_string(),
-        requested_lines: Some(requested_lines),
+        requested_lines: Some(lines),
+        window: FileReadWindow::Range { start, lines },
     })
 }
 
@@ -17093,13 +17267,86 @@ fn parse_requested_line_count(raw: &str) -> Option<usize> {
     trimmed.parse::<usize>().ok()
 }
 
-fn parse_sed_print_range(raw: &str) -> Option<usize> {
+fn parse_sed_print_window(raw: &str) -> Option<(usize, usize)> {
     let trimmed = strip_shell_quotes(raw);
     let range = trimmed.strip_suffix('p')?;
     let (start, end) = range.split_once(',')?;
     let start = start.parse::<usize>().ok()?;
     let end = end.parse::<usize>().ok()?;
-    (end >= start).then_some(end - start + 1)
+    (end >= start).then_some((start, end - start + 1))
+}
+
+fn file_is_supported_source(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(lang::Lang::from_extension)
+        .is_some()
+}
+
+fn count_file_lines(path: &Path) -> Option<usize> {
+    let file = fs::File::open(path).ok()?;
+    Some(
+        BufReader::new(file)
+            .lines()
+            .filter(|line| line.is_ok())
+            .count(),
+    )
+}
+
+fn source_window_for_read(window: FileReadWindow, total_lines: usize) -> Option<(usize, usize)> {
+    if total_lines == 0 {
+        return None;
+    }
+    match window {
+        FileReadWindow::FullFile => Some((1, SOURCE_READ_LINE_THRESHOLD.min(total_lines))),
+        FileReadWindow::FromStart { lines } => Some((1, lines.min(total_lines))),
+        FileReadWindow::FromEnd { lines } => {
+            let bounded = lines.min(total_lines);
+            Some((total_lines - bounded + 1, bounded))
+        }
+        FileReadWindow::Range { start, lines } => {
+            if start == 0 || start > total_lines {
+                return None;
+            }
+            Some((start, lines.min(total_lines - start + 1)))
+        }
+    }
+}
+
+fn build_source_read_rewrite_command(
+    root: &Path,
+    file: &str,
+    start: usize,
+    lines: usize,
+) -> String {
+    format!(
+        "tsift --envelope source-read {} --path {} --start {} --lines {} --budget normal",
+        shell_quote(file),
+        shell_quote(&root.to_string_lossy()),
+        start,
+        lines
+    )
+}
+
+fn project_has_index(root: &Path) -> bool {
+    let tsift_dir = root.join(".tsift");
+    tsift_dir.join("index.db").is_file() || directory_contains_index_db(&tsift_dir.join("indexes"))
+}
+
+fn directory_contains_index_db(path: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.file_name().is_some_and(|name| name == "index.db") && path.is_file() {
+            return true;
+        }
+        if path.is_dir() && directory_contains_index_db(&path) {
+            return true;
+        }
+    }
+    false
 }
 
 fn detect_session_digest_source(path: &Path) -> Option<session_digest::SessionDigestSource> {
