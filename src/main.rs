@@ -6860,7 +6860,14 @@ fn cmd_session_review_with_budget(
                     envelope_metric("prompt_targets", report.prompt_target_count),
                     envelope_metric("failures", report.failure_groups),
                     envelope_metric("file_reads", report.file_read_diagnostics.len()),
-                    envelope_metric("total_tokens", report.total_tokens),
+                    envelope_metric("aggregate_total_tokens", report.total_tokens),
+                    envelope_metric(
+                        "latest_session_total_tokens",
+                        report
+                            .latest_session_cost
+                            .as_ref()
+                            .map_or(0, |cost| cost.total_tokens),
+                    ),
                 ],
             },
             false,
@@ -6874,8 +6881,18 @@ fn cmd_session_review_with_budget(
             .cached_input_ratio
             .map(|value| format!("{value:.2}%"))
             .unwrap_or_else(|| "-".to_string());
+        let latest_total = report
+            .latest_session_cost
+            .as_ref()
+            .map(|cost| format_compact_count(cost.total_tokens))
+            .unwrap_or_else(|| "-".to_string());
+        let latest_largest_turn = report
+            .latest_session_cost
+            .as_ref()
+            .map(|cost| format_compact_count(cost.largest_turn_total_tokens))
+            .unwrap_or_else(|| "-".to_string());
         println!(
-            "session-review target:{} kind:{} matched:{} claude:{} codex:{} agent_doc:{} prompt:{} cached:{} cache_ratio:{} output:{} total:{} loops:{} file_reads:{}",
+            "session-review target:{} kind:{} matched:{} claude:{} codex:{} agent_doc:{} aggregate_prompt:{} aggregate_cached:{} aggregate_cache_ratio:{} aggregate_output:{} aggregate_total:{} latest_total:{} latest_largest_turn:{} loops:{} file_reads:{}",
             report.target,
             report.target_kind,
             report.sessions_matched,
@@ -6887,14 +6904,17 @@ fn cmd_session_review_with_budget(
             cache_ratio,
             format_compact_count(report.output_tokens),
             format_compact_count(report.total_tokens),
+            latest_total,
+            latest_largest_turn,
             report.loop_clusters.len(),
             report.file_read_diagnostics.len()
         );
         for session in &report.sessions {
             println!(
-                "session {} total:{} prompts:{} fails:{} matched_by:{} path:{}",
+                "session {} total:{} largest_turn:{} prompts:{} fails:{} matched_by:{} path:{}",
                 session.source,
                 format_compact_count(session.total_tokens),
+                format_compact_count(session.largest_turn_total_tokens),
                 session.prompt_target_count,
                 session.failure_groups,
                 session.matched_by.join(","),
@@ -6985,36 +7005,44 @@ fn cmd_session_review_with_budget(
         "  repeated file reads:    {}",
         report.file_read_diagnostics.len()
     );
-    println!("  usage samples:          {}", report.usage_samples);
-    println!("  prompt tokens:          {}", report.prompt_tokens);
-    println!("  cached input tokens:    {}", report.cached_input_tokens);
+    println!("  aggregate usage samples: {}", report.usage_samples);
+    println!("  aggregate prompt tokens: {}", report.prompt_tokens);
+    println!("  aggregate cached input: {}", report.cached_input_tokens);
     println!(
-        "  cache creation tokens:  {}",
+        "  aggregate cache create: {}",
         report.cache_creation_input_tokens
     );
-    println!("  output tokens:          {}", report.output_tokens);
+    println!("  aggregate output tokens: {}", report.output_tokens);
     println!(
-        "  reasoning output:       {}",
+        "  aggregate reasoning out: {}",
         report.reasoning_output_tokens
     );
-    println!("  total tokens:           {}", report.total_tokens);
+    println!("  aggregate total tokens: {}", report.total_tokens);
     if let Some(ratio) = report.cached_input_ratio {
-        println!("  cached input ratio:     {ratio:.2}%");
+        println!("  aggregate cache ratio:  {ratio:.2}%");
     }
     println!(
-        "  largest turn total:     {}",
+        "  aggregate largest turn: {}",
         report.largest_turn_total_tokens
     );
+    if let Some(latest) = &report.latest_session_cost {
+        println!("  latest session tokens:  {}", latest.total_tokens);
+        println!(
+            "  latest session largest: {}",
+            latest.largest_turn_total_tokens
+        );
+    }
 
     if !report.sessions.is_empty() {
         println!();
         println!("Matched sessions:");
         for session in &report.sessions {
             println!(
-                "  - [{}] {} | total {} | prompts {} | failures {} | matched by {}",
+                "  - [{}] {} | total {} | largest turn {} | prompts {} | failures {} | matched by {}",
                 session.source,
                 session.path,
                 session.total_tokens,
+                session.largest_turn_total_tokens,
                 session.prompt_target_count,
                 session.failure_groups,
                 session.matched_by.join(", ")
@@ -7158,6 +7186,7 @@ struct SessionReviewBudgetSessionPreview {
     path: String,
     matched_by: Vec<String>,
     total_tokens: u64,
+    largest_turn_total_tokens: u64,
     prompt_targets: usize,
     failures: usize,
     expand: String,
@@ -7194,6 +7223,10 @@ struct SessionReviewBudgetReport {
     prompt_tokens: u64,
     cached_input_tokens: u64,
     total_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_session_total_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_session_largest_turn_total_tokens: Option<u64>,
     truncated: bool,
     sessions: Vec<SessionReviewBudgetSessionPreview>,
     prompt_targets: Vec<SessionReviewBudgetPromptPreview>,
@@ -7420,6 +7453,7 @@ fn build_session_review_budget_report(
                 .map(|value| truncate_for_budget(value, max_bytes))
                 .collect(),
             total_tokens: entry.total_tokens,
+            largest_turn_total_tokens: entry.largest_turn_total_tokens,
             prompt_targets: entry.prompt_target_count,
             failures: entry.failure_groups,
             expand: format!(
@@ -7483,6 +7517,14 @@ fn build_session_review_budget_report(
         prompt_tokens: report.prompt_tokens,
         cached_input_tokens: report.cached_input_tokens,
         total_tokens: report.total_tokens,
+        latest_session_total_tokens: report
+            .latest_session_cost
+            .as_ref()
+            .map(|cost| cost.total_tokens),
+        latest_session_largest_turn_total_tokens: report
+            .latest_session_cost
+            .as_ref()
+            .map(|cost| cost.largest_turn_total_tokens),
         truncated: report.sessions.len() > max_items
             || report.prompt_targets.len() > max_items
             || report.failures.len() > max_items
@@ -7589,22 +7631,33 @@ fn build_session_review_next_context_budget_report(
 }
 
 fn print_session_review_budget_human(report: &SessionReviewBudgetReport) {
+    let latest_total = report
+        .latest_session_total_tokens
+        .map(format_compact_count)
+        .unwrap_or_else(|| "-".to_string());
+    let latest_largest_turn = report
+        .latest_session_largest_turn_total_tokens
+        .map(format_compact_count)
+        .unwrap_or_else(|| "-".to_string());
     println!(
-        "session-review-budget target:{} kind:{} sessions:{}/{} prompt:{} cached:{} total:{}",
+        "session-review-budget target:{} kind:{} sessions:{}/{} aggregate_prompt:{} aggregate_cached:{} aggregate_total:{} latest_total:{} latest_largest_turn:{}",
         shell_quote(&report.target),
         report.target_kind,
         report.sessions.len(),
         report.sessions_matched,
         format_compact_count(report.prompt_tokens),
         format_compact_count(report.cached_input_tokens),
-        format_compact_count(report.total_tokens)
+        format_compact_count(report.total_tokens),
+        latest_total,
+        latest_largest_turn
     );
     for session in &report.sessions {
         println!(
-            "session {} {} total:{} prompts:{} fails:{} expand:{}",
+            "session {} {} total:{} largest_turn:{} prompts:{} fails:{} expand:{}",
             session.handle,
             session.path,
             format_compact_count(session.total_tokens),
+            format_compact_count(session.largest_turn_total_tokens),
             session.prompt_targets,
             session.failures,
             session.expand
@@ -15728,6 +15781,32 @@ tier = "private"
             total_tokens: 240,
             cached_input_ratio: Some(40.0),
             largest_turn_total_tokens: 240,
+            aggregate_cost: session_review::SessionReviewCostSummary {
+                scope: "bounded_matched_sessions".to_string(),
+                sessions: 1,
+                usage_samples: 1,
+                prompt_tokens: 120,
+                cached_input_tokens: 80,
+                cache_creation_input_tokens: 0,
+                output_tokens: 40,
+                reasoning_output_tokens: 0,
+                total_tokens: 240,
+                cached_input_ratio: Some(40.0),
+                largest_turn_total_tokens: 240,
+            },
+            latest_session_cost: Some(session_review::SessionReviewCostSummary {
+                scope: "latest_matched_session".to_string(),
+                sessions: 1,
+                usage_samples: 1,
+                prompt_tokens: 120,
+                cached_input_tokens: 80,
+                cache_creation_input_tokens: 0,
+                output_tokens: 40,
+                reasoning_output_tokens: 0,
+                total_tokens: 240,
+                cached_input_ratio: Some(66.67),
+                largest_turn_total_tokens: 240,
+            }),
             guardrails: vec![],
             loop_clusters: vec![],
             file_read_diagnostics: vec![],
@@ -15769,6 +15848,7 @@ tier = "private"
                 output_tokens: 40,
                 reasoning_output_tokens: 0,
                 total_tokens: 240,
+                largest_turn_total_tokens: 240,
             }],
             next_context: session_review::SessionReviewNextContext {
                 target: "tasks/software/tsift.md".to_string(),

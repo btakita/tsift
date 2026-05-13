@@ -4683,6 +4683,123 @@ fn session_review_aggregates_only_visible_bounded_session_rows() {
 }
 
 #[test]
+fn session_review_separates_aggregate_and_latest_session_cost() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let target = root.path().join("tasks/software/tsift.md");
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(
+        &target,
+        "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n",
+    )
+    .unwrap();
+
+    fn codex_transcript(root_text: &str, turns: &[u64]) -> String {
+        let mut transcript = String::new();
+        transcript.push_str(
+            &serde_json::json!({
+                "type": "session_meta",
+                "payload": { "cwd": root_text }
+            })
+            .to_string(),
+        );
+        transcript.push('\n');
+        transcript.push_str(
+            &serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": format!("agent-doc {root_text}/tasks/software/tsift.md")
+                }
+            })
+            .to_string(),
+        );
+        transcript.push('\n');
+        let mut cumulative = 0_u64;
+        for (index, turn_total) in turns.iter().enumerate() {
+            cumulative += turn_total;
+            let cached = turn_total.saturating_sub(100);
+            let cumulative_cached = cumulative.saturating_sub((index as u64 + 1) * 100);
+            transcript.push_str(
+                &serde_json::json!({
+                    "timestamp": format!("2026-05-05T00:00:{:02}Z", index + 1),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": cumulative,
+                                "cached_input_tokens": cumulative_cached,
+                                "output_tokens": 0,
+                                "reasoning_output_tokens": 0,
+                                "total_tokens": cumulative
+                            },
+                            "last_token_usage": {
+                                "input_tokens": turn_total,
+                                "cached_input_tokens": cached,
+                                "output_tokens": 0,
+                                "reasoning_output_tokens": 0,
+                                "total_tokens": turn_total
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+            );
+            transcript.push('\n');
+        }
+        transcript
+    }
+
+    let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let root_text = root.path().display().to_string();
+    fs::write(
+        codex_dir.join("bb-older-high-cache.jsonl"),
+        codex_transcript(&root_text, &[1_000_000]),
+    )
+    .unwrap();
+    fs::write(
+        codex_dir.join("aa-latest-lower-cost.jsonl"),
+        codex_transcript(
+            &root_text,
+            &[
+                67_644, 67_644, 67_644, 67_644, 67_644, 67_644, 67_644, 44_883,
+            ],
+        ),
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["session-review", "--json", target.to_str().unwrap()])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "session-review should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["sessions_matched"], 2);
+    assert_eq!(json["aggregate_cost"]["scope"], "bounded_matched_sessions");
+    assert_eq!(json["aggregate_cost"]["total_tokens"], 1_518_391);
+    assert_eq!(
+        json["aggregate_cost"]["largest_turn_total_tokens"],
+        1_000_000
+    );
+    assert_eq!(
+        json["latest_session_cost"]["scope"],
+        "latest_matched_session"
+    );
+    assert_eq!(json["latest_session_cost"]["total_tokens"], 518_391);
+    assert_eq!(
+        json["latest_session_cost"]["largest_turn_total_tokens"],
+        67_644
+    );
+    assert_eq!(json["sessions"][0]["total_tokens"], 518_391);
+    assert_eq!(json["sessions"][0]["largest_turn_total_tokens"], 67_644);
+}
+
+#[test]
 fn rewrite_routes_long_agent_doc_reads_to_session_digest() {
     let dir = tempfile::tempdir().unwrap();
     let session = dir.path().join("tsift.md");

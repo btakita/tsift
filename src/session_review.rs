@@ -42,6 +42,23 @@ pub struct SessionReviewSession {
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
     pub total_tokens: u64,
+    pub largest_turn_total_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SessionReviewCostSummary {
+    pub scope: String,
+    pub sessions: usize,
+    pub usage_samples: usize,
+    pub prompt_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub total_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_ratio: Option<f64>,
+    pub largest_turn_total_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -150,6 +167,9 @@ pub struct SessionReviewReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_input_ratio: Option<f64>,
     pub largest_turn_total_tokens: u64,
+    pub aggregate_cost: SessionReviewCostSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_session_cost: Option<SessionReviewCostSummary>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub guardrails: Vec<SessionCostGuardrail>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -575,6 +595,9 @@ pub fn compute_with_options(
                 .as_ref()
                 .map_or(0, |report| report.reasoning_output_tokens),
             total_tokens: cost.as_ref().map_or(0, |report| report.total_tokens),
+            largest_turn_total_tokens: cost
+                .as_ref()
+                .map_or(0, |report| report.largest_turn_total_tokens),
         });
     }
 
@@ -675,6 +698,38 @@ pub fn compute_with_options(
     let loop_clusters = collect_loop_clusters(loop_clusters, MAX_LOOP_CLUSTERS);
     let file_read_diagnostics =
         collect_file_read_diagnostics(file_read_diagnostics, MAX_AGGREGATE_ITEMS);
+    let aggregate_cost = SessionReviewCostSummary {
+        scope: "bounded_matched_sessions".to_string(),
+        sessions: session_rows.len(),
+        usage_samples,
+        prompt_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+        total_tokens,
+        cached_input_ratio,
+        largest_turn_total_tokens,
+    };
+    let latest_session_cost = session_rows
+        .first()
+        .map(|session| SessionReviewCostSummary {
+            scope: "latest_matched_session".to_string(),
+            sessions: 1,
+            usage_samples: session.usage_samples,
+            prompt_tokens: session.prompt_tokens,
+            cached_input_tokens: session.cached_input_tokens,
+            cache_creation_input_tokens: session.cache_creation_input_tokens,
+            output_tokens: session.output_tokens,
+            reasoning_output_tokens: session.reasoning_output_tokens,
+            total_tokens: session.total_tokens,
+            cached_input_ratio: (session.prompt_tokens > 0).then_some(
+                ((session.cached_input_tokens as f64) / (session.prompt_tokens as f64) * 10_000.0)
+                    .round()
+                    / 100.0,
+            ),
+            largest_turn_total_tokens: session.largest_turn_total_tokens,
+        });
     let document_active_context = match collect_document_active_context(&context) {
         Ok(active_context) => active_context,
         Err(error) => {
@@ -744,6 +799,8 @@ pub fn compute_with_options(
         total_tokens,
         cached_input_ratio,
         largest_turn_total_tokens,
+        aggregate_cost,
+        latest_session_cost,
         guardrails,
         loop_clusters,
         file_read_diagnostics,
