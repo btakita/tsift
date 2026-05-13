@@ -17,6 +17,8 @@ pub struct StatusReport {
     pub summaries: SummaryStatus,
     pub instructions: InstructionStatus,
     pub recommendations: Recommendations,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub reminders: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -142,12 +144,14 @@ pub fn check_status(root: &Path) -> Result<StatusReport> {
         workspace,
         &summarize_extract,
     );
+    let reminders = build_reminders(&index, &summaries, &recommendations, &summarize_extract);
 
     Ok(StatusReport {
         index,
         summaries,
         instructions,
         recommendations,
+        reminders,
     })
 }
 
@@ -488,6 +492,56 @@ fn build_recommendations(
             }
         }
     }
+}
+
+fn build_reminders(
+    index: &IndexStatus,
+    summaries: &SummaryStatus,
+    recommendations: &Recommendations,
+    summarize_extract: &str,
+) -> Vec<String> {
+    let IndexStatus::Stale {
+        stale_files,
+        missing_scopes,
+        ..
+    } = index
+    else {
+        return Vec::new();
+    };
+
+    let run =
+        status_recommendation_command(recommendations.run.as_deref().unwrap_or("tsift index ."));
+    let mut reminder = format!(
+        "index stale: run `{}` before relying on tsift search/explain/graph",
+        run
+    );
+    if *stale_files > 0 {
+        reminder.push_str(&format!(
+            " ({} stale file{})",
+            stale_files,
+            if *stale_files == 1 { "" } else { "s" }
+        ));
+    }
+    if !missing_scopes.is_empty() {
+        reminder.push_str(&format!(
+            " ({} missing workspace scope{})",
+            missing_scopes.len(),
+            if missing_scopes.len() == 1 { "" } else { "s" }
+        ));
+    }
+    if matches!(summaries, SummaryStatus::None { .. }) {
+        reminder.push_str(&format!(
+            "; no summaries are cached, so run `tsift summarize --extract {}` after the index is fresh when summary refs are needed",
+            summarize_extract
+        ));
+    }
+    vec![reminder]
+}
+
+fn status_recommendation_command(run: &str) -> &str {
+    run.split_once("  (")
+        .map(|(command, _)| command)
+        .unwrap_or(run)
 }
 
 fn recommended_summarize_extract_path(
@@ -1010,6 +1064,9 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
     }
 
     if compact {
+        for reminder in &report.reminders {
+            out.push_str(&format!("reminder: {}\n", reminder));
+        }
         if report.recommendations.use_commands.is_empty() {
             out.push_str("use: none\n");
         } else {
@@ -1022,6 +1079,12 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
             out.push_str(&format!("run: {}\n", run));
         }
     } else {
+        if !report.reminders.is_empty() {
+            out.push_str("reminders:\n");
+            for reminder in &report.reminders {
+                out.push_str(&format!("  - {}\n", reminder));
+            }
+        }
         out.push_str("recommendations:\n");
         if report.recommendations.use_commands.is_empty() {
             out.push_str("  use: (none — run tsift index first)\n");
@@ -1630,6 +1693,29 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_stale_index_reminder() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn main() { println!(\"hi\"); }\n",
+        )
+        .unwrap();
+
+        let report = check_status(dir.path()).unwrap();
+
+        assert_eq!(report.reminders.len(), 1);
+        assert!(report.reminders[0].contains("index stale"));
+        assert!(report.reminders[0].contains("tsift index ."));
+        assert!(report.reminders[0].contains("no summaries are cached"));
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"reminders\""));
+    }
+
+    #[test]
     fn status_human_format_missing() {
         let report = StatusReport {
             index: IndexStatus::Missing {
@@ -1641,6 +1727,7 @@ mod tests {
                 use_commands: vec![],
                 run: Some("tsift init && tsift index .".to_string()),
             },
+            reminders: Vec::new(),
         };
         let output = format_human(&report, false);
         assert!(output.contains("index: missing"));
@@ -1678,6 +1765,7 @@ mod tests {
                 ],
                 run: None,
             },
+            reminders: Vec::new(),
         };
         let output = format_human(&report, false);
         assert!(output.contains("index: fresh"));
@@ -1711,10 +1799,31 @@ mod tests {
                 ],
                 run: Some("tsift init && tsift index .".to_string()),
             },
+            reminders: build_reminders(
+                &IndexStatus::Stale {
+                    total_files: 42,
+                    stale_files: 3,
+                    last_indexed_secs_ago: 120,
+                    recovery: None,
+                    workspace_scopes: Vec::new(),
+                    missing_scopes: Vec::new(),
+                },
+                &SummaryStatus::None { recovery: None },
+                &Recommendations {
+                    use_commands: vec![
+                        "search".to_string(),
+                        "explain".to_string(),
+                        "graph".to_string(),
+                    ],
+                    run: Some("tsift init && tsift index .".to_string()),
+                },
+                ".",
+            ),
         };
         let output = format_human(&report, true);
         assert!(output.contains("index: stale tracked:42 stale:3"));
         assert!(output.contains("instructions: stale v=0.0.9 expected=0.1.0"));
+        assert!(output.contains("reminder: index stale"));
         assert!(output.contains("use: search, explain, graph"));
         assert!(!output.contains("recommendations:"));
     }
@@ -1738,6 +1847,7 @@ mod tests {
                 use_commands: vec!["search".to_string()],
                 run: None,
             },
+            reminders: Vec::new(),
         };
         let output = format_human(&report, false);
         assert!(output.contains("recovery: snapshot fallback"));
@@ -1762,6 +1872,7 @@ mod tests {
                 use_commands: vec!["search".to_string()],
                 run: None,
             },
+            reminders: Vec::new(),
         };
         let output = format_human(&report, false);
         assert!(output.contains("copied live WAL sidecars"));
@@ -1786,6 +1897,7 @@ mod tests {
                 use_commands: vec!["search".to_string()],
                 run: None,
             },
+            reminders: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"recovery\":\"snapshot_fallback\""));
@@ -1815,6 +1927,7 @@ mod tests {
                 use_commands: vec!["search".to_string(), "summarize".to_string()],
                 run: None,
             },
+            reminders: Vec::new(),
         };
         let output = format_human(&report, false);
         assert!(output.contains("summaries recovery: snapshot fallback"));
@@ -1841,6 +1954,7 @@ mod tests {
                 use_commands: vec!["search".to_string()],
                 run: None,
             },
+            reminders: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"state\":\"none\""));

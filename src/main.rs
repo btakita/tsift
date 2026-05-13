@@ -7262,6 +7262,8 @@ struct ContextPackReport {
     max_items: usize,
     max_bytes: usize,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    status_reminders: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     ontology_refs: Vec<CompactOntologyRefPreview>,
     next_context: SessionReviewNextContextBudgetReport,
     diff_digest: ContextPackDiffPreview,
@@ -8200,6 +8202,7 @@ fn build_context_pack_report(
     let budget = effective_context_budget(budget);
     let review = session_review::compute(path)?;
     let root = PathBuf::from(&review.root);
+    let status_reminders = context_pack_status_reminders(&root);
     let ontology = load_tag_ontology_preview_context(&root);
     let ontology_ref = ontology.as_ref();
     let mut next_context =
@@ -8286,6 +8289,7 @@ fn build_context_pack_report(
         target_kind: review.target_kind,
         max_items: budget.preview_items(),
         max_bytes: budget.preview_bytes(),
+        status_reminders,
         ontology_refs,
         next_context,
         diff_digest,
@@ -8293,6 +8297,12 @@ fn build_context_pack_report(
         log_digest,
         resume_commands: review.next_context.next_digest_commands,
     })
+}
+
+fn context_pack_status_reminders(root: &Path) -> Vec<String> {
+    status::check_status(root)
+        .map(|report| report.reminders)
+        .unwrap_or_default()
 }
 
 fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
@@ -8307,6 +8317,9 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
             report.test_digest.status,
             report.log_digest.status
         );
+        for reminder in &report.status_reminders {
+            println!("reminder {reminder}");
+        }
         for prompt in &report.next_context.prompt_targets {
             println!("prompt {prompt}");
         }
@@ -8362,6 +8375,12 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
         "  preview budget:         {} items / {} bytes",
         report.max_items, report.max_bytes
     );
+    if !report.status_reminders.is_empty() {
+        println!("  status reminders:");
+        for reminder in &report.status_reminders {
+            println!("  - {reminder}");
+        }
+    }
     println!();
     println!("Next context");
     println!(
@@ -15975,6 +15994,23 @@ tier = "private"
             "tsift summarize --file \"src/lib.rs\""
         );
         assert_eq!(preview.files[0].warnings, vec!["stale parse"]);
+    }
+
+    #[test]
+    fn context_pack_status_reminders_include_stale_index_state() {
+        let dir = setup_graph_index();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() { println!(\"updated\"); }\nfn main() { helper(); Vec::new(); }\n",
+        )
+        .unwrap();
+
+        let reminders = context_pack_status_reminders(dir.path());
+
+        assert_eq!(reminders.len(), 1);
+        assert!(reminders[0].contains("index stale"));
+        assert!(reminders[0].contains("tsift index ."));
     }
 
     #[test]

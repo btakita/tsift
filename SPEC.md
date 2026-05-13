@@ -863,6 +863,8 @@ Release-bump regressions are covered through the compiled CLI path: a stale Code
 
 `tsift status` reports index freshness, instruction version, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session. When the input path is a nested subdirectory, `status` first promotes it to the nearest ancestor that already owns `.tsift/` so the check reuses the existing project/workspace state, but it stops at a nested git root before considering parent `.tsift/` directories and ignores ambient system-temp-root project markers for child temp dirs so unrelated temp or parent workspaces cannot capture a child repo. On workspace roots, it treats scoped indexes under `.tsift/indexes/<scope>/index.db` as the authoritative status surface even if a shared `.tsift/index.db` also exists. If one or more configured workspace scopes are present on disk but their scoped `index.db` files are missing, the CLI auto-builds just those missing scoped indexes before it prints the final status so a partially initialized workspace does not stay stuck at `index: missing` / `stale` after a successful status pass. `tsift status --fix` additionally applies the safe local fixes behind the `run:` recommendation: refresh stale or missing indexes, rebuild all existing workspace scopes when the workspace index is stale, refresh stale/missing Code Navigation instructions via `tsift init`, and then print the final status. When status recommends `tsift summarize --extract ...`, that extract scope is derived from the indexed layout: it uses the common indexed root (for example `src/` when every tracked file or scope lives under `src/`) and falls back to `.` when the indexed files span the project root or multiple unrelated workspace roots.
 
+When the index is stale, `status` also emits a lightweight `reminders` list in JSON and a matching human `reminders:` section. The reminder repeats the concrete reindex command, includes the stale-file or missing-scope count, and notes when no summary cache is available so agents know to refresh the index before relying on search/explain/graph and to run `tsift summarize --extract <scope>` after the index is fresh when summary refs are needed.
+
 ```bash
 tsift status            # human-readable output
 tsift status --json     # structured JSON output
@@ -945,7 +947,8 @@ recommendations:
   },
   "instructions": { "state": "current|stale|missing", "version": "0.1.0", "found": "0.0.1", "expected": "0.1.0" },
   "summaries": { "state": "available|none|unavailable", "cached_files": N, "total_indexed_files": N, "coverage_pct": N },
-  "recommendations": { "use": ["search", "explain", ...], "run": "tsift index ." }
+  "recommendations": { "use": ["search", "explain", ...], "run": "tsift index ." },
+  "reminders": ["index stale: run `tsift index .` before relying on tsift search/explain/graph (8 stale files); no summaries are cached, so run `tsift summarize --extract .` after the index is fresh when summary refs are needed"]
 }
 ```
 
@@ -1256,6 +1259,7 @@ Behavior:
 3. Optionally inlines `test-digest` when `--test-input <file>` is provided.
 4. Optionally inlines `log-digest` when `--log-input <file>` is provided.
 5. Emits the follow-up digest commands needed to refresh or expand the pack without replaying raw transcripts or verbose logs.
+6. Includes current `status_reminders` from the resolved repo root, so a stale index or missing summary cache remains visible in context-pack JSON and human output without requiring a separate `tsift status` call.
 
 `context-pack` is intentionally bounded by default: it emits preview-style lists plus counts rather than dumping the full underlying reports, and `--max-items` / `--max-bytes` further tighten the preview envelope for high-token-pressure turns. Its symbol-bearing preview lists keep the raw `touched_symbols` strings for compatibility while also adding compact symbol-ref objects with stable `handle` ids and canonical `tag_alias` values for `next_context`, diff previews, and log symbol references. If tagpath ontology docs exist under `.naming/tags/*.md`, `context-pack` also loads them once and attaches compact `ontology_refs` to matching symbol refs, summary refs, and the top-level pack; those refs carry handle/tag/path metadata so stable domain vocabulary can be referenced without inlining repeated prose definitions. When the underlying diff/test/log digest already found current cached summaries, the corresponding touched file, failure, signal, file-ref, and symbol/tag-alias family rows expose bounded `summary_refs` with stable handles plus `tsift summarize --file ...` or `tsift summarize <symbol>` expansion commands, so resumptions can keep summary context behind handles instead of inlining every cached summary body.
 

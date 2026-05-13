@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- `tsift status` now emits structured stale-index reminders, and `context-pack` carries the same reminders forward so agent handoff packs still show the reindex command and missing-summary follow-up when the repo index is stale.
 - `log-digest` no longer reports clean `quit_after_eof` / user Ctrl-D exits as restart-churn warning signals; those exits remain summarized in runtime churn context while actual fresh restarts, timeouts, and Ctrl-D restart loops continue to warn.
 - `session-review --next-context` now carries aggregate guardrails forward as `guardrail:<kind>` unresolved-failure action rows, so restart-loop, prompt-budget, cached-resend, and no-op closeout warnings remain visible in resumable handoff context even when no command failure was extracted.
 - `log-digest` now classifies agent-doc runtime failures, restart churn, timeouts, and closeout churn as warning/error signals, so agent-doc logs no longer report `signal_groups: 0` while `session-digest` sees runtime failures and churn.
