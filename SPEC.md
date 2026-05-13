@@ -251,6 +251,7 @@ Behavior:
 - Symbol-bearing preview items expose a canonical `tag_alias` derived from the `tagpath` family API (for example `alpha/helper`), so search, explain, session-review, and context-pack use one shared family model across surface spellings.
 - `context-pack` loads tagpath ontology docs from `.naming/tags/*.md` when present and attaches compact `ontology_refs` to visible symbol refs and summary refs. Each ref carries a stable handle, canonical tag, markdown path, and optional title/domain metadata, while deliberately omitting ontology prose so agents can expand the tag document by path only when needed.
 - When search preview mode sees repeated symbol hits that collapse to the same canonical `tag_alias`, it emits one family summary row with match/file counts plus a follow-up `expand` command keyed to that canonical tag family instead of repeating every surface spelling inline.
+- When a search preview looks too broad for safe fan-out, the report includes a `scale_guard` with `high-hit` or `corpus-size` level, explicit corpus/tool-budget signals, and concrete `narrow_commands` to run before dispatching parallel agents. Envelope `follow_up` lists those narrowing commands before ordinary item expansion commands.
 - JSON/terse/schema output in preview mode returns the same bounded preview report instead of the full raw payload; without these flags, the existing output formats remain unchanged.
 
 `tsift token-savings --fixture <path>` is a CI-friendly report surface for preview compression contracts. The fixture lists per-command cases with raw symbol rows, compact tagpath families, and minimum savings thresholds; session-review cases can include raw `prompt_targets`, `sessions`, `commands`, `touched_files`, `touched_symbols`, `failures`, `guardrails`, and `largest_turns`, while context-pack cases can include raw `next_context`, `diff`, `test`, and `log` input rows. That keeps the benchmark focused on the real transcript and handoff sections that dominate prompt volume, not only symbol-family compression. tsift serializes the raw rows and the compact envelope rows, then reports byte deltas, estimated token deltas using `ceil(utf8_bytes / 4)`, savings percentages, and pass/fail status per command. `--json` emits the report as structured data, `--fail-under` exits non-zero when any case misses its fixture threshold, and `tsift --envelope token-savings ...` wraps the same report in the common summary envelope.
@@ -279,6 +280,8 @@ Envelope shape:
 - `report`: the existing command-specific JSON payload
 
 Preview reports keep their item-level `handle` + `expand` fields inside `report`, so clients can render a top summary from the envelope and then request narrower follow-up expansion without falling back to prose-heavy defaults.
+
+Search preview reports may also include `report.scale_guard`. Clients should surface that warning prominently and prefer the guard's `narrow_commands` before launching independent search/explain/summarize work, because those commands encode the result-count, corpus-size, and preview-budget context that made the original query risky.
 
 ### Command/Test-Run Envelopes
 

@@ -9045,11 +9045,16 @@ fn cmd_search_with_budget(
             budget,
         );
         if format.json_output {
-            let mut follow_up = vec![build_search_budget_follow_up(
+            let mut follow_up = report
+                .scale_guard
+                .as_ref()
+                .map(|guard| guard.narrow_commands.clone())
+                .unwrap_or_default();
+            follow_up.push(build_search_budget_follow_up(
                 &query,
                 &effective_strategy,
                 base_path.to_string_lossy().as_ref(),
-            )];
+            ));
             if let Some(symbol) = report.symbols.first() {
                 follow_up.push(symbol.expand.clone());
             }
@@ -9321,6 +9326,27 @@ struct SearchBudgetHitPreview {
 }
 
 #[derive(Serialize)]
+struct SearchScaleSignals {
+    preview_symbols: usize,
+    symbol_families: usize,
+    raw_symbol_matches: usize,
+    preview_hits: usize,
+    returned_hits: usize,
+    indexed_artifacts: usize,
+    skipped_artifacts: usize,
+    max_items: usize,
+    max_bytes: usize,
+}
+
+#[derive(Serialize)]
+struct SearchScaleGuard {
+    level: String,
+    warning: String,
+    signals: SearchScaleSignals,
+    narrow_commands: Vec<String>,
+}
+
+#[derive(Serialize)]
 struct SearchBudgetReport {
     query: String,
     strategy: String,
@@ -9332,6 +9358,8 @@ struct SearchBudgetReport {
     raw_symbol_total: usize,
     hit_total: usize,
     truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scale_guard: Option<SearchScaleGuard>,
     symbols: Vec<SearchBudgetSymbolPreview>,
     hits: Vec<SearchBudgetHitPreview>,
 }
@@ -9413,6 +9441,95 @@ fn build_search_budget_follow_up(query: &str, strategy: &str, path: &str) -> Str
     command
 }
 
+fn build_search_exact_narrow_command(query: &str, path: &str, max_items: usize) -> String {
+    format!(
+        "tsift search {} --path {} --limit {} --exact",
+        shell_quote(query),
+        shell_quote(path),
+        max_items.max(1)
+    )
+}
+
+fn build_search_path_narrow_command(query: &str, strategy: &str, path: &str) -> String {
+    let mut command = format!(
+        "tsift search {} --path {} --limit 20",
+        shell_quote(query),
+        shell_quote(path)
+    );
+    if strategy == "exact" {
+        command.push_str(" --exact");
+    } else if strategy != "lexical" {
+        command.push_str(&format!(" --strategy {}", shell_quote(strategy)));
+    }
+    command
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_search_scale_guard(
+    query: &str,
+    strategy: &str,
+    root: &Path,
+    response: &sift::SearchResponse,
+    symbol_total: usize,
+    raw_symbol_total: usize,
+    hit_total: usize,
+    max_items: usize,
+    max_bytes: usize,
+    symbols: &[SearchBudgetSymbolPreview],
+    hits: &[SearchBudgetHitPreview],
+) -> Option<SearchScaleGuard> {
+    let broad_symbols = symbol_total > max_items || raw_symbol_total > max_items;
+    let broad_hits = hit_total > max_items;
+    let broad_corpus = response
+        .indexed_artifacts
+        .saturating_add(response.skipped_artifacts)
+        >= 250;
+    if !broad_symbols && !broad_hits && !broad_corpus {
+        return None;
+    }
+
+    let mut narrow_commands = Vec::new();
+    let root_path = root.to_string_lossy();
+    if strategy != "exact" {
+        narrow_commands.push(build_search_exact_narrow_command(
+            query,
+            root_path.as_ref(),
+            max_items,
+        ));
+    }
+    if let Some(symbol) = symbols.first() {
+        narrow_commands.push(symbol.expand.clone());
+    }
+    if let Some(hit) = hits.first() {
+        narrow_commands.push(build_search_path_narrow_command(query, strategy, &hit.path));
+    }
+    narrow_commands.push(
+        "tsift workflow search --json # preserve handles, expand only cited parents".to_string(),
+    );
+
+    Some(SearchScaleGuard {
+        level: if broad_hits || broad_symbols {
+            "high-hit".to_string()
+        } else {
+            "corpus-size".to_string()
+        },
+        warning: "Broad search surface: inspect the preview first and run a narrowing command before dispatching parallel agents."
+            .to_string(),
+        signals: SearchScaleSignals {
+            preview_symbols: symbols.len(),
+            symbol_families: symbol_total,
+            raw_symbol_matches: raw_symbol_total,
+            preview_hits: hits.len(),
+            returned_hits: hit_total,
+            indexed_artifacts: response.indexed_artifacts,
+            skipped_artifacts: response.skipped_artifacts,
+            max_items,
+            max_bytes,
+        },
+        narrow_commands: dedupe_preserve_order(narrow_commands),
+    })
+}
+
 fn build_search_budget_report(
     query: &str,
     strategy: &str,
@@ -9475,7 +9592,7 @@ fn build_search_budget_report(
     }
 
     let symbol_total = families.len();
-    let symbols = families
+    let symbols: Vec<SearchBudgetSymbolPreview> = families
         .into_iter()
         .take(max_items)
         .map(|family| {
@@ -9529,7 +9646,7 @@ fn build_search_budget_report(
         })
         .collect();
 
-    let hits = response
+    let hits: Vec<SearchBudgetHitPreview> = response
         .hits
         .iter()
         .take(max_items)
@@ -9555,6 +9672,20 @@ fn build_search_budget_report(
         })
         .collect();
 
+    let scale_guard = build_search_scale_guard(
+        query,
+        strategy,
+        root,
+        response,
+        symbol_total,
+        raw_symbol_total,
+        hit_total,
+        max_items,
+        max_bytes,
+        &symbols,
+        &hits,
+    );
+
     SearchBudgetReport {
         query: query.to_string(),
         strategy: strategy.to_string(),
@@ -9566,6 +9697,7 @@ fn build_search_budget_report(
         raw_symbol_total,
         hit_total,
         truncated: symbol_total > max_items || hit_total > max_items,
+        scale_guard,
         symbols,
         hits,
     }
@@ -9633,6 +9765,24 @@ fn print_search_budget_human(report: &SearchBudgetReport) {
             "budget truncated items:{} bytes:{}",
             report.max_items, report.max_bytes
         );
+    }
+    if let Some(guard) = &report.scale_guard {
+        println!("scale guard [{}]: {}", guard.level, guard.warning);
+        println!(
+            "signals preview-symbols:{} symbol-families:{} raw-symbols:{} preview-hits:{} hits:{} indexed:{} skipped:{} budget-items:{} budget-bytes:{}",
+            guard.signals.preview_symbols,
+            guard.signals.symbol_families,
+            guard.signals.raw_symbol_matches,
+            guard.signals.preview_hits,
+            guard.signals.returned_hits,
+            guard.signals.indexed_artifacts,
+            guard.signals.skipped_artifacts,
+            guard.signals.max_items,
+            guard.signals.max_bytes
+        );
+        for command in &guard.narrow_commands {
+            println!("narrow: {command}");
+        }
     }
 }
 
@@ -14349,6 +14499,73 @@ tier = "private"
         assert!(report.symbols[0].file.contains("(+2 files)"));
         assert!(report.symbols[0].expand.contains("tsift search"));
         assert!(report.symbols[0].expand.contains("alpha helper"));
+    }
+
+    #[test]
+    fn search_budget_report_warns_on_broad_preview_and_lists_narrowing_commands() {
+        let mut response = empty_search_response(Path::new("/repo"), "lexical");
+        response.indexed_artifacts = 450;
+        let symbol_hits = vec![
+            index::SymbolHit {
+                name: "alpha_helper".to_string(),
+                kind: "function".to_string(),
+                language: "rust".to_string(),
+                file: "/repo/src/lib.rs".to_string(),
+                line: 12,
+                end_line: None,
+                tags: Some("alpha,helper".to_string()),
+                score: 0.98,
+                match_type: "exact_name".to_string(),
+            },
+            index::SymbolHit {
+                name: "beta_helper".to_string(),
+                kind: "function".to_string(),
+                language: "rust".to_string(),
+                file: "/repo/src/beta.rs".to_string(),
+                line: 21,
+                end_line: None,
+                tags: Some("beta,helper".to_string()),
+                score: 0.92,
+                match_type: "tag_overlap".to_string(),
+            },
+        ];
+
+        let report = build_search_budget_report(
+            "helper",
+            "lexical",
+            Path::new("/repo"),
+            &response,
+            &symbol_hits,
+            false,
+            ResponseBudget::new(Some(1), Some(64)),
+        );
+
+        let guard = report
+            .scale_guard
+            .as_ref()
+            .expect("broad previews should emit a scale guard");
+        assert_eq!(guard.level, "high-hit");
+        assert_eq!(guard.signals.indexed_artifacts, 450);
+        assert_eq!(guard.signals.raw_symbol_matches, 2);
+        assert!(
+            guard
+                .narrow_commands
+                .iter()
+                .any(|command| command.contains("--exact"))
+        );
+        assert!(
+            guard
+                .narrow_commands
+                .iter()
+                .any(|command| command.contains("alpha helper"))
+        );
+        assert!(
+            guard
+                .narrow_commands
+                .last()
+                .unwrap()
+                .contains("workflow search")
+        );
     }
 
     #[test]
