@@ -12,6 +12,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 - `context-pack` now loads tagpath ontology docs from `.naming/tags/*.md` and attaches compact ontology references to visible symbol refs, summary refs, and the top-level handoff payload so stable tag docs can be referenced by handle/path without repeating ontology prose.
 - Regression coverage now locks ontology refs in both preview-builder unit tests and the compiled `context-pack --json` integration path.
 - Budgeted `session-review --next-context` now keeps follow-up digest commands on an independent 4-command floor and preserves them verbatim, so small previews do not hide or corrupt the resume commands measured by the real-session token-savings fixture.
+- Added a tsift-local deterministic SimWorld for session prompt extraction, rewrite routing, and status recommendation edge coverage. The fast corpus runs in normal `cargo test`; the wider ignored corpus runs in GitHub Actions through `make ci-full`.
+- The generated Code Navigation guidance now tells agents to run local `make check`, then inspect the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1` and fix red CI before calling work complete.
 
 ## 0.1.42
 

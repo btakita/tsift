@@ -794,6 +794,7 @@ With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject
 7. When the resolved target has `.gitmodules`, the Codex hook automatically uses `tsift index --check --exit-code --workspace <root>` / `tsift index --workspace <root>` so one root hook covers initialized submodules. `--workspace` makes that root resolution explicit from inside a submodule.
 8. The injected Code Navigation section explicitly tells harnesses to switch to the owning repo or submodule root before running tsift/build/test commands, so submodule work does not inherit the wider superproject instruction surface by accident.
 9. The injected section also steers harnesses toward envelope-backed `search`, `explain`, `session-review`, `context-pack`, and digest-runner artifacts instead of raw transcript replays, `git diff/show/log` patch dumps, or verbose build/test output reads.
+10. The injected section tells agents to run the local default suite with `make check`, then check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1`; the wider ignored deterministic simulation corpus is a CI-owned `make ci-full` concern and must be fixed before the work is complete if CI reports failures.
 
 ### Injected Section
 
@@ -808,12 +809,18 @@ Use the commands listed in its `use:` output:
 - `tsift --envelope explain <symbol> --budget normal` — callers, callees, community preview
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
+- `tsift workflow search` — ordered exact/search/explain/summarize/digest recipe that preserves result handles across expansions
+
+When a search envelope includes `report.scale_guard`, run one of its `narrow_commands` before dispatching parallel agents. The guard means the original result set or corpus is broad enough that fan-out should start from a narrower cited handle, path, or exact query.
 
 Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
 - `tsift --envelope session-review <path> --next-context --budget normal` or `tsift --envelope context-pack <path> --budget normal` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
 - `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
 - `tsift --envelope __digest-runner --kind test --path . --shell-command '<test command>'` / `tsift --envelope __digest-runner --kind log --path . --shell-command '<build command>'` for noisy test/build/install output, or let the rewrite/hooks create those artifact-backed envelopes for `cargo test`, `pytest`, and verbose cargo commands.
+- If RTK is installed, digest-runner delegates supported generic command families through `rtk rewrite` and records the chosen compact filter in `report.filter` while preserving tsift artifact handles.
 - If your harness does not support Claude-style `PreToolUse` hooks, run `tsift rewrite --run '<command>'` to execute the same envelope-first, artifact-backed tsift equivalent manually.
+
+For local verification, run `make check` before committing. CI owns the wider ignored deterministic simulation corpus via `make ci-full`; after local changes, check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1` and fix any failing tests before calling the work complete.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->
@@ -1098,6 +1105,18 @@ Behavior:
 Each task records whether the strategy localized the intended edit/review target plus `tool_calls`, `latency_ms`, and `estimated_tokens`. The report aggregates localization rate, average tool calls, average latency, and average token budget per strategy, then ranks strategies by localization first and agent budget second. Missing expected lanes are warnings, not hard failures, so partial experiments can still be digested while making gaps visible.
 
 The checked-in `fixtures/dci-search-benchmark.json` is a seed benchmark for tsift's own multi-hop workflows: rewrite/digest routing, summary-cache lock fallback, and workspace scope fail-closed localization. It is intentionally recorded-run based rather than a live runner, so CI stays deterministic and hybrid/vector model downloads do not gate normal verification. Live benchmark scripts can append new task records and use `tsift dci-benchmark --json` as the stable summarizer.
+
+## Deterministic SimWorld
+
+`src/sim_world.rs` provides a tsift-local deterministic simulation harness for high-risk agent workflow states that should not require live tmux or long CLI matrices. The fast corpus runs in normal `cargo test`; the wider ignored corpus runs through `make ci-full` in GitHub Actions.
+
+The model currently covers:
+
+- session prompt-target extraction, including live exchange prompts versus copied instruction/frontmatter/archive ballast;
+- rewrite routing for long session reads, short passthrough reads, test/build digest-runner wrappers, diff-digest routing, and shell metacharacter passthrough;
+- status recommendation transitions for missing, stale, and current Code Navigation instructions.
+
+Coverage counters are explicit and fail closed when a named edge class disappears from the corpus. This mirrors the agent-doc pattern of replacing expensive live tmux edge sweeps with deterministic model coverage first, while keeping wider ignored simulation budgets in CI rather than the local development loop.
 
 ## Log Digest
 

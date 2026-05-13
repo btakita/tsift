@@ -35,6 +35,9 @@ pub mod summarize;
 pub mod test_digest;
 pub mod walk;
 
+#[cfg(test)]
+mod sim_world;
+
 #[derive(Parser)]
 #[command(
     name = "tsift",

@@ -58,11 +58,8 @@ jobs:
             exit 1
           fi
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test
+      - name: Full CI suite
+        run: make ci-full
 
   build:
     name: build ${{ matrix.target }}

@@ -31,6 +31,8 @@ Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
 - If RTK is installed, digest-runner delegates supported generic command families through `rtk rewrite` and records the chosen compact filter in `report.filter` while preserving tsift artifact handles.
 - If your harness does not support Claude-style `PreToolUse` hooks, run `tsift rewrite --run '<command>'` to execute the same envelope-first, artifact-backed tsift equivalent manually.
 
+For local verification, run `make check` before committing. CI owns the wider ignored deterministic simulation corpus via `make ci-full`; after local changes, check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1` and fix any failing tests before calling the work complete.
+
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->"#,
         version = TSIFT_VERSION
