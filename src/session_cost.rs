@@ -1094,6 +1094,8 @@ fn looks_like_instruction_ballast(text: &str) -> bool {
 
     looks_like_markdown_heading(trimmed)
         || looks_like_slash_command_example(trimmed)
+        || looks_like_frontmatter_prompt_preset(trimmed)
+        || looks_like_completed_backlog_archive(trimmed)
         || trimmed.starts_with("<!-- tsift:")
         || trimmed.starts_with("<!-- /tsift:")
         || looks_like_instruction_label(trimmed)
@@ -1168,6 +1170,33 @@ fn strip_common_prefixes(text: &str) -> &str {
         .or_else(|| text.strip_prefix("> "))
         .unwrap_or(text)
         .trim()
+}
+
+fn looks_like_frontmatter_prompt_preset(text: &str) -> bool {
+    let trimmed = strip_common_prefixes(text.trim());
+    if trimmed == "prompt_presets:" || trimmed.starts_with("prompt_presets:") {
+        return true;
+    }
+    let Some((key, _)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let key = key.trim().trim_matches(['"', '\'']);
+    key.starts_with('#') && key.len() > 1 && key[1..].chars().all(is_prompt_preset_char)
+}
+
+fn is_prompt_preset_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')
+}
+
+fn looks_like_completed_backlog_archive(text: &str) -> bool {
+    let stripped = strip_common_prefixes(text.trim());
+    let Some(date) = stripped.get(..10) else {
+        return false;
+    };
+    date.chars().enumerate().all(|(index, ch)| match index {
+        4 | 7 => ch == '-',
+        _ => ch.is_ascii_digit(),
+    }) && stripped[10..].contains("[#")
 }
 
 fn looks_like_command(text: &str) -> bool {

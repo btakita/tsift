@@ -336,7 +336,24 @@ fn resolve_source(input: &str, source_hint: Option<&str>) -> Result<SessionDiges
 }
 
 fn ingest_markdown(root: &Path, input: &str, state: &mut DigestState) -> Result<()> {
+    let mut in_frontmatter = false;
+    let mut first_line = true;
     for line in input.lines() {
+        let trimmed = line.trim();
+        if first_line {
+            first_line = false;
+            if trimmed == "---" {
+                in_frontmatter = true;
+                state.transcript_items += 1;
+                continue;
+            }
+        } else if in_frontmatter {
+            state.transcript_items += 1;
+            if trimmed == "---" {
+                in_frontmatter = false;
+            }
+            continue;
+        }
         state.transcript_items += 1;
         ingest_text_line(root, line, false, state)?;
     }
@@ -842,6 +859,25 @@ fn push_prompt_target(prompt: &str, targets: &mut Vec<String>) {
     }
 }
 
+pub(crate) fn extract_prompt_targets_from_text_block(input: &str, user_bias: bool) -> Vec<String> {
+    let mut targets = Vec::new();
+    for raw_line in input.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || looks_like_instruction_ballast(trimmed) {
+            continue;
+        }
+        let prompt_candidate = trimmed
+            .strip_prefix("❯ ")
+            .or_else(|| trimmed.strip_prefix("> "))
+            .unwrap_or(trimmed)
+            .trim();
+        if looks_like_prompt_target(prompt_candidate, user_bias || prompt_candidate != trimmed) {
+            push_prompt_target(prompt_candidate, &mut targets);
+        }
+    }
+    targets
+}
+
 fn looks_like_prompt_target(text: &str, user_bias: bool) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty()
@@ -889,6 +925,8 @@ fn looks_like_instruction_ballast(text: &str) -> bool {
 
     looks_like_markdown_heading(trimmed)
         || looks_like_slash_command_example(trimmed)
+        || looks_like_frontmatter_prompt_preset(trimmed)
+        || looks_like_completed_backlog_archive(trimmed)
         || trimmed.starts_with("<!-- tsift:")
         || trimmed.starts_with("<!-- /tsift:")
         || looks_like_instruction_label(trimmed)
@@ -911,6 +949,33 @@ fn looks_like_slash_command_example(text: &str) -> bool {
         && trimmed.contains('<')
         && trimmed.contains('>')
         && !trimmed.contains('`')
+}
+
+fn looks_like_frontmatter_prompt_preset(text: &str) -> bool {
+    let trimmed = strip_common_prefixes(text.trim());
+    if trimmed == "prompt_presets:" || trimmed.starts_with("prompt_presets:") {
+        return true;
+    }
+    let Some((key, _)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let key = key.trim().trim_matches(['"', '\'']);
+    key.starts_with('#') && key.len() > 1 && key[1..].chars().all(is_prompt_preset_char)
+}
+
+fn is_prompt_preset_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')
+}
+
+fn looks_like_completed_backlog_archive(text: &str) -> bool {
+    let stripped = strip_common_prefixes(text.trim());
+    let Some(date) = stripped.get(..10) else {
+        return false;
+    };
+    date.chars().enumerate().all(|(index, ch)| match index {
+        4 | 7 => ch == '-',
+        _ => ch.is_ascii_digit(),
+    }) && stripped[10..].contains("[#")
 }
 
 fn looks_like_slash_prompt_target(text: &str) -> bool {
@@ -1592,6 +1657,53 @@ do [#sessiondigest]. spec-test-build-install-commit-push
             vec!["do [#sessiondigest]. spec-test-build-install-commit-push".to_string()]
         );
         assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn prompt_target_digest_ignores_frontmatter_presets_and_completed_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = "\
+---
+agent_doc_format: template
+prompt_presets:
+  '#agent-doc-bug': Please create a plan for agent-doc to fix this issue.
+  '#spec-test-build-install-commit-push': update spec + tests. build + install for local testing. commit + push
+---
+
+## Exchange
+
+<!-- agent:exchange patch=append -->
+do [#active]. spec-test-build-install-commit-push
+<!-- /agent:exchange -->
+
+## Completed / Reaped
+
+<!-- agent:done -->
+- 2026-05-12 [#old1] Add an old completed task.
+- 2026-05-12 [#old2] do [#old2]. spec-test-build-install-commit-push
+<!-- /agent:done -->
+";
+
+        let report = compute(dir.path(), input, None).unwrap();
+        assert_eq!(
+            report.prompt_targets,
+            vec!["do [#active]. spec-test-build-install-commit-push".to_string()]
+        );
+    }
+
+    #[test]
+    fn codex_digest_ignores_copied_frontmatter_prompt_presets() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = concat!(
+            r##"{"type":"event_msg","payload":{"type":"user_message","message":"---\nprompt_presets:\n  '#spec-test-build-install-commit-push': update spec + tests. build + install for local testing. commit + push\n---\n/agent-doc <FILE>\ndo [#cdxactive]. spec-test-build-install-commit-push"}}"##,
+            "\n"
+        );
+
+        let report = compute(dir.path(), input, Some("codex-jsonl")).unwrap();
+        assert_eq!(
+            report.prompt_targets,
+            vec!["do [#cdxactive]. spec-test-build-install-commit-push".to_string()]
+        );
     }
 
     #[test]

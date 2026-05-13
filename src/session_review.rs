@@ -563,9 +563,6 @@ pub fn compute_with_options(
     largest_turns.truncate(MAX_LARGEST_TURNS);
 
     session_rows.truncate(MAX_SESSIONS);
-    warnings.sort();
-    warnings.truncate(MAX_WARNINGS);
-
     let prompt_targets =
         collect_strings(prompt_targets, MAX_AGGREGATE_ITEMS, |text, occurrences| {
             SessionReviewPromptTarget { text, occurrences }
@@ -611,9 +608,27 @@ pub fn compute_with_options(
         },
     );
     let loop_clusters = collect_loop_clusters(loop_clusters, MAX_LOOP_CLUSTERS);
+    let document_active_prompt_targets = match collect_document_active_prompt_targets(&context) {
+        Ok(targets) => targets,
+        Err(error) => {
+            warnings.push(format!(
+                "{}: could not extract live document prompt targets: {error:#}",
+                context.canonical_target.display()
+            ));
+            Vec::new()
+        }
+    };
+    let active_prompt_targets = if document_active_prompt_targets.is_empty() {
+        prompt_targets
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect()
+    } else {
+        document_active_prompt_targets
+    };
     let next_context = build_next_context(
         &context,
-        &prompt_targets,
+        active_prompt_targets,
         &touched_files,
         &touched_symbols,
         &failures,
@@ -622,6 +637,8 @@ pub fn compute_with_options(
             detail: "no verification closeout found in matched sessions".to_string(),
         }),
     );
+    warnings.sort();
+    warnings.truncate(MAX_WARNINGS);
 
     Ok(SessionReviewReport {
         root: context.root.display().to_string(),
@@ -714,7 +731,7 @@ fn build_target_context(target: &Path) -> Result<TargetContext> {
 
 fn build_next_context(
     context: &TargetContext,
-    prompt_targets: &[SessionReviewPromptTarget],
+    active_prompt_targets: Vec<String>,
     touched_files: &[SessionReviewFileRef],
     touched_symbols: &[SessionReviewSymbolRef],
     failures: &[SessionReviewFailure],
@@ -731,10 +748,7 @@ fn build_next_context(
 
     SessionReviewNextContext {
         target,
-        active_prompt_targets: prompt_targets
-            .iter()
-            .map(|entry| entry.text.clone())
-            .collect(),
+        active_prompt_targets,
         last_verification,
         touched_files: touched_files
             .iter()
@@ -755,6 +769,64 @@ fn build_next_context(
             "tsift log-digest --path . < build.log".to_string(),
         ],
     }
+}
+
+fn collect_document_active_prompt_targets(context: &TargetContext) -> Result<Vec<String>> {
+    if context.kind != TargetKind::File {
+        return Ok(Vec::new());
+    }
+    let content = fs::read_to_string(&context.canonical_target).with_context(|| {
+        format!(
+            "reading target document {}",
+            context.canonical_target.display()
+        )
+    })?;
+    let Some(exchange) = extract_agent_component(&content, "exchange") else {
+        return Ok(Vec::new());
+    };
+    let tail = active_exchange_tail(exchange);
+    Ok(session_digest::extract_prompt_targets_from_text_block(
+        &tail, false,
+    ))
+}
+
+fn extract_agent_component<'a>(content: &'a str, name: &str) -> Option<&'a str> {
+    let open_prefix = format!("<!-- agent:{name}");
+    let close_marker = format!("<!-- /agent:{name} -->");
+    let open_start = content.find(&open_prefix)?;
+    let after_open = content[open_start..].find("-->")? + open_start + 3;
+    let close_start = content[after_open..].find(&close_marker)? + after_open;
+    Some(&content[after_open..close_start])
+}
+
+fn active_exchange_tail(exchange: &str) -> String {
+    let mut start = 0;
+    for (index, _) in exchange.match_indices("<!-- agent:boundary:") {
+        let marker_tail = &exchange[index..];
+        let marker_end = marker_tail
+            .find("-->")
+            .map(|offset| index + offset + 3)
+            .unwrap_or(index);
+        start = marker_end;
+    }
+    let after_boundary = &exchange[start..];
+    let mut response_seen = false;
+    let mut prompt_region = String::new();
+    for line in after_boundary.lines() {
+        if line.trim_start().starts_with("### Re:") {
+            response_seen = true;
+            prompt_region.clear();
+            continue;
+        }
+        if !response_seen
+            || line.trim_start().starts_with("❯ ")
+            || line.trim_start().starts_with("> ")
+        {
+            prompt_region.push_str(line);
+            prompt_region.push('\n');
+        }
+    }
+    prompt_region
 }
 
 fn parse_agent_doc_session(path: &Path) -> Result<Option<String>> {
@@ -1471,6 +1543,93 @@ mod tests {
                 .unresolved_failures
                 .iter()
                 .any(|failure| failure.kind == "missing" || failure.kind == "error")
+        );
+    }
+
+    #[test]
+    fn session_review_next_context_prefers_live_exchange_prompt_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let target = root.path().join("tasks/software/tsift.md");
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(
+            &target,
+            "\
+---
+agent_doc_session: tsift-v0.1
+agent_doc_format: template
+prompt_presets:
+  '#spec-test-build-install-commit-push': update spec + tests. build + install for local testing. commit + push
+---
+
+## Exchange
+
+<!-- agent:exchange patch=append -->
+### Session Summary
+
+Compacted content:
+- Archived 2 response topic(s): #old1 search workflow; #old2 build workflow
+<!-- agent:boundary:abc123 -->
+do [#active]. spec-test-build-install-commit-push
+<!-- /agent:exchange -->
+
+## Completed / Reaped
+
+<!-- agent:done -->
+- 2026-05-12 [#old1] do [#old1]. spec-test-build-install-commit-push
+<!-- /agent:done -->
+",
+        )
+        .unwrap();
+
+        let agent_doc_logs = root.path().join(".agent-doc/logs");
+        fs::create_dir_all(&agent_doc_logs).unwrap();
+        fs::write(
+            agent_doc_logs.join("tsift-v0.1.log"),
+            concat!(
+                "[1776712372] session_start file=tasks/software/tsift.md pane=%77 session=tsift-v0.1\n",
+                "[1776712373] cwd_resolved path=/tmp/replace-me source=project_root\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("rollout-old.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","payload":{"cwd":"/tmp/replace-me"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#old1]. spec-test-build-install-commit-push\nagent-doc /tmp/replace-me/tasks/software/tsift.md"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"do [#old1]. spec-test-build-install-commit-push"}}"#,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let report = compute_with_options(
+            &target,
+            &SessionReviewOptions {
+                claude_projects_dir: Some(home.path().join(".claude/projects")),
+                codex_sessions_dir: Some(home.path().join(".codex/sessions")),
+                agent_doc_logs_dir: Some(agent_doc_logs),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            report
+                .prompt_targets
+                .iter()
+                .any(|prompt| { prompt.text == "do [#old1]. spec-test-build-install-commit-push" })
+        );
+        assert_eq!(
+            report.next_context.active_prompt_targets,
+            vec!["do [#active]. spec-test-build-install-commit-push".to_string()]
         );
     }
 
