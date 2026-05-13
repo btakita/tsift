@@ -641,6 +641,9 @@ fn classify_agent_doc_runtime_signals(line: &str) -> Vec<(&'static str, String)>
     }
 
     for family in runtime_churn::classify_restart_churn_families(event_name, line) {
+        if !runtime_churn::is_restart_churn_warning_family(family) {
+            continue;
+        }
         signals.push(("warning", format!("agent-doc restart churn: {family}")));
     }
 
@@ -1076,6 +1079,8 @@ RuntimeError: boom
 [1776528398] claude_start mode=fresh_restart restart_count=1 file=tasks/software/tsift.md
 [1776528446] auto_trigger_timeout harness=codex reason=no_prompt_after_30s
 [1776528450] ctrl_d_restart_fresh restart_count=2 file=tasks/software/tsift.md
+[1776528451] user_quit_after_ctrl_d
+[1776528452] supervisor_exit reason=user_quit_after_eof restart_count=0
 [1776528532] claude_exit code=1 restart_count=0
 [1777603403] document_cycle phase=committed cycle=cycle-1 event=commit_already_current
 [1777603404] document_cycle phase=committed cycle=cycle-2 event=commit_already_current
@@ -1108,6 +1113,12 @@ RuntimeError: boom
             signal.message == "agent-doc restart churn: ctrl_d_restart_loop"
                 && signal.occurrences == 1
         }));
+        assert!(
+            !report
+                .signals
+                .iter()
+                .any(|signal| signal.message == "agent-doc restart churn: quit_after_eof")
+        );
         assert!(report.signals.iter().any(|signal| {
             signal.message == "agent-doc closeout churn: commit_already_current"
                 && signal.occurrences == 2

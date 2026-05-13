@@ -83,6 +83,10 @@ pub fn classify_restart_churn_families(event_name: &str, detail: &str) -> Vec<&'
     families
 }
 
+pub fn is_restart_churn_warning_family(family: &str) -> bool {
+    family != "quit_after_eof"
+}
+
 fn is_fresh_restart(event_name: &str, detail: &str) -> bool {
     if matches!(
         event_name,
@@ -198,5 +202,7 @@ mod tests {
                 .iter()
                 .any(|entry| entry.family == "quit_after_eof" && entry.occurrences == 2)
         );
+        assert!(!is_restart_churn_warning_family("quit_after_eof"));
+        assert!(is_restart_churn_warning_family("fresh_restart"));
     }
 }
