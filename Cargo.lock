@@ -2767,6 +2767,8 @@ dependencies = [
 [[package]]
 name = "tagpath"
 version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5558b0ede33c45ba7cb36afe9a95b0df93125a8be041913be3503b97c1db3d39"
 dependencies = [
  "clap",
  "petgraph",

@@ -6,6 +6,9 @@ description = "Token-efficient CLI plugin for Claude Code — Sift-powered searc
 license = "MIT"
 repository = "https://github.com/btakita/tsift"
 authors = ["Brian Takita <brian.takita@gmail.com>"]
+readme = "README.md"
+keywords = ["agent", "search", "rag", "cli", "context"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"
@@ -19,7 +22,7 @@ toml = "0.8"
 blake3 = "1"
 ureq = { version = "3", features = ["json"] }
 sift = { git = "https://github.com/rupurt/sift" }
-tagpath = { version = "0.6.2", path = "../tagpath", default-features = false }
+tagpath = { version = "0.6.2", default-features = false }
 tree-sitter = "0.25"
 
 # Language grammars (optional, behind feature flags)

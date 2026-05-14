@@ -4481,10 +4481,10 @@ fn context_pack_json_composes_next_context_and_optional_digests() {
 #[test]
 fn token_savings_accepts_tagpath_preview_fixture() {
     let fixture_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../tagpath/fixtures/tsift-token-savings.json");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tsift-token-savings.json");
     assert!(
         fixture_path.exists(),
-        "tagpath token-savings fixture should exist at {}",
+        "tagpath token-savings fixture should exist locally at {}",
         fixture_path.display()
     );
 

@@ -25,7 +25,7 @@ Each git submodule gets its own index. Isolation tiers control federation (cross
 
 | Tier | Behavior | Examples |
 |------|----------|----------|
-| **Isolated** | Never federated, strict boundary | session-share, monsterrodholders-dev |
+| **Isolated** | Never federated, strict boundary | private-client, production-secrets |
 | **Private** | Never federated | mail, resume |
 | **Shared** | Federated by default | agent-doc, corky, ctx-core-dev |
 

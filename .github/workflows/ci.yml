@@ -22,11 +22,6 @@ jobs:
         with:
           path: tsift
 
-      - uses: actions/checkout@v4
-        with:
-          repository: btakita/tagpath
-          path: tagpath
-
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:

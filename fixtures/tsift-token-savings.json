@@ -1,0 +1,463 @@
+{
+  "schema_version": 1,
+  "description": "Tsift-facing fixture for comparing raw symbol previews with compact tagpath family/alias previews.",
+  "token_estimate": "ceil(utf8_bytes / 4)",
+  "cases": [
+    {
+      "name": "search-preview",
+      "surface": "search",
+      "minimum_savings_percent": 40.0,
+      "raw_symbols": [
+        { "identifier": "validate_user", "file": "src/auth.py", "line": 12, "context": "function" },
+        { "identifier": "validateUser", "file": "src/auth.ts", "line": 18, "context": "function" },
+        { "identifier": "ValidateUser", "file": "src/auth.go", "line": 24, "context": "function" },
+        { "identifier": "validate-user", "file": "src/auth.css", "line": 7, "context": "selector" },
+        { "identifier": "VALIDATE_USER", "file": "src/auth.rs", "line": 31, "context": "constant" },
+        { "identifier": "Validate_User", "file": "src/auth.adb", "line": 9, "context": "procedure" },
+        { "identifier": "raw_symbol", "file": "src/search.rs", "line": 42, "context": "field" },
+        { "identifier": "rawSymbol", "file": "src/search.ts", "line": 46, "context": "property" },
+        { "identifier": "RawSymbol", "file": "src/search.go", "line": 50, "context": "type" },
+        { "identifier": "raw-symbol", "file": "src/search.css", "line": 11, "context": "selector" },
+        { "identifier": "RAW_SYMBOL", "file": "src/search.rs", "line": 55, "context": "constant" },
+        { "identifier": "Raw_Symbol", "file": "src/search.adb", "line": 14, "context": "record" }
+      ],
+      "tagpath_families": [
+        {
+          "canonical": "raw_symbol",
+          "count": 6,
+          "aliases": {
+            "snake_case": "raw_symbol",
+            "camelCase": "rawSymbol",
+            "PascalCase": "RawSymbol",
+            "kebab-case": "raw-symbol",
+            "UPPER_SNAKE_CASE": "RAW_SYMBOL",
+            "Ada_Case": "Raw_Symbol"
+          }
+        },
+        {
+          "canonical": "validate_user",
+          "count": 6,
+          "aliases": {
+            "snake_case": "validate_user",
+            "camelCase": "validateUser",
+            "PascalCase": "ValidateUser",
+            "kebab-case": "validate-user",
+            "UPPER_SNAKE_CASE": "VALIDATE_USER",
+            "Ada_Case": "Validate_User"
+          }
+        }
+      ]
+    },
+    {
+      "name": "explain-preview",
+      "surface": "explain",
+      "minimum_savings_percent": 35.0,
+      "raw_symbols": [
+        { "identifier": "explain_symbol_family", "file": "src/explain.py", "line": 8, "context": "function" },
+        { "identifier": "explainSymbolFamily", "file": "src/explain.ts", "line": 13, "context": "function" },
+        { "identifier": "ExplainSymbolFamily", "file": "src/explain.go", "line": 21, "context": "function" },
+        { "identifier": "explain-symbol-family", "file": "src/explain.css", "line": 4, "context": "selector" },
+        { "identifier": "EXPLAIN_SYMBOL_FAMILY", "file": "src/explain.rs", "line": 34, "context": "constant" },
+        { "identifier": "Explain_Symbol_Family", "file": "src/explain.adb", "line": 16, "context": "procedure" },
+        { "identifier": "build_explain_preview", "file": "src/explain.py", "line": 41, "context": "function" },
+        { "identifier": "buildExplainPreview", "file": "src/explain.ts", "line": 49, "context": "function" },
+        { "identifier": "BuildExplainPreview", "file": "src/explain.go", "line": 58, "context": "function" },
+        { "identifier": "build-explain-preview", "file": "src/explain.css", "line": 19, "context": "selector" },
+        { "identifier": "BUILD_EXPLAIN_PREVIEW", "file": "src/explain.rs", "line": 67, "context": "constant" },
+        { "identifier": "Build_Explain_Preview", "file": "src/explain.adb", "line": 22, "context": "procedure" }
+      ],
+      "tagpath_families": [
+        {
+          "canonical": "build_explain_preview",
+          "count": 6,
+          "aliases": {
+            "snake_case": "build_explain_preview",
+            "camelCase": "buildExplainPreview",
+            "PascalCase": "BuildExplainPreview",
+            "kebab-case": "build-explain-preview",
+            "UPPER_SNAKE_CASE": "BUILD_EXPLAIN_PREVIEW",
+            "Ada_Case": "Build_Explain_Preview"
+          }
+        },
+        {
+          "canonical": "explain_symbol_family",
+          "count": 6,
+          "aliases": {
+            "snake_case": "explain_symbol_family",
+            "camelCase": "explainSymbolFamily",
+            "PascalCase": "ExplainSymbolFamily",
+            "kebab-case": "explain-symbol-family",
+            "UPPER_SNAKE_CASE": "EXPLAIN_SYMBOL_FAMILY",
+            "Ada_Case": "Explain_Symbol_Family"
+          }
+        }
+      ]
+    },
+    {
+      "name": "session-review-preview",
+      "surface": "session-review",
+      "minimum_savings_percent": 45.0,
+      "raw_symbols": [
+        { "identifier": "session_review_preview", "file": "src/review.py", "line": 10, "context": "function" },
+        { "identifier": "sessionReviewPreview", "file": "src/review.ts", "line": 19, "context": "function" },
+        { "identifier": "SessionReviewPreview", "file": "src/review.go", "line": 29, "context": "function" },
+        { "identifier": "session-review-preview", "file": "src/review.css", "line": 6, "context": "selector" },
+        { "identifier": "SESSION_REVIEW_PREVIEW", "file": "src/review.rs", "line": 38, "context": "constant" },
+        { "identifier": "Session_Review_Preview", "file": "src/review.adb", "line": 17, "context": "procedure" },
+        { "identifier": "session_review_score", "file": "src/review.py", "line": 45, "context": "field" },
+        { "identifier": "sessionReviewScore", "file": "src/review.ts", "line": 51, "context": "property" },
+        { "identifier": "SessionReviewScore", "file": "src/review.go", "line": 62, "context": "field" },
+        { "identifier": "session-review-score", "file": "src/review.css", "line": 13, "context": "selector" },
+        { "identifier": "SESSION_REVIEW_SCORE", "file": "src/review.rs", "line": 74, "context": "constant" },
+        { "identifier": "Session_Review_Score", "file": "src/review.adb", "line": 25, "context": "record" },
+        { "identifier": "raw_symbol_output", "file": "src/review.py", "line": 88, "context": "field" },
+        { "identifier": "rawSymbolOutput", "file": "src/review.ts", "line": 93, "context": "property" },
+        { "identifier": "RawSymbolOutput", "file": "src/review.go", "line": 105, "context": "field" },
+        { "identifier": "raw-symbol-output", "file": "src/review.css", "line": 31, "context": "selector" },
+        { "identifier": "RAW_SYMBOL_OUTPUT", "file": "src/review.rs", "line": 114, "context": "constant" },
+        { "identifier": "Raw_Symbol_Output", "file": "src/review.adb", "line": 34, "context": "record" }
+      ],
+      "tagpath_families": [
+        {
+          "canonical": "raw_symbol_output",
+          "count": 6,
+          "aliases": {
+            "snake_case": "raw_symbol_output",
+            "camelCase": "rawSymbolOutput",
+            "PascalCase": "RawSymbolOutput",
+            "kebab-case": "raw-symbol-output",
+            "UPPER_SNAKE_CASE": "RAW_SYMBOL_OUTPUT",
+            "Ada_Case": "Raw_Symbol_Output"
+          }
+        },
+        {
+          "canonical": "session_review_preview",
+          "count": 6,
+          "aliases": {
+            "snake_case": "session_review_preview",
+            "camelCase": "sessionReviewPreview",
+            "PascalCase": "SessionReviewPreview",
+            "kebab-case": "session-review-preview",
+            "UPPER_SNAKE_CASE": "SESSION_REVIEW_PREVIEW",
+            "Ada_Case": "Session_Review_Preview"
+          }
+        },
+        {
+          "canonical": "session_review_score",
+          "count": 6,
+          "aliases": {
+            "snake_case": "session_review_score",
+            "camelCase": "sessionReviewScore",
+            "PascalCase": "SessionReviewScore",
+            "kebab-case": "session-review-score",
+            "UPPER_SNAKE_CASE": "SESSION_REVIEW_SCORE",
+            "Ada_Case": "Session_Review_Score"
+          }
+        }
+      ]
+    },
+    {
+      "name": "context-pack-preview",
+      "surface": "context-pack",
+      "minimum_savings_percent": 55.0,
+      "raw_symbols": [
+        { "identifier": "context_pack_summary", "file": "src/main.rs", "line": 6948, "context": "symbol_ref" },
+        { "identifier": "contextPackSummary", "file": "src/context.ts", "line": 21, "context": "symbol_ref" },
+        { "identifier": "ContextPackSummary", "file": "src/context.go", "line": 32, "context": "symbol_ref" },
+        { "identifier": "context-pack-summary", "file": "src/context.css", "line": 6, "context": "symbol_ref" },
+        { "identifier": "CONTEXT_PACK_SUMMARY", "file": "src/context.rs", "line": 77, "context": "symbol_ref" },
+        { "identifier": "Context_Pack_Summary", "file": "src/context.adb", "line": 18, "context": "symbol_ref" },
+        { "identifier": "ontology_ref_handle", "file": "src/main.rs", "line": 7012, "context": "ontology_ref" },
+        { "identifier": "ontologyRefHandle", "file": "src/context.ts", "line": 46, "context": "ontology_ref" },
+        { "identifier": "OntologyRefHandle", "file": "src/context.go", "line": 53, "context": "ontology_ref" },
+        { "identifier": "ontology-ref-handle", "file": "src/context.css", "line": 12, "context": "ontology_ref" },
+        { "identifier": "ONTOLOGY_REF_HANDLE", "file": "src/context.rs", "line": 88, "context": "ontology_ref" },
+        { "identifier": "Ontology_Ref_Handle", "file": "src/context.adb", "line": 27, "context": "ontology_ref" },
+        { "identifier": "diff_digest_summary", "file": "src/diff_digest.rs", "line": 121, "context": "diff_ref" },
+        { "identifier": "diffDigestSummary", "file": "src/diff.ts", "line": 34, "context": "diff_ref" },
+        { "identifier": "DiffDigestSummary", "file": "src/diff.go", "line": 43, "context": "diff_ref" },
+        { "identifier": "diff-digest-summary", "file": "src/diff.css", "line": 8, "context": "diff_ref" },
+        { "identifier": "DIFF_DIGEST_SUMMARY", "file": "src/diff.rs", "line": 62, "context": "diff_ref" },
+        { "identifier": "Diff_Digest_Summary", "file": "src/diff.adb", "line": 15, "context": "diff_ref" }
+      ],
+      "tagpath_families": [
+        {
+          "canonical": "context_pack_summary",
+          "count": 6,
+          "aliases": {
+            "snake_case": "context_pack_summary",
+            "camelCase": "contextPackSummary",
+            "PascalCase": "ContextPackSummary",
+            "kebab-case": "context-pack-summary",
+            "UPPER_SNAKE_CASE": "CONTEXT_PACK_SUMMARY",
+            "Ada_Case": "Context_Pack_Summary"
+          }
+        },
+        {
+          "canonical": "diff_digest_summary",
+          "count": 6,
+          "aliases": {
+            "snake_case": "diff_digest_summary",
+            "camelCase": "diffDigestSummary",
+            "PascalCase": "DiffDigestSummary",
+            "kebab-case": "diff-digest-summary",
+            "UPPER_SNAKE_CASE": "DIFF_DIGEST_SUMMARY",
+            "Ada_Case": "Diff_Digest_Summary"
+          }
+        },
+        {
+          "canonical": "ontology_ref_handle",
+          "count": 6,
+          "aliases": {
+            "snake_case": "ontology_ref_handle",
+            "camelCase": "ontologyRefHandle",
+            "PascalCase": "OntologyRefHandle",
+            "kebab-case": "ontology-ref-handle",
+            "UPPER_SNAKE_CASE": "ONTOLOGY_REF_HANDLE",
+            "Ada_Case": "Ontology_Ref_Handle"
+          }
+        }
+      ],
+      "context_pack_inputs": {
+        "next_context": [
+          {
+            "prompt_target": "do [#ctxp]. spec-test-build-install-commit-push",
+            "touched_symbols": ["context_pack_summary", "contextPackSummary", "ContextPackSummary"],
+            "symbol_refs": [
+              {
+                "name": "context_pack_summary",
+                "file": "src/main.rs",
+                "line": 6948,
+                "tag_alias": "context/pack/summary",
+                "summary_refs": [
+                  {
+                    "handle": "sum-context-pack-summary",
+                    "path": ".tsift/summaries.db",
+                    "expand": "tsift summarize context_pack_summary"
+                  }
+                ],
+                "ontology_refs": [
+                  {
+                    "handle": "ont-context",
+                    "tag": "context",
+                    "path": ".naming/tags/context.md",
+                    "title": "Context",
+                    "domain": "retrieval"
+                  },
+                  {
+                    "handle": "ont-session",
+                    "tag": "session",
+                    "path": ".naming/tags/session.md",
+                    "title": "Session",
+                    "domain": "agent-doc"
+                  }
+                ]
+              }
+            ],
+            "expand": "tsift session-review --next-context tasks/software/tsift.md --json"
+          }
+        ],
+        "diff": [
+          {
+            "path": "src/main.rs",
+            "status": "modified",
+            "symbols": ["diff_digest_summary", "diffDigestSummary"],
+            "summary_refs": [
+              {
+                "handle": "sum-diff-digest-summary",
+                "path": ".tsift/summaries.db",
+                "expand": "tsift summarize diff_digest_summary"
+              }
+            ],
+            "ontology_refs": [
+              {
+                "handle": "ont-diff",
+                "tag": "diff",
+                "path": ".naming/tags/diff.md",
+                "title": "Diff",
+                "domain": "change-review"
+              }
+            ]
+          }
+        ],
+        "test": [
+          {
+            "runner": "cargo",
+            "command": "cargo test",
+            "signals": ["token_savings_fixture", "context_pack_preview"],
+            "artifact": {
+              "handle": "art-test-context-pack",
+              "path": ".tsift/artifacts/test-context-pack.log",
+              "expand": "tsift test-digest --path . --input .tsift/artifacts/test-context-pack.log"
+            }
+          }
+        ],
+        "log": [
+          {
+            "command": "cargo build --release",
+            "signals": ["ontology_ref_handle", "context_pack_summary"],
+            "artifact": {
+              "handle": "art-build-context-pack",
+              "path": ".tsift/artifacts/build-context-pack.log",
+              "expand": "tsift log-digest --path . --input .tsift/artifacts/build-context-pack.log"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "normalize-query-preview",
+      "surface": "normalize-query",
+      "minimum_savings_percent": 50.0,
+      "raw_symbols": [
+        { "identifier": "normalize_query_input", "file": "src/query.rs", "line": 18, "context": "query_input" },
+        { "identifier": "normalizeQueryInput", "file": "src/query.ts", "line": 27, "context": "query_input" },
+        { "identifier": "NormalizeQueryInput", "file": "src/query.go", "line": 33, "context": "query_input" },
+        { "identifier": "normalize-query-input", "file": "src/query.css", "line": 9, "context": "query_input" },
+        { "identifier": "NORMALIZE_QUERY_INPUT", "file": "src/query.rs", "line": 44, "context": "query_input" },
+        { "identifier": "Normalize_Query_Input", "file": "src/query.adb", "line": 21, "context": "query_input" },
+        { "identifier": "ontology_ref_handle", "file": "src/query.rs", "line": 59, "context": "ontology_ref" },
+        { "identifier": "ontologyRefHandle", "file": "src/query.ts", "line": 66, "context": "ontology_ref" },
+        { "identifier": "OntologyRefHandle", "file": "src/query.go", "line": 73, "context": "ontology_ref" },
+        { "identifier": "ontology-ref-handle", "file": "src/query.css", "line": 16, "context": "ontology_ref" },
+        { "identifier": "ONTOLOGY_REF_HANDLE", "file": "src/query.rs", "line": 81, "context": "ontology_ref" },
+        { "identifier": "Ontology_Ref_Handle", "file": "src/query.adb", "line": 29, "context": "ontology_ref" },
+        { "identifier": "query_tag_weight", "file": "src/query.rs", "line": 94, "context": "normalized_tag" },
+        { "identifier": "queryTagWeight", "file": "src/query.ts", "line": 101, "context": "normalized_tag" },
+        { "identifier": "QueryTagWeight", "file": "src/query.go", "line": 112, "context": "normalized_tag" },
+        { "identifier": "query-tag-weight", "file": "src/query.css", "line": 23, "context": "normalized_tag" },
+        { "identifier": "QUERY_TAG_WEIGHT", "file": "src/query.rs", "line": 128, "context": "normalized_tag" },
+        { "identifier": "Query_Tag_Weight", "file": "src/query.adb", "line": 37, "context": "normalized_tag" }
+      ],
+      "tagpath_families": [
+        {
+          "canonical": "normalize_query_input",
+          "count": 6,
+          "aliases": {
+            "snake_case": "normalize_query_input",
+            "camelCase": "normalizeQueryInput",
+            "PascalCase": "NormalizeQueryInput",
+            "kebab-case": "normalize-query-input",
+            "UPPER_SNAKE_CASE": "NORMALIZE_QUERY_INPUT",
+            "Ada_Case": "Normalize_Query_Input"
+          }
+        },
+        {
+          "canonical": "ontology_ref_handle",
+          "count": 6,
+          "aliases": {
+            "snake_case": "ontology_ref_handle",
+            "camelCase": "ontologyRefHandle",
+            "PascalCase": "OntologyRefHandle",
+            "kebab-case": "ontology-ref-handle",
+            "UPPER_SNAKE_CASE": "ONTOLOGY_REF_HANDLE",
+            "Ada_Case": "Ontology_Ref_Handle"
+          }
+        },
+        {
+          "canonical": "query_tag_weight",
+          "count": 6,
+          "aliases": {
+            "snake_case": "query_tag_weight",
+            "camelCase": "queryTagWeight",
+            "PascalCase": "QueryTagWeight",
+            "kebab-case": "query-tag-weight",
+            "UPPER_SNAKE_CASE": "QUERY_TAG_WEIGHT",
+            "Ada_Case": "Query_Tag_Weight"
+          }
+        }
+      ],
+      "normalize_query_input": "normalize-query contextPackSummary ontology_ref_handle query_tag_weight .naming/tags/context.md",
+      "expected_query_tags": ["normalize", "query", "context", "pack", "summary", "ontology", "ref", "handle", "tag", "weight", "naming", "tags"]
+    },
+    {
+      "name": "ontology-refs-preview",
+      "surface": "ontology-refs",
+      "minimum_savings_percent": 50.0,
+      "raw_symbols": [
+        { "identifier": "naming_tag_ref", "file": "src/ontology.rs", "line": 14, "context": "ontology_ref" },
+        { "identifier": "namingTagRef", "file": "src/ontology.ts", "line": 22, "context": "ontology_ref" },
+        { "identifier": "NamingTagRef", "file": "src/ontology.go", "line": 30, "context": "ontology_ref" },
+        { "identifier": "naming-tag-ref", "file": "src/ontology.css", "line": 5, "context": "ontology_ref" },
+        { "identifier": "NAMING_TAG_REF", "file": "src/ontology.rs", "line": 41, "context": "ontology_ref" },
+        { "identifier": "Naming_Tag_Ref", "file": "src/ontology.adb", "line": 17, "context": "ontology_ref" },
+        { "identifier": "ontology_ref_handle", "file": "src/ontology.rs", "line": 55, "context": "ontology_ref" },
+        { "identifier": "ontologyRefHandle", "file": "src/ontology.ts", "line": 64, "context": "ontology_ref" },
+        { "identifier": "OntologyRefHandle", "file": "src/ontology.go", "line": 75, "context": "ontology_ref" },
+        { "identifier": "ontology-ref-handle", "file": "src/ontology.css", "line": 12, "context": "ontology_ref" },
+        { "identifier": "ONTOLOGY_REF_HANDLE", "file": "src/ontology.rs", "line": 87, "context": "ontology_ref" },
+        { "identifier": "Ontology_Ref_Handle", "file": "src/ontology.adb", "line": 25, "context": "ontology_ref" },
+        { "identifier": "tag_definition_path", "file": "src/ontology.rs", "line": 103, "context": "ontology_path" },
+        { "identifier": "tagDefinitionPath", "file": "src/ontology.ts", "line": 111, "context": "ontology_path" },
+        { "identifier": "TagDefinitionPath", "file": "src/ontology.go", "line": 119, "context": "ontology_path" },
+        { "identifier": "tag-definition-path", "file": "src/ontology.css", "line": 19, "context": "ontology_path" },
+        { "identifier": "TAG_DEFINITION_PATH", "file": "src/ontology.rs", "line": 133, "context": "ontology_path" },
+        { "identifier": "Tag_Definition_Path", "file": "src/ontology.adb", "line": 34, "context": "ontology_path" }
+      ],
+      "tagpath_families": [
+        {
+          "canonical": "naming_tag_ref",
+          "count": 6,
+          "aliases": {
+            "snake_case": "naming_tag_ref",
+            "camelCase": "namingTagRef",
+            "PascalCase": "NamingTagRef",
+            "kebab-case": "naming-tag-ref",
+            "UPPER_SNAKE_CASE": "NAMING_TAG_REF",
+            "Ada_Case": "Naming_Tag_Ref"
+          }
+        },
+        {
+          "canonical": "ontology_ref_handle",
+          "count": 6,
+          "aliases": {
+            "snake_case": "ontology_ref_handle",
+            "camelCase": "ontologyRefHandle",
+            "PascalCase": "OntologyRefHandle",
+            "kebab-case": "ontology-ref-handle",
+            "UPPER_SNAKE_CASE": "ONTOLOGY_REF_HANDLE",
+            "Ada_Case": "Ontology_Ref_Handle"
+          }
+        },
+        {
+          "canonical": "tag_definition_path",
+          "count": 6,
+          "aliases": {
+            "snake_case": "tag_definition_path",
+            "camelCase": "tagDefinitionPath",
+            "PascalCase": "TagDefinitionPath",
+            "kebab-case": "tag-definition-path",
+            "UPPER_SNAKE_CASE": "TAG_DEFINITION_PATH",
+            "Ada_Case": "Tag_Definition_Path"
+          }
+        }
+      ],
+      "ontology_refs": [
+        {
+          "handle": "ont-context",
+          "tag": "context",
+          "path": ".naming/tags/context.md",
+          "title": "Context",
+          "domain": "retrieval",
+          "summary": "Long-form guidance for context tags, including when a session handoff should preserve a compact reference to prior conversation state instead of repeating every retrieved paragraph."
+        },
+        {
+          "handle": "ont-query",
+          "tag": "query",
+          "path": ".naming/tags/query.md",
+          "title": "Query",
+          "domain": "retrieval",
+          "summary": "Long-form guidance for query tags, including normalized query input, weighted tag ranking, source token provenance, and fallback search behavior for downstream tools."
+        },
+        {
+          "handle": "ont-ontology",
+          "tag": "ontology",
+          "path": ".naming/tags/ontology.md",
+          "title": "Ontology",
+          "domain": "naming",
+          "summary": "Long-form guidance for ontology tags, including stable markdown paths, tag declarations, validation diagnostics, aliases, and compact handle references in summaries."
+        }
+      ]
+    }
+  ]
+}

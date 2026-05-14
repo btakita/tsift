@@ -1887,7 +1887,7 @@ do [#sessiondigest]. spec-test-build-install-commit-push
 **Auto-update skill:** Run `agent-doc --version` and compare against `agent-doc-version`.
 - **Imperative edits are executable directives** — when the user writes `do #id`, `run tests`, `build + install`, or `commit + push`
 **Compound task steering:** if one directive mixes commit + push, normalize it before execution.
-/home/brian/work/btakita/agent-loop/src/boost-client
+/workspace/agent-loop/src/boost-client
 #[test]
 //!
 /**

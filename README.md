@@ -1,0 +1,53 @@
+# tsift
+
+`tsift` is a token-conscious code search and session digest CLI for coding agents.
+It builds a local index, returns compact search and source-read envelopes, and
+turns noisy logs, tests, diffs, and agent-doc session documents into bounded
+evidence that smaller models can use without replaying an entire repository or
+transcript.
+
+## Install
+
+Install the latest GitHub release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/btakita/tsift/main/scripts/install.sh | sh
+```
+
+Install a specific version or directory:
+
+```sh
+TSIFT_VERSION=0.1.42 TSIFT_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/btakita/tsift/main/scripts/install.sh)"
+```
+
+The installer supports Linux x86_64, macOS x86_64, and macOS arm64 release
+assets. It verifies the downloaded archive with the release SHA-256 file before
+installing `tsift` into `$HOME/.local/bin` by default.
+
+## Quick Start
+
+```sh
+tsift status --fix
+tsift --envelope search "route dispatch" --budget normal
+tsift --envelope source-read src/main.rs --start 1 --lines 120 --budget normal
+tsift diff-digest .
+tsift --envelope session-review tasks/software/tsift.md --next-context --budget normal
+```
+
+For agent-doc projects, run `tsift status` from the repository root at session
+start. If `status` recommends a fix, run `tsift status --fix` before depending
+on search or digest output.
+
+## Release Notes
+
+GitHub release assets are built by the `Release` workflow for:
+
+- `x86_64-unknown-linux-gnu`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+- `x86_64-pc-windows-msvc`
+
+The crates.io package path is still gated by the upstream `sift` git dependency.
+`cargo package` and `cargo publish` cannot succeed until that dependency is
+available from crates.io under a compatible package name or tsift stops depending
+on the git source.
