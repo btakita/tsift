@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- Added `tsift traverse`, a Graphify-style traversal surface that exports JSON/HTML graph slices with stable `gfil-*`, `gsym-*`, `gses-*`, and `gbak-*` handles for files, symbols, agent-doc sessions, and backlog items, plus neighborhood, shortest-path, and next-node recommendation reports for bug-fix navigation.
 - `tsift status` now emits structured stale-index reminders, and `context-pack` carries the same reminders forward so agent handoff packs still show the reindex command and missing-summary follow-up when the repo index is stale.
 - `log-digest` no longer reports clean `quit_after_eof` / user Ctrl-D exits as restart-churn warning signals; those exits remain summarized in runtime churn context while actual fresh restarts, timeouts, and Ctrl-D restart loops continue to warn.
 - `session-review --next-context` now carries aggregate guardrails forward as `guardrail:<kind>` unresolved-failure action rows, so restart-loop, prompt-budget, cached-resend, and no-op closeout warnings remain visible in resumable handoff context even when no command failure was extracted.

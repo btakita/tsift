@@ -6,7 +6,7 @@ use sift::{SearchInput, SearchOptions, Sift};
 #[cfg(test)]
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -308,6 +308,29 @@ enum Commands {
         #[arg(long, value_enum)]
         budget: Option<ResponseBudgetPreset>,
     },
+    /// Build a Graphify-style traversal graph for files, symbols, sessions, and backlog items
+    Traverse {
+        /// Node handle, symbol name, file path, or backlog id to explain
+        node: Option<String>,
+        /// Optional target node for shortest-path traversal
+        #[arg(long)]
+        to: Option<String>,
+        /// Path to the indexed codebase or workspace (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Restrict indexed code nodes to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Neighborhood depth around the selected node
+        #[arg(long, default_value = "1")]
+        depth: usize,
+        /// Max neighborhood/recommendation/export items (0 = unlimited)
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+        /// Output format for the graph traversal report
+        #[arg(long, value_enum, default_value = "json")]
+        format: TraverseFormat,
+    },
     /// Read a bounded source-file line window with expansion handles and index refs
     SourceRead {
         /// Source file to preview (relative to --path/root unless absolute)
@@ -608,6 +631,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum TraverseFormat {
+    Json,
+    Html,
 }
 
 #[derive(Deserialize)]
@@ -1022,6 +1051,26 @@ fn main() -> Result<()> {
             schema,
             envelope,
             ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
+        ),
+        Some(Commands::Traverse {
+            node,
+            to,
+            path,
+            scope,
+            depth,
+            limit,
+            format,
+        }) => cmd_traverse(
+            node.as_deref(),
+            to.as_deref(),
+            &path,
+            scope.as_deref(),
+            depth,
+            limit,
+            format,
+            pretty,
+            terse,
+            schema,
         ),
         Some(Commands::SourceRead {
             file,
@@ -3958,6 +4007,977 @@ fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::I
         );
     }
     index::IndexDb::open_read_only_resilient(&db_path)
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct TraversalNode {
+    handle: String,
+    kind: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ref_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    expand: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct TraversalEdge {
+    from: String,
+    to: String,
+    relation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    weight: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TraversalGraphBuild {
+    nodes: BTreeMap<String, TraversalNode>,
+    edges: Vec<TraversalEdge>,
+    edge_keys: BTreeSet<(String, String, String)>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct TraversalTotals {
+    nodes: usize,
+    edges: usize,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct TraversalPathReport {
+    from: TraversalNode,
+    to: TraversalNode,
+    hops: usize,
+    nodes: Vec<TraversalNode>,
+    edges: Vec<TraversalEdge>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct TraversalRecommendation {
+    handle: String,
+    kind: String,
+    label: String,
+    reason: String,
+    score: usize,
+    expand: String,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct TraversalReport {
+    root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    mode: String,
+    totals: TraversalTotals,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    nodes: Vec<TraversalNode>,
+    edges: Vec<TraversalEdge>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shortest_path: Option<TraversalPathReport>,
+    recommendations: Vec<TraversalRecommendation>,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Clone)]
+struct TraversalSymbolIndexEntry {
+    handle: String,
+    node: TraversalNode,
+    tokens: BTreeSet<String>,
+}
+
+#[derive(Clone)]
+struct TraversalFileIndexEntry {
+    handle: String,
+    node: TraversalNode,
+    tokens: BTreeSet<String>,
+}
+
+impl TraversalGraphBuild {
+    fn add_node(&mut self, node: TraversalNode) {
+        self.nodes.entry(node.handle.clone()).or_insert(node);
+    }
+
+    fn add_edge(
+        &mut self,
+        from: &str,
+        to: &str,
+        relation: &str,
+        label: Option<String>,
+        weight: usize,
+    ) {
+        if from == to || !self.nodes.contains_key(from) || !self.nodes.contains_key(to) {
+            return;
+        }
+        let key = (from.to_string(), to.to_string(), relation.to_string());
+        if self.edge_keys.insert(key) {
+            self.edges.push(TraversalEdge {
+                from: from.to_string(),
+                to: to.to_string(),
+                relation: relation.to_string(),
+                label,
+                weight,
+            });
+        }
+    }
+}
+
+fn traversal_expand_command(root: &Path, handle: &str) -> String {
+    format!(
+        "tsift traverse {} --path {} --depth 1 --limit 50",
+        shell_quote(handle),
+        shell_quote(root.to_string_lossy().as_ref())
+    )
+}
+
+fn traversal_file_node(root: &Path, file: &str) -> TraversalNode {
+    let display = relativize(file, root);
+    let handle = stable_handle("gfil", &format!("file:{display}"));
+    TraversalNode {
+        handle: handle.clone(),
+        kind: "file".to_string(),
+        label: display.clone(),
+        ref_id: Some(display.clone()),
+        path: Some(display),
+        line: None,
+        detail: None,
+        expand: traversal_expand_command(root, &handle),
+    }
+}
+
+fn traversal_symbol_node(root: &Path, symbol: &index::StoredSymbol) -> TraversalNode {
+    let file = relativize(&symbol.file, root);
+    let key = format!("symbol:{file}:{}:{}", symbol.line, symbol.name);
+    let handle = stable_handle("gsym", &key);
+    TraversalNode {
+        handle: handle.clone(),
+        kind: "symbol".to_string(),
+        label: symbol.name.clone(),
+        ref_id: Some(symbol.name.clone()),
+        path: Some(file),
+        line: Some(symbol.line),
+        detail: Some(format!("{} {}", symbol.language, symbol.kind)),
+        expand: traversal_expand_command(root, &handle),
+    }
+}
+
+fn traversal_unresolved_symbol_node(root: &Path, name: &str) -> TraversalNode {
+    let handle = stable_handle("gsym", &format!("symbol:{name}"));
+    TraversalNode {
+        handle: handle.clone(),
+        kind: "symbol".to_string(),
+        label: name.to_string(),
+        ref_id: Some(name.to_string()),
+        path: None,
+        line: None,
+        detail: Some("unresolved call target".to_string()),
+        expand: traversal_expand_command(root, &handle),
+    }
+}
+
+fn traversal_session_node(
+    root: &Path,
+    markdown_path: &Path,
+    session_id: Option<&str>,
+) -> TraversalNode {
+    let display = relativize_pathbuf(markdown_path, root)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let handle = stable_handle("gses", &format!("session:{display}"));
+    TraversalNode {
+        handle: handle.clone(),
+        kind: "session".to_string(),
+        label: session_id.unwrap_or(&display).to_string(),
+        ref_id: session_id.map(str::to_string),
+        path: Some(display),
+        line: None,
+        detail: Some("agent-doc session artifact".to_string()),
+        expand: traversal_expand_command(root, &handle),
+    }
+}
+
+fn traversal_backlog_node(
+    root: &Path,
+    markdown_path: &Path,
+    id: &str,
+    text: &str,
+    line: i64,
+) -> TraversalNode {
+    let display = relativize_pathbuf(markdown_path, root)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let handle = stable_handle("gbak", &format!("backlog:{display}:#{id}"));
+    TraversalNode {
+        handle: handle.clone(),
+        kind: "backlog".to_string(),
+        label: format!("#{id}"),
+        ref_id: Some(id.to_string()),
+        path: Some(display),
+        line: Some(line),
+        detail: Some(text.to_string()),
+        expand: traversal_expand_command(root, &handle),
+    }
+}
+
+fn traversal_tokens(input: &str) -> BTreeSet<String> {
+    input
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .flat_map(|part| part.split(['_', '-']))
+        .map(str::trim)
+        .filter(|part| part.len() >= 3)
+        .map(|part| part.to_ascii_lowercase())
+        .collect()
+}
+
+fn traversal_node_tokens(node: &TraversalNode) -> BTreeSet<String> {
+    let mut tokens = traversal_tokens(&node.label);
+    if let Some(ref_id) = &node.ref_id {
+        tokens.extend(traversal_tokens(ref_id));
+    }
+    if let Some(path) = &node.path {
+        tokens.extend(traversal_tokens(path));
+    }
+    if let Some(detail) = &node.detail {
+        tokens.extend(traversal_tokens(detail));
+    }
+    tokens
+}
+
+fn parse_agent_doc_session_id(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("agent_doc_session:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn parse_backlog_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("- [") {
+        return None;
+    }
+    let start = trimmed.find("[#")?;
+    let after_start = start + 2;
+    let rest = &trimmed[after_start..];
+    let end = rest.find(']')?;
+    let id = rest[..end].trim();
+    if id.is_empty() {
+        return None;
+    }
+    let text = rest[end + 1..].trim().to_string();
+    Some((id.to_string(), text))
+}
+
+fn markdown_files_for_traversal(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+    for result in walker {
+        let entry =
+            result.with_context(|| format!("walking markdown files under {}", root.display()))?;
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        if entry.path().extension().and_then(|ext| ext.to_str()) == Some("md") {
+            files.push(entry.path().to_path_buf());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn link_backlog_to_code_nodes(
+    graph: &mut TraversalGraphBuild,
+    backlog: &TraversalNode,
+    text: &str,
+    symbols: &[TraversalSymbolIndexEntry],
+    files: &[TraversalFileIndexEntry],
+    limit: usize,
+) {
+    let mut query_tokens = traversal_tokens(text);
+    if let Some(ref_id) = &backlog.ref_id {
+        query_tokens.extend(traversal_tokens(ref_id));
+    }
+    if query_tokens.is_empty() {
+        return;
+    }
+
+    let mut symbol_matches = symbols
+        .iter()
+        .filter_map(|entry| {
+            let score = query_tokens.intersection(&entry.tokens).count();
+            (score > 0).then_some((score, entry))
+        })
+        .collect::<Vec<_>>();
+    symbol_matches.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.node.label.cmp(&right.node.label))
+            .then_with(|| left.handle.cmp(&right.handle))
+    });
+    for (score, entry) in symbol_matches.into_iter().take(limit) {
+        graph.add_edge(
+            &backlog.handle,
+            &entry.handle,
+            "mentions",
+            Some("backlog text matches symbol tokens".to_string()),
+            score,
+        );
+    }
+
+    let mut file_matches = files
+        .iter()
+        .filter_map(|entry| {
+            let score = query_tokens.intersection(&entry.tokens).count();
+            (score > 0).then_some((score, entry))
+        })
+        .collect::<Vec<_>>();
+    file_matches.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.node.label.cmp(&right.node.label))
+            .then_with(|| left.handle.cmp(&right.handle))
+    });
+    for (score, entry) in file_matches.into_iter().take(limit.min(5)) {
+        graph.add_edge(
+            &backlog.handle,
+            &entry.handle,
+            "mentions",
+            Some("backlog text matches file tokens".to_string()),
+            score,
+        );
+    }
+}
+
+fn load_agent_doc_traversal_nodes(
+    root: &Path,
+    graph: &mut TraversalGraphBuild,
+    symbols: &[TraversalSymbolIndexEntry],
+    files: &[TraversalFileIndexEntry],
+) -> Result<()> {
+    for markdown_path in markdown_files_for_traversal(root)? {
+        let content = match fs::read_to_string(&markdown_path) {
+            Ok(content) => content,
+            Err(err) => {
+                graph.warnings.push(format!(
+                    "session artifact unavailable: {}: {err}",
+                    markdown_path.display()
+                ));
+                continue;
+            }
+        };
+        let session_id = parse_agent_doc_session_id(&content);
+        let looks_like_session = session_id.is_some()
+            || content.contains("<!-- agent:exchange")
+            || content.contains("<!-- agent:backlog")
+            || content.contains("## Backlog");
+        if !looks_like_session {
+            continue;
+        }
+
+        let session = traversal_session_node(root, &markdown_path, session_id.as_deref());
+        graph.add_node(session.clone());
+        for (idx, line) in content.lines().enumerate() {
+            let Some((id, text)) = parse_backlog_line(line) else {
+                continue;
+            };
+            let backlog = traversal_backlog_node(root, &markdown_path, &id, &text, idx as i64 + 1);
+            graph.add_node(backlog.clone());
+            graph.add_edge(
+                &session.handle,
+                &backlog.handle,
+                "contains",
+                Some("session backlog item".to_string()),
+                1,
+            );
+            link_backlog_to_code_nodes(graph, &backlog, &text, symbols, files, 8);
+        }
+    }
+    Ok(())
+}
+
+fn build_traversal_graph(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+) -> Result<TraversalGraphBuild> {
+    let mut graph = TraversalGraphBuild::default();
+    let mut symbol_entries = Vec::new();
+    let mut file_entries = Vec::new();
+
+    match resolve_query_db_path(root, path_hint, scope) {
+        Ok(db_path) if db_path.exists() => {
+            let db = index::IndexDb::open_read_only_resilient(&db_path)?;
+            let file_paths = db.file_paths()?;
+            for file in file_paths {
+                let node = traversal_file_node(root, &file);
+                let entry = TraversalFileIndexEntry {
+                    handle: node.handle.clone(),
+                    tokens: traversal_node_tokens(&node),
+                    node: node.clone(),
+                };
+                graph.add_node(node);
+                file_entries.push(entry);
+            }
+
+            let symbols = db.all_symbols()?;
+            let mut symbol_by_file_name_line = HashMap::new();
+            let mut first_symbol_by_name = BTreeMap::<String, String>::new();
+            for symbol in &symbols {
+                let node = traversal_symbol_node(root, symbol);
+                let file = relativize(&symbol.file, root);
+                symbol_by_file_name_line.insert(
+                    format!("{file}:{}:{}", symbol.line, symbol.name),
+                    node.handle.clone(),
+                );
+                first_symbol_by_name
+                    .entry(symbol.name.clone())
+                    .or_insert_with(|| node.handle.clone());
+                let entry = TraversalSymbolIndexEntry {
+                    handle: node.handle.clone(),
+                    tokens: traversal_node_tokens(&node),
+                    node: node.clone(),
+                };
+                graph.add_node(node.clone());
+                if let Some(file_node) = file_entries
+                    .iter()
+                    .find(|entry| entry.node.path.as_deref() == Some(file.as_str()))
+                {
+                    graph.add_edge(
+                        &file_node.handle,
+                        &node.handle,
+                        "defines",
+                        Some("file defines symbol".to_string()),
+                        1,
+                    );
+                }
+                symbol_entries.push(entry);
+            }
+
+            for edge in db.all_stored_edges()? {
+                let caller_file = relativize(&edge.caller_file, root);
+                let caller_key = format!("{caller_file}:{}:{}", edge.caller_line, edge.caller_name);
+                let Some(caller_handle) = symbol_by_file_name_line.get(&caller_key).cloned() else {
+                    continue;
+                };
+                let callee_handle =
+                    if let Some(handle) = first_symbol_by_name.get(&edge.callee_name) {
+                        handle.clone()
+                    } else {
+                        let node = traversal_unresolved_symbol_node(root, &edge.callee_name);
+                        let handle = node.handle.clone();
+                        graph.add_node(node);
+                        handle
+                    };
+                graph.add_edge(
+                    &caller_handle,
+                    &callee_handle,
+                    "calls",
+                    Some(format!("call site {}:{}", caller_file, edge.call_site_line)),
+                    1,
+                );
+            }
+        }
+        Ok(db_path) => {
+            graph.warnings.push(format!(
+                "code index unavailable: no index found at {}",
+                db_path.display()
+            ));
+        }
+        Err(err) => {
+            graph
+                .warnings
+                .push(format!("code index unavailable: {err:#}"));
+        }
+    }
+
+    load_agent_doc_traversal_nodes(root, &mut graph, &symbol_entries, &file_entries)?;
+    Ok(graph)
+}
+
+fn traversal_node_matches_query(node: &TraversalNode, query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if node.handle == trimmed || node.label == trimmed || node.path.as_deref() == Some(trimmed) {
+        return true;
+    }
+    let normalized_backlog = trimmed.trim_start_matches('#');
+    if node.ref_id.as_deref() == Some(trimmed) || node.ref_id.as_deref() == Some(normalized_backlog)
+    {
+        return true;
+    }
+    node.kind == "symbol" && node.label == normalized_backlog
+}
+
+fn resolve_traversal_node<'a>(
+    graph: &'a TraversalGraphBuild,
+    query: &str,
+) -> Option<&'a TraversalNode> {
+    graph
+        .nodes
+        .values()
+        .find(|node| traversal_node_matches_query(node, query))
+}
+
+fn traversal_adjacency(edges: &[TraversalEdge]) -> BTreeMap<String, Vec<String>> {
+    let mut adj = BTreeMap::<String, BTreeSet<String>>::new();
+    for edge in edges {
+        adj.entry(edge.from.clone())
+            .or_default()
+            .insert(edge.to.clone());
+        adj.entry(edge.to.clone())
+            .or_default()
+            .insert(edge.from.clone());
+    }
+    adj.into_iter()
+        .map(|(node, neighbors)| (node, neighbors.into_iter().collect()))
+        .collect()
+}
+
+fn traversal_shortest_handles(
+    edges: &[TraversalEdge],
+    from: &str,
+    to: &str,
+) -> Option<Vec<String>> {
+    if from == to {
+        return Some(vec![from.to_string()]);
+    }
+    let adj = traversal_adjacency(edges);
+    if !adj.contains_key(from) || !adj.contains_key(to) {
+        return None;
+    }
+    let mut visited = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    let mut parent = BTreeMap::<String, String>::new();
+    visited.insert(from.to_string());
+    queue.push_back(from.to_string());
+    while let Some(current) = queue.pop_front() {
+        if let Some(neighbors) = adj.get(&current) {
+            for neighbor in neighbors {
+                if visited.insert(neighbor.clone()) {
+                    parent.insert(neighbor.clone(), current.clone());
+                    if neighbor == to {
+                        let mut path = vec![to.to_string()];
+                        let mut cursor = to.to_string();
+                        while let Some(prev) = parent.get(&cursor) {
+                            path.push(prev.clone());
+                            cursor = prev.clone();
+                        }
+                        path.reverse();
+                        return Some(path);
+                    }
+                    queue.push_back(neighbor.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn traversal_neighborhood_handles(
+    edges: &[TraversalEdge],
+    origin: &str,
+    depth: usize,
+    limit: usize,
+) -> BTreeSet<String> {
+    let adj = traversal_adjacency(edges);
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    seen.insert(origin.to_string());
+    queue.push_back((origin.to_string(), 0usize));
+    while let Some((current, current_depth)) = queue.pop_front() {
+        if current_depth >= depth {
+            continue;
+        }
+        if let Some(neighbors) = adj.get(&current) {
+            for neighbor in neighbors {
+                if limit > 0 && seen.len() >= limit {
+                    return seen;
+                }
+                if seen.insert(neighbor.clone()) {
+                    queue.push_back((neighbor.clone(), current_depth + 1));
+                }
+            }
+        }
+    }
+    seen
+}
+
+fn traversal_edges_between(
+    handles: &BTreeSet<String>,
+    edges: &[TraversalEdge],
+) -> Vec<TraversalEdge> {
+    edges
+        .iter()
+        .filter(|edge| handles.contains(&edge.from) && handles.contains(&edge.to))
+        .cloned()
+        .collect()
+}
+
+fn traversal_path_edges(path: &[String], edges: &[TraversalEdge]) -> Vec<TraversalEdge> {
+    let mut result = Vec::new();
+    for pair in path.windows(2) {
+        if let Some(edge) = edges.iter().find(|edge| {
+            (edge.from == pair[0] && edge.to == pair[1])
+                || (edge.from == pair[1] && edge.to == pair[0])
+        }) {
+            result.push(edge.clone());
+        }
+    }
+    result
+}
+
+fn sorted_traversal_nodes<'a>(
+    nodes: impl IntoIterator<Item = &'a TraversalNode>,
+) -> Vec<TraversalNode> {
+    let mut nodes = nodes.into_iter().cloned().collect::<Vec<_>>();
+    nodes.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.handle.cmp(&right.handle))
+    });
+    nodes
+}
+
+fn traversal_relation_score(edge: &TraversalEdge, origin: &str) -> usize {
+    let base = match edge.relation.as_str() {
+        "mentions" => 100,
+        "contains" => 80,
+        "calls" => {
+            if edge.from == origin {
+                70
+            } else {
+                65
+            }
+        }
+        "defines" => {
+            if edge.from == origin {
+                60
+            } else {
+                55
+            }
+        }
+        _ => 10,
+    };
+    base + edge.weight
+}
+
+fn traversal_recommendation_reason(edge: &TraversalEdge, origin: &str) -> String {
+    match edge.relation.as_str() {
+        "mentions" => "matched from backlog/session text".to_string(),
+        "contains" => "contained in the selected session artifact".to_string(),
+        "defines" if edge.from == origin => "symbol defined in selected file".to_string(),
+        "defines" => "file that defines the selected symbol".to_string(),
+        "calls" if edge.from == origin => "callee from the selected symbol".to_string(),
+        "calls" => "caller of the selected symbol".to_string(),
+        other => format!("connected by {other}"),
+    }
+}
+
+fn traversal_recommendations(
+    graph: &TraversalGraphBuild,
+    origin: Option<&str>,
+    shortest_path: Option<&[String]>,
+    limit: usize,
+) -> Vec<TraversalRecommendation> {
+    let Some(origin) = origin else {
+        return Vec::new();
+    };
+    let mut recommendations = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    if let Some(path) = shortest_path
+        && path.len() > 1
+        && path.first().is_some_and(|handle| handle == origin)
+        && let Some(next) = graph.nodes.get(&path[1])
+    {
+        seen.insert(next.handle.clone());
+        recommendations.push(TraversalRecommendation {
+            handle: next.handle.clone(),
+            kind: next.kind.clone(),
+            label: next.label.clone(),
+            reason: "next hop on shortest path".to_string(),
+            score: 1_000,
+            expand: next.expand.clone(),
+        });
+    }
+
+    let mut candidates = graph
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            let neighbor = if edge.from == origin {
+                edge.to.as_str()
+            } else if edge.to == origin {
+                edge.from.as_str()
+            } else {
+                return None;
+            };
+            let node = graph.nodes.get(neighbor)?;
+            Some((traversal_relation_score(edge, origin), edge, node))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(left_score, _, left), (right_score, _, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.handle.cmp(&right.handle))
+    });
+
+    let max = if limit == 0 { usize::MAX } else { limit };
+    for (score, edge, node) in candidates {
+        if recommendations.len() >= max {
+            break;
+        }
+        if seen.insert(node.handle.clone()) {
+            recommendations.push(TraversalRecommendation {
+                handle: node.handle.clone(),
+                kind: node.kind.clone(),
+                label: node.label.clone(),
+                reason: traversal_recommendation_reason(edge, origin),
+                score,
+                expand: node.expand.clone(),
+            });
+        }
+    }
+
+    recommendations
+}
+
+fn traversal_report(
+    root: &Path,
+    scope: Option<&str>,
+    graph: TraversalGraphBuild,
+    query: Option<&str>,
+    target: Option<&str>,
+    depth: usize,
+    limit: usize,
+) -> Result<TraversalReport> {
+    let totals = TraversalTotals {
+        nodes: graph.nodes.len(),
+        edges: graph.edges.len(),
+    };
+    let origin_node = query.and_then(|value| resolve_traversal_node(&graph, value));
+    let target_node = target.and_then(|value| resolve_traversal_node(&graph, value));
+    if let Some(query) = query
+        && origin_node.is_none()
+    {
+        bail!("traversal node not found: {}", query);
+    }
+    if let Some(target) = target
+        && target_node.is_none()
+    {
+        bail!("traversal target not found: {}", target);
+    }
+
+    let (mode, selected_nodes, selected_edges, shortest_path) =
+        if let (Some(origin), Some(target)) = (origin_node, target_node) {
+            if let Some(handles) =
+                traversal_shortest_handles(&graph.edges, &origin.handle, &target.handle)
+            {
+                let handle_set = handles.iter().cloned().collect::<BTreeSet<_>>();
+                let nodes = handles
+                    .iter()
+                    .filter_map(|handle| graph.nodes.get(handle).cloned())
+                    .collect::<Vec<_>>();
+                let edges = traversal_path_edges(&handles, &graph.edges);
+                let path = TraversalPathReport {
+                    from: origin.clone(),
+                    to: target.clone(),
+                    hops: handles.len().saturating_sub(1),
+                    nodes: nodes.clone(),
+                    edges: edges.clone(),
+                };
+                (
+                    "path".to_string(),
+                    nodes,
+                    traversal_edges_between(&handle_set, &graph.edges),
+                    Some(path),
+                )
+            } else {
+                (
+                    "path".to_string(),
+                    vec![origin.clone(), target.clone()],
+                    Vec::new(),
+                    None,
+                )
+            }
+        } else if let Some(origin) = origin_node {
+            let handles =
+                traversal_neighborhood_handles(&graph.edges, &origin.handle, depth, limit);
+            let nodes =
+                sorted_traversal_nodes(handles.iter().filter_map(|handle| graph.nodes.get(handle)));
+            let edges = traversal_edges_between(&handles, &graph.edges);
+            ("neighborhood".to_string(), nodes, edges, None)
+        } else {
+            let mut nodes = sorted_traversal_nodes(graph.nodes.values());
+            let truncated_nodes = limit > 0 && nodes.len() > limit;
+            if truncated_nodes {
+                nodes.truncate(limit);
+            }
+            let handles = nodes
+                .iter()
+                .map(|node| node.handle.clone())
+                .collect::<BTreeSet<_>>();
+            let mut edges = traversal_edges_between(&handles, &graph.edges);
+            let truncated_edges = limit > 0 && edges.len() > limit;
+            if truncated_edges {
+                edges.truncate(limit);
+            }
+            ("export".to_string(), nodes, edges, None)
+        };
+
+    let shortest_handles = shortest_path.as_ref().map(|path| {
+        path.nodes
+            .iter()
+            .map(|node| node.handle.clone())
+            .collect::<Vec<_>>()
+    });
+    let recommendations = traversal_recommendations(
+        &graph,
+        origin_node.map(|node| node.handle.as_str()),
+        shortest_handles.as_deref(),
+        if limit == 0 { 10 } else { limit.min(10) },
+    );
+    let truncated = selected_nodes.len() < totals.nodes || selected_edges.len() < totals.edges;
+
+    Ok(TraversalReport {
+        root: root.to_string_lossy().to_string(),
+        scope: scope.map(str::to_string),
+        mode,
+        totals,
+        query: query.map(str::to_string),
+        target: target.map(str::to_string),
+        nodes: selected_nodes,
+        edges: selected_edges,
+        shortest_path,
+        recommendations,
+        truncated,
+        warnings: graph.warnings,
+    })
+}
+
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn traversal_report_html(report: &TraversalReport) -> Result<String> {
+    let json = serde_json::to_string(report)?;
+    let mut html = String::new();
+    html.push_str(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>tsift traversal graph</title>",
+    );
+    html.push_str("<style>body{font-family:system-ui,sans-serif;margin:24px;line-height:1.4}h1{font-size:24px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.item{border:1px solid #ddd;border-radius:6px;padding:8px;margin:6px 0}.kind{font-size:12px;text-transform:uppercase;color:#666}code{background:#f6f6f6;padding:1px 4px;border-radius:3px}pre{white-space:pre-wrap;background:#111;color:#f8f8f2;padding:12px;border-radius:6px;overflow:auto}</style>");
+    html.push_str("</head><body>");
+    html.push_str(&format!(
+        "<h1>tsift traversal graph</h1><p>mode <code>{}</code>, nodes <code>{}</code>/<code>{}</code>, edges <code>{}</code>/<code>{}</code></p>",
+        html_escape(&report.mode),
+        report.nodes.len(),
+        report.totals.nodes,
+        report.edges.len(),
+        report.totals.edges
+    ));
+    html.push_str("<div class=\"grid\"><section><h2>Nodes</h2>");
+    for node in &report.nodes {
+        html.push_str(&format!(
+            "<div class=\"item\"><div class=\"kind\">{}</div><strong>{}</strong><br><code>{}</code>",
+            html_escape(&node.kind),
+            html_escape(&node.label),
+            html_escape(&node.handle)
+        ));
+        if let Some(path) = &node.path {
+            html.push_str(&format!("<br>{}", html_escape(path)));
+        }
+        if let Some(detail) = &node.detail {
+            html.push_str(&format!("<br>{}", html_escape(detail)));
+        }
+        html.push_str("</div>");
+    }
+    html.push_str("</section><section><h2>Edges</h2>");
+    for edge in &report.edges {
+        html.push_str(&format!(
+            "<div class=\"item\"><code>{}</code> -{}-&gt; <code>{}</code>",
+            html_escape(&edge.from),
+            html_escape(&edge.relation),
+            html_escape(&edge.to)
+        ));
+        if let Some(label) = &edge.label {
+            html.push_str(&format!("<br>{}", html_escape(label)));
+        }
+        html.push_str("</div>");
+    }
+    html.push_str("</section></div>");
+    if !report.recommendations.is_empty() {
+        html.push_str("<section><h2>Next Nodes</h2>");
+        for rec in &report.recommendations {
+            html.push_str(&format!(
+                "<div class=\"item\"><strong>{}</strong> <code>{}</code><br>{}<br><code>{}</code></div>",
+                html_escape(&rec.label),
+                html_escape(&rec.kind),
+                html_escape(&rec.reason),
+                html_escape(&rec.expand)
+            ));
+        }
+        html.push_str("</section>");
+    }
+    html.push_str("<section><h2>JSON</h2><pre>");
+    html.push_str(&html_escape(&json));
+    html.push_str("</pre></section></body></html>");
+    Ok(html)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_traverse(
+    node: Option<&str>,
+    to: Option<&str>,
+    path: &Path,
+    scope: Option<&str>,
+    depth: usize,
+    limit: usize,
+    format: TraverseFormat,
+    pretty: bool,
+    terse: bool,
+    schema: bool,
+) -> Result<()> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let graph = build_traversal_graph(&root, path, scope)?;
+    let report = traversal_report(&root, scope, graph, node, to, depth, limit)?;
+    match format {
+        TraverseFormat::Json => {
+            println!("{}", to_json_schema(&report, pretty, terse, schema)?);
+        }
+        TraverseFormat::Html => {
+            println!("{}", traversal_report_html(&report)?);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -12280,6 +13300,34 @@ mod tests {
         dir
     }
 
+    fn setup_traversal_project() -> tempfile::TempDir {
+        let dir = setup_graph_index();
+        let task_dir = dir.path().join("tasks/software");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        std::fs::write(
+            task_dir.join("tsift.md"),
+            r#"---
+agent_doc_session: tsift-v0.1
+agent_doc_format: template
+---
+
+## Exchange
+
+<!-- agent:exchange patch=append -->
+❯ do [#kgnv]
+<!-- /agent:exchange -->
+
+## Backlog
+
+<!-- agent:backlog -->
+- [ ] [#kgnv] Fix helper traversal handles while preserving graph navigation.
+<!-- /agent:backlog -->
+"#,
+        )
+        .unwrap();
+        dir
+    }
+
     #[test]
     fn graph_callers_query() {
         let dir = setup_graph_index();
@@ -12326,6 +13374,112 @@ mod tests {
             false,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn traversal_graph_has_stable_typed_handles() {
+        let dir = setup_traversal_project();
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let graph_again = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+
+        let file = resolve_traversal_node(&graph, "main.rs").unwrap();
+        let symbol = resolve_traversal_node(&graph, "helper").unwrap();
+        let backlog = resolve_traversal_node(&graph, "#kgnv").unwrap();
+        let session = resolve_traversal_node(&graph, "tsift-v0.1").unwrap();
+
+        assert!(file.handle.starts_with("gfil-"));
+        assert!(symbol.handle.starts_with("gsym-"));
+        assert!(backlog.handle.starts_with("gbak-"));
+        assert!(session.handle.starts_with("gses-"));
+
+        assert_eq!(
+            symbol.handle,
+            resolve_traversal_node(&graph_again, "helper")
+                .unwrap()
+                .handle
+        );
+        assert_eq!(
+            backlog.handle,
+            resolve_traversal_node(&graph_again, "#kgnv")
+                .unwrap()
+                .handle
+        );
+    }
+
+    #[test]
+    fn traversal_graph_links_backlog_items_to_code_tokens() {
+        let dir = setup_traversal_project();
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let backlog = resolve_traversal_node(&graph, "#kgnv").unwrap();
+        let helper = resolve_traversal_node(&graph, "helper").unwrap();
+
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == backlog.handle && edge.to == helper.handle && edge.relation == "mentions"
+        }));
+    }
+
+    #[test]
+    fn traversal_shortest_path_crosses_artifacts_and_symbols() {
+        let dir = setup_traversal_project();
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let backlog = resolve_traversal_node(&graph, "#kgnv").unwrap();
+        let main = resolve_traversal_node(&graph, "main").unwrap();
+
+        let path = traversal_shortest_handles(&graph.edges, &backlog.handle, &main.handle).unwrap();
+        assert_eq!(path.first(), Some(&backlog.handle));
+        assert_eq!(path.last(), Some(&main.handle));
+        assert!(
+            path.len() >= 3,
+            "expected backlog -> symbol -> main, got {path:?}"
+        );
+    }
+
+    #[test]
+    fn traversal_report_recommends_next_bugfix_nodes() {
+        let dir = setup_traversal_project();
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let report = traversal_report(dir.path(), None, graph, Some("#kgnv"), None, 1, 50).unwrap();
+
+        assert_eq!(report.mode, "neighborhood");
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .any(|rec| rec.label == "helper" && rec.reason.contains("matched")),
+            "expected helper recommendation, got {:?}",
+            report.recommendations
+        );
+    }
+
+    #[test]
+    fn traversal_cmd_supports_json_and_html_outputs() {
+        let dir = setup_traversal_project();
+        cmd_traverse(
+            Some("#kgnv"),
+            Some("main"),
+            dir.path(),
+            None,
+            1,
+            50,
+            TraverseFormat::Json,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        cmd_traverse(
+            None,
+            None,
+            dir.path(),
+            None,
+            1,
+            50,
+            TraverseFormat::Html,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -16338,6 +17492,28 @@ tier = "private"
         let cli = Cli::parse_from(["tsift", "--tabular", "explain", "main"]);
         assert!(cli.tabular);
         assert!(matches!(cli.command, Some(Commands::Explain { .. })));
+    }
+
+    #[test]
+    fn cli_traverse_accepts_path_target_and_html_format() {
+        let cli = Cli::parse_from([
+            "tsift", "traverse", "#kgnv", "--to", "main", "--path", ".", "--format", "html",
+        ]);
+        match cli.command {
+            Some(Commands::Traverse {
+                node,
+                to,
+                path,
+                format,
+                ..
+            }) => {
+                assert_eq!(node.as_deref(), Some("#kgnv"));
+                assert_eq!(to.as_deref(), Some("main"));
+                assert_eq!(path, PathBuf::from("."));
+                assert_eq!(format, TraverseFormat::Html);
+            }
+            _ => panic!("expected Traverse command"),
+        }
     }
 
     #[test]

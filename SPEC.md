@@ -73,6 +73,7 @@ tsift graph --callers <symbol>  # who calls this function?
 tsift graph --callees <symbol>  # what does this function call?
 tsift communities [--path]      # Louvain community detection over call graph
 tsift path <from> <to>          # BFS shortest path between symbols
+tsift traverse [node] [--to target] --format json|html # Graphify-style file/symbol/session/backlog traversal graph
 tsift --envelope explain <symbol> --budget normal # bounded agent preview
 tsift --envelope source-read src/main.rs --start 1 --lines 80 --budget normal # bounded source-file preview with expansion handles
 tsift edit < edits.json         # staged multi-file search/replace batch
@@ -181,6 +182,18 @@ The command still returns the source preview when index or summary stores are mi
 The contract is to keep every emitted handle with its originating command, query, path, and strategy, then use each result's `expand`, `follow_up`, or `resume_commands` field for the next command while citing the parent handle. Search previews preserve `sfam-*` and `shit-*` handles, explain previews preserve `edef-*`, `ecall-*`, and `eces-*` handles, and digest/context-pack outputs preserve artifact and touched-symbol handles across diff, test, log, and session expansions.
 
 When an index is present, the AST symbol-ranking prepass is now bounded: SQLite only pulls exact-name rows and overlapping-tag candidates, orders them by exact/tag overlap, and caps that candidate scan to the requested search `--limit` instead of loading the full `symbols` table into memory first.
+
+## Graph Traversal Handles
+
+`tsift traverse` exposes a Graphify-style traversal graph over indexed files, indexed symbols, agent-doc session documents, and backlog items. It assigns stable handles by node family: `gfil-*` for files, `gsym-*` for symbols, `gses-*` for session artifacts, and `gbak-*` for backlog items. Handles are deterministic from normalized file paths, symbol names/locations, session paths, and backlog ids so agents can cite and revisit graph nodes across turns.
+
+The command supports three traversal modes:
+
+- no node: export a bounded graph slice as JSON or HTML (`tsift traverse --path . --format html`)
+- node only: return a neighborhood explanation around a handle, symbol name, file path, or backlog id (`tsift traverse '#kgnv' --depth 2 --path .`)
+- node plus `--to`: return the shortest path between two graph nodes (`tsift traverse '#kgnv' --to main --path .`)
+
+Traversal edges include file-to-symbol `defines`, symbol-to-symbol `calls`, session-to-backlog `contains`, and backlog-to-code `mentions` links derived from backlog text tokens. Reports include `recommendations` that rank the next useful graph nodes for bug-fix navigation, prioritizing backlog mentions, shortest-path next hops, callers/callees, and defining files.
 
 On stale existing indexes, search exits early with a message like:
 ```

@@ -915,6 +915,45 @@ impl IndexDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn all_symbols(&self) -> Result<Vec<StoredSymbol>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, kind, language, signature, file, line, end_line, parent_module, visibility, tags \
+             FROM symbols ORDER BY file, line, name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StoredSymbol {
+                name: row.get(0)?,
+                kind: row.get(1)?,
+                language: row.get(2)?,
+                signature: row.get(3)?,
+                file: row.get(4)?,
+                line: row.get(5)?,
+                end_line: row.get(6)?,
+                parent_module: row.get(7)?,
+                visibility: row.get(8)?,
+                tags: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn all_stored_edges(&self) -> Result<Vec<StoredEdge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT caller_file, caller_name, caller_line, callee_name, call_site_line \
+             FROM call_edges ORDER BY caller_file, call_site_line, caller_name, callee_name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StoredEdge {
+                caller_file: row.get(0)?,
+                caller_name: row.get(1)?,
+                caller_line: row.get(2)?,
+                callee_name: row.get(3)?,
+                call_site_line: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn symbol_info(&self, name: &str) -> Result<Vec<StoredSymbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT name, kind, language, signature, file, line, end_line, parent_module, visibility, tags FROM symbols WHERE name = ?1 ORDER BY file, line"
