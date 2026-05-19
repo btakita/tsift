@@ -4155,6 +4155,15 @@ fn traversal_file_node(root: &Path, file: &str) -> TraversalNode {
     }
 }
 
+fn traversal_raw_source_file_node(root: &Path, file: &str) -> TraversalNode {
+    let mut node = traversal_file_node(root, file);
+    if let Some(path) = node.path.clone() {
+        node.detail = Some("raw source fallback; graph evidence unavailable".to_string());
+        node.expand = source_read_command(root, &path, 1, 80);
+    }
+    node
+}
+
 fn traversal_symbol_node(root: &Path, symbol: &index::StoredSymbol) -> TraversalNode {
     let file = relativize(&symbol.file, root);
     let key = format!("symbol:{file}:{}:{}", symbol.line, symbol.name);
@@ -4413,6 +4422,172 @@ fn load_agent_doc_traversal_nodes(
     Ok(())
 }
 
+#[derive(Debug)]
+struct AgentDocIndexGate {
+    db_path: Option<PathBuf>,
+    source_root: PathBuf,
+    diagnostics: Vec<String>,
+}
+
+fn index_reason_for_state(state: SearchIndexState) -> Option<RebuildSearchReason> {
+    match state {
+        SearchIndexState::Fresh => None,
+        SearchIndexState::Missing => Some(RebuildSearchReason::Missing),
+        SearchIndexState::Stale { stale_files } => Some(RebuildSearchReason::Stale { stale_files }),
+    }
+}
+
+fn index_reason_detail(target: &SearchIndexTarget, reason: RebuildSearchReason) -> String {
+    rebuild_search_target_detail(&RebuildSearchTarget {
+        label: target.label.clone(),
+        reason,
+        reindex_cmd: target.reindex_cmd.clone(),
+    })
+}
+
+fn index_refresh_diagnostic(
+    target: &SearchIndexTarget,
+    reason: RebuildSearchReason,
+    summary: &index::IndexSummary,
+    packet_label: &str,
+) -> String {
+    let changed = summary.new + summary.modified + summary.deleted;
+    format!(
+        "index refreshed: {}; updated {} changed file{} before {}",
+        index_reason_detail(target, reason),
+        changed,
+        if changed == 1 { "" } else { "s" },
+        packet_label
+    )
+}
+
+fn index_refresh_fallback_diagnostic(
+    target: &SearchIndexTarget,
+    reason: RebuildSearchReason,
+    err: &anyhow::Error,
+    packet_label: &str,
+) -> String {
+    format!(
+        "{}; could not refresh before {}: {err:#}; falling back to raw source file nodes",
+        index_reason_detail(target, reason),
+        packet_label
+    )
+}
+
+fn graph_fallback_source_root(root: &Path, path_hint: &Path, scope: Option<&str>) -> PathBuf {
+    if let Some(scope_name) = scope
+        && let Ok(scope) = config::Config::resolve_submodule(root, scope_name)
+    {
+        return scope.source_root;
+    }
+    if let Ok(Some(scope)) = config::Config::infer_submodule_from_path(root, path_hint) {
+        return scope.source_root;
+    }
+    root.to_path_buf()
+}
+
+fn prepare_agent_doc_index_gate(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+    packet_label: &str,
+) -> AgentDocIndexGate {
+    let fallback_source_root = graph_fallback_source_root(root, path_hint, scope);
+    let targets = match resolve_search_index_targets(root, path_hint, scope, false) {
+        Ok(targets) => targets,
+        Err(err) => {
+            return AgentDocIndexGate {
+                db_path: None,
+                source_root: fallback_source_root,
+                diagnostics: vec![format!(
+                    "code index unavailable before {packet_label}: {err:#}; falling back to raw source file nodes"
+                )],
+            };
+        }
+    };
+    let Some(target) = targets.into_iter().next() else {
+        return AgentDocIndexGate {
+            db_path: None,
+            source_root: fallback_source_root,
+            diagnostics: vec![format!(
+                "code index unavailable before {packet_label}: no index target resolved; falling back to raw source file nodes"
+            )],
+        };
+    };
+
+    let state = match inspect_search_index(&target) {
+        Ok(state) => state,
+        Err(err) => {
+            return AgentDocIndexGate {
+                db_path: None,
+                source_root: target.source_root,
+                diagnostics: vec![format!(
+                    "code index freshness unavailable before {packet_label}: {err:#}; falling back to raw source file nodes"
+                )],
+            };
+        }
+    };
+
+    let Some(reason) = index_reason_for_state(state) else {
+        return AgentDocIndexGate {
+            db_path: Some(target.db_path),
+            source_root: target.source_root,
+            diagnostics: Vec::new(),
+        };
+    };
+
+    match apply_search_index_update(root, &target) {
+        Ok(summary) => {
+            let diagnostics = vec![index_refresh_diagnostic(
+                &target,
+                reason,
+                &summary,
+                packet_label,
+            )];
+            AgentDocIndexGate {
+                db_path: Some(target.db_path),
+                source_root: target.source_root,
+                diagnostics,
+            }
+        }
+        Err(err) => {
+            let diagnostics = vec![index_refresh_fallback_diagnostic(
+                &target,
+                reason,
+                &err,
+                packet_label,
+            )];
+            AgentDocIndexGate {
+                db_path: None,
+                source_root: target.source_root,
+                diagnostics,
+            }
+        }
+    }
+}
+
+fn add_raw_source_file_nodes(
+    root: &Path,
+    source_root: &Path,
+    graph: &mut TraversalGraphBuild,
+    file_entries: &mut Vec<TraversalFileIndexEntry>,
+) -> Result<()> {
+    let mut entries = walk::walk_files(source_root)?;
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    for entry in entries {
+        let file = entry.path.to_string_lossy();
+        let node = traversal_raw_source_file_node(root, file.as_ref());
+        let entry = TraversalFileIndexEntry {
+            handle: node.handle.clone(),
+            tokens: traversal_node_tokens(&node),
+            node: node.clone(),
+        };
+        graph.add_node(node);
+        file_entries.push(entry);
+    }
+    Ok(())
+}
+
 fn build_traversal_graph(
     root: &Path,
     path_hint: &Path,
@@ -4421,9 +4596,11 @@ fn build_traversal_graph(
     let mut graph = TraversalGraphBuild::default();
     let mut symbol_entries = Vec::new();
     let mut file_entries = Vec::new();
+    let gate = prepare_agent_doc_index_gate(root, path_hint, scope, "graph traversal packet");
+    graph.warnings.extend(gate.diagnostics);
 
-    match resolve_query_db_path(root, path_hint, scope) {
-        Ok(db_path) if db_path.exists() => {
+    match gate.db_path {
+        Some(db_path) if db_path.exists() => {
             let db = index::IndexDb::open_read_only_resilient(&db_path)?;
             let file_paths = db.file_paths()?;
             for file in file_paths {
@@ -4495,16 +4672,14 @@ fn build_traversal_graph(
                 );
             }
         }
-        Ok(db_path) => {
-            graph.warnings.push(format!(
-                "code index unavailable: no index found at {}",
-                db_path.display()
-            ));
-        }
-        Err(err) => {
-            graph
-                .warnings
-                .push(format!("code index unavailable: {err:#}"));
+        _ => {
+            add_raw_source_file_nodes(root, &gate.source_root, &mut graph, &mut file_entries)
+                .with_context(|| {
+                    format!(
+                        "loading raw source fallback nodes from {}",
+                        gate.source_root.display()
+                    )
+                })?;
         }
     }
 
@@ -9222,7 +9397,9 @@ fn build_context_pack_report(
     let budget = effective_context_budget(budget);
     let review = session_review::compute(path)?;
     let root = PathBuf::from(&review.root);
-    let status_reminders = context_pack_status_reminders(&root);
+    let gate = prepare_agent_doc_index_gate(&root, path, None, "context-pack handoff");
+    let mut status_reminders = gate.diagnostics;
+    status_reminders.extend(context_pack_status_reminders(&root));
     let ontology = load_tag_ontology_preview_context(&root);
     let ontology_ref = ontology.as_ref();
     let mut next_context =
@@ -10458,7 +10635,10 @@ fn degraded_search_target(
     }
 }
 
-fn apply_search_index_update(root: &Path, target: &SearchIndexTarget) -> Result<()> {
+fn apply_search_index_update(
+    root: &Path,
+    target: &SearchIndexTarget,
+) -> Result<index::IndexSummary> {
     run_index_update(
         &target.db_path,
         &target.source_root,
@@ -10467,8 +10647,7 @@ fn apply_search_index_update(root: &Path, target: &SearchIndexTarget) -> Result<
         target.scope_name.as_deref(),
         false,
         false,
-    )?;
-    Ok(())
+    )
 }
 
 fn collect_rebuild_search_targets(
@@ -13448,6 +13627,75 @@ agent_doc_format: template
                 .any(|rec| rec.label == "helper" && rec.reason.contains("matched")),
             "expected helper recommendation, got {:?}",
             report.recommendations
+        );
+    }
+
+    #[test]
+    fn traversal_graph_refreshes_stale_index_before_loading_symbols() {
+        let dir = setup_traversal_project();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn fresh_helper() { println!(\"fresh\"); }\nfn main() { fresh_helper(); }\n",
+        )
+        .unwrap();
+
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+
+        assert!(
+            graph
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("index refreshed")
+                    && warning.contains("graph traversal packet")),
+            "expected refresh diagnostic, got {:?}",
+            graph.warnings
+        );
+        assert!(resolve_traversal_node(&graph, "fresh_helper").is_some());
+
+        let db = index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
+        let summary = db.compute_changes(dir.path()).unwrap();
+        assert_eq!(summary.new + summary.modified + summary.deleted, 0);
+    }
+
+    #[test]
+    fn traversal_graph_falls_back_to_raw_source_when_stale_refresh_is_blocked() {
+        let dir = setup_traversal_project();
+        let db_path = dir.path().join(".tsift/index.db");
+        let _writer = hold_writer_lock(&index::writer_lock_path(&db_path));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn fresh_helper() { println!(\"fresh\"); }\nfn main() { fresh_helper(); }\n",
+        )
+        .unwrap();
+
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let file = resolve_traversal_node(&graph, "main.rs").unwrap();
+
+        assert!(
+            graph
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("falling back to raw source file nodes")),
+            "expected raw-source fallback diagnostic, got {:?}",
+            graph.warnings
+        );
+        assert!(
+            file.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("raw source fallback")),
+            "expected raw-source detail, got {:?}",
+            file.detail
+        );
+        assert!(
+            file.expand.contains("source-read"),
+            "expected source-read fallback command, got {}",
+            file.expand
+        );
+        assert!(
+            resolve_traversal_node(&graph, "helper").is_none(),
+            "stale symbol evidence should be skipped when refresh is blocked"
         );
     }
 
@@ -17165,6 +17413,49 @@ tier = "private"
         assert_eq!(reminders.len(), 1);
         assert!(reminders[0].contains("index stale"));
         assert!(reminders[0].contains("tsift index ."));
+    }
+
+    #[test]
+    fn context_pack_refreshes_stale_index_before_handoff() {
+        let dir = setup_graph_index();
+        init_git_repo(dir.path());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() { println!(\"updated\"); }\nfn main() { helper(); }\n",
+        )
+        .unwrap();
+
+        let report = build_context_pack_report(
+            dir.path(),
+            None,
+            None,
+            None,
+            ResponseBudget::new(Some(2), Some(96)),
+        )
+        .unwrap();
+
+        assert!(
+            report
+                .status_reminders
+                .iter()
+                .any(|reminder| reminder.contains("index refreshed")
+                    && reminder.contains("context-pack handoff")),
+            "expected context-pack refresh diagnostic, got {:?}",
+            report.status_reminders
+        );
+        assert!(
+            !report
+                .status_reminders
+                .iter()
+                .any(|reminder| reminder.contains("index stale")),
+            "stale reminder should be gone after refresh: {:?}",
+            report.status_reminders
+        );
+
+        let db = index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
+        let summary = db.compute_changes(dir.path()).unwrap();
+        assert_eq!(summary.new + summary.modified + summary.deleted, 0);
     }
 
     #[test]

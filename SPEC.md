@@ -195,6 +195,8 @@ The command supports three traversal modes:
 
 Traversal edges include file-to-symbol `defines`, symbol-to-symbol `calls`, session-to-backlog `contains`, and backlog-to-code `mentions` links derived from backlog text tokens. Reports include `recommendations` that rank the next useful graph nodes for bug-fix navigation, prioritizing backlog mentions, shortest-path next hops, callers/callees, and defining files.
 
+Agent-facing context and traversal packets gate graph evidence on fresh incremental indexes. Before `context-pack` handoffs and `traverse` graph reports read indexed symbols or call edges, tsift checks the matching root or scoped index and runs the normal incremental update path for missing or changed files. Reports include a concise diagnostic when that refresh happened. If a stale or missing index cannot be refreshed, for example because another writer owns the index lock, traversal skips stale symbol/call edges, emits a stale/missing diagnostic, and falls back to live source-file nodes whose expansion commands use `tsift source-read`; this keeps agent-doc navigation grounded in current raw source instead of stale graph evidence.
+
 On stale existing indexes, search exits early with a message like:
 ```
 tsift search aborted: index is stale (51 files). Run `tsift index .` or re-run with `--autoindex`.
