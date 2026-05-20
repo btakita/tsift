@@ -737,6 +737,8 @@ enum GraphDbBackend {
 enum GraphDbQuery {
     /// Diagnose graph.db or Convex snapshot health without refreshing the local projection
     Doctor,
+    /// Compare the local SQLite projection against a Convex snapshot before apply/read operations
+    Drift,
     /// Show the stable JSON shape for graph database records and responses
     Schema,
     /// Look up one node by stable id
@@ -787,6 +789,9 @@ enum GraphDbQuery {
         /// Restrict traversed edges to this kind
         #[arg(long)]
         edge_kind: Option<String>,
+        /// Stop directed path search after this many hops
+        #[arg(long)]
+        max_hops: Option<usize>,
     },
 }
 
@@ -4516,6 +4521,8 @@ fn traversal_projection_from_graph(
         edges.push(edge_with_content_freshness(projected)?);
     }
 
+    append_traversal_context_projection_rows(root, graph, &provenance, &mut nodes, &mut edges)?;
+
     let projection_hash = projection_content_hash(&nodes, &edges)?;
     let meta = SubstrateGraphNode::new(
         graph_projection_meta_id(scope),
@@ -4533,6 +4540,110 @@ fn traversal_projection_from_graph(
     nodes.push(meta);
 
     Ok(GraphProjection { nodes, edges })
+}
+
+fn append_traversal_context_projection_rows(
+    root: &Path,
+    graph: &TraversalGraphBuild,
+    provenance: &GraphProvenance,
+    nodes: &mut Vec<SubstrateGraphNode>,
+    edges: &mut Vec<SubstrateGraphEdge>,
+) -> Result<()> {
+    let budget = exploration_budget_for_counts(graph.nodes.len(), graph.edges.len());
+    let file_node_by_path = graph
+        .nodes
+        .values()
+        .filter(|node| node.kind == "file")
+        .filter_map(|node| {
+            node.path
+                .as_ref()
+                .map(|path| (path.clone(), node.handle.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut seen_windows = BTreeSet::new();
+    let mut source_handles = Vec::new();
+    for node in graph.nodes.values() {
+        if source_handles.len() >= budget.max_source_windows {
+            break;
+        }
+        let Some(window) = exploration_source_window_for_node(root, node, &budget) else {
+            continue;
+        };
+        let window_key = (window.file.clone(), window.start, window.end);
+        if !seen_windows.insert(window_key) {
+            continue;
+        }
+
+        let label = format!("{}:{}-{}", window.file, window.start, window.end);
+        let projected = SubstrateGraphNode::new(window.handle.clone(), "source_handle", label)
+            .with_property("handle", window.handle.clone())
+            .with_property("file", window.file.clone())
+            .with_property("start", window.start.to_string())
+            .with_property("end", window.end.to_string())
+            .with_property("reason", window.reason.clone())
+            .with_property("expand", window.expand.clone())
+            .with_provenance(provenance.clone());
+        nodes.push(node_with_content_freshness(projected)?);
+
+        if let Some(file_handle) = file_node_by_path.get(&window.file) {
+            let edge = SubstrateGraphEdge::new(
+                window.handle.clone(),
+                file_handle.clone(),
+                "expands_source",
+            )
+            .with_property("label", window.reason.clone())
+            .with_provenance(provenance.clone());
+            edges.push(edge_with_content_freshness(edge)?);
+        }
+        source_handles.push(window.handle);
+    }
+
+    let mut worker_count = 0usize;
+    for node in graph.nodes.values() {
+        if worker_count >= budget.relationship_limit.min(8) || source_handles.is_empty() {
+            break;
+        }
+        if node.kind != "backlog" && node.kind != "job_packet" {
+            continue;
+        }
+        let target = node
+            .path
+            .clone()
+            .unwrap_or_else(|| root.to_string_lossy().to_string());
+        let summary = node.detail.clone().unwrap_or_else(|| node.label.clone());
+        let handle = stable_handle("xwrk", &format!("{}:{}:{}", target, node.handle, summary));
+        let projected = SubstrateGraphNode::new(handle.clone(), "worker_context", summary.clone())
+            .with_property("handle", handle.clone())
+            .with_property("target", target.clone())
+            .with_property("summary", summary)
+            .with_property(
+                "expand",
+                format!(
+                    "tsift --envelope context-pack {} --budget normal",
+                    shell_quote(&target)
+                ),
+            )
+            .with_provenance(provenance.clone());
+        nodes.push(node_with_content_freshness(projected)?);
+
+        let request_edge =
+            SubstrateGraphEdge::new(node.handle.clone(), handle.clone(), "requests_context")
+                .with_property("label", "bounded worker context".to_string())
+                .with_provenance(provenance.clone());
+        edges.push(edge_with_content_freshness(request_edge)?);
+
+        for source_handle in &source_handles {
+            let scope_edge =
+                SubstrateGraphEdge::new(handle.clone(), source_handle.clone(), "scopes_source")
+                    .with_property("label", "bounded worker source window".to_string())
+                    .with_provenance(provenance.clone());
+            edges.push(edge_with_content_freshness(scope_edge)?);
+        }
+        worker_count += 1;
+    }
+
+    Ok(())
 }
 
 fn traversal_node_from_graph_node(root: &Path, node: SubstrateGraphNode) -> TraversalNode {
@@ -5488,6 +5599,46 @@ struct GraphDbDoctorReport {
     required_indexes: Vec<ConvexRequiredIndex>,
 }
 
+#[derive(Serialize)]
+struct GraphDbDriftSummary {
+    node_upserts: usize,
+    edge_upserts: usize,
+    node_tombstones: usize,
+    edge_tombstones: usize,
+    stale_nodes: usize,
+    stale_edges: usize,
+    stale_projection_metadata: usize,
+    duplicate_failures: usize,
+    orphan_failures: usize,
+    missing_required_indexes: usize,
+}
+
+#[derive(Serialize)]
+struct GraphDbDriftReport {
+    root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    graph_db: String,
+    convex_snapshot: String,
+    status: String,
+    graph_reads_allowed: bool,
+    projection_version: String,
+    local_hash: Option<String>,
+    snapshot_hash: Option<String>,
+    summary: GraphDbDriftSummary,
+    node_upserts: Vec<String>,
+    edge_upserts: Vec<String>,
+    node_tombstones: Vec<String>,
+    edge_tombstones: Vec<String>,
+    stale_nodes: Vec<String>,
+    stale_edges: Vec<String>,
+    diagnostics: Vec<String>,
+    next_commands: Vec<String>,
+    required_indexes: Vec<ConvexRequiredIndex>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
 impl GraphDbDoctorReport {
     fn new(
         root: &Path,
@@ -6227,6 +6378,199 @@ fn append_convex_snapshot_doctor_checks(
     }
 }
 
+fn graph_db_convex_snapshot_doctor_command(
+    root: &Path,
+    scope: Option<&str>,
+    snapshot_path: &Path,
+) -> String {
+    format!(
+        "tsift graph-db --path {}{} --backend convex-snapshot --convex-snapshot {} doctor --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope),
+        shell_quote(snapshot_path.to_string_lossy().as_ref())
+    )
+}
+
+fn graph_db_convex_snapshot_read_command(
+    root: &Path,
+    scope: Option<&str>,
+    snapshot_path: &Path,
+) -> String {
+    format!(
+        "tsift graph-db --path {}{} --backend convex-snapshot --convex-snapshot {} schema --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope),
+        shell_quote(snapshot_path.to_string_lossy().as_ref())
+    )
+}
+
+fn convex_sync_snapshot_diff_command(
+    root: &Path,
+    scope: Option<&str>,
+    snapshot_path: &Path,
+) -> String {
+    format!(
+        "tsift convex-sync {}{} --snapshot {} --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope),
+        shell_quote(snapshot_path.to_string_lossy().as_ref())
+    )
+}
+
+struct GraphDbDriftInput<'a> {
+    root: &'a Path,
+    scope: Option<&'a str>,
+    graph_db: &'a Path,
+    snapshot_path: &'a Path,
+    local: &'a ConvexProjectionRows,
+    snapshot: &'a ConvexProjectionRows,
+    snapshot_value: &'a serde_json::Value,
+    warnings: Vec<String>,
+}
+
+fn graph_db_drift_report(input: GraphDbDriftInput<'_>) -> GraphDbDriftReport {
+    let GraphDbDriftInput {
+        root,
+        scope,
+        graph_db,
+        snapshot_path,
+        local,
+        snapshot,
+        snapshot_value,
+        warnings,
+    } = input;
+    let freshness = convex_projection_freshness(local, Some(snapshot), scope);
+    let (node_upserts, edge_upserts, node_tombstones, edge_tombstones) =
+        convex_rows_diff(local, Some(snapshot));
+    let row_diagnostics = convex_projection_row_diagnostics(snapshot);
+    let index_diagnostics = convex_snapshot_index_diagnostics(snapshot_value)
+        .unwrap_or_else(|err| vec![format!("Convex snapshot index metadata failed: {err}")]);
+    let local_hash = freshness.local_hash.clone();
+    let snapshot_hash = freshness.snapshot_hash.clone();
+    let stale_nodes = freshness.stale_nodes.clone();
+    let stale_edges = freshness.stale_edges.clone();
+
+    let duplicate_failures = row_diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.contains("duplicate"))
+        .count();
+    let orphan_failures = row_diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.contains("references missing"))
+        .count();
+    let missing_required_indexes = index_diagnostics.len();
+    let stale_projection_metadata =
+        usize::from(local_hash != snapshot_hash || snapshot_hash.is_none());
+    let hard_failures = duplicate_failures + orphan_failures + missing_required_indexes;
+    let has_drift = freshness.fail_closed
+        || !node_upserts.is_empty()
+        || !edge_upserts.is_empty()
+        || !node_tombstones.is_empty()
+        || !edge_tombstones.is_empty();
+    let status = if hard_failures > 0 {
+        "fail_closed"
+    } else if has_drift {
+        "drift"
+    } else {
+        "current"
+    }
+    .to_string();
+
+    let mut diagnostics = Vec::new();
+    diagnostics.extend(row_diagnostics);
+    diagnostics.extend(index_diagnostics);
+    diagnostics.extend(freshness.diagnostics.clone());
+    if has_drift {
+        diagnostics.push(format!(
+            "projection diff: {} node upsert(s), {} edge upsert(s), {} node tombstone(s), {} edge tombstone(s)",
+            node_upserts.len(),
+            edge_upserts.len(),
+            node_tombstones.len(),
+            edge_tombstones.len()
+        ));
+    }
+
+    let mut next_commands = vec![graph_db_convex_snapshot_doctor_command(
+        root,
+        scope,
+        snapshot_path,
+    )];
+    if status == "current" {
+        next_commands.push(graph_db_convex_snapshot_read_command(
+            root,
+            scope,
+            snapshot_path,
+        ));
+    } else {
+        next_commands.push(convex_sync_snapshot_diff_command(
+            root,
+            scope,
+            snapshot_path,
+        ));
+        next_commands.push(convex_refresh_command(root, scope));
+    }
+
+    GraphDbDriftReport {
+        root: root.to_string_lossy().to_string(),
+        scope: scope.map(str::to_string),
+        graph_db: graph_db.to_string_lossy().to_string(),
+        convex_snapshot: snapshot_path.to_string_lossy().to_string(),
+        status: status.clone(),
+        graph_reads_allowed: status == "current",
+        projection_version: GRAPH_PROJECTION_VERSION.to_string(),
+        local_hash,
+        snapshot_hash,
+        summary: GraphDbDriftSummary {
+            node_upserts: node_upserts.len(),
+            edge_upserts: edge_upserts.len(),
+            node_tombstones: node_tombstones.len(),
+            edge_tombstones: edge_tombstones.len(),
+            stale_nodes: stale_nodes.len(),
+            stale_edges: stale_edges.len(),
+            stale_projection_metadata,
+            duplicate_failures,
+            orphan_failures,
+            missing_required_indexes,
+        },
+        node_upserts: node_upserts
+            .into_iter()
+            .map(|row| row.external_id)
+            .collect(),
+        edge_upserts: edge_upserts.into_iter().map(|row| row.edge_key).collect(),
+        node_tombstones,
+        edge_tombstones,
+        stale_nodes,
+        stale_edges,
+        diagnostics,
+        next_commands,
+        required_indexes: convex_required_indexes(),
+        warnings,
+    }
+}
+
+fn print_graph_db_drift_human(report: &GraphDbDriftReport) {
+    println!(
+        "graph-db drift status: {} reads_allowed: {}",
+        report.status, report.graph_reads_allowed
+    );
+    println!("graph_db: {}", report.graph_db);
+    println!("convex_snapshot: {}", report.convex_snapshot);
+    println!(
+        "upserts: {} node(s), {} edge(s)",
+        report.summary.node_upserts, report.summary.edge_upserts
+    );
+    println!(
+        "tombstones: {} node(s), {} edge(s)",
+        report.summary.node_tombstones, report.summary.edge_tombstones
+    );
+    for diagnostic in &report.diagnostics {
+        println!("diagnostic: {diagnostic}");
+    }
+    for command in &report.next_commands {
+        println!("next: {command}");
+    }
+}
+
 fn print_graph_db_doctor_human(report: &GraphDbDoctorReport) {
     println!(
         "graph-db doctor backend: {} status: {}",
@@ -6316,6 +6660,63 @@ fn cmd_graph_db_doctor(
         );
     }
     Ok(())
+}
+
+fn cmd_graph_db_drift(
+    root: &Path,
+    path: &Path,
+    scope: Option<&str>,
+    convex_snapshot: Option<&Path>,
+    format: OutputFormat,
+) -> Result<()> {
+    let snapshot_path =
+        convex_snapshot.context("graph-db drift requires --convex-snapshot <rows.json>")?;
+    let graph = build_traversal_graph(root, path, scope)?;
+    let graph_db = graph_substrate_db_path(root, scope);
+    let store = SqliteGraphStore::open(&graph_db)?;
+    let local = convex_rows_from_graph_store(&store)?;
+    let (snapshot, snapshot_value) = load_convex_projection_snapshot_value(snapshot_path)?;
+    let report = graph_db_drift_report(GraphDbDriftInput {
+        root,
+        scope,
+        graph_db: &graph_db,
+        snapshot_path,
+        local: &local,
+        snapshot: &snapshot,
+        snapshot_value: &snapshot_value,
+        warnings: graph.warnings,
+    });
+
+    if format.json_output {
+        print_json_or_envelope(
+            &report,
+            &format,
+            "graph-db",
+            "drift",
+            ToolEnvelopeSummary {
+                text: format!(
+                    "Graph DB drift status {} with {} node upsert(s), {} edge upsert(s), {} node tombstone(s), {} edge tombstone(s)",
+                    report.status,
+                    report.summary.node_upserts,
+                    report.summary.edge_upserts,
+                    report.summary.node_tombstones,
+                    report.summary.edge_tombstones
+                ),
+                metrics: vec![
+                    envelope_metric("status", &report.status),
+                    envelope_metric("node_upserts", report.summary.node_upserts),
+                    envelope_metric("edge_upserts", report.summary.edge_upserts),
+                    envelope_metric("node_tombstones", report.summary.node_tombstones),
+                    envelope_metric("edge_tombstones", report.summary.edge_tombstones),
+                ],
+            },
+            false,
+            report.next_commands.clone(),
+        )
+    } else {
+        print_graph_db_drift_human(&report);
+        Ok(())
+    }
 }
 
 fn parse_graph_db_property_filters(raw: &[String]) -> Result<Vec<GraphDbPropertyFilter>> {
@@ -6499,6 +6900,10 @@ fn graph_db_schema() -> GraphDbSchema {
                 description: "Validate graph.db or Convex snapshot health and return fail-closed repair diagnostics",
             },
             GraphDbSchemaOperation {
+                command: "drift",
+                description: "Compare local SQLite projection rows with a Convex snapshot and return upsert, tombstone, metadata, duplicate, orphan, and next-command diagnostics",
+            },
+            GraphDbSchemaOperation {
                 command: "schema",
                 description: "Return record and operation schemas",
             },
@@ -6515,8 +6920,8 @@ fn graph_db_schema() -> GraphDbSchema {
                 description: "Return a directed outgoing subgraph around a node, optionally filtered and paged by node id",
             },
             GraphDbSchemaOperation {
-                command: "path <from> <to> [--edge-kind <kind>]",
-                description: "Return the shortest directed path by node id",
+                command: "path <from> <to> [--edge-kind <kind>] [--max-hops N]",
+                description: "Return the shortest directed path by node id, optionally bounded by hop count",
             },
         ],
     }
@@ -6575,6 +6980,64 @@ fn convex_graph_freshness(
     }
 }
 
+fn graph_db_shortest_path_with_max_hops(
+    store: &impl GraphStore,
+    from_id: &str,
+    to_id: &str,
+    kind: Option<&str>,
+    max_hops: Option<usize>,
+) -> Result<Option<substrate::GraphPath>> {
+    let Some(max_hops) = max_hops else {
+        return store.shortest_path(from_id, to_id, kind);
+    };
+    if from_id == to_id {
+        return Ok(Some(substrate::GraphPath {
+            nodes: vec![from_id.to_string()],
+            hops: 0,
+        }));
+    }
+
+    let mut queue = VecDeque::new();
+    let mut parent = BTreeMap::<String, String>::new();
+    let mut depth = BTreeMap::<String, usize>::new();
+    parent.insert(from_id.to_string(), String::new());
+    depth.insert(from_id.to_string(), 0);
+    queue.push_back(from_id.to_string());
+
+    while let Some(current) = queue.pop_front() {
+        let current_depth = depth.get(&current).copied().unwrap_or(0);
+        if current_depth >= max_hops {
+            continue;
+        }
+        for edge in store.outgoing_edges(&current, kind)? {
+            if parent.contains_key(&edge.to_id) {
+                continue;
+            }
+            let next_depth = current_depth + 1;
+            parent.insert(edge.to_id.clone(), current.clone());
+            depth.insert(edge.to_id.clone(), next_depth);
+            if edge.to_id == to_id {
+                let mut nodes = vec![to_id.to_string()];
+                let mut cursor = to_id.to_string();
+                while let Some(prev) = parent.get(&cursor) {
+                    if prev.is_empty() {
+                        break;
+                    }
+                    nodes.push(prev.clone());
+                    cursor = prev.clone();
+                }
+                nodes.reverse();
+                return Ok(Some(substrate::GraphPath {
+                    hops: nodes.len().saturating_sub(1),
+                    nodes,
+                }));
+            }
+            queue.push_back(edge.to_id);
+        }
+    }
+    Ok(None)
+}
+
 fn graph_db_report_from_store(
     root: &Path,
     scope: Option<&str>,
@@ -6609,6 +7072,9 @@ fn graph_db_report_from_store(
     match query {
         GraphDbQuery::Doctor => {
             bail!("graph-db doctor must be handled by the doctor command path");
+        }
+        GraphDbQuery::Drift => {
+            bail!("graph-db drift must be handled by the drift command path");
         }
         GraphDbQuery::Schema => {
             report.schema = Some(graph_db_schema());
@@ -6653,8 +7119,23 @@ fn graph_db_report_from_store(
             from,
             to,
             edge_kind,
+            max_hops,
         } => {
-            report.path = store.shortest_path(&from, &to, edge_kind.as_deref())?;
+            report.path = graph_db_shortest_path_with_max_hops(
+                store,
+                &from,
+                &to,
+                edge_kind.as_deref(),
+                max_hops,
+            )?;
+            if let Some(max_hops) = max_hops
+                && report.path.is_none()
+            {
+                report.warnings.push(format!(
+                    "no directed path found within --max-hops {}",
+                    max_hops
+                ));
+            }
         }
     }
     Ok(report)
@@ -6718,6 +7199,9 @@ fn cmd_graph_db(
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     if matches!(query, GraphDbQuery::Doctor) {
         return cmd_graph_db_doctor(&root, scope, backend, convex_snapshot, format);
+    }
+    if matches!(query, GraphDbQuery::Drift) {
+        return cmd_graph_db_drift(&root, path, scope, convex_snapshot, format);
     }
     let graph = build_traversal_graph(&root, path, scope)?;
     let graph_db = graph_substrate_db_path(&root, scope);
@@ -6999,11 +7483,14 @@ fn parse_backlog_line(line: &str) -> Option<(String, String)> {
 }
 
 fn parse_queue_dispatch_line(line: &str) -> Option<String> {
-    line.trim()
-        .strip_prefix("dispatch ")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+    let trimmed = line.trim();
+    ["dispatch ", "preset "].iter().find_map(|prefix| {
+        trimmed
+            .strip_prefix(prefix)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
 }
 
 fn parse_queue_do_line(line: &str) -> Option<String> {
@@ -17189,6 +17676,21 @@ def list_items():
                     && node.properties.get("projection_version")
                         == Some(&GRAPH_PROJECTION_VERSION.to_string())),
             "expected projection metadata node"
+        );
+        let source_handles = store.nodes_by_kind("source_handle").unwrap();
+        assert!(
+            source_handles
+                .iter()
+                .any(|node| node.properties.get("file") == Some(&"main.rs".to_string())),
+            "expected bounded source_handle rows, got {source_handles:?}"
+        );
+        let worker_context = store.nodes_by_kind("worker_context").unwrap();
+        assert!(
+            worker_context
+                .iter()
+                .any(|node| node.properties.get("target")
+                    == Some(&"tasks/software/tsift.md".to_string())),
+            "expected bounded worker_context rows, got {worker_context:?}"
         );
     }
 

@@ -4,6 +4,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 const LIVE_CONVEX_ACCEPTANCE_ENV: &str = "TSIFT_LIVE_CONVEX_ACCEPTANCE";
 const LIVE_CONVEX_GRAPH_URL_ENV: &str = "TSIFT_LIVE_CONVEX_GRAPH_URL";
@@ -442,6 +443,108 @@ fn graph_db_cli_conformance_matches_sqlite_and_convex_snapshot_queries() {
 }
 
 #[test]
+fn graph_db_cli_covers_agent_loop_workspace_fixture_rows() {
+    let project = graph_db_project();
+    assert_tsift_json(vec![
+        "traverse".to_string(),
+        "--path".to_string(),
+        project.path().to_string_lossy().to_string(),
+    ]);
+
+    let session = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "kind".to_string(),
+            "session".to_string(),
+            "--property".to_string(),
+            "ref_id=tsift-conformance".to_string(),
+            "--limit".to_string(),
+            "1".to_string(),
+        ],
+    );
+    let session_id = node_ids(&session).remove(0);
+
+    let backlog = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "kind".to_string(),
+            "backlog".to_string(),
+            "--property".to_string(),
+            "ref_id=gval".to_string(),
+            "--limit".to_string(),
+            "1".to_string(),
+        ],
+    );
+    let backlog_id = node_ids(&backlog).remove(0);
+
+    let source = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "kind".to_string(),
+            "source_handle".to_string(),
+            "--property".to_string(),
+            "file=main.rs".to_string(),
+            "--limit".to_string(),
+            "1".to_string(),
+        ],
+    );
+    let source_id = node_ids(&source).remove(0);
+
+    let worker = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "kind".to_string(),
+            "worker_context".to_string(),
+            "--property".to_string(),
+            "target=tasks/software/tsift.md".to_string(),
+            "--limit".to_string(),
+            "1".to_string(),
+        ],
+    );
+    assert_eq!(node_ids(&worker).len(), 1);
+
+    let neighborhood = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "neighborhood".to_string(),
+            session_id,
+            "--depth".to_string(),
+            "3".to_string(),
+            "--limit".to_string(),
+            "50".to_string(),
+        ],
+    );
+    let neighborhood_ids = node_ids(&neighborhood);
+    assert!(neighborhood_ids.contains(&backlog_id), "{neighborhood}");
+    assert!(
+        neighborhood["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["kind"] == "worker_context"),
+        "{neighborhood}"
+    );
+
+    let path = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "path".to_string(),
+            backlog_id,
+            source_id,
+            "--max-hops".to_string(),
+            "3".to_string(),
+        ],
+    );
+    assert_eq!(path["path"]["hops"], 2, "{path}");
+}
+
+#[test]
 #[ignore = "requires a dedicated live Convex deployment"]
 fn live_convex_graph_backend_acceptance_applies_and_matches_graph_db_queries() {
     if !live_convex_acceptance_enabled() {
@@ -502,6 +605,99 @@ fn live_convex_graph_backend_acceptance_applies_and_matches_graph_db_queries() {
     );
     assert_eq!(doctor["status"], "ok", "{doctor}");
     assert_graph_db_snapshot_query_parity(project.path(), &snapshot);
+}
+
+#[test]
+fn graph_db_drift_report_summarizes_snapshot_diff_and_failures() {
+    let project = graph_db_project();
+    let mut snapshot = current_convex_snapshot(project.path());
+    attach_required_convex_indexes(&mut snapshot);
+
+    let nodes = snapshot["nodes"].as_array_mut().unwrap();
+    let removed = nodes
+        .iter()
+        .position(|node| node["kind"] == "backlog")
+        .unwrap();
+    nodes.remove(removed);
+    let duplicate_node = nodes
+        .iter()
+        .find(|node| node["kind"] == "symbol")
+        .unwrap()
+        .clone();
+    nodes.push(duplicate_node);
+    let stale = nodes
+        .iter_mut()
+        .find(|node| node["kind"] == "projection_meta")
+        .unwrap();
+    stale["properties"]["content_hash"] = json!("stale-snapshot-hash");
+    nodes.push(json!({
+        "externalId": "stale-remote-node",
+        "kind": "backlog",
+        "label": "stale",
+        "properties": {},
+        "provenance": []
+    }));
+    let removed_edge = snapshot["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|edge| edge["kind"] == "calls")
+        .unwrap();
+    snapshot["edges"]
+        .as_array_mut()
+        .unwrap()
+        .remove(removed_edge);
+    snapshot["edges"].as_array_mut().unwrap().push(json!({
+        "edgeKey": "stale-remote-edge",
+        "fromExternalId": "stale-remote-node",
+        "toExternalId": "stale-remote-node",
+        "kind": "mentions",
+        "properties": {},
+        "provenance": []
+    }));
+    snapshot["edges"].as_array_mut().unwrap().push(json!({
+        "edgeKey": "edge:orphan",
+        "fromExternalId": "missing-symbol",
+        "toExternalId": "stale-remote-node",
+        "kind": "calls",
+        "properties": {},
+        "provenance": []
+    }));
+    let snapshot_path = write_snapshot(project.path(), "convex-drift-bad.json", &snapshot);
+
+    let report = assert_tsift_json(vec![
+        "graph-db".to_string(),
+        "--path".to_string(),
+        project.path().to_string_lossy().to_string(),
+        "--backend".to_string(),
+        "convex-snapshot".to_string(),
+        "--convex-snapshot".to_string(),
+        snapshot_path.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "drift".to_string(),
+    ]);
+
+    assert_eq!(report["status"], "fail_closed", "{report}");
+    assert!(report["summary"]["node_upserts"].as_u64().unwrap() > 0);
+    assert!(report["summary"]["edge_upserts"].as_u64().unwrap() > 0);
+    assert_eq!(report["summary"]["node_tombstones"], 1);
+    assert!(report["summary"]["edge_tombstones"].as_u64().unwrap() >= 1);
+    assert!(
+        report["summary"]["stale_projection_metadata"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(report["summary"]["duplicate_failures"].as_u64().unwrap() > 0);
+    assert!(report["summary"]["orphan_failures"].as_u64().unwrap() > 0);
+    assert!(
+        report["next_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("convex-sync")),
+        "{report}"
+    );
 }
 
 #[test]
@@ -747,6 +943,206 @@ fn graph_db_doctor_fails_closed_for_sqlite_stale_metadata_and_schema_drift() {
         "{report}"
     );
     assert!(stderr.contains("graph-db doctor failed closed"), "{stderr}");
+}
+
+fn large_graph_db_project(symbol_count: usize) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let mut source = String::new();
+    source.push_str("fn main() { f000(); }\n");
+    for idx in 0..symbol_count {
+        if idx + 1 < symbol_count {
+            source.push_str(&format!("fn f{idx:03}() {{ f{:03}(); }}\n", idx + 1));
+        } else {
+            source.push_str(&format!("fn f{idx:03}() {{}}\n"));
+        }
+    }
+    fs::write(dir.path().join("main.rs"), source).unwrap();
+
+    let task_dir = dir.path().join("tasks/software");
+    fs::create_dir_all(&task_dir).unwrap();
+    let mut backlog = String::from(
+        r#"---
+agent_doc_session: tsift-scale
+agent_doc_format: template
+---
+
+## Backlog
+
+<!-- agent:backlog -->
+"#,
+    );
+    for idx in 0..30 {
+        backlog.push_str(&format!(
+            "- [ ] [#b{idx:03}] Trace f{idx:03} graph-db scale coverage through calls and pagination.\n"
+        ));
+    }
+    backlog.push_str("<!-- /agent:backlog -->\n");
+    fs::write(task_dir.join("tsift.md"), backlog).unwrap();
+
+    let output = run_tsift(vec![
+        "index".to_string(),
+        dir.path().to_string_lossy().to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "index failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    dir
+}
+
+fn collect_paged_symbol_ids(project: &Path, limit: usize) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut cursor = None;
+    loop {
+        let mut query = vec![
+            "kind".to_string(),
+            "symbol".to_string(),
+            "--property".to_string(),
+            "path=main.rs".to_string(),
+            "--limit".to_string(),
+            limit.to_string(),
+        ];
+        if let Some(cursor) = cursor.take() {
+            query.push("--cursor".to_string());
+            query.push(cursor);
+        }
+        let page = graph_db_json(project, Backend::Sqlite, query);
+        ids.extend(node_ids(&page));
+        cursor = page["page"]["next_cursor"].as_str().map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    ids
+}
+
+fn query_plan_details(db_path: &Path, sql: &str) -> Vec<String> {
+    let conn = Connection::open(db_path).unwrap();
+    let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    stmt.query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+#[test]
+fn graph_db_scale_caps_pagination_paths_doctor_and_sqlite_plans() {
+    let project = large_graph_db_project(120);
+    let first_id = symbol_id_by_ref(project.path(), Backend::Sqlite, "f000");
+    let far_id = symbol_id_by_ref(project.path(), Backend::Sqlite, "f080");
+
+    let paged_ids = collect_paged_symbol_ids(project.path(), 17);
+    assert!(
+        paged_ids.len() >= 120,
+        "expected all symbols: {paged_ids:?}"
+    );
+    assert_sorted(&paged_ids);
+    let mut deduped = paged_ids.clone();
+    deduped.dedup();
+    assert_eq!(deduped.len(), paged_ids.len(), "pagination duplicated ids");
+
+    let selective = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "kind".to_string(),
+            "symbol".to_string(),
+            "--property".to_string(),
+            "ref_id=f042".to_string(),
+            "--limit".to_string(),
+            "10".to_string(),
+        ],
+    );
+    assert_eq!(node_ids(&selective).len(), 1, "{selective}");
+
+    let neighborhood = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "neighborhood".to_string(),
+            first_id.clone(),
+            "--depth".to_string(),
+            "200".to_string(),
+            "--edge-kind".to_string(),
+            "calls".to_string(),
+            "--limit".to_string(),
+            "13".to_string(),
+        ],
+    );
+    assert_eq!(neighborhood["page"]["returned_nodes"], 13);
+    assert!(neighborhood["page"]["truncated"].as_bool().unwrap());
+    assert!(neighborhood["edges"].as_array().unwrap().len() <= 12);
+
+    let capped_path = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "path".to_string(),
+            first_id.clone(),
+            far_id.clone(),
+            "--edge-kind".to_string(),
+            "calls".to_string(),
+            "--max-hops".to_string(),
+            "20".to_string(),
+        ],
+    );
+    assert!(capped_path["path"].is_null(), "{capped_path}");
+    assert!(
+        capped_path["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("--max-hops 20")),
+        "{capped_path}"
+    );
+
+    let full_path = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "path".to_string(),
+            first_id.clone(),
+            far_id,
+            "--edge-kind".to_string(),
+            "calls".to_string(),
+            "--max-hops".to_string(),
+            "200".to_string(),
+        ],
+    );
+    assert_eq!(full_path["path"]["hops"], 80, "{full_path}");
+
+    let started = Instant::now();
+    let doctor = graph_db_json(project.path(), Backend::Sqlite, vec!["doctor".to_string()]);
+    assert_eq!(doctor["status"], "ok", "{doctor}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "doctor should stay bounded on synthetic graph"
+    );
+
+    let db_path = graph_db_path(project.path());
+    let node_plan = query_plan_details(
+        &db_path,
+        "SELECT id FROM graph_nodes WHERE kind = 'symbol' ORDER BY id",
+    )
+    .join("\n");
+    assert!(
+        node_plan.contains("idx_graph_nodes_kind"),
+        "expected graph_nodes kind index in plan:\n{node_plan}"
+    );
+    let edge_plan = query_plan_details(
+        &db_path,
+        &format!(
+            "SELECT to_id FROM graph_edges INDEXED BY idx_graph_edges_from_kind WHERE from_id = '{}' AND kind = 'calls' ORDER BY to_id, kind",
+            first_id.replace('\'', "''")
+        ),
+    )
+    .join("\n");
+    assert!(
+        edge_plan.contains("idx_graph_edges_from_kind"),
+        "expected graph_edges from/kind index in plan:\n{edge_plan}"
+    );
 }
 
 #[test]
