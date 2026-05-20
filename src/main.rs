@@ -7,6 +7,7 @@ use sift::{SearchInput, SearchOptions, Sift};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::env;
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,7 @@ use substrate::{
 };
 #[cfg(test)]
 use substrate::{ConvexGraphClient, ConvexGraphStore};
+use substrate::{ConvexGraphStore as SubstrateConvexGraphStore, ConvexRowsGraphClient};
 use tagpath::{family as tagpath_family, ontology as tagpath_ontology};
 use tempfile::NamedTempFile;
 
@@ -357,9 +359,41 @@ enum Commands {
         /// Max rows per planned mutation chunk
         #[arg(long, default_value = "100")]
         chunk_size: usize,
+        /// Pull the current remote Convex rows through the configured transport before diffing
+        #[arg(long, conflicts_with = "snapshot")]
+        remote_snapshot: bool,
+        /// Apply the planned chunks through the configured Convex transport
+        #[arg(long)]
+        apply: bool,
+        /// Convex HTTP action endpoint; falls back to TSIFT_CONVEX_GRAPH_URL
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Environment variable that holds the bearer token
+        #[arg(long, default_value = "TSIFT_CONVEX_AUTH_TOKEN")]
+        auth_token_env: String,
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Query the provider-neutral graph database API over SQLite or a Convex snapshot
+    GraphDb {
+        /// Path to the indexed codebase or workspace (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Restrict indexed code nodes to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Graph backend to query
+        #[arg(long, value_enum, default_value = "sqlite")]
+        backend: GraphDbBackend,
+        /// Convex nodes/edges snapshot for --backend convex-snapshot
+        #[arg(long)]
+        convex_snapshot: Option<PathBuf>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        query: GraphDbQuery,
     },
     /// Read a bounded source-file line window with expansion handles and index refs
     SourceRead {
@@ -691,6 +725,49 @@ enum Commands {
 enum TraverseFormat {
     Json,
     Html,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum GraphDbBackend {
+    Sqlite,
+    ConvexSnapshot,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum GraphDbQuery {
+    /// Show the stable JSON shape for graph database records and responses
+    Schema,
+    /// Look up one node by stable id
+    Node {
+        /// Stable graph node id
+        id: String,
+    },
+    /// Scan nodes by kind
+    Kind {
+        /// Node kind to scan
+        kind: String,
+    },
+    /// Read an outgoing neighborhood from one node
+    Neighborhood {
+        /// Stable graph node id
+        id: String,
+        /// Outgoing traversal depth
+        #[arg(long, default_value = "1")]
+        depth: usize,
+        /// Restrict traversed edges to this kind
+        #[arg(long)]
+        edge_kind: Option<String>,
+    },
+    /// Find the shortest directed path between two nodes
+    Path {
+        /// Starting graph node id
+        from: String,
+        /// Target graph node id
+        to: String,
+        /// Restrict traversed edges to this kind
+        #[arg(long)]
+        edge_kind: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -1133,12 +1210,44 @@ fn main() -> Result<()> {
             scope,
             snapshot,
             chunk_size,
+            remote_snapshot,
+            apply,
+            endpoint,
+            auth_token_env,
             json,
         }) => cmd_convex_sync(
+            ConvexSyncOptions {
+                path: &path,
+                scope: scope.as_deref(),
+                snapshot: snapshot.as_deref(),
+                chunk_size,
+                remote_snapshot,
+                apply,
+                endpoint: endpoint.as_deref(),
+                auth_token_env: &auth_token_env,
+            },
+            OutputFormat {
+                json_output: json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                schema,
+                envelope,
+            },
+        ),
+        Some(Commands::GraphDb {
+            path,
+            scope,
+            backend,
+            convex_snapshot,
+            json,
+            query,
+        }) => cmd_graph_db(
             &path,
             scope.as_deref(),
-            snapshot.as_deref(),
-            chunk_size,
+            backend,
+            convex_snapshot.as_deref(),
+            query,
             OutputFormat {
                 json_output: json || terse || schema || envelope,
                 compact,
@@ -4326,6 +4435,14 @@ fn projection_content_hash(
     })
 }
 
+fn graph_projection_content_hash(projection: &GraphProjection) -> Option<String> {
+    projection
+        .nodes
+        .iter()
+        .find(|node| node.kind == GRAPH_PROJECTION_META_KIND)
+        .and_then(|node| node.properties.get("content_hash").cloned())
+}
+
 fn traversal_projection_from_graph(
     root: &Path,
     scope: Option<&str>,
@@ -4462,6 +4579,45 @@ struct ConvexSyncChunk {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
+struct ConvexTransportSummary {
+    endpoint_env: String,
+    endpoint_configured: bool,
+    auth_token_env: String,
+    auth_configured: bool,
+    remote_snapshot: bool,
+    applied_chunks: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct ConvexTransportReceipt {
+    operation: String,
+    chunk: usize,
+    attempt: usize,
+    status: String,
+    message: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConvexTransportRequest<'a> {
+    operation: &'a str,
+    chunk: usize,
+    projection_version: &'a str,
+    projection_hash: Option<&'a str>,
+    node_rows: Vec<ConvexNodeRow>,
+    edge_rows: Vec<ConvexEdgeRow>,
+    keys: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConvexTransportResponse {
+    status: Option<String>,
+    message: Option<String>,
+    rows: Option<ConvexProjectionRows>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
 struct ConvexProjectionFreshness {
     status: String,
     fail_closed: bool,
@@ -4473,6 +4629,8 @@ struct ConvexProjectionFreshness {
     stale_edges: Vec<String>,
     diagnostics: Vec<String>,
 }
+
+const DEFAULT_CONVEX_GRAPH_URL_ENV: &str = "TSIFT_CONVEX_GRAPH_URL";
 
 impl ConvexProjectionFreshness {
     fn current(local_hash: Option<String>, snapshot_hash: Option<String>) -> Self {
@@ -4506,6 +4664,8 @@ struct ConvexSyncReport {
     edge_tombstones: Vec<String>,
     chunks: Vec<ConvexSyncChunk>,
     freshness: ConvexProjectionFreshness,
+    transport: Option<ConvexTransportSummary>,
+    receipts: Vec<ConvexTransportReceipt>,
     diagnostics: Vec<String>,
     warnings: Vec<String>,
 }
@@ -4545,6 +4705,126 @@ fn load_convex_projection_rows(path: &Path) -> Result<ConvexProjectionRows> {
         .with_context(|| format!("reading Convex projection snapshot {}", path.display()))?;
     serde_json::from_str(&content)
         .with_context(|| format!("parsing Convex projection snapshot {}", path.display()))
+}
+
+struct ConvexHttpTransport {
+    endpoint: String,
+    auth_token_env: String,
+    auth_token: Option<String>,
+}
+
+impl ConvexHttpTransport {
+    fn from_options(endpoint: Option<&str>, auth_token_env: &str) -> Result<Self> {
+        let endpoint = endpoint
+            .map(str::to_string)
+            .or_else(|| env::var(DEFAULT_CONVEX_GRAPH_URL_ENV).ok())
+            .context("Convex transport requires --endpoint or TSIFT_CONVEX_GRAPH_URL")?;
+        let auth_token = env::var(auth_token_env)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        Ok(Self {
+            endpoint,
+            auth_token_env: auth_token_env.to_string(),
+            auth_token,
+        })
+    }
+
+    fn summary(&self, remote_snapshot: bool, applied_chunks: usize) -> ConvexTransportSummary {
+        ConvexTransportSummary {
+            endpoint_env: DEFAULT_CONVEX_GRAPH_URL_ENV.to_string(),
+            endpoint_configured: true,
+            auth_token_env: self.auth_token_env.clone(),
+            auth_configured: self.auth_token.is_some(),
+            remote_snapshot,
+            applied_chunks,
+        }
+    }
+
+    fn post(&self, request: &ConvexTransportRequest<'_>) -> Result<ConvexTransportResponse> {
+        let mut builder = ureq::post(&self.endpoint);
+        if let Some(token) = &self.auth_token {
+            builder = builder.header("Authorization", &format!("Bearer {token}"));
+        }
+        builder
+            .send_json(request)
+            .with_context(|| format!("calling Convex graph transport {}", self.endpoint))?
+            .body_mut()
+            .read_json::<ConvexTransportResponse>()
+            .with_context(|| format!("parsing Convex graph transport response {}", self.endpoint))
+    }
+
+    fn fetch_snapshot(&self, projection_version: &str) -> Result<ConvexProjectionRows> {
+        let response = self.post(&ConvexTransportRequest {
+            operation: "snapshot",
+            chunk: 0,
+            projection_version,
+            projection_hash: None,
+            node_rows: Vec::new(),
+            edge_rows: Vec::new(),
+            keys: Vec::new(),
+        })?;
+        response
+            .rows
+            .context("Convex snapshot response did not include rows")
+    }
+
+    fn apply_chunk(
+        &self,
+        report: &ConvexSyncReport,
+        chunk: &ConvexSyncChunk,
+    ) -> Result<ConvexTransportReceipt> {
+        let node_rows = if chunk.operation == "upsert_nodes" {
+            report
+                .node_upserts
+                .iter()
+                .filter(|row| chunk.keys.contains(&row.external_id))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let edge_rows = if chunk.operation == "upsert_edges" {
+            report
+                .edge_upserts
+                .iter()
+                .filter(|row| chunk.keys.contains(&row.edge_key))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let request = ConvexTransportRequest {
+            operation: &chunk.operation,
+            chunk: chunk.chunk,
+            projection_version: &report.projection_version,
+            projection_hash: report.projection_hash.as_deref(),
+            node_rows,
+            edge_rows,
+            keys: chunk.keys.clone(),
+        };
+        let mut last_error = None;
+        for attempt in 1..=chunk.max_attempts {
+            match self.post(&request) {
+                Ok(response) => {
+                    return Ok(ConvexTransportReceipt {
+                        operation: chunk.operation.clone(),
+                        chunk: chunk.chunk,
+                        attempt,
+                        status: response.status.unwrap_or_else(|| "ok".to_string()),
+                        message: response.message,
+                    });
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt < chunk.max_attempts {
+                        std::thread::sleep(Duration::from_millis(100 * attempt as u64));
+                    }
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Convex transport chunk failed")))
+            .with_context(|| format!("applying Convex {} chunk {}", chunk.operation, chunk.chunk))
+    }
 }
 
 fn convex_projection_hash(rows: &ConvexProjectionRows, scope: Option<&str>) -> Option<String> {
@@ -4771,11 +5051,12 @@ fn push_sync_chunks(
     }
 }
 
-fn build_convex_sync_report(
+fn build_convex_sync_report_with_snapshot(
     path: &Path,
     scope: Option<&str>,
-    snapshot_path: Option<&Path>,
+    snapshot: Option<ConvexProjectionRows>,
     chunk_size: usize,
+    dry_run: bool,
 ) -> Result<ConvexSyncReport> {
     if chunk_size == 0 {
         bail!("--chunk-size must be greater than zero");
@@ -4785,12 +5066,17 @@ fn build_convex_sync_report(
     let graph_db = graph_substrate_db_path(&root, scope);
     let store = SqliteGraphStore::open(&graph_db)?;
     let local = convex_rows_from_graph_store(&store)?;
-    let snapshot = snapshot_path.map(load_convex_projection_rows).transpose()?;
     let freshness = convex_projection_freshness(&local, snapshot.as_ref(), scope);
     let (node_upserts, edge_upserts, node_tombstones, edge_tombstones) =
         convex_rows_diff(&local, snapshot.as_ref());
 
     let mut chunks = Vec::new();
+    push_sync_chunks(
+        &mut chunks,
+        "delete_edges",
+        edge_tombstones.clone(),
+        chunk_size,
+    );
     push_sync_chunks(
         &mut chunks,
         "upsert_nodes",
@@ -4811,22 +5097,18 @@ fn build_convex_sync_report(
     );
     push_sync_chunks(
         &mut chunks,
-        "delete_edges",
-        edge_tombstones.clone(),
-        chunk_size,
-    );
-    push_sync_chunks(
-        &mut chunks,
         "delete_nodes",
         node_tombstones.clone(),
         chunk_size,
     );
 
     let mut diagnostics = vec![
-        "dry-run only: no Convex network mutation was attempted".to_string(),
         "apply node upserts before edge upserts; apply edge tombstones before node tombstones"
             .to_string(),
     ];
+    if dry_run {
+        diagnostics.push("dry-run only: no Convex network mutation was attempted".to_string());
+    }
     if freshness.fail_closed {
         diagnostics.push(
             "Convex-backed traverse/context-pack reads must fail closed until this plan is applied"
@@ -4838,7 +5120,7 @@ fn build_convex_sync_report(
         root: root.to_string_lossy().to_string(),
         scope: scope.map(str::to_string),
         graph_db: graph_db.to_string_lossy().to_string(),
-        dry_run: true,
+        dry_run,
         projection_version: GRAPH_PROJECTION_VERSION.to_string(),
         projection_hash: convex_projection_hash(&local, scope),
         required_indexes: convex_required_indexes(),
@@ -4848,9 +5130,22 @@ fn build_convex_sync_report(
         edge_tombstones,
         chunks,
         freshness,
+        transport: None,
+        receipts: Vec::new(),
         diagnostics,
         warnings: graph.warnings,
     })
+}
+
+#[cfg(test)]
+fn build_convex_sync_report(
+    path: &Path,
+    scope: Option<&str>,
+    snapshot_path: Option<&Path>,
+    chunk_size: usize,
+) -> Result<ConvexSyncReport> {
+    let snapshot = snapshot_path.map(load_convex_projection_rows).transpose()?;
+    build_convex_sync_report_with_snapshot(path, scope, snapshot, chunk_size, true)
 }
 
 fn print_convex_sync_human(report: &ConvexSyncReport, compact: bool) {
@@ -4867,7 +5162,10 @@ fn print_convex_sync_human(report: &ConvexSyncReport, compact: bool) {
         return;
     }
 
-    println!("Convex graph sync dry-run");
+    println!(
+        "Convex graph sync {}",
+        if report.dry_run { "dry-run" } else { "apply" }
+    );
     println!("root: {}", report.root);
     println!("graph_db: {}", report.graph_db);
     println!(
@@ -4882,6 +5180,18 @@ fn print_convex_sync_human(report: &ConvexSyncReport, compact: bool) {
     );
     println!("chunks: {}", report.chunks.len());
     println!("freshness: {}", report.freshness.status);
+    if let Some(transport) = &report.transport {
+        println!(
+            "transport: endpoint_env={} auth_env={} applied_chunks={}",
+            transport.endpoint_env, transport.auth_token_env, transport.applied_chunks
+        );
+    }
+    for receipt in &report.receipts {
+        println!(
+            "receipt: {} chunk {} attempt {} {}",
+            receipt.operation, receipt.chunk, receipt.attempt, receipt.status
+        );
+    }
     for diagnostic in report
         .diagnostics
         .iter()
@@ -4891,23 +5201,75 @@ fn print_convex_sync_human(report: &ConvexSyncReport, compact: bool) {
     }
 }
 
-fn cmd_convex_sync(
-    path: &Path,
-    scope: Option<&str>,
-    snapshot: Option<&Path>,
+struct ConvexSyncOptions<'a> {
+    path: &'a Path,
+    scope: Option<&'a str>,
+    snapshot: Option<&'a Path>,
     chunk_size: usize,
-    format: OutputFormat,
-) -> Result<()> {
-    let report = build_convex_sync_report(path, scope, snapshot, chunk_size)?;
+    remote_snapshot: bool,
+    apply: bool,
+    endpoint: Option<&'a str>,
+    auth_token_env: &'a str,
+}
+
+fn cmd_convex_sync(options: ConvexSyncOptions<'_>, format: OutputFormat) -> Result<()> {
+    let transport = if options.remote_snapshot || options.apply {
+        Some(ConvexHttpTransport::from_options(
+            options.endpoint,
+            options.auth_token_env,
+        )?)
+    } else {
+        None
+    };
+    let snapshot_rows = if options.remote_snapshot {
+        Some(
+            transport
+                .as_ref()
+                .expect("transport is initialized when remote_snapshot is set")
+                .fetch_snapshot(GRAPH_PROJECTION_VERSION)?,
+        )
+    } else {
+        options
+            .snapshot
+            .map(load_convex_projection_rows)
+            .transpose()?
+    };
+    let mut report = build_convex_sync_report_with_snapshot(
+        options.path,
+        options.scope,
+        snapshot_rows,
+        options.chunk_size,
+        !options.apply,
+    )?;
+    if let Some(transport) = &transport {
+        let mut receipts = Vec::new();
+        if options.apply {
+            for chunk in &report.chunks {
+                receipts.push(transport.apply_chunk(&report, chunk)?);
+            }
+        }
+        report.transport = Some(transport.summary(options.remote_snapshot, receipts.len()));
+        report.receipts = receipts;
+        if options.apply {
+            report
+                .diagnostics
+                .push("live Convex transport completed all planned chunks".to_string());
+        } else if options.remote_snapshot {
+            report
+                .diagnostics
+                .push("remote Convex snapshot was pulled before diffing".to_string());
+        }
+    }
     if format.json_output {
         print_json_or_envelope(
             &report,
             &format,
             "convex-sync",
-            "dry-run",
+            if report.dry_run { "dry-run" } else { "apply" },
             ToolEnvelopeSummary {
                 text: format!(
-                    "Convex graph sync plan: {} node upserts, {} edge upserts, {} chunks, freshness {}",
+                    "Convex graph sync {}: {} node upserts, {} edge upserts, {} chunks, freshness {}",
+                    if report.dry_run { "plan" } else { "apply" },
                     report.node_upserts.len(),
                     report.edge_upserts.len(),
                     report.chunks.len(),
@@ -4928,6 +5290,384 @@ fn cmd_convex_sync(
         )
     } else {
         print_convex_sync_human(&report, format.compact);
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct GraphDbSchemaField {
+    name: &'static str,
+    value_type: &'static str,
+    description: &'static str,
+}
+
+#[derive(Serialize)]
+struct GraphDbSchemaOperation {
+    command: &'static str,
+    description: &'static str,
+}
+
+#[derive(Serialize)]
+struct GraphDbSchema {
+    node_fields: Vec<GraphDbSchemaField>,
+    edge_fields: Vec<GraphDbSchemaField>,
+    operations: Vec<GraphDbSchemaOperation>,
+}
+
+#[derive(Serialize)]
+struct GraphDbFreshnessReport {
+    status: String,
+    fail_closed: bool,
+    projection_version: Option<String>,
+    content_hash: Option<String>,
+    source_watermark: Option<String>,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GraphDbReport {
+    root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    backend: String,
+    query: String,
+    freshness: GraphDbFreshnessReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema: Option<GraphDbSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<SubstrateGraphNode>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    nodes: Vec<SubstrateGraphNode>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    edges: Vec<SubstrateGraphEdge>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<substrate::GraphPath>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+fn graph_db_schema() -> GraphDbSchema {
+    GraphDbSchema {
+        node_fields: vec![
+            GraphDbSchemaField {
+                name: "id",
+                value_type: "string",
+                description: "Stable provider-neutral node id",
+            },
+            GraphDbSchemaField {
+                name: "kind",
+                value_type: "string",
+                description: "Application-defined node family such as file, symbol, or backlog",
+            },
+            GraphDbSchemaField {
+                name: "label",
+                value_type: "string",
+                description: "Human-readable label",
+            },
+            GraphDbSchemaField {
+                name: "properties",
+                value_type: "object<string,string>",
+                description: "Adapter-specific string properties",
+            },
+            GraphDbSchemaField {
+                name: "provenance",
+                value_type: "array",
+                description: "Source system and source reference metadata",
+            },
+            GraphDbSchemaField {
+                name: "freshness",
+                value_type: "object|null",
+                description: "Optional content hash and observed timestamp",
+            },
+        ],
+        edge_fields: vec![
+            GraphDbSchemaField {
+                name: "from_id",
+                value_type: "string",
+                description: "Source node id",
+            },
+            GraphDbSchemaField {
+                name: "to_id",
+                value_type: "string",
+                description: "Target node id",
+            },
+            GraphDbSchemaField {
+                name: "kind",
+                value_type: "string",
+                description: "Application-defined edge relation",
+            },
+            GraphDbSchemaField {
+                name: "properties",
+                value_type: "object<string,string>",
+                description: "Adapter-specific string properties",
+            },
+            GraphDbSchemaField {
+                name: "provenance",
+                value_type: "array",
+                description: "Source system and source reference metadata",
+            },
+            GraphDbSchemaField {
+                name: "freshness",
+                value_type: "object|null",
+                description: "Optional content hash and observed timestamp",
+            },
+        ],
+        operations: vec![
+            GraphDbSchemaOperation {
+                command: "schema",
+                description: "Return record and operation schemas",
+            },
+            GraphDbSchemaOperation {
+                command: "node <id>",
+                description: "Return one node by stable id",
+            },
+            GraphDbSchemaOperation {
+                command: "kind <kind>",
+                description: "Return nodes of one kind ordered by id",
+            },
+            GraphDbSchemaOperation {
+                command: "neighborhood <id> --depth <n> [--edge-kind <kind>]",
+                description: "Return a directed outgoing subgraph around a node",
+            },
+            GraphDbSchemaOperation {
+                command: "path <from> <to> [--edge-kind <kind>]",
+                description: "Return the shortest directed path by node id",
+            },
+        ],
+    }
+}
+
+fn sqlite_graph_freshness(store: &SqliteGraphStore, scope: &str) -> Result<GraphDbFreshnessReport> {
+    let version = store.projection_version(scope)?;
+    let Some(version) = version else {
+        return Ok(GraphDbFreshnessReport {
+            status: "missing".to_string(),
+            fail_closed: true,
+            projection_version: None,
+            content_hash: None,
+            source_watermark: None,
+            diagnostics: vec![
+                "graph projection metadata is missing; rebuild the graph before trusting reads"
+                    .to_string(),
+            ],
+        });
+    };
+    let mut diagnostics = Vec::new();
+    let fail_closed =
+        version.projection_version != GRAPH_PROJECTION_VERSION || version.content_hash.is_none();
+    if version.projection_version != GRAPH_PROJECTION_VERSION {
+        diagnostics.push(format!(
+            "projection version mismatch: expected {} got {}",
+            GRAPH_PROJECTION_VERSION, version.projection_version
+        ));
+    }
+    if version.content_hash.is_none() {
+        diagnostics.push("projection content hash is missing".to_string());
+    }
+    Ok(GraphDbFreshnessReport {
+        status: if fail_closed { "stale" } else { "current" }.to_string(),
+        fail_closed,
+        projection_version: Some(version.projection_version),
+        content_hash: version.content_hash,
+        source_watermark: version.source_watermark,
+        diagnostics,
+    })
+}
+
+fn convex_graph_freshness(
+    local: &ConvexProjectionRows,
+    snapshot: &ConvexProjectionRows,
+    scope: Option<&str>,
+) -> GraphDbFreshnessReport {
+    let freshness = convex_projection_freshness(local, Some(snapshot), scope);
+    GraphDbFreshnessReport {
+        status: freshness.status,
+        fail_closed: freshness.fail_closed,
+        projection_version: Some(GRAPH_PROJECTION_VERSION.to_string()),
+        content_hash: freshness.snapshot_hash,
+        source_watermark: None,
+        diagnostics: freshness.diagnostics,
+    }
+}
+
+fn graph_db_report_from_store(
+    root: &Path,
+    scope: Option<&str>,
+    backend: &str,
+    query: GraphDbQuery,
+    store: &impl GraphStore,
+    freshness: GraphDbFreshnessReport,
+    warnings: Vec<String>,
+) -> Result<GraphDbReport> {
+    if freshness.fail_closed {
+        bail!(
+            "graph database read failed closed for {} backend: {}",
+            backend,
+            freshness.diagnostics.join("; ")
+        );
+    }
+    let mut report = GraphDbReport {
+        root: root.to_string_lossy().to_string(),
+        scope: scope.map(str::to_string),
+        backend: backend.to_string(),
+        query: format!("{query:?}"),
+        freshness,
+        schema: None,
+        node: None,
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        path: None,
+        warnings,
+    };
+
+    match query {
+        GraphDbQuery::Schema => {
+            report.schema = Some(graph_db_schema());
+        }
+        GraphDbQuery::Node { id } => {
+            report.node = store.node(&id)?;
+        }
+        GraphDbQuery::Kind { kind } => {
+            report.nodes = store.nodes_by_kind(&kind)?;
+        }
+        GraphDbQuery::Neighborhood {
+            id,
+            depth,
+            edge_kind,
+        } => {
+            if let Some(subgraph) = store.neighborhood(&id, depth, edge_kind.as_deref())? {
+                report.nodes = subgraph.nodes;
+                report.edges = subgraph.edges;
+            }
+        }
+        GraphDbQuery::Path {
+            from,
+            to,
+            edge_kind,
+        } => {
+            report.path = store.shortest_path(&from, &to, edge_kind.as_deref())?;
+        }
+    }
+    Ok(report)
+}
+
+fn print_graph_db_human(report: &GraphDbReport, compact: bool) {
+    if compact {
+        println!(
+            "graph-db backend:{} query:{} nodes:{} edges:{} freshness:{}",
+            report.backend,
+            report.query,
+            report.nodes.len() + usize::from(report.node.is_some()),
+            report.edges.len(),
+            report.freshness.status
+        );
+        return;
+    }
+    println!("graph-db backend: {}", report.backend);
+    println!("freshness: {}", report.freshness.status);
+    if let Some(schema) = &report.schema {
+        println!(
+            "schema: {} node fields, {} edge fields, {} operations",
+            schema.node_fields.len(),
+            schema.edge_fields.len(),
+            schema.operations.len()
+        );
+    }
+    if let Some(node) = &report.node {
+        println!("node: {} [{}] {}", node.id, node.kind, node.label);
+    }
+    for node in &report.nodes {
+        println!("node: {} [{}] {}", node.id, node.kind, node.label);
+    }
+    for edge in &report.edges {
+        println!("edge: {} -{}-> {}", edge.from_id, edge.kind, edge.to_id);
+    }
+    if let Some(path) = &report.path {
+        println!("path: {} hop(s) {}", path.hops, path.nodes.join(" -> "));
+    }
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+}
+
+fn cmd_graph_db(
+    path: &Path,
+    scope: Option<&str>,
+    backend: GraphDbBackend,
+    convex_snapshot: Option<&Path>,
+    query: GraphDbQuery,
+    format: OutputFormat,
+) -> Result<()> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let graph = build_traversal_graph(&root, path, scope)?;
+    let graph_db = graph_substrate_db_path(&root, scope);
+    let report = match backend {
+        GraphDbBackend::Sqlite => {
+            let store = SqliteGraphStore::open(&graph_db)?;
+            let freshness = sqlite_graph_freshness(&store, scope.unwrap_or("root"))?;
+            graph_db_report_from_store(
+                &root,
+                scope,
+                "sqlite",
+                query,
+                &store,
+                freshness,
+                graph.warnings,
+            )?
+        }
+        GraphDbBackend::ConvexSnapshot => {
+            let snapshot_path = convex_snapshot
+                .context("--backend convex-snapshot requires --convex-snapshot <rows.json>")?;
+            let local_store = SqliteGraphStore::open(&graph_db)?;
+            let local = convex_rows_from_graph_store(&local_store)?;
+            let snapshot = load_convex_projection_rows(snapshot_path)?;
+            let freshness = convex_graph_freshness(&local, &snapshot, scope);
+            let client = ConvexRowsGraphClient::from_rows(snapshot);
+            let store = SubstrateConvexGraphStore::new(client);
+            graph_db_report_from_store(
+                &root,
+                scope,
+                "convex-snapshot",
+                query,
+                &store,
+                freshness,
+                graph.warnings,
+            )?
+        }
+    };
+
+    if format.json_output {
+        print_json_or_envelope(
+            &report,
+            &format,
+            "graph-db",
+            "query",
+            ToolEnvelopeSummary {
+                text: format!(
+                    "Graph DB {} query returned {} node(s), {} edge(s), freshness {}",
+                    report.backend,
+                    report.nodes.len() + usize::from(report.node.is_some()),
+                    report.edges.len(),
+                    report.freshness.status
+                ),
+                metrics: vec![
+                    envelope_metric("backend", &report.backend),
+                    envelope_metric(
+                        "nodes",
+                        report.nodes.len() + usize::from(report.node.is_some()),
+                    ),
+                    envelope_metric("edges", report.edges.len()),
+                    envelope_metric("freshness", &report.freshness.status),
+                ],
+            },
+            false,
+            vec![format!(
+                "Use tsift convex-sync {} --json to inspect or refresh Convex projection rows",
+                shell_quote(root.to_string_lossy().as_ref())
+            )],
+        )
+    } else {
+        print_graph_db_human(&report, format.compact);
         Ok(())
     }
 }
@@ -5590,7 +6330,12 @@ fn build_traversal_graph(
     let projection = traversal_projection_from_graph(root, scope, &source_graph)?;
     let graph_db = graph_substrate_db_path(root, scope);
     let mut store = SqliteGraphStore::open(&graph_db)?;
-    store.replace_projection(&projection)?;
+    store.replace_projection_with_version(
+        scope.unwrap_or("root"),
+        &projection,
+        Some(GRAPH_PROJECTION_VERSION),
+        graph_projection_content_hash(&projection),
+    )?;
     let mut graph = traversal_graph_from_store(root, &store)?;
     graph.warnings = source_graph.warnings;
     Ok(graph)
@@ -13445,6 +14190,18 @@ mod tests {
             Ok(())
         }
 
+        fn delete_node_row(&self, external_id: &str) -> Result<usize> {
+            Ok(usize::from(
+                self.nodes.borrow_mut().remove(external_id).is_some(),
+            ))
+        }
+
+        fn delete_edge_row(&self, edge_key: &str) -> Result<usize> {
+            Ok(usize::from(
+                self.edges.borrow_mut().remove(edge_key).is_some(),
+            ))
+        }
+
         fn node_row(&self, external_id: &str) -> Result<Option<ConvexNodeRow>> {
             Ok(self.nodes.borrow().get(external_id).cloned())
         }
@@ -15132,6 +15889,58 @@ def list_items():
                 && edge.to == convex_helper.handle
                 && edge.relation == "mentions"
         }));
+    }
+
+    #[test]
+    fn graph_db_api_queries_sqlite_neighborhood_and_schema() {
+        let dir = setup_traversal_project();
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
+        let freshness = sqlite_graph_freshness(&store, "root").unwrap();
+        assert_eq!(freshness.status, "current");
+
+        let backlog = resolve_traversal_node(&graph, "#kgnv").unwrap();
+        let report = graph_db_report_from_store(
+            dir.path(),
+            None,
+            "sqlite",
+            GraphDbQuery::Neighborhood {
+                id: backlog.handle.clone(),
+                depth: 1,
+                edge_kind: Some("mentions".to_string()),
+            },
+            &store,
+            freshness,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            report
+                .edges
+                .iter()
+                .any(|edge| edge.from_id == backlog.handle && edge.kind == "mentions"),
+            "expected backlog mention edge, got {:?}",
+            report.edges
+        );
+
+        let schema_report = graph_db_report_from_store(
+            dir.path(),
+            None,
+            "sqlite",
+            GraphDbQuery::Schema,
+            &store,
+            sqlite_graph_freshness(&store, "root").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            schema_report
+                .schema
+                .unwrap()
+                .operations
+                .iter()
+                .any(|operation| operation.command.starts_with("neighborhood"))
+        );
     }
 
     #[test]
@@ -19065,6 +19874,15 @@ tier = "private"
             freshness: None,
         });
         snapshot.edges.clear();
+        snapshot.edges.push(ConvexEdgeRow {
+            edge_key: "stale-edge".to_string(),
+            from_external_id: "stale-node".to_string(),
+            to_external_id: "stale-node".to_string(),
+            kind: "mentions".to_string(),
+            properties: BTreeMap::new(),
+            provenance: Vec::new(),
+            freshness: None,
+        });
         let snapshot_path = dir.path().join("convex-snapshot.json");
         fs::write(&snapshot_path, serde_json::to_string(&snapshot).unwrap()).unwrap();
 
@@ -19076,6 +19894,12 @@ tier = "private"
         assert!(
             report.edge_upserts.len() > 1,
             "snapshot without edges should upsert local edges"
+        );
+        assert_eq!(report.edge_tombstones, vec!["stale-edge".to_string()]);
+        assert_eq!(
+            report.chunks.first().map(|chunk| chunk.operation.as_str()),
+            Some("delete_edges"),
+            "edge tombstones should be planned before node tombstones"
         );
         assert!(
             report
@@ -19100,6 +19924,29 @@ tier = "private"
             err.to_string()
                 .contains("Convex graph projection is not current"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn convex_sync_report_marks_live_apply_mode_without_network() {
+        let dir = setup_traversal_project();
+        let report =
+            build_convex_sync_report_with_snapshot(dir.path(), None, None, 100, false).unwrap();
+
+        assert!(!report.dry_run);
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("dry-run only")),
+            "apply-mode report should not claim dry-run diagnostics"
+        );
+        assert!(
+            report
+                .chunks
+                .iter()
+                .any(|chunk| chunk.operation == "upsert_nodes"),
+            "live apply mode should still expose chunked idempotent operations"
         );
     }
 
@@ -19478,6 +20325,84 @@ tier = "private"
                 assert!(json);
             }
             _ => panic!("expected ConvexSync command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_convex_sync_live_flags() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "convex-sync",
+            ".",
+            "--remote-snapshot",
+            "--apply",
+            "--endpoint",
+            "https://example.test/convex-graph",
+            "--auth-token-env",
+            "TSIFT_TEST_TOKEN",
+        ]);
+        match cli.command {
+            Some(Commands::ConvexSync {
+                remote_snapshot,
+                apply,
+                endpoint,
+                auth_token_env,
+                ..
+            }) => {
+                assert!(remote_snapshot);
+                assert!(apply);
+                assert_eq!(
+                    endpoint.as_deref(),
+                    Some("https://example.test/convex-graph")
+                );
+                assert_eq!(auth_token_env, "TSIFT_TEST_TOKEN");
+            }
+            _ => panic!("expected ConvexSync command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_db_query() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "graph-db",
+            "--backend",
+            "convex-snapshot",
+            "--convex-snapshot",
+            "rows.json",
+            "--json",
+            "neighborhood",
+            "gbak-kgnv",
+            "--depth",
+            "2",
+            "--edge-kind",
+            "mentions",
+        ]);
+        match cli.command {
+            Some(Commands::GraphDb {
+                backend,
+                convex_snapshot,
+                json,
+                query,
+                ..
+            }) => {
+                assert_eq!(backend, GraphDbBackend::ConvexSnapshot);
+                assert_eq!(convex_snapshot, Some(PathBuf::from("rows.json")));
+                assert!(json);
+                match query {
+                    GraphDbQuery::Neighborhood {
+                        id,
+                        depth,
+                        edge_kind,
+                    } => {
+                        assert_eq!(id, "gbak-kgnv");
+                        assert_eq!(depth, 2);
+                        assert_eq!(edge_kind.as_deref(), Some("mentions"));
+                    }
+                    _ => panic!("expected graph-db neighborhood query"),
+                }
+            }
+            _ => panic!("expected GraphDb command"),
         }
     }
 

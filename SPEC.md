@@ -9,10 +9,11 @@ Extend tsift with tree-sitter AST parsing, dependency graph tracking, and per-su
 ```
 tsift (CLI + MCP plugin)
 ├── sift (BM25 + vector — existing)
-├── substrate module (provider-neutral graph — src/substrate.rs)
+├── substrate module (provider-neutral graph DB API — src/substrate.rs)
 │   ├── generic nodes/edges/provenance/freshness records
-│   ├── SQLite graph store prototype (`graph_nodes`, `graph_edges`)
-│   ├── Convex projection adapter for `nodes` + `edges` read models
+│   ├── GraphStore CRUD/query contract (lookup, kind scans, neighborhoods, shortest paths)
+│   ├── SQLite graph store (`graph_nodes`, `graph_edges`, projection versions, tombstones)
+│   ├── Convex projection adapter for `nodes` + `edges` read models and snapshots
 │   └── projection boundary for FalkorDB/other read models
 ├── graph module (internal — src/graph.rs)
 │   ├── call-site extraction via tree-sitter queries
@@ -35,7 +36,9 @@ The graph substrate is a content-agnostic layer below tsift. It stores typed pro
 - provenance: source system plus source reference, with optional content hash
 - freshness: optional content hash and observation timestamp for rebuildable projections
 
-The first implementation is a local SQLite store with `graph_nodes` and `graph_edges` tables. SQLite is the development/offline/test correctness engine and a portable projection target; it is not the only intended backend. Convex, FalkorDB, or another graph/query system should consume the same generic graph model as derived projections, not replace tsift's local correctness model or force code-domain concepts into the substrate.
+The stable API surface is the `GraphStore` contract plus the `tsift graph-db` CLI. The contract supports node upsert/delete, edge upsert/delete, node lookup, kind scans, outgoing edge scans, bounded directed neighborhoods, and shortest paths. `tsift graph-db` exposes those reads over either the local SQLite graph store or a freshness-checked Convex snapshot, and `graph-db schema --json` returns the stable node/edge/operation JSON shapes.
+
+The first implementation is a local SQLite store with `graph_nodes`, `graph_edges`, `graph_projection_versions`, and `graph_tombstones` tables. SQLite is the development/offline/test correctness engine and a portable projection target; it is not the only intended backend. Refreshes are transactional: readers see the old projection or the new projection, never a half-swapped graph. Projection version rows record the traversal projection version, content hash, and source watermark; row-level tombstones record removed nodes and edges so incremental projection consumers can reconcile deletions. Opening a `graph.db` fails closed if the file advertises a newer schema version than the current binary supports.
 
 Convex support is a projection backend for the same substrate contract. `GraphProjection::upsert_into` writes nodes before edges, so stores can fail closed when an edge references a missing node. The Convex adapter maps records onto two application tables:
 
@@ -46,7 +49,7 @@ Convex support is a projection backend for the same substrate contract. `GraphPr
 
 `tsift traverse` now treats the SQLite substrate as the local graph read model. It builds file, symbol, route, session, backlog, and source-handle projection rows, replaces the local `.tsift/graph.db` `graph_nodes` / `graph_edges` snapshot, then resolves traversal reports back through the `GraphStore` contract. Projection rows include per-record freshness plus a `projection_meta` node with `projection_version=tsift-traversal-v1` and a content hash. `tsift context-pack` also materializes its exploration `source_handle` windows and relationship refs into the same substrate before returning the handoff packet.
 
-`tsift convex-sync <path> --json` emits the concrete Convex sync plan for that local graph projection. It produces idempotent node/edge upsert rows, edge-then-node tombstones when a supplied `--snapshot <rows.json>` contains stale remote rows, ordered chunks controlled by `--chunk-size`, required Convex index metadata, and retry/partial-failure diagnostics. `tsift traverse --convex-snapshot <rows.json>` and `tsift context-pack --convex-snapshot <rows.json>` fail closed when the Convex snapshot's projection metadata or rows trail the local SQLite correctness store.
+`tsift convex-sync <path> --json` emits the concrete Convex sync plan for that local graph projection. It produces idempotent node/edge upsert rows, edge-then-node tombstones when a supplied `--snapshot <rows.json>` contains stale remote rows, ordered chunks controlled by `--chunk-size`, required Convex index metadata, and retry/partial-failure diagnostics. `--remote-snapshot` pulls the current remote rows through a configured HTTP action before diffing, using `--endpoint` or `TSIFT_CONVEX_GRAPH_URL` plus an optional bearer token from `--auth-token-env` (default `TSIFT_CONVEX_AUTH_TOKEN`). `--apply` sends the ordered chunks to the same transport with bounded retries; chunk payloads are idempotent by `externalId` and `edgeKey`. `tsift traverse --convex-snapshot <rows.json>`, `tsift context-pack --convex-snapshot <rows.json>`, and `tsift graph-db --backend convex-snapshot --convex-snapshot <rows.json> ...` fail closed when the Convex snapshot's projection metadata or rows trail the local SQLite correctness store.
 
 tsift owns the code adapter on top of this substrate. Code symbols become `code_symbol` nodes and call relationships become `calls` edges with line metadata and tsift index provenance. Future adapters can add code comments, routes, markdown sessions, backlog items, LiveKit docs, Orbit topics, questions, answers, visuals, and assets without changing the substrate schema. The boundary rule is: no AST, source-language, Orbit, LiveKit, Convex, or FalkorDB semantics are required to create or query generic substrate records.
 
@@ -106,6 +109,13 @@ tsift communities [--path]      # Louvain community detection over call graph
 tsift path <from> <to>          # BFS shortest path between symbols
 tsift traverse [node] [--to target] --format json|html # Graphify-style file/symbol/session/backlog traversal graph
 tsift convex-sync . --snapshot convex-rows.json --chunk-size 100 --json # dry-run Convex nodes/edges sync plan
+tsift convex-sync . --remote-snapshot --apply --endpoint https://... --json # live Convex sync transport
+tsift graph-db --path . schema --json # stable provider-neutral graph DB JSON schema
+tsift graph-db --path . node <id> --json # SQLite graph node lookup
+tsift graph-db --path . kind backlog --json # SQLite graph kind scan
+tsift graph-db --path . neighborhood <id> --depth 2 --edge-kind mentions --json # bounded subgraph
+tsift graph-db --path . path <from-id> <to-id> --json # shortest directed path
+tsift graph-db --backend convex-snapshot --convex-snapshot rows.json node <id> --json # Convex snapshot read
 tsift --envelope explain <symbol> --budget normal # bounded agent preview
 tsift --envelope source-read src/main.rs --start 1 --lines 80 --budget normal # bounded source-file preview with expansion handles
 tsift edit < edits.json         # staged multi-file search/replace batch
