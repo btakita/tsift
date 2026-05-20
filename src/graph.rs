@@ -1,6 +1,8 @@
 use crate::lang::{Lang, Symbol};
+use crate::substrate::{GraphEdge as SubstrateEdge, GraphNode, GraphProjection, GraphProvenance};
 use anyhow::Result;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
@@ -120,6 +122,45 @@ pub fn resolve_edges(symbols: &[Symbol], call_sites: &[CallSite]) -> Vec<CallEdg
         }
     }
     edges
+}
+
+pub fn code_symbol_node_id(name: &str) -> String {
+    format!("code.symbol:{name}")
+}
+
+pub fn project_call_edges(
+    edges: &[CallEdge],
+    provenance: Option<GraphProvenance>,
+) -> GraphProjection {
+    let mut nodes = BTreeMap::<String, GraphNode>::new();
+    let mut projected_edges = Vec::with_capacity(edges.len());
+
+    for edge in edges {
+        let caller_id = code_symbol_node_id(&edge.caller);
+        let callee_id = code_symbol_node_id(&edge.callee);
+        for (id, label) in [(&caller_id, &edge.caller), (&callee_id, &edge.callee)] {
+            nodes.entry(id.clone()).or_insert_with(|| {
+                let mut node = GraphNode::new(id.clone(), "code_symbol", label.clone());
+                if let Some(provenance) = provenance.clone() {
+                    node = node.with_provenance(provenance);
+                }
+                node
+            });
+        }
+
+        let mut projected = SubstrateEdge::new(caller_id, callee_id, "calls")
+            .with_property("caller_line", edge.caller_line.to_string())
+            .with_property("call_site_line", edge.call_site_line.to_string());
+        if let Some(provenance) = provenance.clone() {
+            projected = projected.with_provenance(provenance);
+        }
+        projected_edges.push(projected);
+    }
+
+    GraphProjection {
+        nodes: nodes.into_values().collect(),
+        edges: projected_edges,
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -363,6 +404,7 @@ pub fn shortest_path(edges: &[(String, String)], from: &str, to: &str) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::substrate::{GraphStore, SqliteGraphStore};
 
     #[cfg(feature = "lang-rust")]
     #[test]
@@ -541,6 +583,48 @@ mod tests {
         }];
         let edges = resolve_edges(&symbols, &sites);
         assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn project_call_edges_to_provider_neutral_substrate() {
+        let edges = vec![CallEdge {
+            caller: "main".into(),
+            callee: "helper".into(),
+            caller_line: 10,
+            call_site_line: 12,
+        }];
+        let projection = project_call_edges(
+            &edges,
+            Some(GraphProvenance::new("tsift.index", "src/main.rs")),
+        );
+
+        assert_eq!(projection.nodes.len(), 2);
+        assert_eq!(projection.edges.len(), 1);
+        assert!(
+            projection
+                .nodes
+                .iter()
+                .any(|node| node.id == code_symbol_node_id("main") && node.kind == "code_symbol")
+        );
+
+        let store = SqliteGraphStore::in_memory().unwrap();
+        for node in &projection.nodes {
+            store.upsert_node(node).unwrap();
+        }
+        for edge in &projection.edges {
+            store.upsert_edge(edge).unwrap();
+        }
+
+        let calls = store
+            .outgoing_edges(&code_symbol_node_id("main"), Some("calls"))
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].to_id, code_symbol_node_id("helper"));
+        assert_eq!(
+            calls[0].properties.get("call_site_line"),
+            Some(&"12".to_string())
+        );
+        assert_eq!(calls[0].provenance[0].source, "tsift.index");
     }
 
     #[test]

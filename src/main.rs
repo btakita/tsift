@@ -31,6 +31,7 @@ pub mod session_cost;
 pub mod session_digest;
 pub mod session_review;
 pub mod status;
+pub mod substrate;
 pub mod summarize;
 pub mod test_digest;
 pub mod walk;

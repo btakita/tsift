@@ -9,15 +9,33 @@ Extend tsift with tree-sitter AST parsing, dependency graph tracking, and per-su
 ```
 tsift (CLI + MCP plugin)
 ├── sift (BM25 + vector — existing)
+├── substrate module (provider-neutral graph — src/substrate.rs)
+│   ├── generic nodes/edges/provenance/freshness records
+│   ├── SQLite graph store prototype (`graph_nodes`, `graph_edges`)
+│   └── projection boundary for Convex/FalkorDB/other read models
 ├── graph module (internal — src/graph.rs)
 │   ├── call-site extraction via tree-sitter queries
 │   ├── caller→callee edge resolution against symbol table
+│   ├── tsift code-symbol/call-edge adapter into substrate records
 │   └── SQLite storage (call_edges table)
 ├── lang module (tree-sitter parsing — existing)
 │   ├── symbol extraction (function/type/trait definitions)
 │   └── call queries (function calls, method calls, macro invocations)
 └── rusqlite (storage — existing)
 ```
+
+## Provider-Neutral Graph Substrate
+
+The graph substrate is a content-agnostic layer below tsift. It stores typed property graph records:
+
+- nodes: stable `id`, `kind`, `label`, string properties, provenance, and freshness
+- edges: `from_id`, `to_id`, `kind`, string properties, provenance, and freshness
+- provenance: source system plus source reference, with optional content hash
+- freshness: optional content hash and observation timestamp for rebuildable projections
+
+The first implementation is a local SQLite store with `graph_nodes` and `graph_edges` tables. SQLite is the development/offline/test engine and a portable projection target; it is not the only intended backend. Convex, FalkorDB, or another graph/query system should consume the same generic graph model as derived projections, not replace tsift's local correctness model or force code-domain concepts into the substrate.
+
+tsift owns the code adapter on top of this substrate. Code symbols become `code_symbol` nodes and call relationships become `calls` edges with line metadata and tsift index provenance. Future adapters can add code comments, routes, markdown sessions, backlog items, LiveKit docs, Orbit topics, questions, answers, visuals, and assets without changing the substrate schema. The boundary rule is: no AST, source-language, Orbit, LiveKit, Convex, or FalkorDB semantics are required to create or query generic substrate records.
 
 ## Per-Submodule Isolation
 
