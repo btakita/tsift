@@ -33,6 +33,7 @@ tsift --envelope source-read src/main.rs --start 1 --lines 120 --budget normal
 tsift diff-digest .
 tsift --envelope session-review tasks/software/tsift.md --next-context --budget normal
 tsift graph-db --path . kind backlog --property ref_id=cvxa --limit 5 --json
+tsift graph-db --path . doctor --json
 tsift convex-sync . --chunk-size 100 --json
 ```
 
@@ -43,7 +44,8 @@ on search or digest output.
 Graph DB and Convex operator examples live under
 `fixtures/graph-db-operator-examples`; the reusable Convex app-side schema,
 mutations, and HTTP action for `tsift convex-sync --apply` live under
-`examples/convex-graph`.
+`examples/convex-graph`. Use `tsift graph-db doctor` to validate local
+`graph.db` and Convex snapshot metadata before trusting operator handoffs.
 
 ## Release Notes
 

@@ -36,6 +36,21 @@ fn assert_tsift_failure(args: Vec<String>) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+fn assert_tsift_failure_json(args: Vec<String>) -> (Value, String) {
+    let output = run_tsift(args.clone());
+    assert!(
+        !output.status.success(),
+        "tsift {} unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (
+        serde_json::from_slice(&output.stdout).unwrap(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
 fn graph_db_project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -158,6 +173,20 @@ fn current_convex_snapshot(project: &Path) -> Value {
         "nodes": report["node_upserts"].clone(),
         "edges": report["edge_upserts"].clone(),
     })
+}
+
+fn required_convex_indexes_json() -> Value {
+    json!([
+        {"table": "nodes", "name": "by_external_id", "fields": ["externalId"]},
+        {"table": "nodes", "name": "by_kind", "fields": ["kind"]},
+        {"table": "edges", "name": "by_edge_key", "fields": ["edgeKey"]},
+        {"table": "edges", "name": "by_from_kind", "fields": ["fromExternalId", "kind"]},
+        {"table": "edges", "name": "by_to_kind", "fields": ["toExternalId", "kind"]}
+    ])
+}
+
+fn attach_required_convex_indexes(snapshot: &mut Value) {
+    snapshot["indexes"] = required_convex_indexes_json();
 }
 
 fn write_snapshot(project: &Path, name: &str, snapshot: &Value) -> PathBuf {
@@ -517,4 +546,147 @@ fn graph_db_cli_rejects_convex_snapshot_orphan_edges() {
         stderr.contains("Convex snapshot edge edge:orphan references missing from node"),
         "{stderr}"
     );
+}
+
+#[test]
+fn graph_db_doctor_passes_for_current_sqlite_and_convex_snapshot() {
+    let project = graph_db_project();
+    let mut snapshot = current_convex_snapshot(project.path());
+    attach_required_convex_indexes(&mut snapshot);
+    let snapshot_path = write_snapshot(project.path(), "convex-current-indexed.json", &snapshot);
+
+    let sqlite = graph_db_json(project.path(), Backend::Sqlite, vec!["doctor".to_string()]);
+    assert_eq!(sqlite["status"], "ok");
+    assert_eq!(sqlite["fail_closed"], false);
+    assert!(
+        sqlite["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| check["status"] == "ok"),
+        "{sqlite}"
+    );
+
+    let convex = graph_db_json(
+        project.path(),
+        Backend::ConvexSnapshot(&snapshot_path),
+        vec!["doctor".to_string()],
+    );
+    assert_eq!(convex["status"], "ok");
+    assert_eq!(convex["fail_closed"], false);
+    assert!(
+        convex["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| check["status"] == "ok"),
+        "{convex}"
+    );
+}
+
+#[test]
+fn graph_db_doctor_fails_closed_for_sqlite_stale_metadata_and_schema_drift() {
+    let project = graph_db_project();
+    current_convex_snapshot(project.path());
+    let db_path = graph_db_path(project.path());
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE graph_projection_versions SET projection_version = 'old-v0', content_hash = NULL WHERE scope = 'root'",
+        [],
+    )
+    .unwrap();
+    conn.execute("DROP INDEX idx_graph_edges_to_kind", [])
+        .unwrap();
+    drop(conn);
+
+    let (report, stderr) = assert_tsift_failure_json(graph_db_args(
+        project.path(),
+        Backend::Sqlite,
+        vec!["doctor".to_string()],
+    ));
+    assert_eq!(report["status"], "fail_closed");
+    assert_eq!(report["fail_closed"], true);
+    let report_text = serde_json::to_string(&report).unwrap();
+    assert!(
+        report_text.contains("projection version mismatch"),
+        "{report_text}"
+    );
+    assert!(
+        report_text.contains("projection content hash is missing"),
+        "{report_text}"
+    );
+    assert!(
+        report_text.contains("missing index idx_graph_edges_to_kind"),
+        "{report_text}"
+    );
+    assert!(
+        report["repair_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("tsift traverse")),
+        "{report}"
+    );
+    assert!(stderr.contains("graph-db doctor failed closed"), "{stderr}");
+}
+
+#[test]
+fn graph_db_doctor_fails_closed_for_convex_index_duplicates_and_orphans() {
+    let project = graph_db_project();
+    let mut snapshot = current_convex_snapshot(project.path());
+    let mut indexes = required_convex_indexes_json();
+    indexes.as_array_mut().unwrap().pop();
+    snapshot["indexes"] = indexes;
+    let duplicate_node = snapshot["nodes"].as_array().unwrap()[0].clone();
+    snapshot["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate_node);
+    let target_id = snapshot["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["kind"] == "symbol")
+        .unwrap()["externalId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    snapshot["edges"].as_array_mut().unwrap().push(json!({
+        "edgeKey": "edge:orphan",
+        "fromExternalId": "missing-symbol",
+        "toExternalId": target_id,
+        "kind": "calls",
+        "properties": {},
+        "provenance": []
+    }));
+    let snapshot_path = write_snapshot(project.path(), "convex-doctor-bad.json", &snapshot);
+
+    let (report, stderr) = assert_tsift_failure_json(graph_db_args(
+        project.path(),
+        Backend::ConvexSnapshot(&snapshot_path),
+        vec!["doctor".to_string()],
+    ));
+    assert_eq!(report["status"], "fail_closed");
+    let report_text = serde_json::to_string(&report).unwrap();
+    assert!(
+        report_text.contains("duplicate node externalId"),
+        "{report_text}"
+    );
+    assert!(
+        report_text.contains("references missing from node"),
+        "{report_text}"
+    );
+    assert!(
+        report_text.contains("missing required index metadata"),
+        "{report_text}"
+    );
+    assert!(
+        report["repair_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("convex-sync")),
+        "{report}"
+    );
+    assert!(stderr.contains("graph-db doctor failed closed"), "{stderr}");
 }

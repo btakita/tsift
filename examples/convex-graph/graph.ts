@@ -33,12 +33,21 @@ const edgeRow = v.object({
   freshness: v.optional(freshness),
 });
 
+const requiredIndexes = [
+  { table: "nodes", name: "by_external_id", fields: ["externalId"] },
+  { table: "nodes", name: "by_kind", fields: ["kind"] },
+  { table: "edges", name: "by_edge_key", fields: ["edgeKey"] },
+  { table: "edges", name: "by_from_kind", fields: ["fromExternalId", "kind"] },
+  { table: "edges", name: "by_to_kind", fields: ["toExternalId", "kind"] },
+];
+
 export const snapshot = query({
   args: {},
   handler: async (ctx) => {
     return {
       nodes: await ctx.db.query("nodes").collect(),
       edges: await ctx.db.query("edges").collect(),
+      indexes: requiredIndexes,
     };
   },
 });

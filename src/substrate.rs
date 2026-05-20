@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 
-const SQLITE_GRAPH_SCHEMA_VERSION: i64 = 1;
+pub const SQLITE_GRAPH_SCHEMA_VERSION: i64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphProvenance {

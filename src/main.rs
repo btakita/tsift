@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sift::{SearchInput, SearchOptions, Sift};
 #[cfg(test)]
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use substrate::{
     ConvexEdgeRow, ConvexNodeRow, ConvexProjectionRows, GraphEdge as SubstrateGraphEdge,
     GraphFreshness, GraphNode as SubstrateGraphNode, GraphProjection, GraphProvenance, GraphStore,
-    SqliteGraphStore,
+    SQLITE_GRAPH_SCHEMA_VERSION, SqliteGraphStore,
 };
 #[cfg(test)]
 use substrate::{ConvexGraphClient, ConvexGraphStore};
@@ -735,6 +735,8 @@ enum GraphDbBackend {
 
 #[derive(Subcommand, Debug, Clone)]
 enum GraphDbQuery {
+    /// Diagnose graph.db or Convex snapshot health without refreshing the local projection
+    Doctor,
     /// Show the stable JSON shape for graph database records and responses
     Schema,
     /// Look up one node by stable id
@@ -4589,7 +4591,7 @@ fn convex_rows_from_graph_store(store: &impl GraphStore) -> Result<ConvexProject
     .to_convex_rows())
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 struct ConvexRequiredIndex {
     table: String,
     name: String,
@@ -4735,29 +4737,58 @@ fn load_convex_projection_rows(path: &Path) -> Result<ConvexProjectionRows> {
         .with_context(|| format!("parsing Convex projection snapshot {}", path.display()))
 }
 
-fn validate_convex_projection_rows(rows: &ConvexProjectionRows) -> Result<()> {
-    let node_ids = rows
-        .nodes
-        .iter()
-        .map(|row| row.external_id.as_str())
-        .collect::<BTreeSet<_>>();
+fn convex_projection_row_diagnostics(rows: &ConvexProjectionRows) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    let mut node_counts = BTreeMap::<&str, usize>::new();
+    for row in &rows.nodes {
+        *node_counts.entry(row.external_id.as_str()).or_default() += 1;
+    }
+    for (external_id, count) in node_counts.iter().filter(|(_, count)| **count > 1) {
+        diagnostics.push(format!(
+            "Convex snapshot contains duplicate node externalId {external_id} ({count} rows)"
+        ));
+    }
+
+    let node_ids = node_counts.keys().copied().collect::<BTreeSet<_>>();
+    let mut edge_counts = BTreeMap::<&str, usize>::new();
     for edge in &rows.edges {
+        *edge_counts.entry(edge.edge_key.as_str()).or_default() += 1;
         if !node_ids.contains(edge.from_external_id.as_str()) {
-            bail!(
+            diagnostics.push(format!(
                 "Convex snapshot edge {} references missing from node {}",
-                edge.edge_key,
-                edge.from_external_id
-            );
+                edge.edge_key, edge.from_external_id
+            ));
         }
         if !node_ids.contains(edge.to_external_id.as_str()) {
-            bail!(
+            diagnostics.push(format!(
                 "Convex snapshot edge {} references missing to node {}",
-                edge.edge_key,
-                edge.to_external_id
-            );
+                edge.edge_key, edge.to_external_id
+            ));
+        }
+        let expected_key =
+            ConvexEdgeRow::stable_key(&edge.from_external_id, &edge.to_external_id, &edge.kind);
+        if edge.edge_key != expected_key {
+            diagnostics.push(format!(
+                "Convex snapshot edge {} has non-canonical key; expected {} for ({}, {}, {})",
+                edge.edge_key, expected_key, edge.from_external_id, edge.kind, edge.to_external_id
+            ));
         }
     }
-    Ok(())
+    for (edge_key, count) in edge_counts.iter().filter(|(_, count)| **count > 1) {
+        diagnostics.push(format!(
+            "Convex snapshot contains duplicate edgeKey {edge_key} ({count} rows)"
+        ));
+    }
+    diagnostics
+}
+
+fn validate_convex_projection_rows(rows: &ConvexProjectionRows) -> Result<()> {
+    let diagnostics = convex_projection_row_diagnostics(rows);
+    if diagnostics.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", diagnostics.join("; "))
+    }
 }
 
 struct ConvexHttpTransport {
@@ -5431,6 +5462,862 @@ struct GraphDbReport {
     warnings: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct GraphDbDoctorCheck {
+    name: String,
+    status: String,
+    fail_closed: bool,
+    diagnostics: Vec<String>,
+    repair_commands: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GraphDbDoctorReport {
+    root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    backend: String,
+    graph_db: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    convex_snapshot: Option<String>,
+    status: String,
+    fail_closed: bool,
+    checks: Vec<GraphDbDoctorCheck>,
+    repair_commands: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    required_indexes: Vec<ConvexRequiredIndex>,
+}
+
+impl GraphDbDoctorReport {
+    fn new(
+        root: &Path,
+        scope: Option<&str>,
+        backend: &str,
+        graph_db: &Path,
+        convex_snapshot: Option<&Path>,
+    ) -> Self {
+        Self {
+            root: root.to_string_lossy().to_string(),
+            scope: scope.map(str::to_string),
+            backend: backend.to_string(),
+            graph_db: graph_db.to_string_lossy().to_string(),
+            convex_snapshot: convex_snapshot.map(|path| path.to_string_lossy().to_string()),
+            status: "ok".to_string(),
+            fail_closed: false,
+            checks: Vec::new(),
+            repair_commands: Vec::new(),
+            required_indexes: Vec::new(),
+        }
+    }
+
+    fn push_check(&mut self, check: GraphDbDoctorCheck) {
+        self.checks.push(check);
+    }
+
+    fn finalize(&mut self) {
+        self.fail_closed = self.checks.iter().any(|check| check.fail_closed);
+        self.status = if self.fail_closed {
+            "fail_closed"
+        } else {
+            "ok"
+        }
+        .to_string();
+        let mut commands = BTreeSet::new();
+        for check in &self.checks {
+            commands.extend(check.repair_commands.iter().cloned());
+        }
+        self.repair_commands = commands.into_iter().collect();
+    }
+
+    fn summary(&self) -> String {
+        self.checks
+            .iter()
+            .filter(|check| check.fail_closed)
+            .flat_map(|check| check.diagnostics.iter())
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+fn graph_db_doctor_check(
+    name: impl Into<String>,
+    diagnostics: Vec<String>,
+    repair_commands: Vec<String>,
+) -> GraphDbDoctorCheck {
+    let fail_closed = !diagnostics.is_empty();
+    GraphDbDoctorCheck {
+        name: name.into(),
+        status: if fail_closed { "fail_closed" } else { "ok" }.to_string(),
+        fail_closed,
+        diagnostics,
+        repair_commands: if fail_closed {
+            repair_commands
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+fn graph_db_scope_arg(scope: Option<&str>) -> String {
+    scope
+        .map(|scope| format!(" --scope {}", shell_quote(scope)))
+        .unwrap_or_default()
+}
+
+fn graph_db_rebuild_command(root: &Path, scope: Option<&str>) -> String {
+    format!(
+        "tsift traverse --path {}{} --format json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope)
+    )
+}
+
+fn graph_db_backup_rebuild_command(root: &Path, scope: Option<&str>, graph_db: &Path) -> String {
+    let backup = format!("{}.bak", graph_db.to_string_lossy());
+    format!(
+        "mv {} {} && {}",
+        shell_quote(graph_db.to_string_lossy().as_ref()),
+        shell_quote(&backup),
+        graph_db_rebuild_command(root, scope)
+    )
+}
+
+fn convex_refresh_command(root: &Path, scope: Option<&str>) -> String {
+    format!(
+        "tsift convex-sync {}{} --remote-snapshot --apply --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope)
+    )
+}
+
+fn open_sqlite_graph_db_readonly(graph_db: &Path) -> Result<Connection> {
+    Connection::open_with_flags(graph_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening graph.db read-only: {}", graph_db.display()))
+}
+
+fn sqlite_string_set(conn: &Connection, sql: &str) -> Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut values = BTreeSet::new();
+    for row in rows {
+        values.insert(row?);
+    }
+    Ok(values)
+}
+
+fn sqlite_column_names(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut columns = BTreeSet::new();
+    for row in rows {
+        columns.insert(row?);
+    }
+    Ok(columns)
+}
+
+fn sqlite_graph_schema_diagnostics(conn: &Connection) -> Result<Vec<String>> {
+    let mut diagnostics = Vec::new();
+    let user_version: i64 =
+        conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
+    if user_version > SQLITE_GRAPH_SCHEMA_VERSION {
+        diagnostics.push(format!(
+            "graph.db schema version {user_version} is newer than supported version {SQLITE_GRAPH_SCHEMA_VERSION}"
+        ));
+    } else if user_version < SQLITE_GRAPH_SCHEMA_VERSION {
+        diagnostics.push(format!(
+            "graph.db schema version {user_version} is older than supported version {SQLITE_GRAPH_SCHEMA_VERSION}"
+        ));
+    }
+
+    let tables = sqlite_string_set(
+        conn,
+        "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+    )?;
+    let required_tables = [
+        (
+            "graph_nodes",
+            vec![
+                "id",
+                "kind",
+                "label",
+                "properties_json",
+                "provenance_json",
+                "freshness_json",
+            ],
+        ),
+        (
+            "graph_edges",
+            vec![
+                "from_id",
+                "to_id",
+                "kind",
+                "properties_json",
+                "provenance_json",
+                "freshness_json",
+            ],
+        ),
+        (
+            "graph_projection_versions",
+            vec![
+                "scope",
+                "projection_version",
+                "content_hash",
+                "source_watermark",
+                "observed_at_unix",
+            ],
+        ),
+        (
+            "graph_tombstones",
+            vec!["row_key", "row_kind", "deleted_at_unix"],
+        ),
+    ];
+    for (table, required_columns) in required_tables {
+        if !tables.contains(table) {
+            diagnostics.push(format!("graph.db schema drift: missing table {table}"));
+            continue;
+        }
+        let columns = sqlite_column_names(conn, table)?;
+        for column in required_columns {
+            if !columns.contains(column) {
+                diagnostics.push(format!(
+                    "graph.db schema drift: missing column {table}.{column}"
+                ));
+            }
+        }
+    }
+
+    let indexes = sqlite_string_set(
+        conn,
+        "SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name",
+    )?;
+    for index in [
+        "idx_graph_nodes_kind",
+        "idx_graph_edges_from_kind",
+        "idx_graph_edges_to_kind",
+    ] {
+        if !indexes.contains(index) {
+            diagnostics.push(format!("graph.db schema drift: missing index {index}"));
+        }
+    }
+
+    if tables.contains("graph_edges") {
+        let mut stmt = conn.prepare("PRAGMA foreign_key_list(graph_edges)")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(3)?, row.get::<_, String>(4)?))
+        })?;
+        let mut fks = BTreeSet::new();
+        for row in rows {
+            fks.insert(row?);
+        }
+        for expected in [
+            ("from_id".to_string(), "id".to_string()),
+            ("to_id".to_string(), "id".to_string()),
+        ] {
+            if !fks.contains(&expected) {
+                diagnostics.push(format!(
+                    "graph.db schema drift: missing graph_edges foreign key {} -> graph_nodes.{}",
+                    expected.0, expected.1
+                ));
+            }
+        }
+    }
+
+    Ok(diagnostics)
+}
+
+fn sqlite_query_diagnostics(conn: &Connection, sql: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut diagnostics = Vec::new();
+    for row in rows {
+        diagnostics.push(row?);
+    }
+    Ok(diagnostics)
+}
+
+fn sqlite_graph_duplicate_diagnostics(conn: &Connection) -> Result<Vec<String>> {
+    let mut diagnostics = sqlite_query_diagnostics(
+        conn,
+        r#"
+        SELECT 'duplicate graph_nodes.id ' || id || ' (' || COUNT(*) || ' rows)'
+        FROM graph_nodes
+        GROUP BY id
+        HAVING COUNT(*) > 1
+        ORDER BY id
+        "#,
+    )?;
+    diagnostics.extend(sqlite_query_diagnostics(
+        conn,
+        r#"
+        SELECT 'duplicate graph_edges key ' || from_id || ' -' || kind || '-> ' || to_id || ' (' || COUNT(*) || ' rows)'
+        FROM graph_edges
+        GROUP BY from_id, to_id, kind
+        HAVING COUNT(*) > 1
+        ORDER BY from_id, kind, to_id
+        "#,
+    )?);
+    Ok(diagnostics)
+}
+
+fn sqlite_graph_orphan_diagnostics(conn: &Connection) -> Result<Vec<String>> {
+    sqlite_query_diagnostics(
+        conn,
+        r#"
+        SELECT 'orphan edge missing from node: ' || e.from_id || ' -' || e.kind || '-> ' || e.to_id
+        FROM graph_edges e
+        LEFT JOIN graph_nodes n ON n.id = e.from_id
+        WHERE n.id IS NULL
+        UNION ALL
+        SELECT 'orphan edge missing to node: ' || e.from_id || ' -' || e.kind || '-> ' || e.to_id
+        FROM graph_edges e
+        LEFT JOIN graph_nodes n ON n.id = e.to_id
+        WHERE n.id IS NULL
+        ORDER BY 1
+        "#,
+    )
+}
+
+fn sqlite_graph_json_diagnostics(conn: &Connection) -> Result<Vec<String>> {
+    let mut diagnostics = Vec::new();
+    let mut node_stmt = conn.prepare(
+        "SELECT id, properties_json, provenance_json, freshness_json FROM graph_nodes ORDER BY id",
+    )?;
+    let node_rows = node_stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    for row in node_rows {
+        let (id, properties_json, provenance_json, freshness_json) = row?;
+        if let Err(err) = serde_json::from_str::<BTreeMap<String, String>>(&properties_json) {
+            diagnostics.push(format!(
+                "graph_nodes {id} properties_json is invalid: {err}"
+            ));
+        }
+        if let Err(err) = serde_json::from_str::<Vec<GraphProvenance>>(&provenance_json) {
+            diagnostics.push(format!(
+                "graph_nodes {id} provenance_json is invalid: {err}"
+            ));
+        }
+        if let Some(freshness_json) = freshness_json
+            && let Err(err) = serde_json::from_str::<GraphFreshness>(&freshness_json)
+        {
+            diagnostics.push(format!("graph_nodes {id} freshness_json is invalid: {err}"));
+        }
+    }
+
+    let mut edge_stmt = conn.prepare(
+        "SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json FROM graph_edges ORDER BY from_id, kind, to_id",
+    )?;
+    let edge_rows = edge_stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+        ))
+    })?;
+    for row in edge_rows {
+        let (from_id, to_id, kind, properties_json, provenance_json, freshness_json) = row?;
+        let edge = format!("{from_id} -{kind}-> {to_id}");
+        if let Err(err) = serde_json::from_str::<BTreeMap<String, String>>(&properties_json) {
+            diagnostics.push(format!(
+                "graph_edges {edge} properties_json is invalid: {err}"
+            ));
+        }
+        if let Err(err) = serde_json::from_str::<Vec<GraphProvenance>>(&provenance_json) {
+            diagnostics.push(format!(
+                "graph_edges {edge} provenance_json is invalid: {err}"
+            ));
+        }
+        if let Some(freshness_json) = freshness_json
+            && let Err(err) = serde_json::from_str::<GraphFreshness>(&freshness_json)
+        {
+            diagnostics.push(format!(
+                "graph_edges {edge} freshness_json is invalid: {err}"
+            ));
+        }
+    }
+    Ok(diagnostics)
+}
+
+fn sqlite_graph_projection_metadata_diagnostics(
+    conn: &Connection,
+    scope: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut diagnostics = Vec::new();
+    let scope_key = scope.unwrap_or("root");
+    let version = conn
+        .query_row(
+            r#"
+            SELECT projection_version, content_hash, source_watermark
+            FROM graph_projection_versions
+            WHERE scope = ?1
+            "#,
+            [scope_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((projection_version, content_hash, _source_watermark)) = version else {
+        diagnostics.push(format!(
+            "graph projection metadata is missing for scope {scope_key}"
+        ));
+        return Ok(diagnostics);
+    };
+    if projection_version != GRAPH_PROJECTION_VERSION {
+        diagnostics.push(format!(
+            "projection version mismatch: expected {GRAPH_PROJECTION_VERSION} got {projection_version}"
+        ));
+    }
+    if content_hash.is_none() {
+        diagnostics.push("projection content hash is missing".to_string());
+    }
+
+    let meta_id = graph_projection_meta_id(scope);
+    let meta_properties = conn
+        .query_row(
+            "SELECT properties_json FROM graph_nodes WHERE id = ?1 AND kind = ?2",
+            (&meta_id, GRAPH_PROJECTION_META_KIND),
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(meta_properties) = meta_properties else {
+        diagnostics.push(format!("projection_meta node {meta_id} is missing"));
+        return Ok(diagnostics);
+    };
+    let properties = serde_json::from_str::<BTreeMap<String, String>>(&meta_properties)
+        .with_context(|| format!("parsing projection_meta properties for {meta_id}"))?;
+    if properties.get("projection_version").map(String::as_str) != Some(GRAPH_PROJECTION_VERSION) {
+        diagnostics.push(format!(
+            "projection_meta node {meta_id} has stale projection_version"
+        ));
+    }
+    if properties.get("content_hash") != content_hash.as_ref() {
+        diagnostics.push(format!(
+            "projection_meta node {meta_id} content_hash does not match graph_projection_versions"
+        ));
+    }
+    Ok(diagnostics)
+}
+
+fn sqlite_convex_rows_from_conn(conn: &Connection) -> Result<ConvexProjectionRows> {
+    let mut node_stmt = conn.prepare(
+        "SELECT id, kind, label, properties_json, provenance_json, freshness_json FROM graph_nodes ORDER BY id",
+    )?;
+    let node_rows = node_stmt.query_map([], |row| {
+        let properties_json: String = row.get(3)?;
+        let provenance_json: String = row.get(4)?;
+        let freshness_json: Option<String> = row.get(5)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            properties_json,
+            provenance_json,
+            freshness_json,
+        ))
+    })?;
+    let mut nodes = Vec::new();
+    for row in node_rows {
+        let (external_id, kind, label, properties_json, provenance_json, freshness_json) = row?;
+        nodes.push(ConvexNodeRow {
+            external_id,
+            kind,
+            label,
+            properties: serde_json::from_str(&properties_json)?,
+            provenance: serde_json::from_str(&provenance_json)?,
+            freshness: freshness_json
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?,
+        });
+    }
+
+    let mut edge_stmt = conn.prepare(
+        "SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json FROM graph_edges ORDER BY from_id, kind, to_id",
+    )?;
+    let edge_rows = edge_stmt.query_map([], |row| {
+        let properties_json: String = row.get(3)?;
+        let provenance_json: String = row.get(4)?;
+        let freshness_json: Option<String> = row.get(5)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            properties_json,
+            provenance_json,
+            freshness_json,
+        ))
+    })?;
+    let mut edges = Vec::new();
+    for row in edge_rows {
+        let (
+            from_external_id,
+            to_external_id,
+            kind,
+            properties_json,
+            provenance_json,
+            freshness_json,
+        ) = row?;
+        edges.push(ConvexEdgeRow {
+            edge_key: ConvexEdgeRow::stable_key(&from_external_id, &to_external_id, &kind),
+            from_external_id,
+            to_external_id,
+            kind,
+            properties: serde_json::from_str(&properties_json)?,
+            provenance: serde_json::from_str(&provenance_json)?,
+            freshness: freshness_json
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?,
+        });
+    }
+    Ok(ConvexProjectionRows { nodes, edges })
+}
+
+fn convex_required_index_label(index: &ConvexRequiredIndex) -> String {
+    format!("{}.{}({})", index.table, index.name, index.fields.join(","))
+}
+
+fn convex_snapshot_index_value(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    value
+        .get("indexes")
+        .or_else(|| value.get("requiredIndexes"))
+        .or_else(|| {
+            value
+                .get("metadata")
+                .and_then(|metadata| metadata.get("indexes"))
+        })
+}
+
+fn convex_snapshot_declared_indexes(
+    value: &serde_json::Value,
+) -> Result<Option<Vec<ConvexRequiredIndex>>> {
+    convex_snapshot_index_value(value)
+        .map(|indexes| {
+            serde_json::from_value::<Vec<ConvexRequiredIndex>>(indexes.clone())
+                .context("parsing Convex snapshot index metadata")
+        })
+        .transpose()
+}
+
+fn convex_snapshot_index_diagnostics(value: &serde_json::Value) -> Result<Vec<String>> {
+    let required = convex_required_indexes();
+    let Some(declared) = convex_snapshot_declared_indexes(value)? else {
+        return Ok(vec![format!(
+            "Convex snapshot index metadata is missing; required indexes not confirmed: {}",
+            required
+                .iter()
+                .map(convex_required_index_label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )]);
+    };
+    let declared = declared.into_iter().collect::<BTreeSet<_>>();
+    let missing = required
+        .iter()
+        .filter(|index| !declared.contains(*index))
+        .map(convex_required_index_label)
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![format!(
+            "Convex snapshot is missing required index metadata: {}",
+            missing.join(", ")
+        )])
+    }
+}
+
+fn load_convex_projection_snapshot_value(
+    snapshot_path: &Path,
+) -> Result<(ConvexProjectionRows, serde_json::Value)> {
+    let content = fs::read_to_string(snapshot_path).with_context(|| {
+        format!(
+            "reading Convex projection snapshot {}",
+            snapshot_path.display()
+        )
+    })?;
+    let value = serde_json::from_str::<serde_json::Value>(&content).with_context(|| {
+        format!(
+            "parsing Convex projection snapshot {}",
+            snapshot_path.display()
+        )
+    })?;
+    let rows = serde_json::from_value::<ConvexProjectionRows>(value.clone())
+        .with_context(|| format!("parsing Convex projection rows {}", snapshot_path.display()))?;
+    Ok((rows, value))
+}
+
+fn append_sqlite_graph_doctor_checks(
+    report: &mut GraphDbDoctorReport,
+    root: &Path,
+    scope: Option<&str>,
+    graph_db: &Path,
+) -> Option<Connection> {
+    let rebuild = graph_db_rebuild_command(root, scope);
+    let backup_rebuild = graph_db_backup_rebuild_command(root, scope, graph_db);
+    if !graph_db.exists() {
+        report.push_check(graph_db_doctor_check(
+            "sqlite_graph_db_exists",
+            vec![format!("graph.db is missing at {}", graph_db.display())],
+            vec![rebuild],
+        ));
+        return None;
+    }
+    report.push_check(graph_db_doctor_check(
+        "sqlite_graph_db_exists",
+        Vec::new(),
+        vec![rebuild.clone()],
+    ));
+
+    let conn = match open_sqlite_graph_db_readonly(graph_db) {
+        Ok(conn) => conn,
+        Err(err) => {
+            report.push_check(graph_db_doctor_check(
+                "sqlite_graph_db_open",
+                vec![err.to_string()],
+                vec![backup_rebuild],
+            ));
+            return None;
+        }
+    };
+    report.push_check(graph_db_doctor_check(
+        "sqlite_graph_db_open",
+        Vec::new(),
+        vec![rebuild.clone()],
+    ));
+
+    let schema_diagnostics = sqlite_graph_schema_diagnostics(&conn)
+        .unwrap_or_else(|err| vec![format!("graph.db schema inspection failed: {err}")]);
+    report.push_check(graph_db_doctor_check(
+        "sqlite_schema",
+        schema_diagnostics,
+        vec![backup_rebuild.clone()],
+    ));
+
+    let metadata_diagnostics = sqlite_graph_projection_metadata_diagnostics(&conn, scope)
+        .unwrap_or_else(|err| {
+            vec![format!(
+                "graph projection metadata inspection failed: {err}"
+            )]
+        });
+    report.push_check(graph_db_doctor_check(
+        "sqlite_projection_metadata",
+        metadata_diagnostics,
+        vec![rebuild.clone()],
+    ));
+
+    let duplicate_diagnostics = sqlite_graph_duplicate_diagnostics(&conn)
+        .unwrap_or_else(|err| vec![format!("duplicate id inspection failed: {err}")]);
+    report.push_check(graph_db_doctor_check(
+        "sqlite_duplicate_ids",
+        duplicate_diagnostics,
+        vec![backup_rebuild.clone()],
+    ));
+
+    let orphan_diagnostics = sqlite_graph_orphan_diagnostics(&conn)
+        .unwrap_or_else(|err| vec![format!("orphan edge inspection failed: {err}")]);
+    report.push_check(graph_db_doctor_check(
+        "sqlite_orphan_edges",
+        orphan_diagnostics,
+        vec![rebuild.clone()],
+    ));
+
+    let json_diagnostics = sqlite_graph_json_diagnostics(&conn)
+        .unwrap_or_else(|err| vec![format!("graph row JSON inspection failed: {err}")]);
+    report.push_check(graph_db_doctor_check(
+        "sqlite_row_json",
+        json_diagnostics,
+        vec![backup_rebuild],
+    ));
+
+    Some(conn)
+}
+
+fn append_convex_snapshot_doctor_checks(
+    report: &mut GraphDbDoctorReport,
+    root: &Path,
+    scope: Option<&str>,
+    local_rows: Option<&ConvexProjectionRows>,
+    snapshot_path: Option<&Path>,
+) {
+    let repair = convex_refresh_command(root, scope);
+    let Some(snapshot_path) = snapshot_path else {
+        report.push_check(graph_db_doctor_check(
+            "convex_snapshot_present",
+            vec!["--backend convex-snapshot requires --convex-snapshot <rows.json>".to_string()],
+            vec![format!(
+                "tsift convex-sync {}{} --json > convex-rows.json",
+                shell_quote(root.to_string_lossy().as_ref()),
+                graph_db_scope_arg(scope)
+            )],
+        ));
+        return;
+    };
+    report.push_check(graph_db_doctor_check(
+        "convex_snapshot_present",
+        Vec::new(),
+        vec![repair.clone()],
+    ));
+
+    let (snapshot, snapshot_value) = match load_convex_projection_snapshot_value(snapshot_path) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            report.push_check(graph_db_doctor_check(
+                "convex_snapshot_parse",
+                vec![err.to_string()],
+                vec![repair],
+            ));
+            return;
+        }
+    };
+    report.push_check(graph_db_doctor_check(
+        "convex_snapshot_parse",
+        Vec::new(),
+        vec![repair.clone()],
+    ));
+
+    let row_diagnostics = convex_projection_row_diagnostics(&snapshot);
+    report.push_check(graph_db_doctor_check(
+        "convex_snapshot_rows",
+        row_diagnostics,
+        vec![repair.clone()],
+    ));
+
+    let index_diagnostics = convex_snapshot_index_diagnostics(&snapshot_value)
+        .unwrap_or_else(|err| vec![err.to_string()]);
+    report.required_indexes = convex_required_indexes();
+    report.push_check(graph_db_doctor_check(
+        "convex_required_indexes",
+        index_diagnostics,
+        vec![
+            "Add the indexes from examples/convex-graph/schema.ts, then redeploy the Convex app"
+                .to_string(),
+        ],
+    ));
+
+    if let Some(local_rows) = local_rows {
+        let freshness = convex_projection_freshness(local_rows, Some(&snapshot), scope);
+        report.push_check(graph_db_doctor_check(
+            "convex_projection_freshness",
+            freshness.diagnostics,
+            vec![repair],
+        ));
+    } else {
+        report.push_check(graph_db_doctor_check(
+            "convex_projection_freshness",
+            vec![
+                "local SQLite graph.db could not be read, so Convex freshness cannot be verified"
+                    .to_string(),
+            ],
+            vec![graph_db_rebuild_command(root, scope)],
+        ));
+    }
+}
+
+fn print_graph_db_doctor_human(report: &GraphDbDoctorReport) {
+    println!(
+        "graph-db doctor backend: {} status: {}",
+        report.backend, report.status
+    );
+    println!("graph_db: {}", report.graph_db);
+    if let Some(snapshot) = &report.convex_snapshot {
+        println!("convex_snapshot: {snapshot}");
+    }
+    for check in &report.checks {
+        println!("check: {} {}", check.name, check.status);
+        for diagnostic in &check.diagnostics {
+            println!("  diagnostic: {diagnostic}");
+        }
+    }
+    for command in &report.repair_commands {
+        println!("repair: {command}");
+    }
+}
+
+fn cmd_graph_db_doctor(
+    root: &Path,
+    scope: Option<&str>,
+    backend: GraphDbBackend,
+    convex_snapshot: Option<&Path>,
+    format: OutputFormat,
+) -> Result<()> {
+    let graph_db = graph_substrate_db_path(root, scope);
+    let backend_name = match backend {
+        GraphDbBackend::Sqlite => "sqlite",
+        GraphDbBackend::ConvexSnapshot => "convex-snapshot",
+    };
+    let mut report =
+        GraphDbDoctorReport::new(root, scope, backend_name, &graph_db, convex_snapshot);
+    let conn = append_sqlite_graph_doctor_checks(&mut report, root, scope, &graph_db);
+    let local_rows = conn
+        .as_ref()
+        .and_then(|conn| sqlite_convex_rows_from_conn(conn).ok());
+    if backend == GraphDbBackend::ConvexSnapshot {
+        append_convex_snapshot_doctor_checks(
+            &mut report,
+            root,
+            scope,
+            local_rows.as_ref(),
+            convex_snapshot,
+        );
+    }
+    report.finalize();
+
+    let fail_closed = report.fail_closed;
+    let summary = report.summary();
+    if format.json_output {
+        print_json_or_envelope(
+            &report,
+            &format,
+            "graph-db",
+            "doctor",
+            ToolEnvelopeSummary {
+                text: format!(
+                    "Graph DB doctor {} for {} backend with {} check(s)",
+                    report.status,
+                    report.backend,
+                    report.checks.len()
+                ),
+                metrics: vec![
+                    envelope_metric("backend", &report.backend),
+                    envelope_metric("status", &report.status),
+                    envelope_metric("checks", report.checks.len()),
+                ],
+            },
+            false,
+            report.repair_commands.clone(),
+        )?;
+    } else {
+        print_graph_db_doctor_human(&report);
+    }
+
+    if fail_closed {
+        bail!(
+            "graph-db doctor failed closed for {} backend: {}",
+            backend_name,
+            if summary.is_empty() {
+                "see diagnostics".to_string()
+            } else {
+                summary
+            }
+        );
+    }
+    Ok(())
+}
+
 fn parse_graph_db_property_filters(raw: &[String]) -> Result<Vec<GraphDbPropertyFilter>> {
     raw.iter()
         .map(|value| {
@@ -5608,6 +6495,10 @@ fn graph_db_schema() -> GraphDbSchema {
         ],
         operations: vec![
             GraphDbSchemaOperation {
+                command: "doctor",
+                description: "Validate graph.db or Convex snapshot health and return fail-closed repair diagnostics",
+            },
+            GraphDbSchemaOperation {
                 command: "schema",
                 description: "Return record and operation schemas",
             },
@@ -5716,6 +6607,9 @@ fn graph_db_report_from_store(
     };
 
     match query {
+        GraphDbQuery::Doctor => {
+            bail!("graph-db doctor must be handled by the doctor command path");
+        }
         GraphDbQuery::Schema => {
             report.schema = Some(graph_db_schema());
         }
@@ -5822,6 +6716,9 @@ fn cmd_graph_db(
     format: OutputFormat,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
+    if matches!(query, GraphDbQuery::Doctor) {
+        return cmd_graph_db_doctor(&root, scope, backend, convex_snapshot, format);
+    }
     let graph = build_traversal_graph(&root, path, scope)?;
     let graph_db = graph_substrate_db_path(&root, scope);
     let report = match backend {

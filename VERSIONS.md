@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- Added `tsift graph-db doctor` for read-only SQLite `graph.db` and Convex snapshot diagnostics, including stale projection metadata, schema drift, orphan edges, duplicate ids, missing Convex index metadata, repair commands, and fail-closed exit codes.
 - `tsift graph-db kind` and `graph-db neighborhood` now support deterministic node-id cursor pagination, repeatable `--property KEY=VALUE` node filters, page diagnostics, and backend parity coverage across SQLite and Convex snapshot stores.
 - Added `examples/convex-graph`, a reusable Convex app-side schema/mutation/HTTP-action package for `tsift convex-sync --remote-snapshot --apply`, plus a local HTTP smoke test proving apply chunks round-trip through the documented transport shape.
 - Agent-doc queue entries now materialize as `job_packet` graph nodes, and `context-pack` exploration packets now include bounded `worker_context` nodes linked to source handles so worker handoffs preserve prompt scope in the graph substrate.
