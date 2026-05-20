@@ -5,13 +5,17 @@ These examples document the SQLite and Convex graph DB paths with reusable comma
 ## SQLite Graph DB Reads
 
 ```bash
-tsift traverse --path . --format json >/tmp/tsift-traverse.json
+tsift graph-db --path . refresh --json
+tsift graph-db --path . status --json
 tsift graph-db --path . schema --json
 tsift graph-db --path . kind backlog --property ref_id=cvxa --limit 5 --json
+tsift graph-db --path . evidence cvxa --depth 3 --limit 8 --json
 tsift graph-db --path . neighborhood gbak-example --depth 2 --edge-kind mentions --json
 ```
 
-`traverse` materializes `.tsift/graph.db`; `graph-db` then reads the same SQLite correctness store.
+`graph-db refresh` materializes `.tsift/graph.db` explicitly; `graph-db status`
+reports projection version, content hash, source watermark, row counts, and
+tombstone counts without refreshing.
 
 ## Convex Sync Dry Run
 
@@ -64,6 +68,7 @@ Convex-backed reads fail closed when the supplied snapshot trails `.tsift/graph.
 
 ```bash
 tsift --envelope context-pack tasks/software/tsift.md --budget normal --json
+tsift graph-db --path . evidence '#gref' --depth 3 --limit 8 --json
 tsift traverse <source_handle_or_job_packet_handle> --path . --depth 1 --format json
 ```
 

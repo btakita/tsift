@@ -43,3 +43,47 @@ jobs:
 
       - name: Full CI suite
         run: make ci-full
+
+  live-convex-acceptance:
+    name: live Convex graph acceptance
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tsift
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tsift
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tsift/target
+          key: ${{ runner.os }}-cargo-live-convex-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Live Convex graph backend acceptance
+        shell: bash
+        env:
+          TSIFT_LIVE_CONVEX_GRAPH_URL: ${{ secrets.TSIFT_LIVE_CONVEX_GRAPH_URL }}
+          TSIFT_LIVE_CONVEX_AUTH_TOKEN: ${{ secrets.TSIFT_LIVE_CONVEX_AUTH_TOKEN }}
+        run: |
+          if [ -z "${TSIFT_LIVE_CONVEX_GRAPH_URL}" ]; then
+            echo "::notice title=Live Convex graph acceptance skipped::Configure TSIFT_LIVE_CONVEX_GRAPH_URL on a dedicated deployment to enable the remote graph-db parity gate."
+            exit 0
+          fi
+
+          TSIFT_LIVE_CONVEX_ACCEPTANCE=1 cargo test --test graph_db_conformance \
+            live_convex_graph_backend_acceptance_applies_and_matches_graph_db_queries \
+            -- --ignored --nocapture

@@ -545,6 +545,144 @@ fn graph_db_cli_covers_agent_loop_workspace_fixture_rows() {
 }
 
 #[test]
+fn graph_db_refresh_and_status_materialize_operator_report() {
+    let project = graph_db_project();
+
+    let initial = graph_db_json(project.path(), Backend::Sqlite, vec!["status".to_string()]);
+    assert_eq!(initial["status"], "missing", "{initial}");
+    assert_eq!(initial["materialized"], false, "{initial}");
+    assert!(
+        initial["next_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("graph-db")
+                && command.as_str().unwrap().contains("refresh")),
+        "{initial}"
+    );
+
+    let refresh = graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
+    assert_eq!(refresh["operation"], "refresh", "{refresh}");
+    assert_eq!(refresh["status"], "current", "{refresh}");
+    assert_eq!(refresh["materialized"], true, "{refresh}");
+    assert_eq!(
+        refresh["freshness"]["projection_version"], "tsift-traversal-v1",
+        "{refresh}"
+    );
+    assert!(refresh["freshness"]["content_hash"].as_str().is_some());
+    assert!(refresh["freshness"]["source_watermark"].as_str().is_some());
+    assert!(refresh["counts"]["nodes"].as_u64().unwrap() > 0);
+    assert!(refresh["counts"]["edges"].as_u64().unwrap() > 0);
+    assert!(refresh["counts"]["tombstones"]["total"].as_u64().is_some());
+    let refresh_commands = refresh["next_commands"].as_array().unwrap();
+    assert!(
+        refresh_commands
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("doctor")),
+        "{refresh}"
+    );
+    assert!(
+        refresh_commands
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("drift")),
+        "{refresh}"
+    );
+    assert!(
+        refresh_commands
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("convex-sync")),
+        "{refresh}"
+    );
+
+    let status = graph_db_json(project.path(), Backend::Sqlite, vec!["status".to_string()]);
+    assert_eq!(status["operation"], "status", "{status}");
+    assert_eq!(status["status"], "current", "{status}");
+    assert_eq!(status["counts"]["nodes"], refresh["counts"]["nodes"]);
+}
+
+#[test]
+fn graph_db_evidence_packet_covers_backlog_job_worker_context_and_source_handles() {
+    let project = graph_db_project();
+
+    let backlog = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "evidence".to_string(),
+            "gval".to_string(),
+            "--depth".to_string(),
+            "3".to_string(),
+            "--limit".to_string(),
+            "8".to_string(),
+        ],
+    );
+    assert_eq!(backlog["target_node"]["kind"], "backlog", "{backlog}");
+    assert!(
+        !backlog["worker_context"].as_array().unwrap().is_empty(),
+        "{backlog}"
+    );
+    assert!(
+        !backlog["source_handles"].as_array().unwrap().is_empty(),
+        "{backlog}"
+    );
+    assert!(
+        backlog["shortest_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path["kind"] == "source_handle" && !path["path"].is_null()),
+        "{backlog}"
+    );
+    assert!(
+        backlog["next_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("source-read")),
+        "{backlog}"
+    );
+    assert!(
+        backlog["fixture_coverage"]["test"]
+            .as_str()
+            .unwrap()
+            .contains("graph_db_evidence_packet"),
+        "{backlog}"
+    );
+
+    let job = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "kind".to_string(),
+            "job_packet".to_string(),
+            "--property".to_string(),
+            "ref_id=gval".to_string(),
+            "--limit".to_string(),
+            "1".to_string(),
+        ],
+    );
+    let job_id = node_ids(&job).remove(0);
+    let job_evidence = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "evidence".to_string(),
+            job_id,
+            "--depth".to_string(),
+            "3".to_string(),
+        ],
+    );
+    assert_eq!(job_evidence["target_node"]["kind"], "job_packet");
+    assert!(
+        !job_evidence["worker_context"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{job_evidence}"
+    );
+}
+
+#[test]
 #[ignore = "requires a dedicated live Convex deployment"]
 fn live_convex_graph_backend_acceptance_applies_and_matches_graph_db_queries() {
     if !live_convex_acceptance_enabled() {
@@ -939,7 +1077,8 @@ fn graph_db_doctor_fails_closed_for_sqlite_stale_metadata_and_schema_drift() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|command| command.as_str().unwrap().contains("tsift traverse")),
+            .any(|command| command.as_str().unwrap().contains("graph-db")
+                && command.as_str().unwrap().contains("refresh")),
         "{report}"
     );
     assert!(stderr.contains("graph-db doctor failed closed"), "{stderr}");

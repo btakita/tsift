@@ -32,7 +32,10 @@ tsift --envelope search "route dispatch" --budget normal
 tsift --envelope source-read src/main.rs --start 1 --lines 120 --budget normal
 tsift diff-digest .
 tsift --envelope session-review tasks/software/tsift.md --next-context --budget normal
+tsift graph-db --path . refresh --json
+tsift graph-db --path . status --json
 tsift graph-db --path . kind backlog --property ref_id=cvxa --limit 5 --json
+tsift graph-db --path . evidence cvxa --depth 3 --limit 8 --json
 tsift graph-db --path . doctor --json
 tsift convex-sync . --chunk-size 100 --json
 ```
@@ -44,12 +47,20 @@ on search or digest output.
 Graph DB and Convex operator examples live under
 `fixtures/graph-db-operator-examples`; the reusable Convex app-side schema,
 mutations, and HTTP action for `tsift convex-sync --apply` live under
-`examples/convex-graph`. Use `tsift graph-db doctor` to validate local
-`graph.db` and Convex snapshot metadata before trusting operator handoffs. The
+`examples/convex-graph`. Use `tsift graph-db refresh` to materialize
+`.tsift/graph.db` explicitly, `tsift graph-db status` to inspect projection
+version/hash/watermark and tombstone counts without refreshing, and
+`tsift graph-db evidence <backlog-id-or-job-handle>` for bounded
+worker-context/source-handle handoff packets. Use `tsift graph-db doctor` to
+validate local `graph.db` and Convex snapshot metadata before trusting operator
+handoffs. The
 ignored `live_convex_graph_backend_acceptance_applies_and_matches_graph_db_queries`
 test is opt-in via `TSIFT_LIVE_CONVEX_ACCEPTANCE=1` and
 `TSIFT_LIVE_CONVEX_GRAPH_URL`; point it at a dedicated Convex deployment because
-it applies and reconciles a temporary projection.
+it applies and reconciles a temporary projection. CI runs that acceptance path as
+a no-op until the dedicated deployment secret is configured, then it becomes a
+remote snapshot parity gate for graph-db node, kind, neighborhood, and path
+queries.
 
 ## Release Notes
 

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use substrate::{
     ConvexEdgeRow, ConvexNodeRow, ConvexProjectionRows, GraphEdge as SubstrateGraphEdge,
     GraphFreshness, GraphNode as SubstrateGraphNode, GraphProjection, GraphProvenance, GraphStore,
-    SQLITE_GRAPH_SCHEMA_VERSION, SqliteGraphStore,
+    SQLITE_GRAPH_SCHEMA_VERSION, SqliteGraphStore, SqliteProjectionRefresh,
 };
 #[cfg(test)]
 use substrate::{ConvexGraphClient, ConvexGraphStore};
@@ -735,10 +735,25 @@ enum GraphDbBackend {
 
 #[derive(Subcommand, Debug, Clone)]
 enum GraphDbQuery {
+    /// Materialize or refresh the local SQLite graph.db projection for operator workflows
+    Refresh,
+    /// Report graph.db freshness, projection metadata, row counts, tombstone counts, and next commands without refreshing
+    Status,
     /// Diagnose graph.db or Convex snapshot health without refreshing the local projection
     Doctor,
     /// Compare the local SQLite projection against a Convex snapshot before apply/read operations
     Drift,
+    /// Build a bounded worker handoff evidence packet from a backlog id or job packet handle
+    Evidence {
+        /// Backlog id, job packet handle, or graph node id
+        target: String,
+        /// Maximum directed hops to follow when collecting context evidence
+        #[arg(long, default_value = "3")]
+        depth: usize,
+        /// Maximum worker/source evidence records to return (0 = unlimited)
+        #[arg(long, default_value = "8")]
+        limit: usize,
+    },
     /// Show the stable JSON shape for graph database records and responses
     Schema,
     /// Look up one node by stable id
@@ -5639,6 +5654,96 @@ struct GraphDbDriftReport {
     warnings: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct GraphDbTombstoneCounts {
+    nodes: usize,
+    edges: usize,
+    total: usize,
+}
+
+#[derive(Serialize)]
+struct GraphDbOperatorCounts {
+    nodes: usize,
+    edges: usize,
+    tombstones: GraphDbTombstoneCounts,
+}
+
+#[derive(Serialize)]
+struct GraphDbRefreshSummary {
+    scope: String,
+    projection_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_watermark: Option<String>,
+    tombstoned_nodes: usize,
+    tombstoned_edges: usize,
+}
+
+#[derive(Serialize)]
+struct GraphDbOperatorReport {
+    root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    graph_db: String,
+    operation: String,
+    status: String,
+    materialized: bool,
+    freshness: GraphDbFreshnessReport,
+    counts: GraphDbOperatorCounts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh: Option<GraphDbRefreshSummary>,
+    next_commands: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GraphDbEvidencePath {
+    to: String,
+    kind: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<substrate::GraphPath>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expand: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GraphDbFixtureCoverage {
+    test: String,
+    fixture: String,
+    assertions: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GraphDbEvidenceReport {
+    root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    backend: String,
+    target: String,
+    freshness: GraphDbFreshnessReport,
+    target_node: SubstrateGraphNode,
+    worker_context: Vec<SubstrateGraphNode>,
+    source_handles: Vec<SubstrateGraphNode>,
+    shortest_paths: Vec<GraphDbEvidencePath>,
+    next_commands: Vec<String>,
+    fixture_coverage: GraphDbFixtureCoverage,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+struct GraphDbEvidenceInput<'a, S: GraphStore> {
+    root: &'a Path,
+    scope: Option<&'a str>,
+    backend: &'a str,
+    target: &'a str,
+    depth: usize,
+    limit: usize,
+    store: &'a S,
+    freshness: GraphDbFreshnessReport,
+    warnings: Vec<String>,
+}
+
 impl GraphDbDoctorReport {
     fn new(
         root: &Path,
@@ -5717,12 +5822,16 @@ fn graph_db_scope_arg(scope: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-fn graph_db_rebuild_command(root: &Path, scope: Option<&str>) -> String {
+fn graph_db_refresh_command(root: &Path, scope: Option<&str>) -> String {
     format!(
-        "tsift traverse --path {}{} --format json",
+        "tsift graph-db --path {}{} refresh --json",
         shell_quote(root.to_string_lossy().as_ref()),
         graph_db_scope_arg(scope)
     )
+}
+
+fn graph_db_rebuild_command(root: &Path, scope: Option<&str>) -> String {
+    graph_db_refresh_command(root, scope)
 }
 
 fn graph_db_backup_rebuild_command(root: &Path, scope: Option<&str>, graph_db: &Path) -> String {
@@ -5746,6 +5855,169 @@ fn convex_refresh_command(root: &Path, scope: Option<&str>) -> String {
 fn open_sqlite_graph_db_readonly(graph_db: &Path) -> Result<Connection> {
     Connection::open_with_flags(graph_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("opening graph.db read-only: {}", graph_db.display()))
+}
+
+fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(Into::into)
+}
+
+fn sqlite_known_table_count(conn: &Connection, table: &str) -> Result<usize> {
+    let sql = match table {
+        "graph_nodes" => "SELECT COUNT(*) FROM graph_nodes",
+        "graph_edges" => "SELECT COUNT(*) FROM graph_edges",
+        "graph_tombstones" => "SELECT COUNT(*) FROM graph_tombstones",
+        other => bail!("unsupported graph count table {other}"),
+    };
+    conn.query_row(sql, [], |row| row.get::<_, usize>(0))
+        .map_err(Into::into)
+}
+
+fn sqlite_tombstone_counts(conn: &Connection) -> Result<GraphDbTombstoneCounts> {
+    if !sqlite_table_exists(conn, "graph_tombstones")? {
+        return Ok(GraphDbTombstoneCounts {
+            nodes: 0,
+            edges: 0,
+            total: 0,
+        });
+    }
+    let mut stmt =
+        conn.prepare("SELECT row_kind, COUNT(*) FROM graph_tombstones GROUP BY row_kind")?;
+    let mut rows = stmt.query([])?;
+    let mut nodes = 0usize;
+    let mut edges = 0usize;
+    while let Some(row) = rows.next()? {
+        let row_kind: String = row.get(0)?;
+        let count: usize = row.get(1)?;
+        match row_kind.as_str() {
+            "node" => nodes = count,
+            "edge" => edges = count,
+            _ => {}
+        }
+    }
+    Ok(GraphDbTombstoneCounts {
+        nodes,
+        edges,
+        total: nodes + edges,
+    })
+}
+
+fn sqlite_graph_counts(conn: &Connection) -> Result<GraphDbOperatorCounts> {
+    let nodes = if sqlite_table_exists(conn, "graph_nodes")? {
+        sqlite_known_table_count(conn, "graph_nodes")?
+    } else {
+        0
+    };
+    let edges = if sqlite_table_exists(conn, "graph_edges")? {
+        sqlite_known_table_count(conn, "graph_edges")?
+    } else {
+        0
+    };
+    Ok(GraphDbOperatorCounts {
+        nodes,
+        edges,
+        tombstones: sqlite_tombstone_counts(conn)?,
+    })
+}
+
+fn sqlite_graph_freshness_from_conn(
+    conn: &Connection,
+    scope: &str,
+) -> Result<GraphDbFreshnessReport> {
+    if !sqlite_table_exists(conn, "graph_projection_versions")? {
+        return Ok(GraphDbFreshnessReport {
+            status: "missing".to_string(),
+            fail_closed: true,
+            projection_version: None,
+            content_hash: None,
+            source_watermark: None,
+            diagnostics: vec![
+                "graph projection metadata table is missing; refresh graph.db before trusting reads"
+                    .to_string(),
+            ],
+        });
+    }
+    let version = conn
+        .query_row(
+            r#"
+            SELECT projection_version, content_hash, source_watermark
+            FROM graph_projection_versions
+            WHERE scope = ?1
+            "#,
+            [scope],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((projection_version, content_hash, source_watermark)) = version else {
+        return Ok(GraphDbFreshnessReport {
+            status: "missing".to_string(),
+            fail_closed: true,
+            projection_version: None,
+            content_hash: None,
+            source_watermark: None,
+            diagnostics: vec![
+                "graph projection metadata is missing; refresh graph.db before trusting reads"
+                    .to_string(),
+            ],
+        });
+    };
+
+    let mut diagnostics = Vec::new();
+    if projection_version != GRAPH_PROJECTION_VERSION {
+        diagnostics.push(format!(
+            "projection version mismatch: expected {} got {}",
+            GRAPH_PROJECTION_VERSION, projection_version
+        ));
+    }
+    if content_hash.is_none() {
+        diagnostics.push("projection content hash is missing".to_string());
+    }
+    let fail_closed = !diagnostics.is_empty();
+    Ok(GraphDbFreshnessReport {
+        status: if fail_closed { "stale" } else { "current" }.to_string(),
+        fail_closed,
+        projection_version: Some(projection_version),
+        content_hash,
+        source_watermark,
+        diagnostics,
+    })
+}
+
+fn graph_db_operator_next_commands(
+    root: &Path,
+    scope: Option<&str>,
+    include_refresh: bool,
+) -> Vec<String> {
+    let mut commands = Vec::new();
+    if include_refresh {
+        commands.push(graph_db_refresh_command(root, scope));
+    }
+    commands.push(format!(
+        "tsift graph-db --path {}{} doctor --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope)
+    ));
+    commands.push(format!(
+        "tsift graph-db --path {}{} --backend convex-snapshot --convex-snapshot <rows.json> drift --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope)
+    ));
+    commands.push(format!(
+        "tsift convex-sync {}{} --remote-snapshot --apply --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope)
+    ));
+    commands
 }
 
 fn sqlite_string_set(conn: &Connection, sql: &str) -> Result<BTreeSet<String>> {
@@ -6591,6 +6863,194 @@ fn print_graph_db_doctor_human(report: &GraphDbDoctorReport) {
     }
 }
 
+fn graph_db_operator_report_from_disk(
+    root: &Path,
+    scope: Option<&str>,
+    graph_db: &Path,
+    operation: &str,
+    refresh: Option<GraphDbRefreshSummary>,
+    warnings: Vec<String>,
+) -> Result<GraphDbOperatorReport> {
+    if !graph_db.exists() {
+        return Ok(GraphDbOperatorReport {
+            root: root.to_string_lossy().to_string(),
+            scope: scope.map(str::to_string),
+            graph_db: graph_db.to_string_lossy().to_string(),
+            operation: operation.to_string(),
+            status: "missing".to_string(),
+            materialized: false,
+            freshness: GraphDbFreshnessReport {
+                status: "missing".to_string(),
+                fail_closed: true,
+                projection_version: None,
+                content_hash: None,
+                source_watermark: None,
+                diagnostics: vec![
+                    "graph.db is missing; run graph-db refresh before trusting graph reads"
+                        .to_string(),
+                ],
+            },
+            counts: GraphDbOperatorCounts {
+                nodes: 0,
+                edges: 0,
+                tombstones: GraphDbTombstoneCounts {
+                    nodes: 0,
+                    edges: 0,
+                    total: 0,
+                },
+            },
+            refresh,
+            next_commands: graph_db_operator_next_commands(root, scope, true),
+            warnings,
+        });
+    }
+
+    let conn = open_sqlite_graph_db_readonly(graph_db)?;
+    let mut freshness = sqlite_graph_freshness_from_conn(&conn, scope.unwrap_or("root"))?;
+    let schema_diagnostics = sqlite_graph_schema_diagnostics(&conn)
+        .unwrap_or_else(|err| vec![format!("graph.db schema inspection failed: {err}")]);
+    if !schema_diagnostics.is_empty() {
+        freshness.diagnostics.extend(schema_diagnostics);
+        freshness.fail_closed = true;
+        freshness.status = "stale".to_string();
+    }
+    let counts = sqlite_graph_counts(&conn)?;
+    let status = if freshness.fail_closed {
+        "stale"
+    } else {
+        "current"
+    }
+    .to_string();
+
+    Ok(GraphDbOperatorReport {
+        root: root.to_string_lossy().to_string(),
+        scope: scope.map(str::to_string),
+        graph_db: graph_db.to_string_lossy().to_string(),
+        operation: operation.to_string(),
+        status,
+        materialized: true,
+        freshness,
+        counts,
+        refresh,
+        next_commands: graph_db_operator_next_commands(root, scope, false),
+        warnings,
+    })
+}
+
+fn print_graph_db_operator_human(report: &GraphDbOperatorReport) {
+    println!(
+        "graph-db {} status: {} materialized: {}",
+        report.operation, report.status, report.materialized
+    );
+    println!("graph_db: {}", report.graph_db);
+    println!(
+        "projection: version={} hash={} watermark={}",
+        report
+            .freshness
+            .projection_version
+            .as_deref()
+            .unwrap_or("<missing>"),
+        report
+            .freshness
+            .content_hash
+            .as_deref()
+            .unwrap_or("<missing>"),
+        report
+            .freshness
+            .source_watermark
+            .as_deref()
+            .unwrap_or("<missing>")
+    );
+    println!(
+        "rows: {} node(s), {} edge(s), {} tombstone(s)",
+        report.counts.nodes, report.counts.edges, report.counts.tombstones.total
+    );
+    if let Some(refresh) = &report.refresh {
+        println!(
+            "refresh: {} tombstoned node(s), {} tombstoned edge(s)",
+            refresh.tombstoned_nodes, refresh.tombstoned_edges
+        );
+    }
+    for diagnostic in &report.freshness.diagnostics {
+        println!("diagnostic: {diagnostic}");
+    }
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    for command in &report.next_commands {
+        println!("next: {command}");
+    }
+}
+
+fn print_graph_db_operator_report(
+    report: &GraphDbOperatorReport,
+    format: OutputFormat,
+) -> Result<()> {
+    if format.json_output {
+        print_json_or_envelope(
+            report,
+            &format,
+            "graph-db",
+            &report.operation,
+            ToolEnvelopeSummary {
+                text: format!(
+                    "Graph DB {} status {} with {} node(s), {} edge(s), {} tombstone(s)",
+                    report.operation,
+                    report.status,
+                    report.counts.nodes,
+                    report.counts.edges,
+                    report.counts.tombstones.total
+                ),
+                metrics: vec![
+                    envelope_metric("operation", &report.operation),
+                    envelope_metric("status", &report.status),
+                    envelope_metric("nodes", report.counts.nodes),
+                    envelope_metric("edges", report.counts.edges),
+                    envelope_metric("tombstones", report.counts.tombstones.total),
+                ],
+            },
+            false,
+            report.next_commands.clone(),
+        )
+    } else {
+        print_graph_db_operator_human(report);
+        Ok(())
+    }
+}
+
+fn cmd_graph_db_status(root: &Path, scope: Option<&str>, format: OutputFormat) -> Result<()> {
+    let graph_db = graph_substrate_db_path(root, scope);
+    let report =
+        graph_db_operator_report_from_disk(root, scope, &graph_db, "status", None, Vec::new())?;
+    print_graph_db_operator_report(&report, format)
+}
+
+fn cmd_graph_db_refresh(
+    root: &Path,
+    path: &Path,
+    scope: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    let (graph, refresh) = refresh_traversal_graph_store(root, path, scope)?;
+    let graph_db = graph_substrate_db_path(root, scope);
+    let refresh = GraphDbRefreshSummary {
+        scope: refresh.scope,
+        projection_version: refresh.projection_version,
+        source_watermark: refresh.source_watermark,
+        tombstoned_nodes: refresh.tombstoned_nodes.len(),
+        tombstoned_edges: refresh.tombstoned_edges.len(),
+    };
+    let report = graph_db_operator_report_from_disk(
+        root,
+        scope,
+        &graph_db,
+        "refresh",
+        Some(refresh),
+        graph.warnings,
+    )?;
+    print_graph_db_operator_report(&report, format)
+}
+
 fn cmd_graph_db_doctor(
     root: &Path,
     scope: Option<&str>,
@@ -6896,12 +7356,24 @@ fn graph_db_schema() -> GraphDbSchema {
         ],
         operations: vec![
             GraphDbSchemaOperation {
+                command: "refresh",
+                description: "Materialize .tsift/graph.db explicitly and report projection metadata, row counts, tombstone counts, and operator next commands",
+            },
+            GraphDbSchemaOperation {
+                command: "status",
+                description: "Inspect .tsift/graph.db freshness, projection metadata, row counts, tombstone counts, and operator next commands without refreshing",
+            },
+            GraphDbSchemaOperation {
                 command: "doctor",
                 description: "Validate graph.db or Convex snapshot health and return fail-closed repair diagnostics",
             },
             GraphDbSchemaOperation {
                 command: "drift",
                 description: "Compare local SQLite projection rows with a Convex snapshot and return upsert, tombstone, metadata, duplicate, orphan, and next-command diagnostics",
+            },
+            GraphDbSchemaOperation {
+                command: "evidence <target> [--depth N] [--limit N]",
+                description: "Return a bounded graph-db handoff packet for a backlog id or job packet handle, including worker_context rows, source_handle rows, shortest paths, and next commands",
             },
             GraphDbSchemaOperation {
                 command: "schema",
@@ -7038,6 +7510,256 @@ fn graph_db_shortest_path_with_max_hops(
     Ok(None)
 }
 
+fn graph_db_resolve_evidence_target(
+    store: &impl GraphStore,
+    target: &str,
+) -> Result<Option<SubstrateGraphNode>> {
+    if let Some(node) = store.node(target)? {
+        return Ok(Some(node));
+    }
+    let normalized = target.trim().trim_start_matches('#');
+    let mut candidates = store
+        .all_nodes()?
+        .into_iter()
+        .filter(|node| {
+            node.properties.get("handle").map(String::as_str) == Some(target)
+                || node.properties.get("ref_id").map(String::as_str) == Some(normalized)
+                || node.label == target
+                || node.label == format!("#{normalized}")
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        evidence_kind_rank(&left.kind)
+            .cmp(&evidence_kind_rank(&right.kind))
+            .then(left.id.cmp(&right.id))
+    });
+    Ok(candidates.into_iter().next())
+}
+
+fn evidence_kind_rank(kind: &str) -> usize {
+    match kind {
+        "backlog" => 0,
+        "job_packet" => 1,
+        "worker_context" => 2,
+        "source_handle" => 3,
+        _ => 9,
+    }
+}
+
+fn graph_db_reachable_nodes_by_kind(
+    store: &impl GraphStore,
+    from_id: &str,
+    kind: &str,
+    depth: usize,
+    limit: usize,
+) -> Result<Vec<(SubstrateGraphNode, substrate::GraphPath)>> {
+    let mut rows = Vec::new();
+    for node in store
+        .all_nodes()?
+        .into_iter()
+        .filter(|node| node.kind == kind)
+    {
+        if let Some(path) =
+            graph_db_shortest_path_with_max_hops(store, from_id, &node.id, None, Some(depth))?
+        {
+            rows.push((node, path));
+        }
+    }
+    rows.sort_by(|(left_node, left_path), (right_node, right_path)| {
+        left_path
+            .hops
+            .cmp(&right_path.hops)
+            .then(left_node.label.cmp(&right_node.label))
+            .then(left_node.id.cmp(&right_node.id))
+    });
+    if limit > 0 && rows.len() > limit {
+        rows.truncate(limit);
+    }
+    Ok(rows)
+}
+
+fn graph_db_evidence_next_commands(
+    root: &Path,
+    scope: Option<&str>,
+    target: &SubstrateGraphNode,
+    worker_context: &[SubstrateGraphNode],
+    source_handles: &[SubstrateGraphNode],
+) -> Vec<String> {
+    let mut commands = BTreeSet::new();
+    if let Some(expand) = target.properties.get("expand") {
+        commands.insert(expand.clone());
+    }
+    for worker in worker_context {
+        if let Some(expand) = worker.properties.get("expand") {
+            commands.insert(expand.clone());
+        }
+    }
+    for source in source_handles {
+        if let Some(expand) = source.properties.get("expand") {
+            commands.insert(expand.clone());
+        }
+    }
+    commands.insert(format!(
+        "tsift graph-db --path {}{} status --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope)
+    ));
+    commands.insert(format!(
+        "tsift graph-db --path {}{} doctor --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope)
+    ));
+    commands.into_iter().collect()
+}
+
+fn graph_db_evidence_report_from_store<S: GraphStore>(
+    input: GraphDbEvidenceInput<'_, S>,
+) -> Result<GraphDbEvidenceReport> {
+    let GraphDbEvidenceInput {
+        root,
+        scope,
+        backend,
+        target,
+        depth,
+        limit,
+        store,
+        freshness,
+        warnings,
+    } = input;
+    if freshness.fail_closed {
+        bail!(
+            "graph database evidence failed closed for {} backend: {}",
+            backend,
+            freshness.diagnostics.join("; ")
+        );
+    }
+    let target_node = graph_db_resolve_evidence_target(store, target)?
+        .with_context(|| format!("graph-db evidence target not found: {target}"))?;
+    let max_rows = if limit == 0 { usize::MAX } else { limit };
+    let worker_paths = graph_db_reachable_nodes_by_kind(
+        store,
+        &target_node.id,
+        "worker_context",
+        depth,
+        max_rows,
+    )?;
+    let source_paths =
+        graph_db_reachable_nodes_by_kind(store, &target_node.id, "source_handle", depth, max_rows)?;
+
+    let worker_context = worker_paths
+        .iter()
+        .map(|(node, _)| node.clone())
+        .collect::<Vec<_>>();
+    let source_handles = source_paths
+        .iter()
+        .map(|(node, _)| node.clone())
+        .collect::<Vec<_>>();
+    let shortest_paths = worker_paths
+        .iter()
+        .chain(source_paths.iter())
+        .map(|(node, path)| GraphDbEvidencePath {
+            to: node.id.clone(),
+            kind: node.kind.clone(),
+            label: node.label.clone(),
+            path: Some(path.clone()),
+            expand: node.properties.get("expand").cloned(),
+        })
+        .collect::<Vec<_>>();
+    let next_commands = graph_db_evidence_next_commands(
+        root,
+        scope,
+        &target_node,
+        &worker_context,
+        &source_handles,
+    );
+
+    Ok(GraphDbEvidenceReport {
+        root: root.to_string_lossy().to_string(),
+        scope: scope.map(str::to_string),
+        backend: backend.to_string(),
+        target: target.to_string(),
+        freshness,
+        target_node,
+        worker_context,
+        source_handles,
+        shortest_paths,
+        next_commands,
+        fixture_coverage: GraphDbFixtureCoverage {
+            test: "graph_db_evidence_packet_covers_backlog_job_worker_context_and_source_handles"
+                .to_string(),
+            fixture: "tests/graph_db_conformance.rs::graph_db_project".to_string(),
+            assertions: vec![
+                "backlog id and job packet handle resolve to graph nodes".to_string(),
+                "worker_context rows are reachable from queued work".to_string(),
+                "source_handle rows are reachable through bounded shortest paths".to_string(),
+            ],
+        },
+        warnings,
+    })
+}
+
+fn print_graph_db_evidence_human(report: &GraphDbEvidenceReport) {
+    println!(
+        "graph-db evidence backend: {} target: {} [{}]",
+        report.backend, report.target_node.id, report.target_node.kind
+    );
+    println!(
+        "evidence: {} worker_context row(s), {} source_handle row(s), {} path(s)",
+        report.worker_context.len(),
+        report.source_handles.len(),
+        report.shortest_paths.len()
+    );
+    for path in &report.shortest_paths {
+        if let Some(graph_path) = &path.path {
+            println!(
+                "path: {} hop(s) {}",
+                graph_path.hops,
+                graph_path.nodes.join(" -> ")
+            );
+        }
+    }
+    for command in &report.next_commands {
+        println!("next: {command}");
+    }
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+}
+
+fn print_graph_db_evidence_report(
+    report: &GraphDbEvidenceReport,
+    format: OutputFormat,
+) -> Result<()> {
+    if format.json_output {
+        print_json_or_envelope(
+            report,
+            &format,
+            "graph-db",
+            "evidence",
+            ToolEnvelopeSummary {
+                text: format!(
+                    "Graph DB evidence for {} returned {} worker context row(s), {} source handle(s), and {} shortest path(s)",
+                    report.target,
+                    report.worker_context.len(),
+                    report.source_handles.len(),
+                    report.shortest_paths.len()
+                ),
+                metrics: vec![
+                    envelope_metric("backend", &report.backend),
+                    envelope_metric("worker_context", report.worker_context.len()),
+                    envelope_metric("source_handles", report.source_handles.len()),
+                    envelope_metric("paths", report.shortest_paths.len()),
+                ],
+            },
+            false,
+            report.next_commands.clone(),
+        )
+    } else {
+        print_graph_db_evidence_human(report);
+        Ok(())
+    }
+}
+
 fn graph_db_report_from_store(
     root: &Path,
     scope: Option<&str>,
@@ -7070,11 +7792,20 @@ fn graph_db_report_from_store(
     };
 
     match query {
+        GraphDbQuery::Refresh => {
+            bail!("graph-db refresh must be handled by the refresh command path");
+        }
+        GraphDbQuery::Status => {
+            bail!("graph-db status must be handled by the status command path");
+        }
         GraphDbQuery::Doctor => {
             bail!("graph-db doctor must be handled by the doctor command path");
         }
         GraphDbQuery::Drift => {
             bail!("graph-db drift must be handled by the drift command path");
+        }
+        GraphDbQuery::Evidence { .. } => {
+            bail!("graph-db evidence must be handled by the evidence command path");
         }
         GraphDbQuery::Schema => {
             report.schema = Some(graph_db_schema());
@@ -7197,11 +7928,20 @@ fn cmd_graph_db(
     format: OutputFormat,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    if matches!(query, GraphDbQuery::Doctor) {
-        return cmd_graph_db_doctor(&root, scope, backend, convex_snapshot, format);
-    }
-    if matches!(query, GraphDbQuery::Drift) {
-        return cmd_graph_db_drift(&root, path, scope, convex_snapshot, format);
+    match &query {
+        GraphDbQuery::Refresh => {
+            return cmd_graph_db_refresh(&root, path, scope, format);
+        }
+        GraphDbQuery::Status => {
+            return cmd_graph_db_status(&root, scope, format);
+        }
+        GraphDbQuery::Doctor => {
+            return cmd_graph_db_doctor(&root, scope, backend, convex_snapshot, format);
+        }
+        GraphDbQuery::Drift => {
+            return cmd_graph_db_drift(&root, path, scope, convex_snapshot, format);
+        }
+        _ => {}
     }
     let graph = build_traversal_graph(&root, path, scope)?;
     let graph_db = graph_substrate_db_path(&root, scope);
@@ -7209,6 +7949,25 @@ fn cmd_graph_db(
         GraphDbBackend::Sqlite => {
             let store = SqliteGraphStore::open(&graph_db)?;
             let freshness = sqlite_graph_freshness(&store, scope.unwrap_or("root"))?;
+            if let GraphDbQuery::Evidence {
+                target,
+                depth,
+                limit,
+            } = &query
+            {
+                let report = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
+                    root: &root,
+                    scope,
+                    backend: "sqlite",
+                    target,
+                    depth: *depth,
+                    limit: *limit,
+                    store: &store,
+                    freshness,
+                    warnings: graph.warnings,
+                })?;
+                return print_graph_db_evidence_report(&report, format);
+            }
             graph_db_report_from_store(
                 &root,
                 scope,
@@ -7229,6 +7988,25 @@ fn cmd_graph_db(
             let freshness = convex_graph_freshness(&local, &snapshot, scope);
             let client = ConvexRowsGraphClient::from_rows(snapshot);
             let store = SubstrateConvexGraphStore::new(client);
+            if let GraphDbQuery::Evidence {
+                target,
+                depth,
+                limit,
+            } = &query
+            {
+                let report = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
+                    root: &root,
+                    scope,
+                    backend: "convex-snapshot",
+                    target,
+                    depth: *depth,
+                    limit: *limit,
+                    store: &store,
+                    freshness,
+                    warnings: graph.warnings,
+                })?;
+                return print_graph_db_evidence_report(&report, format);
+            }
             graph_db_report_from_store(
                 &root,
                 scope,
@@ -8039,16 +8817,16 @@ fn build_traversal_graph_source(
     Ok(graph)
 }
 
-fn build_traversal_graph(
+fn refresh_traversal_graph_store(
     root: &Path,
     path_hint: &Path,
     scope: Option<&str>,
-) -> Result<TraversalGraphBuild> {
+) -> Result<(TraversalGraphBuild, SqliteProjectionRefresh)> {
     let source_graph = build_traversal_graph_source(root, path_hint, scope)?;
     let projection = traversal_projection_from_graph(root, scope, &source_graph)?;
     let graph_db = graph_substrate_db_path(root, scope);
     let mut store = SqliteGraphStore::open(&graph_db)?;
-    store.replace_projection_with_version(
+    let refresh = store.replace_projection_with_version(
         scope.unwrap_or("root"),
         &projection,
         Some(GRAPH_PROJECTION_VERSION),
@@ -8056,6 +8834,15 @@ fn build_traversal_graph(
     )?;
     let mut graph = traversal_graph_from_store(root, &store)?;
     graph.warnings = source_graph.warnings;
+    Ok((graph, refresh))
+}
+
+fn build_traversal_graph(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+) -> Result<TraversalGraphBuild> {
+    let (graph, _refresh) = refresh_traversal_graph_store(root, path_hint, scope)?;
     Ok(graph)
 }
 
