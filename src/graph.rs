@@ -20,6 +20,24 @@ pub struct CallEdge {
     pub call_site_line: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteSite {
+    pub framework: String,
+    pub method: Option<String>,
+    pub path: String,
+    pub handler: String,
+    pub line: usize,
+    pub handler_line: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRoute {
+    framework: String,
+    method: Option<String>,
+    path: String,
+    line: usize,
+}
+
 impl Lang {
     pub fn call_query(&self) -> Option<&'static str> {
         match self {
@@ -104,6 +122,336 @@ pub fn extract_call_sites(lang: Lang, source: &[u8]) -> Result<Vec<CallSite>> {
     Ok(sites)
 }
 
+pub fn extract_route_sites(lang: Lang, source: &[u8]) -> Result<Vec<RouteSite>> {
+    let text = std::str::from_utf8(source)?;
+    Ok(match lang {
+        #[cfg(feature = "lang-rust")]
+        Lang::Rust => extract_rust_routes(text),
+        #[cfg(feature = "lang-python")]
+        Lang::Python => extract_python_routes(text),
+        #[cfg(feature = "lang-typescript")]
+        Lang::TypeScript | Lang::Tsx => extract_typescript_routes(text),
+        #[cfg(feature = "lang-javascript")]
+        Lang::JavaScript | Lang::Jsx => extract_typescript_routes(text),
+        _ => Vec::new(),
+    })
+}
+
+fn extract_string_literal(input: &str) -> Option<(String, usize)> {
+    let mut chars = input.char_indices();
+    while let Some((start, ch)) = chars.next() {
+        if ch != '"' && ch != '\'' {
+            continue;
+        }
+        let quote = ch;
+        let mut escaped = false;
+        let mut value = String::new();
+        for (offset, current) in chars.by_ref() {
+            if escaped {
+                value.push(current);
+                escaped = false;
+                continue;
+            }
+            if current == '\\' {
+                escaped = true;
+                continue;
+            }
+            if current == quote {
+                return Some((value, offset + current.len_utf8()));
+            }
+            value.push(current);
+        }
+        return Some((input[start + quote.len_utf8()..].to_string(), input.len()));
+    }
+    None
+}
+
+fn first_identifier(input: &str) -> Option<String> {
+    let mut start = None;
+    for (idx, ch) in input.char_indices() {
+        if start.is_none() {
+            if ch == '_' || ch.is_ascii_alphabetic() {
+                start = Some(idx);
+            }
+            continue;
+        }
+        if !(ch == '_' || ch.is_ascii_alphanumeric()) {
+            let value = input[start.unwrap()..idx].to_string();
+            return (!is_handler_keyword(&value)).then_some(value);
+        }
+    }
+    start
+        .map(|idx| input[idx..].to_string())
+        .filter(|value| !is_handler_keyword(value))
+}
+
+fn is_handler_keyword(value: &str) -> bool {
+    matches!(
+        value,
+        "async" | "await" | "function" | "move" | "None" | "Some" | "lambda"
+    )
+}
+
+fn route_methods() -> &'static [&'static str] {
+    &[
+        "get", "post", "put", "patch", "delete", "head", "options", "any", "route",
+    ]
+}
+
+fn parse_wrapped_handler(input: &str) -> (Option<String>, Option<String>) {
+    for method in route_methods() {
+        let needle = format!("{method}(");
+        if let Some(pos) = input.find(&needle) {
+            let inside = &input[pos + needle.len()..];
+            return (
+                Some((*method).to_string()),
+                first_identifier(inside).or_else(|| Some("<inline>".to_string())),
+            );
+        }
+    }
+    (None, first_identifier(input))
+}
+
+fn parse_rust_fn_name(line: &str) -> Option<String> {
+    let pos = line.find("fn ")?;
+    first_identifier(&line[pos + 3..])
+}
+
+fn parse_route_attribute(line: &str, framework: &str) -> Option<PendingRoute> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("#[")?;
+    for method in route_methods() {
+        let Some(method_rest) = rest.strip_prefix(method) else {
+            continue;
+        };
+        if !method_rest.trim_start().starts_with('(') {
+            continue;
+        }
+        let (path, _) = extract_string_literal(method_rest)?;
+        return Some(PendingRoute {
+            framework: framework.to_string(),
+            method: Some((*method).to_string()),
+            path,
+            line: 0,
+        });
+    }
+    None
+}
+
+fn extract_rust_routes(text: &str) -> Vec<RouteSite> {
+    let mut routes = Vec::new();
+    let mut pending = Vec::<PendingRoute>::new();
+
+    for (line_idx, line) in text.lines().enumerate() {
+        if let Some(mut attr) = parse_route_attribute(line, "actix") {
+            attr.line = line_idx;
+            if let Some(handler) = parse_rust_fn_name(line) {
+                routes.push(RouteSite {
+                    framework: attr.framework,
+                    method: attr.method,
+                    path: attr.path,
+                    handler,
+                    line: attr.line,
+                    handler_line: Some(line_idx),
+                });
+            } else {
+                pending.push(attr);
+            }
+        } else if !pending.is_empty()
+            && let Some(handler) = parse_rust_fn_name(line)
+        {
+            for attr in pending.drain(..) {
+                routes.push(RouteSite {
+                    framework: attr.framework,
+                    method: attr.method,
+                    path: attr.path,
+                    handler: handler.clone(),
+                    line: attr.line,
+                    handler_line: Some(line_idx),
+                });
+            }
+        }
+
+        if let Some(route_pos) = line.find(".route(") {
+            let route_args = &line[route_pos + ".route(".len()..];
+            if let Some((path, end_offset)) = extract_string_literal(route_args) {
+                let args_after_path = &route_args[end_offset..];
+                let (method, handler) = parse_wrapped_handler(args_after_path);
+                if let Some(handler) = handler {
+                    routes.push(RouteSite {
+                        framework: "axum".to_string(),
+                        method: method.or_else(|| Some("route".to_string())),
+                        path,
+                        handler,
+                        line: line_idx,
+                        handler_line: None,
+                    });
+                }
+            }
+        }
+    }
+
+    routes
+}
+
+fn parse_python_def_name(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .strip_prefix("async def ")
+        .or_else(|| trimmed.strip_prefix("def "))?;
+    first_identifier(rest)
+}
+
+fn parse_python_route_decorator(line: &str) -> Option<PendingRoute> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix('@')?;
+    let dot = rest.find('.')?;
+    let after_dot = &rest[dot + 1..];
+    for method in route_methods() {
+        let Some(method_rest) = after_dot.strip_prefix(method) else {
+            continue;
+        };
+        if !method_rest.trim_start().starts_with('(') {
+            continue;
+        }
+        let (path, _) = extract_string_literal(method_rest)?;
+        let framework = if *method == "route" {
+            "flask"
+        } else {
+            "fastapi"
+        };
+        return Some(PendingRoute {
+            framework: framework.to_string(),
+            method: Some((*method).to_string()),
+            path,
+            line: 0,
+        });
+    }
+    None
+}
+
+fn extract_python_routes(text: &str) -> Vec<RouteSite> {
+    let mut routes = Vec::new();
+    let mut pending = Vec::<PendingRoute>::new();
+
+    for (line_idx, line) in text.lines().enumerate() {
+        if let Some(mut route) = parse_python_route_decorator(line) {
+            route.line = line_idx;
+            pending.push(route);
+            continue;
+        }
+
+        if !pending.is_empty()
+            && let Some(handler) = parse_python_def_name(line)
+        {
+            for route in pending.drain(..) {
+                routes.push(RouteSite {
+                    framework: route.framework,
+                    method: route.method,
+                    path: route.path,
+                    handler: handler.clone(),
+                    line: route.line,
+                    handler_line: Some(line_idx),
+                });
+            }
+        }
+    }
+
+    routes
+}
+
+fn parse_ts_method_name(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    first_identifier(trimmed)
+}
+
+fn parse_ts_route_decorator(line: &str) -> Option<PendingRoute> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix('@')?;
+    for method in route_methods() {
+        let mut chars = method.chars();
+        let title = match chars.next() {
+            Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+            None => continue,
+        };
+        let Some(method_rest) = rest.strip_prefix(&title) else {
+            continue;
+        };
+        if !method_rest.trim_start().starts_with('(') {
+            continue;
+        }
+        let (path, _) = extract_string_literal(method_rest)?;
+        return Some(PendingRoute {
+            framework: "nestjs".to_string(),
+            method: Some((*method).to_string()),
+            path,
+            line: 0,
+        });
+    }
+    None
+}
+
+fn parse_ts_router_call(line: &str, line_idx: usize) -> Option<RouteSite> {
+    for method in route_methods() {
+        if *method == "route" {
+            continue;
+        }
+        let needle = format!(".{method}(");
+        let Some(pos) = line.find(&needle) else {
+            continue;
+        };
+        let args = &line[pos + needle.len()..];
+        let (path, end_offset) = extract_string_literal(args)?;
+        let handler = args[end_offset..]
+            .split_once(',')
+            .and_then(|(_, rest)| first_identifier(rest))
+            .unwrap_or_else(|| "<inline>".to_string());
+        return Some(RouteSite {
+            framework: "express".to_string(),
+            method: Some((*method).to_string()),
+            path,
+            handler,
+            line: line_idx,
+            handler_line: None,
+        });
+    }
+    None
+}
+
+fn extract_typescript_routes(text: &str) -> Vec<RouteSite> {
+    let mut routes = Vec::new();
+    let mut pending = Vec::<PendingRoute>::new();
+
+    for (line_idx, line) in text.lines().enumerate() {
+        if let Some(mut route) = parse_ts_route_decorator(line) {
+            route.line = line_idx;
+            pending.push(route);
+            continue;
+        }
+
+        if !pending.is_empty()
+            && let Some(handler) = parse_ts_method_name(line)
+        {
+            for route in pending.drain(..) {
+                routes.push(RouteSite {
+                    framework: route.framework,
+                    method: route.method,
+                    path: route.path,
+                    handler: handler.clone(),
+                    line: route.line,
+                    handler_line: Some(line_idx),
+                });
+            }
+        }
+
+        if let Some(route) = parse_ts_router_call(line, line_idx) {
+            routes.push(route);
+        }
+    }
+
+    routes
+}
+
 pub fn resolve_edges(symbols: &[Symbol], call_sites: &[CallSite]) -> Vec<CallEdge> {
     let mut edges = Vec::new();
     for site in call_sites {
@@ -126,6 +474,15 @@ pub fn resolve_edges(symbols: &[Symbol], call_sites: &[CallSite]) -> Vec<CallEdg
 
 pub fn code_symbol_node_id(name: &str) -> String {
     format!("code.symbol:{name}")
+}
+
+pub fn code_route_node_id(framework: &str, method: Option<&str>, path: &str) -> String {
+    format!(
+        "code.route:{}:{}:{}",
+        framework,
+        method.unwrap_or("any"),
+        path
+    )
 }
 
 pub fn project_call_edges(
@@ -155,6 +512,63 @@ pub fn project_call_edges(
             projected = projected.with_provenance(provenance);
         }
         projected_edges.push(projected);
+    }
+
+    GraphProjection {
+        nodes: nodes.into_values().collect(),
+        edges: projected_edges,
+    }
+}
+
+pub fn project_routes(
+    routes: &[RouteSite],
+    provenance: Option<GraphProvenance>,
+) -> GraphProjection {
+    let mut nodes = BTreeMap::<String, GraphNode>::new();
+    let mut projected_edges = Vec::with_capacity(routes.len());
+
+    for route in routes {
+        let route_id = code_route_node_id(&route.framework, route.method.as_deref(), &route.path);
+        let handler_id = code_symbol_node_id(&route.handler);
+        let mut route_node = GraphNode::new(
+            route_id.clone(),
+            "route",
+            format!(
+                "{} {}",
+                route.method.as_deref().unwrap_or("any").to_uppercase(),
+                route.path
+            ),
+        )
+        .with_property("framework", route.framework.clone())
+        .with_property("path", route.path.clone())
+        .with_property("handler", route.handler.clone())
+        .with_property("line", route.line.to_string());
+        if let Some(method) = &route.method {
+            route_node = route_node.with_property("method", method.clone());
+        }
+        if let Some(provenance) = provenance.clone() {
+            route_node = route_node.with_provenance(provenance);
+        }
+        nodes.entry(route_id.clone()).or_insert(route_node);
+
+        nodes.entry(handler_id.clone()).or_insert_with(|| {
+            let mut node = GraphNode::new(handler_id.clone(), "code_symbol", route.handler.clone());
+            if let Some(provenance) = provenance.clone() {
+                node = node.with_provenance(provenance);
+            }
+            node
+        });
+
+        let mut edge = SubstrateEdge::new(route_id, handler_id, "handled_by")
+            .with_property("route_path", route.path.clone())
+            .with_property("framework", route.framework.clone());
+        if let Some(method) = &route.method {
+            edge = edge.with_property("method", method.clone());
+        }
+        if let Some(provenance) = provenance.clone() {
+            edge = edge.with_provenance(provenance);
+        }
+        projected_edges.push(edge);
     }
 
     GraphProjection {
@@ -446,6 +860,36 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lang-rust")]
+    #[test]
+    fn rust_axum_route_extracted() {
+        let source = br#"fn router() {
+    Router::new().route("/users", get(list_users));
+}
+fn list_users() {}
+"#;
+        let routes = extract_route_sites(Lang::Rust, source).unwrap();
+        assert!(routes.iter().any(|route| {
+            route.framework == "axum"
+                && route.method.as_deref() == Some("get")
+                && route.path == "/users"
+                && route.handler == "list_users"
+        }));
+    }
+
+    #[cfg(feature = "lang-rust")]
+    #[test]
+    fn rust_actix_route_attribute_extracted() {
+        let source = br#"#[post("/submit")]
+async fn submit_form() {}
+"#;
+        let routes = extract_route_sites(Lang::Rust, source).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].framework, "actix");
+        assert_eq!(routes[0].method.as_deref(), Some("post"));
+        assert_eq!(routes[0].handler, "submit_form");
+    }
+
     #[cfg(feature = "lang-python")]
     #[test]
     fn python_direct_call() {
@@ -470,6 +914,21 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "lang-python")]
+    #[test]
+    fn python_fastapi_route_extracted() {
+        let source = br#"@router.get("/items/{item_id}")
+def read_item(item_id: str):
+    return item_id
+"#;
+        let routes = extract_route_sites(Lang::Python, source).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].framework, "fastapi");
+        assert_eq!(routes[0].method.as_deref(), Some("get"));
+        assert_eq!(routes[0].path, "/items/{item_id}");
+        assert_eq!(routes[0].handler, "read_item");
+    }
+
     #[cfg(feature = "lang-typescript")]
     #[test]
     fn typescript_direct_call() {
@@ -488,6 +947,20 @@ mod tests {
         let source = b"function main() { arr.push(1); }";
         let sites = extract_call_sites(Lang::TypeScript, source).unwrap();
         assert!(sites.iter().any(|s| s.callee == "push"), "got: {:?}", sites);
+    }
+
+    #[cfg(feature = "lang-typescript")]
+    #[test]
+    fn typescript_express_route_extracted() {
+        let source = br#"router.post("/users", createUser);
+function createUser() {}
+"#;
+        let routes = extract_route_sites(Lang::TypeScript, source).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].framework, "express");
+        assert_eq!(routes[0].method.as_deref(), Some("post"));
+        assert_eq!(routes[0].path, "/users");
+        assert_eq!(routes[0].handler, "createUser");
     }
 
     #[cfg(feature = "lang-javascript")]
@@ -625,6 +1098,31 @@ mod tests {
             Some(&"12".to_string())
         );
         assert_eq!(calls[0].provenance[0].source, "tsift.index");
+    }
+
+    #[test]
+    fn project_routes_to_provider_neutral_substrate() {
+        let routes = vec![RouteSite {
+            framework: "fastapi".into(),
+            method: Some("get".into()),
+            path: "/items".into(),
+            handler: "list_items".into(),
+            line: 3,
+            handler_line: Some(4),
+        }];
+        let projection = project_routes(
+            &routes,
+            Some(GraphProvenance::new("tsift.index", "src/api.py")),
+        );
+
+        assert!(
+            projection
+                .nodes
+                .iter()
+                .any(|node| node.kind == "route" && node.label == "GET /items")
+        );
+        assert!(projection.edges.iter().any(|edge| edge.kind == "handled_by"
+            && edge.properties.get("route_path") == Some(&"/items".to_string())));
     }
 
     #[test]

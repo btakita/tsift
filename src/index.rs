@@ -135,6 +135,7 @@ pub enum IndexWarningStage {
     ReadSource,
     ExtractSymbols,
     ExtractCallSites,
+    ExtractRoutes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -201,6 +202,17 @@ pub struct StoredEdge {
     pub caller_line: i64,
     pub callee_name: String,
     pub call_site_line: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredRoute {
+    pub framework: String,
+    pub method: Option<String>,
+    pub route_path: String,
+    pub handler_name: String,
+    pub file: String,
+    pub line: i64,
+    pub handler_line: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -318,6 +330,19 @@ impl IndexDb {
             CREATE INDEX IF NOT EXISTS idx_call_edges_caller ON call_edges(caller_name);
             CREATE INDEX IF NOT EXISTS idx_call_edges_callee ON call_edges(callee_name);
             CREATE INDEX IF NOT EXISTS idx_call_edges_file ON call_edges(caller_file);
+            CREATE TABLE IF NOT EXISTS route_nodes (
+                id INTEGER PRIMARY KEY,
+                framework TEXT NOT NULL,
+                method TEXT,
+                route_path TEXT NOT NULL,
+                handler_name TEXT NOT NULL,
+                file TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                handler_line INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_route_nodes_path ON route_nodes(route_path);
+            CREATE INDEX IF NOT EXISTS idx_route_nodes_handler ON route_nodes(handler_name);
+            CREATE INDEX IF NOT EXISTS idx_route_nodes_file ON route_nodes(file);
             CREATE TABLE IF NOT EXISTS dir_state (
                 path TEXT PRIMARY KEY,
                 mtime_secs INTEGER NOT NULL,
@@ -699,6 +724,12 @@ impl IndexDb {
             let mut insert_edge = self.conn.prepare(
                 "INSERT INTO call_edges (caller_file, caller_name, caller_line, callee_name, call_site_line) VALUES (?1, ?2, ?3, ?4, ?5)"
             )?;
+            let mut delete_routes = self
+                .conn
+                .prepare("DELETE FROM route_nodes WHERE file = ?1")?;
+            let mut insert_route = self.conn.prepare(
+                "INSERT INTO route_nodes (framework, method, route_path, handler_name, file, line, handler_line) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+            )?;
             let mut warnings = Vec::new();
 
             for change in &summary.changes {
@@ -718,6 +749,7 @@ impl IndexDb {
 
                         delete_symbols.execute(rusqlite::params![&path_str])?;
                         delete_edges.execute(rusqlite::params![&path_str])?;
+                        delete_routes.execute(rusqlite::params![&path_str])?;
                         let lang = change
                             .path
                             .extension()
@@ -779,6 +811,26 @@ impl IndexDb {
                                         ])?;
                                     }
                                 }
+                                let routes = warning_on_error(
+                                    graph::extract_route_sites(lang, source),
+                                    &mut warnings,
+                                    &change.path,
+                                    Some(lang_name),
+                                    IndexWarningStage::ExtractRoutes,
+                                );
+                                if let Some(routes) = routes {
+                                    for route in &routes {
+                                        insert_route.execute(rusqlite::params![
+                                            &route.framework,
+                                            route.method.as_deref(),
+                                            &route.path,
+                                            &route.handler,
+                                            &path_str,
+                                            route.line as i64,
+                                            route.handler_line.map(|line| line as i64),
+                                        ])?;
+                                    }
+                                }
                             }
                         }
                     }
@@ -786,6 +838,7 @@ impl IndexDb {
                         delete_file.execute(rusqlite::params![&path_str])?;
                         delete_symbols.execute(rusqlite::params![&path_str])?;
                         delete_edges.execute(rusqlite::params![&path_str])?;
+                        delete_routes.execute(rusqlite::params![&path_str])?;
                     }
                 }
             }
@@ -829,6 +882,7 @@ impl IndexDb {
             self.conn.execute("DELETE FROM file_state", [])?;
             self.conn.execute("DELETE FROM symbols", [])?;
             self.conn.execute("DELETE FROM call_edges", [])?;
+            self.conn.execute("DELETE FROM route_nodes", [])?;
             self.conn.execute("DELETE FROM dir_state", [])?;
             maybe_fail_rebuild_after_clear()?;
             self.apply_changes(root)
@@ -949,6 +1003,25 @@ impl IndexDb {
                 caller_line: row.get(2)?,
                 callee_name: row.get(3)?,
                 call_site_line: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn all_routes(&self) -> Result<Vec<StoredRoute>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT framework, method, route_path, handler_name, file, line, handler_line \
+             FROM route_nodes ORDER BY file, line, route_path, handler_name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StoredRoute {
+                framework: row.get(0)?,
+                method: row.get(1)?,
+                route_path: row.get(2)?,
+                handler_name: row.get(3)?,
+                file: row.get(4)?,
+                line: row.get(5)?,
+                handler_line: row.get(6)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1846,6 +1919,28 @@ mod tests {
             db.edge_count().unwrap() > 0,
             "expected call edges from indexed files"
         );
+    }
+
+    #[test]
+    fn route_nodes_extracted_on_index() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("api.py"),
+            r#"@router.get("/items")
+def list_items():
+    return []
+"#,
+        )
+        .unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let routes = db.all_routes().unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].framework, "fastapi");
+        assert_eq!(routes[0].method.as_deref(), Some("get"));
+        assert_eq!(routes[0].route_path, "/items");
+        assert_eq!(routes[0].handler_name, "list_items");
     }
 
     #[test]

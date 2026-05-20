@@ -16,8 +16,9 @@ tsift (CLI + MCP plugin)
 ├── graph module (internal — src/graph.rs)
 │   ├── call-site extraction via tree-sitter queries
 │   ├── caller→callee edge resolution against symbol table
+│   ├── narrow Rust/TypeScript/Python route extraction for common web handlers
 │   ├── tsift code-symbol/call-edge adapter into substrate records
-│   └── SQLite storage (call_edges table)
+│   └── SQLite storage (call_edges and route_nodes tables)
 ├── lang module (tree-sitter parsing — existing)
 │   ├── symbol extraction (function/type/trait definitions)
 │   └── call queries (function calls, method calls, macro invocations)
@@ -103,6 +104,7 @@ tsift summarize --extract --diff  # re-extract only git-changed files within the
 tsift diff-digest [path]        # bounded worktree diff digest
 tsift diff-digest --cached .    # bounded staged-index diff digest
 tsift diff-digest --revision HEAD . # bounded single-revision/history digest
+tsift impact [path]             # affected-test candidates from changed files, imports, and graph edges
 tsift --envelope context-pack tasks/software/tsift.md --test-input test.log --log-input build.log
 tsift test-digest --path . < test.log  # bounded test-output digest from stdin or --input
 tsift metric-digest < runs.json  # repeated metric-run digest: deltas, improvements, news-ready table
@@ -211,9 +213,17 @@ The command supports three traversal modes:
 - node only: return a neighborhood explanation around a handle, symbol name, file path, or backlog id (`tsift traverse '#kgnv' --depth 2 --path .`)
 - node plus `--to`: return the shortest path between two graph nodes (`tsift traverse '#kgnv' --to main --path .`)
 
-Traversal edges include file-to-symbol `defines`, symbol-to-symbol `calls`, session-to-backlog `contains`, and backlog-to-code `mentions` links derived from backlog text tokens. Reports include `recommendations` that rank the next useful graph nodes for bug-fix navigation, prioritizing backlog mentions, shortest-path next hops, callers/callees, and defining files.
+Traversal edges include file-to-symbol `defines`, symbol-to-symbol `calls`, file-to-route `defines_route`, route-to-symbol `handled_by`, session-to-backlog `contains`, and backlog-to-code `mentions` links derived from backlog text tokens. Reports include `recommendations` that rank the next useful graph nodes for bug-fix navigation, prioritizing backlog mentions, shortest-path next hops, routes/handlers, callers/callees, and defining files.
 
 Agent-facing context and traversal packets gate graph evidence on fresh incremental indexes. Before `context-pack` handoffs and `traverse` graph reports read indexed symbols or call edges, tsift checks the matching root or scoped index and runs the normal incremental update path for missing or changed files. Reports include a concise diagnostic when that refresh happened. If a stale or missing index cannot be refreshed, for example because another writer owns the index lock, traversal skips stale symbol/call edges, emits a stale/missing diagnostic, and falls back to live source-file nodes whose expansion commands use `tsift source-read`; this keeps agent-doc navigation grounded in current raw source instead of stale graph evidence.
+
+Traversal and `context-pack` JSON include an `exploration` packet for agent handoffs. The packet adapts source-window and relationship-map budgets to graph size, exposes compact relationship rows, emits line-numbered `source-read` windows clustered around selected files/symbols/routes, and includes explicit no-reread guidance so follow-up agents expand stable handles instead of replaying whole files.
+
+### `impact`
+
+`tsift impact <path>` estimates affected test targets for the current worktree diff, staged diff (`--cached`), or a single revision (`--revision`). It combines changed files and touched symbols from `diff-digest`, import-line scans in test-bearing files, indexed call edges from tests or inline test modules to changed symbols, and route handler references when a changed handler backs a framework route.
+
+The output is advisory, not a proof of test completeness. Each target includes reasons and runnable command suggestions such as `cargo test --test name`, `pytest tests/test_api.py`, or `npm test -- path.spec.ts`.
 
 On stale existing indexes, search exits early with a message like:
 ```
@@ -755,6 +765,20 @@ CREATE TABLE symbols (
 CREATE INDEX idx_symbols_name ON symbols(name);
 CREATE INDEX idx_symbols_language ON symbols(language);
 CREATE INDEX idx_symbols_file ON symbols(file);
+
+CREATE TABLE route_nodes (
+    id INTEGER PRIMARY KEY,
+    framework TEXT NOT NULL,    -- 'axum', 'actix', 'express', 'nestjs', 'fastapi', 'flask'
+    method TEXT,                -- 'get', 'post', ... or NULL for framework defaults
+    route_path TEXT NOT NULL,
+    handler_name TEXT NOT NULL,
+    file TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    handler_line INTEGER
+);
+CREATE INDEX idx_route_nodes_path ON route_nodes(route_path);
+CREATE INDEX idx_route_nodes_handler ON route_nodes(handler_name);
+CREATE INDEX idx_route_nodes_file ON route_nodes(file);
 
 CREATE TABLE dir_state (
     path TEXT PRIMARY KEY,

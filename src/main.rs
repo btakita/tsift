@@ -20,6 +20,7 @@ pub mod config;
 pub mod dci_benchmark;
 pub mod diff_digest;
 pub mod graph;
+pub mod impact;
 pub mod index;
 pub mod init;
 mod lang;
@@ -445,6 +446,27 @@ enum Commands {
         /// Compare a single revision against its first parent instead of the working tree
         #[arg(long)]
         revision: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Estimate affected tests from changed files, imports, and call edges
+    Impact {
+        /// Path to the codebase (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Compare the staged index against HEAD instead of the working tree
+        #[arg(long, conflicts_with = "revision")]
+        cached: bool,
+        /// Compare a single revision against its first parent instead of the working tree
+        #[arg(long)]
+        revision: Option<String>,
+        /// Restrict graph evidence to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Maximum affected test targets to display (0 = unlimited)
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -1171,6 +1193,28 @@ fn main() -> Result<()> {
             &path,
             cached,
             revision.as_deref(),
+            OutputFormat {
+                json_output: json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                schema,
+                envelope,
+            },
+        ),
+        Some(Commands::Impact {
+            path,
+            cached,
+            revision,
+            scope,
+            limit,
+            json,
+        }) => cmd_impact(
+            &path,
+            cached,
+            revision.as_deref(),
+            scope.as_deref(),
+            limit,
             OutputFormat {
                 json_output: json || terse || schema || envelope,
                 compact,
@@ -4085,6 +4129,7 @@ struct TraversalReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     shortest_path: Option<TraversalPathReport>,
     recommendations: Vec<TraversalRecommendation>,
+    exploration: ExplorationPacket,
     truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     warnings: Vec<String>,
@@ -4102,6 +4147,48 @@ struct TraversalFileIndexEntry {
     handle: String,
     node: TraversalNode,
     tokens: BTreeSet<String>,
+}
+
+#[derive(Clone)]
+struct TraversalRouteIndexEntry {
+    handle: String,
+    node: TraversalNode,
+    tokens: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct ExplorationBudget {
+    project_size: String,
+    max_source_windows: usize,
+    lines_per_window: usize,
+    relationship_limit: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct ExplorationRelation {
+    from: String,
+    relation: String,
+    to: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct ExplorationSourceWindow {
+    handle: String,
+    file: String,
+    start: usize,
+    end: usize,
+    reason: String,
+    expand: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct ExplorationPacket {
+    budget: ExplorationBudget,
+    relationship_map: Vec<ExplorationRelation>,
+    source_windows: Vec<ExplorationSourceWindow>,
+    no_reread_guidance: String,
 }
 
 impl TraversalGraphBuild {
@@ -4191,6 +4278,29 @@ fn traversal_unresolved_symbol_node(root: &Path, name: &str) -> TraversalNode {
         path: None,
         line: None,
         detail: Some("unresolved call target".to_string()),
+        expand: traversal_expand_command(root, &handle),
+    }
+}
+
+fn traversal_route_node(root: &Path, route: &index::StoredRoute) -> TraversalNode {
+    let file = relativize(&route.file, root);
+    let method = route.method.as_deref().unwrap_or("any");
+    let key = format!(
+        "route:{file}:{}:{}:{}",
+        route.line, method, route.route_path
+    );
+    let handle = stable_handle("grte", &key);
+    TraversalNode {
+        handle: handle.clone(),
+        kind: "route".to_string(),
+        label: format!("{} {}", method.to_uppercase(), route.route_path),
+        ref_id: Some(route.route_path.clone()),
+        path: Some(file),
+        line: Some(route.line),
+        detail: Some(format!(
+            "{} route handled by {}",
+            route.framework, route.handler_name
+        )),
         expand: traversal_expand_command(root, &handle),
     }
 }
@@ -4319,6 +4429,7 @@ fn link_backlog_to_code_nodes(
     text: &str,
     symbols: &[TraversalSymbolIndexEntry],
     files: &[TraversalFileIndexEntry],
+    routes: &[TraversalRouteIndexEntry],
     limit: usize,
 ) {
     let mut query_tokens = traversal_tokens(text);
@@ -4374,6 +4485,29 @@ fn link_backlog_to_code_nodes(
             score,
         );
     }
+
+    let mut route_matches = routes
+        .iter()
+        .filter_map(|entry| {
+            let score = query_tokens.intersection(&entry.tokens).count();
+            (score > 0).then_some((score, entry))
+        })
+        .collect::<Vec<_>>();
+    route_matches.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.node.label.cmp(&right.node.label))
+            .then_with(|| left.handle.cmp(&right.handle))
+    });
+    for (score, entry) in route_matches.into_iter().take(limit.min(5)) {
+        graph.add_edge(
+            &backlog.handle,
+            &entry.handle,
+            "mentions",
+            Some("backlog text matches route tokens".to_string()),
+            score,
+        );
+    }
 }
 
 fn load_agent_doc_traversal_nodes(
@@ -4381,6 +4515,7 @@ fn load_agent_doc_traversal_nodes(
     graph: &mut TraversalGraphBuild,
     symbols: &[TraversalSymbolIndexEntry],
     files: &[TraversalFileIndexEntry],
+    routes: &[TraversalRouteIndexEntry],
 ) -> Result<()> {
     for markdown_path in markdown_files_for_traversal(root)? {
         let content = match fs::read_to_string(&markdown_path) {
@@ -4417,7 +4552,7 @@ fn load_agent_doc_traversal_nodes(
                 Some("session backlog item".to_string()),
                 1,
             );
-            link_backlog_to_code_nodes(graph, &backlog, &text, symbols, files, 8);
+            link_backlog_to_code_nodes(graph, &backlog, &text, symbols, files, routes, 8);
         }
     }
     Ok(())
@@ -4597,6 +4732,7 @@ fn build_traversal_graph(
     let mut graph = TraversalGraphBuild::default();
     let mut symbol_entries = Vec::new();
     let mut file_entries = Vec::new();
+    let mut route_entries = Vec::new();
     let gate = prepare_agent_doc_index_gate(root, path_hint, scope, "graph traversal packet");
     graph.warnings.extend(gate.diagnostics);
 
@@ -4672,6 +4808,45 @@ fn build_traversal_graph(
                     1,
                 );
             }
+
+            for route in db.all_routes()? {
+                let node = traversal_route_node(root, &route);
+                let entry = TraversalRouteIndexEntry {
+                    handle: node.handle.clone(),
+                    tokens: traversal_node_tokens(&node),
+                    node: node.clone(),
+                };
+                graph.add_node(node.clone());
+                if let Some(file_node) = file_entries
+                    .iter()
+                    .find(|entry| entry.node.path.as_deref() == node.path.as_deref())
+                {
+                    graph.add_edge(
+                        &file_node.handle,
+                        &node.handle,
+                        "defines_route",
+                        Some("file declares route".to_string()),
+                        1,
+                    );
+                }
+                let handler_handle =
+                    if let Some(handle) = first_symbol_by_name.get(&route.handler_name) {
+                        handle.clone()
+                    } else {
+                        let node = traversal_unresolved_symbol_node(root, &route.handler_name);
+                        let handle = node.handle.clone();
+                        graph.add_node(node);
+                        handle
+                    };
+                graph.add_edge(
+                    &entry.handle,
+                    &handler_handle,
+                    "handled_by",
+                    Some("route handler reference".to_string()),
+                    1,
+                );
+                route_entries.push(entry);
+            }
         }
         _ => {
             add_raw_source_file_nodes(root, &gate.source_root, &mut graph, &mut file_entries)
@@ -4684,7 +4859,13 @@ fn build_traversal_graph(
         }
     }
 
-    load_agent_doc_traversal_nodes(root, &mut graph, &symbol_entries, &file_entries)?;
+    load_agent_doc_traversal_nodes(
+        root,
+        &mut graph,
+        &symbol_entries,
+        &file_entries,
+        &route_entries,
+    )?;
     Ok(graph)
 }
 
@@ -4847,6 +5028,8 @@ fn traversal_relation_score(edge: &TraversalEdge, origin: &str) -> usize {
                 65
             }
         }
+        "handled_by" => 68,
+        "defines_route" => 62,
         "defines" => {
             if edge.from == origin {
                 60
@@ -4865,6 +5048,10 @@ fn traversal_recommendation_reason(edge: &TraversalEdge, origin: &str) -> String
         "contains" => "contained in the selected session artifact".to_string(),
         "defines" if edge.from == origin => "symbol defined in selected file".to_string(),
         "defines" => "file that defines the selected symbol".to_string(),
+        "defines_route" if edge.from == origin => "route declared in selected file".to_string(),
+        "defines_route" => "file that declares the selected route".to_string(),
+        "handled_by" if edge.from == origin => "handler for the selected route".to_string(),
+        "handled_by" => "route handled by the selected symbol".to_string(),
         "calls" if edge.from == origin => "callee from the selected symbol".to_string(),
         "calls" => "caller of the selected symbol".to_string(),
         other => format!("connected by {other}"),
@@ -4940,6 +5127,114 @@ fn traversal_recommendations(
     }
 
     recommendations
+}
+
+fn exploration_budget_for_counts(nodes: usize, edges: usize) -> ExplorationBudget {
+    let scale = nodes.saturating_add(edges);
+    if scale <= 80 {
+        ExplorationBudget {
+            project_size: "small".to_string(),
+            max_source_windows: 8,
+            lines_per_window: 96,
+            relationship_limit: 40,
+        }
+    } else if scale <= 800 {
+        ExplorationBudget {
+            project_size: "medium".to_string(),
+            max_source_windows: 6,
+            lines_per_window: 80,
+            relationship_limit: 32,
+        }
+    } else {
+        ExplorationBudget {
+            project_size: "large".to_string(),
+            max_source_windows: 4,
+            lines_per_window: 64,
+            relationship_limit: 24,
+        }
+    }
+}
+
+fn exploration_node_label(node: &TraversalNode) -> String {
+    format!("{}:{}", node.kind, node.label)
+}
+
+fn exploration_source_window_for_node(
+    root: &Path,
+    node: &TraversalNode,
+    budget: &ExplorationBudget,
+) -> Option<ExplorationSourceWindow> {
+    let file = node.path.as_ref()?;
+    let anchor = node
+        .line
+        .and_then(|line| usize::try_from(line).ok())
+        .and_then(|line| line.checked_add(1))
+        .unwrap_or(1);
+    let context_before = budget.lines_per_window / 3;
+    let start = anchor.saturating_sub(context_before).max(1);
+    let end = start
+        .saturating_add(budget.lines_per_window)
+        .saturating_sub(1);
+    let handle = stable_handle("xwin", &format!("{file}:{start}:{end}:{}", node.handle));
+    Some(ExplorationSourceWindow {
+        handle,
+        file: file.clone(),
+        start,
+        end,
+        reason: format!("cluster around {}", exploration_node_label(node)),
+        expand: source_read_command(root, file, start, budget.lines_per_window),
+    })
+}
+
+fn build_exploration_packet(
+    root: &Path,
+    totals: &TraversalTotals,
+    selected_nodes: &[TraversalNode],
+    selected_edges: &[TraversalEdge],
+) -> ExplorationPacket {
+    let budget = exploration_budget_for_counts(totals.nodes, totals.edges);
+    let node_by_handle = selected_nodes
+        .iter()
+        .map(|node| (node.handle.as_str(), node))
+        .collect::<BTreeMap<_, _>>();
+    let relationship_map = selected_edges
+        .iter()
+        .take(budget.relationship_limit)
+        .filter_map(|edge| {
+            let from = node_by_handle.get(edge.from.as_str())?;
+            let to = node_by_handle.get(edge.to.as_str())?;
+            Some(ExplorationRelation {
+                from: exploration_node_label(from),
+                relation: edge.relation.clone(),
+                to: exploration_node_label(to),
+                label: edge.label.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut seen_windows = BTreeSet::new();
+    let mut source_windows = Vec::new();
+    for node in selected_nodes {
+        if source_windows.len() >= budget.max_source_windows {
+            break;
+        }
+        let Some(window) = exploration_source_window_for_node(root, node, &budget) else {
+            continue;
+        };
+        let key = (window.file.clone(), window.start, window.end);
+        if seen_windows.insert(key) {
+            source_windows.push(window);
+        }
+    }
+
+    ExplorationPacket {
+        budget,
+        relationship_map,
+        source_windows,
+        no_reread_guidance:
+            "Use the source_windows expand commands for line-numbered context; avoid whole-file reads unless the needed line is outside every listed window."
+                .to_string(),
+    }
 }
 
 fn traversal_report(
@@ -5037,6 +5332,7 @@ fn traversal_report(
         shortest_handles.as_deref(),
         if limit == 0 { 10 } else { limit.min(10) },
     );
+    let exploration = build_exploration_packet(root, &totals, &selected_nodes, &selected_edges);
     let truncated = selected_nodes.len() < totals.nodes || selected_edges.len() < totals.edges;
 
     Ok(TraversalReport {
@@ -5050,6 +5346,7 @@ fn traversal_report(
         edges: selected_edges,
         shortest_path,
         recommendations,
+        exploration,
         truncated,
         warnings: graph.warnings,
     })
@@ -6837,6 +7134,81 @@ fn diff_digest_empty_message(report: &diff_digest::DiffDigestReport) -> String {
     }
 }
 
+fn cmd_impact(
+    path: &Path,
+    cached: bool,
+    revision: Option<&str>,
+    scope: Option<&str>,
+    limit: usize,
+    format: OutputFormat,
+) -> Result<()> {
+    let report = impact::compute(
+        path,
+        impact::ImpactOptions {
+            cached,
+            revision,
+            scope,
+            limit,
+        },
+    )?;
+    if format.json_output {
+        println!(
+            "{}",
+            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+        );
+        return Ok(());
+    }
+
+    if format.compact {
+        println!(
+            "impact mode:{} changed:{} symbols:{} tests:{}/{}",
+            diff_digest_mode_label(report.mode),
+            report.changed_files.len(),
+            report.changed_symbols.len(),
+            report.affected_tests.len(),
+            report.affected_tests_total
+        );
+        for target in &report.affected_tests {
+            println!(
+                "{} reasons:{} command:{}",
+                target.path,
+                target.reasons.len(),
+                target.commands.join(" && ")
+            );
+        }
+        for warning in &report.warnings {
+            println!("warning {warning}");
+        }
+        return Ok(());
+    }
+
+    println!("Impact ({})", diff_digest_mode_label(report.mode));
+    println!("  changed files:          {}", report.changed_files.len());
+    println!("  changed symbols:        {}", report.changed_symbols.len());
+    println!(
+        "  affected tests:         {}/{}",
+        report.affected_tests.len(),
+        report.affected_tests_total
+    );
+    for target in &report.affected_tests {
+        println!();
+        println!("{}", target.path);
+        for reason in &target.reasons {
+            println!("  - {reason}");
+        }
+        if !target.symbols.is_empty() {
+            println!("  symbols: {}", target.symbols.join(", "));
+        }
+        for command in &target.commands {
+            println!("  run: {}", command);
+        }
+    }
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    Ok(())
+}
+
 fn cmd_test_digest(
     path: &Path,
     input_path: Option<&Path>,
@@ -8465,6 +8837,7 @@ struct ContextPackReport {
     diff_digest: ContextPackDiffPreview,
     test_digest: ContextPackOptionalSection<ContextPackTestPreview>,
     log_digest: ContextPackOptionalSection<ContextPackLogPreview>,
+    exploration: ExplorationPacket,
     resume_commands: Vec<String>,
 }
 
@@ -9117,6 +9490,110 @@ fn enrich_next_context_with_diff_symbols(
         .collect();
 }
 
+fn context_exploration_source_window(
+    root: &Path,
+    file: &str,
+    reason: String,
+    budget: &ExplorationBudget,
+) -> ExplorationSourceWindow {
+    let start = 1;
+    let end = budget.lines_per_window;
+    ExplorationSourceWindow {
+        handle: stable_handle("xwin", &format!("context:{file}:{start}:{end}:{reason}")),
+        file: file.to_string(),
+        start,
+        end,
+        reason,
+        expand: source_read_command(root, file, start, budget.lines_per_window),
+    }
+}
+
+fn build_context_pack_exploration_packet(
+    root: &Path,
+    next_context: &SessionReviewNextContextBudgetReport,
+    diff_digest: &ContextPackDiffPreview,
+) -> ExplorationPacket {
+    let node_count = diff_digest
+        .files_changed
+        .saturating_add(next_context.touched_file_total)
+        .saturating_add(next_context.touched_symbol_total);
+    let edge_count = diff_digest
+        .call_edges_added
+        .saturating_add(diff_digest.call_edges_removed)
+        .saturating_add(
+            diff_digest
+                .files
+                .iter()
+                .map(|file| file.touched_symbol_refs.len())
+                .sum::<usize>(),
+        );
+    let budget = exploration_budget_for_counts(node_count, edge_count);
+
+    let mut relationship_map = Vec::new();
+    for file in &diff_digest.files {
+        for symbol in &file.touched_symbol_refs {
+            if relationship_map.len() >= budget.relationship_limit {
+                break;
+            }
+            relationship_map.push(ExplorationRelation {
+                from: format!("file:{}", file.path),
+                relation: "touches_symbol".to_string(),
+                to: format!("symbol:{}", symbol.name),
+                label: Some(format!("{} diff", file.status)),
+            });
+        }
+    }
+    for symbol in &next_context.touched_symbol_refs {
+        if relationship_map.len() >= budget.relationship_limit {
+            break;
+        }
+        relationship_map.push(ExplorationRelation {
+            from: format!("context:{}", next_context.target),
+            relation: "mentions_symbol".to_string(),
+            to: format!("symbol:{}", symbol.name),
+            label: Some("session next-context symbol".to_string()),
+        });
+    }
+
+    let mut source_windows = Vec::new();
+    let mut seen_files = BTreeSet::new();
+    for file in &diff_digest.files {
+        if source_windows.len() >= budget.max_source_windows {
+            break;
+        }
+        if seen_files.insert(file.path.clone()) {
+            source_windows.push(context_exploration_source_window(
+                root,
+                &file.path,
+                format!("changed file ({})", file.status),
+                &budget,
+            ));
+        }
+    }
+    for file in &next_context.touched_files {
+        if source_windows.len() >= budget.max_source_windows {
+            break;
+        }
+        if seen_files.insert(file.clone()) {
+            source_windows.push(context_exploration_source_window(
+                root,
+                file,
+                "session touched file".to_string(),
+                &budget,
+            ));
+        }
+    }
+
+    ExplorationPacket {
+        budget,
+        relationship_map,
+        source_windows,
+        no_reread_guidance:
+            "Use the source_windows expand commands before broad file reads; relationship_map explains why each window is in the handoff."
+                .to_string(),
+    }
+}
+
 fn build_context_pack_test_preview(
     report: &test_digest::TestDigestReport,
     budget: ResponseBudget,
@@ -9480,6 +9957,7 @@ fn build_context_pack_report(
 
     let ontology_refs =
         collect_context_pack_ontology_refs(&next_context, &diff_digest, &test_digest, &log_digest);
+    let exploration = build_context_pack_exploration_packet(&root, &next_context, &diff_digest);
 
     Ok(ContextPackReport {
         root: review.root,
@@ -9493,6 +9971,7 @@ fn build_context_pack_report(
         diff_digest,
         test_digest,
         log_digest,
+        exploration,
         resume_commands: review.next_context.next_digest_commands,
     })
 }
@@ -9562,6 +10041,12 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
         } else {
             println!("log {}", report.log_digest.command);
         }
+        println!(
+            "explore windows:{} relations:{} budget:{}",
+            report.exploration.source_windows.len(),
+            report.exploration.relationship_map.len(),
+            report.exploration.budget.project_size
+        );
         return;
     }
 
@@ -9761,6 +10246,28 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
             }
         }
         None => println!("  capture:                {}", report.log_digest.command),
+    }
+
+    println!();
+    println!("Exploration packet");
+    println!(
+        "  budget:                 {} ({} windows x {} lines)",
+        report.exploration.budget.project_size,
+        report.exploration.budget.max_source_windows,
+        report.exploration.budget.lines_per_window
+    );
+    for window in &report.exploration.source_windows {
+        println!(
+            "  - window {}:{}-{} ({})",
+            window.file, window.start, window.end, window.reason
+        );
+        println!("    expand: {}", window.expand);
+    }
+    for relation in &report.exploration.relationship_map {
+        println!(
+            "  - relation {} -{}-> {}",
+            relation.from, relation.relation, relation.to
+        );
     }
 
     println!();
@@ -10311,6 +10818,7 @@ fn emit_index_warnings(summary: &index::IndexSummary, root: &Path, scope: Option
             index::IndexWarningStage::ReadSource => "read failed",
             index::IndexWarningStage::ExtractSymbols => "symbol extraction failed",
             index::IndexWarningStage::ExtractCallSites => "call extraction failed",
+            index::IndexWarningStage::ExtractRoutes => "route extraction failed",
         };
         let scope_prefix = scope.map(|name| format!("[{}] ", name)).unwrap_or_default();
         let lang_suffix = warning
@@ -13599,6 +14107,30 @@ agent_doc_format: template
     }
 
     #[test]
+    fn traversal_graph_includes_routes_and_handler_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("api.py"),
+            r#"@router.get("/items")
+def list_items():
+    return []
+"#,
+        )
+        .unwrap();
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let route = resolve_traversal_node(&graph, "/items").unwrap();
+        let handler = resolve_traversal_node(&graph, "list_items").unwrap();
+
+        assert_eq!(route.kind, "route");
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == route.handle && edge.to == handler.handle && edge.relation == "handled_by"
+        }));
+    }
+
+    #[test]
     fn traversal_shortest_path_crosses_artifacts_and_symbols() {
         let dir = setup_traversal_project();
         let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
@@ -13628,6 +14160,16 @@ agent_doc_format: template
                 .any(|rec| rec.label == "helper" && rec.reason.contains("matched")),
             "expected helper recommendation, got {:?}",
             report.recommendations
+        );
+        assert!(
+            !report.exploration.source_windows.is_empty(),
+            "expected exploration source windows"
+        );
+        assert!(
+            report
+                .exploration
+                .no_reread_guidance
+                .contains("avoid whole-file reads")
         );
     }
 
@@ -17805,6 +18347,24 @@ tier = "private"
                 assert_eq!(format, TraverseFormat::Html);
             }
             _ => panic!("expected Traverse command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_impact_command() {
+        let cli = Cli::parse_from(["tsift", "impact", ".", "--cached", "--limit", "5"]);
+        match cli.command {
+            Some(Commands::Impact {
+                path,
+                cached,
+                limit,
+                ..
+            }) => {
+                assert_eq!(path, PathBuf::from("."));
+                assert!(cached);
+                assert_eq!(limit, 5);
+            }
+            _ => panic!("expected Impact command"),
         }
     }
 
