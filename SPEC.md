@@ -12,7 +12,8 @@ tsift (CLI + MCP plugin)
 ├── substrate module (provider-neutral graph — src/substrate.rs)
 │   ├── generic nodes/edges/provenance/freshness records
 │   ├── SQLite graph store prototype (`graph_nodes`, `graph_edges`)
-│   └── projection boundary for Convex/FalkorDB/other read models
+│   ├── Convex projection adapter for `nodes` + `edges` read models
+│   └── projection boundary for FalkorDB/other read models
 ├── graph module (internal — src/graph.rs)
 │   ├── call-site extraction via tree-sitter queries
 │   ├── caller→callee edge resolution against symbol table
@@ -34,7 +35,14 @@ The graph substrate is a content-agnostic layer below tsift. It stores typed pro
 - provenance: source system plus source reference, with optional content hash
 - freshness: optional content hash and observation timestamp for rebuildable projections
 
-The first implementation is a local SQLite store with `graph_nodes` and `graph_edges` tables. SQLite is the development/offline/test engine and a portable projection target; it is not the only intended backend. Convex, FalkorDB, or another graph/query system should consume the same generic graph model as derived projections, not replace tsift's local correctness model or force code-domain concepts into the substrate.
+The first implementation is a local SQLite store with `graph_nodes` and `graph_edges` tables. SQLite is the development/offline/test correctness engine and a portable projection target; it is not the only intended backend. Convex, FalkorDB, or another graph/query system should consume the same generic graph model as derived projections, not replace tsift's local correctness model or force code-domain concepts into the substrate.
+
+Convex support is a projection backend for the same substrate contract. `GraphProjection::upsert_into` writes nodes before edges, so stores can fail closed when an edge references a missing node. The Convex adapter maps records onto two application tables:
+
+- `nodes`: `externalId`, `kind`, `label`, `properties`, `provenance`, and `freshness`
+- `edges`: `edgeKey`, `fromExternalId`, `toExternalId`, `kind`, `properties`, `provenance`, and `freshness`
+
+`externalId` is the stable substrate node id. `edgeKey` is a deterministic key derived from `(from_id, kind, to_id)` so Convex mutations can be idempotent. A Convex schema should index `nodes.by_external_id`, `nodes.by_kind`, `edges.by_edge_key`, `edges.by_from_kind`, and `edges.by_to_kind`; query code should continue to enforce provenance and freshness checks before trusting derived graph data. Backend-agnostic parity tests must prove the same projection round-trips through SQLite and the Convex `nodes`/`edges` adapter.
 
 tsift owns the code adapter on top of this substrate. Code symbols become `code_symbol` nodes and call relationships become `calls` edges with line metadata and tsift index provenance. Future adapters can add code comments, routes, markdown sessions, backlog items, LiveKit docs, Orbit topics, questions, answers, visuals, and assets without changing the substrate schema. The boundary rule is: no AST, source-language, Orbit, LiveKit, Convex, or FalkorDB semantics are required to create or query generic substrate records.
 

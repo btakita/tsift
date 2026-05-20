@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, types::Type};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, VecDeque};
@@ -136,6 +136,22 @@ pub struct GraphProjection {
     pub edges: Vec<GraphEdge>,
 }
 
+impl GraphProjection {
+    pub fn upsert_into<S: GraphStore + ?Sized>(&self, store: &S) -> Result<()> {
+        for node in &self.nodes {
+            store.upsert_node(node)?;
+        }
+        for edge in &self.edges {
+            store.upsert_edge(edge)?;
+        }
+        Ok(())
+    }
+
+    pub fn to_convex_rows(&self) -> ConvexProjectionRows {
+        ConvexProjectionRows::from(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphPath {
     pub nodes: Vec<String>,
@@ -154,6 +170,208 @@ pub trait GraphStore {
         to_id: &str,
         kind: Option<&str>,
     ) -> Result<Option<GraphPath>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ConvexProjectionRows {
+    pub nodes: Vec<ConvexNodeRow>,
+    pub edges: Vec<ConvexEdgeRow>,
+}
+
+impl From<&GraphProjection> for ConvexProjectionRows {
+    fn from(projection: &GraphProjection) -> Self {
+        Self {
+            nodes: projection.nodes.iter().map(ConvexNodeRow::from).collect(),
+            edges: projection.edges.iter().map(ConvexEdgeRow::from).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConvexNodeRow {
+    pub external_id: String,
+    pub kind: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<GraphProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<GraphFreshness>,
+}
+
+impl From<&GraphNode> for ConvexNodeRow {
+    fn from(node: &GraphNode) -> Self {
+        Self {
+            external_id: node.id.clone(),
+            kind: node.kind.clone(),
+            label: node.label.clone(),
+            properties: node.properties.clone(),
+            provenance: node.provenance.clone(),
+            freshness: node.freshness.clone(),
+        }
+    }
+}
+
+impl From<ConvexNodeRow> for GraphNode {
+    fn from(row: ConvexNodeRow) -> Self {
+        Self {
+            id: row.external_id,
+            kind: row.kind,
+            label: row.label,
+            properties: row.properties,
+            provenance: row.provenance,
+            freshness: row.freshness,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConvexEdgeRow {
+    pub edge_key: String,
+    pub from_external_id: String,
+    pub to_external_id: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<GraphProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<GraphFreshness>,
+}
+
+impl ConvexEdgeRow {
+    pub fn stable_key(from_id: &str, to_id: &str, kind: &str) -> String {
+        let raw = serde_json::json!([from_id, kind, to_id]).to_string();
+        format!("edge:{}", blake3::hash(raw.as_bytes()).to_hex())
+    }
+}
+
+impl From<&GraphEdge> for ConvexEdgeRow {
+    fn from(edge: &GraphEdge) -> Self {
+        Self {
+            edge_key: ConvexEdgeRow::stable_key(&edge.from_id, &edge.to_id, &edge.kind),
+            from_external_id: edge.from_id.clone(),
+            to_external_id: edge.to_id.clone(),
+            kind: edge.kind.clone(),
+            properties: edge.properties.clone(),
+            provenance: edge.provenance.clone(),
+            freshness: edge.freshness.clone(),
+        }
+    }
+}
+
+impl From<ConvexEdgeRow> for GraphEdge {
+    fn from(row: ConvexEdgeRow) -> Self {
+        Self {
+            from_id: row.from_external_id,
+            to_id: row.to_external_id,
+            kind: row.kind,
+            properties: row.properties,
+            provenance: row.provenance,
+            freshness: row.freshness,
+        }
+    }
+}
+
+pub trait ConvexGraphClient {
+    fn upsert_node_row(&self, row: &ConvexNodeRow) -> Result<()>;
+    fn upsert_edge_row(&self, row: &ConvexEdgeRow) -> Result<()>;
+    fn node_row(&self, external_id: &str) -> Result<Option<ConvexNodeRow>>;
+    fn node_rows_by_kind(&self, kind: &str) -> Result<Vec<ConvexNodeRow>>;
+    fn outgoing_edge_rows(
+        &self,
+        from_external_id: &str,
+        kind: Option<&str>,
+    ) -> Result<Vec<ConvexEdgeRow>>;
+}
+
+pub struct ConvexGraphStore<C> {
+    client: C,
+}
+
+impl<C> ConvexGraphStore<C> {
+    pub fn new(client: C) -> Self {
+        Self { client }
+    }
+
+    pub fn client(&self) -> &C {
+        &self.client
+    }
+
+    pub fn into_inner(self) -> C {
+        self.client
+    }
+}
+
+impl<C: ConvexGraphClient> GraphStore for ConvexGraphStore<C> {
+    fn upsert_node(&self, node: &GraphNode) -> Result<()> {
+        self.client.upsert_node_row(&ConvexNodeRow::from(node))
+    }
+
+    fn upsert_edge(&self, edge: &GraphEdge) -> Result<()> {
+        if self.client.node_row(&edge.from_id)?.is_none() {
+            bail!(
+                "convex graph edge {} -> {} ({}) references missing from node",
+                edge.from_id,
+                edge.to_id,
+                edge.kind
+            );
+        }
+        if self.client.node_row(&edge.to_id)?.is_none() {
+            bail!(
+                "convex graph edge {} -> {} ({}) references missing to node",
+                edge.from_id,
+                edge.to_id,
+                edge.kind
+            );
+        }
+        self.client.upsert_edge_row(&ConvexEdgeRow::from(edge))
+    }
+
+    fn node(&self, id: &str) -> Result<Option<GraphNode>> {
+        Ok(self.client.node_row(id)?.map(GraphNode::from))
+    }
+
+    fn nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>> {
+        let mut nodes: Vec<GraphNode> = self
+            .client
+            .node_rows_by_kind(kind)?
+            .into_iter()
+            .map(GraphNode::from)
+            .collect();
+        nodes.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(nodes)
+    }
+
+    fn outgoing_edges(&self, from_id: &str, kind: Option<&str>) -> Result<Vec<GraphEdge>> {
+        let mut edges: Vec<GraphEdge> = self
+            .client
+            .outgoing_edge_rows(from_id, kind)?
+            .into_iter()
+            .map(GraphEdge::from)
+            .collect();
+        edges.sort_by(|left, right| {
+            left.to_id
+                .cmp(&right.to_id)
+                .then(left.kind.cmp(&right.kind))
+        });
+        Ok(edges)
+    }
+
+    fn shortest_path(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        kind: Option<&str>,
+    ) -> Result<Option<GraphPath>> {
+        shortest_path_using_outgoing(from_id, to_id, kind, |current, kind| {
+            self.outgoing_edges(current, kind)
+        })
+    }
 }
 
 pub struct SqliteGraphStore {
@@ -321,44 +539,55 @@ impl GraphStore for SqliteGraphStore {
         to_id: &str,
         kind: Option<&str>,
     ) -> Result<Option<GraphPath>> {
-        if from_id == to_id {
-            return Ok(Some(GraphPath {
-                nodes: vec![from_id.to_string()],
-                hops: 0,
-            }));
-        }
-
-        let mut queue = VecDeque::new();
-        let mut parent = BTreeMap::<String, String>::new();
-        parent.insert(from_id.to_string(), String::new());
-        queue.push_back(from_id.to_string());
-
-        while let Some(current) = queue.pop_front() {
-            for edge in self.outgoing_edges(&current, kind)? {
-                if parent.contains_key(&edge.to_id) {
-                    continue;
-                }
-                parent.insert(edge.to_id.clone(), current.clone());
-                if edge.to_id == to_id {
-                    let mut nodes = vec![to_id.to_string()];
-                    let mut cursor = to_id;
-                    while let Some(previous) = parent.get(cursor) {
-                        if previous.is_empty() {
-                            break;
-                        }
-                        nodes.push(previous.clone());
-                        cursor = previous;
-                    }
-                    nodes.reverse();
-                    let hops = nodes.len().saturating_sub(1);
-                    return Ok(Some(GraphPath { nodes, hops }));
-                }
-                queue.push_back(edge.to_id);
-            }
-        }
-
-        Ok(None)
+        shortest_path_using_outgoing(from_id, to_id, kind, |current, kind| {
+            self.outgoing_edges(current, kind)
+        })
     }
+}
+
+fn shortest_path_using_outgoing(
+    from_id: &str,
+    to_id: &str,
+    kind: Option<&str>,
+    mut outgoing_edges: impl FnMut(&str, Option<&str>) -> Result<Vec<GraphEdge>>,
+) -> Result<Option<GraphPath>> {
+    if from_id == to_id {
+        return Ok(Some(GraphPath {
+            nodes: vec![from_id.to_string()],
+            hops: 0,
+        }));
+    }
+
+    let mut queue = VecDeque::new();
+    let mut parent = BTreeMap::<String, String>::new();
+    parent.insert(from_id.to_string(), String::new());
+    queue.push_back(from_id.to_string());
+
+    while let Some(current) = queue.pop_front() {
+        for edge in outgoing_edges(&current, kind)? {
+            if parent.contains_key(&edge.to_id) {
+                continue;
+            }
+            parent.insert(edge.to_id.clone(), current.clone());
+            if edge.to_id == to_id {
+                let mut nodes = vec![to_id.to_string()];
+                let mut cursor = to_id;
+                while let Some(previous) = parent.get(cursor) {
+                    if previous.is_empty() {
+                        break;
+                    }
+                    nodes.push(previous.clone());
+                    cursor = previous;
+                }
+                nodes.reverse();
+                let hops = nodes.len().saturating_sub(1);
+                return Ok(Some(GraphPath { nodes, hops }));
+            }
+            queue.push_back(edge.to_id);
+        }
+    }
+
+    Ok(None)
 }
 
 fn to_json<T: Serialize>(value: &T) -> Result<String> {
@@ -419,9 +648,122 @@ fn optional_from_json<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     fn sample_provenance() -> GraphProvenance {
         GraphProvenance::new("fixture", "src/lib.rs:1").with_content_hash("hash-1")
+    }
+
+    fn sample_projection() -> GraphProjection {
+        let source = sample_provenance();
+        GraphProjection {
+            nodes: vec![
+                GraphNode::new("doc:livekit", "document", "LiveKit guide")
+                    .with_property("domain", "livekit")
+                    .with_provenance(source.clone())
+                    .with_freshness(GraphFreshness::content_hash("node-hash")),
+                GraphNode::new("topic:rooms", "topic", "Rooms"),
+                GraphNode::new("topic:egress", "topic", "Egress"),
+            ],
+            edges: vec![
+                GraphEdge::new("doc:livekit", "topic:rooms", "mentions")
+                    .with_property("confidence", "0.91")
+                    .with_provenance(source.clone())
+                    .with_freshness(GraphFreshness::content_hash("edge-hash")),
+                GraphEdge::new("topic:rooms", "topic:egress", "related_to").with_provenance(source),
+            ],
+        }
+    }
+
+    fn assert_projection_store_contract(store: &impl GraphStore) {
+        let projection = sample_projection();
+        projection.upsert_into(store).unwrap();
+
+        assert_eq!(
+            store.node("doc:livekit").unwrap(),
+            projection
+                .nodes
+                .iter()
+                .find(|node| node.id == "doc:livekit")
+                .cloned()
+        );
+        assert_eq!(
+            store.nodes_by_kind("topic").unwrap(),
+            vec![
+                GraphNode::new("topic:egress", "topic", "Egress"),
+                GraphNode::new("topic:rooms", "topic", "Rooms"),
+            ]
+        );
+
+        let mentions = store
+            .outgoing_edges("doc:livekit", Some("mentions"))
+            .unwrap();
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].to_id, "topic:rooms");
+        assert_eq!(
+            mentions[0].properties.get("confidence"),
+            Some(&"0.91".into())
+        );
+
+        let path = store
+            .shortest_path("doc:livekit", "topic:egress", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            path.nodes,
+            vec!["doc:livekit", "topic:rooms", "topic:egress"]
+        );
+    }
+
+    #[derive(Default)]
+    struct MemoryConvexGraphClient {
+        nodes: RefCell<BTreeMap<String, ConvexNodeRow>>,
+        edges: RefCell<BTreeMap<String, ConvexEdgeRow>>,
+    }
+
+    impl ConvexGraphClient for MemoryConvexGraphClient {
+        fn upsert_node_row(&self, row: &ConvexNodeRow) -> Result<()> {
+            self.nodes
+                .borrow_mut()
+                .insert(row.external_id.clone(), row.clone());
+            Ok(())
+        }
+
+        fn upsert_edge_row(&self, row: &ConvexEdgeRow) -> Result<()> {
+            self.edges
+                .borrow_mut()
+                .insert(row.edge_key.clone(), row.clone());
+            Ok(())
+        }
+
+        fn node_row(&self, external_id: &str) -> Result<Option<ConvexNodeRow>> {
+            Ok(self.nodes.borrow().get(external_id).cloned())
+        }
+
+        fn node_rows_by_kind(&self, kind: &str) -> Result<Vec<ConvexNodeRow>> {
+            Ok(self
+                .nodes
+                .borrow()
+                .values()
+                .filter(|row| row.kind == kind)
+                .cloned()
+                .collect())
+        }
+
+        fn outgoing_edge_rows(
+            &self,
+            from_external_id: &str,
+            kind: Option<&str>,
+        ) -> Result<Vec<ConvexEdgeRow>> {
+            Ok(self
+                .edges
+                .borrow()
+                .values()
+                .filter(|row| row.from_external_id == from_external_id)
+                .filter(|row| kind.is_none_or(|kind| row.kind == kind))
+                .cloned()
+                .collect())
+        }
     }
 
     #[test]
@@ -449,6 +791,66 @@ mod tests {
                 .outgoing_edges("doc:livekit", Some("mentions"))
                 .unwrap(),
             vec![edge]
+        );
+    }
+
+    #[test]
+    fn graph_projection_round_trips_through_backend_agnostic_store_contract() {
+        let sqlite = SqliteGraphStore::in_memory().unwrap();
+        assert_projection_store_contract(&sqlite);
+
+        let convex = ConvexGraphStore::new(MemoryConvexGraphClient::default());
+        assert_projection_store_contract(&convex);
+
+        let client = convex.client();
+        assert_eq!(client.nodes.borrow().len(), 3);
+        assert_eq!(client.edges.borrow().len(), 2);
+        assert!(
+            client.nodes.borrow().contains_key("doc:livekit"),
+            "Convex rows keep GraphNode.id as the externalId upsert key"
+        );
+    }
+
+    #[test]
+    fn convex_projection_rows_keep_stable_ids_and_edge_keys() {
+        let projection = sample_projection();
+        let rows = projection.to_convex_rows();
+
+        let doc_row = rows
+            .nodes
+            .iter()
+            .find(|row| row.external_id == "doc:livekit")
+            .unwrap();
+        assert_eq!(doc_row.kind, "document");
+        assert_eq!(doc_row.properties.get("domain"), Some(&"livekit".into()));
+
+        let mentions = rows
+            .edges
+            .iter()
+            .find(|row| row.kind == "mentions")
+            .unwrap();
+        assert_eq!(mentions.from_external_id, "doc:livekit");
+        assert_eq!(mentions.to_external_id, "topic:rooms");
+        assert_eq!(
+            mentions.edge_key,
+            ConvexEdgeRow::stable_key("doc:livekit", "topic:rooms", "mentions")
+        );
+        assert!(mentions.edge_key.starts_with("edge:"));
+    }
+
+    #[test]
+    fn convex_store_rejects_edges_when_projection_nodes_are_missing() {
+        let store = ConvexGraphStore::new(MemoryConvexGraphClient::default());
+        store
+            .upsert_node(&GraphNode::new("doc:livekit", "document", "LiveKit guide"))
+            .unwrap();
+
+        let err = store
+            .upsert_edge(&GraphEdge::new("doc:livekit", "topic:rooms", "mentions"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("references missing to node"),
+            "{err}"
         );
     }
 
