@@ -1,0 +1,29 @@
+{
+  "nodes": [
+    {
+      "externalId": "stale-node",
+      "kind": "backlog",
+      "label": "stale",
+      "properties": {
+        "ref_id": "stale"
+      },
+      "provenance": [],
+      "freshness": {
+        "content_hash": "stale"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "edgeKey": "stale-edge",
+      "fromExternalId": "stale-node",
+      "toExternalId": "stale-node",
+      "kind": "mentions",
+      "properties": {},
+      "provenance": [],
+      "freshness": {
+        "content_hash": "stale"
+      }
+    }
+  ]
+}

@@ -4438,6 +4438,18 @@ fn context_pack_json_composes_next_context_and_optional_digests() {
         json["resume_commands"][0],
         "tsift session-review --next-context tasks/software/tsift.md"
     );
+    assert!(
+        json["exploration"]["worker_context"][0]["handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("xwrk-")
+    );
+    assert!(
+        json["exploration"]["worker_context"][0]["expand"]
+            .as_str()
+            .unwrap()
+            .contains("context-pack")
+    );
 
     let envelope_output = tsift_bin()
         .args([

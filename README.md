@@ -32,11 +32,18 @@ tsift --envelope search "route dispatch" --budget normal
 tsift --envelope source-read src/main.rs --start 1 --lines 120 --budget normal
 tsift diff-digest .
 tsift --envelope session-review tasks/software/tsift.md --next-context --budget normal
+tsift graph-db --path . kind backlog --property ref_id=cvxa --limit 5 --json
+tsift convex-sync . --chunk-size 100 --json
 ```
 
 For agent-doc projects, run `tsift status` from the repository root at session
 start. If `status` recommends a fix, run `tsift status --fix` before depending
 on search or digest output.
+
+Graph DB and Convex operator examples live under
+`fixtures/graph-db-operator-examples`; the reusable Convex app-side schema,
+mutations, and HTTP action for `tsift convex-sync --apply` live under
+`examples/convex-graph`.
 
 ## Release Notes
 

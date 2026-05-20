@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- `tsift graph-db kind` and `graph-db neighborhood` now support deterministic node-id cursor pagination, repeatable `--property KEY=VALUE` node filters, page diagnostics, and backend parity coverage across SQLite and Convex snapshot stores.
+- Added `examples/convex-graph`, a reusable Convex app-side schema/mutation/HTTP-action package for `tsift convex-sync --remote-snapshot --apply`, plus a local HTTP smoke test proving apply chunks round-trip through the documented transport shape.
+- Agent-doc queue entries now materialize as `job_packet` graph nodes, and `context-pack` exploration packets now include bounded `worker_context` nodes linked to source handles so worker handoffs preserve prompt scope in the graph substrate.
+- Added `fixtures/graph-db-operator-examples` with SQLite graph-db commands, Convex sync/apply examples, a stale snapshot fixture, and handle-reuse guidance for `traverse` / `context-pack`.
 - `tsift traverse` and `context-pack` now materialize provider-neutral graph rows into `.tsift/graph.db` before report generation, including projection metadata/freshness, source-handle nodes, and Convex snapshot fail-closed validation; `tsift convex-sync` emits dry-run Convex `nodes`/`edges` upsert, tombstone, chunk, index, and freshness diagnostics.
 - Added `tsift traverse`, a Graphify-style traversal surface that exports JSON/HTML graph slices with stable `gfil-*`, `gsym-*`, `gses-*`, and `gbak-*` handles for files, symbols, agent-doc sessions, and backlog items, plus neighborhood, shortest-path, and next-node recommendation reports for bug-fix navigation.
 - `tsift status` now emits structured stale-index reminders, and `context-pack` carries the same reminders forward so agent handoff packs still show the reindex command and missing-summary follow-up when the repo index is stale.

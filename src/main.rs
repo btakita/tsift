@@ -746,6 +746,15 @@ enum GraphDbQuery {
     Kind {
         /// Node kind to scan
         kind: String,
+        /// Return records after this node id cursor
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum node records to return (0 = unlimited)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Require a node property match, formatted KEY=VALUE. Repeatable.
+        #[arg(long = "property", value_name = "KEY=VALUE")]
+        property_filters: Vec<String>,
     },
     /// Read an outgoing neighborhood from one node
     Neighborhood {
@@ -757,6 +766,15 @@ enum GraphDbQuery {
         /// Restrict traversed edges to this kind
         #[arg(long)]
         edge_kind: Option<String>,
+        /// Return nodes after this node id cursor
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum node records to return (0 = unlimited)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Require a node property match, formatted KEY=VALUE. Repeatable.
+        #[arg(long = "property", value_name = "KEY=VALUE")]
+        property_filters: Vec<String>,
     },
     /// Find the shortest directed path between two nodes
     Path {
@@ -4351,10 +4369,20 @@ struct ExplorationSourceWindow {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
+struct ExplorationWorkerContext {
+    handle: String,
+    target: String,
+    summary: String,
+    expand: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
 struct ExplorationPacket {
     budget: ExplorationBudget,
     relationship_map: Vec<ExplorationRelation>,
     source_windows: Vec<ExplorationSourceWindow>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    worker_context: Vec<ExplorationWorkerContext>,
     no_reread_guidance: String,
 }
 
@@ -5324,6 +5352,35 @@ struct GraphDbFreshnessReport {
     diagnostics: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct GraphDbPropertyFilter {
+    key: String,
+    value: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GraphDbQueryOptions {
+    cursor: Option<String>,
+    limit: Option<usize>,
+    property_filters: Vec<GraphDbPropertyFilter>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct GraphDbPageReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+    returned_nodes: usize,
+    returned_edges: usize,
+    truncated: bool,
+    property_filters: Vec<GraphDbPropertyFilter>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    diagnostics: Vec<String>,
+}
+
 #[derive(Serialize)]
 struct GraphDbReport {
     root: String,
@@ -5342,8 +5399,119 @@ struct GraphDbReport {
     edges: Vec<SubstrateGraphEdge>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<substrate::GraphPath>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page: Option<GraphDbPageReport>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     warnings: Vec<String>,
+}
+
+fn parse_graph_db_property_filters(raw: &[String]) -> Result<Vec<GraphDbPropertyFilter>> {
+    raw.iter()
+        .map(|value| {
+            let (key, filter_value) = value
+                .split_once('=')
+                .with_context(|| format!("graph-db --property expects KEY=VALUE, got {value:?}"))?;
+            let key = key.trim();
+            let filter_value = filter_value.trim();
+            if key.is_empty() || filter_value.is_empty() {
+                bail!("graph-db --property expects non-empty KEY=VALUE, got {value:?}");
+            }
+            Ok(GraphDbPropertyFilter {
+                key: key.to_string(),
+                value: filter_value.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn graph_db_query_options(
+    cursor: Option<String>,
+    limit: Option<usize>,
+    property_filters: &[String],
+) -> Result<GraphDbQueryOptions> {
+    Ok(GraphDbQueryOptions {
+        cursor,
+        limit: limit.filter(|limit| *limit > 0),
+        property_filters: parse_graph_db_property_filters(property_filters)?,
+    })
+}
+
+fn graph_db_node_matches_filters(
+    node: &SubstrateGraphNode,
+    filters: &[GraphDbPropertyFilter],
+) -> bool {
+    filters
+        .iter()
+        .all(|filter| node.properties.get(&filter.key) == Some(&filter.value))
+}
+
+fn graph_db_edge_key(edge: &SubstrateGraphEdge) -> String {
+    substrate::ConvexEdgeRow::stable_key(&edge.from_id, &edge.to_id, &edge.kind)
+}
+
+fn apply_graph_db_node_page(
+    nodes: &mut Vec<SubstrateGraphNode>,
+    edges: &mut Vec<SubstrateGraphEdge>,
+    options: GraphDbQueryOptions,
+) -> GraphDbPageReport {
+    nodes.sort_by(|left, right| left.id.cmp(&right.id));
+    edges.sort_by_key(graph_db_edge_key);
+
+    let before_filter = nodes.len();
+    if !options.property_filters.is_empty() {
+        nodes.retain(|node| graph_db_node_matches_filters(node, &options.property_filters));
+    }
+    let after_filter = nodes.len();
+
+    if let Some(cursor) = &options.cursor {
+        nodes.retain(|node| node.id > *cursor);
+    }
+
+    let before_limit = nodes.len();
+    let mut next_cursor = None;
+    if let Some(limit) = options.limit
+        && nodes.len() > limit
+    {
+        next_cursor = nodes
+            .get(limit.saturating_sub(1))
+            .map(|node| node.id.clone());
+        nodes.truncate(limit);
+    }
+
+    let node_ids = nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    edges.retain(|edge| {
+        node_ids.contains(edge.from_id.as_str()) && node_ids.contains(edge.to_id.as_str())
+    });
+
+    let mut diagnostics = Vec::new();
+    if after_filter != before_filter {
+        diagnostics.push(format!(
+            "property filters removed {} node(s)",
+            before_filter.saturating_sub(after_filter)
+        ));
+    }
+    if options.cursor.is_some() {
+        diagnostics.push("cursor is exclusive and ordered by node id".to_string());
+    }
+    if next_cursor.is_some() {
+        diagnostics.push(
+            "result was truncated; pass page.next_cursor as --cursor for the next page".to_string(),
+        );
+    }
+
+    GraphDbPageReport {
+        cursor: options.cursor,
+        limit: options.limit,
+        next_cursor,
+        returned_nodes: nodes.len(),
+        returned_edges: edges.len(),
+        truncated: options.limit.is_some_and(|limit| before_limit > limit),
+        property_filters: options.property_filters,
+        diagnostics,
+    }
 }
 
 fn graph_db_schema() -> GraphDbSchema {
@@ -5422,12 +5590,12 @@ fn graph_db_schema() -> GraphDbSchema {
                 description: "Return one node by stable id",
             },
             GraphDbSchemaOperation {
-                command: "kind <kind>",
-                description: "Return nodes of one kind ordered by id",
+                command: "kind <kind> [--property KEY=VALUE] [--cursor ID] [--limit N]",
+                description: "Return nodes of one kind ordered by id with optional property filtering and cursor pagination",
             },
             GraphDbSchemaOperation {
-                command: "neighborhood <id> --depth <n> [--edge-kind <kind>]",
-                description: "Return a directed outgoing subgraph around a node",
+                command: "neighborhood <id> --depth <n> [--edge-kind <kind>] [--property KEY=VALUE] [--cursor ID] [--limit N]",
+                description: "Return a directed outgoing subgraph around a node, optionally filtered and paged by node id",
             },
             GraphDbSchemaOperation {
                 command: "path <from> <to> [--edge-kind <kind>]",
@@ -5517,6 +5685,7 @@ fn graph_db_report_from_store(
         nodes: Vec::new(),
         edges: Vec::new(),
         path: None,
+        page: None,
         warnings,
     };
 
@@ -5527,17 +5696,37 @@ fn graph_db_report_from_store(
         GraphDbQuery::Node { id } => {
             report.node = store.node(&id)?;
         }
-        GraphDbQuery::Kind { kind } => {
+        GraphDbQuery::Kind {
+            kind,
+            cursor,
+            limit,
+            property_filters,
+        } => {
             report.nodes = store.nodes_by_kind(&kind)?;
+            let options = graph_db_query_options(cursor, limit, &property_filters)?;
+            report.page = Some(apply_graph_db_node_page(
+                &mut report.nodes,
+                &mut report.edges,
+                options,
+            ));
         }
         GraphDbQuery::Neighborhood {
             id,
             depth,
             edge_kind,
+            cursor,
+            limit,
+            property_filters,
         } => {
             if let Some(subgraph) = store.neighborhood(&id, depth, edge_kind.as_deref())? {
                 report.nodes = subgraph.nodes;
                 report.edges = subgraph.edges;
+                let options = graph_db_query_options(cursor, limit, &property_filters)?;
+                report.page = Some(apply_graph_db_node_page(
+                    &mut report.nodes,
+                    &mut report.edges,
+                    options,
+                ));
             }
         }
         GraphDbQuery::Path {
@@ -5584,6 +5773,14 @@ fn print_graph_db_human(report: &GraphDbReport, compact: bool) {
     }
     if let Some(path) = &report.path {
         println!("path: {} hop(s) {}", path.hops, path.nodes.join(" -> "));
+    }
+    if let Some(page) = &report.page {
+        if let Some(next_cursor) = &page.next_cursor {
+            println!("next_cursor: {next_cursor}");
+        }
+        for diagnostic in &page.diagnostics {
+            println!("page: {diagnostic}");
+        }
     }
     for warning in &report.warnings {
         println!("warning: {warning}");
@@ -5801,6 +5998,30 @@ fn traversal_backlog_node(
     }
 }
 
+fn traversal_job_packet_node(
+    root: &Path,
+    markdown_path: &Path,
+    label: &str,
+    ref_id: Option<&str>,
+    detail: &str,
+    line: i64,
+) -> TraversalNode {
+    let display = relativize_pathbuf(markdown_path, root)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let handle = stable_handle("gjob", &format!("job:{display}:{line}:{label}"));
+    TraversalNode {
+        handle: handle.clone(),
+        kind: "job_packet".to_string(),
+        label: label.to_string(),
+        ref_id: ref_id.map(str::to_string),
+        path: Some(display),
+        line: Some(line),
+        detail: Some(detail.to_string()),
+        expand: traversal_expand_command(root, &handle),
+    }
+}
+
 fn traversal_tokens(input: &str) -> BTreeSet<String> {
     input
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
@@ -5851,6 +6072,22 @@ fn parse_backlog_line(line: &str) -> Option<(String, String)> {
     }
     let text = rest[end + 1..].trim().to_string();
     Some((id.to_string(), text))
+}
+
+fn parse_queue_dispatch_line(line: &str) -> Option<String> {
+    line.trim()
+        .strip_prefix("dispatch ")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_queue_do_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("- do [#")?;
+    let end = rest.find(']')?;
+    let id = rest[..end].trim();
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 fn markdown_files_for_traversal(root: &Path) -> Result<Vec<PathBuf>> {
@@ -5991,12 +6228,15 @@ fn load_agent_doc_traversal_nodes(
 
         let session = traversal_session_node(root, &markdown_path, session_id.as_deref());
         graph.add_node(session.clone());
-        for (idx, line) in content.lines().enumerate() {
+        let lines = content.lines().collect::<Vec<_>>();
+        let mut backlog_by_id = BTreeMap::<String, TraversalNode>::new();
+        for (idx, line) in lines.iter().enumerate() {
             let Some((id, text)) = parse_backlog_line(line) else {
                 continue;
             };
             let backlog = traversal_backlog_node(root, &markdown_path, &id, &text, idx as i64 + 1);
             graph.add_node(backlog.clone());
+            backlog_by_id.insert(id.clone(), backlog.clone());
             graph.add_edge(
                 &session.handle,
                 &backlog.handle,
@@ -6005,6 +6245,73 @@ fn load_agent_doc_traversal_nodes(
                 1,
             );
             link_backlog_to_code_nodes(graph, &backlog, &text, symbols, files, routes, 8);
+        }
+
+        let mut in_queue = false;
+        for (idx, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("<!-- agent:queue") {
+                in_queue = true;
+                continue;
+            }
+            if trimmed.starts_with("<!-- /agent:queue") {
+                in_queue = false;
+                continue;
+            }
+            if !in_queue {
+                continue;
+            }
+            if let Some(dispatch) = parse_queue_dispatch_line(line) {
+                let dispatch_ref = dispatch.strip_prefix('#').unwrap_or(dispatch.as_str());
+                let node = traversal_job_packet_node(
+                    root,
+                    &markdown_path,
+                    &format!("dispatch {dispatch}"),
+                    Some(dispatch_ref),
+                    "agent-doc dispatch preset",
+                    idx as i64 + 1,
+                );
+                graph.add_node(node.clone());
+                graph.add_edge(
+                    &session.handle,
+                    &node.handle,
+                    "contains",
+                    Some("session queued dispatch".to_string()),
+                    1,
+                );
+                continue;
+            }
+            if let Some(id) = parse_queue_do_line(line) {
+                let detail = backlog_by_id
+                    .get(&id)
+                    .and_then(|node| node.detail.clone())
+                    .unwrap_or_else(|| "queued backlog item".to_string());
+                let node = traversal_job_packet_node(
+                    root,
+                    &markdown_path,
+                    &format!("do #{id}"),
+                    Some(&id),
+                    &detail,
+                    idx as i64 + 1,
+                );
+                graph.add_node(node.clone());
+                graph.add_edge(
+                    &session.handle,
+                    &node.handle,
+                    "contains",
+                    Some("session queued job packet".to_string()),
+                    1,
+                );
+                if let Some(backlog) = backlog_by_id.get(&id) {
+                    graph.add_edge(
+                        &node.handle,
+                        &backlog.handle,
+                        "targets",
+                        Some("queued backlog item".to_string()),
+                        1,
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -6703,6 +7010,7 @@ fn build_exploration_packet(
         budget,
         relationship_map,
         source_windows,
+        worker_context: Vec::new(),
         no_reread_guidance:
             "Use the source_windows expand commands for line-numbered context; avoid whole-file reads unless the needed line is outside every listed window."
                 .to_string(),
@@ -11066,12 +11374,39 @@ fn build_context_pack_exploration_packet(
         }
     }
 
+    let worker_seeds = if next_context.prompt_targets.is_empty() {
+        next_context.next_digest_commands.clone()
+    } else {
+        next_context.prompt_targets.clone()
+    };
+    let mut worker_context = Vec::new();
+    for (idx, prompt) in worker_seeds
+        .iter()
+        .take(budget.relationship_limit)
+        .enumerate()
+    {
+        let summary = truncate_for_budget(prompt, next_context.max_bytes);
+        worker_context.push(ExplorationWorkerContext {
+            handle: stable_handle(
+                "xwrk",
+                &format!("{}:{}:{}", next_context.target, idx, prompt),
+            ),
+            target: next_context.target.clone(),
+            summary,
+            expand: format!(
+                "tsift --envelope context-pack {} --budget normal",
+                shell_quote(&next_context.target)
+            ),
+        });
+    }
+
     ExplorationPacket {
         budget,
         relationship_map,
         source_windows,
+        worker_context,
         no_reread_guidance:
-            "Use the source_windows expand commands before broad file reads; relationship_map explains why each window is in the handoff."
+            "Use worker_context for bounded handoff scope, then source_windows expand commands before broad file reads; relationship_map explains why each window is in the handoff."
                 .to_string(),
     }
 }
@@ -11129,6 +11464,45 @@ fn context_pack_exploration_projection(packet: &ExplorationPacket) -> Result<Gra
             .with_property("label", window.reason.clone())
             .with_provenance(provenance.clone());
         edges.push(edge_with_content_freshness(edge)?);
+    }
+
+    for worker in &packet.worker_context {
+        let node = SubstrateGraphNode::new(
+            worker.handle.clone(),
+            "worker_context",
+            worker.summary.clone(),
+        )
+        .with_property("handle", worker.handle.clone())
+        .with_property("target", worker.target.clone())
+        .with_property("summary", worker.summary.clone())
+        .with_property("expand", worker.expand.clone())
+        .with_provenance(provenance.clone());
+        nodes.insert(worker.handle.clone(), node_with_content_freshness(node)?);
+
+        let target_ref = format!("context:{}", worker.target);
+        let target_ref_id = exploration_ref_id(&target_ref);
+        nodes.entry(target_ref_id.clone()).or_insert_with(|| {
+            SubstrateGraphNode::new(target_ref_id.clone(), "exploration_ref", target_ref.clone())
+                .with_property("label", target_ref.clone())
+                .with_provenance(provenance.clone())
+        });
+        edges.push(edge_with_content_freshness(
+            SubstrateGraphEdge::new(worker.handle.clone(), target_ref_id, "scopes_context")
+                .with_property("label", "bounded worker context".to_string())
+                .with_provenance(provenance.clone()),
+        )?);
+
+        for window in &packet.source_windows {
+            edges.push(edge_with_content_freshness(
+                SubstrateGraphEdge::new(
+                    worker.handle.clone(),
+                    window.handle.clone(),
+                    "scopes_source",
+                )
+                .with_property("label", window.reason.clone())
+                .with_provenance(provenance.clone()),
+            )?);
+        }
     }
 
     let mut nodes = nodes.into_values().collect::<Vec<_>>();
@@ -11227,6 +11601,7 @@ fn materialize_context_pack_exploration_packet(
         budget: packet.budget,
         relationship_map,
         source_windows,
+        worker_context: packet.worker_context,
         no_reread_guidance: packet.no_reread_guidance,
     })
 }
@@ -15716,6 +16091,11 @@ agent_doc_format: template
 ❯ do [#kgnv]
 <!-- /agent:exchange -->
 
+<!-- agent:queue -->
+dispatch #spec-test-build-install-commit-push
+- do [#kgnv]
+<!-- /agent:queue -->
+
 ## Backlog
 
 <!-- agent:backlog -->
@@ -15818,6 +16198,28 @@ agent_doc_format: template
     }
 
     #[test]
+    fn traversal_graph_links_agent_doc_queue_job_packets_to_backlog() {
+        let dir = setup_traversal_project();
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let job = resolve_traversal_node(&graph, "do #kgnv").unwrap();
+        let backlog = resolve_traversal_node(&graph, "#kgnv").unwrap();
+
+        assert_eq!(job.kind, "job_packet");
+        assert!(job.handle.starts_with("gjob-"));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == job.handle && edge.to == backlog.handle && edge.relation == "targets"
+        }));
+
+        let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
+        let jobs = store.nodes_by_kind("job_packet").unwrap();
+        assert!(
+            jobs.iter()
+                .any(|node| node.properties.get("ref_id") == Some(&"kgnv".to_string())),
+            "expected queued job packet in graph store, got {jobs:?}"
+        );
+    }
+
+    #[test]
     fn traversal_graph_includes_routes_and_handler_edges() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -15908,6 +16310,9 @@ def list_items():
                 id: backlog.handle.clone(),
                 depth: 1,
                 edge_kind: Some("mentions".to_string()),
+                cursor: None,
+                limit: None,
+                property_filters: Vec::new(),
             },
             &store,
             freshness,
@@ -15941,6 +16346,78 @@ def list_items():
                 .iter()
                 .any(|operation| operation.command.starts_with("neighborhood"))
         );
+    }
+
+    fn current_graph_db_freshness() -> GraphDbFreshnessReport {
+        GraphDbFreshnessReport {
+            status: "current".to_string(),
+            fail_closed: false,
+            projection_version: Some(GRAPH_PROJECTION_VERSION.to_string()),
+            content_hash: Some("fixture".to_string()),
+            source_watermark: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn paged_graph_ids(
+        store: &impl GraphStore,
+        cursor: Option<&str>,
+    ) -> (Vec<String>, GraphDbPageReport) {
+        let report = graph_db_report_from_store(
+            Path::new("."),
+            None,
+            "fixture",
+            GraphDbQuery::Kind {
+                kind: "backlog".to_string(),
+                cursor: cursor.map(str::to_string),
+                limit: Some(2),
+                property_filters: vec!["phase=open".to_string()],
+            },
+            store,
+            current_graph_db_freshness(),
+            Vec::new(),
+        )
+        .unwrap();
+        (
+            report.nodes.iter().map(|node| node.id.clone()).collect(),
+            report.page.unwrap(),
+        )
+    }
+
+    #[test]
+    fn graph_db_query_pagination_and_filters_match_sqlite_and_convex() {
+        let nodes = (0..5)
+            .map(|idx| {
+                let phase = if idx == 1 { "closed" } else { "open" };
+                SubstrateGraphNode::new(format!("gbak-{idx:02}"), "backlog", format!("#{idx:02}"))
+                    .with_property("phase", phase)
+            })
+            .collect::<Vec<_>>();
+        let projection = GraphProjection {
+            nodes,
+            edges: Vec::new(),
+        };
+        let sqlite = SqliteGraphStore::in_memory().unwrap();
+        projection.upsert_into(&sqlite).unwrap();
+        let convex = ConvexGraphStore::new(MemoryConvexGraphClient::default());
+        projection.upsert_into(&convex).unwrap();
+
+        let (sqlite_first_ids, sqlite_first_page) = paged_graph_ids(&sqlite, None);
+        let (convex_first_ids, convex_first_page) = paged_graph_ids(&convex, None);
+        assert_eq!(sqlite_first_ids, vec!["gbak-00", "gbak-02"]);
+        assert_eq!(sqlite_first_ids, convex_first_ids);
+        assert_eq!(sqlite_first_page.next_cursor.as_deref(), Some("gbak-02"));
+        assert!(sqlite_first_page.truncated);
+        assert_eq!(sqlite_first_page, convex_first_page);
+
+        let cursor = sqlite_first_page.next_cursor.as_deref();
+        let (sqlite_next_ids, sqlite_next_page) = paged_graph_ids(&sqlite, cursor);
+        let (convex_next_ids, convex_next_page) = paged_graph_ids(&convex, cursor);
+        assert_eq!(sqlite_next_ids, vec!["gbak-03", "gbak-04"]);
+        assert_eq!(sqlite_next_ids, convex_next_ids);
+        assert_eq!(sqlite_next_page.next_cursor, None);
+        assert!(!sqlite_next_page.truncated);
+        assert_eq!(sqlite_next_page, convex_next_page);
     }
 
     #[test]
@@ -19837,6 +20314,13 @@ tier = "private"
                 reason: "changed file".to_string(),
                 expand: "tsift source-read main.rs --path . --start 1 --lines 32".to_string(),
             }],
+            worker_context: vec![ExplorationWorkerContext {
+                handle: "xwrk-test".to_string(),
+                target: "tasks/software/tsift.md".to_string(),
+                summary: "do #kgnv".to_string(),
+                expand: "tsift --envelope context-pack tasks/software/tsift.md --budget normal"
+                    .to_string(),
+            }],
             no_reread_guidance: "use windows".to_string(),
         };
 
@@ -19853,6 +20337,15 @@ tier = "private"
         assert_eq!(
             store
                 .outgoing_edges(&exploration_ref_id("file:main.rs"), Some("touches_symbol"))
+                .unwrap()
+                .len(),
+            1
+        );
+        let worker_context = store.nodes_by_kind("worker_context").unwrap();
+        assert_eq!(worker_context.len(), 1);
+        assert_eq!(
+            store
+                .outgoing_edges("xwrk-test", Some("scopes_source"))
                 .unwrap()
                 .len(),
             1
@@ -19948,6 +20441,88 @@ tier = "private"
                 .any(|chunk| chunk.operation == "upsert_nodes"),
             "live apply mode should still expose chunked idempotent operations"
         );
+    }
+
+    #[test]
+    fn convex_sync_apply_round_trips_with_http_backend() {
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let dir = setup_traversal_project();
+        let report =
+            build_convex_sync_report_with_snapshot(dir.path(), None, None, 100, false).unwrap();
+        let expected_chunks = report.chunks.len();
+        assert!(expected_chunks > 0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let operations = Arc::new(Mutex::new(Vec::<String>::new()));
+        let server_operations = Arc::clone(&operations);
+        let server = std::thread::spawn(move || {
+            for _ in 0..expected_chunks {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                assert!(request_line.starts_with("POST "));
+
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+
+                let mut body = vec![0u8; content_length];
+                reader.read_exact(&mut body).unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                server_operations
+                    .lock()
+                    .unwrap()
+                    .push(request["operation"].as_str().unwrap().to_string());
+
+                let response = br#"{"status":"ok","message":"accepted"}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                )
+                .unwrap();
+                stream.write_all(response).unwrap();
+            }
+        });
+
+        cmd_convex_sync(
+            ConvexSyncOptions {
+                path: dir.path(),
+                scope: None,
+                snapshot: None,
+                chunk_size: 100,
+                remote_snapshot: false,
+                apply: true,
+                endpoint: Some(&endpoint),
+                auth_token_env: "TSIFT_TEST_CONVEX_AUTH_TOKEN",
+            },
+            OutputFormat {
+                json_output: false,
+                compact: true,
+                pretty: false,
+                terse: false,
+                schema: false,
+                envelope: false,
+            },
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        let operations = operations.lock().unwrap().clone();
+        assert!(operations.contains(&"upsert_nodes".to_string()));
+        assert!(operations.contains(&"upsert_edges".to_string()));
     }
 
     #[test]
@@ -20377,6 +20952,12 @@ tier = "private"
             "2",
             "--edge-kind",
             "mentions",
+            "--property",
+            "path=tasks/software/tsift.md",
+            "--cursor",
+            "gbak-old",
+            "--limit",
+            "10",
         ]);
         match cli.command {
             Some(Commands::GraphDb {
@@ -20394,10 +20975,19 @@ tier = "private"
                         id,
                         depth,
                         edge_kind,
+                        cursor,
+                        limit,
+                        property_filters,
                     } => {
                         assert_eq!(id, "gbak-kgnv");
                         assert_eq!(depth, 2);
                         assert_eq!(edge_kind.as_deref(), Some("mentions"));
+                        assert_eq!(cursor.as_deref(), Some("gbak-old"));
+                        assert_eq!(limit, Some(10));
+                        assert_eq!(
+                            property_filters,
+                            vec!["path=tasks/software/tsift.md".to_string()]
+                        );
                     }
                     _ => panic!("expected graph-db neighborhood query"),
                 }

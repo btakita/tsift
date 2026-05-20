@@ -1,0 +1,55 @@
+# Graph DB Operator Examples
+
+These examples document the SQLite and Convex graph DB paths with reusable commands and small fixtures.
+
+## SQLite Graph DB Reads
+
+```bash
+tsift traverse --path . --format json >/tmp/tsift-traverse.json
+tsift graph-db --path . schema --json
+tsift graph-db --path . kind backlog --property ref_id=cvxa --limit 5 --json
+tsift graph-db --path . neighborhood gbak-example --depth 2 --edge-kind mentions --json
+```
+
+`traverse` materializes `.tsift/graph.db`; `graph-db` then reads the same SQLite correctness store.
+
+## Convex Sync Dry Run
+
+```bash
+tsift convex-sync . --snapshot fixtures/graph-db-operator-examples/stale-convex-snapshot.json --chunk-size 25 --json
+```
+
+The stale fixture intentionally omits the local projection metadata, so freshness should report a fail-closed plan with node and edge upserts.
+
+## Convex Apply
+
+```bash
+TSIFT_CONVEX_GRAPH_URL="https://<deployment>.convex.site/tsift/graph" \
+TSIFT_CONVEX_AUTH_TOKEN="<optional bearer token>" \
+tsift convex-sync . --remote-snapshot --apply --json
+```
+
+Use `examples/convex-graph` for the Convex app-side schema, mutations, and HTTP action that accepts the chunks.
+
+## Convex Snapshot Reads
+
+```bash
+tsift graph-db \
+  --backend convex-snapshot \
+  --convex-snapshot /tmp/current-convex-rows.json \
+  kind source_handle \
+  --limit 10 \
+  --json
+```
+
+Convex-backed reads fail closed when the supplied snapshot trails `.tsift/graph.db`.
+
+## Handle Reuse
+
+```bash
+tsift --envelope context-pack tasks/software/tsift.md --budget normal --json
+tsift traverse <source_handle_or_job_packet_handle> --path . --depth 1 --format json
+```
+
+The context pack stores `source_handle` and `worker_context` nodes in the graph. Agent-doc queue entries become `job_packet` nodes, so workers can keep handoff scope, source windows, and queued backlog items linked by stable handles.
+
