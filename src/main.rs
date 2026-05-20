@@ -4735,6 +4735,31 @@ fn load_convex_projection_rows(path: &Path) -> Result<ConvexProjectionRows> {
         .with_context(|| format!("parsing Convex projection snapshot {}", path.display()))
 }
 
+fn validate_convex_projection_rows(rows: &ConvexProjectionRows) -> Result<()> {
+    let node_ids = rows
+        .nodes
+        .iter()
+        .map(|row| row.external_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for edge in &rows.edges {
+        if !node_ids.contains(edge.from_external_id.as_str()) {
+            bail!(
+                "Convex snapshot edge {} references missing from node {}",
+                edge.edge_key,
+                edge.from_external_id
+            );
+        }
+        if !node_ids.contains(edge.to_external_id.as_str()) {
+            bail!(
+                "Convex snapshot edge {} references missing to node {}",
+                edge.edge_key,
+                edge.to_external_id
+            );
+        }
+    }
+    Ok(())
+}
+
 struct ConvexHttpTransport {
     endpoint: String,
     auth_token_env: String,
@@ -4971,6 +4996,7 @@ fn verify_convex_projection_snapshot(
     let store = SqliteGraphStore::open(&graph_db)?;
     let local = convex_rows_from_graph_store(&store)?;
     let snapshot = load_convex_projection_rows(snapshot_path)?;
+    validate_convex_projection_rows(&snapshot)?;
     let freshness = convex_projection_freshness(&local, Some(&snapshot), scope);
     if freshness.fail_closed {
         bail!(
@@ -5818,6 +5844,7 @@ fn cmd_graph_db(
             let local_store = SqliteGraphStore::open(&graph_db)?;
             let local = convex_rows_from_graph_store(&local_store)?;
             let snapshot = load_convex_projection_rows(snapshot_path)?;
+            validate_convex_projection_rows(&snapshot)?;
             let freshness = convex_graph_freshness(&local, &snapshot, scope);
             let client = ConvexRowsGraphClient::from_rows(snapshot);
             let store = SubstrateConvexGraphStore::new(client);
