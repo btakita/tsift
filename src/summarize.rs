@@ -306,6 +306,18 @@ impl SummaryDb {
         Ok(rows)
     }
 
+    pub fn all(&self) -> Result<Vec<Summary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, symbol_name, file_path, content_hash, summary, entities, relationships,
+                    concept_labels, extracted_at, model, tokens_input, tokens_output
+             FROM summaries ORDER BY file_path, symbol_name, id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok(row_to_summary(row)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn insert(&self, summary: &Summary) -> Result<()> {
         insert_summary(&self.conn, summary)
     }

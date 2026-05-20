@@ -497,6 +497,26 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Find related cached semantic concepts/entities from the local graph store
+    Semantic {
+        /// Concept or entity text to compare against cached semantic graph rows
+        query: String,
+        /// Path to the indexed codebase (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Restrict indexed code nodes to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Max related items to return (0 = unlimited)
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+        /// Which semantic node family to search
+        #[arg(long, value_enum, default_value = "concept")]
+        kind: SemanticRelatedKind,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Summarize git-changed files into a bounded, code-aware digest
     DiffDigest {
         /// Path to the codebase (defaults to current directory)
@@ -725,6 +745,13 @@ enum Commands {
 enum TraverseFormat {
     Json,
     Html,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum SemanticRelatedKind {
+    Concept,
+    Entity,
+    All,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1380,6 +1407,25 @@ fn main() -> Result<()> {
             diff,
             stats,
             &path,
+            json || terse || schema || envelope,
+            compact,
+            pretty,
+            terse,
+            schema,
+        ),
+        Some(Commands::Semantic {
+            query,
+            path,
+            scope,
+            limit,
+            kind,
+            json,
+        }) => cmd_semantic_related(
+            &query,
+            &path,
+            scope.as_deref(),
+            limit,
+            kind,
             json || terse || schema || envelope,
             compact,
             pretty,
@@ -4342,6 +4388,34 @@ struct TraversalReport {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Serialize, PartialEq)]
+struct SemanticRelatedReport {
+    root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    query: String,
+    embedding_model: String,
+    count: usize,
+    items: Vec<SemanticRelatedItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct SemanticRelatedItem {
+    handle: String,
+    kind: String,
+    label: String,
+    score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    expand: String,
+}
+
 #[derive(Clone)]
 struct TraversalSymbolIndexEntry {
     handle: String,
@@ -4467,6 +4541,374 @@ fn edge_with_content_freshness(mut edge: SubstrateGraphEdge) -> Result<Substrate
     Ok(edge)
 }
 
+const SEMANTIC_EMBEDDING_DIM: usize = 32;
+const SEMANTIC_EMBEDDING_MODEL: &str = "tsift-local-hash-v1";
+
+fn semantic_related_command(root: &Path, query: &str, kind: SemanticRelatedKind) -> String {
+    let kind_arg = match kind {
+        SemanticRelatedKind::Concept => "concept",
+        SemanticRelatedKind::Entity => "entity",
+        SemanticRelatedKind::All => "all",
+    };
+    format!(
+        "tsift semantic {} --path {} --kind {} --limit 10",
+        shell_quote(query),
+        shell_quote(root.to_string_lossy().as_ref()),
+        kind_arg
+    )
+}
+
+fn semantic_embedding(input: &str) -> Vec<f64> {
+    let mut vector = vec![0.0; SEMANTIC_EMBEDDING_DIM];
+    let mut tokens = traversal_tokens(input);
+    if tokens.is_empty() {
+        let trimmed = input.trim().to_ascii_lowercase();
+        if !trimmed.is_empty() {
+            tokens.insert(trimmed);
+        }
+    }
+
+    for token in tokens {
+        let hash = blake3::hash(token.as_bytes());
+        let bytes = hash.as_bytes();
+        let idx = usize::from(bytes[0]) % SEMANTIC_EMBEDDING_DIM;
+        let sign = if bytes[1] & 1 == 0 { 1.0 } else { -1.0 };
+        vector[idx] += sign;
+    }
+
+    let norm = vector.iter().map(|value| value * value).sum::<f64>().sqrt();
+    if norm > 0.0 {
+        for value in &mut vector {
+            *value /= norm;
+        }
+    }
+    vector
+}
+
+fn semantic_embedding_property(input: &str) -> String {
+    semantic_embedding(input)
+        .iter()
+        .map(|value| format!("{value:.6}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_semantic_embedding_property(value: &str) -> Option<Vec<f64>> {
+    let parsed = value
+        .split(',')
+        .map(str::trim)
+        .map(str::parse::<f64>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    (parsed.len() == SEMANTIC_EMBEDDING_DIM).then_some(parsed)
+}
+
+fn semantic_cosine(left: &[f64], right: &[f64]) -> f64 {
+    if left.len() != right.len() {
+        return 0.0;
+    }
+    left.iter()
+        .zip(right.iter())
+        .map(|(left, right)| left * right)
+        .sum::<f64>()
+}
+
+fn semantic_entity_handle(name: &str, kind: &str) -> String {
+    stable_handle(
+        "gent",
+        &format!(
+            "entity:{}:{}",
+            kind.trim().to_ascii_lowercase(),
+            name.trim().to_ascii_lowercase()
+        ),
+    )
+}
+
+fn semantic_concept_handle(label: &str) -> String {
+    stable_handle(
+        "gcon",
+        &format!("concept:{}", label.trim().to_ascii_lowercase()),
+    )
+}
+
+fn summary_source_handles(
+    summary: &summarize::Summary,
+    file_node_by_path: &BTreeMap<String, String>,
+    symbol_node_by_file_label: &BTreeMap<(String, String), String>,
+) -> Vec<String> {
+    let mut handles = Vec::new();
+    if let Some(handle) = file_node_by_path.get(&summary.file_path) {
+        handles.push(handle.clone());
+    }
+    if let Some(handle) =
+        symbol_node_by_file_label.get(&(summary.file_path.clone(), summary.symbol_name.clone()))
+        && !handles.iter().any(|existing| existing == handle)
+    {
+        handles.push(handle.clone());
+    }
+    handles
+}
+
+fn semantic_entity_node(
+    root: &Path,
+    summary: &summarize::Summary,
+    name: &str,
+    kind: &str,
+    description: &str,
+    provenance: &GraphProvenance,
+) -> SubstrateGraphNode {
+    let handle = semantic_entity_handle(name, kind);
+    let detail = if description.trim().is_empty() {
+        format!("{kind} entity from cached summaries")
+    } else {
+        format!("{kind}: {description}")
+    };
+    SubstrateGraphNode::new(handle.clone(), "semantic_entity", name.to_string())
+        .with_property("handle", handle)
+        .with_property("ref_id", name.to_string())
+        .with_property("detail", detail)
+        .with_property("entity_kind", kind.to_string())
+        .with_property("description", description.to_string())
+        .with_property("source_file", summary.file_path.clone())
+        .with_property("source_symbol", summary.symbol_name.clone())
+        .with_property("embedding_model", SEMANTIC_EMBEDDING_MODEL)
+        .with_property(
+            "embedding",
+            semantic_embedding_property(&format!("{name} {kind} {description}")),
+        )
+        .with_property(
+            "expand",
+            semantic_related_command(root, name, SemanticRelatedKind::Entity),
+        )
+        .with_provenance(provenance.clone())
+}
+
+fn semantic_concept_node(
+    root: &Path,
+    summary: &summarize::Summary,
+    label: &str,
+    provenance: &GraphProvenance,
+) -> SubstrateGraphNode {
+    let handle = semantic_concept_handle(label);
+    SubstrateGraphNode::new(handle.clone(), "semantic_concept", label.to_string())
+        .with_property("handle", handle)
+        .with_property("ref_id", label.to_string())
+        .with_property("detail", "concept label from cached summaries".to_string())
+        .with_property("source_file", summary.file_path.clone())
+        .with_property("source_symbol", summary.symbol_name.clone())
+        .with_property("embedding_model", SEMANTIC_EMBEDDING_MODEL)
+        .with_property("embedding", semantic_embedding_property(label))
+        .with_property(
+            "expand",
+            semantic_related_command(root, label, SemanticRelatedKind::Concept),
+        )
+        .with_provenance(provenance.clone())
+}
+
+fn insert_semantic_edge(
+    edge_map: &mut BTreeMap<(String, String, String), SubstrateGraphEdge>,
+    edge: SubstrateGraphEdge,
+) {
+    edge_map
+        .entry((edge.from_id.clone(), edge.to_id.clone(), edge.kind.clone()))
+        .or_insert(edge);
+}
+
+fn append_summary_semantic_projection_rows(
+    root: &Path,
+    graph: &TraversalGraphBuild,
+    provenance: &GraphProvenance,
+    nodes: &mut Vec<SubstrateGraphNode>,
+    edges: &mut Vec<SubstrateGraphEdge>,
+) -> Result<()> {
+    let summaries_db = root.join(".tsift/summaries.db");
+    if !summaries_db.exists() {
+        return Ok(());
+    }
+
+    let summary_db = summarize::SummaryDb::open_read_only_resilient(&summaries_db)?;
+    let summaries = summary_db.all()?;
+    if summaries.is_empty() {
+        return Ok(());
+    }
+
+    let file_node_by_path = graph
+        .nodes
+        .values()
+        .filter(|node| node.kind == "file")
+        .filter_map(|node| {
+            node.path
+                .as_ref()
+                .map(|path| (path.clone(), node.handle.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let symbol_node_by_file_label = graph
+        .nodes
+        .values()
+        .filter(|node| node.kind == "symbol")
+        .filter_map(|node| {
+            Some((
+                (node.path.clone()?, node.label.clone()),
+                node.handle.clone(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut semantic_nodes = BTreeMap::<String, SubstrateGraphNode>::new();
+    let mut semantic_edges = BTreeMap::<(String, String, String), SubstrateGraphEdge>::new();
+
+    for summary in &summaries {
+        let source_handles =
+            summary_source_handles(summary, &file_node_by_path, &symbol_node_by_file_label);
+        let mut entity_ids_by_name = BTreeMap::<String, String>::new();
+
+        if let Some(entities) = &summary.entities {
+            for entity in entities {
+                let node = semantic_entity_node(
+                    root,
+                    summary,
+                    &entity.name,
+                    &entity.kind,
+                    &entity.description,
+                    provenance,
+                );
+                let entity_id = node.id.clone();
+                entity_ids_by_name.insert(entity.name.to_ascii_lowercase(), entity_id.clone());
+                semantic_nodes.entry(entity_id.clone()).or_insert(node);
+
+                for source_handle in &source_handles {
+                    insert_semantic_edge(
+                        &mut semantic_edges,
+                        SubstrateGraphEdge::new(
+                            source_handle.clone(),
+                            entity_id.clone(),
+                            "mentions_entity",
+                        )
+                        .with_property("label", format!("summary entity: {}", entity.name))
+                        .with_property("source_file", summary.file_path.clone())
+                        .with_provenance(provenance.clone()),
+                    );
+                }
+            }
+        }
+
+        let mut concept_ids = Vec::new();
+        if let Some(labels) = &summary.concept_labels {
+            for label in labels
+                .iter()
+                .map(|label| label.trim())
+                .filter(|label| !label.is_empty())
+            {
+                let node = semantic_concept_node(root, summary, label, provenance);
+                let concept_id = node.id.clone();
+                semantic_nodes.entry(concept_id.clone()).or_insert(node);
+                concept_ids.push(concept_id.clone());
+
+                for source_handle in &source_handles {
+                    insert_semantic_edge(
+                        &mut semantic_edges,
+                        SubstrateGraphEdge::new(
+                            source_handle.clone(),
+                            concept_id.clone(),
+                            "mentions_concept",
+                        )
+                        .with_property("label", format!("summary concept: {label}"))
+                        .with_property("source_file", summary.file_path.clone())
+                        .with_provenance(provenance.clone()),
+                    );
+                }
+            }
+        }
+
+        for entity_id in entity_ids_by_name.values() {
+            for concept_id in &concept_ids {
+                insert_semantic_edge(
+                    &mut semantic_edges,
+                    SubstrateGraphEdge::new(
+                        entity_id.clone(),
+                        concept_id.clone(),
+                        "tagged_concept",
+                    )
+                    .with_property("label", "entity concept label".to_string())
+                    .with_property("source_file", summary.file_path.clone())
+                    .with_provenance(provenance.clone()),
+                );
+            }
+        }
+
+        for idx in 0..concept_ids.len() {
+            for next_idx in (idx + 1)..concept_ids.len() {
+                insert_semantic_edge(
+                    &mut semantic_edges,
+                    SubstrateGraphEdge::new(
+                        concept_ids[idx].clone(),
+                        concept_ids[next_idx].clone(),
+                        "related_concept",
+                    )
+                    .with_property("label", format!("co-occurs in {}", summary.symbol_name))
+                    .with_property("source_file", summary.file_path.clone())
+                    .with_provenance(provenance.clone()),
+                );
+            }
+        }
+
+        if let Some(relationships) = &summary.relationships {
+            for relationship in relationships {
+                let from_id = entity_ids_by_name
+                    .get(&relationship.from.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let node = semantic_entity_node(
+                            root,
+                            summary,
+                            &relationship.from,
+                            "unknown",
+                            "",
+                            provenance,
+                        );
+                        let id = node.id.clone();
+                        semantic_nodes.entry(id.clone()).or_insert(node);
+                        id
+                    });
+                let to_id = entity_ids_by_name
+                    .get(&relationship.to.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let node = semantic_entity_node(
+                            root,
+                            summary,
+                            &relationship.to,
+                            "unknown",
+                            "",
+                            provenance,
+                        );
+                        let id = node.id.clone();
+                        semantic_nodes.entry(id.clone()).or_insert(node);
+                        id
+                    });
+                insert_semantic_edge(
+                    &mut semantic_edges,
+                    SubstrateGraphEdge::new(from_id, to_id, "semantic_relation")
+                        .with_property("relationship_kind", relationship.kind.clone())
+                        .with_property("label", relationship.kind.clone())
+                        .with_property("source_file", summary.file_path.clone())
+                        .with_property("source_symbol", summary.symbol_name.clone())
+                        .with_provenance(provenance.clone()),
+                );
+            }
+        }
+    }
+
+    for node in semantic_nodes.into_values() {
+        nodes.push(node_with_content_freshness(node)?);
+    }
+    for edge in semantic_edges.into_values() {
+        edges.push(edge_with_content_freshness(edge)?);
+    }
+
+    Ok(())
+}
+
 fn projection_content_hash(
     nodes: &[SubstrateGraphNode],
     edges: &[SubstrateGraphEdge],
@@ -4537,6 +4979,7 @@ fn traversal_projection_from_graph(
     }
 
     append_traversal_context_projection_rows(root, graph, &provenance, &mut nodes, &mut edges)?;
+    append_summary_semantic_projection_rows(root, graph, &provenance, &mut nodes, &mut edges)?;
 
     let projection_hash = projection_content_hash(&nodes, &edges)?;
     let meta = SubstrateGraphNode::new(
@@ -8846,20 +9289,46 @@ fn build_traversal_graph(
     Ok(graph)
 }
 
-fn traversal_node_matches_query(node: &TraversalNode, query: &str) -> bool {
+fn traversal_query_kind_priority(kind: &str) -> usize {
+    match kind {
+        "backlog" => 0,
+        "job_packet" => 1,
+        "symbol" => 2,
+        "file" => 3,
+        "route" => 4,
+        "session" => 5,
+        "semantic_concept" => 6,
+        "semantic_entity" => 7,
+        _ => 8,
+    }
+}
+
+fn traversal_node_match_rank(node: &TraversalNode, query: &str) -> Option<(usize, usize, String)> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        return false;
+        return None;
     }
-    if node.handle == trimmed || node.label == trimmed || node.path.as_deref() == Some(trimmed) {
-        return true;
+    let kind_priority = traversal_query_kind_priority(&node.kind);
+    if node.handle == trimmed {
+        return Some((0, kind_priority, node.handle.clone()));
+    }
+    if node.path.as_deref() == Some(trimmed) {
+        let path_priority = if node.kind == "file" {
+            0
+        } else {
+            kind_priority.saturating_add(1)
+        };
+        return Some((1, path_priority, node.handle.clone()));
     }
     let normalized_backlog = trimmed.trim_start_matches('#');
     if node.ref_id.as_deref() == Some(trimmed) || node.ref_id.as_deref() == Some(normalized_backlog)
     {
-        return true;
+        return Some((2, kind_priority, node.handle.clone()));
     }
-    node.kind == "symbol" && node.label == normalized_backlog
+    if node.label == trimmed || (node.kind == "symbol" && node.label == normalized_backlog) {
+        return Some((3, kind_priority, node.handle.clone()));
+    }
+    None
 }
 
 fn resolve_traversal_node<'a>(
@@ -8869,7 +9338,9 @@ fn resolve_traversal_node<'a>(
     graph
         .nodes
         .values()
-        .find(|node| traversal_node_matches_query(node, query))
+        .filter_map(|node| traversal_node_match_rank(node, query).map(|rank| (rank, node)))
+        .min_by(|(left_rank, _), (right_rank, _)| left_rank.cmp(right_rank))
+        .map(|(_, node)| node)
 }
 
 fn traversal_adjacency(edges: &[TraversalEdge]) -> BTreeMap<String, Vec<String>> {
@@ -9007,6 +9478,9 @@ fn traversal_relation_score(edge: &TraversalEdge, origin: &str) -> usize {
         }
         "handled_by" => 68,
         "defines_route" => 62,
+        "mentions_concept" | "mentions_entity" => 66,
+        "semantic_relation" => 64,
+        "tagged_concept" | "related_concept" => 58,
         "defines" => {
             if edge.from == origin {
                 60
@@ -9029,6 +9503,11 @@ fn traversal_recommendation_reason(edge: &TraversalEdge, origin: &str) -> String
         "defines_route" => "file that declares the selected route".to_string(),
         "handled_by" if edge.from == origin => "handler for the selected route".to_string(),
         "handled_by" => "route handled by the selected symbol".to_string(),
+        "mentions_concept" => "cached summary concept for the selected source".to_string(),
+        "mentions_entity" => "cached summary entity for the selected source".to_string(),
+        "semantic_relation" => "LLM-extracted semantic relationship".to_string(),
+        "tagged_concept" => "concept label attached to the selected entity".to_string(),
+        "related_concept" => "co-occurring cached summary concept".to_string(),
         "calls" if edge.from == origin => "callee from the selected symbol".to_string(),
         "calls" => "caller of the selected symbol".to_string(),
         other => format!("connected by {other}"),
@@ -9340,67 +9819,138 @@ fn html_escape(input: &str) -> String {
 }
 
 fn traversal_report_html(report: &TraversalReport) -> Result<String> {
-    let json = serde_json::to_string(report)?;
+    let json = serde_json::to_string(report)?.replace("</", "<\\/");
     let mut html = String::new();
     html.push_str(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>tsift traversal graph</title>",
     );
-    html.push_str("<style>body{font-family:system-ui,sans-serif;margin:24px;line-height:1.4}h1{font-size:24px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.item{border:1px solid #ddd;border-radius:6px;padding:8px;margin:6px 0}.kind{font-size:12px;text-transform:uppercase;color:#666}code{background:#f6f6f6;padding:1px 4px;border-radius:3px}pre{white-space:pre-wrap;background:#111;color:#f8f8f2;padding:12px;border-radius:6px;overflow:auto}</style>");
+    html.push_str(
+        r#"<style>
+:root{color-scheme:light dark;--bg:#f7f8fb;--panel:#ffffff;--text:#17202a;--muted:#5c6674;--line:#d7dce3;--edge:#8b98a8;--accent:#0f766e;--semantic:#9a3412}
+@media (prefers-color-scheme:dark){:root{--bg:#111318;--panel:#1b2028;--text:#ecf1f7;--muted:#a8b3c1;--line:#323946;--edge:#667386;--accent:#2dd4bf;--semantic:#fb923c}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,sans-serif;line-height:1.4}.page{max-width:1280px;margin:0 auto;padding:20px}.top{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:14px}.top h1{font-size:22px;margin:0}.meta{color:var(--muted);font-size:13px}.toolbar{display:flex;gap:8px;align-items:center}.toolbar input{min-width:220px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--text);padding:8px 10px}.layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:14px;min-height:650px}.graph-panel,.side{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}.graph-panel{position:relative}.legend{position:absolute;left:12px;top:12px;display:flex;flex-wrap:wrap;gap:6px;max-width:calc(100% - 24px)}.legend span{font-size:12px;background:color-mix(in srgb,var(--panel) 86%,transparent);border:1px solid var(--line);border-radius:999px;padding:4px 8px}.side{padding:14px;overflow:auto}.side h2{font-size:15px;margin:0 0 8px}.selected{border-top:1px solid var(--line);margin-top:12px;padding-top:12px}.list{display:grid;gap:8px}.row{border:1px solid var(--line);border-radius:6px;padding:8px;cursor:pointer}.row:hover{border-color:var(--accent)}.kind{font-size:11px;text-transform:uppercase;color:var(--muted);letter-spacing:.04em}.label{font-weight:650;overflow-wrap:anywhere}.handle,code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted)}svg{width:100%;height:650px;display:block}.edge{stroke:var(--edge);stroke-width:1.4;opacity:.72}.edge.semantic{stroke:var(--semantic);stroke-width:1.8}.node{stroke:var(--panel);stroke-width:2;cursor:pointer}.node.semantic{stroke:var(--semantic);stroke-width:2.5}.node-label{font-size:12px;paint-order:stroke;stroke:var(--panel);stroke-width:4px;stroke-linejoin:round;fill:var(--text);pointer-events:none}.hidden{display:none}@media(max-width:900px){.top{display:block}.toolbar{margin-top:12px}.layout{grid-template-columns:1fr}.side{max-height:360px}svg{height:560px}}
+</style>"#,
+    );
     html.push_str("</head><body>");
+    html.push_str("<div class=\"page\">");
     html.push_str(&format!(
-        "<h1>tsift traversal graph</h1><p>mode <code>{}</code>, nodes <code>{}</code>/<code>{}</code>, edges <code>{}</code>/<code>{}</code></p>",
+        "<header class=\"top\"><div><h1>tsift traversal graph</h1><div class=\"meta\">mode <code>{}</code> | nodes <code>{}</code>/<code>{}</code> | edges <code>{}</code>/<code>{}</code></div></div><div class=\"toolbar\"><input id=\"filter\" type=\"search\" placeholder=\"Filter nodes\"></div></header>",
         html_escape(&report.mode),
         report.nodes.len(),
         report.totals.nodes,
         report.edges.len(),
         report.totals.edges
     ));
-    html.push_str("<div class=\"grid\"><section><h2>Nodes</h2>");
-    for node in &report.nodes {
-        html.push_str(&format!(
-            "<div class=\"item\"><div class=\"kind\">{}</div><strong>{}</strong><br><code>{}</code>",
-            html_escape(&node.kind),
-            html_escape(&node.label),
-            html_escape(&node.handle)
-        ));
-        if let Some(path) = &node.path {
-            html.push_str(&format!("<br>{}", html_escape(path)));
-        }
-        if let Some(detail) = &node.detail {
-            html.push_str(&format!("<br>{}", html_escape(detail)));
-        }
-        html.push_str("</div>");
-    }
-    html.push_str("</section><section><h2>Edges</h2>");
-    for edge in &report.edges {
-        html.push_str(&format!(
-            "<div class=\"item\"><code>{}</code> -{}-&gt; <code>{}</code>",
-            html_escape(&edge.from),
-            html_escape(&edge.relation),
-            html_escape(&edge.to)
-        ));
-        if let Some(label) = &edge.label {
-            html.push_str(&format!("<br>{}", html_escape(label)));
-        }
-        html.push_str("</div>");
-    }
-    html.push_str("</section></div>");
-    if !report.recommendations.is_empty() {
-        html.push_str("<section><h2>Next Nodes</h2>");
-        for rec in &report.recommendations {
-            html.push_str(&format!(
-                "<div class=\"item\"><strong>{}</strong> <code>{}</code><br>{}<br><code>{}</code></div>",
-                html_escape(&rec.label),
-                html_escape(&rec.kind),
-                html_escape(&rec.reason),
-                html_escape(&rec.expand)
-            ));
-        }
-        html.push_str("</section>");
-    }
-    html.push_str("<section><h2>JSON</h2><pre>");
-    html.push_str(&html_escape(&json));
-    html.push_str("</pre></section></body></html>");
+    html.push_str(
+        r#"<main class="layout"><section class="graph-panel"><div id="legend" class="legend"></div><svg id="graph-canvas" role="img" aria-label="Traversal graph"></svg></section><aside class="side"><h2>Nodes</h2><div id="node-list" class="list"></div><div id="selected" class="selected"></div></aside></main>"#,
+    );
+    html.push_str("<script id=\"graph-data\" type=\"application/json\">");
+    html.push_str(&json);
+    html.push_str(
+        r##"</script><script>
+const report = JSON.parse(document.getElementById("graph-data").textContent);
+const svg = document.getElementById("graph-canvas");
+const list = document.getElementById("node-list");
+const selected = document.getElementById("selected");
+const filter = document.getElementById("filter");
+const legend = document.getElementById("legend");
+const nodes = report.nodes.map((node, index) => ({...node, index}));
+const nodeByHandle = new Map(nodes.map(node => [node.handle, node]));
+const edges = report.edges.filter(edge => nodeByHandle.has(edge.from) && nodeByHandle.has(edge.to));
+const colorByKind = new Map([
+  ["file", "#2563eb"], ["symbol", "#16a34a"], ["route", "#7c3aed"],
+  ["session", "#0891b2"], ["backlog", "#dc2626"], ["job_packet", "#ea580c"],
+  ["semantic_concept", "#9a3412"], ["semantic_entity", "#b45309"],
+  ["source_handle", "#64748b"], ["worker_context", "#475569"]
+]);
+function color(kind){ return colorByKind.get(kind) || "#6b7280"; }
+function isSemantic(edge){ return edge.relation.includes("concept") || edge.relation.includes("entity") || edge.relation.includes("semantic"); }
+function text(value){ return value == null ? "" : String(value); }
+function matches(node, query){
+  if (!query) return true;
+  const haystack = [node.kind,node.label,node.handle,node.ref_id,node.path,node.detail].map(text).join(" ").toLowerCase();
+  return haystack.includes(query);
+}
+function layout(){
+  const rect = svg.getBoundingClientRect();
+  const width = rect.width || 900;
+  const height = rect.height || 650;
+  const cx = width / 2;
+  const cy = height / 2;
+  const kinds = [...new Set(nodes.map(node => node.kind))].sort();
+  const counts = new Map();
+  for (const node of nodes) counts.set(node.kind, (counts.get(node.kind) || 0) + 1);
+  const offsets = new Map();
+  for (const node of nodes) {
+    const group = kinds.indexOf(node.kind);
+    const index = offsets.get(node.kind) || 0;
+    offsets.set(node.kind, index + 1);
+    const groupCount = counts.get(node.kind) || 1;
+    const ring = Math.min(width, height) * (0.18 + ((group % 4) * 0.09));
+    const angle = (Math.PI * 2 * index / Math.max(groupCount, 1)) + (group * 0.47);
+    node.x = cx + Math.cos(angle) * ring;
+    node.y = cy + Math.sin(angle) * ring;
+  }
+}
+function draw(){
+  const query = filter.value.trim().toLowerCase();
+  const visible = new Set(nodes.filter(node => matches(node, query)).map(node => node.handle));
+  svg.innerHTML = "";
+  for (const edge of edges) {
+    if (!visible.has(edge.from) || !visible.has(edge.to)) continue;
+    const from = nodeByHandle.get(edge.from);
+    const to = nodeByHandle.get(edge.to);
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", from.x); line.setAttribute("y1", from.y);
+    line.setAttribute("x2", to.x); line.setAttribute("y2", to.y);
+    line.setAttribute("class", "edge" + (isSemantic(edge) ? " semantic" : ""));
+    line.appendChild(document.createElementNS("http://www.w3.org/2000/svg", "title")).textContent = edge.relation + (edge.label ? ": " + edge.label : "");
+    svg.appendChild(line);
+  }
+  for (const node of nodes) {
+    if (!visible.has(node.handle)) continue;
+    const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    circle.setAttribute("cx", node.x); circle.setAttribute("cy", node.y);
+    circle.setAttribute("r", node.kind.startsWith("semantic_") ? 8 : 6);
+    circle.setAttribute("fill", color(node.kind));
+    circle.setAttribute("class", "node" + (node.kind.startsWith("semantic_") ? " semantic" : ""));
+    circle.addEventListener("click", () => selectNode(node));
+    circle.appendChild(document.createElementNS("http://www.w3.org/2000/svg", "title")).textContent = node.kind + ": " + node.label;
+    svg.appendChild(circle);
+    const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    label.setAttribute("x", node.x + 9); label.setAttribute("y", node.y + 4);
+    label.setAttribute("class", "node-label");
+    label.textContent = node.label.length > 34 ? node.label.slice(0, 31) + "..." : node.label;
+    svg.appendChild(label);
+  }
+  renderList(query);
+}
+function renderLegend(){
+  const kinds = [...new Set(nodes.map(node => node.kind))].sort();
+  legend.innerHTML = kinds.map(kind => `<span><b style="color:${color(kind)}">&#9679;</b> ${kind}</span>`).join("");
+}
+function renderList(query){
+  const rows = nodes.filter(node => matches(node, query)).slice(0, 120);
+  list.innerHTML = rows.map(node => `<div class="row" data-handle="${node.handle}"><div class="kind">${node.kind}</div><div class="label">${escapeHtml(node.label)}</div><div class="handle">${node.handle}</div></div>`).join("");
+  for (const row of list.querySelectorAll(".row")) {
+    row.addEventListener("click", () => selectNode(nodeByHandle.get(row.dataset.handle)));
+  }
+}
+function selectNode(node){
+  const adjacent = edges.filter(edge => edge.from === node.handle || edge.to === node.handle).slice(0, 20);
+  selected.innerHTML = `<h2>${escapeHtml(node.label)}</h2><div class="kind">${node.kind}</div><p class="handle">${node.handle}</p>${node.path ? `<p>${escapeHtml(node.path)}${node.line != null ? ":" + node.line : ""}</p>` : ""}${node.detail ? `<p>${escapeHtml(node.detail)}</p>` : ""}<p><code>${escapeHtml(node.expand)}</code></p><h2>Edges</h2><div class="list">${adjacent.map(edge => `<div class="row"><div class="kind">${edge.relation}</div><div>${escapeHtml(edge.from)} -> ${escapeHtml(edge.to)}</div>${edge.label ? `<div>${escapeHtml(edge.label)}</div>` : ""}</div>`).join("") || "<div class=\"meta\">No visible edges.</div>"}</div>`;
+}
+function escapeHtml(value){
+  return text(value).replace(/[&<>"']/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[ch]));
+}
+filter.addEventListener("input", draw);
+window.addEventListener("resize", () => { layout(); draw(); });
+renderLegend();
+layout();
+draw();
+if (nodes.length) selectNode(nodes[0]);
+</script></div></body></html>"##,
+    );
     Ok(html)
 }
 
@@ -9432,6 +9982,154 @@ fn cmd_traverse(
             println!("{}", traversal_report_html(&report)?);
         }
     }
+    Ok(())
+}
+
+fn semantic_related_report_from_store(
+    root: &Path,
+    scope: Option<&str>,
+    query: &str,
+    limit: usize,
+    kind: SemanticRelatedKind,
+    store: &impl GraphStore,
+) -> Result<SemanticRelatedReport> {
+    if query.trim().is_empty() {
+        bail!("semantic query cannot be empty");
+    }
+
+    let query_embedding = semantic_embedding(query);
+    let node_kinds: &[&str] = match kind {
+        SemanticRelatedKind::Concept => &["semantic_concept"],
+        SemanticRelatedKind::Entity => &["semantic_entity"],
+        SemanticRelatedKind::All => &["semantic_concept", "semantic_entity"],
+    };
+
+    let mut items = Vec::new();
+    for node_kind in node_kinds {
+        for node in store.nodes_by_kind(node_kind)? {
+            let Some(embedding) = node
+                .properties
+                .get("embedding")
+                .and_then(|value| parse_semantic_embedding_property(value))
+            else {
+                continue;
+            };
+            let score = semantic_cosine(&query_embedding, &embedding);
+            items.push(SemanticRelatedItem {
+                handle: node
+                    .properties
+                    .get("handle")
+                    .cloned()
+                    .unwrap_or_else(|| node.id.clone()),
+                kind: node.kind,
+                label: node.label,
+                score,
+                file_path: node
+                    .properties
+                    .get("source_file")
+                    .or_else(|| node.properties.get("path"))
+                    .cloned(),
+                source_symbol: node.properties.get("source_symbol").cloned(),
+                detail: node
+                    .properties
+                    .get("description")
+                    .or_else(|| node.properties.get("detail"))
+                    .cloned(),
+                expand: node
+                    .properties
+                    .get("expand")
+                    .cloned()
+                    .unwrap_or_else(|| traversal_expand_command(root, &node.id)),
+            });
+        }
+    }
+
+    items.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.handle.cmp(&right.handle))
+    });
+    if limit > 0 && items.len() > limit {
+        items.truncate(limit);
+    }
+
+    let mut warnings = Vec::new();
+    if items.is_empty() {
+        warnings.push(
+            "no semantic graph rows found; run `tsift summarize --extract <path>` first"
+                .to_string(),
+        );
+    }
+
+    Ok(SemanticRelatedReport {
+        root: root.to_string_lossy().to_string(),
+        scope: scope.map(str::to_string),
+        query: query.to_string(),
+        embedding_model: SEMANTIC_EMBEDDING_MODEL.to_string(),
+        count: items.len(),
+        items,
+        warnings,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_semantic_related(
+    query: &str,
+    path: &Path,
+    scope: Option<&str>,
+    limit: usize,
+    kind: SemanticRelatedKind,
+    json_output: bool,
+    compact: bool,
+    pretty: bool,
+    terse: bool,
+    schema: bool,
+) -> Result<()> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    refresh_traversal_graph_store(&root, path, scope)?;
+    let graph_db = graph_substrate_db_path(&root, scope);
+    let store = SqliteGraphStore::open(&graph_db)?;
+    let report = semantic_related_report_from_store(&root, scope, query, limit, kind, &store)?;
+
+    if json_output {
+        println!("{}", to_json_schema(&report, pretty, terse, schema)?);
+    } else if compact {
+        for item in &report.items {
+            println!(
+                "{:.3}\t{}\t{}\t{}",
+                item.score, item.kind, item.label, item.handle
+            );
+        }
+        for warning in &report.warnings {
+            eprintln!("warning: {warning}");
+        }
+    } else {
+        println!(
+            "Related semantic graph rows for {:?} ({})",
+            report.query, report.embedding_model
+        );
+        for item in &report.items {
+            println!(
+                "  {:.3} [{}] {} ({})",
+                item.score, item.kind, item.label, item.handle
+            );
+            if let Some(detail) = &item.detail {
+                println!("      {}", detail);
+            }
+            if let Some(file_path) = &item.file_path {
+                println!("      file: {}", file_path);
+            }
+            println!("      expand: {}", item.expand);
+        }
+        for warning in &report.warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
+
     Ok(())
 }
 
@@ -18305,6 +19003,44 @@ dispatch #spec-test-build-install-commit-push
         dir
     }
 
+    fn seed_traversal_semantic_summaries(dir: &Path) {
+        let summary_db = summarize::SummaryDb::open(&dir.join(".tsift/summaries.db")).unwrap();
+        summary_db
+            .insert(&summarize::Summary {
+                id: 0,
+                symbol_name: "helper".to_string(),
+                file_path: "main.rs".to_string(),
+                content_hash: "hash-main".to_string(),
+                summary: "helper builds graph navigation handles for traversal.".to_string(),
+                entities: Some(vec![
+                    summarize::Entity {
+                        name: "helper".to_string(),
+                        kind: "function".to_string(),
+                        description: "Builds graph navigation handles.".to_string(),
+                    },
+                    summarize::Entity {
+                        name: "TraversalGraph".to_string(),
+                        kind: "type".to_string(),
+                        description: "Carries GraphStore-backed traversal rows.".to_string(),
+                    },
+                ]),
+                relationships: Some(vec![summarize::Relationship {
+                    from: "helper".to_string(),
+                    to: "TraversalGraph".to_string(),
+                    kind: "uses".to_string(),
+                }]),
+                concept_labels: Some(vec![
+                    "graph navigation".to_string(),
+                    "semantic extraction".to_string(),
+                ]),
+                extracted_at: "1700000000".to_string(),
+                model: "test-model".to_string(),
+                tokens_input: Some(10),
+                tokens_output: Some(5),
+            })
+            .unwrap();
+    }
+
     #[test]
     fn graph_callers_query() {
         let dir = setup_graph_index();
@@ -18478,6 +19214,82 @@ def list_items():
                 .any(|node| node.properties.get("target")
                     == Some(&"tasks/software/tsift.md".to_string())),
             "expected bounded worker_context rows, got {worker_context:?}"
+        );
+    }
+
+    #[test]
+    fn traversal_projection_materializes_cached_semantic_rows() {
+        let dir = setup_traversal_project();
+        seed_traversal_semantic_summaries(dir.path());
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let helper = resolve_traversal_node(&graph, "helper").unwrap();
+        let concept = resolve_traversal_node(&graph, "graph navigation").unwrap();
+        let entity = resolve_traversal_node(&graph, "TraversalGraph").unwrap();
+
+        assert_eq!(concept.kind, "semantic_concept");
+        assert_eq!(entity.kind, "semantic_entity");
+        assert!(concept.handle.starts_with("gcon-"));
+        assert!(entity.handle.starts_with("gent-"));
+
+        let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
+        assert!(
+            store
+                .nodes_by_kind("semantic_concept")
+                .unwrap()
+                .iter()
+                .any(|node| node.label == "semantic extraction"
+                    && node.properties.contains_key("embedding")),
+            "expected persisted concept embeddings"
+        );
+        assert!(
+            store
+                .outgoing_edges(&helper.handle, Some("mentions_concept"))
+                .unwrap()
+                .iter()
+                .any(|edge| edge.to_id == concept.handle),
+            "expected helper symbol to link to cached summary concept"
+        );
+        assert!(
+            store
+                .outgoing_edges(
+                    &semantic_entity_handle("helper", "function"),
+                    Some("semantic_relation")
+                )
+                .unwrap()
+                .iter()
+                .any(|edge| edge.to_id == entity.handle
+                    && edge.properties.get("relationship_kind") == Some(&"uses".to_string())),
+            "expected LLM relationship rows projected into GraphStore"
+        );
+    }
+
+    #[test]
+    fn semantic_related_query_uses_persisted_graph_embeddings() {
+        let dir = setup_traversal_project();
+        seed_traversal_semantic_summaries(dir.path());
+        refresh_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
+        let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
+
+        let report = semantic_related_report_from_store(
+            dir.path(),
+            None,
+            "graph navigation",
+            5,
+            SemanticRelatedKind::Concept,
+            &store,
+        )
+        .unwrap();
+
+        assert_eq!(report.embedding_model, SEMANTIC_EMBEDDING_MODEL);
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|item| item.label == "graph navigation"
+                    && item.kind == "semantic_concept"
+                    && item.score > 0.9),
+            "expected nearest concept match from graph embeddings, got {:?}",
+            report.items
         );
     }
 
@@ -18776,6 +19588,20 @@ def list_items():
             None,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn traversal_html_renders_inline_graph_visualization() {
+        let dir = setup_traversal_project();
+        seed_traversal_semantic_summaries(dir.path());
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let report = traversal_report(dir.path(), None, graph, None, None, 1, 50).unwrap();
+        let html = traversal_report_html(&report).unwrap();
+
+        assert!(html.contains("id=\"graph-canvas\""));
+        assert!(html.contains("semantic_concept"));
+        assert!(html.contains("graph navigation"));
+        assert!(html.contains("JSON.parse"));
     }
 
     #[test]
@@ -23084,6 +23910,39 @@ tier = "private"
                 assert_eq!(format, TraverseFormat::Html);
             }
             _ => panic!("expected Traverse command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_semantic_related_command() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "semantic",
+            "graph navigation",
+            "--path",
+            ".",
+            "--kind",
+            "all",
+            "--limit",
+            "3",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::Semantic {
+                query,
+                path,
+                kind,
+                limit,
+                json,
+                ..
+            }) => {
+                assert_eq!(query, "graph navigation");
+                assert_eq!(path, PathBuf::from("."));
+                assert_eq!(kind, SemanticRelatedKind::All);
+                assert_eq!(limit, 3);
+                assert!(json);
+            }
+            _ => panic!("expected Semantic command"),
         }
     }
 

@@ -37,6 +37,8 @@ tsift graph-db --path . status --json
 tsift graph-db --path . kind backlog --property ref_id=cvxa --limit 5 --json
 tsift graph-db --path . evidence cvxa --depth 3 --limit 8 --json
 tsift graph-db --path . doctor --json
+tsift traverse --path . --format html > traversal.html
+tsift semantic "graph navigation" --path . --kind concept --json
 tsift convex-sync . --chunk-size 100 --json
 ```
 
@@ -53,7 +55,9 @@ version/hash/watermark and tombstone counts without refreshing, and
 `tsift graph-db evidence <backlog-id-or-job-handle>` for bounded
 worker-context/source-handle handoff packets. Use `tsift graph-db doctor` to
 validate local `graph.db` and Convex snapshot metadata before trusting operator
-handoffs. The
+handoffs. `tsift traverse --format html` renders the selected GraphStore slice as
+an offline SVG graph, and `tsift semantic` queries cached summary concepts and
+entities from the same persisted graph rows without calling an API. The
 ignored `live_convex_graph_backend_acceptance_applies_and_matches_graph_db_queries`
 test is opt-in via `TSIFT_LIVE_CONVEX_ACCEPTANCE=1` and
 `TSIFT_LIVE_CONVEX_GRAPH_URL`; point it at a dedicated Convex deployment because
