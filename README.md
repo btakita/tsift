@@ -45,7 +45,11 @@ Graph DB and Convex operator examples live under
 `fixtures/graph-db-operator-examples`; the reusable Convex app-side schema,
 mutations, and HTTP action for `tsift convex-sync --apply` live under
 `examples/convex-graph`. Use `tsift graph-db doctor` to validate local
-`graph.db` and Convex snapshot metadata before trusting operator handoffs.
+`graph.db` and Convex snapshot metadata before trusting operator handoffs. The
+ignored `live_convex_graph_backend_acceptance_applies_and_matches_graph_db_queries`
+test is opt-in via `TSIFT_LIVE_CONVEX_ACCEPTANCE=1` and
+`TSIFT_LIVE_CONVEX_GRAPH_URL`; point it at a dedicated Convex deployment because
+it applies and reconciles a temporary projection.
 
 ## Release Notes
 

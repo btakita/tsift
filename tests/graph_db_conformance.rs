@@ -1,8 +1,13 @@
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+const LIVE_CONVEX_ACCEPTANCE_ENV: &str = "TSIFT_LIVE_CONVEX_ACCEPTANCE";
+const LIVE_CONVEX_GRAPH_URL_ENV: &str = "TSIFT_LIVE_CONVEX_GRAPH_URL";
+const LIVE_CONVEX_AUTH_TOKEN_ENV: &str = "TSIFT_LIVE_CONVEX_AUTH_TOKEN";
 
 fn tsift_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tsift"))
@@ -195,6 +200,61 @@ fn write_snapshot(project: &Path, name: &str, snapshot: &Value) -> PathBuf {
     path
 }
 
+fn live_convex_acceptance_enabled() -> bool {
+    env::var(LIVE_CONVEX_ACCEPTANCE_ENV)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn fetch_live_convex_snapshot(
+    endpoint: &str,
+    auth_token_env: &str,
+    projection_version: &str,
+) -> Value {
+    let request = json!({
+        "operation": "snapshot",
+        "chunk": 0,
+        "projectionVersion": projection_version,
+        "projectionHash": null,
+        "nodeRows": [],
+        "edgeRows": [],
+        "keys": []
+    });
+    let mut builder = ureq::post(endpoint);
+    if let Ok(token) = env::var(auth_token_env)
+        && !token.trim().is_empty()
+    {
+        builder = builder.header("Authorization", &format!("Bearer {token}"));
+    }
+    let mut response = builder
+        .send_json(&request)
+        .unwrap_or_else(|err| panic!("live Convex snapshot request failed for {endpoint}: {err}"));
+    let response: Value = response
+        .body_mut()
+        .read_json()
+        .unwrap_or_else(|err| panic!("live Convex snapshot response was not JSON: {err}"));
+    assert_eq!(
+        response["status"], "ok",
+        "unexpected snapshot response: {response}"
+    );
+    let rows = response["rows"].clone();
+    assert!(
+        rows["nodes"].is_array(),
+        "snapshot rows missing nodes: {rows}"
+    );
+    assert!(
+        rows["edges"].is_array(),
+        "snapshot rows missing edges: {rows}"
+    );
+    rows
+}
+
 fn node_ids(report: &Value) -> Vec<String> {
     report["nodes"]
         .as_array()
@@ -259,16 +319,11 @@ fn sql_node_ids(db_path: &Path, kind: &str) -> Vec<String> {
         .unwrap()
 }
 
-#[test]
-fn graph_db_cli_conformance_matches_sqlite_and_convex_snapshot_queries() {
-    let project = graph_db_project();
-    let snapshot_value = current_convex_snapshot(project.path());
-    let snapshot = write_snapshot(project.path(), "convex-current.json", &snapshot_value);
-
-    let sqlite_schema = graph_db_json(project.path(), Backend::Sqlite, vec!["schema".to_string()]);
+fn assert_graph_db_snapshot_query_parity(project: &Path, snapshot: &Path) {
+    let sqlite_schema = graph_db_json(project, Backend::Sqlite, vec!["schema".to_string()]);
     let convex_schema = graph_db_json(
-        project.path(),
-        Backend::ConvexSnapshot(&snapshot),
+        project,
+        Backend::ConvexSnapshot(snapshot),
         vec!["schema".to_string()],
     );
     assert_eq!(sqlite_schema["schema"], convex_schema["schema"]);
@@ -281,12 +336,8 @@ fn graph_db_cli_conformance_matches_sqlite_and_convex_snapshot_queries() {
         "--limit".to_string(),
         "2".to_string(),
     ];
-    let sqlite_first = graph_db_json(project.path(), Backend::Sqlite, first_query.clone());
-    let convex_first = graph_db_json(
-        project.path(),
-        Backend::ConvexSnapshot(&snapshot),
-        first_query,
-    );
+    let sqlite_first = graph_db_json(project, Backend::Sqlite, first_query.clone());
+    let convex_first = graph_db_json(project, Backend::ConvexSnapshot(snapshot), first_query);
     let sqlite_first_ids = node_ids(&sqlite_first);
     assert_eq!(sqlite_first_ids, node_ids(&convex_first));
     assert_sorted(&sqlite_first_ids);
@@ -304,27 +355,28 @@ fn graph_db_cli_conformance_matches_sqlite_and_convex_snapshot_queries() {
         "--limit".to_string(),
         "2".to_string(),
     ];
-    let sqlite_second = graph_db_json(project.path(), Backend::Sqlite, second_query.clone());
-    let convex_second = graph_db_json(
-        project.path(),
-        Backend::ConvexSnapshot(&snapshot),
-        second_query,
-    );
+    let sqlite_second = graph_db_json(project, Backend::Sqlite, second_query.clone());
+    let convex_second = graph_db_json(project, Backend::ConvexSnapshot(snapshot), second_query);
     let sqlite_second_ids = node_ids(&sqlite_second);
     assert_eq!(sqlite_second_ids, node_ids(&convex_second));
     assert_sorted(&sqlite_second_ids);
     assert_eq!(sqlite_second["page"], convex_second["page"]);
 
-    let main_id = symbol_id_by_ref(project.path(), Backend::Sqlite, "main");
-    let helper_id = symbol_id_by_ref(project.path(), Backend::Sqlite, "helper");
+    let main_id = symbol_id_by_ref(project, Backend::Sqlite, "main");
+    let helper_id = symbol_id_by_ref(project, Backend::Sqlite, "helper");
     assert_eq!(
         main_id,
-        symbol_id_by_ref(project.path(), Backend::ConvexSnapshot(&snapshot), "main")
+        symbol_id_by_ref(project, Backend::ConvexSnapshot(snapshot), "main")
     );
     assert_eq!(
         helper_id,
-        symbol_id_by_ref(project.path(), Backend::ConvexSnapshot(&snapshot), "helper")
+        symbol_id_by_ref(project, Backend::ConvexSnapshot(snapshot), "helper")
     );
+
+    let node_query = vec!["node".to_string(), main_id.clone()];
+    let sqlite_node = graph_db_json(project, Backend::Sqlite, node_query.clone());
+    let convex_node = graph_db_json(project, Backend::ConvexSnapshot(snapshot), node_query);
+    assert_eq!(sqlite_node["node"], convex_node["node"]);
 
     let path_query = vec![
         "path".to_string(),
@@ -333,12 +385,8 @@ fn graph_db_cli_conformance_matches_sqlite_and_convex_snapshot_queries() {
         "--edge-kind".to_string(),
         "calls".to_string(),
     ];
-    let sqlite_path = graph_db_json(project.path(), Backend::Sqlite, path_query.clone());
-    let convex_path = graph_db_json(
-        project.path(),
-        Backend::ConvexSnapshot(&snapshot),
-        path_query,
-    );
+    let sqlite_path = graph_db_json(project, Backend::Sqlite, path_query.clone());
+    let convex_path = graph_db_json(project, Backend::ConvexSnapshot(snapshot), path_query);
     assert_eq!(sqlite_path["path"], convex_path["path"]);
     assert!(sqlite_path["path"]["hops"].as_u64().unwrap() >= 1);
 
@@ -352,11 +400,10 @@ fn graph_db_cli_conformance_matches_sqlite_and_convex_snapshot_queries() {
         "--limit".to_string(),
         "20".to_string(),
     ];
-    let sqlite_neighborhood =
-        graph_db_json(project.path(), Backend::Sqlite, neighborhood_query.clone());
+    let sqlite_neighborhood = graph_db_json(project, Backend::Sqlite, neighborhood_query.clone());
     let convex_neighborhood = graph_db_json(
-        project.path(),
-        Backend::ConvexSnapshot(&snapshot),
+        project,
+        Backend::ConvexSnapshot(snapshot),
         neighborhood_query,
     );
     assert_eq!(
@@ -369,11 +416,11 @@ fn graph_db_cli_conformance_matches_sqlite_and_convex_snapshot_queries() {
     assert_eq!(sqlite_neighborhood["page"], convex_neighborhood["page"]);
 
     let repeated_sqlite_neighborhood = graph_db_json(
-        project.path(),
+        project,
         Backend::Sqlite,
         vec![
             "neighborhood".to_string(),
-            symbol_id_by_ref(project.path(), Backend::Sqlite, "main"),
+            symbol_id_by_ref(project, Backend::Sqlite, "main"),
             "--depth".to_string(),
             "3".to_string(),
             "--edge-kind".to_string(),
@@ -383,6 +430,78 @@ fn graph_db_cli_conformance_matches_sqlite_and_convex_snapshot_queries() {
         ],
     );
     assert_eq!(sqlite_edges, edge_keys(&repeated_sqlite_neighborhood));
+}
+
+#[test]
+fn graph_db_cli_conformance_matches_sqlite_and_convex_snapshot_queries() {
+    let project = graph_db_project();
+    let snapshot_value = current_convex_snapshot(project.path());
+    let snapshot = write_snapshot(project.path(), "convex-current.json", &snapshot_value);
+
+    assert_graph_db_snapshot_query_parity(project.path(), &snapshot);
+}
+
+#[test]
+#[ignore = "requires a dedicated live Convex deployment"]
+fn live_convex_graph_backend_acceptance_applies_and_matches_graph_db_queries() {
+    if !live_convex_acceptance_enabled() {
+        eprintln!(
+            "skipping live Convex acceptance; set {LIVE_CONVEX_ACCEPTANCE_ENV}=1 and {LIVE_CONVEX_GRAPH_URL_ENV}=https://<deployment>.convex.site/tsift/graph"
+        );
+        return;
+    }
+    let endpoint = env::var(LIVE_CONVEX_GRAPH_URL_ENV).unwrap_or_else(|_| {
+        panic!("{LIVE_CONVEX_GRAPH_URL_ENV} must be set when {LIVE_CONVEX_ACCEPTANCE_ENV}=1")
+    });
+    let project = graph_db_project();
+
+    let output = run_tsift(vec![
+        "convex-sync".to_string(),
+        project.path().to_string_lossy().to_string(),
+        "--remote-snapshot".to_string(),
+        "--apply".to_string(),
+        "--endpoint".to_string(),
+        endpoint.clone(),
+        "--auth-token-env".to_string(),
+        LIVE_CONVEX_AUTH_TOKEN_ENV.to_string(),
+        "--json".to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "live convex-sync apply failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let apply_report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(apply_report["dry_run"], false, "{apply_report}");
+    assert_eq!(
+        apply_report["transport"]["remote_snapshot"], true,
+        "{apply_report}"
+    );
+    assert!(
+        apply_report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .as_str()
+                .unwrap()
+                .contains("live Convex transport completed")),
+        "{apply_report}"
+    );
+
+    let projection_version = apply_report["projection_version"].as_str().unwrap();
+    let live_snapshot =
+        fetch_live_convex_snapshot(&endpoint, LIVE_CONVEX_AUTH_TOKEN_ENV, projection_version);
+    let snapshot = write_snapshot(project.path(), "convex-live-current.json", &live_snapshot);
+
+    let doctor = graph_db_json(
+        project.path(),
+        Backend::ConvexSnapshot(&snapshot),
+        vec!["doctor".to_string()],
+    );
+    assert_eq!(doctor["status"], "ok", "{doctor}");
+    assert_graph_db_snapshot_query_parity(project.path(), &snapshot);
 }
 
 #[test]

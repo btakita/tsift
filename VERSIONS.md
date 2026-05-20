@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- Added an opt-in live Convex graph backend acceptance harness that applies a temporary projection to a dedicated deployment, pulls the remote snapshot, and runs graph-db node/kind/neighborhood/path parity against SQLite.
 - Added `tsift graph-db doctor` for read-only SQLite `graph.db` and Convex snapshot diagnostics, including stale projection metadata, schema drift, orphan edges, duplicate ids, missing Convex index metadata, repair commands, and fail-closed exit codes.
 - `tsift graph-db kind` and `graph-db neighborhood` now support deterministic node-id cursor pagination, repeatable `--property KEY=VALUE` node filters, page diagnostics, and backend parity coverage across SQLite and Convex snapshot stores.
 - Added `examples/convex-graph`, a reusable Convex app-side schema/mutation/HTTP-action package for `tsift convex-sync --remote-snapshot --apply`, plus a local HTTP smoke test proving apply chunks round-trip through the documented transport shape.

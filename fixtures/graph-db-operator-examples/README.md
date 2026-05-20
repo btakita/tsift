@@ -31,6 +31,22 @@ tsift convex-sync . --remote-snapshot --apply --json
 
 Use `examples/convex-graph` for the Convex app-side schema, mutations, and HTTP action that accepts the chunks.
 
+## Live Convex Acceptance
+
+The live acceptance harness is opt-in and should point at a disposable Convex
+deployment. It pulls the current remote snapshot, applies the local temporary
+projection, pulls the snapshot again, then runs `graph-db` node, kind,
+neighborhood, and path parity checks against SQLite and the remote rows:
+
+```bash
+TSIFT_LIVE_CONVEX_ACCEPTANCE=1 \
+TSIFT_LIVE_CONVEX_GRAPH_URL="https://<deployment>.convex.site/tsift/graph" \
+TSIFT_LIVE_CONVEX_AUTH_TOKEN="<optional bearer token>" \
+cargo test --test graph_db_conformance \
+  live_convex_graph_backend_acceptance_applies_and_matches_graph_db_queries \
+  -- --ignored --nocapture
+```
+
 ## Convex Snapshot Reads
 
 ```bash
@@ -52,4 +68,3 @@ tsift traverse <source_handle_or_job_packet_handle> --path . --depth 1 --format 
 ```
 
 The context pack stores `source_handle` and `worker_context` nodes in the graph. Agent-doc queue entries become `job_packet` nodes, so workers can keep handoff scope, source windows, and queued backlog items linked by stable handles.
-
