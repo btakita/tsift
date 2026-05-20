@@ -44,6 +44,10 @@ Convex support is a projection backend for the same substrate contract. `GraphPr
 
 `externalId` is the stable substrate node id. `edgeKey` is a deterministic key derived from `(from_id, kind, to_id)` so Convex mutations can be idempotent. A Convex schema should index `nodes.by_external_id`, `nodes.by_kind`, `edges.by_edge_key`, `edges.by_from_kind`, and `edges.by_to_kind`; query code should continue to enforce provenance and freshness checks before trusting derived graph data. Backend-agnostic parity tests must prove the same projection round-trips through SQLite and the Convex `nodes`/`edges` adapter.
 
+`tsift traverse` now treats the SQLite substrate as the local graph read model. It builds file, symbol, route, session, backlog, and source-handle projection rows, replaces the local `.tsift/graph.db` `graph_nodes` / `graph_edges` snapshot, then resolves traversal reports back through the `GraphStore` contract. Projection rows include per-record freshness plus a `projection_meta` node with `projection_version=tsift-traversal-v1` and a content hash. `tsift context-pack` also materializes its exploration `source_handle` windows and relationship refs into the same substrate before returning the handoff packet.
+
+`tsift convex-sync <path> --json` emits the concrete Convex sync plan for that local graph projection. It produces idempotent node/edge upsert rows, edge-then-node tombstones when a supplied `--snapshot <rows.json>` contains stale remote rows, ordered chunks controlled by `--chunk-size`, required Convex index metadata, and retry/partial-failure diagnostics. `tsift traverse --convex-snapshot <rows.json>` and `tsift context-pack --convex-snapshot <rows.json>` fail closed when the Convex snapshot's projection metadata or rows trail the local SQLite correctness store.
+
 tsift owns the code adapter on top of this substrate. Code symbols become `code_symbol` nodes and call relationships become `calls` edges with line metadata and tsift index provenance. Future adapters can add code comments, routes, markdown sessions, backlog items, LiveKit docs, Orbit topics, questions, answers, visuals, and assets without changing the substrate schema. The boundary rule is: no AST, source-language, Orbit, LiveKit, Convex, or FalkorDB semantics are required to create or query generic substrate records.
 
 ## Per-Submodule Isolation
@@ -101,6 +105,7 @@ tsift graph --callees <symbol>  # what does this function call?
 tsift communities [--path]      # Louvain community detection over call graph
 tsift path <from> <to>          # BFS shortest path between symbols
 tsift traverse [node] [--to target] --format json|html # Graphify-style file/symbol/session/backlog traversal graph
+tsift convex-sync . --snapshot convex-rows.json --chunk-size 100 --json # dry-run Convex nodes/edges sync plan
 tsift --envelope explain <symbol> --budget normal # bounded agent preview
 tsift --envelope source-read src/main.rs --start 1 --lines 80 --budget normal # bounded source-file preview with expansion handles
 tsift edit < edits.json         # staged multi-file search/replace batch
@@ -213,7 +218,7 @@ When an index is present, the AST symbol-ranking prepass is now bounded: SQLite 
 
 ## Graph Traversal Handles
 
-`tsift traverse` exposes a Graphify-style traversal graph over indexed files, indexed symbols, agent-doc session documents, and backlog items. It assigns stable handles by node family: `gfil-*` for files, `gsym-*` for symbols, `gses-*` for session artifacts, and `gbak-*` for backlog items. Handles are deterministic from normalized file paths, symbol names/locations, session paths, and backlog ids so agents can cite and revisit graph nodes across turns.
+`tsift traverse` exposes a Graphify-style traversal graph over indexed files, indexed symbols, agent-doc session documents, and backlog items. It assigns stable handles by node family: `gfil-*` for files, `gsym-*` for symbols, `gses-*` for session artifacts, and `gbak-*` for backlog items. Handles are deterministic from normalized file paths, symbol names/locations, session paths, and backlog ids so agents can cite and revisit graph nodes across turns. The report is now backed by the provider-neutral `GraphStore`: tsift first materializes the traversal projection into `.tsift/graph.db`, then reads the same typed property graph rows used by the Convex adapter.
 
 The command supports three traversal modes:
 
@@ -225,7 +230,7 @@ Traversal edges include file-to-symbol `defines`, symbol-to-symbol `calls`, file
 
 Agent-facing context and traversal packets gate graph evidence on fresh incremental indexes. Before `context-pack` handoffs and `traverse` graph reports read indexed symbols or call edges, tsift checks the matching root or scoped index and runs the normal incremental update path for missing or changed files. Reports include a concise diagnostic when that refresh happened. If a stale or missing index cannot be refreshed, for example because another writer owns the index lock, traversal skips stale symbol/call edges, emits a stale/missing diagnostic, and falls back to live source-file nodes whose expansion commands use `tsift source-read`; this keeps agent-doc navigation grounded in current raw source instead of stale graph evidence.
 
-Traversal and `context-pack` JSON include an `exploration` packet for agent handoffs. The packet adapts source-window and relationship-map budgets to graph size, exposes compact relationship rows, emits line-numbered `source-read` windows clustered around selected files/symbols/routes, and includes explicit no-reread guidance so follow-up agents expand stable handles instead of replaying whole files.
+Traversal and `context-pack` JSON include an `exploration` packet for agent handoffs. The packet adapts source-window and relationship-map budgets to graph size, exposes compact relationship rows, emits line-numbered `source-read` windows clustered around selected files/symbols/routes, and includes explicit no-reread guidance so follow-up agents expand stable handles instead of replaying whole files. `context-pack` stores those source-window handles as `source_handle` graph nodes so downstream Convex projections can carry the same resumable handles as the local SQLite projection.
 
 ### `impact`
 

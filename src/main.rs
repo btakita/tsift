@@ -12,6 +12,13 @@ use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use substrate::{
+    ConvexEdgeRow, ConvexNodeRow, ConvexProjectionRows, GraphEdge as SubstrateGraphEdge,
+    GraphFreshness, GraphNode as SubstrateGraphNode, GraphProjection, GraphProvenance, GraphStore,
+    SqliteGraphStore,
+};
+#[cfg(test)]
+use substrate::{ConvexGraphClient, ConvexGraphStore};
 use tagpath::{family as tagpath_family, ontology as tagpath_ontology};
 use tempfile::NamedTempFile;
 
@@ -332,6 +339,27 @@ enum Commands {
         /// Output format for the graph traversal report
         #[arg(long, value_enum, default_value = "json")]
         format: TraverseFormat,
+        /// Validate a Convex nodes/edges snapshot before trusting projected graph reads
+        #[arg(long)]
+        convex_snapshot: Option<PathBuf>,
+    },
+    /// Plan Convex nodes/edges sync batches for the local graph projection
+    ConvexSync {
+        /// Path to the indexed codebase or workspace (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Restrict indexed code nodes to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Existing Convex rows snapshot to diff against
+        #[arg(long)]
+        snapshot: Option<PathBuf>,
+        /// Max rows per planned mutation chunk
+        #[arg(long, default_value = "100")]
+        chunk_size: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Read a bounded source-file line window with expansion handles and index refs
     SourceRead {
@@ -524,6 +552,9 @@ enum Commands {
         /// Named preview budget preset (auto adapts from context-window env vars)
         #[arg(long, value_enum)]
         budget: Option<ResponseBudgetPreset>,
+        /// Validate a Convex nodes/edges snapshot before trusting projected graph reads
+        #[arg(long)]
+        convex_snapshot: Option<PathBuf>,
     },
     /// Compare raw symbol output with compact tag-family preview envelopes
     TokenSavings {
@@ -1083,6 +1114,7 @@ fn main() -> Result<()> {
             depth,
             limit,
             format,
+            convex_snapshot,
         }) => cmd_traverse(
             node.as_deref(),
             to.as_deref(),
@@ -1094,6 +1126,27 @@ fn main() -> Result<()> {
             pretty,
             terse,
             schema,
+            convex_snapshot.as_deref(),
+        ),
+        Some(Commands::ConvexSync {
+            path,
+            scope,
+            snapshot,
+            chunk_size,
+            json,
+        }) => cmd_convex_sync(
+            &path,
+            scope.as_deref(),
+            snapshot.as_deref(),
+            chunk_size,
+            OutputFormat {
+                json_output: json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                schema,
+                envelope,
+            },
         ),
         Some(Commands::SourceRead {
             file,
@@ -1263,6 +1316,7 @@ fn main() -> Result<()> {
             max_items,
             max_bytes,
             budget,
+            convex_snapshot,
         }) => cmd_context_pack(
             &path,
             test_input.as_deref(),
@@ -1277,6 +1331,7 @@ fn main() -> Result<()> {
                 envelope,
             },
             ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
+            convex_snapshot.as_deref(),
         ),
         Some(Commands::TokenSavings {
             fixture,
@@ -4088,6 +4143,9 @@ struct TraversalGraphBuild {
     warnings: Vec<String>,
 }
 
+const GRAPH_PROJECTION_VERSION: &str = "tsift-traversal-v1";
+const GRAPH_PROJECTION_META_KIND: &str = "projection_meta";
+
 #[derive(Debug, Serialize, PartialEq)]
 struct TraversalTotals {
     nodes: usize,
@@ -4217,6 +4275,660 @@ impl TraversalGraphBuild {
                 weight,
             });
         }
+    }
+}
+
+fn graph_substrate_db_path(root: &Path, scope: Option<&str>) -> PathBuf {
+    match scope {
+        Some(scope) => root.join(".tsift/indexes").join(scope).join("graph.db"),
+        None => root.join(".tsift/graph.db"),
+    }
+}
+
+fn graph_projection_meta_id(scope: Option<&str>) -> String {
+    format!("projection:tsift-traversal:{}", scope.unwrap_or("root"))
+}
+
+fn content_hash<T: Serialize>(value: &T) -> Result<String> {
+    let bytes = serde_json::to_vec(value)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn node_with_content_freshness(mut node: SubstrateGraphNode) -> Result<SubstrateGraphNode> {
+    let mut hashable = node.clone();
+    hashable.freshness = None;
+    node.freshness = Some(GraphFreshness::content_hash(content_hash(&hashable)?));
+    Ok(node)
+}
+
+fn edge_with_content_freshness(mut edge: SubstrateGraphEdge) -> Result<SubstrateGraphEdge> {
+    let mut hashable = edge.clone();
+    hashable.freshness = None;
+    edge.freshness = Some(GraphFreshness::content_hash(content_hash(&hashable)?));
+    Ok(edge)
+}
+
+fn projection_content_hash(
+    nodes: &[SubstrateGraphNode],
+    edges: &[SubstrateGraphEdge],
+) -> Result<String> {
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        version: &'static str,
+        nodes: &'a [SubstrateGraphNode],
+        edges: &'a [SubstrateGraphEdge],
+    }
+
+    content_hash(&Payload {
+        version: GRAPH_PROJECTION_VERSION,
+        nodes,
+        edges,
+    })
+}
+
+fn traversal_projection_from_graph(
+    root: &Path,
+    scope: Option<&str>,
+    graph: &TraversalGraphBuild,
+) -> Result<GraphProjection> {
+    let provenance = GraphProvenance::new(
+        "tsift.traverse",
+        format!("{}:{}", root.display(), scope.unwrap_or("root")),
+    );
+    let mut nodes = Vec::with_capacity(graph.nodes.len() + 1);
+    for node in graph.nodes.values() {
+        let mut projected =
+            SubstrateGraphNode::new(node.handle.clone(), node.kind.clone(), node.label.clone())
+                .with_property("handle", node.handle.clone())
+                .with_property("expand", node.expand.clone())
+                .with_provenance(provenance.clone());
+        if let Some(ref_id) = &node.ref_id {
+            projected = projected.with_property("ref_id", ref_id.clone());
+        }
+        if let Some(path) = &node.path {
+            projected = projected.with_property("path", path.clone());
+        }
+        if let Some(line) = node.line {
+            projected = projected.with_property("line", line.to_string());
+        }
+        if let Some(detail) = &node.detail {
+            projected = projected.with_property("detail", detail.clone());
+        }
+        nodes.push(node_with_content_freshness(projected)?);
+    }
+
+    let mut edges = Vec::with_capacity(graph.edges.len());
+    for edge in &graph.edges {
+        let mut projected =
+            SubstrateGraphEdge::new(edge.from.clone(), edge.to.clone(), edge.relation.clone())
+                .with_property("weight", edge.weight.to_string())
+                .with_provenance(provenance.clone());
+        if let Some(label) = &edge.label {
+            projected = projected.with_property("label", label.clone());
+        }
+        edges.push(edge_with_content_freshness(projected)?);
+    }
+
+    let projection_hash = projection_content_hash(&nodes, &edges)?;
+    let meta = SubstrateGraphNode::new(
+        graph_projection_meta_id(scope),
+        GRAPH_PROJECTION_META_KIND,
+        "tsift traversal projection",
+    )
+    .with_property("projection_version", GRAPH_PROJECTION_VERSION)
+    .with_property("content_hash", projection_hash.clone())
+    .with_property("root", root.to_string_lossy().to_string())
+    .with_property("scope", scope.unwrap_or("root"))
+    .with_property("node_count", graph.nodes.len().to_string())
+    .with_property("edge_count", graph.edges.len().to_string())
+    .with_provenance(provenance)
+    .with_freshness(GraphFreshness::content_hash(projection_hash));
+    nodes.push(meta);
+
+    Ok(GraphProjection { nodes, edges })
+}
+
+fn traversal_node_from_graph_node(root: &Path, node: SubstrateGraphNode) -> TraversalNode {
+    let handle = node
+        .properties
+        .get("handle")
+        .cloned()
+        .unwrap_or_else(|| node.id.clone());
+    TraversalNode {
+        expand: node
+            .properties
+            .get("expand")
+            .cloned()
+            .unwrap_or_else(|| traversal_expand_command(root, &handle)),
+        handle,
+        kind: node.kind,
+        label: node.label,
+        ref_id: node.properties.get("ref_id").cloned(),
+        path: node.properties.get("path").cloned(),
+        line: node
+            .properties
+            .get("line")
+            .and_then(|value| value.parse::<i64>().ok()),
+        detail: node.properties.get("detail").cloned(),
+    }
+}
+
+fn traversal_graph_from_store(root: &Path, store: &impl GraphStore) -> Result<TraversalGraphBuild> {
+    let mut graph = TraversalGraphBuild::default();
+    for node in store.all_nodes()? {
+        if node.kind == GRAPH_PROJECTION_META_KIND {
+            continue;
+        }
+        graph.add_node(traversal_node_from_graph_node(root, node));
+    }
+    for edge in store.all_edges()? {
+        graph.add_edge(
+            &edge.from_id,
+            &edge.to_id,
+            &edge.kind,
+            edge.properties.get("label").cloned(),
+            edge.properties
+                .get("weight")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1),
+        );
+    }
+    Ok(graph)
+}
+
+fn convex_rows_from_graph_store(store: &impl GraphStore) -> Result<ConvexProjectionRows> {
+    Ok(GraphProjection {
+        nodes: store.all_nodes()?,
+        edges: store.all_edges()?,
+    }
+    .to_convex_rows())
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct ConvexRequiredIndex {
+    table: String,
+    name: String,
+    fields: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct ConvexSyncChunk {
+    operation: String,
+    chunk: usize,
+    count: usize,
+    keys: Vec<String>,
+    max_attempts: usize,
+    retry_policy: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct ConvexProjectionFreshness {
+    status: String,
+    fail_closed: bool,
+    local_hash: Option<String>,
+    snapshot_hash: Option<String>,
+    missing_nodes: Vec<String>,
+    stale_nodes: Vec<String>,
+    missing_edges: Vec<String>,
+    stale_edges: Vec<String>,
+    diagnostics: Vec<String>,
+}
+
+impl ConvexProjectionFreshness {
+    fn current(local_hash: Option<String>, snapshot_hash: Option<String>) -> Self {
+        Self {
+            status: "current".to_string(),
+            fail_closed: false,
+            local_hash,
+            snapshot_hash,
+            missing_nodes: Vec::new(),
+            stale_nodes: Vec::new(),
+            missing_edges: Vec::new(),
+            stale_edges: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct ConvexSyncReport {
+    root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    graph_db: String,
+    dry_run: bool,
+    projection_version: String,
+    projection_hash: Option<String>,
+    required_indexes: Vec<ConvexRequiredIndex>,
+    node_upserts: Vec<ConvexNodeRow>,
+    edge_upserts: Vec<ConvexEdgeRow>,
+    node_tombstones: Vec<String>,
+    edge_tombstones: Vec<String>,
+    chunks: Vec<ConvexSyncChunk>,
+    freshness: ConvexProjectionFreshness,
+    diagnostics: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn convex_required_indexes() -> Vec<ConvexRequiredIndex> {
+    vec![
+        ConvexRequiredIndex {
+            table: "nodes".to_string(),
+            name: "by_external_id".to_string(),
+            fields: vec!["externalId".to_string()],
+        },
+        ConvexRequiredIndex {
+            table: "nodes".to_string(),
+            name: "by_kind".to_string(),
+            fields: vec!["kind".to_string()],
+        },
+        ConvexRequiredIndex {
+            table: "edges".to_string(),
+            name: "by_edge_key".to_string(),
+            fields: vec!["edgeKey".to_string()],
+        },
+        ConvexRequiredIndex {
+            table: "edges".to_string(),
+            name: "by_from_kind".to_string(),
+            fields: vec!["fromExternalId".to_string(), "kind".to_string()],
+        },
+        ConvexRequiredIndex {
+            table: "edges".to_string(),
+            name: "by_to_kind".to_string(),
+            fields: vec!["toExternalId".to_string(), "kind".to_string()],
+        },
+    ]
+}
+
+fn load_convex_projection_rows(path: &Path) -> Result<ConvexProjectionRows> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("reading Convex projection snapshot {}", path.display()))?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("parsing Convex projection snapshot {}", path.display()))
+}
+
+fn convex_projection_hash(rows: &ConvexProjectionRows, scope: Option<&str>) -> Option<String> {
+    let meta_id = graph_projection_meta_id(scope);
+    rows.nodes
+        .iter()
+        .find(|row| row.external_id == meta_id && row.kind == GRAPH_PROJECTION_META_KIND)
+        .and_then(|row| row.properties.get("content_hash").cloned())
+}
+
+fn convex_projection_freshness(
+    local: &ConvexProjectionRows,
+    snapshot: Option<&ConvexProjectionRows>,
+    scope: Option<&str>,
+) -> ConvexProjectionFreshness {
+    let local_hash = convex_projection_hash(local, scope);
+    let Some(snapshot) = snapshot else {
+        return ConvexProjectionFreshness {
+            status: "unchecked".to_string(),
+            fail_closed: false,
+            local_hash,
+            snapshot_hash: None,
+            missing_nodes: Vec::new(),
+            stale_nodes: Vec::new(),
+            missing_edges: Vec::new(),
+            stale_edges: Vec::new(),
+            diagnostics: vec![
+                "no Convex snapshot supplied; sync output is a local dry-run plan".to_string(),
+            ],
+        };
+    };
+
+    let snapshot_hash = convex_projection_hash(snapshot, scope);
+    let snapshot_nodes = snapshot
+        .nodes
+        .iter()
+        .map(|row| (row.external_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let snapshot_edges = snapshot
+        .edges
+        .iter()
+        .map(|row| (row.edge_key.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut missing_nodes = Vec::new();
+    let mut stale_nodes = Vec::new();
+    for row in &local.nodes {
+        match snapshot_nodes.get(row.external_id.as_str()) {
+            Some(snapshot_row) if *snapshot_row == row => {}
+            Some(_) => stale_nodes.push(row.external_id.clone()),
+            None => missing_nodes.push(row.external_id.clone()),
+        }
+    }
+
+    let mut missing_edges = Vec::new();
+    let mut stale_edges = Vec::new();
+    for row in &local.edges {
+        match snapshot_edges.get(row.edge_key.as_str()) {
+            Some(snapshot_row) if *snapshot_row == row => {}
+            Some(_) => stale_edges.push(row.edge_key.clone()),
+            None => missing_edges.push(row.edge_key.clone()),
+        }
+    }
+
+    let hash_current = local_hash.is_some() && local_hash == snapshot_hash;
+    let rows_current = missing_nodes.is_empty()
+        && stale_nodes.is_empty()
+        && missing_edges.is_empty()
+        && stale_edges.is_empty();
+    if hash_current && rows_current {
+        return ConvexProjectionFreshness::current(local_hash, snapshot_hash);
+    }
+
+    let mut diagnostics = Vec::new();
+    if local_hash != snapshot_hash {
+        diagnostics.push(format!(
+            "projection hash mismatch: local={} snapshot={}",
+            local_hash.as_deref().unwrap_or("missing"),
+            snapshot_hash.as_deref().unwrap_or("missing")
+        ));
+    }
+    if !missing_nodes.is_empty() || !missing_edges.is_empty() {
+        diagnostics.push(format!(
+            "Convex snapshot is missing {} node(s) and {} edge(s)",
+            missing_nodes.len(),
+            missing_edges.len()
+        ));
+    }
+    if !stale_nodes.is_empty() || !stale_edges.is_empty() {
+        diagnostics.push(format!(
+            "Convex snapshot has {} stale node row(s) and {} stale edge row(s)",
+            stale_nodes.len(),
+            stale_edges.len()
+        ));
+    }
+
+    ConvexProjectionFreshness {
+        status: "stale".to_string(),
+        fail_closed: true,
+        local_hash,
+        snapshot_hash,
+        missing_nodes,
+        stale_nodes,
+        missing_edges,
+        stale_edges,
+        diagnostics,
+    }
+}
+
+fn verify_convex_projection_snapshot(
+    root: &Path,
+    scope: Option<&str>,
+    snapshot_path: &Path,
+) -> Result<()> {
+    let graph_db = graph_substrate_db_path(root, scope);
+    let store = SqliteGraphStore::open(&graph_db)?;
+    let local = convex_rows_from_graph_store(&store)?;
+    let snapshot = load_convex_projection_rows(snapshot_path)?;
+    let freshness = convex_projection_freshness(&local, Some(&snapshot), scope);
+    if freshness.fail_closed {
+        bail!(
+            "Convex graph projection is not current for {}: {}",
+            root.display(),
+            freshness.diagnostics.join("; ")
+        );
+    }
+    Ok(())
+}
+
+fn convex_rows_diff(
+    local: &ConvexProjectionRows,
+    snapshot: Option<&ConvexProjectionRows>,
+) -> (
+    Vec<ConvexNodeRow>,
+    Vec<ConvexEdgeRow>,
+    Vec<String>,
+    Vec<String>,
+) {
+    let Some(snapshot) = snapshot else {
+        return (
+            local.nodes.clone(),
+            local.edges.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+    };
+    let local_nodes = local
+        .nodes
+        .iter()
+        .map(|row| (row.external_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let local_edges = local
+        .edges
+        .iter()
+        .map(|row| (row.edge_key.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let snapshot_nodes = snapshot
+        .nodes
+        .iter()
+        .map(|row| (row.external_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let snapshot_edges = snapshot
+        .edges
+        .iter()
+        .map(|row| (row.edge_key.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+
+    let node_upserts = local
+        .nodes
+        .iter()
+        .filter(|row| {
+            snapshot_nodes
+                .get(row.external_id.as_str())
+                .is_none_or(|snapshot_row| *snapshot_row != *row)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let edge_upserts = local
+        .edges
+        .iter()
+        .filter(|row| {
+            snapshot_edges
+                .get(row.edge_key.as_str())
+                .is_none_or(|snapshot_row| *snapshot_row != *row)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let node_tombstones = snapshot
+        .nodes
+        .iter()
+        .filter(|row| !local_nodes.contains_key(row.external_id.as_str()))
+        .map(|row| row.external_id.clone())
+        .collect::<Vec<_>>();
+    let edge_tombstones = snapshot
+        .edges
+        .iter()
+        .filter(|row| !local_edges.contains_key(row.edge_key.as_str()))
+        .map(|row| row.edge_key.clone())
+        .collect::<Vec<_>>();
+
+    (node_upserts, edge_upserts, node_tombstones, edge_tombstones)
+}
+
+fn push_sync_chunks(
+    chunks: &mut Vec<ConvexSyncChunk>,
+    operation: &str,
+    keys: Vec<String>,
+    size: usize,
+) {
+    if keys.is_empty() {
+        return;
+    }
+    for (idx, chunk) in keys.chunks(size).enumerate() {
+        chunks.push(ConvexSyncChunk {
+            operation: operation.to_string(),
+            chunk: idx + 1,
+            count: chunk.len(),
+            keys: chunk.to_vec(),
+            max_attempts: 3,
+            retry_policy:
+                "retry the whole chunk; rows are idempotent by externalId/edgeKey, stop on a repeated partial failure"
+                    .to_string(),
+        });
+    }
+}
+
+fn build_convex_sync_report(
+    path: &Path,
+    scope: Option<&str>,
+    snapshot_path: Option<&Path>,
+    chunk_size: usize,
+) -> Result<ConvexSyncReport> {
+    if chunk_size == 0 {
+        bail!("--chunk-size must be greater than zero");
+    }
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let graph = build_traversal_graph(&root, path, scope)?;
+    let graph_db = graph_substrate_db_path(&root, scope);
+    let store = SqliteGraphStore::open(&graph_db)?;
+    let local = convex_rows_from_graph_store(&store)?;
+    let snapshot = snapshot_path.map(load_convex_projection_rows).transpose()?;
+    let freshness = convex_projection_freshness(&local, snapshot.as_ref(), scope);
+    let (node_upserts, edge_upserts, node_tombstones, edge_tombstones) =
+        convex_rows_diff(&local, snapshot.as_ref());
+
+    let mut chunks = Vec::new();
+    push_sync_chunks(
+        &mut chunks,
+        "upsert_nodes",
+        node_upserts
+            .iter()
+            .map(|row| row.external_id.clone())
+            .collect(),
+        chunk_size,
+    );
+    push_sync_chunks(
+        &mut chunks,
+        "upsert_edges",
+        edge_upserts
+            .iter()
+            .map(|row| row.edge_key.clone())
+            .collect(),
+        chunk_size,
+    );
+    push_sync_chunks(
+        &mut chunks,
+        "delete_edges",
+        edge_tombstones.clone(),
+        chunk_size,
+    );
+    push_sync_chunks(
+        &mut chunks,
+        "delete_nodes",
+        node_tombstones.clone(),
+        chunk_size,
+    );
+
+    let mut diagnostics = vec![
+        "dry-run only: no Convex network mutation was attempted".to_string(),
+        "apply node upserts before edge upserts; apply edge tombstones before node tombstones"
+            .to_string(),
+    ];
+    if freshness.fail_closed {
+        diagnostics.push(
+            "Convex-backed traverse/context-pack reads must fail closed until this plan is applied"
+                .to_string(),
+        );
+    }
+
+    Ok(ConvexSyncReport {
+        root: root.to_string_lossy().to_string(),
+        scope: scope.map(str::to_string),
+        graph_db: graph_db.to_string_lossy().to_string(),
+        dry_run: true,
+        projection_version: GRAPH_PROJECTION_VERSION.to_string(),
+        projection_hash: convex_projection_hash(&local, scope),
+        required_indexes: convex_required_indexes(),
+        node_upserts,
+        edge_upserts,
+        node_tombstones,
+        edge_tombstones,
+        chunks,
+        freshness,
+        diagnostics,
+        warnings: graph.warnings,
+    })
+}
+
+fn print_convex_sync_human(report: &ConvexSyncReport, compact: bool) {
+    if compact {
+        println!(
+            "convex-sync nodes:+{} -{} edges:+{} -{} chunks:{} freshness:{}",
+            report.node_upserts.len(),
+            report.node_tombstones.len(),
+            report.edge_upserts.len(),
+            report.edge_tombstones.len(),
+            report.chunks.len(),
+            report.freshness.status
+        );
+        return;
+    }
+
+    println!("Convex graph sync dry-run");
+    println!("root: {}", report.root);
+    println!("graph_db: {}", report.graph_db);
+    println!(
+        "upserts: {} node(s), {} edge(s)",
+        report.node_upserts.len(),
+        report.edge_upserts.len()
+    );
+    println!(
+        "tombstones: {} node(s), {} edge(s)",
+        report.node_tombstones.len(),
+        report.edge_tombstones.len()
+    );
+    println!("chunks: {}", report.chunks.len());
+    println!("freshness: {}", report.freshness.status);
+    for diagnostic in report
+        .diagnostics
+        .iter()
+        .chain(report.freshness.diagnostics.iter())
+    {
+        println!("- {}", diagnostic);
+    }
+}
+
+fn cmd_convex_sync(
+    path: &Path,
+    scope: Option<&str>,
+    snapshot: Option<&Path>,
+    chunk_size: usize,
+    format: OutputFormat,
+) -> Result<()> {
+    let report = build_convex_sync_report(path, scope, snapshot, chunk_size)?;
+    if format.json_output {
+        print_json_or_envelope(
+            &report,
+            &format,
+            "convex-sync",
+            "dry-run",
+            ToolEnvelopeSummary {
+                text: format!(
+                    "Convex graph sync plan: {} node upserts, {} edge upserts, {} chunks, freshness {}",
+                    report.node_upserts.len(),
+                    report.edge_upserts.len(),
+                    report.chunks.len(),
+                    report.freshness.status
+                ),
+                metrics: vec![
+                    envelope_metric("node_upserts", report.node_upserts.len()),
+                    envelope_metric("edge_upserts", report.edge_upserts.len()),
+                    envelope_metric("chunks", report.chunks.len()),
+                    envelope_metric("freshness", &report.freshness.status),
+                ],
+            },
+            report.freshness.fail_closed,
+            vec![
+                "Apply the planned chunks in order, then rerun with --snapshot to verify freshness"
+                    .to_string(),
+            ],
+        )
+    } else {
+        print_convex_sync_human(&report, format.compact);
+        Ok(())
     }
 }
 
@@ -4724,7 +5436,7 @@ fn add_raw_source_file_nodes(
     Ok(())
 }
 
-fn build_traversal_graph(
+fn build_traversal_graph_source(
     root: &Path,
     path_hint: &Path,
     scope: Option<&str>,
@@ -4866,6 +5578,21 @@ fn build_traversal_graph(
         &file_entries,
         &route_entries,
     )?;
+    Ok(graph)
+}
+
+fn build_traversal_graph(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+) -> Result<TraversalGraphBuild> {
+    let source_graph = build_traversal_graph_source(root, path_hint, scope)?;
+    let projection = traversal_projection_from_graph(root, scope, &source_graph)?;
+    let graph_db = graph_substrate_db_path(root, scope);
+    let mut store = SqliteGraphStore::open(&graph_db)?;
+    store.replace_projection(&projection)?;
+    let mut graph = traversal_graph_from_store(root, &store)?;
+    graph.warnings = source_graph.warnings;
     Ok(graph)
 }
 
@@ -5438,9 +6165,13 @@ fn cmd_traverse(
     pretty: bool,
     terse: bool,
     schema: bool,
+    convex_snapshot: Option<&Path>,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     let graph = build_traversal_graph(&root, path, scope)?;
+    if let Some(snapshot) = convex_snapshot {
+        verify_convex_projection_snapshot(&root, scope, snapshot)?;
+    }
     let report = traversal_report(&root, scope, graph, node, to, depth, limit)?;
     match format {
         TraverseFormat::Json => {
@@ -7356,7 +8087,13 @@ fn cmd_context_pack(
     log_input: Option<&Path>,
     format: OutputFormat,
     budget: ResponseBudget,
+    convex_snapshot: Option<&Path>,
 ) -> Result<()> {
+    if let Some(snapshot) = convex_snapshot {
+        let root = lint::resolve_project_root_or_canonical_path(path)?;
+        build_traversal_graph(&root, path, None)?;
+        verify_convex_projection_snapshot(&root, None, snapshot)?;
+    }
     let report = build_context_pack_report(path, test_input, runner, log_input, budget)?;
     if format.json_output {
         print_json_or_envelope(
@@ -9594,6 +10331,161 @@ fn build_context_pack_exploration_packet(
     }
 }
 
+fn exploration_ref_id(label: &str) -> String {
+    stable_handle("xref", label)
+}
+
+fn context_pack_exploration_projection(packet: &ExplorationPacket) -> Result<GraphProjection> {
+    let provenance = GraphProvenance::new("tsift.context-pack", "exploration");
+    let mut nodes = BTreeMap::<String, SubstrateGraphNode>::new();
+    let mut edges = Vec::new();
+
+    for relation in &packet.relationship_map {
+        for label in [&relation.from, &relation.to] {
+            let id = exploration_ref_id(label);
+            nodes.entry(id.clone()).or_insert_with(|| {
+                SubstrateGraphNode::new(id, "exploration_ref", label.clone())
+                    .with_property("label", label.clone())
+                    .with_provenance(provenance.clone())
+            });
+        }
+        let mut edge = SubstrateGraphEdge::new(
+            exploration_ref_id(&relation.from),
+            exploration_ref_id(&relation.to),
+            relation.relation.clone(),
+        )
+        .with_provenance(provenance.clone());
+        if let Some(label) = &relation.label {
+            edge = edge.with_property("label", label.clone());
+        }
+        edges.push(edge_with_content_freshness(edge)?);
+    }
+
+    for window in &packet.source_windows {
+        let label = format!("{}:{}-{}", window.file, window.start, window.end);
+        let node = SubstrateGraphNode::new(window.handle.clone(), "source_handle", label)
+            .with_property("handle", window.handle.clone())
+            .with_property("file", window.file.clone())
+            .with_property("start", window.start.to_string())
+            .with_property("end", window.end.to_string())
+            .with_property("reason", window.reason.clone())
+            .with_property("expand", window.expand.clone())
+            .with_provenance(provenance.clone());
+        nodes.insert(window.handle.clone(), node_with_content_freshness(node)?);
+
+        let file_ref = format!("file:{}", window.file);
+        let file_ref_id = exploration_ref_id(&file_ref);
+        nodes.entry(file_ref_id.clone()).or_insert_with(|| {
+            SubstrateGraphNode::new(file_ref_id.clone(), "exploration_ref", file_ref.clone())
+                .with_property("label", file_ref.clone())
+                .with_provenance(provenance.clone())
+        });
+        let edge = SubstrateGraphEdge::new(window.handle.clone(), file_ref_id, "expands_source")
+            .with_property("label", window.reason.clone())
+            .with_provenance(provenance.clone());
+        edges.push(edge_with_content_freshness(edge)?);
+    }
+
+    let mut nodes = nodes.into_values().collect::<Vec<_>>();
+    for node in &mut nodes {
+        if node.freshness.is_none() {
+            let fresh = node_with_content_freshness(node.clone())?;
+            *node = fresh;
+        }
+    }
+
+    Ok(GraphProjection { nodes, edges })
+}
+
+fn source_window_from_graph_node(node: SubstrateGraphNode) -> Result<ExplorationSourceWindow> {
+    let file = node
+        .properties
+        .get("file")
+        .cloned()
+        .with_context(|| format!("source handle {} missing file property", node.id))?;
+    let start = node
+        .properties
+        .get("start")
+        .with_context(|| format!("source handle {} missing start property", node.id))?
+        .parse::<usize>()
+        .with_context(|| format!("source handle {} has invalid start", node.id))?;
+    let end = node
+        .properties
+        .get("end")
+        .with_context(|| format!("source handle {} missing end property", node.id))?
+        .parse::<usize>()
+        .with_context(|| format!("source handle {} has invalid end", node.id))?;
+    Ok(ExplorationSourceWindow {
+        handle: node
+            .properties
+            .get("handle")
+            .cloned()
+            .unwrap_or_else(|| node.id.clone()),
+        file,
+        start,
+        end,
+        reason: node
+            .properties
+            .get("reason")
+            .cloned()
+            .unwrap_or_else(|| "source context".to_string()),
+        expand: node.properties.get("expand").cloned().unwrap_or_default(),
+    })
+}
+
+fn materialize_context_pack_exploration_packet(
+    root: &Path,
+    packet: ExplorationPacket,
+) -> Result<ExplorationPacket> {
+    let projection = context_pack_exploration_projection(&packet)?;
+    let graph_db = graph_substrate_db_path(root, None);
+    let store = SqliteGraphStore::open(&graph_db)?;
+    projection.upsert_into(&store)?;
+
+    let mut source_windows = Vec::new();
+    for window in &packet.source_windows {
+        let node = store
+            .node(&window.handle)?
+            .with_context(|| format!("source handle {} was not materialized", window.handle))?;
+        source_windows.push(source_window_from_graph_node(node)?);
+    }
+
+    let mut relationship_map = Vec::new();
+    for relation in &packet.relationship_map {
+        let from_id = exploration_ref_id(&relation.from);
+        let to_id = exploration_ref_id(&relation.to);
+        let from = store
+            .node(&from_id)?
+            .with_context(|| format!("exploration ref {} was not materialized", relation.from))?;
+        let to = store
+            .node(&to_id)?
+            .with_context(|| format!("exploration ref {} was not materialized", relation.to))?;
+        let edge = store
+            .outgoing_edges(&from_id, Some(&relation.relation))?
+            .into_iter()
+            .find(|edge| edge.to_id == to_id)
+            .with_context(|| {
+                format!(
+                    "exploration relation {} -> {} ({}) was not materialized",
+                    relation.from, relation.to, relation.relation
+                )
+            })?;
+        relationship_map.push(ExplorationRelation {
+            from: from.label,
+            relation: edge.kind,
+            to: to.label,
+            label: edge.properties.get("label").cloned(),
+        });
+    }
+
+    Ok(ExplorationPacket {
+        budget: packet.budget,
+        relationship_map,
+        source_windows,
+        no_reread_guidance: packet.no_reread_guidance,
+    })
+}
+
 fn build_context_pack_test_preview(
     report: &test_digest::TestDigestReport,
     budget: ResponseBudget,
@@ -9957,7 +10849,10 @@ fn build_context_pack_report(
 
     let ontology_refs =
         collect_context_pack_ontology_refs(&next_context, &diff_digest, &test_digest, &log_digest);
-    let exploration = build_context_pack_exploration_packet(&root, &next_context, &diff_digest);
+    let exploration = materialize_context_pack_exploration_packet(
+        &root,
+        build_context_pack_exploration_packet(&root, &next_context, &diff_digest),
+    )?;
 
     Ok(ContextPackReport {
         root: review.root,
@@ -12529,6 +13424,65 @@ fn cmd_search_worker(
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct MemoryConvexGraphClient {
+        nodes: RefCell<BTreeMap<String, ConvexNodeRow>>,
+        edges: RefCell<BTreeMap<String, ConvexEdgeRow>>,
+    }
+
+    impl ConvexGraphClient for MemoryConvexGraphClient {
+        fn upsert_node_row(&self, row: &ConvexNodeRow) -> Result<()> {
+            self.nodes
+                .borrow_mut()
+                .insert(row.external_id.clone(), row.clone());
+            Ok(())
+        }
+
+        fn upsert_edge_row(&self, row: &ConvexEdgeRow) -> Result<()> {
+            self.edges
+                .borrow_mut()
+                .insert(row.edge_key.clone(), row.clone());
+            Ok(())
+        }
+
+        fn node_row(&self, external_id: &str) -> Result<Option<ConvexNodeRow>> {
+            Ok(self.nodes.borrow().get(external_id).cloned())
+        }
+
+        fn node_rows(&self) -> Result<Vec<ConvexNodeRow>> {
+            Ok(self.nodes.borrow().values().cloned().collect())
+        }
+
+        fn edge_rows(&self) -> Result<Vec<ConvexEdgeRow>> {
+            Ok(self.edges.borrow().values().cloned().collect())
+        }
+
+        fn node_rows_by_kind(&self, kind: &str) -> Result<Vec<ConvexNodeRow>> {
+            Ok(self
+                .nodes
+                .borrow()
+                .values()
+                .filter(|row| row.kind == kind)
+                .cloned()
+                .collect())
+        }
+
+        fn outgoing_edge_rows(
+            &self,
+            from_external_id: &str,
+            kind: Option<&str>,
+        ) -> Result<Vec<ConvexEdgeRow>> {
+            Ok(self
+                .edges
+                .borrow()
+                .values()
+                .filter(|row| row.from_external_id == from_external_id)
+                .filter(|row| kind.is_none_or(|kind| row.kind == kind))
+                .cloned()
+                .collect())
+        }
+    }
+
     fn init_git_repo(path: &Path) {
         let status = std::process::Command::new("git")
             .args(["init"])
@@ -14131,6 +15085,56 @@ def list_items():
     }
 
     #[test]
+    fn traversal_materializes_provider_neutral_sqlite_graph() {
+        let dir = setup_traversal_project();
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let backlog = resolve_traversal_node(&graph, "#kgnv").unwrap();
+
+        let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
+        let backlog_nodes = store.nodes_by_kind("backlog").unwrap();
+        assert!(
+            backlog_nodes.iter().any(|node| node.id == backlog.handle
+                && node.properties.get("ref_id") == Some(&"kgnv".to_string())),
+            "expected materialized backlog node, got {backlog_nodes:?}"
+        );
+        assert!(
+            store
+                .all_nodes()
+                .unwrap()
+                .iter()
+                .any(|node| node.kind == GRAPH_PROJECTION_META_KIND
+                    && node.properties.get("projection_version")
+                        == Some(&GRAPH_PROJECTION_VERSION.to_string())),
+            "expected projection metadata node"
+        );
+    }
+
+    #[test]
+    fn traversal_projection_queries_match_sqlite_and_convex_stores() {
+        let dir = setup_traversal_project();
+        let source_graph = build_traversal_graph_source(dir.path(), dir.path(), None).unwrap();
+        let projection = traversal_projection_from_graph(dir.path(), None, &source_graph).unwrap();
+
+        let mut sqlite = SqliteGraphStore::in_memory().unwrap();
+        sqlite.replace_projection(&projection).unwrap();
+        let convex = ConvexGraphStore::new(MemoryConvexGraphClient::default());
+        projection.upsert_into(&convex).unwrap();
+
+        let sqlite_graph = traversal_graph_from_store(dir.path(), &sqlite).unwrap();
+        let convex_graph = traversal_graph_from_store(dir.path(), &convex).unwrap();
+        assert_eq!(sqlite_graph.nodes.len(), convex_graph.nodes.len());
+        assert_eq!(sqlite_graph.edges.len(), convex_graph.edges.len());
+
+        let sqlite_backlog = resolve_traversal_node(&sqlite_graph, "#kgnv").unwrap();
+        let convex_helper = resolve_traversal_node(&convex_graph, "helper").unwrap();
+        assert!(convex_graph.edges.iter().any(|edge| {
+            edge.from == sqlite_backlog.handle
+                && edge.to == convex_helper.handle
+                && edge.relation == "mentions"
+        }));
+    }
+
+    #[test]
     fn traversal_shortest_path_crosses_artifacts_and_symbols() {
         let dir = setup_traversal_project();
         let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
@@ -14256,6 +15260,7 @@ def list_items():
             false,
             false,
             false,
+            None,
         )
         .unwrap();
         cmd_traverse(
@@ -14269,6 +15274,7 @@ def list_items():
             false,
             false,
             false,
+            None,
         )
         .unwrap();
     }
@@ -17311,6 +18317,7 @@ tier = "private"
                 max_items,
                 max_bytes,
                 budget,
+                convex_snapshot,
             }) => {
                 assert_eq!(path, PathBuf::from("tasks/software/tsift.md"));
                 assert_eq!(test_input, Some(PathBuf::from("target/test.log")));
@@ -17320,6 +18327,7 @@ tier = "private"
                 assert_eq!(max_items, Some(3));
                 assert_eq!(max_bytes, Some(96));
                 assert!(budget.is_none());
+                assert!(convex_snapshot.is_none());
             }
             _ => panic!("expected ContextPack command"),
         }
@@ -18002,6 +19010,100 @@ tier = "private"
     }
 
     #[test]
+    fn context_pack_materializes_source_handles_into_graph_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let packet = ExplorationPacket {
+            budget: exploration_budget_for_counts(2, 1),
+            relationship_map: vec![ExplorationRelation {
+                from: "file:main.rs".to_string(),
+                relation: "touches_symbol".to_string(),
+                to: "symbol:helper".to_string(),
+                label: Some("modified diff".to_string()),
+            }],
+            source_windows: vec![ExplorationSourceWindow {
+                handle: "xwin-test".to_string(),
+                file: "main.rs".to_string(),
+                start: 1,
+                end: 32,
+                reason: "changed file".to_string(),
+                expand: "tsift source-read main.rs --path . --start 1 --lines 32".to_string(),
+            }],
+            no_reread_guidance: "use windows".to_string(),
+        };
+
+        let packet = materialize_context_pack_exploration_packet(dir.path(), packet).unwrap();
+        assert_eq!(packet.source_windows[0].handle, "xwin-test");
+
+        let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
+        let source_handles = store.nodes_by_kind("source_handle").unwrap();
+        assert_eq!(source_handles.len(), 1);
+        assert_eq!(
+            source_handles[0].properties.get("file"),
+            Some(&"main.rs".to_string())
+        );
+        assert_eq!(
+            store
+                .outgoing_edges(&exploration_ref_id("file:main.rs"), Some("touches_symbol"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn convex_sync_report_chunks_upserts_and_tombstones() {
+        let dir = setup_traversal_project();
+        let source_graph = build_traversal_graph_source(dir.path(), dir.path(), None).unwrap();
+        let projection = traversal_projection_from_graph(dir.path(), None, &source_graph).unwrap();
+        let mut snapshot = projection.to_convex_rows();
+        snapshot.nodes.push(ConvexNodeRow {
+            external_id: "stale-node".to_string(),
+            kind: "backlog".to_string(),
+            label: "stale".to_string(),
+            properties: BTreeMap::new(),
+            provenance: Vec::new(),
+            freshness: None,
+        });
+        snapshot.edges.clear();
+        let snapshot_path = dir.path().join("convex-snapshot.json");
+        fs::write(&snapshot_path, serde_json::to_string(&snapshot).unwrap()).unwrap();
+
+        let report = build_convex_sync_report(dir.path(), None, Some(&snapshot_path), 2).unwrap();
+
+        assert_eq!(report.freshness.status, "stale");
+        assert!(report.freshness.fail_closed);
+        assert_eq!(report.node_tombstones, vec!["stale-node".to_string()]);
+        assert!(
+            report.edge_upserts.len() > 1,
+            "snapshot without edges should upsert local edges"
+        );
+        assert!(
+            report
+                .chunks
+                .iter()
+                .any(|chunk| chunk.operation == "upsert_edges" && chunk.count <= 2),
+            "expected chunked edge upserts, got {:?}",
+            report.chunks
+        );
+    }
+
+    #[test]
+    fn convex_snapshot_validation_fails_closed_when_stale() {
+        let dir = setup_traversal_project();
+        build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let snapshot = ConvexProjectionRows::default();
+        let snapshot_path = dir.path().join("empty-convex-snapshot.json");
+        fs::write(&snapshot_path, serde_json::to_string(&snapshot).unwrap()).unwrap();
+
+        let err = verify_convex_projection_snapshot(dir.path(), None, &snapshot_path).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Convex graph projection is not current"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn context_pack_diff_preview_attaches_tag_ontology_refs() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir_all(root.path().join(".naming/tags")).unwrap();
@@ -18347,6 +19449,35 @@ tier = "private"
                 assert_eq!(format, TraverseFormat::Html);
             }
             _ => panic!("expected Traverse command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_convex_sync_command() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "convex-sync",
+            ".",
+            "--snapshot",
+            "rows.json",
+            "--chunk-size",
+            "25",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::ConvexSync {
+                path,
+                snapshot,
+                chunk_size,
+                json,
+                ..
+            }) => {
+                assert_eq!(path, PathBuf::from("."));
+                assert_eq!(snapshot, Some(PathBuf::from("rows.json")));
+                assert_eq!(chunk_size, 25);
+                assert!(json);
+            }
+            _ => panic!("expected ConvexSync command"),
         }
     }
 

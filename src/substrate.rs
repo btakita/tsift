@@ -162,6 +162,8 @@ pub trait GraphStore {
     fn upsert_node(&self, node: &GraphNode) -> Result<()>;
     fn upsert_edge(&self, edge: &GraphEdge) -> Result<()>;
     fn node(&self, id: &str) -> Result<Option<GraphNode>>;
+    fn all_nodes(&self) -> Result<Vec<GraphNode>>;
+    fn all_edges(&self) -> Result<Vec<GraphEdge>>;
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>>;
     fn outgoing_edges(&self, from_id: &str, kind: Option<&str>) -> Result<Vec<GraphEdge>>;
     fn shortest_path(
@@ -281,6 +283,8 @@ pub trait ConvexGraphClient {
     fn upsert_node_row(&self, row: &ConvexNodeRow) -> Result<()>;
     fn upsert_edge_row(&self, row: &ConvexEdgeRow) -> Result<()>;
     fn node_row(&self, external_id: &str) -> Result<Option<ConvexNodeRow>>;
+    fn node_rows(&self) -> Result<Vec<ConvexNodeRow>>;
+    fn edge_rows(&self) -> Result<Vec<ConvexEdgeRow>>;
     fn node_rows_by_kind(&self, kind: &str) -> Result<Vec<ConvexNodeRow>>;
     fn outgoing_edge_rows(
         &self,
@@ -334,6 +338,33 @@ impl<C: ConvexGraphClient> GraphStore for ConvexGraphStore<C> {
 
     fn node(&self, id: &str) -> Result<Option<GraphNode>> {
         Ok(self.client.node_row(id)?.map(GraphNode::from))
+    }
+
+    fn all_nodes(&self) -> Result<Vec<GraphNode>> {
+        let mut nodes: Vec<GraphNode> = self
+            .client
+            .node_rows()?
+            .into_iter()
+            .map(GraphNode::from)
+            .collect();
+        nodes.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(nodes)
+    }
+
+    fn all_edges(&self) -> Result<Vec<GraphEdge>> {
+        let mut edges: Vec<GraphEdge> = self
+            .client
+            .edge_rows()?
+            .into_iter()
+            .map(GraphEdge::from)
+            .collect();
+        edges.sort_by(|left, right| {
+            left.from_id
+                .cmp(&right.from_id)
+                .then(left.to_id.cmp(&right.to_id))
+                .then(left.kind.cmp(&right.kind))
+        });
+        Ok(edges)
     }
 
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>> {
@@ -428,6 +459,48 @@ impl SqliteGraphStore {
         )?;
         Ok(Self { conn })
     }
+
+    pub fn replace_projection(&mut self, projection: &GraphProjection) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM graph_edges", [])?;
+        tx.execute("DELETE FROM graph_nodes", [])?;
+        for node in &projection.nodes {
+            tx.execute(
+                r#"
+                INSERT INTO graph_nodes
+                    (id, kind, label, properties_json, provenance_json, freshness_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                (
+                    &node.id,
+                    &node.kind,
+                    &node.label,
+                    to_json(&node.properties)?,
+                    to_json(&node.provenance)?,
+                    optional_to_json(&node.freshness)?,
+                ),
+            )?;
+        }
+        for edge in &projection.edges {
+            tx.execute(
+                r#"
+                INSERT INTO graph_edges
+                    (from_id, to_id, kind, properties_json, provenance_json, freshness_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+                (
+                    &edge.from_id,
+                    &edge.to_id,
+                    &edge.kind,
+                    to_json(&edge.properties)?,
+                    to_json(&edge.provenance)?,
+                    optional_to_json(&edge.freshness)?,
+                ),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 impl GraphStore for SqliteGraphStore {
@@ -492,6 +565,28 @@ impl GraphStore for SqliteGraphStore {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    fn all_nodes(&self) -> Result<Vec<GraphNode>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, kind, label, properties_json, provenance_json, freshness_json
+            FROM graph_nodes
+            ORDER BY id
+            "#,
+        )?;
+        collect_rows(stmt.query_map([], node_from_row)?)
+    }
+
+    fn all_edges(&self) -> Result<Vec<GraphEdge>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json
+            FROM graph_edges
+            ORDER BY from_id, to_id, kind
+            "#,
+        )?;
+        collect_rows(stmt.query_map([], edge_from_row)?)
     }
 
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>> {
@@ -740,6 +835,14 @@ mod tests {
             Ok(self.nodes.borrow().get(external_id).cloned())
         }
 
+        fn node_rows(&self) -> Result<Vec<ConvexNodeRow>> {
+            Ok(self.nodes.borrow().values().cloned().collect())
+        }
+
+        fn edge_rows(&self) -> Result<Vec<ConvexEdgeRow>> {
+            Ok(self.edges.borrow().values().cloned().collect())
+        }
+
         fn node_rows_by_kind(&self, kind: &str) -> Result<Vec<ConvexNodeRow>> {
             Ok(self
                 .nodes
@@ -786,6 +889,8 @@ mod tests {
 
         assert_eq!(store.node("doc:livekit").unwrap(), Some(node));
         assert_eq!(store.nodes_by_kind("topic").unwrap(), vec![topic]);
+        assert_eq!(store.all_nodes().unwrap().len(), 2);
+        assert_eq!(store.all_edges().unwrap().len(), 1);
         assert_eq!(
             store
                 .outgoing_edges("doc:livekit", Some("mentions"))
