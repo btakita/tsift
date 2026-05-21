@@ -610,6 +610,29 @@ enum Commands {
         #[arg(long)]
         convex_snapshot: Option<PathBuf>,
     },
+    /// Rank candidate worker scopes and flag parallel-dispatch merge risks
+    ConflictMatrix {
+        /// Candidate backlog ids, job handles, or graph node ids to compare
+        targets: Vec<String>,
+        /// Agent-doc session document or repo path to plan against
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Restrict graph evidence to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Graph-db evidence depth for each target
+        #[arg(long, default_value = "3")]
+        depth: usize,
+        /// Max graph-db evidence rows per target (0 = unlimited)
+        #[arg(long, default_value = "8")]
+        limit: usize,
+        /// Maximum affected test targets to include from impact
+        #[arg(long, default_value = "20")]
+        impact_limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Compare raw symbol output with compact tag-family preview envelopes
     TokenSavings {
         /// Fixture describing raw symbols, tagpath families, and minimum savings thresholds
@@ -1527,6 +1550,30 @@ fn main() -> Result<()> {
             },
             ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
             convex_snapshot.as_deref(),
+        ),
+        Some(Commands::ConflictMatrix {
+            targets,
+            path,
+            scope,
+            depth,
+            limit,
+            impact_limit,
+            json,
+        }) => cmd_conflict_matrix(
+            &path,
+            scope.as_deref(),
+            &targets,
+            depth,
+            limit,
+            impact_limit,
+            OutputFormat {
+                json_output: json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                schema,
+                envelope,
+            },
         ),
         Some(Commands::TokenSavings {
             fixture,
@@ -5968,7 +6015,7 @@ struct GraphDbSchema {
     operations: Vec<GraphDbSchemaOperation>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct GraphDbFreshnessReport {
     status: String,
     fail_closed: bool,
@@ -12080,6 +12127,902 @@ fn cmd_context_pack(
 
     print_context_pack_human(&report, format.compact);
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ConflictMatrixRisk {
+    Low,
+    Medium,
+    High,
+    FailClosed,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct ConflictMatrixOverlap {
+    files: Vec<String>,
+    symbols: Vec<String>,
+    tests: Vec<String>,
+    config_files: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ConflictMatrixSourceHandle {
+    handle: String,
+    file: String,
+    start: usize,
+    end: usize,
+    reason: String,
+    expand: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ConflictMatrixOwnershipBlock {
+    title: String,
+    owned_files: Vec<String>,
+    owned_symbols: Vec<String>,
+    read_only_files: Vec<String>,
+    forbidden_files: Vec<String>,
+    expected_tests: Vec<String>,
+    prompt: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ConflictMatrixCandidate {
+    rank: usize,
+    target: String,
+    target_node_id: String,
+    target_kind: String,
+    target_label: String,
+    risk: ConflictMatrixRisk,
+    risk_score: usize,
+    risk_reasons: Vec<String>,
+    owned_files: Vec<String>,
+    owned_symbols: Vec<String>,
+    config_files: Vec<String>,
+    affected_tests: Vec<String>,
+    worker_context: Vec<String>,
+    source_handles: Vec<ConflictMatrixSourceHandle>,
+    staged_overlap: ConflictMatrixOverlap,
+    ownership: ConflictMatrixOwnershipBlock,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ConflictMatrixPair {
+    left: String,
+    right: String,
+    risk: ConflictMatrixRisk,
+    risk_score: usize,
+    shared_files: Vec<String>,
+    shared_symbols: Vec<String>,
+    shared_tests: Vec<String>,
+    shared_config_files: Vec<String>,
+    verdict: String,
+}
+
+#[derive(Serialize)]
+struct ConflictMatrixInputSummary {
+    graph_db_evidence_targets: Vec<String>,
+    context_pack_command: String,
+    cached_diff_command: String,
+    impact_command: String,
+}
+
+#[derive(Serialize)]
+struct ConflictMatrixContextSummary {
+    target: String,
+    target_kind: String,
+    prompt_targets: Vec<String>,
+    touched_files: Vec<String>,
+    touched_symbols: Vec<String>,
+    files_changed: usize,
+    worker_context: Vec<String>,
+    source_windows: Vec<String>,
+    status_reminders: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ConflictMatrixReport {
+    root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    targets: Vec<String>,
+    can_parallel: bool,
+    fail_closed: bool,
+    inputs: ConflictMatrixInputSummary,
+    context_pack: ConflictMatrixContextSummary,
+    cached_diff: diff_digest::DiffDigestReport,
+    impact: impact::ImpactReport,
+    candidates: Vec<ConflictMatrixCandidate>,
+    conflicts: Vec<ConflictMatrixPair>,
+    next_commands: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+fn conflict_risk_label(risk: ConflictMatrixRisk) -> &'static str {
+    match risk {
+        ConflictMatrixRisk::Low => "low",
+        ConflictMatrixRisk::Medium => "medium",
+        ConflictMatrixRisk::High => "high",
+        ConflictMatrixRisk::FailClosed => "fail_closed",
+    }
+}
+
+fn sorted_set(values: &BTreeSet<String>) -> Vec<String> {
+    values.iter().cloned().collect()
+}
+
+fn sorted_intersection(left: &BTreeSet<String>, right: &BTreeSet<String>) -> Vec<String> {
+    left.intersection(right).cloned().collect()
+}
+
+fn normalize_conflict_target(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '`' | ',' | ';' | '.'));
+    let bracketed = trimmed
+        .strip_prefix("[#")
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    let normalized = bracketed
+        .trim()
+        .trim_start_matches('#')
+        .trim_matches(|ch: char| matches!(ch, '[' | ']'));
+    (!normalized.is_empty()).then(|| normalized.to_string())
+}
+
+fn extract_conflict_target_refs(input: &str) -> Vec<String> {
+    input
+        .split(|ch: char| {
+            !(ch.is_ascii_alphanumeric()
+                || ch == '#'
+                || ch == '_'
+                || ch == '-'
+                || ch == '['
+                || ch == ']')
+        })
+        .filter_map(|token| {
+            let hash = token.find('#')?;
+            normalize_conflict_target(&token[hash..])
+        })
+        .collect()
+}
+
+fn conflict_targets_from_context_pack(
+    store: &impl GraphStore,
+    context_pack: &ContextPackReport,
+) -> Result<Vec<String>> {
+    let mut candidates = Vec::new();
+    for prompt in &context_pack.next_context.prompt_targets {
+        candidates.extend(extract_conflict_target_refs(prompt));
+    }
+    for worker in &context_pack.exploration.worker_context {
+        candidates.extend(extract_conflict_target_refs(&worker.summary));
+    }
+
+    let mut targets = Vec::new();
+    let mut seen = BTreeSet::new();
+    for candidate in candidates {
+        if !seen.insert(candidate.clone()) {
+            continue;
+        }
+        if graph_db_resolve_evidence_target(store, &candidate)?.is_some() {
+            targets.push(candidate);
+        }
+    }
+    Ok(targets)
+}
+
+fn resolve_conflict_matrix_targets(
+    store: &impl GraphStore,
+    raw_targets: &[String],
+    context_pack: &ContextPackReport,
+) -> Result<Vec<String>> {
+    let mut targets = raw_targets
+        .iter()
+        .filter_map(|target| normalize_conflict_target(target))
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        targets = conflict_targets_from_context_pack(store, context_pack)?;
+    }
+
+    let mut seen = BTreeSet::new();
+    targets.retain(|target| seen.insert(target.clone()));
+    if targets.is_empty() {
+        bail!(
+            "conflict-matrix needs at least one resolvable backlog id, job handle, or graph node id"
+        );
+    }
+    Ok(targets)
+}
+
+fn is_planner_config_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    normalized.starts_with(".github/")
+        || normalized.starts_with(".codex/")
+        || normalized.starts_with(".agent-doc/")
+        || normalized.contains("/.github/")
+        || matches!(
+            file_name,
+            "agents.md"
+                | "claude.md"
+                | "cargo.toml"
+                | "cargo.lock"
+                | "package.json"
+                | "package-lock.json"
+                | "pnpm-lock.yaml"
+                | "yarn.lock"
+                | "makefile"
+                | "justfile"
+                | "dockerfile"
+                | "docker-compose.yml"
+                | "docker-compose.yaml"
+                | "config.toml"
+                | "tsconfig.json"
+        )
+        || file_name.ends_with(".config.js")
+        || file_name.ends_with(".config.ts")
+        || file_name.ends_with(".yml")
+        || file_name.ends_with(".yaml")
+}
+
+fn conflict_matrix_source_handle(node: &SubstrateGraphNode) -> Option<ConflictMatrixSourceHandle> {
+    let file = node.properties.get("file")?.clone();
+    let start = node
+        .properties
+        .get("start")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    let end = node
+        .properties
+        .get("end")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(start);
+    Some(ConflictMatrixSourceHandle {
+        handle: node
+            .properties
+            .get("handle")
+            .cloned()
+            .unwrap_or_else(|| node.id.clone()),
+        file,
+        start,
+        end,
+        reason: node.properties.get("reason").cloned().unwrap_or_default(),
+        expand: node.properties.get("expand").cloned().unwrap_or_default(),
+    })
+}
+
+fn conflict_matrix_symbols_for_files(
+    graph_nodes: &[SubstrateGraphNode],
+    files: &BTreeSet<String>,
+    target_node: &SubstrateGraphNode,
+) -> BTreeSet<String> {
+    let mut symbols = BTreeSet::new();
+    if target_node.kind == "symbol" {
+        symbols.insert(target_node.label.clone());
+    }
+    for node in graph_nodes {
+        if node.kind != "symbol" {
+            continue;
+        }
+        if let Some(path) = node.properties.get("path")
+            && files.contains(path)
+        {
+            symbols.insert(node.label.clone());
+        }
+    }
+    symbols
+}
+
+fn conflict_matrix_test_commands(target: &impact::ImpactTestTarget) -> Vec<String> {
+    if target.commands.is_empty() {
+        vec![target.path.clone()]
+    } else {
+        target.commands.clone()
+    }
+}
+
+fn conflict_matrix_affected_tests(
+    impact_report: &impact::ImpactReport,
+    files: &BTreeSet<String>,
+    symbols: &BTreeSet<String>,
+    staged_overlap: &ConflictMatrixOverlap,
+) -> Vec<String> {
+    let mut tests = BTreeSet::new();
+    for target in &impact_report.affected_tests {
+        let path_match = files.contains(&target.path);
+        let symbol_match = target.symbols.iter().any(|symbol| symbols.contains(symbol));
+        if path_match || symbol_match {
+            tests.extend(conflict_matrix_test_commands(target));
+        }
+    }
+
+    if tests.is_empty()
+        && (!staged_overlap.files.is_empty()
+            || !staged_overlap.symbols.is_empty()
+            || !staged_overlap.config_files.is_empty())
+    {
+        for target in &impact_report.affected_tests {
+            tests.extend(conflict_matrix_test_commands(target));
+        }
+    }
+    tests.into_iter().collect()
+}
+
+fn conflict_matrix_staged_overlap(
+    files: &BTreeSet<String>,
+    symbols: &BTreeSet<String>,
+    cached_diff: &diff_digest::DiffDigestReport,
+) -> ConflictMatrixOverlap {
+    let staged_files = cached_diff
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<BTreeSet<_>>();
+    let staged_symbols = cached_diff
+        .files
+        .iter()
+        .flat_map(|file| file.touched_symbols.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let file_overlap = sorted_intersection(files, &staged_files);
+    let symbol_overlap = sorted_intersection(symbols, &staged_symbols);
+    let config_files = file_overlap
+        .iter()
+        .filter(|file| is_planner_config_path(file))
+        .cloned()
+        .collect::<Vec<_>>();
+    ConflictMatrixOverlap {
+        files: file_overlap,
+        symbols: symbol_overlap,
+        tests: Vec::new(),
+        config_files,
+    }
+}
+
+fn empty_conflict_matrix_ownership(target: &str) -> ConflictMatrixOwnershipBlock {
+    ConflictMatrixOwnershipBlock {
+        title: format!("Worker ownership for {target}"),
+        owned_files: Vec::new(),
+        owned_symbols: Vec::new(),
+        read_only_files: Vec::new(),
+        forbidden_files: Vec::new(),
+        expected_tests: Vec::new(),
+        prompt: String::new(),
+    }
+}
+
+fn conflict_matrix_candidate_from_evidence(
+    evidence: &GraphDbEvidenceReport,
+    graph_nodes: &[SubstrateGraphNode],
+    cached_diff: &diff_digest::DiffDigestReport,
+    impact_report: &impact::ImpactReport,
+) -> ConflictMatrixCandidate {
+    let mut files = BTreeSet::new();
+    let source_handles = evidence
+        .source_handles
+        .iter()
+        .filter_map(|node| {
+            let handle = conflict_matrix_source_handle(node)?;
+            files.insert(handle.file.clone());
+            Some(handle)
+        })
+        .collect::<Vec<_>>();
+    if let Some(path) = evidence.target_node.properties.get("path") {
+        files.insert(path.clone());
+    }
+
+    let symbols = conflict_matrix_symbols_for_files(graph_nodes, &files, &evidence.target_node);
+    let config_files = files
+        .iter()
+        .filter(|file| is_planner_config_path(file))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut staged_overlap = conflict_matrix_staged_overlap(&files, &symbols, cached_diff);
+    let affected_tests =
+        conflict_matrix_affected_tests(impact_report, &files, &symbols, &staged_overlap);
+    staged_overlap.tests = affected_tests.clone();
+
+    let mut risk_score = 0usize;
+    let mut risk_reasons = Vec::new();
+    if files.is_empty() {
+        risk_score += 120;
+        risk_reasons.push("no source ownership evidence; fail closed before dispatch".to_string());
+    }
+    if !config_files.is_empty() {
+        risk_score += 80 * config_files.len();
+        risk_reasons.push("candidate owns config or workflow files".to_string());
+    }
+    if !staged_overlap.config_files.is_empty() {
+        risk_score += 100 * staged_overlap.config_files.len();
+        risk_reasons.push("staged diff already touches candidate config files".to_string());
+    }
+    if !staged_overlap.files.is_empty() {
+        risk_score += 70 * staged_overlap.files.len();
+        risk_reasons.push("staged diff already touches candidate files".to_string());
+    }
+    if !staged_overlap.symbols.is_empty() {
+        risk_score += 35 * staged_overlap.symbols.len();
+        risk_reasons.push("staged diff already touches candidate symbols".to_string());
+    }
+    if affected_tests.len() > 1 {
+        risk_score += affected_tests.len() * 5;
+        risk_reasons.push("candidate fans into multiple affected test commands".to_string());
+    }
+    let risk = if files.is_empty()
+        || !staged_overlap.config_files.is_empty()
+        || !staged_overlap.files.is_empty()
+    {
+        ConflictMatrixRisk::FailClosed
+    } else if !config_files.is_empty() || !staged_overlap.symbols.is_empty() {
+        ConflictMatrixRisk::High
+    } else if affected_tests.len() > 1 {
+        ConflictMatrixRisk::Medium
+    } else {
+        ConflictMatrixRisk::Low
+    };
+
+    let worker_context = evidence
+        .worker_context
+        .iter()
+        .map(|node| {
+            node.properties
+                .get("summary")
+                .cloned()
+                .unwrap_or_else(|| node.label.clone())
+        })
+        .collect::<Vec<_>>();
+
+    ConflictMatrixCandidate {
+        rank: 0,
+        target: evidence.target.clone(),
+        target_node_id: evidence.target_node.id.clone(),
+        target_kind: evidence.target_node.kind.clone(),
+        target_label: evidence.target_node.label.clone(),
+        risk,
+        risk_score,
+        risk_reasons,
+        owned_files: sorted_set(&files),
+        owned_symbols: sorted_set(&symbols),
+        config_files: sorted_set(&config_files),
+        affected_tests,
+        worker_context,
+        source_handles,
+        staged_overlap,
+        ownership: empty_conflict_matrix_ownership(&evidence.target),
+    }
+}
+
+fn set_from_vec(values: &[String]) -> BTreeSet<String> {
+    values.iter().cloned().collect()
+}
+
+fn conflict_pair_risk(
+    shared_files: &[String],
+    shared_symbols: &[String],
+    shared_tests: &[String],
+    shared_config_files: &[String],
+) -> (ConflictMatrixRisk, usize, String) {
+    let score = shared_files.len() * 100
+        + shared_config_files.len() * 100
+        + shared_symbols.len() * 40
+        + shared_tests.len() * 10;
+    if !shared_files.is_empty() || !shared_config_files.is_empty() {
+        (
+            ConflictMatrixRisk::FailClosed,
+            score,
+            "serialize or assign one worker as the sole owner of the shared files".to_string(),
+        )
+    } else if !shared_symbols.is_empty() {
+        (
+            ConflictMatrixRisk::High,
+            score,
+            "split by file or serialize; shared symbols are not safe parallel ownership"
+                .to_string(),
+        )
+    } else if !shared_tests.is_empty() {
+        (
+            ConflictMatrixRisk::Medium,
+            score,
+            "parallel work is possible, but keep a shared test gate after merge".to_string(),
+        )
+    } else {
+        (
+            ConflictMatrixRisk::Low,
+            score,
+            "no direct file, symbol, config, or test overlap found".to_string(),
+        )
+    }
+}
+
+fn build_conflict_matrix_pairs(candidates: &[ConflictMatrixCandidate]) -> Vec<ConflictMatrixPair> {
+    let mut pairs = Vec::new();
+    for left_idx in 0..candidates.len() {
+        for right_idx in (left_idx + 1)..candidates.len() {
+            let left = &candidates[left_idx];
+            let right = &candidates[right_idx];
+            let left_files = set_from_vec(&left.owned_files);
+            let right_files = set_from_vec(&right.owned_files);
+            let left_symbols = set_from_vec(&left.owned_symbols);
+            let right_symbols = set_from_vec(&right.owned_symbols);
+            let left_tests = set_from_vec(&left.affected_tests);
+            let right_tests = set_from_vec(&right.affected_tests);
+            let left_config = set_from_vec(&left.config_files);
+            let right_config = set_from_vec(&right.config_files);
+            let shared_files = sorted_intersection(&left_files, &right_files);
+            let shared_symbols = sorted_intersection(&left_symbols, &right_symbols);
+            let shared_tests = sorted_intersection(&left_tests, &right_tests);
+            let shared_config_files = sorted_intersection(&left_config, &right_config);
+            let (risk, risk_score, verdict) = conflict_pair_risk(
+                &shared_files,
+                &shared_symbols,
+                &shared_tests,
+                &shared_config_files,
+            );
+            pairs.push(ConflictMatrixPair {
+                left: left.target.clone(),
+                right: right.target.clone(),
+                risk,
+                risk_score,
+                shared_files,
+                shared_symbols,
+                shared_tests,
+                shared_config_files,
+                verdict,
+            });
+        }
+    }
+    pairs.sort_by(|left, right| {
+        right
+            .risk
+            .cmp(&left.risk)
+            .then_with(|| right.risk_score.cmp(&left.risk_score))
+            .then_with(|| left.left.cmp(&right.left))
+            .then_with(|| left.right.cmp(&right.right))
+    });
+    pairs
+}
+
+fn markdown_list(values: &[String]) -> String {
+    if values.is_empty() {
+        return "- none".to_string();
+    }
+    values
+        .iter()
+        .map(|value| format!("- {value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn apply_conflict_matrix_ownership_blocks(candidates: &mut [ConflictMatrixCandidate]) {
+    let all_files_by_target = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.target.clone(),
+                candidate
+                    .owned_files
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for candidate in candidates.iter_mut() {
+        let mut read_only = BTreeSet::new();
+        for (target, files) in &all_files_by_target {
+            if target != &candidate.target {
+                read_only.extend(files.iter().cloned());
+            }
+        }
+        let mut forbidden = read_only.clone();
+        forbidden.extend(candidate.staged_overlap.files.iter().cloned());
+        forbidden.extend(candidate.staged_overlap.config_files.iter().cloned());
+        let read_only_files = sorted_set(&read_only);
+        let forbidden_files = sorted_set(&forbidden);
+        let expected_tests = candidate.affected_tests.clone();
+        let title = format!(
+            "Worker {} owns {} ({})",
+            candidate.rank, candidate.target, candidate.target_label
+        );
+        let prompt = format!(
+            "{title}\n\nOwned files:\n{}\n\nOwned symbols:\n{}\n\nRead-only context:\n{}\n\nForbidden files:\n{}\n\nExpected tests:\n{}\n\nFail closed if the task requires a forbidden/shared file, an unowned config file, or a public contract change outside this ownership block.",
+            markdown_list(&candidate.owned_files),
+            markdown_list(&candidate.owned_symbols),
+            markdown_list(&read_only_files),
+            markdown_list(&forbidden_files),
+            markdown_list(&expected_tests),
+        );
+        candidate.ownership = ConflictMatrixOwnershipBlock {
+            title,
+            owned_files: candidate.owned_files.clone(),
+            owned_symbols: candidate.owned_symbols.clone(),
+            read_only_files,
+            forbidden_files,
+            expected_tests,
+            prompt,
+        };
+    }
+}
+
+fn conflict_matrix_context_summary(
+    context_pack: &ContextPackReport,
+) -> ConflictMatrixContextSummary {
+    ConflictMatrixContextSummary {
+        target: context_pack.target.clone(),
+        target_kind: context_pack.target_kind.clone(),
+        prompt_targets: context_pack.next_context.prompt_targets.clone(),
+        touched_files: context_pack.next_context.touched_files.clone(),
+        touched_symbols: context_pack.next_context.touched_symbols.clone(),
+        files_changed: context_pack.diff_digest.files_changed,
+        worker_context: context_pack
+            .exploration
+            .worker_context
+            .iter()
+            .map(|worker| worker.summary.clone())
+            .collect(),
+        source_windows: context_pack
+            .exploration
+            .source_windows
+            .iter()
+            .map(|window| format!("{}:{}-{}", window.file, window.start, window.end))
+            .collect(),
+        status_reminders: context_pack.status_reminders.clone(),
+    }
+}
+
+fn conflict_matrix_next_commands(
+    root: &Path,
+    path: &Path,
+    scope: Option<&str>,
+    targets: &[String],
+    depth: usize,
+    limit: usize,
+    impact_limit: usize,
+) -> Vec<String> {
+    let mut commands = Vec::new();
+    for target in targets {
+        commands.push(format!(
+            "tsift graph-db --path {}{} evidence {} --depth {} --limit {} --json",
+            shell_quote(root.to_string_lossy().as_ref()),
+            graph_db_scope_arg(scope),
+            shell_quote(target),
+            depth,
+            limit
+        ));
+    }
+    commands.push(format!(
+        "tsift --envelope context-pack {} --budget normal",
+        shell_quote(path.to_string_lossy().as_ref())
+    ));
+    commands.push(format!(
+        "tsift diff-digest --cached {} --json",
+        shell_quote(root.to_string_lossy().as_ref())
+    ));
+    commands.push(format!(
+        "tsift impact {} --cached{} --limit {} --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        scope
+            .map(|scope| format!(" --scope {}", shell_quote(scope)))
+            .unwrap_or_default(),
+        impact_limit
+    ));
+    dedupe_preserve_order(commands)
+}
+
+fn print_conflict_matrix_human(report: &ConflictMatrixReport, compact: bool) {
+    if compact {
+        println!(
+            "conflict-matrix targets:{} candidates:{} conflicts:{} can_parallel:{} fail_closed:{}",
+            report.targets.len(),
+            report.candidates.len(),
+            report.conflicts.len(),
+            report.can_parallel,
+            report.fail_closed
+        );
+    } else {
+        println!("Conflict matrix");
+        println!("  targets:      {}", report.targets.join(", "));
+        println!("  can parallel: {}", report.can_parallel);
+        println!("  fail closed:  {}", report.fail_closed);
+    }
+    for candidate in &report.candidates {
+        println!(
+            "candidate #{} {} risk:{} score:{} files:{} symbols:{} tests:{}",
+            candidate.rank,
+            candidate.target,
+            conflict_risk_label(candidate.risk),
+            candidate.risk_score,
+            candidate.owned_files.len(),
+            candidate.owned_symbols.len(),
+            candidate.affected_tests.len()
+        );
+        for reason in &candidate.risk_reasons {
+            println!("  reason: {reason}");
+        }
+    }
+    for pair in &report.conflicts {
+        println!(
+            "conflict {} <-> {} risk:{} score:{} verdict:{}",
+            pair.left,
+            pair.right,
+            conflict_risk_label(pair.risk),
+            pair.risk_score,
+            pair.verdict
+        );
+        for file in &pair.shared_files {
+            println!("  shared file: {file}");
+        }
+        for symbol in &pair.shared_symbols {
+            println!("  shared symbol: {symbol}");
+        }
+    }
+    for command in &report.next_commands {
+        println!("next: {command}");
+    }
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+}
+
+fn cmd_conflict_matrix(
+    path: &Path,
+    scope: Option<&str>,
+    raw_targets: &[String],
+    depth: usize,
+    limit: usize,
+    impact_limit: usize,
+    format: OutputFormat,
+) -> Result<()> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    build_traversal_graph(&root, path, scope)
+        .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
+    let context_pack = build_context_pack_report(
+        path,
+        None,
+        None,
+        None,
+        ResponseBudget::from_cli(None, None, Some(ResponseBudgetPreset::Normal), false),
+    )?;
+    let graph_db = graph_substrate_db_path(&root, scope);
+    let store = SqliteGraphStore::open(&graph_db)
+        .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
+    let freshness = sqlite_graph_freshness(&store, scope.unwrap_or("root"))?;
+    let targets = resolve_conflict_matrix_targets(&store, raw_targets, &context_pack)?;
+    let cached_diff = diff_digest::compute(
+        &root,
+        diff_digest::DiffDigestOptions {
+            cached: true,
+            revision: None,
+        },
+    )
+    .with_context(|| format!("computing cached diff digest for {}", root.display()))?;
+    let impact_report = impact::compute(
+        &root,
+        impact::ImpactOptions {
+            cached: true,
+            revision: None,
+            scope,
+            limit: impact_limit,
+        },
+    )
+    .with_context(|| format!("computing cached impact report for {}", root.display()))?;
+    let graph_nodes = store.all_nodes()?;
+
+    let mut warnings = context_pack.status_reminders.clone();
+    let mut candidates = Vec::new();
+    for target in &targets {
+        let evidence = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
+            root: &root,
+            scope,
+            backend: "sqlite",
+            target,
+            depth,
+            limit,
+            store: &store,
+            freshness: freshness.clone(),
+            warnings: Vec::new(),
+        })
+        .with_context(|| format!("collecting graph-db evidence for {target}"))?;
+        warnings.extend(evidence.warnings.clone());
+        candidates.push(conflict_matrix_candidate_from_evidence(
+            &evidence,
+            &graph_nodes,
+            &cached_diff,
+            &impact_report,
+        ));
+    }
+
+    candidates.sort_by(|left, right| {
+        left.risk
+            .cmp(&right.risk)
+            .then_with(|| left.risk_score.cmp(&right.risk_score))
+            .then_with(|| left.target.cmp(&right.target))
+    });
+    for (idx, candidate) in candidates.iter_mut().enumerate() {
+        candidate.rank = idx + 1;
+    }
+    let conflicts = build_conflict_matrix_pairs(&candidates);
+    apply_conflict_matrix_ownership_blocks(&mut candidates);
+
+    let fail_closed = candidates
+        .iter()
+        .any(|candidate| candidate.risk == ConflictMatrixRisk::FailClosed)
+        || conflicts
+            .iter()
+            .any(|pair| pair.risk == ConflictMatrixRisk::FailClosed);
+    let can_parallel = !fail_closed
+        && conflicts
+            .iter()
+            .all(|pair| pair.risk <= ConflictMatrixRisk::Medium);
+    let next_commands =
+        conflict_matrix_next_commands(&root, path, scope, &targets, depth, limit, impact_limit);
+    let inputs = ConflictMatrixInputSummary {
+        graph_db_evidence_targets: targets.clone(),
+        context_pack_command: format!(
+            "tsift --envelope context-pack {} --budget normal",
+            shell_quote(path.to_string_lossy().as_ref())
+        ),
+        cached_diff_command: format!(
+            "tsift diff-digest --cached {} --json",
+            shell_quote(root.to_string_lossy().as_ref())
+        ),
+        impact_command: format!(
+            "tsift impact {} --cached{} --limit {} --json",
+            shell_quote(root.to_string_lossy().as_ref()),
+            scope
+                .map(|scope| format!(" --scope {}", shell_quote(scope)))
+                .unwrap_or_default(),
+            impact_limit
+        ),
+    };
+    let context_summary = conflict_matrix_context_summary(&context_pack);
+    let report = ConflictMatrixReport {
+        root: root.to_string_lossy().to_string(),
+        scope: scope.map(str::to_string),
+        targets,
+        can_parallel,
+        fail_closed,
+        inputs,
+        context_pack: context_summary,
+        cached_diff,
+        impact: impact_report,
+        candidates,
+        conflicts,
+        next_commands,
+        warnings,
+    };
+
+    if format.json_output {
+        print_json_or_envelope(
+            &report,
+            &format,
+            "conflict-matrix",
+            "parallel-planning",
+            ToolEnvelopeSummary {
+                text: format!(
+                    "Conflict matrix for {} target(s): can_parallel={} fail_closed={}",
+                    report.targets.len(),
+                    report.can_parallel,
+                    report.fail_closed
+                ),
+                metrics: vec![
+                    envelope_metric("targets", report.targets.len()),
+                    envelope_metric("candidates", report.candidates.len()),
+                    envelope_metric("conflicts", report.conflicts.len()),
+                    envelope_metric("can_parallel", report.can_parallel),
+                    envelope_metric("fail_closed", report.fail_closed),
+                ],
+            },
+            report.fail_closed,
+            report.next_commands.clone(),
+        )
+    } else {
+        print_conflict_matrix_human(&report, format.compact);
+        Ok(())
+    }
 }
 
 fn render_log_digest_from_input(path: &Path, input: &str, format: OutputFormat) -> Result<()> {
@@ -24083,6 +25026,44 @@ tier = "private"
                 assert_eq!(limit, 5);
             }
             _ => panic!("expected Impact command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_conflict_matrix_command() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "conflict-matrix",
+            "--path",
+            "tasks/software/tsift.md",
+            "--depth",
+            "4",
+            "--limit",
+            "12",
+            "--impact-limit",
+            "6",
+            "--json",
+            "pwcm",
+            "#g6kf",
+        ]);
+        match cli.command {
+            Some(Commands::ConflictMatrix {
+                targets,
+                path,
+                depth,
+                limit,
+                impact_limit,
+                json,
+                ..
+            }) => {
+                assert_eq!(targets, vec!["pwcm".to_string(), "#g6kf".to_string()]);
+                assert_eq!(path, PathBuf::from("tasks/software/tsift.md"));
+                assert_eq!(depth, 4);
+                assert_eq!(limit, 12);
+                assert_eq!(impact_limit, 6);
+                assert!(json);
+            }
+            _ => panic!("expected ConflictMatrix command"),
         }
     }
 

@@ -132,6 +132,38 @@ dispatch #spec-test-build-install-commit-push
     dir
 }
 
+fn init_git_repo(path: &Path) {
+    let status = Command::new("git")
+        .args(["init"])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git init failed");
+
+    let status = Command::new("git")
+        .args(["add", "."])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git add failed");
+
+    let status = Command::new("git")
+        .args([
+            "-c",
+            "user.name=tsift-tests",
+            "-c",
+            "user.email=tsift-tests@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "init",
+        ])
+        .current_dir(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git commit failed");
+}
+
 fn graph_db_path(project: &Path) -> PathBuf {
     project.join(".tsift/graph.db")
 }
@@ -679,6 +711,56 @@ fn graph_db_evidence_packet_covers_backlog_job_worker_context_and_source_handles
             .unwrap()
             .is_empty(),
         "{job_evidence}"
+    );
+}
+
+#[test]
+fn conflict_matrix_cli_composes_planner_evidence_and_worker_ownership() {
+    let project = graph_db_project();
+    init_git_repo(project.path());
+    let session = project.path().join("tasks/software/tsift.md");
+
+    let report = assert_tsift_json(vec![
+        "conflict-matrix".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "gval".to_string(),
+    ]);
+
+    assert_eq!(report["targets"], json!(["gval"]));
+    assert_eq!(report["cached_diff"]["mode"], "cached");
+    assert_eq!(report["impact"]["mode"], "cached");
+    assert!(
+        report["inputs"]["cached_diff_command"]
+            .as_str()
+            .unwrap()
+            .contains("diff-digest --cached"),
+        "{report}"
+    );
+    let candidates = report["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 1, "{report}");
+    assert!(
+        !candidates[0]["source_handles"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{report}"
+    );
+    assert!(
+        candidates[0]["ownership"]["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("Owned files"),
+        "{report}"
+    );
+    assert!(
+        report["next_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("graph-db --path")),
+        "{report}"
     );
 }
 

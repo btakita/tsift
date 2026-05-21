@@ -36,6 +36,7 @@ tsift graph-db --path . refresh --json
 tsift graph-db --path . status --json
 tsift graph-db --path . kind backlog --property ref_id=cvxa --limit 5 --json
 tsift graph-db --path . evidence cvxa --depth 3 --limit 8 --json
+tsift conflict-matrix --path tasks/software/tsift.md cvxa --json
 tsift graph-db --path . doctor --json
 tsift traverse --path . --format html > traversal.html
 tsift semantic "graph navigation" --path . --kind concept --json
@@ -53,7 +54,10 @@ mutations, and HTTP action for `tsift convex-sync --apply` live under
 `.tsift/graph.db` explicitly, `tsift graph-db status` to inspect projection
 version/hash/watermark and tombstone counts without refreshing, and
 `tsift graph-db evidence <backlog-id-or-job-handle>` for bounded
-worker-context/source-handle handoff packets. Use `tsift graph-db doctor` to
+worker-context/source-handle handoff packets. Use `tsift conflict-matrix` to
+rank candidate worker scopes, flag shared file/symbol/test/config ownership,
+and emit fail-closed prompt ownership blocks before parallel dispatch. Use
+`tsift graph-db doctor` to
 validate local `graph.db` and Convex snapshot metadata before trusting operator
 handoffs. `tsift traverse --format html` renders the selected GraphStore slice as
 an offline SVG graph, and `tsift semantic` queries cached summary concepts and
