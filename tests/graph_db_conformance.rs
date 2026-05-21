@@ -1906,6 +1906,29 @@ fn graph_orchestration_contract_fixture_matches_live_reports() {
             .all(|packet| packet["packet_id"].as_str().unwrap().starts_with("wpp-")),
         "{dispatch_trace}"
     );
+
+    let dependency_dag = assert_tsift_json(vec![
+        "dependency-dag".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "gval".to_string(),
+        "solo".to_string(),
+        "shrd".to_string(),
+    ]);
+    assert_contract_fields(&fixture, "dependency_dag", &dependency_dag);
+    assert!(
+        dependency_dag["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["kind"] == "worker_result_follow_up"),
+        "{dependency_dag}"
+    );
+    assert!(
+        dependency_dag["topo_batches"].is_array(),
+        "{dependency_dag}"
+    );
 }
 
 #[test]

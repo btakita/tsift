@@ -660,6 +660,26 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Extract a graph-level dependency DAG for agent-doc backlog work
+    DependencyDag {
+        /// Backlog ids, job handles, or graph node ids to schedule (defaults to the session backlog)
+        targets: Vec<String>,
+        /// Agent-doc session document or repo path to schedule
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Restrict graph evidence to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Graph traversal depth for semantic and worker-result evidence
+        #[arg(long, default_value = "4")]
+        depth: usize,
+        /// Max graph rows per evidence family (0 = unlimited)
+        #[arg(long, default_value = "12")]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Compare raw symbol output with compact tag-family preview envelopes
     TokenSavings {
         /// Fixture describing raw symbols, tagpath families, and minimum savings thresholds
@@ -1631,6 +1651,28 @@ fn main() -> Result<()> {
                     format
                 },
             },
+            OutputFormat {
+                json_output: json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                schema,
+                envelope,
+            },
+        ),
+        Some(Commands::DependencyDag {
+            targets,
+            path,
+            scope,
+            depth,
+            limit,
+            json,
+        }) => cmd_dependency_dag(
+            &path,
+            scope.as_deref(),
+            &targets,
+            depth,
+            limit,
             OutputFormat {
                 json_output: json || terse || schema || envelope,
                 compact,
@@ -4460,6 +4502,7 @@ const CONTEXT_PACK_GRAPH_ORCHESTRATION_CONTRACT_VERSION: &str =
     "context-pack-graph-orchestration-v1";
 const SESSION_REVIEW_FOLLOW_UP_CONTRACT_VERSION: &str = "session-review-follow-up-v1";
 const DISPATCH_TRACE_CONTRACT_VERSION: &str = "dispatch-trace-v1";
+const DEPENDENCY_DAG_CONTRACT_VERSION: &str = "dependency-dag-v1";
 const GRAPH_PROJECTION_META_KIND: &str = "projection_meta";
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -8237,6 +8280,10 @@ fn graph_db_schema() -> GraphDbSchema {
             GraphDbSchemaOperation {
                 command: "dispatch-trace [target...] --path <session> [--format json|html]",
                 description: "Export a compact graph-backed dispatch trace with evidence packet ids, worker-result feedback closure summaries, graph links, and conflict-matrix worker prompt packets",
+            },
+            GraphDbSchemaOperation {
+                command: "dependency-dag [target...] --path <session>",
+                description: "Extract a versioned agent-doc dependency DAG from backlog ids, explicit depends-on text, shared file/symbol/test/config evidence, semantic overlap, and worker-result follow-up ids",
             },
             GraphDbSchemaOperation {
                 command: "schema",
@@ -14961,6 +15008,819 @@ fn cmd_dispatch_trace(
             println!("{}", dispatch_trace_html(&report)?);
             Ok(())
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DependencyDagProfile {
+    id: String,
+    graph_node_id: String,
+    label: String,
+    path: Option<String>,
+    line: Option<i64>,
+    detail: Option<String>,
+    source_files: BTreeSet<String>,
+    source_symbols: BTreeSet<String>,
+    config_files: BTreeSet<String>,
+    expected_tests: BTreeSet<String>,
+    semantic_refs: BTreeMap<String, ConflictMatrixSemanticRef>,
+    worker_feedback: ConflictMatrixWorkerFeedback,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DependencyDagNode {
+    id: String,
+    graph_node_id: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    source_files: Vec<String>,
+    source_symbols: Vec<String>,
+    config_files: Vec<String>,
+    expected_tests: Vec<String>,
+    semantic_refs: Vec<ConflictMatrixSemanticRef>,
+    worker_feedback: ConflictMatrixWorkerFeedback,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DependencyDagEdge {
+    from: String,
+    to: String,
+    kind: String,
+    weight: usize,
+    reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    shared_files: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    shared_symbols: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    shared_tests: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    shared_config_files: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    shared_semantic_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DependencyDagTopoBatch {
+    batch: usize,
+    targets: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DependencyDagCycleDiagnostics {
+    has_cycles: bool,
+    blocked_nodes: Vec<String>,
+    cycle_edges: Vec<DependencyDagEdge>,
+}
+
+#[derive(Serialize)]
+struct DependencyDagSummary {
+    nodes: usize,
+    edges: usize,
+    topo_batches: usize,
+    has_cycles: bool,
+}
+
+#[derive(Serialize)]
+struct DependencyDagReport {
+    contract_version: &'static str,
+    root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    path: String,
+    targets: Vec<String>,
+    projection_freshness: GraphDbFreshnessReport,
+    projection_hashes: Vec<String>,
+    nodes: Vec<DependencyDagNode>,
+    edges: Vec<DependencyDagEdge>,
+    topo_batches: Vec<DependencyDagTopoBatch>,
+    cycle_diagnostics: DependencyDagCycleDiagnostics,
+    summary: DependencyDagSummary,
+    replay_commands: Vec<String>,
+    repair_commands: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+fn dependency_dag_backlog_node_for_target(
+    store: &impl GraphStore,
+    target: &str,
+) -> Result<SubstrateGraphNode> {
+    let resolved = graph_db_resolve_evidence_target(store, target)?
+        .with_context(|| format!("dependency-dag target not found: {target}"))?;
+    if resolved.kind == "backlog" {
+        return Ok(resolved);
+    }
+    let Some(ref_id) = resolved.properties.get("ref_id").cloned() else {
+        bail!(
+            "dependency-dag target {} resolved to {} without a backlog ref_id",
+            target,
+            resolved.kind
+        );
+    };
+    store
+        .nodes_by_kind("backlog")?
+        .into_iter()
+        .filter(|node| node.properties.get("ref_id") == Some(&ref_id))
+        .min_by(|left, right| {
+            left.properties
+                .get("line")
+                .and_then(|value| value.parse::<i64>().ok())
+                .cmp(
+                    &right
+                        .properties
+                        .get("line")
+                        .and_then(|value| value.parse::<i64>().ok()),
+                )
+                .then(left.id.cmp(&right.id))
+        })
+        .with_context(|| format!("dependency-dag backlog node not found for #{ref_id}"))
+}
+
+fn dependency_dag_resolve_backlog_nodes(
+    root: &Path,
+    path: &Path,
+    store: &impl GraphStore,
+    raw_targets: &[String],
+) -> Result<Vec<SubstrateGraphNode>> {
+    let mut nodes = Vec::new();
+    let mut seen = BTreeSet::new();
+    if raw_targets.is_empty() {
+        let hinted_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let hinted_markdown = hinted_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+        let hinted_rel = hinted_markdown.then(|| {
+            relativize_pathbuf(&hinted_path, root)
+                .to_string_lossy()
+                .replace('\\', "/")
+        });
+        for node in store.nodes_by_kind("backlog")? {
+            if let Some(expected_path) = &hinted_rel
+                && node.properties.get("path") != Some(expected_path)
+            {
+                continue;
+            }
+            if seen.insert(node.id.clone()) {
+                nodes.push(node);
+            }
+        }
+        if nodes.is_empty() && hinted_rel.is_some() {
+            for node in store.nodes_by_kind("backlog")? {
+                if seen.insert(node.id.clone()) {
+                    nodes.push(node);
+                }
+            }
+        }
+    } else {
+        for target in raw_targets {
+            let normalized = normalize_conflict_target(target).unwrap_or_else(|| target.clone());
+            let node = dependency_dag_backlog_node_for_target(store, &normalized)?;
+            if seen.insert(node.id.clone()) {
+                nodes.push(node);
+            }
+        }
+    }
+    if nodes.is_empty() {
+        bail!("dependency-dag needs at least one resolvable backlog id");
+    }
+    nodes.sort_by(|left, right| {
+        left.properties
+            .get("line")
+            .and_then(|value| value.parse::<i64>().ok())
+            .cmp(
+                &right
+                    .properties
+                    .get("line")
+                    .and_then(|value| value.parse::<i64>().ok()),
+            )
+            .then(left.id.cmp(&right.id))
+    });
+    Ok(nodes)
+}
+
+fn dependency_dag_node_id(node: &SubstrateGraphNode) -> String {
+    node.properties
+        .get("ref_id")
+        .cloned()
+        .unwrap_or_else(|| node.label.trim_start_matches('#').to_string())
+}
+
+fn dependency_dag_node_profile(
+    root: &Path,
+    store: &impl GraphStore,
+    node: &SubstrateGraphNode,
+    graph_nodes_by_id: &BTreeMap<String, SubstrateGraphNode>,
+    graph_edges: &[SubstrateGraphEdge],
+    depth: usize,
+    limit: usize,
+) -> Result<DependencyDagProfile> {
+    let id = dependency_dag_node_id(node);
+    let mut source_files = BTreeSet::new();
+    let mut source_symbols = BTreeSet::new();
+    for edge in graph_edges
+        .iter()
+        .filter(|edge| edge.from_id == node.id && edge.kind == "mentions")
+    {
+        let Some(target) = graph_nodes_by_id.get(&edge.to_id) else {
+            continue;
+        };
+        match target.kind.as_str() {
+            "file" | "route" => {
+                if let Some(path) = target.properties.get("path") {
+                    source_files.insert(path.clone());
+                }
+            }
+            "symbol" => {
+                source_symbols.insert(target.label.clone());
+                if let Some(path) = target.properties.get("path") {
+                    source_files.insert(path.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let max_rows = if limit == 0 { usize::MAX } else { limit };
+    for (source, _) in
+        graph_db_reachable_nodes_by_kind(store, &node.id, "source_handle", depth, max_rows)?
+    {
+        if let Some(handle) = conflict_matrix_source_handle(&source) {
+            source_files.insert(handle.file);
+        }
+    }
+
+    let worker_results = graph_nodes_by_id
+        .values()
+        .filter(|candidate| {
+            candidate.kind == "worker_result"
+                && candidate.properties.get("ref_id").map(String::as_str) == Some(id.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let worker_feedback = conflict_matrix_worker_feedback(&worker_results);
+    let expected_tests = worker_feedback.expected_tests.iter().cloned().collect();
+    let config_files = source_files
+        .iter()
+        .filter(|file| is_planner_config_path(file))
+        .cloned()
+        .collect();
+
+    let mut semantic_refs = BTreeMap::new();
+    for kind in ["semantic_concept", "semantic_entity"] {
+        for (semantic, _) in
+            graph_db_reachable_nodes_by_kind(store, &node.id, kind, depth, max_rows)?
+        {
+            let item = conflict_matrix_semantic_ref(root, &semantic);
+            semantic_refs
+                .entry(format!("{}:{}", item.kind, item.label))
+                .or_insert(item);
+        }
+    }
+
+    Ok(DependencyDagProfile {
+        id,
+        graph_node_id: node.id.clone(),
+        label: node.label.clone(),
+        path: node.properties.get("path").cloned(),
+        line: node
+            .properties
+            .get("line")
+            .and_then(|value| value.parse::<i64>().ok()),
+        detail: node.properties.get("detail").cloned(),
+        source_files,
+        source_symbols,
+        config_files,
+        expected_tests,
+        semantic_refs,
+        worker_feedback,
+    })
+}
+
+fn dependency_dag_marker_refs(text: &str, markers: &[&str]) -> Vec<String> {
+    let lower = text.to_ascii_lowercase();
+    let mut refs = Vec::new();
+    for marker in markers {
+        let mut offset = 0usize;
+        while let Some(pos) = lower[offset..].find(marker) {
+            let start = offset + pos + marker.len();
+            let segment = text[start..]
+                .split(['\n', '.'])
+                .next()
+                .unwrap_or(&text[start..]);
+            refs.extend(extract_conflict_target_refs(segment));
+            offset = start;
+        }
+    }
+    dedupe_preserve_order(refs)
+}
+
+fn dependency_dag_push_edge(
+    edges: &mut Vec<DependencyDagEdge>,
+    seen: &mut BTreeSet<(String, String, String)>,
+    edge: DependencyDagEdge,
+) {
+    if edge.from == edge.to {
+        return;
+    }
+    if seen.insert((edge.from.clone(), edge.to.clone(), edge.kind.clone())) {
+        edges.push(edge);
+    }
+}
+
+fn dependency_dag_explicit_edges(
+    profiles: &[DependencyDagProfile],
+    target_ids: &BTreeSet<String>,
+    edges: &mut Vec<DependencyDagEdge>,
+    seen: &mut BTreeSet<(String, String, String)>,
+) {
+    for profile in profiles {
+        let detail = profile.detail.as_deref().unwrap_or_default();
+        for dep in dependency_dag_marker_refs(
+            detail,
+            &[
+                "depends on",
+                "depends-on",
+                "deps:",
+                "after",
+                "blocked by",
+                "requires",
+            ],
+        ) {
+            if target_ids.contains(&dep) {
+                dependency_dag_push_edge(
+                    edges,
+                    seen,
+                    DependencyDagEdge {
+                        from: dep.clone(),
+                        to: profile.id.clone(),
+                        kind: "explicit_depends_on".to_string(),
+                        weight: 1000,
+                        reasons: vec![format!("{} declares dependency on #{dep}", profile.id)],
+                        shared_files: Vec::new(),
+                        shared_symbols: Vec::new(),
+                        shared_tests: Vec::new(),
+                        shared_config_files: Vec::new(),
+                        shared_semantic_refs: Vec::new(),
+                    },
+                );
+            }
+        }
+        for downstream in dependency_dag_marker_refs(detail, &["before", "unblocks"]) {
+            if target_ids.contains(&downstream) {
+                dependency_dag_push_edge(
+                    edges,
+                    seen,
+                    DependencyDagEdge {
+                        from: profile.id.clone(),
+                        to: downstream.clone(),
+                        kind: "explicit_before".to_string(),
+                        weight: 900,
+                        reasons: vec![format!(
+                            "{} declares it should run before #{downstream}",
+                            profile.id
+                        )],
+                        shared_files: Vec::new(),
+                        shared_symbols: Vec::new(),
+                        shared_tests: Vec::new(),
+                        shared_config_files: Vec::new(),
+                        shared_semantic_refs: Vec::new(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn dependency_dag_worker_follow_up_edges(
+    profiles: &[DependencyDagProfile],
+    target_ids: &BTreeSet<String>,
+    edges: &mut Vec<DependencyDagEdge>,
+    seen: &mut BTreeSet<(String, String, String)>,
+) {
+    for profile in profiles {
+        for follow_up in &profile.worker_feedback.follow_up_ids {
+            if target_ids.contains(follow_up) {
+                dependency_dag_push_edge(
+                    edges,
+                    seen,
+                    DependencyDagEdge {
+                        from: profile.id.clone(),
+                        to: follow_up.clone(),
+                        kind: "worker_result_follow_up".to_string(),
+                        weight: 700,
+                        reasons: vec![format!(
+                            "worker_result for #{} references follow-up #{}",
+                            profile.id, follow_up
+                        )],
+                        shared_files: Vec::new(),
+                        shared_symbols: Vec::new(),
+                        shared_tests: Vec::new(),
+                        shared_config_files: Vec::new(),
+                        shared_semantic_refs: Vec::new(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn dependency_dag_overlap_edges(
+    profiles: &[DependencyDagProfile],
+    edges: &mut Vec<DependencyDagEdge>,
+    seen: &mut BTreeSet<(String, String, String)>,
+) {
+    for left_idx in 0..profiles.len() {
+        for right_idx in (left_idx + 1)..profiles.len() {
+            let left = &profiles[left_idx];
+            let right = &profiles[right_idx];
+            let shared_files = sorted_intersection(&left.source_files, &right.source_files);
+            let shared_symbols = sorted_intersection(&left.source_symbols, &right.source_symbols);
+            let shared_tests = sorted_intersection(&left.expected_tests, &right.expected_tests);
+            let shared_config_files = sorted_intersection(&left.config_files, &right.config_files);
+            let left_semantic = left.semantic_refs.keys().cloned().collect::<BTreeSet<_>>();
+            let right_semantic = right.semantic_refs.keys().cloned().collect::<BTreeSet<_>>();
+            let shared_semantic_refs = sorted_intersection(&left_semantic, &right_semantic);
+            if shared_files.is_empty()
+                && shared_symbols.is_empty()
+                && shared_tests.is_empty()
+                && shared_config_files.is_empty()
+                && shared_semantic_refs.is_empty()
+            {
+                continue;
+            }
+            let kind = if shared_files.is_empty()
+                && shared_symbols.is_empty()
+                && shared_tests.is_empty()
+                && shared_config_files.is_empty()
+            {
+                "semantic_relation"
+            } else {
+                "shared_resource"
+            };
+            let mut reasons = Vec::new();
+            if !shared_files.is_empty() {
+                reasons.push(format!("shared files: {}", shared_files.join(", ")));
+            }
+            if !shared_symbols.is_empty() {
+                reasons.push(format!("shared symbols: {}", shared_symbols.join(", ")));
+            }
+            if !shared_tests.is_empty() {
+                reasons.push(format!("shared tests: {}", shared_tests.join(" && ")));
+            }
+            if !shared_config_files.is_empty() {
+                reasons.push(format!(
+                    "shared config files: {}",
+                    shared_config_files.join(", ")
+                ));
+            }
+            if !shared_semantic_refs.is_empty() {
+                reasons.push(format!(
+                    "shared semantic refs: {}",
+                    shared_semantic_refs.join(", ")
+                ));
+            }
+            let weight = shared_files.len() * 100
+                + shared_config_files.len() * 100
+                + shared_symbols.len() * 40
+                + shared_tests.len() * 10
+                + shared_semantic_refs.len() * 5;
+            dependency_dag_push_edge(
+                edges,
+                seen,
+                DependencyDagEdge {
+                    from: left.id.clone(),
+                    to: right.id.clone(),
+                    kind: kind.to_string(),
+                    weight,
+                    reasons,
+                    shared_files,
+                    shared_symbols,
+                    shared_tests,
+                    shared_config_files,
+                    shared_semantic_refs,
+                },
+            );
+        }
+    }
+}
+
+fn dependency_dag_topo_batches(
+    targets: &[String],
+    edges: &[DependencyDagEdge],
+) -> (Vec<DependencyDagTopoBatch>, DependencyDagCycleDiagnostics) {
+    let target_set = targets.iter().cloned().collect::<BTreeSet<_>>();
+    let order = targets
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| (id.clone(), idx))
+        .collect::<BTreeMap<_, _>>();
+    let mut indegree = targets
+        .iter()
+        .map(|id| (id.clone(), 0usize))
+        .collect::<BTreeMap<_, _>>();
+    let mut outgoing = BTreeMap::<String, Vec<String>>::new();
+    let mut seen_pairs = BTreeSet::<(String, String)>::new();
+    for edge in edges {
+        if !target_set.contains(&edge.from) || !target_set.contains(&edge.to) {
+            continue;
+        }
+        if !seen_pairs.insert((edge.from.clone(), edge.to.clone())) {
+            continue;
+        }
+        *indegree.entry(edge.to.clone()).or_default() += 1;
+        outgoing
+            .entry(edge.from.clone())
+            .or_default()
+            .push(edge.to.clone());
+    }
+    for values in outgoing.values_mut() {
+        values.sort_by_key(|id| order.get(id).copied().unwrap_or(usize::MAX));
+        values.dedup();
+    }
+
+    let mut processed = BTreeSet::new();
+    let mut batches = Vec::new();
+    loop {
+        let mut ready = targets
+            .iter()
+            .filter(|id| !processed.contains(*id))
+            .filter(|id| indegree.get(*id).copied().unwrap_or(0) == 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        ready.sort_by_key(|id| order.get(id).copied().unwrap_or(usize::MAX));
+        if ready.is_empty() {
+            break;
+        }
+        for id in &ready {
+            processed.insert(id.clone());
+            for next in outgoing.get(id).into_iter().flatten() {
+                if let Some(value) = indegree.get_mut(next) {
+                    *value = value.saturating_sub(1);
+                }
+            }
+        }
+        batches.push(DependencyDagTopoBatch {
+            batch: batches.len() + 1,
+            targets: ready,
+        });
+    }
+
+    let blocked_nodes = targets
+        .iter()
+        .filter(|id| !processed.contains(*id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let blocked_set = blocked_nodes.iter().cloned().collect::<BTreeSet<_>>();
+    let cycle_edges = edges
+        .iter()
+        .filter(|edge| blocked_set.contains(&edge.from) && blocked_set.contains(&edge.to))
+        .cloned()
+        .collect::<Vec<_>>();
+    (
+        batches,
+        DependencyDagCycleDiagnostics {
+            has_cycles: !blocked_nodes.is_empty(),
+            blocked_nodes,
+            cycle_edges,
+        },
+    )
+}
+
+fn dependency_dag_replay_commands(
+    path: &Path,
+    scope: Option<&str>,
+    targets: &[String],
+    depth: usize,
+    limit: usize,
+) -> Vec<String> {
+    let target_args = targets
+        .iter()
+        .map(|target| shell_quote(target))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut command = format!(
+        "tsift dependency-dag --path {}{} --depth {} --limit {} --json",
+        shell_quote(path.to_string_lossy().as_ref()),
+        scope
+            .map(|scope| format!(" --scope {}", shell_quote(scope)))
+            .unwrap_or_default(),
+        depth,
+        limit
+    );
+    if !target_args.is_empty() {
+        command.push(' ');
+        command.push_str(&target_args);
+    }
+    vec![command]
+}
+
+fn build_dependency_dag_report(
+    path: &Path,
+    scope: Option<&str>,
+    raw_targets: &[String],
+    depth: usize,
+    limit: usize,
+) -> Result<DependencyDagReport> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    build_traversal_graph(&root, path, scope)
+        .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
+    let graph_db = graph_substrate_db_path(&root, scope);
+    let store = SqliteGraphStore::open_read_only_resilient(&graph_db)
+        .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
+    let mut warnings = Vec::new();
+    if let Some(recovery) = store.read_only_recovery() {
+        warnings.push(graph_db_read_recovery_diagnostic(recovery));
+    }
+    let freshness = sqlite_graph_freshness(&store, scope.unwrap_or("root"))?;
+    if freshness.fail_closed {
+        bail!(
+            "dependency-dag graph projection failed closed: {}; repair: {}",
+            freshness.diagnostics.join("; "),
+            graph_db_repair_commands(&root, scope).join("; ")
+        );
+    }
+
+    let target_nodes = dependency_dag_resolve_backlog_nodes(&root, path, &store, raw_targets)?;
+    let graph_nodes = store.all_nodes()?;
+    let graph_edges = store.all_edges()?;
+    let graph_nodes_by_id = graph_nodes
+        .into_iter()
+        .map(|node| (node.id.clone(), node))
+        .collect::<BTreeMap<_, _>>();
+    let profiles = target_nodes
+        .iter()
+        .map(|node| {
+            dependency_dag_node_profile(
+                &root,
+                &store,
+                node,
+                &graph_nodes_by_id,
+                &graph_edges,
+                depth,
+                limit,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let targets = profiles
+        .iter()
+        .map(|profile| profile.id.clone())
+        .collect::<Vec<_>>();
+    let target_ids = targets.iter().cloned().collect::<BTreeSet<_>>();
+
+    let mut edges = Vec::new();
+    let mut seen_edges = BTreeSet::new();
+    dependency_dag_explicit_edges(&profiles, &target_ids, &mut edges, &mut seen_edges);
+    dependency_dag_worker_follow_up_edges(&profiles, &target_ids, &mut edges, &mut seen_edges);
+    dependency_dag_overlap_edges(&profiles, &mut edges, &mut seen_edges);
+    edges.sort_by(|left, right| {
+        left.from
+            .cmp(&right.from)
+            .then(left.to.cmp(&right.to))
+            .then(left.kind.cmp(&right.kind))
+    });
+    let (topo_batches, cycle_diagnostics) = dependency_dag_topo_batches(&targets, &edges);
+
+    let nodes = profiles
+        .into_iter()
+        .map(|profile| DependencyDagNode {
+            id: profile.id,
+            graph_node_id: profile.graph_node_id,
+            label: profile.label,
+            path: profile.path,
+            line: profile.line,
+            detail: profile.detail,
+            source_files: sorted_set(&profile.source_files),
+            source_symbols: sorted_set(&profile.source_symbols),
+            config_files: sorted_set(&profile.config_files),
+            expected_tests: sorted_set(&profile.expected_tests),
+            semantic_refs: profile.semantic_refs.into_values().collect(),
+            worker_feedback: profile.worker_feedback,
+        })
+        .collect::<Vec<_>>();
+    let projection_hashes = freshness
+        .content_hash
+        .clone()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let replay_commands = dependency_dag_replay_commands(path, scope, &targets, depth, limit);
+    let repair_commands = graph_db_repair_commands(&root, scope);
+    let summary = DependencyDagSummary {
+        nodes: nodes.len(),
+        edges: edges.len(),
+        topo_batches: topo_batches.len(),
+        has_cycles: cycle_diagnostics.has_cycles,
+    };
+
+    Ok(DependencyDagReport {
+        contract_version: DEPENDENCY_DAG_CONTRACT_VERSION,
+        root: root.to_string_lossy().to_string(),
+        scope: scope.map(str::to_string),
+        path: path.to_string_lossy().to_string(),
+        targets,
+        projection_freshness: freshness,
+        projection_hashes,
+        nodes,
+        edges,
+        topo_batches,
+        cycle_diagnostics,
+        summary,
+        replay_commands,
+        repair_commands,
+        warnings,
+    })
+}
+
+fn print_dependency_dag_human(report: &DependencyDagReport, compact: bool) {
+    if compact {
+        println!(
+            "dependency-dag targets:{} edges:{} batches:{} cycles:{}",
+            report.targets.len(),
+            report.edges.len(),
+            report.topo_batches.len(),
+            report.cycle_diagnostics.has_cycles
+        );
+    } else {
+        println!("Dependency DAG");
+        println!("  targets: {}", report.targets.join(", "));
+        println!("  edges:   {}", report.edges.len());
+        println!("  cycles:  {}", report.cycle_diagnostics.has_cycles);
+    }
+    for batch in &report.topo_batches {
+        println!("batch #{}: {}", batch.batch, batch.targets.join(", "));
+    }
+    for edge in &report.edges {
+        println!(
+            "edge {} -> {} kind:{} weight:{}",
+            edge.from, edge.to, edge.kind, edge.weight
+        );
+        for reason in &edge.reasons {
+            println!("  reason: {reason}");
+        }
+    }
+    if report.cycle_diagnostics.has_cycles {
+        println!(
+            "cycle blocked nodes: {}",
+            report.cycle_diagnostics.blocked_nodes.join(", ")
+        );
+    }
+    for command in &report.replay_commands {
+        println!("replay: {command}");
+    }
+    for command in &report.repair_commands {
+        println!("repair: {command}");
+    }
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+}
+
+fn cmd_dependency_dag(
+    path: &Path,
+    scope: Option<&str>,
+    raw_targets: &[String],
+    depth: usize,
+    limit: usize,
+    format: OutputFormat,
+) -> Result<()> {
+    let report = build_dependency_dag_report(path, scope, raw_targets, depth, limit)?;
+    if format.json_output {
+        print_json_or_envelope(
+            &report,
+            &format,
+            "dependency-dag",
+            "topological-planning",
+            ToolEnvelopeSummary {
+                text: format!(
+                    "Dependency DAG for {} target(s): edges={} batches={} cycles={}",
+                    report.targets.len(),
+                    report.edges.len(),
+                    report.topo_batches.len(),
+                    report.cycle_diagnostics.has_cycles
+                ),
+                metrics: vec![
+                    envelope_metric("targets", report.targets.len()),
+                    envelope_metric("edges", report.edges.len()),
+                    envelope_metric("topo_batches", report.topo_batches.len()),
+                    envelope_metric("has_cycles", report.cycle_diagnostics.has_cycles),
+                ],
+            },
+            report.cycle_diagnostics.has_cycles,
+            report.replay_commands.clone(),
+        )
+    } else {
+        print_dependency_dag_human(&report, format.compact);
+        Ok(())
     }
 }
 
@@ -22034,6 +22894,73 @@ dispatch #spec-test-build-install-commit-push
         dir
     }
 
+    fn setup_dependency_dag_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn shared_helper() {}\nfn main() { shared_helper(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"dag-fixture\"\n",
+        )
+        .unwrap();
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+
+        let task_dir = dir.path().join("tasks/software");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        std::fs::write(
+            task_dir.join("tsift.md"),
+            r#"---
+agent_doc_session: tsift-dag
+agent_doc_format: template
+---
+
+## Exchange
+
+<!-- agent:exchange patch=append -->
+Completed `#alpha`; touched files `main.rs`; tests `cargo test dependency_dag`; follow-up `#gamma`.
+<!-- /agent:exchange -->
+
+## Backlog
+
+<!-- agent:backlog -->
+- [ ] [#prep] Prepare Cargo.toml configuration before shared helper work.
+- [ ] [#alpha] Update shared_helper in main.rs after #prep.
+- [ ] [#beta] Refactor shared_helper tests in main.rs.
+- [ ] [#gamma] Follow-up review for graph navigation.
+<!-- /agent:backlog -->
+"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    fn setup_dependency_dag_cycle_project() -> tempfile::TempDir {
+        let dir = setup_graph_index();
+        let task_dir = dir.path().join("tasks/software");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        std::fs::write(
+            task_dir.join("tsift.md"),
+            r#"---
+agent_doc_session: tsift-dag-cycle
+agent_doc_format: template
+---
+
+## Backlog
+
+<!-- agent:backlog -->
+- [ ] [#left] Left side depends on #right.
+- [ ] [#right] Right side depends on #left.
+<!-- /agent:backlog -->
+"#,
+        )
+        .unwrap();
+        dir
+    }
+
     fn seed_traversal_semantic_summaries(dir: &Path) {
         let summary_db = summarize::SummaryDb::open(&dir.join(".tsift/summaries.db")).unwrap();
         summary_db
@@ -22428,6 +23355,84 @@ def list_items():
                 .then_with(|| left.target.cmp(&right.target))
         });
         assert_eq!(ranked[0].target, "kgnv");
+    }
+
+    #[test]
+    fn dependency_dag_extracts_explicit_overlap_and_follow_up_edges() {
+        let dir = setup_dependency_dag_project();
+        let session = dir.path().join("tasks/software/tsift.md");
+        let report = build_dependency_dag_report(dir.path(), None, &[], 4, 12).unwrap();
+
+        assert_eq!(report.contract_version, "dependency-dag-v1");
+        assert_eq!(
+            report.targets,
+            vec![
+                "prep".to_string(),
+                "alpha".to_string(),
+                "beta".to_string(),
+                "gamma".to_string()
+            ]
+        );
+        assert!(report.edges.iter().any(|edge| {
+            edge.from == "prep" && edge.to == "alpha" && edge.kind == "explicit_depends_on"
+        }));
+        assert!(report.edges.iter().any(|edge| {
+            edge.from == "alpha" && edge.to == "gamma" && edge.kind == "worker_result_follow_up"
+        }));
+        assert!(report.edges.iter().any(|edge| {
+            edge.from == "alpha"
+                && edge.to == "beta"
+                && edge.kind == "shared_resource"
+                && edge.shared_files.contains(&"main.rs".to_string())
+                && edge.shared_symbols.contains(&"shared_helper".to_string())
+        }));
+        assert!(
+            !report.cycle_diagnostics.has_cycles,
+            "{:?}",
+            report.cycle_diagnostics
+        );
+        assert_eq!(report.topo_batches[0].targets, vec!["prep".to_string()]);
+        assert_eq!(report.topo_batches[1].targets, vec!["alpha".to_string()]);
+        assert!(
+            report.replay_commands[0].contains("dependency-dag"),
+            "{:?}",
+            report.replay_commands
+        );
+
+        cmd_dependency_dag(
+            &session,
+            None,
+            &["alpha".to_string(), "beta".to_string()],
+            4,
+            12,
+            OutputFormat {
+                json_output: true,
+                compact: false,
+                pretty: false,
+                terse: false,
+                schema: false,
+                envelope: false,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dependency_dag_reports_cycles_from_explicit_depends_on_text() {
+        let dir = setup_dependency_dag_cycle_project();
+        let report = build_dependency_dag_report(dir.path(), None, &[], 4, 12).unwrap();
+
+        assert!(report.cycle_diagnostics.has_cycles);
+        assert_eq!(
+            report.cycle_diagnostics.blocked_nodes,
+            vec!["left".to_string(), "right".to_string()]
+        );
+        assert!(report.cycle_diagnostics.cycle_edges.iter().any(|edge| {
+            edge.from == "left" && edge.to == "right" && edge.kind == "explicit_depends_on"
+        }));
+        assert!(report.cycle_diagnostics.cycle_edges.iter().any(|edge| {
+            edge.from == "right" && edge.to == "left" && edge.kind == "explicit_depends_on"
+        }));
     }
 
     #[test]
@@ -27470,6 +28475,40 @@ tier = "private"
                 assert_eq!(depth, 4);
             }
             _ => panic!("expected DispatchTrace command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_dependency_dag_command() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "dependency-dag",
+            "--path",
+            "tasks/software/tsift.md",
+            "--depth",
+            "5",
+            "--limit",
+            "20",
+            "--json",
+            "alpha",
+            "#beta",
+        ]);
+        match cli.command {
+            Some(Commands::DependencyDag {
+                targets,
+                path,
+                depth,
+                limit,
+                json,
+                ..
+            }) => {
+                assert_eq!(targets, vec!["alpha".to_string(), "#beta".to_string()]);
+                assert_eq!(path, PathBuf::from("tasks/software/tsift.md"));
+                assert_eq!(depth, 5);
+                assert_eq!(limit, 20);
+                assert!(json);
+            }
+            _ => panic!("expected DependencyDag command"),
         }
     }
 

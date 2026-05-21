@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- Added `tsift dependency-dag --path <session> [target...] --json` with a `dependency-dag-v1` contract for agent-doc backlog nodes, explicit dependency text, shared file/symbol/test/config and semantic overlap edges, worker-result follow-up edges, deterministic topological batches, cycle diagnostics, replay commands, and repair commands.
 - `conflict-matrix` candidates and `worker_prompt_packets` now expose `previously_completed`; completed worker_result evidence downgrades missing source ownership to an informational warning instead of `per_target_fail_closed`, preventing completed agent-doc queue items from being reactivated only to rediscover ownership.
 - Graph orchestration JSON surfaces now publish explicit contract versions and replay metadata: `graph-db evidence` emits `packet_id`, `projection_hash`, explicit worker/semantic result arrays, `replay_commands`, and `repair_commands`; `conflict-matrix`, `worker_prompt_packets`, `context-pack graph_orchestration`, `session-review --next-context`, and `dispatch-trace` carry matching contract markers for agent-doc consumers.
 - Completed/blocked agent-doc worker responses now materialize as `worker_result` graph rows linked to backlog/job/source handles with status, touched files, expected tests, and follow-up ids, and `conflict-matrix` summarizes them as worker feedback with repeated-blockage warnings that do not weaken hard conflict gates.

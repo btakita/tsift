@@ -142,6 +142,23 @@
         "replay_commands",
         "repair_commands"
       ]
+    },
+    {
+      "name": "dependency_dag",
+      "version": "dependency-dag-v1",
+      "required_fields": [
+        "contract_version",
+        "projection_freshness",
+        "projection_hashes",
+        "targets",
+        "nodes",
+        "edges",
+        "topo_batches",
+        "cycle_diagnostics",
+        "summary",
+        "replay_commands",
+        "repair_commands"
+      ]
     }
   ]
 }

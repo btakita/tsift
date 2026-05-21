@@ -38,6 +38,7 @@ tsift graph-db --path . status --json
 tsift graph-db --path . kind backlog --property ref_id=cvxa --limit 5 --json
 tsift graph-db --path . evidence cvxa --depth 3 --limit 8 --json
 tsift conflict-matrix --path tasks/software/tsift.md cvxa --json
+tsift dependency-dag --path tasks/software/tsift.md cvxa --json
 tsift graph-db --path . doctor --json
 tsift traverse --path . --format html > traversal.html
 tsift semantic "graph navigation" --path . --kind concept --json
@@ -63,9 +64,13 @@ budgets, and fail-closed ownership blocks before parallel dispatch. Use `tsift
 dispatch-trace --format json|html` for a graph-backed operator review view
 linking backlog, job packets, worker results, source handles, semantic rows,
 evidence packet ids, worker-feedback closure summaries, and worker prompt
-packets. Those orchestration surfaces include stable contract versions, evidence
-packet ids, projection hashes, replay commands, and repair commands so agent-doc
-can consume them as JSON rather than parsing prose. Use `tsift
+packets. Use `tsift dependency-dag` to extract a replayable agent-doc backlog
+DAG with explicit dependency edges, shared ownership/semantic overlap edges,
+worker-result follow-up edges, topological batches, and cycle diagnostics before
+running DAG-shaped dispatch. Those orchestration surfaces include stable
+contract versions, evidence packet ids, projection hashes, replay commands, and
+repair commands so agent-doc can consume them as JSON rather than parsing prose.
+Use `tsift
 graph-db doctor` to
 validate local `graph.db` and Convex snapshot metadata before trusting operator
 handoffs. `tsift traverse --format html` renders the selected GraphStore slice as

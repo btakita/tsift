@@ -17,6 +17,9 @@ fields that agent-doc should consume:
 - `session-review-follow-up-v1` for session-review next-context commands
 - `dispatch-trace-v1` for JSON/HTML replay views over backlog, job_packet,
   worker_result, worker feedback, source_handle, and worker_prompt_packet rows
+- `dependency-dag-v1` for topological batches, cycle diagnostics, and replayable
+  backlog dependency edges from explicit text, overlaps, semantics, and
+  worker-result follow-up ids
 
 ```bash
 tsift graph-db --path . schema --json
@@ -60,6 +63,7 @@ tsift graph-db --path . evidence gsch --depth 3 --limit 8 --json
 tsift conflict-matrix --path tasks/software/tsift.md gsch grev wres --json
 tsift dispatch-trace --path tasks/software/tsift.md gsch grev wres --json
 tsift dispatch-trace --path tasks/software/tsift.md gsch --format html
+tsift dependency-dag --path tasks/software/tsift.md gsch grev wres --json
 tsift --envelope context-pack tasks/software/tsift.md --budget normal --json
 tsift session-review tasks/software/tsift.md --next-context --json
 ```
