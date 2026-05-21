@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sift::{SearchInput, SearchOptions, Sift};
 #[cfg(test)]
@@ -5888,7 +5888,7 @@ fn verify_convex_projection_snapshot(
     snapshot_path: &Path,
 ) -> Result<()> {
     let graph_db = graph_substrate_db_path(root, scope);
-    let store = SqliteGraphStore::open(&graph_db)?;
+    let store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
     let local = convex_rows_from_graph_store(&store)?;
     let snapshot = load_convex_projection_rows(snapshot_path)?;
     validate_convex_projection_rows(&snapshot)?;
@@ -6013,7 +6013,7 @@ fn build_convex_sync_report_with_snapshot(
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     let graph = build_traversal_graph(&root, path, scope)?;
     let graph_db = graph_substrate_db_path(&root, scope);
-    let store = SqliteGraphStore::open(&graph_db)?;
+    let store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
     let local = convex_rows_from_graph_store(&store)?;
     let freshness = convex_projection_freshness(&local, snapshot.as_ref(), scope);
     let (node_upserts, edge_upserts, node_tombstones, edge_tombstones) =
@@ -6437,6 +6437,8 @@ struct GraphDbOperatorReport {
     counts: GraphDbOperatorCounts,
     #[serde(skip_serializing_if = "Option::is_none")]
     refresh: Option<GraphDbRefreshSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery: Option<index::ReadOnlyRecovery>,
     next_commands: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     warnings: Vec<String>,
@@ -6606,9 +6608,8 @@ fn convex_refresh_command(root: &Path, scope: Option<&str>) -> String {
     )
 }
 
-fn open_sqlite_graph_db_readonly(graph_db: &Path) -> Result<Connection> {
-    Connection::open_with_flags(graph_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("opening graph.db read-only: {}", graph_db.display()))
+fn open_sqlite_graph_db_readonly(graph_db: &Path) -> Result<substrate::SqliteReadOnlyConnection> {
+    substrate::open_graph_read_only_connection_resilient(graph_db)
 }
 
 fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool> {
@@ -6772,6 +6773,17 @@ fn graph_db_operator_next_commands(
         graph_db_scope_arg(scope)
     ));
     commands
+}
+
+fn graph_db_read_recovery_diagnostic(recovery: index::ReadOnlyRecovery) -> String {
+    match recovery {
+        index::ReadOnlyRecovery::SnapshotFallback => {
+            "graph.db read recovered through snapshot fallback after a rollback-journal lock on the live database".to_string()
+        }
+        index::ReadOnlyRecovery::SnapshotFallbackWal => {
+            "graph.db read recovered through WAL-aware snapshot fallback after copying live -wal/-shm sidecars".to_string()
+        }
+    }
 }
 
 fn sqlite_string_set(conn: &Connection, sql: &str) -> Result<BTreeSet<String>> {
@@ -7242,7 +7254,7 @@ fn append_sqlite_graph_doctor_checks(
     root: &Path,
     scope: Option<&str>,
     graph_db: &Path,
-) -> Option<Connection> {
+) -> Option<substrate::SqliteReadOnlyConnection> {
     let rebuild = graph_db_rebuild_command(root, scope);
     let backup_rebuild = graph_db_backup_rebuild_command(root, scope, graph_db);
     if !graph_db.exists() {
@@ -7275,8 +7287,17 @@ fn append_sqlite_graph_doctor_checks(
         Vec::new(),
         vec![rebuild.clone()],
     ));
+    if let Some(recovery) = conn.recovery() {
+        report.push_check(GraphDbDoctorCheck {
+            name: "sqlite_graph_db_read_recovery".to_string(),
+            status: "recovered".to_string(),
+            fail_closed: false,
+            diagnostics: vec![graph_db_read_recovery_diagnostic(recovery)],
+            repair_commands: Vec::new(),
+        });
+    }
 
-    let schema_diagnostics = sqlite_graph_schema_diagnostics(&conn)
+    let schema_diagnostics = sqlite_graph_schema_diagnostics(conn.conn())
         .unwrap_or_else(|err| vec![format!("graph.db schema inspection failed: {err}")]);
     report.push_check(graph_db_doctor_check(
         "sqlite_schema",
@@ -7284,7 +7305,7 @@ fn append_sqlite_graph_doctor_checks(
         vec![backup_rebuild.clone()],
     ));
 
-    let metadata_diagnostics = sqlite_graph_projection_metadata_diagnostics(&conn, scope)
+    let metadata_diagnostics = sqlite_graph_projection_metadata_diagnostics(conn.conn(), scope)
         .unwrap_or_else(|err| {
             vec![format!(
                 "graph projection metadata inspection failed: {err}"
@@ -7296,7 +7317,7 @@ fn append_sqlite_graph_doctor_checks(
         vec![rebuild.clone()],
     ));
 
-    let duplicate_diagnostics = sqlite_graph_duplicate_diagnostics(&conn)
+    let duplicate_diagnostics = sqlite_graph_duplicate_diagnostics(conn.conn())
         .unwrap_or_else(|err| vec![format!("duplicate id inspection failed: {err}")]);
     report.push_check(graph_db_doctor_check(
         "sqlite_duplicate_ids",
@@ -7304,7 +7325,7 @@ fn append_sqlite_graph_doctor_checks(
         vec![backup_rebuild.clone()],
     ));
 
-    let orphan_diagnostics = sqlite_graph_orphan_diagnostics(&conn)
+    let orphan_diagnostics = sqlite_graph_orphan_diagnostics(conn.conn())
         .unwrap_or_else(|err| vec![format!("orphan edge inspection failed: {err}")]);
     report.push_check(graph_db_doctor_check(
         "sqlite_orphan_edges",
@@ -7312,7 +7333,7 @@ fn append_sqlite_graph_doctor_checks(
         vec![rebuild.clone()],
     ));
 
-    let json_diagnostics = sqlite_graph_json_diagnostics(&conn)
+    let json_diagnostics = sqlite_graph_json_diagnostics(conn.conn())
         .unwrap_or_else(|err| vec![format!("graph row JSON inspection failed: {err}")]);
     report.push_check(graph_db_doctor_check(
         "sqlite_row_json",
@@ -7654,21 +7675,27 @@ fn graph_db_operator_report_from_disk(
                 },
             },
             refresh,
+            recovery: None,
             next_commands: graph_db_operator_next_commands(root, scope, true),
             warnings,
         });
     }
 
     let conn = open_sqlite_graph_db_readonly(graph_db)?;
-    let mut freshness = sqlite_graph_freshness_from_conn(&conn, scope.unwrap_or("root"))?;
-    let schema_diagnostics = sqlite_graph_schema_diagnostics(&conn)
+    let recovery = conn.recovery();
+    let mut warnings = warnings;
+    if let Some(recovery) = recovery {
+        warnings.push(graph_db_read_recovery_diagnostic(recovery));
+    }
+    let mut freshness = sqlite_graph_freshness_from_conn(conn.conn(), scope.unwrap_or("root"))?;
+    let schema_diagnostics = sqlite_graph_schema_diagnostics(conn.conn())
         .unwrap_or_else(|err| vec![format!("graph.db schema inspection failed: {err}")]);
     if !schema_diagnostics.is_empty() {
         freshness.diagnostics.extend(schema_diagnostics);
         freshness.fail_closed = true;
         freshness.status = "stale".to_string();
     }
-    let counts = sqlite_graph_counts(&conn)?;
+    let counts = sqlite_graph_counts(conn.conn())?;
     let status = if freshness.fail_closed {
         "stale"
     } else {
@@ -7686,6 +7713,7 @@ fn graph_db_operator_report_from_disk(
         freshness,
         counts,
         refresh,
+        recovery,
         next_commands: graph_db_operator_next_commands(root, scope, false),
         warnings,
     })
@@ -7724,6 +7752,9 @@ fn print_graph_db_operator_human(report: &GraphDbOperatorReport) {
             "refresh: {} tombstoned node(s), {} tombstoned edge(s)",
             refresh.tombstoned_nodes, refresh.tombstoned_edges
         );
+    }
+    if let Some(recovery) = report.recovery {
+        println!("recovery: {}", graph_db_read_recovery_diagnostic(recovery));
     }
     for diagnostic in &report.freshness.diagnostics {
         println!("diagnostic: {diagnostic}");
@@ -7860,7 +7891,7 @@ fn cmd_graph_db_doctor(
     let conn = append_sqlite_graph_doctor_checks(&mut report, root, scope, &graph_db);
     let local_rows = conn
         .as_ref()
-        .and_then(|conn| sqlite_convex_rows_from_conn(conn).ok());
+        .and_then(|conn| sqlite_convex_rows_from_conn(conn.conn()).ok());
     if backend == GraphDbBackend::ConvexSnapshot {
         append_convex_snapshot_doctor_checks(
             &mut report,
@@ -7925,9 +7956,13 @@ fn cmd_graph_db_drift(
         convex_snapshot.context("graph-db drift requires --convex-snapshot <rows.json>")?;
     let graph = build_traversal_graph(root, path, scope)?;
     let graph_db = graph_substrate_db_path(root, scope);
-    let store = SqliteGraphStore::open(&graph_db)?;
+    let store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
     let local = convex_rows_from_graph_store(&store)?;
     let (snapshot, snapshot_value) = load_convex_projection_snapshot_value(snapshot_path)?;
+    let mut warnings = graph.warnings;
+    if let Some(recovery) = store.read_only_recovery() {
+        warnings.push(graph_db_read_recovery_diagnostic(recovery));
+    }
     let report = graph_db_drift_report(GraphDbDriftInput {
         root,
         scope,
@@ -7936,7 +7971,7 @@ fn cmd_graph_db_drift(
         local: &local,
         snapshot: &snapshot,
         snapshot_value: &snapshot_value,
-        warnings: graph.warnings,
+        warnings,
     });
 
     if format.json_output {
@@ -8972,7 +9007,7 @@ fn cmd_graph_db(
     let mut warnings = Vec::new();
     if let GraphDbQuery::Evidence { target, .. } = &query {
         let needs_refresh = if graph_db.exists() {
-            let store = SqliteGraphStore::open(&graph_db)?;
+            let store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
             sqlite_graph_freshness(&store, scope.unwrap_or("root"))?.fail_closed
                 || graph_db_resolve_evidence_target(&store, target)?.is_none()
         } else {
@@ -8989,7 +9024,10 @@ fn cmd_graph_db(
     }
     let report = match backend {
         GraphDbBackend::Sqlite => {
-            let store = SqliteGraphStore::open(&graph_db)?;
+            let store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
+            if let Some(recovery) = store.read_only_recovery() {
+                warnings.push(graph_db_read_recovery_diagnostic(recovery));
+            }
             let freshness = sqlite_graph_freshness(&store, scope.unwrap_or("root"))?;
             if let GraphDbQuery::Evidence {
                 target,
@@ -9015,7 +9053,10 @@ fn cmd_graph_db(
         GraphDbBackend::ConvexSnapshot => {
             let snapshot_path = convex_snapshot
                 .context("--backend convex-snapshot requires --convex-snapshot <rows.json>")?;
-            let local_store = SqliteGraphStore::open(&graph_db)?;
+            let local_store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
+            if let Some(recovery) = local_store.read_only_recovery() {
+                warnings.push(graph_db_read_recovery_diagnostic(recovery));
+            }
             let local = convex_rows_from_graph_store(&local_store)?;
             let snapshot = load_convex_projection_rows(snapshot_path)?;
             validate_convex_projection_rows(&snapshot)?;
@@ -10895,8 +10936,13 @@ fn cmd_semantic_related(
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     refresh_traversal_graph_store(&root, path, scope)?;
     let graph_db = graph_substrate_db_path(&root, scope);
-    let store = SqliteGraphStore::open(&graph_db)?;
-    let report = semantic_related_report_from_store(&root, scope, query, limit, kind, &store)?;
+    let store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
+    let mut report = semantic_related_report_from_store(&root, scope, query, limit, kind, &store)?;
+    if let Some(recovery) = store.read_only_recovery() {
+        report
+            .warnings
+            .push(graph_db_read_recovery_diagnostic(recovery));
+    }
 
     if json_output {
         println!("{}", to_json_schema(&report, pretty, terse, schema)?);
@@ -14270,7 +14316,7 @@ fn build_conflict_matrix_report(
         ResponseBudget::from_cli(None, None, Some(ResponseBudgetPreset::Normal), false),
     )?;
     let graph_db = graph_substrate_db_path(&root, scope);
-    let store = SqliteGraphStore::open(&graph_db)
+    let store = SqliteGraphStore::open_read_only_resilient(&graph_db)
         .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
     let freshness = sqlite_graph_freshness(&store, scope.unwrap_or("root"))?;
     let targets = resolve_conflict_matrix_targets(&store, raw_targets, &context_pack)?;
@@ -14295,6 +14341,9 @@ fn build_conflict_matrix_report(
     let graph_nodes = store.all_nodes()?;
 
     let mut warnings = context_pack.status_reminders.clone();
+    if let Some(recovery) = store.read_only_recovery() {
+        warnings.push(graph_db_read_recovery_diagnostic(recovery));
+    }
     let mut candidates = Vec::new();
     let mut evidence_packets = Vec::new();
     for target in &targets {
@@ -14663,8 +14712,11 @@ fn build_dispatch_trace_report(
         build_conflict_matrix_report(path, scope, raw_targets, depth, limit, impact_limit)?;
     let root = PathBuf::from(&conflict.root);
     let graph_db = graph_substrate_db_path(&root, scope);
-    let store = SqliteGraphStore::open(&graph_db)
+    let store = SqliteGraphStore::open_read_only_resilient(&graph_db)
         .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
+    let trace_recovery_warning = store
+        .read_only_recovery()
+        .map(graph_db_read_recovery_diagnostic);
     let graph_nodes = store.all_nodes()?;
     let graph_edges = store.all_edges()?;
     let (ids, truncated) = dispatch_trace_collect_ids(
@@ -14701,6 +14753,11 @@ fn build_dispatch_trace_report(
             .then(left.to_id.cmp(&right.to_id))
     });
 
+    let mut warnings = conflict.warnings;
+    if let Some(warning) = trace_recovery_warning {
+        warnings.push(warning);
+    }
+
     Ok(DispatchTraceReport {
         contract_version: DISPATCH_TRACE_CONTRACT_VERSION,
         root: conflict.root,
@@ -14722,7 +14779,7 @@ fn build_dispatch_trace_report(
         replay_commands: conflict.next_commands,
         repair_commands: graph_db_repair_commands(&root, scope),
         truncated,
-        warnings: conflict.warnings,
+        warnings,
     })
 }
 
@@ -17729,10 +17786,13 @@ fn context_pack_graph_orchestration(
     exploration: &ExplorationPacket,
 ) -> Result<ContextPackGraphOrchestration> {
     let graph_db = graph_substrate_db_path(root, None);
-    let store = SqliteGraphStore::open(&graph_db)
+    let store = SqliteGraphStore::open_read_only_resilient(&graph_db)
         .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
     let projection_freshness = sqlite_graph_freshness(&store, "root")?;
     let mut warnings = projection_freshness.diagnostics.clone();
+    if let Some(recovery) = store.read_only_recovery() {
+        warnings.push(graph_db_read_recovery_diagnostic(recovery));
+    }
     let mut targets = next_context
         .prompt_targets
         .iter()
@@ -22432,6 +22492,89 @@ def list_items():
                 .iter()
                 .any(|operation| operation.command.starts_with("neighborhood"))
         );
+    }
+
+    #[test]
+    fn graph_db_status_uses_snapshot_fallback_when_rollback_journal_is_locked() {
+        let dir = setup_traversal_project();
+        refresh_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
+        let graph_db = dir.path().join(".tsift/graph.db");
+        let _lock = hold_rollback_journal_lock(&graph_db);
+
+        let report =
+            graph_db_operator_report_from_disk(dir.path(), None, &graph_db, "status", None, vec![])
+                .unwrap();
+
+        assert_eq!(report.status, "current");
+        assert_eq!(
+            report.recovery,
+            Some(index::ReadOnlyRecovery::SnapshotFallback)
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("rollback-journal lock")),
+            "expected rollback-journal recovery warning, got {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn graph_db_status_copies_wal_sidecars_when_locked() {
+        let dir = setup_traversal_project();
+        refresh_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
+        let graph_db = dir.path().join(".tsift/graph.db");
+        let _lock = hold_wal_database_lock(&graph_db);
+
+        let report =
+            graph_db_operator_report_from_disk(dir.path(), None, &graph_db, "status", None, vec![])
+                .unwrap();
+
+        assert_eq!(report.status, "current");
+        assert_eq!(
+            report.recovery,
+            Some(index::ReadOnlyRecovery::SnapshotFallbackWal)
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("WAL-aware snapshot fallback")),
+            "expected WAL recovery warning, got {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn graph_db_evidence_uses_snapshot_fallback_when_graph_db_is_locked() {
+        let dir = setup_traversal_project();
+        let session = dir.path().join("tasks/software/tsift.md");
+        refresh_traversal_graph_store(dir.path(), &session, None).unwrap();
+        let graph_db = dir.path().join(".tsift/graph.db");
+        let _lock = hold_rollback_journal_lock(&graph_db);
+
+        let result = cmd_graph_db(
+            &session,
+            None,
+            GraphDbBackend::Sqlite,
+            None,
+            GraphDbQuery::Evidence {
+                target: "kgnv".to_string(),
+                depth: 3,
+                limit: 8,
+            },
+            OutputFormat {
+                json_output: false,
+                compact: true,
+                pretty: false,
+                terse: false,
+                schema: false,
+                envelope: false,
+            },
+        );
+
+        assert!(result.is_ok());
     }
 
     fn current_graph_db_freshness() -> GraphDbFreshnessReport {

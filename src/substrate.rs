@@ -1,11 +1,14 @@
+use crate::index::{ReadOnlyRecovery, copy_read_only_snapshot, read_only_snapshot_recovery};
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, Row, types::Type};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, types::Type};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const SQLITE_GRAPH_SCHEMA_VERSION: i64 = 1;
+const SQLITE_GRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphProvenance {
@@ -595,6 +598,116 @@ impl<C: ConvexGraphClient> GraphStore for ConvexGraphStore<C> {
 
 pub struct SqliteGraphStore {
     conn: Connection,
+    _snapshot_copy: Option<SnapshotCopyGuard>,
+    read_only_recovery: Option<ReadOnlyRecovery>,
+}
+
+pub struct SqliteReadOnlyConnection {
+    conn: Connection,
+    _snapshot_copy: Option<SnapshotCopyGuard>,
+    recovery: Option<ReadOnlyRecovery>,
+}
+
+impl SqliteReadOnlyConnection {
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    pub fn recovery(&self) -> Option<ReadOnlyRecovery> {
+        self.recovery
+    }
+}
+
+struct SnapshotCopyGuard {
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for SnapshotCopyGuard {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn configure_writable_graph_connection(conn: &Connection, db_path: &Path) -> Result<()> {
+    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if mode.to_lowercase() != "wal" {
+        bail!(
+            "graph substrate db {} requires WAL mode for concurrent reads, got {}",
+            db_path.display(),
+            mode
+        );
+    }
+    conn.pragma_update(
+        None,
+        "wal_autocheckpoint",
+        SQLITE_GRAPH_WAL_AUTOCHECKPOINT_PAGES,
+    )?;
+    let checkpoint_pages: i64 =
+        conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?;
+    if checkpoint_pages != SQLITE_GRAPH_WAL_AUTOCHECKPOINT_PAGES {
+        bail!(
+            "graph substrate db {} requires wal_autocheckpoint={}, got {}",
+            db_path.display(),
+            SQLITE_GRAPH_WAL_AUTOCHECKPOINT_PAGES,
+            checkpoint_pages
+        );
+    }
+    Ok(())
+}
+
+pub fn open_graph_read_only_connection(db_path: &Path) -> Result<SqliteReadOnlyConnection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening graph.db read-only: {}", db_path.display()))?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    Ok(SqliteReadOnlyConnection {
+        conn,
+        _snapshot_copy: None,
+        recovery: None,
+    })
+}
+
+pub fn open_graph_read_only_connection_resilient(
+    db_path: &Path,
+) -> Result<SqliteReadOnlyConnection> {
+    match open_graph_read_only_connection(db_path).and_then(|connection| {
+        connection
+            .conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |_row| Ok(()))?;
+        Ok(connection)
+    }) {
+        Ok(connection) => Ok(connection),
+        Err(err) => match read_only_snapshot_recovery(db_path, &err) {
+            Some(recovery) => open_graph_read_only_snapshot(db_path, recovery),
+            None => Err(err),
+        },
+    }
+}
+
+fn open_graph_read_only_snapshot(
+    db_path: &Path,
+    recovery: ReadOnlyRecovery,
+) -> Result<SqliteReadOnlyConnection> {
+    let (snapshot_path, cleanup_paths) = copy_read_only_snapshot(db_path, "graph")?;
+    let conn = Connection::open_with_flags(
+        &snapshot_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening graph.db snapshot {}", snapshot_path.display()))?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    Ok(SqliteReadOnlyConnection {
+        conn,
+        _snapshot_copy: Some(SnapshotCopyGuard {
+            paths: cleanup_paths,
+        }),
+        recovery: Some(recovery),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -621,12 +734,29 @@ impl SqliteGraphStore {
         }
         let conn = Connection::open(db_path)
             .with_context(|| format!("opening graph substrate db: {}", db_path.display()))?;
+        configure_writable_graph_connection(&conn, db_path)?;
         Self::from_connection(conn)
     }
 
     #[cfg(test)]
     pub fn in_memory() -> Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
+        let conn = Connection::open_in_memory()?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Self::from_connection(conn)
+    }
+
+    pub fn open_read_only(db_path: &Path) -> Result<Self> {
+        let connection = open_graph_read_only_connection(db_path)?;
+        Self::from_read_only_connection(connection)
+    }
+
+    pub fn open_read_only_resilient(db_path: &Path) -> Result<Self> {
+        let connection = open_graph_read_only_connection_resilient(db_path)?;
+        Self::from_read_only_connection(connection)
+    }
+
+    pub fn read_only_recovery(&self) -> Option<ReadOnlyRecovery> {
+        self.read_only_recovery
     }
 
     fn from_connection(conn: Connection) -> Result<Self> {
@@ -687,7 +817,34 @@ impl SqliteGraphStore {
         if user_version < SQLITE_GRAPH_SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SQLITE_GRAPH_SCHEMA_VERSION)?;
         }
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            _snapshot_copy: None,
+            read_only_recovery: None,
+        })
+    }
+
+    fn from_read_only_connection(connection: SqliteReadOnlyConnection) -> Result<Self> {
+        connection.conn.pragma_update(None, "foreign_keys", "ON")?;
+        let user_version: i64 =
+            connection
+                .conn
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
+        if user_version > SQLITE_GRAPH_SCHEMA_VERSION {
+            bail!(
+                "graph.db schema version {} is newer than supported version {}",
+                user_version,
+                SQLITE_GRAPH_SCHEMA_VERSION
+            );
+        }
+        connection
+            .conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |_row| Ok(()))?;
+        Ok(Self {
+            conn: connection.conn,
+            _snapshot_copy: connection._snapshot_copy,
+            read_only_recovery: connection.recovery,
+        })
     }
 
     pub fn replace_projection(&mut self, projection: &GraphProjection) -> Result<()> {
