@@ -8,7 +8,7 @@ Extend tsift with tree-sitter AST parsing, dependency graph tracking, and per-su
 
 ```
 tsift (CLI + MCP plugin)
-├── sift (BM25 + vector — existing)
+├── local lexical search adapter
 ├── substrate module (provider-neutral graph DB API — src/substrate.rs)
 │   ├── generic nodes/edges/provenance/freshness records
 │   ├── GraphStore CRUD/query contract (lookup, kind scans, neighborhoods, shortest paths)
@@ -593,10 +593,10 @@ tsift release automation is tag-driven:
 - the workflow fails closed if the tag does not exactly match `Cargo.toml` `package.version`
 - release verification includes `cargo clippy --all-targets -- -D warnings` and `cargo test`
 - successful tagged releases attach prebuilt archives plus `.sha256` checksum files to the matching GitHub Release
-- prebuilt binaries are emitted for `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`
-- the crates.io publish job exists but is gated behind the `TSIFT_ENABLE_CRATES_PUBLISH=true` repo variable so normal GitHub releases do not fail on the current upstream packaging blocker
+- prebuilt binaries are emitted for `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`; macOS x86_64 users install from crates.io with `cargo install tsift`
+- the crates.io publish job is enabled with the `TSIFT_ENABLE_CRATES_PUBLISH=true` repo variable after `cargo publish --dry-run` passes
 
-Current blocker: tsift's search engine dependency comes from `github.com/rupurt/sift`, but that library is not published on crates.io under a compatible package name. The existing crates.io `sift` crate is a different project. Until the upstream dependency is published under a consumable crates.io package name and `Cargo.toml` is retargeted to it, crates.io publishing must remain explicitly disabled.
+tsift's default lexical search adapter is maintained in-tree so crates.io publishing does not depend on the upstream git-only `github.com/rupurt/sift` project. The existing crates.io `sift` crate remains a different project and is intentionally not used.
 
 To keep the remaining dependency surface publish-ready, any dependency that uses a local `path` source should also carry the matching crates.io `version` requirement whenever that published crate already exists.
 

@@ -43,8 +43,11 @@ arch="$(uname -m)"
 
 case "$os:$arch" in
   Linux:x86_64) target="x86_64-unknown-linux-gnu" ;;
-  Darwin:x86_64) target="x86_64-apple-darwin" ;;
   Darwin:arm64 | Darwin:aarch64) target="aarch64-apple-darwin" ;;
+  Darwin:x86_64)
+    echo "tsift installer: macOS x86_64 release assets are not published; use \`cargo install tsift\` after installing Rust." >&2
+    exit 1
+    ;;
   *)
     echo "tsift installer: unsupported platform: $os $arch" >&2
     exit 1

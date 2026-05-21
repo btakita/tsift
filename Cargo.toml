@@ -21,7 +21,6 @@ serde_json = "1"
 toml = "0.8"
 blake3 = "1"
 ureq = { version = "3", features = ["json"] }
-sift = { git = "https://github.com/rupurt/sift" }
 tagpath = { version = "0.6.2", default-features = false }
 tree-sitter = "0.25"
 

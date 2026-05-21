@@ -20,9 +20,10 @@ Install a specific version or directory:
 TSIFT_VERSION=0.1.42 TSIFT_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/btakita/tsift/main/scripts/install.sh)"
 ```
 
-The installer supports Linux x86_64, macOS x86_64, and macOS arm64 release
-assets. It verifies the downloaded archive with the release SHA-256 file before
-installing `tsift` into `$HOME/.local/bin` by default.
+The installer supports Linux x86_64 and macOS arm64 release assets. It verifies
+the downloaded archive with the release SHA-256 file before installing `tsift`
+into `$HOME/.local/bin` by default. macOS x86_64 users should install from
+crates.io with `cargo install tsift`.
 
 ## Quick Start
 
@@ -75,11 +76,9 @@ queries.
 GitHub release assets are built by the `Release` workflow for:
 
 - `x86_64-unknown-linux-gnu`
-- `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 - `x86_64-pc-windows-msvc`
 
-The crates.io package path is still gated by the upstream `sift` git dependency.
-`cargo package` and `cargo publish` cannot succeed until that dependency is
-available from crates.io under a compatible package name or tsift stops depending
-on the git source.
+The crates.io package path is enabled after `cargo publish --dry-run` passes.
+The default lexical search adapter is maintained in-tree, so publishing no
+longer depends on an upstream git-only `sift` crate.
