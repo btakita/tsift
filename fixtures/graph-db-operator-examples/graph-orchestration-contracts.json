@@ -1,0 +1,115 @@
+{
+  "contracts": [
+    {
+      "name": "graph_db_evidence",
+      "version": "graph-db-evidence-v1",
+      "required_fields": [
+        "contract_version",
+        "target",
+        "packet_id",
+        "projection_hash",
+        "freshness",
+        "target_node",
+        "worker_context",
+        "source_handles",
+        "worker_results",
+        "semantic_related",
+        "shortest_paths",
+        "replay_commands",
+        "repair_commands"
+      ],
+      "example": {
+        "contract_version": "graph-db-evidence-v1",
+        "target": "gsch",
+        "packet_id": "gevd-example",
+        "projection_hash": "blake3-projection-hash",
+        "freshness": {
+          "status": "current",
+          "fail_closed": false,
+          "projection_version": "tsift-traversal-v1",
+          "content_hash": "blake3-projection-hash",
+          "source_watermark": "mtime-watermark",
+          "diagnostics": []
+        },
+        "worker_results": [
+          {
+            "kind": "worker_result",
+            "properties": {
+              "status": "completed",
+              "touched_files": "src/main.rs",
+              "expected_tests": "cargo test graph_db_conformance",
+              "follow_up_ids": "grev"
+            }
+          }
+        ],
+        "replay_commands": [
+          "tsift graph-db --path . evidence gsch --depth 3 --limit 8 --json"
+        ],
+        "repair_commands": [
+          "tsift graph-db --path . refresh --json",
+          "tsift graph-db --path . doctor --json"
+        ]
+      }
+    },
+    {
+      "name": "worker_prompt_packet",
+      "version": "worker-prompt-packet-v1",
+      "required_fields": [
+        "contract_version",
+        "packet_id",
+        "target",
+        "rank",
+        "risk",
+        "projection_hash",
+        "owned_files",
+        "owned_symbols",
+        "read_only_context",
+        "forbidden_files",
+        "expected_tests",
+        "expansion_commands",
+        "token_budget",
+        "semantic_dispatch_score",
+        "semantic_dispatch_reasons",
+        "prompt"
+      ]
+    },
+    {
+      "name": "conflict_matrix",
+      "version": "conflict-matrix-v1",
+      "required_fields": [
+        "contract_version",
+        "inputs.evidence_packets",
+        "candidates.evidence_packet_id",
+        "worker_prompt_packets",
+        "orchestration.projection_hashes",
+        "orchestration.evidence_packet_ids",
+        "orchestration.conflict_matrix_decisions"
+      ]
+    },
+    {
+      "name": "context_pack_graph_orchestration",
+      "version": "context-pack-graph-orchestration-v1",
+      "required_fields": [
+        "contract_version",
+        "projection_freshness",
+        "projection_hashes",
+        "evidence_packet_ids",
+        "conflict_matrix_decisions",
+        "worker_ownership_blocks",
+        "follow_up_commands"
+      ]
+    },
+    {
+      "name": "session_review_follow_up",
+      "version": "session-review-follow-up-v1",
+      "required_fields": [
+        "contract_version",
+        "prompt_targets",
+        "touched_files",
+        "touched_symbols",
+        "unresolved_failures",
+        "next_digest_commands"
+      ]
+    }
+  ]
+}

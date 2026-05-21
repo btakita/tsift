@@ -113,6 +113,8 @@ agent_doc_format: template
 
 <!-- agent:exchange patch=append -->
 ### Re: setup
+Completed `#gval`; touched files `main.rs`; tests `cargo test --test graph_db_conformance`; follow-up `#solo`.
+Completed `#solo`; touched files `isolated.rs`; tests `cargo test --test graph_db_conformance`; follow-up `#gval`.
 <!-- /agent:exchange -->
 
 	<!-- agent:queue -->
@@ -663,12 +665,29 @@ fn graph_db_evidence_packet_covers_backlog_job_worker_context_and_source_handles
         ],
     );
     assert_eq!(backlog["target_node"]["kind"], "backlog", "{backlog}");
+    assert_eq!(
+        backlog["contract_version"], "graph-db-evidence-v1",
+        "{backlog}"
+    );
+    assert!(
+        backlog["packet_id"].as_str().unwrap().starts_with("gevd-"),
+        "{backlog}"
+    );
+    assert!(backlog["projection_hash"].as_str().is_some(), "{backlog}");
     assert!(
         !backlog["worker_context"].as_array().unwrap().is_empty(),
         "{backlog}"
     );
     assert!(
         !backlog["source_handles"].as_array().unwrap().is_empty(),
+        "{backlog}"
+    );
+    assert!(
+        backlog["worker_results"].as_array().unwrap().iter().any(
+            |node| node["properties"]["status"] == "completed"
+                && node["properties"]["touched_files"] == "main.rs"
+                && node["properties"]["follow_up_ids"] == "solo"
+        ),
         "{backlog}"
     );
     assert!(
@@ -685,6 +704,22 @@ fn graph_db_evidence_packet_covers_backlog_job_worker_context_and_source_handles
             .unwrap()
             .iter()
             .any(|command| command.as_str().unwrap().contains("source-read")),
+        "{backlog}"
+    );
+    assert!(
+        backlog["replay_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("evidence")),
+        "{backlog}"
+    );
+    assert!(
+        backlog["repair_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("refresh")),
         "{backlog}"
     );
     assert!(
@@ -743,6 +778,7 @@ fn conflict_matrix_cli_composes_planner_evidence_and_worker_ownership() {
     ]);
 
     assert_eq!(report["targets"], json!(["gval"]));
+    assert_eq!(report["contract_version"], "conflict-matrix-v1", "{report}");
     assert_eq!(report["cached_diff"]["mode"], "cached");
     assert_eq!(report["impact"]["mode"], "cached");
     assert!(
@@ -752,8 +788,26 @@ fn conflict_matrix_cli_composes_planner_evidence_and_worker_ownership() {
             .contains("diff-digest --cached"),
         "{report}"
     );
+    assert!(
+        report["inputs"]["evidence_packets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |packet| packet["packet_id"].as_str().unwrap().starts_with("gevd-")
+                    && packet["projection_hash"].as_str().is_some()
+            ),
+        "{report}"
+    );
     let candidates = report["candidates"].as_array().unwrap();
     assert_eq!(candidates.len(), 1, "{report}");
+    assert!(
+        candidates[0]["evidence_packet_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("gevd-"),
+        "{report}"
+    );
     assert!(
         !candidates[0]["source_handles"]
             .as_array()
@@ -866,6 +920,17 @@ fn conflict_matrix_multi_worker_fixture_blocks_shared_files_and_emits_prompt_pac
         .iter()
         .find(|packet| packet["target"] == "solo")
         .unwrap();
+    assert_eq!(
+        solo_packet["contract_version"], "worker-prompt-packet-v1",
+        "{report}"
+    );
+    assert!(
+        solo_packet["packet_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("wpp-"),
+        "{report}"
+    );
     assert!(
         solo_packet["prompt"]
             .as_str()
@@ -878,6 +943,14 @@ fn conflict_matrix_multi_worker_fixture_blocks_shared_files_and_emits_prompt_pac
             .as_u64()
             .unwrap()
             >= 1,
+        "{report}"
+    );
+    assert!(
+        report["orchestration"]["evidence_packet_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|packet| packet.as_str().unwrap().starts_with("gevd-")),
         "{report}"
     );
     assert!(

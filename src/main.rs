@@ -4365,6 +4365,8 @@ struct TraversalNode {
     line: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    properties: BTreeMap<String, String>,
     expand: String,
 }
 
@@ -4387,6 +4389,12 @@ struct TraversalGraphBuild {
 }
 
 const GRAPH_PROJECTION_VERSION: &str = "tsift-traversal-v1";
+const GRAPH_DB_EVIDENCE_CONTRACT_VERSION: &str = "graph-db-evidence-v1";
+const WORKER_PROMPT_PACKET_CONTRACT_VERSION: &str = "worker-prompt-packet-v1";
+const CONFLICT_MATRIX_CONTRACT_VERSION: &str = "conflict-matrix-v1";
+const CONTEXT_PACK_GRAPH_ORCHESTRATION_CONTRACT_VERSION: &str =
+    "context-pack-graph-orchestration-v1";
+const SESSION_REVIEW_FOLLOW_UP_CONTRACT_VERSION: &str = "session-review-follow-up-v1";
 const GRAPH_PROJECTION_META_KIND: &str = "projection_meta";
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -5011,6 +5019,9 @@ fn traversal_projection_from_graph(
         if let Some(detail) = &node.detail {
             projected = projected.with_property("detail", detail.clone());
         }
+        for (key, value) in &node.properties {
+            projected = projected.with_property(key.clone(), value.clone());
+        }
         nodes.push(node_with_content_freshness(projected)?);
     }
 
@@ -5186,12 +5197,15 @@ fn append_traversal_context_projection_rows(
         if worker_count >= budget.relationship_limit.min(8) {
             break;
         }
-        if node.kind != "backlog" && node.kind != "job_packet" {
+        if !matches!(
+            node.kind.as_str(),
+            "backlog" | "job_packet" | "worker_result"
+        ) {
             continue;
         }
         let mut target_node_handles = Vec::new();
         let mut seen_target_nodes = BTreeSet::new();
-        if node.kind == "backlog" {
+        if node.kind == "backlog" || node.kind == "worker_result" {
             push_traversal_backlog_target_handles(
                 node,
                 &edges_by_from,
@@ -5319,6 +5333,7 @@ fn traversal_node_from_graph_node(root: &Path, node: SubstrateGraphNode) -> Trav
             .get("line")
             .and_then(|value| value.parse::<i64>().ok()),
         detail: node.properties.get("detail").cloned(),
+        properties: node.properties,
     }
 }
 
@@ -6155,7 +6170,15 @@ struct GraphDbSchemaOperation {
 }
 
 #[derive(Serialize)]
+struct GraphDbSchemaContract {
+    name: &'static str,
+    version: &'static str,
+    description: &'static str,
+}
+
+#[derive(Serialize)]
 struct GraphDbSchema {
+    contract_versions: Vec<GraphDbSchemaContract>,
     node_fields: Vec<GraphDbSchemaField>,
     edge_fields: Vec<GraphDbSchemaField>,
     operations: Vec<GraphDbSchemaOperation>,
@@ -6356,15 +6379,23 @@ struct GraphDbEvidenceReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     scope: Option<String>,
     backend: String,
+    contract_version: &'static str,
     target: String,
+    packet_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projection_hash: Option<String>,
     freshness: GraphDbFreshnessReport,
     target_node: SubstrateGraphNode,
     worker_context: Vec<SubstrateGraphNode>,
     source_handles: Vec<SubstrateGraphNode>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    worker_results: Vec<SubstrateGraphNode>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     semantic_related: Vec<SubstrateGraphNode>,
     shortest_paths: Vec<GraphDbEvidencePath>,
     next_commands: Vec<String>,
+    replay_commands: Vec<String>,
+    repair_commands: Vec<String>,
     fixture_coverage: GraphDbFixtureCoverage,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     warnings: Vec<String>,
@@ -7928,6 +7959,33 @@ fn apply_graph_db_node_page(
 
 fn graph_db_schema() -> GraphDbSchema {
     GraphDbSchema {
+        contract_versions: vec![
+            GraphDbSchemaContract {
+                name: "graph_db_evidence",
+                version: GRAPH_DB_EVIDENCE_CONTRACT_VERSION,
+                description: "graph-db evidence JSON packet including packet_id, projection hash, worker context, source handles, worker results, semantic rows, replay commands, and repair commands",
+            },
+            GraphDbSchemaContract {
+                name: "worker_prompt_packet",
+                version: WORKER_PROMPT_PACKET_CONTRACT_VERSION,
+                description: "conflict-matrix worker prompt packet with owned scope, read-only context, forbidden files, expected tests, expansion commands, token budget, semantic ranking reasons, and fail-closed prompt text",
+            },
+            GraphDbSchemaContract {
+                name: "conflict_matrix",
+                version: CONFLICT_MATRIX_CONTRACT_VERSION,
+                description: "parallel-dispatch decision report keyed by graph evidence packets and hard file/symbol/test/config gates",
+            },
+            GraphDbSchemaContract {
+                name: "context_pack_graph_orchestration",
+                version: CONTEXT_PACK_GRAPH_ORCHESTRATION_CONTRACT_VERSION,
+                description: "context-pack graph orchestration summary with projection freshness, evidence packet ids, ownership blocks, and follow-up graph commands",
+            },
+            GraphDbSchemaContract {
+                name: "session_review_follow_up",
+                version: SESSION_REVIEW_FOLLOW_UP_CONTRACT_VERSION,
+                description: "session-review next-context follow-up command contract for resumable digest/context-pack commands",
+            },
+        ],
         node_fields: vec![
             GraphDbSchemaField {
                 name: "id",
@@ -8011,7 +8069,7 @@ fn graph_db_schema() -> GraphDbSchema {
             },
             GraphDbSchemaOperation {
                 command: "evidence <target> [--depth N] [--limit N]",
-                description: "Return a bounded graph-db handoff packet for a backlog id or job packet handle, including worker_context rows, source_handle rows, semantic_concept/entity rows, shortest paths, and next commands",
+                description: "Return a bounded versioned graph-db handoff packet for a backlog id or job packet handle, including packet_id, projection hash, worker_context rows, source_handle rows, worker_result rows, semantic_concept/entity rows, shortest paths, replay commands, repair commands, and next commands",
             },
             GraphDbSchemaOperation {
                 command: "schema",
@@ -8178,8 +8236,9 @@ fn evidence_kind_rank(kind: &str) -> usize {
     match kind {
         "backlog" => 0,
         "job_packet" => 1,
-        "worker_context" => 2,
-        "source_handle" => 3,
+        "worker_result" => 2,
+        "worker_context" => 3,
+        "source_handle" => 4,
         _ => 9,
     }
 }
@@ -8222,6 +8281,7 @@ fn graph_db_evidence_next_commands(
     target: &SubstrateGraphNode,
     worker_context: &[SubstrateGraphNode],
     source_handles: &[SubstrateGraphNode],
+    worker_results: &[SubstrateGraphNode],
     semantic_related: &[SubstrateGraphNode],
 ) -> Vec<String> {
     let mut commands = BTreeSet::new();
@@ -8235,6 +8295,11 @@ fn graph_db_evidence_next_commands(
     }
     for source in source_handles {
         if let Some(expand) = source.properties.get("expand") {
+            commands.insert(expand.clone());
+        }
+    }
+    for result in worker_results {
+        if let Some(expand) = result.properties.get("expand") {
             commands.insert(expand.clone());
         }
     }
@@ -8256,6 +8321,62 @@ fn graph_db_evidence_next_commands(
     commands.into_iter().collect()
 }
 
+fn graph_db_repair_commands(root: &Path, scope: Option<&str>) -> Vec<String> {
+    vec![
+        format!(
+            "tsift graph-db --path {}{} refresh --json",
+            shell_quote(root.to_string_lossy().as_ref()),
+            graph_db_scope_arg(scope)
+        ),
+        format!(
+            "tsift graph-db --path {}{} doctor --json",
+            shell_quote(root.to_string_lossy().as_ref()),
+            graph_db_scope_arg(scope)
+        ),
+    ]
+}
+
+fn graph_db_evidence_replay_commands(
+    root: &Path,
+    scope: Option<&str>,
+    target: &str,
+    depth: usize,
+    limit: usize,
+) -> Vec<String> {
+    vec![
+        format!(
+            "tsift graph-db --path {}{} evidence {} --depth {} --limit {} --json",
+            shell_quote(root.to_string_lossy().as_ref()),
+            graph_db_scope_arg(scope),
+            shell_quote(target),
+            depth,
+            limit
+        ),
+        format!(
+            "tsift conflict-matrix --path {} {} --json",
+            shell_quote(root.to_string_lossy().as_ref()),
+            shell_quote(target)
+        ),
+    ]
+}
+
+fn graph_db_evidence_packet_id(
+    target: &str,
+    target_node: &SubstrateGraphNode,
+    freshness: &GraphDbFreshnessReport,
+) -> String {
+    stable_handle(
+        "gevd",
+        &format!(
+            "{}:{}:{}:{}",
+            GRAPH_DB_EVIDENCE_CONTRACT_VERSION,
+            target,
+            target_node.id,
+            freshness.content_hash.as_deref().unwrap_or("no-hash")
+        ),
+    )
+}
+
 fn graph_db_evidence_report_from_store<S: GraphStore>(
     input: GraphDbEvidenceInput<'_, S>,
 ) -> Result<GraphDbEvidenceReport> {
@@ -8270,11 +8391,13 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
         freshness,
         warnings,
     } = input;
+    let repair_commands = graph_db_repair_commands(root, scope);
     if freshness.fail_closed {
         bail!(
-            "graph database evidence failed closed for {} backend: {}",
+            "graph database evidence failed closed for {} backend: {}; repair: {}",
             backend,
-            freshness.diagnostics.join("; ")
+            freshness.diagnostics.join("; "),
+            repair_commands.join("; ")
         );
     }
     let target_node = graph_db_resolve_evidence_target(store, target)?
@@ -8289,6 +8412,8 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
     )?;
     let source_paths =
         graph_db_reachable_nodes_by_kind(store, &target_node.id, "source_handle", depth, max_rows)?;
+    let worker_result_paths =
+        graph_db_reachable_nodes_by_kind(store, &target_node.id, "worker_result", depth, max_rows)?;
     let mut semantic_paths = graph_db_reachable_nodes_by_kind(
         store,
         &target_node.id,
@@ -8323,6 +8448,10 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
         .iter()
         .map(|(node, _)| node.clone())
         .collect::<Vec<_>>();
+    let worker_results = worker_result_paths
+        .iter()
+        .map(|(node, _)| node.clone())
+        .collect::<Vec<_>>();
     let semantic_related = semantic_paths
         .iter()
         .map(|(node, _)| node.clone())
@@ -8330,6 +8459,7 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
     let shortest_paths = worker_paths
         .iter()
         .chain(source_paths.iter())
+        .chain(worker_result_paths.iter())
         .chain(semantic_paths.iter())
         .map(|(node, path)| GraphDbEvidencePath {
             to: node.id.clone(),
@@ -8345,21 +8475,31 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
         &target_node,
         &worker_context,
         &source_handles,
+        &worker_results,
         &semantic_related,
     );
+    let replay_commands = graph_db_evidence_replay_commands(root, scope, target, depth, limit);
+    let packet_id = graph_db_evidence_packet_id(target, &target_node, &freshness);
+    let projection_hash = freshness.content_hash.clone();
 
     Ok(GraphDbEvidenceReport {
         root: root.to_string_lossy().to_string(),
         scope: scope.map(str::to_string),
         backend: backend.to_string(),
+        contract_version: GRAPH_DB_EVIDENCE_CONTRACT_VERSION,
         target: target.to_string(),
+        packet_id,
+        projection_hash,
         freshness,
         target_node,
         worker_context,
         source_handles,
+        worker_results,
         semantic_related,
         shortest_paths,
         next_commands,
+        replay_commands,
+        repair_commands,
         fixture_coverage: GraphDbFixtureCoverage {
             test: "graph_db_evidence_packet_covers_backlog_job_worker_context_and_source_handles"
                 .to_string(),
@@ -8368,6 +8508,7 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
                 "backlog id and job packet handle resolve to graph nodes".to_string(),
                 "worker_context rows are reachable from queued work".to_string(),
                 "source_handle rows are reachable through bounded shortest paths".to_string(),
+                "worker_result rows are reachable from completed or blocked work".to_string(),
             ],
         },
         warnings,
@@ -8376,13 +8517,14 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
 
 fn print_graph_db_evidence_human(report: &GraphDbEvidenceReport) {
     println!(
-        "graph-db evidence backend: {} target: {} [{}]",
-        report.backend, report.target_node.id, report.target_node.kind
+        "graph-db evidence backend: {} target: {} [{}] packet:{}",
+        report.backend, report.target_node.id, report.target_node.kind, report.packet_id
     );
     println!(
-        "evidence: {} worker_context row(s), {} source_handle row(s), {} semantic row(s), {} path(s)",
+        "evidence: {} worker_context row(s), {} source_handle row(s), {} worker_result row(s), {} semantic row(s), {} path(s)",
         report.worker_context.len(),
         report.source_handles.len(),
+        report.worker_results.len(),
         report.semantic_related.len(),
         report.shortest_paths.len()
     );
@@ -8415,10 +8557,11 @@ fn print_graph_db_evidence_report(
             "evidence",
             ToolEnvelopeSummary {
                 text: format!(
-                    "Graph DB evidence for {} returned {} worker context row(s), {} source handle(s), {} semantic row(s), and {} shortest path(s)",
+                    "Graph DB evidence for {} returned {} worker context row(s), {} source handle(s), {} worker result row(s), {} semantic row(s), and {} shortest path(s)",
                     report.target,
                     report.worker_context.len(),
                     report.source_handles.len(),
+                    report.worker_results.len(),
                     report.semantic_related.len(),
                     report.shortest_paths.len()
                 ),
@@ -8426,6 +8569,7 @@ fn print_graph_db_evidence_report(
                     envelope_metric("backend", &report.backend),
                     envelope_metric("worker_context", report.worker_context.len()),
                     envelope_metric("source_handles", report.source_handles.len()),
+                    envelope_metric("worker_results", report.worker_results.len()),
                     envelope_metric("semantic_related", report.semantic_related.len()),
                     envelope_metric("paths", report.shortest_paths.len()),
                 ],
@@ -8753,6 +8897,7 @@ fn traversal_file_node(root: &Path, file: &str) -> TraversalNode {
         path: Some(display),
         line: None,
         detail: None,
+        properties: BTreeMap::new(),
         expand: traversal_expand_command(root, &handle),
     }
 }
@@ -8778,6 +8923,7 @@ fn traversal_symbol_node(root: &Path, symbol: &index::StoredSymbol) -> Traversal
         path: Some(file),
         line: Some(symbol.line),
         detail: Some(format!("{} {}", symbol.language, symbol.kind)),
+        properties: BTreeMap::new(),
         expand: traversal_expand_command(root, &handle),
     }
 }
@@ -8792,6 +8938,7 @@ fn traversal_unresolved_symbol_node(root: &Path, name: &str) -> TraversalNode {
         path: None,
         line: None,
         detail: Some("unresolved call target".to_string()),
+        properties: BTreeMap::new(),
         expand: traversal_expand_command(root, &handle),
     }
 }
@@ -8815,6 +8962,7 @@ fn traversal_route_node(root: &Path, route: &index::StoredRoute) -> TraversalNod
             "{} route handled by {}",
             route.framework, route.handler_name
         )),
+        properties: BTreeMap::new(),
         expand: traversal_expand_command(root, &handle),
     }
 }
@@ -8836,6 +8984,7 @@ fn traversal_session_node(
         path: Some(display),
         line: None,
         detail: Some("agent-doc session artifact".to_string()),
+        properties: BTreeMap::new(),
         expand: traversal_expand_command(root, &handle),
     }
 }
@@ -8859,6 +9008,7 @@ fn traversal_backlog_node(
         path: Some(display),
         line: Some(line),
         detail: Some(text.to_string()),
+        properties: BTreeMap::new(),
         expand: traversal_expand_command(root, &handle),
     }
 }
@@ -8883,6 +9033,57 @@ fn traversal_job_packet_node(
         path: Some(display),
         line: Some(line),
         detail: Some(detail.to_string()),
+        properties: BTreeMap::new(),
+        expand: traversal_expand_command(root, &handle),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ParsedWorkerResult {
+    id: String,
+    status: String,
+    touched_files: Vec<String>,
+    tests: Vec<String>,
+    follow_up_ids: Vec<String>,
+}
+
+fn traversal_worker_result_node(
+    root: &Path,
+    markdown_path: &Path,
+    parsed: &ParsedWorkerResult,
+    line_text: &str,
+    line: i64,
+) -> TraversalNode {
+    let display = relativize_pathbuf(markdown_path, root)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let handle = stable_handle(
+        "wres",
+        &format!(
+            "worker-result:{display}:{}:{}:{}",
+            parsed.id, parsed.status, line
+        ),
+    );
+    let mut properties = BTreeMap::new();
+    properties.insert("status".to_string(), parsed.status.clone());
+    if !parsed.touched_files.is_empty() {
+        properties.insert("touched_files".to_string(), parsed.touched_files.join(","));
+    }
+    if !parsed.tests.is_empty() {
+        properties.insert("expected_tests".to_string(), parsed.tests.join(" && "));
+    }
+    if !parsed.follow_up_ids.is_empty() {
+        properties.insert("follow_up_ids".to_string(), parsed.follow_up_ids.join(","));
+    }
+    TraversalNode {
+        handle: handle.clone(),
+        kind: "worker_result".to_string(),
+        label: format!("{} #{}", parsed.status, parsed.id),
+        ref_id: Some(parsed.id.clone()),
+        path: Some(display),
+        line: Some(line),
+        detail: Some(line_text.trim().to_string()),
+        properties,
         expand: traversal_expand_command(root, &handle),
     }
 }
@@ -8956,6 +9157,70 @@ fn parse_queue_do_line(line: &str) -> Option<String> {
     let end = rest.find(']')?;
     let id = rest[..end].trim();
     (!id.is_empty()).then(|| id.to_string())
+}
+
+fn markdown_code_spans(input: &str) -> Vec<String> {
+    input
+        .split('`')
+        .enumerate()
+        .filter(|(idx, _)| idx % 2 == 1)
+        .map(|(_, part)| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn parse_worker_result_line(
+    line: &str,
+    files: &[TraversalFileIndexEntry],
+) -> Vec<ParsedWorkerResult> {
+    let lower = line.to_ascii_lowercase();
+    let status =
+        if lower.contains("completed") || lower.contains("code-complete") || lower.contains("done")
+        {
+            "completed"
+        } else if lower.contains("blocked") || lower.contains("externally blocked") {
+            "blocked"
+        } else {
+            return Vec::new();
+        };
+    let result_prefix_end = ["follow-up", "follow up", "next:"]
+        .iter()
+        .filter_map(|marker| lower.find(marker))
+        .min()
+        .unwrap_or(line.len());
+    let ids = extract_conflict_target_refs(&line[..result_prefix_end]);
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let result_ids = ids.iter().cloned().collect::<BTreeSet<_>>();
+    let all_ids = extract_conflict_target_refs(line);
+
+    let touched_files = files
+        .iter()
+        .filter_map(|entry| entry.node.path.as_ref())
+        .filter(|path| line.contains(path.as_str()))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let tests = markdown_code_spans(line)
+        .into_iter()
+        .filter(|span| span.to_ascii_lowercase().contains("test"))
+        .collect::<Vec<_>>();
+
+    ids.iter()
+        .map(|id| ParsedWorkerResult {
+            id: id.clone(),
+            status: status.to_string(),
+            touched_files: touched_files.clone(),
+            tests: tests.clone(),
+            follow_up_ids: all_ids
+                .iter()
+                .filter(|other| *other != id && !result_ids.contains(*other))
+                .cloned()
+                .collect(),
+        })
+        .collect()
 }
 
 fn markdown_files_for_traversal(root: &Path) -> Result<Vec<PathBuf>> {
@@ -9116,6 +9381,7 @@ fn load_agent_doc_traversal_nodes(
         }
 
         let mut in_queue = false;
+        let mut job_by_id = BTreeMap::<String, TraversalNode>::new();
         for (idx, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
             if trimmed.starts_with("<!-- agent:queue") {
@@ -9179,6 +9445,51 @@ fn load_agent_doc_traversal_nodes(
                         1,
                     );
                 }
+                job_by_id.insert(id, node);
+            }
+        }
+
+        let mut seen_results = BTreeSet::<(String, String, i64)>::new();
+        for (idx, line) in lines.iter().enumerate() {
+            for parsed in parse_worker_result_line(line, files) {
+                let line_no = idx as i64 + 1;
+                if !seen_results.insert((parsed.id.clone(), parsed.status.clone(), line_no)) {
+                    continue;
+                }
+                let result =
+                    traversal_worker_result_node(root, &markdown_path, &parsed, line, line_no);
+                graph.add_node(result.clone());
+                graph.add_edge(
+                    &session.handle,
+                    &result.handle,
+                    "contains",
+                    Some("session worker result".to_string()),
+                    1,
+                );
+                if let Some(backlog) = backlog_by_id.get(&parsed.id) {
+                    graph.add_edge(
+                        &backlog.handle,
+                        &result.handle,
+                        "has_result",
+                        Some(format!("worker result {}", parsed.status)),
+                        1,
+                    );
+                }
+                if let Some(job) = job_by_id.get(&parsed.id) {
+                    graph.add_edge(
+                        &job.handle,
+                        &result.handle,
+                        "has_result",
+                        Some(format!("queued worker result {}", parsed.status)),
+                        1,
+                    );
+                }
+                let mut result_text = line.to_string();
+                if !parsed.touched_files.is_empty() {
+                    result_text.push(' ');
+                    result_text.push_str(&parsed.touched_files.join(" "));
+                }
+                link_backlog_to_code_nodes(graph, &result, &result_text, symbols, files, routes, 8);
             }
         }
     }
@@ -9529,13 +9840,14 @@ fn traversal_query_kind_priority(kind: &str) -> usize {
     match kind {
         "backlog" => 0,
         "job_packet" => 1,
-        "symbol" => 2,
-        "file" => 3,
-        "route" => 4,
-        "session" => 5,
-        "semantic_concept" => 6,
-        "semantic_entity" => 7,
-        _ => 8,
+        "worker_result" => 2,
+        "symbol" => 3,
+        "file" => 4,
+        "route" => 5,
+        "session" => 6,
+        "semantic_concept" => 7,
+        "semantic_entity" => 8,
+        _ => 9,
     }
 }
 
@@ -10097,7 +10409,7 @@ const colorByKind = new Map([
   ["file", "#2563eb"], ["symbol", "#16a34a"], ["route", "#7c3aed"],
   ["session", "#0891b2"], ["backlog", "#dc2626"], ["job_packet", "#ea580c"],
   ["semantic_concept", "#9a3412"], ["semantic_entity", "#b45309"],
-  ["source_handle", "#64748b"], ["worker_context", "#475569"]
+  ["source_handle", "#64748b"], ["worker_context", "#475569"], ["worker_result", "#15803d"]
 ]);
 function color(kind){ return colorByKind.get(kind) || "#6b7280"; }
 function isSemantic(edge){ return edge.relation.includes("concept") || edge.relation.includes("entity") || edge.relation.includes("semantic"); }
@@ -12368,6 +12680,7 @@ struct ConflictMatrixTokenBudget {
 
 #[derive(Clone, Debug, Serialize)]
 struct ConflictMatrixOwnershipBlock {
+    contract_version: &'static str,
     title: String,
     owned_files: Vec<String>,
     owned_symbols: Vec<String>,
@@ -12382,9 +12695,13 @@ struct ConflictMatrixOwnershipBlock {
 
 #[derive(Clone, Debug, Serialize)]
 struct ConflictMatrixWorkerPromptPacket {
+    contract_version: &'static str,
+    packet_id: String,
     target: String,
     rank: usize,
     risk: ConflictMatrixRisk,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projection_hash: Option<String>,
     title: String,
     owned_files: Vec<String>,
     owned_symbols: Vec<String>,
@@ -12393,6 +12710,9 @@ struct ConflictMatrixWorkerPromptPacket {
     expected_tests: Vec<String>,
     expansion_commands: Vec<String>,
     token_budget: ConflictMatrixTokenBudget,
+    semantic_dispatch_score: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    semantic_dispatch_reasons: Vec<String>,
     prompt: String,
 }
 
@@ -12400,6 +12720,9 @@ struct ConflictMatrixWorkerPromptPacket {
 struct ConflictMatrixCandidate {
     rank: usize,
     target: String,
+    evidence_packet_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projection_hash: Option<String>,
     target_node_id: String,
     target_kind: String,
     target_label: String,
@@ -12413,6 +12736,7 @@ struct ConflictMatrixCandidate {
     worker_context: Vec<String>,
     semantic_related: Vec<ConflictMatrixSemanticRef>,
     semantic_dispatch_score: usize,
+    semantic_dispatch_reasons: Vec<String>,
     source_handles: Vec<ConflictMatrixSourceHandle>,
     staged_overlap: ConflictMatrixOverlap,
     ownership: ConflictMatrixOwnershipBlock,
@@ -12434,9 +12758,20 @@ struct ConflictMatrixPair {
 #[derive(Serialize)]
 struct ConflictMatrixInputSummary {
     graph_db_evidence_targets: Vec<String>,
+    evidence_packets: Vec<ConflictMatrixEvidencePacketSummary>,
     context_pack_command: String,
     cached_diff_command: String,
     impact_command: String,
+}
+
+#[derive(Clone, Serialize)]
+struct ConflictMatrixEvidencePacketSummary {
+    target: String,
+    packet_id: String,
+    target_node_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projection_hash: Option<String>,
+    replay_command: String,
 }
 
 #[derive(Serialize)]
@@ -12454,7 +12789,9 @@ struct ConflictMatrixContextSummary {
 
 #[derive(Serialize)]
 struct ConflictMatrixOrchestrationObservability {
+    contract_version: &'static str,
     projection_freshness: GraphDbFreshnessReport,
+    projection_hashes: Vec<String>,
     evidence_packet_ids: Vec<String>,
     conflict_matrix_decisions: Vec<String>,
     worker_ownership_blocks: Vec<String>,
@@ -12463,6 +12800,7 @@ struct ConflictMatrixOrchestrationObservability {
 
 #[derive(Serialize)]
 struct ConflictMatrixReport {
+    contract_version: &'static str,
     root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     scope: Option<String>,
@@ -12719,6 +13057,43 @@ fn conflict_matrix_affected_tests(
     tests.into_iter().collect()
 }
 
+fn conflict_matrix_semantic_dispatch_score(
+    semantic_related: &[ConflictMatrixSemanticRef],
+    files: &BTreeSet<String>,
+    symbols: &BTreeSet<String>,
+) -> (usize, Vec<String>) {
+    let mut score = 0usize;
+    let mut reasons = Vec::new();
+    for semantic in semantic_related {
+        let base = match semantic.kind.as_str() {
+            "semantic_concept" => 8,
+            "semantic_entity" => 6,
+            _ => 3,
+        };
+        let mut points = base;
+        let mut detail = vec![format!("{} {}", semantic.kind, semantic.label)];
+        if semantic
+            .source_file
+            .as_ref()
+            .is_some_and(|file| files.contains(file))
+        {
+            points += 4;
+            detail.push("owned file".to_string());
+        }
+        if semantic
+            .source_symbol
+            .as_ref()
+            .is_some_and(|symbol| symbols.contains(symbol))
+        {
+            points += 2;
+            detail.push("owned symbol".to_string());
+        }
+        score += points;
+        reasons.push(format!("+{points} {}", detail.join(" / ")));
+    }
+    (score, reasons)
+}
+
 fn conflict_matrix_staged_overlap(
     files: &BTreeSet<String>,
     symbols: &BTreeSet<String>,
@@ -12751,6 +13126,7 @@ fn conflict_matrix_staged_overlap(
 
 fn empty_conflict_matrix_ownership(target: &str) -> ConflictMatrixOwnershipBlock {
     ConflictMatrixOwnershipBlock {
+        contract_version: WORKER_PROMPT_PACKET_CONTRACT_VERSION,
         title: format!("Worker ownership for {target}"),
         owned_files: Vec::new(),
         owned_symbols: Vec::new(),
@@ -12854,11 +13230,14 @@ fn conflict_matrix_candidate_from_evidence(
         .iter()
         .map(|node| conflict_matrix_semantic_ref(root, node))
         .collect::<Vec<_>>();
-    let semantic_dispatch_score = semantic_related.len();
+    let (semantic_dispatch_score, semantic_dispatch_reasons) =
+        conflict_matrix_semantic_dispatch_score(&semantic_related, &files, &symbols);
 
     ConflictMatrixCandidate {
         rank: 0,
         target: evidence.target.clone(),
+        evidence_packet_id: evidence.packet_id.clone(),
+        projection_hash: evidence.projection_hash.clone(),
         target_node_id: evidence.target_node.id.clone(),
         target_kind: evidence.target_node.kind.clone(),
         target_label: evidence.target_node.label.clone(),
@@ -12872,6 +13251,7 @@ fn conflict_matrix_candidate_from_evidence(
         worker_context,
         semantic_related,
         semantic_dispatch_score,
+        semantic_dispatch_reasons,
         source_handles,
         staged_overlap,
         ownership: empty_conflict_matrix_ownership(&evidence.target),
@@ -13067,6 +13447,12 @@ fn apply_conflict_matrix_ownership_blocks(candidates: &mut [ConflictMatrixCandid
                     .unwrap_or_default()
             )
         }));
+        read_only_context.extend(
+            candidate
+                .semantic_dispatch_reasons
+                .iter()
+                .map(|reason| format!("semantic_rank: {reason}")),
+        );
         read_only_context = dedupe_preserve_order(read_only_context);
         let expansion_commands = conflict_matrix_expansion_commands(candidate);
         let title = format!(
@@ -13074,13 +13460,15 @@ fn apply_conflict_matrix_ownership_blocks(candidates: &mut [ConflictMatrixCandid
             candidate.rank, candidate.target, candidate.target_label
         );
         let prompt_body = format!(
-            "{title}\n\nOwned files:\n{}\n\nOwned symbols:\n{}\n\nRead-only context:\n{}\n\nForbidden files:\n{}\n\nExpected tests:\n{}\n\nExpansion commands:\n{}\n\nFail closed if the task requires a forbidden/shared file, an unowned config file, or a public contract change outside this ownership block.",
+            "{title}\n\nOwned files:\n{}\n\nOwned symbols:\n{}\n\nRead-only context:\n{}\n\nForbidden files:\n{}\n\nExpected tests:\n{}\n\nExpansion commands:\n{}\n\nSemantic dispatch score: {}\n{}\n\nFail closed if the task requires a forbidden/shared file, an unowned config file, or a public contract change outside this ownership block.",
             markdown_list(&candidate.owned_files),
             markdown_list(&candidate.owned_symbols),
             markdown_list(&read_only_context),
             markdown_list(&forbidden_files),
             markdown_list(&expected_tests),
             markdown_list(&expansion_commands),
+            candidate.semantic_dispatch_score,
+            markdown_list(&candidate.semantic_dispatch_reasons),
         );
         let token_budget = conflict_matrix_token_budget(&prompt_body, &candidate.source_handles);
         let prompt = format!(
@@ -13092,6 +13480,7 @@ fn apply_conflict_matrix_ownership_blocks(candidates: &mut [ConflictMatrixCandid
             token_budget.max_context_bytes,
         );
         candidate.ownership = ConflictMatrixOwnershipBlock {
+            contract_version: WORKER_PROMPT_PACKET_CONTRACT_VERSION,
             title,
             owned_files: candidate.owned_files.clone(),
             owned_symbols: candidate.owned_symbols.clone(),
@@ -13112,9 +13501,21 @@ fn conflict_matrix_worker_prompt_packets(
     candidates
         .iter()
         .map(|candidate| ConflictMatrixWorkerPromptPacket {
+            contract_version: WORKER_PROMPT_PACKET_CONTRACT_VERSION,
+            packet_id: stable_handle(
+                "wpp",
+                &format!(
+                    "{}:{}:{}:{}",
+                    WORKER_PROMPT_PACKET_CONTRACT_VERSION,
+                    candidate.target,
+                    candidate.target_node_id,
+                    candidate.projection_hash.as_deref().unwrap_or("no-hash")
+                ),
+            ),
             target: candidate.target.clone(),
             rank: candidate.rank,
             risk: candidate.risk,
+            projection_hash: candidate.projection_hash.clone(),
             title: candidate.ownership.title.clone(),
             owned_files: candidate.ownership.owned_files.clone(),
             owned_symbols: candidate.ownership.owned_symbols.clone(),
@@ -13123,6 +13524,8 @@ fn conflict_matrix_worker_prompt_packets(
             expected_tests: candidate.ownership.expected_tests.clone(),
             expansion_commands: candidate.ownership.expansion_commands.clone(),
             token_budget: candidate.ownership.token_budget.clone(),
+            semantic_dispatch_score: candidate.semantic_dispatch_score,
+            semantic_dispatch_reasons: candidate.semantic_dispatch_reasons.clone(),
             prompt: candidate.ownership.prompt.clone(),
         })
         .collect()
@@ -13136,7 +13539,13 @@ fn conflict_matrix_orchestration_observability(
 ) -> ConflictMatrixOrchestrationObservability {
     let evidence_packet_ids = candidates
         .iter()
-        .map(|candidate| format!("{}:{}", candidate.target, candidate.target_node_id))
+        .map(|candidate| candidate.evidence_packet_id.clone())
+        .collect::<Vec<_>>();
+    let projection_hashes = candidates
+        .iter()
+        .filter_map(|candidate| candidate.projection_hash.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect::<Vec<_>>();
     let mut conflict_matrix_decisions = candidates
         .iter()
@@ -13166,7 +13575,9 @@ fn conflict_matrix_orchestration_observability(
         .map(|candidate| candidate.ownership.title.clone())
         .collect::<Vec<_>>();
     ConflictMatrixOrchestrationObservability {
+        contract_version: CONFLICT_MATRIX_CONTRACT_VERSION,
         projection_freshness: freshness.clone(),
+        projection_hashes,
         evidence_packet_ids,
         conflict_matrix_decisions,
         worker_ownership_blocks,
@@ -13344,6 +13755,7 @@ fn cmd_conflict_matrix(
 
     let mut warnings = context_pack.status_reminders.clone();
     let mut candidates = Vec::new();
+    let mut evidence_packets = Vec::new();
     for target in &targets {
         let evidence = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
             root: &root,
@@ -13358,6 +13770,26 @@ fn cmd_conflict_matrix(
         })
         .with_context(|| format!("collecting graph-db evidence for {target}"))?;
         warnings.extend(evidence.warnings.clone());
+        evidence_packets.push(ConflictMatrixEvidencePacketSummary {
+            target: evidence.target.clone(),
+            packet_id: evidence.packet_id.clone(),
+            target_node_id: evidence.target_node.id.clone(),
+            projection_hash: evidence.projection_hash.clone(),
+            replay_command: evidence
+                .replay_commands
+                .first()
+                .cloned()
+                .unwrap_or_else(|| {
+                    format!(
+                        "tsift graph-db --path {}{} evidence {} --depth {} --limit {} --json",
+                        shell_quote(root.to_string_lossy().as_ref()),
+                        graph_db_scope_arg(scope),
+                        shell_quote(target),
+                        depth,
+                        limit
+                    )
+                }),
+        });
         candidates.push(conflict_matrix_candidate_from_evidence(
             &root,
             &evidence,
@@ -13405,6 +13837,7 @@ fn cmd_conflict_matrix(
     );
     let inputs = ConflictMatrixInputSummary {
         graph_db_evidence_targets: targets.clone(),
+        evidence_packets,
         context_pack_command: format!(
             "tsift --envelope context-pack {} --budget normal",
             shell_quote(path.to_string_lossy().as_ref())
@@ -13424,6 +13857,7 @@ fn cmd_conflict_matrix(
     };
     let context_summary = conflict_matrix_context_summary(&context_pack);
     let report = ConflictMatrixReport {
+        contract_version: CONFLICT_MATRIX_CONTRACT_VERSION,
         root: root.to_string_lossy().to_string(),
         scope: scope.map(str::to_string),
         targets,
@@ -14880,6 +15314,7 @@ struct SessionReviewBudgetReport {
 
 #[derive(Serialize)]
 struct SessionReviewNextContextBudgetReport {
+    contract_version: &'static str,
     target: String,
     max_items: usize,
     max_bytes: usize,
@@ -14899,8 +15334,10 @@ struct SessionReviewNextContextBudgetReport {
 
 #[derive(Serialize)]
 struct ContextPackGraphOrchestration {
+    contract_version: &'static str,
     graph_db_command: String,
     projection_freshness: GraphDbFreshnessReport,
+    projection_hashes: Vec<String>,
     evidence_packet_ids: Vec<String>,
     conflict_matrix_decisions: Vec<String>,
     worker_ownership_blocks: Vec<String>,
@@ -15206,6 +15643,7 @@ fn build_session_review_next_context_budget_report(
     let max_bytes = budget.preview_bytes();
     let follow_up_items = budget.follow_up_items();
     SessionReviewNextContextBudgetReport {
+        contract_version: SESSION_REVIEW_FOLLOW_UP_CONTRACT_VERSION,
         target: report.next_context.target.clone(),
         max_items,
         max_bytes,
@@ -16329,7 +16767,11 @@ fn context_pack_graph_orchestration(
     for target in &targets {
         match graph_db_resolve_evidence_target(&store, target)? {
             Some(node) => {
-                evidence_packet_ids.push(format!("{target}:{}", node.id));
+                evidence_packet_ids.push(graph_db_evidence_packet_id(
+                    target,
+                    &node,
+                    &projection_freshness,
+                ));
                 resolvable_targets.push(target.clone());
             }
             None => warnings.push(format!("graph evidence target not found: {target}")),
@@ -16372,13 +16814,20 @@ fn context_pack_graph_orchestration(
         .iter()
         .map(|worker| format!("{} scopes {}", worker.handle, worker.summary))
         .collect::<Vec<_>>();
+    let projection_hashes = projection_freshness
+        .content_hash
+        .clone()
+        .into_iter()
+        .collect();
 
     Ok(ContextPackGraphOrchestration {
+        contract_version: CONTEXT_PACK_GRAPH_ORCHESTRATION_CONTRACT_VERSION,
         graph_db_command: format!(
             "tsift graph-db --path {} status --json",
             shell_quote(root.to_string_lossy().as_ref())
         ),
         projection_freshness,
+        projection_hashes,
         evidence_packet_ids,
         conflict_matrix_decisions,
         worker_ownership_blocks,
@@ -20504,6 +20953,7 @@ agent_doc_format: template
 
 <!-- agent:exchange patch=append -->
 ❯ do [#kgnv]
+Completed `#kgnv`; touched files `main.rs`; tests `cargo test traversal_graph`; follow-up `#gfix`.
 <!-- /agent:exchange -->
 
 <!-- agent:queue -->
@@ -20734,6 +21184,16 @@ def list_items():
                     == Some(&"tasks/software/tsift.md".to_string())),
             "expected bounded worker_context rows, got {worker_context:?}"
         );
+        let worker_results = store.nodes_by_kind("worker_result").unwrap();
+        assert!(
+            worker_results.iter().any(|node| {
+                node.properties.get("ref_id") == Some(&"kgnv".to_string())
+                    && node.properties.get("status") == Some(&"completed".to_string())
+                    && node.properties.get("touched_files") == Some(&"main.rs".to_string())
+                    && node.properties.get("follow_up_ids") == Some(&"gfix".to_string())
+            }),
+            "expected worker_result rows, got {worker_results:?}"
+        );
     }
 
     #[test]
@@ -20875,6 +21335,14 @@ def list_items():
         assert!(semantic_candidate.semantic_dispatch_score > 0);
         assert!(
             semantic_candidate
+                .semantic_dispatch_reasons
+                .iter()
+                .any(|reason| reason.contains("semantic_concept") && reason.contains("owned file")),
+            "expected semantic ranking explanations, got {:?}",
+            semantic_candidate.semantic_dispatch_reasons
+        );
+        assert!(
+            semantic_candidate
                 .semantic_related
                 .iter()
                 .any(|item| item.label == "graph navigation")
@@ -20884,6 +21352,7 @@ def list_items():
         plain_candidate.target = "plain".to_string();
         plain_candidate.semantic_related.clear();
         plain_candidate.semantic_dispatch_score = 0;
+        plain_candidate.semantic_dispatch_reasons.clear();
         let mut ranked = [plain_candidate, semantic_candidate];
         ranked.sort_by(|left, right| {
             left.risk
@@ -20988,6 +21457,40 @@ def list_items():
             source_watermark: None,
             diagnostics: Vec::new(),
         }
+    }
+
+    #[test]
+    fn graph_db_evidence_fails_closed_with_repair_command_for_stale_freshness() {
+        let dir = setup_traversal_project();
+        refresh_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
+        let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
+        let stale = GraphDbFreshnessReport {
+            status: "stale".to_string(),
+            fail_closed: true,
+            projection_version: Some("old-v0".to_string()),
+            content_hash: None,
+            source_watermark: None,
+            diagnostics: vec!["projection content hash is missing".to_string()],
+        };
+
+        let err = match graph_db_evidence_report_from_store(GraphDbEvidenceInput {
+            root: dir.path(),
+            scope: None,
+            backend: "sqlite",
+            target: "kgnv",
+            depth: 3,
+            limit: 8,
+            store: &store,
+            freshness: stale,
+            warnings: Vec::new(),
+        }) {
+            Ok(_) => panic!("stale graph freshness should fail closed"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("failed closed"), "{message}");
+        assert!(message.contains("graph-db --path"), "{message}");
+        assert!(message.contains("refresh --json"), "{message}");
     }
 
     fn paged_graph_ids(
@@ -25014,6 +25517,10 @@ tier = "private"
         .unwrap();
 
         assert_eq!(
+            report.graph_orchestration.contract_version,
+            CONTEXT_PACK_GRAPH_ORCHESTRATION_CONTRACT_VERSION
+        );
+        assert_eq!(
             report
                 .graph_orchestration
                 .projection_freshness
@@ -25021,12 +25528,13 @@ tier = "private"
                 .as_str(),
             "current"
         );
+        assert!(!report.graph_orchestration.projection_hashes.is_empty());
         assert!(
             report
                 .graph_orchestration
                 .evidence_packet_ids
                 .iter()
-                .any(|id| id.starts_with("kgnv:")),
+                .any(|id| id.starts_with("gevd-")),
             "{:?}",
             report.graph_orchestration.evidence_packet_ids
         );

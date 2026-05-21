@@ -2,6 +2,24 @@
 
 These examples document the SQLite and Convex graph DB paths with reusable commands and small fixtures.
 
+## Graph Orchestration Contracts
+
+`graph-orchestration-contracts.json` is a compact fixture for the versioned JSON
+fields that agent-doc should consume:
+
+- `graph-db-evidence-v1` for `graph-db evidence` packets with `packet_id`,
+  `projection_hash`, `worker_results`, `replay_commands`, and `repair_commands`
+- `worker-prompt-packet-v1` for conflict-matrix `worker_prompt_packets`
+- `conflict-matrix-v1` for planner decisions keyed by evidence packet ids
+- `context-pack-graph-orchestration-v1` for context-pack freshness/evidence
+  observability
+- `session-review-follow-up-v1` for session-review next-context commands
+
+```bash
+tsift graph-db --path . schema --json
+cat fixtures/graph-db-operator-examples/graph-orchestration-contracts.json
+```
+
 ## SQLite Graph DB Reads
 
 ```bash
@@ -16,6 +34,22 @@ tsift graph-db --path . neighborhood gbak-example --depth 2 --edge-kind mentions
 `graph-db refresh` materializes `.tsift/graph.db` explicitly; `graph-db status`
 reports projection version, content hash, source watermark, row counts, and
 tombstone counts without refreshing.
+
+## Graph-Backed Dispatch Path
+
+Run the operator path in order when preparing parallel worker dispatch:
+
+```bash
+tsift graph-db --path . refresh --json
+tsift graph-db --path . evidence gsch --depth 3 --limit 8 --json
+tsift conflict-matrix --path tasks/software/tsift.md gsch grev wres --json
+tsift --envelope context-pack tasks/software/tsift.md --budget normal --json
+tsift session-review tasks/software/tsift.md --next-context --json
+```
+
+Use evidence `packet_id` plus `projection_hash` as replay proof. If a packet or
+conflict-matrix input reports stale/missing freshness, stop dispatch and run the
+emitted `repair_commands` before trusting the worker ownership blocks.
 
 ## Convex Sync Dry Run
 
@@ -73,3 +107,6 @@ tsift traverse <source_handle_or_job_packet_handle> --path . --depth 1 --format 
 ```
 
 The context pack stores `source_handle` and `worker_context` nodes in the graph. Agent-doc queue entries become `job_packet` nodes, so workers can keep handoff scope, source windows, and queued backlog items linked by stable handles.
+Completed or blocked worker responses become `worker_result` nodes with status,
+touched files, expected tests, and follow-up ids, then link back to backlog/job
+handles and source windows for the next dispatch cycle.

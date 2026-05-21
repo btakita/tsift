@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- Graph orchestration JSON surfaces now publish explicit contract versions and replay metadata: `graph-db evidence` emits `packet_id`, `projection_hash`, `worker_results`, `replay_commands`, and `repair_commands`; `conflict-matrix`, `worker_prompt_packets`, `context-pack graph_orchestration`, and `session-review --next-context` carry matching contract markers for agent-doc consumers.
+- Completed/blocked agent-doc worker responses now materialize as `worker_result` graph rows linked to backlog/job/source handles with status, touched files, expected tests, and follow-up ids, so later graph evidence can reason over prior worker outcomes.
+- Semantic dispatch ranking now includes fixture-covered score explanations while keeping file/symbol/test/config overlap as the hard fail-closed gate.
+- Added `fixtures/graph-db-operator-examples/graph-orchestration-contracts.json` plus end-to-end refresh/evidence/conflict-matrix/context-pack/session-review operator commands for graph-backed dispatch.
 - `conflict-matrix` now emits first-class `worker_prompt_packets` with owned files/symbols, read-only context, forbidden files, expected tests, expansion commands, and token budgets; target-specific source ownership prevents unrelated workers from inheriting every visible source window.
 - Graph orchestration observability now carries projection freshness, evidence packet ids, conflict-matrix decisions, ownership block labels, and follow-up graph commands through `conflict-matrix`, `context-pack`, and `session-review --next-context`.
 - `graph-db evidence` now includes reachable semantic concept/entity rows, and `conflict-matrix` uses those semantic rows as a ranking signal without overriding file/symbol/test/config conflict gates.
