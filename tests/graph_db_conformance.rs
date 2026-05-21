@@ -489,6 +489,7 @@ fn conflict_candidate_summaries(report: &Value) -> Vec<Value> {
                 "rank": candidate["rank"],
                 "target": candidate["target"],
                 "risk": candidate["risk"],
+                "previously_completed": candidate["previously_completed"],
                 "owned_files": candidate["owned_files"],
                 "owned_symbols": candidate["owned_symbols"],
                 "affected_tests": candidate["affected_tests"],
@@ -515,6 +516,7 @@ fn worker_prompt_packet_summaries(report: &Value) -> Vec<Value> {
                 "target": packet["target"],
                 "rank": packet["rank"],
                 "risk": packet["risk"],
+                "previously_completed": packet["previously_completed"],
                 "packet_id_prefix": packet["packet_id"]
                     .as_str()
                     .unwrap()
@@ -1432,6 +1434,71 @@ fn conflict_matrix_separates_per_target_fail_closed_from_cross_target_overlap() 
     );
     assert!(
         report["conflicts"].as_array().unwrap().is_empty(),
+        "{report}"
+    );
+}
+
+#[test]
+fn conflict_matrix_downgrades_completed_worker_result_without_source_handles() {
+    let project = graph_db_project();
+    init_git_repo(project.path());
+    let session = project.path().join("tasks/software/tsift.md");
+
+    let report = assert_tsift_json(vec![
+        "conflict-matrix".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--depth".to_string(),
+        "1".to_string(),
+        "--json".to_string(),
+        "gval".to_string(),
+    ]);
+
+    assert_eq!(report["fail_closed"], false, "{report}");
+    assert_eq!(report["can_parallel"], true, "{report}");
+    assert!(
+        report["per_target_fail_closed"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{report}"
+    );
+
+    let candidate = &report["candidates"].as_array().unwrap()[0];
+    assert_eq!(candidate["target"], "gval", "{report}");
+    assert_eq!(candidate["risk"], "low", "{report}");
+    assert_eq!(candidate["previously_completed"], true, "{report}");
+    assert!(
+        candidate["owned_files"].as_array().unwrap().is_empty(),
+        "{report}"
+    );
+    assert!(
+        candidate["source_handles"].as_array().unwrap().is_empty(),
+        "{report}"
+    );
+    assert_eq!(candidate["worker_feedback"]["completed"], 1, "{report}");
+    assert!(
+        candidate["risk_reasons"].as_array().unwrap().is_empty(),
+        "completed worker_result should downgrade no-owned-files to info, not a hard risk reason: {report}"
+    );
+    assert!(
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("previously completed")),
+        "{report}"
+    );
+    assert!(
+        report["worker_prompt_packets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|packet| {
+                packet["target"] == "gval"
+                    && packet["previously_completed"] == true
+                    && packet["risk"] == "low"
+            }),
         "{report}"
     );
 }

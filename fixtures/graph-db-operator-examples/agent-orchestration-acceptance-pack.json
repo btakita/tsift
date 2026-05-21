@@ -226,6 +226,7 @@
           "rank": 1,
           "target": "wfdb",
           "risk": "low",
+          "previously_completed": false,
           "owned_files": [
             "clean.rs",
             "closure.rs",
@@ -263,6 +264,7 @@
           "rank": 2,
           "target": "wfok",
           "risk": "low",
+          "previously_completed": true,
           "owned_files": [
             "clean.rs",
             "closure.rs",
@@ -296,6 +298,7 @@
           "target": "wfdb",
           "rank": 1,
           "risk": "low",
+          "previously_completed": false,
           "packet_id_prefix": "wpp",
           "owned_files": [
             "clean.rs",
@@ -324,6 +327,7 @@
           "target": "wfok",
           "rank": 2,
           "risk": "low",
+          "previously_completed": true,
           "packet_id_prefix": "wpp",
           "owned_files": [
             "clean.rs",
@@ -358,6 +362,7 @@
           "target": "wfdb",
           "rank": 1,
           "risk": "low",
+          "previously_completed": false,
           "packet_id_prefix": "wpp",
           "owned_files": [
             "clean.rs",
@@ -386,6 +391,7 @@
           "target": "wfok",
           "rank": 2,
           "risk": "low",
+          "previously_completed": true,
           "packet_id_prefix": "wpp",
           "owned_files": [
             "clean.rs",

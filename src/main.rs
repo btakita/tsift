@@ -13019,6 +13019,7 @@ struct ConflictMatrixWorkerPromptPacket {
     target: String,
     rank: usize,
     risk: ConflictMatrixRisk,
+    previously_completed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     projection_hash: Option<String>,
     title: String,
@@ -13046,6 +13047,7 @@ struct ConflictMatrixCandidate {
     target_kind: String,
     target_label: String,
     risk: ConflictMatrixRisk,
+    previously_completed: bool,
     risk_score: usize,
     risk_reasons: Vec<String>,
     owned_files: Vec<String>,
@@ -13110,6 +13112,7 @@ struct ConflictMatrixContextSummary {
 #[derive(Clone, Debug, Serialize)]
 struct ConflictMatrixPerTargetFailClosed {
     target: String,
+    previously_completed: bool,
     risk_reasons: Vec<String>,
     owned_files: Vec<String>,
     source_handle_count: usize,
@@ -13677,10 +13680,17 @@ fn conflict_matrix_candidate_from_evidence(
     let affected_tests =
         conflict_matrix_affected_tests(impact_report, &files, &symbols, &staged_overlap);
     staged_overlap.tests = affected_tests.clone();
+    let mut worker_feedback = conflict_matrix_worker_feedback(&evidence.worker_results);
+    let previously_completed = worker_feedback.completed > 0;
 
     let mut risk_score = 0usize;
     let mut risk_reasons = Vec::new();
-    if files.is_empty() {
+    if files.is_empty() && previously_completed {
+        worker_feedback.warnings.push(format!(
+            "previously completed: {} completed worker_result row(s) exist without source ownership evidence; treating no-owned-files as informational instead of per-target fail-closed",
+            worker_feedback.completed
+        ));
+    } else if files.is_empty() {
         risk_score += 120;
         risk_reasons.push("no source ownership evidence; fail closed before dispatch".to_string());
     }
@@ -13704,7 +13714,7 @@ fn conflict_matrix_candidate_from_evidence(
         risk_score += affected_tests.len() * 5;
         risk_reasons.push("candidate fans into multiple affected test commands".to_string());
     }
-    let risk = if files.is_empty()
+    let risk = if (files.is_empty() && !previously_completed)
         || !staged_overlap.config_files.is_empty()
         || !staged_overlap.files.is_empty()
     {
@@ -13734,7 +13744,6 @@ fn conflict_matrix_candidate_from_evidence(
         .collect::<Vec<_>>();
     let (semantic_dispatch_score, semantic_dispatch_reasons) =
         conflict_matrix_semantic_dispatch_score(&semantic_related, &files, &symbols);
-    let worker_feedback = conflict_matrix_worker_feedback(&evidence.worker_results);
 
     ConflictMatrixCandidate {
         rank: 0,
@@ -13745,6 +13754,7 @@ fn conflict_matrix_candidate_from_evidence(
         target_kind: evidence.target_node.kind.clone(),
         target_label: evidence.target_node.label.clone(),
         risk,
+        previously_completed,
         risk_score,
         risk_reasons,
         owned_files: sorted_set(&files),
@@ -13860,6 +13870,7 @@ fn conflict_matrix_per_target_fail_closed(
         .filter(|candidate| candidate.risk == ConflictMatrixRisk::FailClosed)
         .map(|candidate| ConflictMatrixPerTargetFailClosed {
             target: candidate.target.clone(),
+            previously_completed: candidate.previously_completed,
             risk_reasons: candidate.risk_reasons.clone(),
             owned_files: candidate.owned_files.clone(),
             source_handle_count: candidate.source_handles.len(),
@@ -14059,6 +14070,7 @@ fn conflict_matrix_worker_prompt_packets(
             target: candidate.target.clone(),
             rank: candidate.rank,
             risk: candidate.risk,
+            previously_completed: candidate.previously_completed,
             projection_hash: candidate.projection_hash.clone(),
             title: candidate.ownership.title.clone(),
             owned_files: candidate.ownership.owned_files.clone(),
@@ -14096,10 +14108,11 @@ fn conflict_matrix_orchestration_observability(
         .iter()
         .map(|candidate| {
             format!(
-                "candidate #{} {} risk={} closure_score={} semantic_score={} owned_files={} forbidden_files={}",
+                "candidate #{} {} risk={} previously_completed={} closure_score={} semantic_score={} owned_files={} forbidden_files={}",
                 candidate.rank,
                 candidate.target,
                 conflict_risk_label(candidate.risk),
+                candidate.previously_completed,
                 candidate.worker_feedback.closure_rank_score,
                 candidate.semantic_dispatch_score,
                 candidate.ownership.owned_files.len(),
@@ -14234,6 +14247,9 @@ fn print_conflict_matrix_human(report: &ConflictMatrixReport, compact: bool) {
             candidate.owned_symbols.len(),
             candidate.affected_tests.len()
         );
+        if candidate.previously_completed {
+            println!("  previously completed: true");
+        }
         for reason in &candidate.risk_reasons {
             println!("  reason: {reason}");
         }
