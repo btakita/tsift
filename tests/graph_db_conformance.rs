@@ -89,6 +89,16 @@ fn helper() {}
 "#,
     )
     .unwrap();
+    fs::write(
+        dir.path().join("isolated.rs"),
+        r#"pub fn independent_worker() {
+    isolated_leaf();
+}
+
+fn isolated_leaf() {}
+"#,
+    )
+    .unwrap();
 
     let task_dir = dir.path().join("tasks/software");
     fs::create_dir_all(&task_dir).unwrap();
@@ -105,17 +115,21 @@ agent_doc_format: template
 ### Re: setup
 <!-- /agent:exchange -->
 
-<!-- agent:queue -->
-dispatch #spec-test-build-install-commit-push
-- do [#gval]
-<!-- /agent:queue -->
+	<!-- agent:queue -->
+	dispatch #spec-test-build-install-commit-push
+	- do [#gval]
+	- do [#shrd]
+		- do [#solo]
+		<!-- /agent:queue -->
 
-## Backlog
+		## Backlog
 
-<!-- agent:backlog -->
-- [ ] [#gval] Verify helper bridge graph-db conformance.
-<!-- /agent:backlog -->
-"#,
+		<!-- agent:backlog -->
+	- [ ] [#gval] Verify helper bridge graph-db conformance.
+	- [ ] [#shrd] Adjust shared helper ownership in main module.
+	- [ ] [#solo] Update independent worker fixture in isolated module.
+	<!-- /agent:backlog -->
+	"#,
     )
     .unwrap();
 
@@ -760,6 +774,118 @@ fn conflict_matrix_cli_composes_planner_evidence_and_worker_ownership() {
             .unwrap()
             .iter()
             .any(|command| command.as_str().unwrap().contains("graph-db --path")),
+        "{report}"
+    );
+}
+
+#[test]
+fn conflict_matrix_multi_worker_fixture_blocks_shared_files_and_emits_prompt_packets() {
+    let project = graph_db_project();
+    init_git_repo(project.path());
+    let session = project.path().join("tasks/software/tsift.md");
+
+    let evidence = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "evidence".to_string(),
+            "solo".to_string(),
+            "--depth".to_string(),
+            "3".to_string(),
+            "--limit".to_string(),
+            "8".to_string(),
+        ],
+    );
+    assert!(
+        evidence["source_handles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["properties"]["file"] == "isolated.rs"),
+        "{evidence}"
+    );
+
+    let report = assert_tsift_json(vec![
+        "conflict-matrix".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "gval".to_string(),
+        "shrd".to_string(),
+        "solo".to_string(),
+    ]);
+    let candidates = report["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 3, "{report}");
+
+    let solo = candidates
+        .iter()
+        .find(|candidate| candidate["target"] == "solo")
+        .unwrap();
+    assert!(
+        solo["owned_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file == "isolated.rs"),
+        "{report}"
+    );
+    assert!(
+        solo["ownership"]["forbidden_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file == "main.rs"),
+        "{report}"
+    );
+
+    let pairs = report["conflicts"].as_array().unwrap();
+    assert!(
+        pairs.iter().any(|pair| {
+            pair["risk"] == "fail_closed"
+                && pair["shared_files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|file| file == "main.rs")
+        }),
+        "{report}"
+    );
+    assert!(
+        pairs.iter().any(|pair| {
+            let left = pair["left"].as_str().unwrap();
+            let right = pair["right"].as_str().unwrap();
+            (left == "solo" || right == "solo")
+                && pair["shared_files"].as_array().unwrap().is_empty()
+        }),
+        "{report}"
+    );
+
+    let packets = report["worker_prompt_packets"].as_array().unwrap();
+    assert_eq!(packets.len(), 3, "{report}");
+    let solo_packet = packets
+        .iter()
+        .find(|packet| packet["target"] == "solo")
+        .unwrap();
+    assert!(
+        solo_packet["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("Expansion commands"),
+        "{report}"
+    );
+    assert!(
+        solo_packet["token_budget"]["source_window_count"]
+            .as_u64()
+            .unwrap()
+            >= 1,
+        "{report}"
+    );
+    assert!(
+        report["orchestration"]["conflict_matrix_decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|decision| decision.as_str().unwrap().contains("candidate #")),
         "{report}"
     );
 }

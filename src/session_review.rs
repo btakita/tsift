@@ -891,6 +891,33 @@ fn build_next_context(
 
     let mut unresolved_failures = failures.to_vec();
     unresolved_failures.extend(guardrail_next_context_failures(guardrails));
+    let mut next_digest_commands = vec![
+        format!(
+            "tsift session-review --next-context {}",
+            shell_quote(&session_target)
+        ),
+        "tsift diff-digest .".to_string(),
+        "tsift test-digest --path . < test.log".to_string(),
+        "tsift log-digest --path . < build.log".to_string(),
+    ];
+    let graph_targets = extract_backlog_refs(&active_prompt_targets);
+    for target in &graph_targets {
+        next_digest_commands.push(format!(
+            "tsift graph-db --path . evidence {} --depth 3 --limit 8 --json",
+            shell_quote(target)
+        ));
+    }
+    if !graph_targets.is_empty() {
+        next_digest_commands.push(format!(
+            "tsift conflict-matrix --path {} {} --json",
+            shell_quote(&session_target),
+            graph_targets
+                .iter()
+                .map(|target| shell_quote(target))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
 
     SessionReviewNextContext {
         target,
@@ -905,16 +932,35 @@ fn build_next_context(
             .map(|entry| entry.symbol.clone())
             .collect(),
         unresolved_failures,
-        next_digest_commands: vec![
-            format!(
-                "tsift session-review --next-context {}",
-                shell_quote(&session_target)
-            ),
-            "tsift diff-digest .".to_string(),
-            "tsift test-digest --path . < test.log".to_string(),
-            "tsift log-digest --path . < build.log".to_string(),
-        ],
+        next_digest_commands,
     }
+}
+
+fn extract_backlog_refs(inputs: &[String]) -> Vec<String> {
+    let mut refs = Vec::new();
+    let mut seen = BTreeSet::new();
+    for input in inputs {
+        for token in input.split(|ch: char| {
+            !(ch.is_ascii_alphanumeric()
+                || ch == '#'
+                || ch == '_'
+                || ch == '-'
+                || ch == '['
+                || ch == ']')
+        }) {
+            let Some(hash) = token.find('#') else {
+                continue;
+            };
+            let normalized = token[hash + 1..]
+                .trim()
+                .trim_matches(|ch: char| matches!(ch, '[' | ']'))
+                .trim();
+            if !normalized.is_empty() && seen.insert(normalized.to_string()) {
+                refs.push(normalized.to_string());
+            }
+        }
+    }
+    refs
 }
 
 fn guardrail_next_context_failures(

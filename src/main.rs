@@ -5048,39 +5048,28 @@ fn traversal_projection_from_graph(
     Ok(GraphProjection { nodes, edges })
 }
 
-fn append_traversal_context_projection_rows(
+#[allow(clippy::too_many_arguments)]
+fn ensure_traversal_source_handle(
     root: &Path,
-    graph: &TraversalGraphBuild,
     provenance: &GraphProvenance,
+    file_node_by_path: &BTreeMap<String, String>,
+    node: &TraversalNode,
+    budget: &ExplorationBudget,
+    source_handle_by_node: &mut BTreeMap<String, String>,
+    seen_windows: &mut BTreeMap<(String, usize, usize), String>,
     nodes: &mut Vec<SubstrateGraphNode>,
     edges: &mut Vec<SubstrateGraphEdge>,
-) -> Result<()> {
-    let budget = exploration_budget_for_counts(graph.nodes.len(), graph.edges.len());
-    let file_node_by_path = graph
-        .nodes
-        .values()
-        .filter(|node| node.kind == "file")
-        .filter_map(|node| {
-            node.path
-                .as_ref()
-                .map(|path| (path.clone(), node.handle.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
-
-    let mut seen_windows = BTreeSet::new();
-    let mut source_handles = Vec::new();
-    for node in graph.nodes.values() {
-        if source_handles.len() >= budget.max_source_windows {
-            break;
-        }
-        let Some(window) = exploration_source_window_for_node(root, node, &budget) else {
-            continue;
-        };
-        let window_key = (window.file.clone(), window.start, window.end);
-        if !seen_windows.insert(window_key) {
-            continue;
-        }
-
+) -> Result<Option<String>> {
+    if let Some(handle) = source_handle_by_node.get(&node.handle) {
+        return Ok(Some(handle.clone()));
+    }
+    let Some(window) = exploration_source_window_for_node(root, node, budget) else {
+        return Ok(None);
+    };
+    let window_key = (window.file.clone(), window.start, window.end);
+    let handle = if let Some(handle) = seen_windows.get(&window_key) {
+        handle.clone()
+    } else {
         let label = format!("{}:{}-{}", window.file, window.start, window.end);
         let projected = SubstrateGraphNode::new(window.handle.clone(), "source_handle", label)
             .with_property("handle", window.handle.clone())
@@ -5102,15 +5091,167 @@ fn append_traversal_context_projection_rows(
             .with_provenance(provenance.clone());
             edges.push(edge_with_content_freshness(edge)?);
         }
-        source_handles.push(window.handle);
+        if node.kind != "file" {
+            let edge = SubstrateGraphEdge::new(
+                window.handle.clone(),
+                node.handle.clone(),
+                "anchors_source",
+            )
+            .with_property("label", window.reason.clone())
+            .with_provenance(provenance.clone());
+            edges.push(edge_with_content_freshness(edge)?);
+        }
+        seen_windows.insert(window_key, window.handle.clone());
+        window.handle
+    };
+    source_handle_by_node.insert(node.handle.clone(), handle.clone());
+    Ok(Some(handle))
+}
+
+fn push_traversal_backlog_target_handles<'a>(
+    backlog: &TraversalNode,
+    edges_by_from: &BTreeMap<&'a str, Vec<&'a TraversalEdge>>,
+    node_by_handle: &BTreeMap<&'a str, &'a TraversalNode>,
+    max_handles: usize,
+    seen_target_nodes: &mut BTreeSet<String>,
+    target_node_handles: &mut Vec<String>,
+) {
+    for edge in edges_by_from
+        .get(backlog.handle.as_str())
+        .into_iter()
+        .flatten()
+        .filter(|edge| edge.relation == "mentions")
+    {
+        let Some(target_node) = node_by_handle.get(edge.to.as_str()) else {
+            continue;
+        };
+        if !matches!(target_node.kind.as_str(), "file" | "symbol" | "route") {
+            continue;
+        }
+        if seen_target_nodes.insert(target_node.handle.clone()) {
+            target_node_handles.push(target_node.handle.clone());
+        }
+        if target_node_handles.len() >= max_handles {
+            break;
+        }
     }
+}
+
+fn append_traversal_context_projection_rows(
+    root: &Path,
+    graph: &TraversalGraphBuild,
+    provenance: &GraphProvenance,
+    nodes: &mut Vec<SubstrateGraphNode>,
+    edges: &mut Vec<SubstrateGraphEdge>,
+) -> Result<()> {
+    let budget = exploration_budget_for_counts(graph.nodes.len(), graph.edges.len());
+    let file_node_by_path = graph
+        .nodes
+        .values()
+        .filter(|node| node.kind == "file")
+        .filter_map(|node| {
+            node.path
+                .as_ref()
+                .map(|path| (path.clone(), node.handle.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let node_by_handle = graph
+        .nodes
+        .values()
+        .map(|node| (node.handle.as_str(), node))
+        .collect::<BTreeMap<_, _>>();
+    let mut edges_by_from = BTreeMap::<&str, Vec<&TraversalEdge>>::new();
+    for edge in &graph.edges {
+        edges_by_from
+            .entry(edge.from.as_str())
+            .or_default()
+            .push(edge);
+    }
+    for rows in edges_by_from.values_mut() {
+        rows.sort_by(|left, right| {
+            right
+                .weight
+                .cmp(&left.weight)
+                .then(left.relation.cmp(&right.relation))
+                .then(left.to.cmp(&right.to))
+        });
+    }
+
+    let mut seen_windows = BTreeMap::<(String, usize, usize), String>::new();
+    let mut source_handle_by_node = BTreeMap::<String, String>::new();
 
     let mut worker_count = 0usize;
     for node in graph.nodes.values() {
-        if worker_count >= budget.relationship_limit.min(8) || source_handles.is_empty() {
+        if worker_count >= budget.relationship_limit.min(8) {
             break;
         }
         if node.kind != "backlog" && node.kind != "job_packet" {
+            continue;
+        }
+        let mut target_node_handles = Vec::new();
+        let mut seen_target_nodes = BTreeSet::new();
+        if node.kind == "backlog" {
+            push_traversal_backlog_target_handles(
+                node,
+                &edges_by_from,
+                &node_by_handle,
+                budget.max_source_windows,
+                &mut seen_target_nodes,
+                &mut target_node_handles,
+            );
+        } else {
+            for edge in edges_by_from
+                .get(node.handle.as_str())
+                .into_iter()
+                .flatten()
+                .filter(|edge| edge.relation == "targets")
+            {
+                let Some(backlog) = node_by_handle.get(edge.to.as_str()) else {
+                    continue;
+                };
+                push_traversal_backlog_target_handles(
+                    backlog,
+                    &edges_by_from,
+                    &node_by_handle,
+                    budget.max_source_windows,
+                    &mut seen_target_nodes,
+                    &mut target_node_handles,
+                );
+                if target_node_handles.len() >= budget.max_source_windows {
+                    break;
+                }
+            }
+        }
+
+        let mut worker_source_handles = Vec::new();
+        let mut seen_worker_handles = BTreeSet::new();
+        for target_handle in target_node_handles {
+            if worker_source_handles.len() >= budget.max_source_windows {
+                break;
+            }
+            let Some(target_node) = node_by_handle.get(target_handle.as_str()) else {
+                continue;
+            };
+            let Some(handle) = ensure_traversal_source_handle(
+                root,
+                provenance,
+                &file_node_by_path,
+                target_node,
+                &budget,
+                &mut source_handle_by_node,
+                &mut seen_windows,
+                nodes,
+                edges,
+            )?
+            else {
+                continue;
+            };
+            if seen_worker_handles.insert(handle.clone()) {
+                worker_source_handles.push(handle);
+            }
+        }
+        if worker_source_handles.is_empty() {
             continue;
         }
         let target = node
@@ -5123,6 +5264,10 @@ fn append_traversal_context_projection_rows(
             .with_property("handle", handle.clone())
             .with_property("target", target.clone())
             .with_property("summary", summary)
+            .with_property(
+                "source_handle_count",
+                worker_source_handles.len().to_string(),
+            )
             .with_property(
                 "expand",
                 format!(
@@ -5139,7 +5284,7 @@ fn append_traversal_context_projection_rows(
                 .with_provenance(provenance.clone());
         edges.push(edge_with_content_freshness(request_edge)?);
 
-        for source_handle in &source_handles {
+        for source_handle in &worker_source_handles {
             let scope_edge =
                 SubstrateGraphEdge::new(handle.clone(), source_handle.clone(), "scopes_source")
                     .with_property("label", "bounded worker source window".to_string())
@@ -6216,6 +6361,8 @@ struct GraphDbEvidenceReport {
     target_node: SubstrateGraphNode,
     worker_context: Vec<SubstrateGraphNode>,
     source_handles: Vec<SubstrateGraphNode>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    semantic_related: Vec<SubstrateGraphNode>,
     shortest_paths: Vec<GraphDbEvidencePath>,
     next_commands: Vec<String>,
     fixture_coverage: GraphDbFixtureCoverage,
@@ -7864,7 +8011,7 @@ fn graph_db_schema() -> GraphDbSchema {
             },
             GraphDbSchemaOperation {
                 command: "evidence <target> [--depth N] [--limit N]",
-                description: "Return a bounded graph-db handoff packet for a backlog id or job packet handle, including worker_context rows, source_handle rows, shortest paths, and next commands",
+                description: "Return a bounded graph-db handoff packet for a backlog id or job packet handle, including worker_context rows, source_handle rows, semantic_concept/entity rows, shortest paths, and next commands",
             },
             GraphDbSchemaOperation {
                 command: "schema",
@@ -8075,6 +8222,7 @@ fn graph_db_evidence_next_commands(
     target: &SubstrateGraphNode,
     worker_context: &[SubstrateGraphNode],
     source_handles: &[SubstrateGraphNode],
+    semantic_related: &[SubstrateGraphNode],
 ) -> Vec<String> {
     let mut commands = BTreeSet::new();
     if let Some(expand) = target.properties.get("expand") {
@@ -8087,6 +8235,11 @@ fn graph_db_evidence_next_commands(
     }
     for source in source_handles {
         if let Some(expand) = source.properties.get("expand") {
+            commands.insert(expand.clone());
+        }
+    }
+    for semantic in semantic_related {
+        if let Some(expand) = semantic.properties.get("expand") {
             commands.insert(expand.clone());
         }
     }
@@ -8136,6 +8289,31 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
     )?;
     let source_paths =
         graph_db_reachable_nodes_by_kind(store, &target_node.id, "source_handle", depth, max_rows)?;
+    let mut semantic_paths = graph_db_reachable_nodes_by_kind(
+        store,
+        &target_node.id,
+        "semantic_concept",
+        depth,
+        max_rows,
+    )?;
+    semantic_paths.extend(graph_db_reachable_nodes_by_kind(
+        store,
+        &target_node.id,
+        "semantic_entity",
+        depth,
+        max_rows,
+    )?);
+    semantic_paths.sort_by(|(left_node, left_path), (right_node, right_path)| {
+        left_path
+            .hops
+            .cmp(&right_path.hops)
+            .then(left_node.kind.cmp(&right_node.kind))
+            .then(left_node.label.cmp(&right_node.label))
+            .then(left_node.id.cmp(&right_node.id))
+    });
+    if max_rows != usize::MAX && semantic_paths.len() > max_rows {
+        semantic_paths.truncate(max_rows);
+    }
 
     let worker_context = worker_paths
         .iter()
@@ -8145,9 +8323,14 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
         .iter()
         .map(|(node, _)| node.clone())
         .collect::<Vec<_>>();
+    let semantic_related = semantic_paths
+        .iter()
+        .map(|(node, _)| node.clone())
+        .collect::<Vec<_>>();
     let shortest_paths = worker_paths
         .iter()
         .chain(source_paths.iter())
+        .chain(semantic_paths.iter())
         .map(|(node, path)| GraphDbEvidencePath {
             to: node.id.clone(),
             kind: node.kind.clone(),
@@ -8162,6 +8345,7 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
         &target_node,
         &worker_context,
         &source_handles,
+        &semantic_related,
     );
 
     Ok(GraphDbEvidenceReport {
@@ -8173,6 +8357,7 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
         target_node,
         worker_context,
         source_handles,
+        semantic_related,
         shortest_paths,
         next_commands,
         fixture_coverage: GraphDbFixtureCoverage {
@@ -8195,9 +8380,10 @@ fn print_graph_db_evidence_human(report: &GraphDbEvidenceReport) {
         report.backend, report.target_node.id, report.target_node.kind
     );
     println!(
-        "evidence: {} worker_context row(s), {} source_handle row(s), {} path(s)",
+        "evidence: {} worker_context row(s), {} source_handle row(s), {} semantic row(s), {} path(s)",
         report.worker_context.len(),
         report.source_handles.len(),
+        report.semantic_related.len(),
         report.shortest_paths.len()
     );
     for path in &report.shortest_paths {
@@ -8229,16 +8415,18 @@ fn print_graph_db_evidence_report(
             "evidence",
             ToolEnvelopeSummary {
                 text: format!(
-                    "Graph DB evidence for {} returned {} worker context row(s), {} source handle(s), and {} shortest path(s)",
+                    "Graph DB evidence for {} returned {} worker context row(s), {} source handle(s), {} semantic row(s), and {} shortest path(s)",
                     report.target,
                     report.worker_context.len(),
                     report.source_handles.len(),
+                    report.semantic_related.len(),
                     report.shortest_paths.len()
                 ),
                 metrics: vec![
                     envelope_metric("backend", &report.backend),
                     envelope_metric("worker_context", report.worker_context.len()),
                     envelope_metric("source_handles", report.source_handles.len()),
+                    envelope_metric("semantic_related", report.semantic_related.len()),
                     envelope_metric("paths", report.shortest_paths.len()),
                 ],
             },
@@ -12158,13 +12346,53 @@ struct ConflictMatrixSourceHandle {
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct ConflictMatrixSemanticRef {
+    handle: String,
+    kind: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_symbol: Option<String>,
+    expand: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct ConflictMatrixTokenBudget {
+    prompt_estimated_tokens: usize,
+    max_prompt_tokens: usize,
+    source_window_count: usize,
+    source_window_lines: usize,
+    max_context_bytes: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct ConflictMatrixOwnershipBlock {
     title: String,
     owned_files: Vec<String>,
     owned_symbols: Vec<String>,
+    read_only_context: Vec<String>,
     read_only_files: Vec<String>,
     forbidden_files: Vec<String>,
     expected_tests: Vec<String>,
+    expansion_commands: Vec<String>,
+    token_budget: ConflictMatrixTokenBudget,
+    prompt: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ConflictMatrixWorkerPromptPacket {
+    target: String,
+    rank: usize,
+    risk: ConflictMatrixRisk,
+    title: String,
+    owned_files: Vec<String>,
+    owned_symbols: Vec<String>,
+    read_only_context: Vec<String>,
+    forbidden_files: Vec<String>,
+    expected_tests: Vec<String>,
+    expansion_commands: Vec<String>,
+    token_budget: ConflictMatrixTokenBudget,
     prompt: String,
 }
 
@@ -12183,6 +12411,8 @@ struct ConflictMatrixCandidate {
     config_files: Vec<String>,
     affected_tests: Vec<String>,
     worker_context: Vec<String>,
+    semantic_related: Vec<ConflictMatrixSemanticRef>,
+    semantic_dispatch_score: usize,
     source_handles: Vec<ConflictMatrixSourceHandle>,
     staged_overlap: ConflictMatrixOverlap,
     ownership: ConflictMatrixOwnershipBlock,
@@ -12223,6 +12453,15 @@ struct ConflictMatrixContextSummary {
 }
 
 #[derive(Serialize)]
+struct ConflictMatrixOrchestrationObservability {
+    projection_freshness: GraphDbFreshnessReport,
+    evidence_packet_ids: Vec<String>,
+    conflict_matrix_decisions: Vec<String>,
+    worker_ownership_blocks: Vec<String>,
+    follow_up_commands: Vec<String>,
+}
+
+#[derive(Serialize)]
 struct ConflictMatrixReport {
     root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12235,7 +12474,9 @@ struct ConflictMatrixReport {
     cached_diff: diff_digest::DiffDigestReport,
     impact: impact::ImpactReport,
     candidates: Vec<ConflictMatrixCandidate>,
+    worker_prompt_packets: Vec<ConflictMatrixWorkerPromptPacket>,
     conflicts: Vec<ConflictMatrixPair>,
+    orchestration: ConflictMatrixOrchestrationObservability,
     next_commands: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     warnings: Vec<String>,
@@ -12395,6 +12636,32 @@ fn conflict_matrix_source_handle(node: &SubstrateGraphNode) -> Option<ConflictMa
     })
 }
 
+fn conflict_matrix_semantic_ref(
+    root: &Path,
+    node: &SubstrateGraphNode,
+) -> ConflictMatrixSemanticRef {
+    ConflictMatrixSemanticRef {
+        handle: node
+            .properties
+            .get("handle")
+            .cloned()
+            .unwrap_or_else(|| node.id.clone()),
+        kind: node.kind.clone(),
+        label: node.label.clone(),
+        source_file: node
+            .properties
+            .get("source_file")
+            .or_else(|| node.properties.get("path"))
+            .cloned(),
+        source_symbol: node.properties.get("source_symbol").cloned(),
+        expand: node
+            .properties
+            .get("expand")
+            .cloned()
+            .unwrap_or_else(|| traversal_expand_command(root, &node.id)),
+    }
+}
+
 fn conflict_matrix_symbols_for_files(
     graph_nodes: &[SubstrateGraphNode],
     files: &BTreeSet<String>,
@@ -12487,14 +12754,18 @@ fn empty_conflict_matrix_ownership(target: &str) -> ConflictMatrixOwnershipBlock
         title: format!("Worker ownership for {target}"),
         owned_files: Vec::new(),
         owned_symbols: Vec::new(),
+        read_only_context: Vec::new(),
         read_only_files: Vec::new(),
         forbidden_files: Vec::new(),
         expected_tests: Vec::new(),
+        expansion_commands: Vec::new(),
+        token_budget: ConflictMatrixTokenBudget::default(),
         prompt: String::new(),
     }
 }
 
 fn conflict_matrix_candidate_from_evidence(
+    root: &Path,
     evidence: &GraphDbEvidenceReport,
     graph_nodes: &[SubstrateGraphNode],
     cached_diff: &diff_digest::DiffDigestReport,
@@ -12510,7 +12781,11 @@ fn conflict_matrix_candidate_from_evidence(
             Some(handle)
         })
         .collect::<Vec<_>>();
-    if let Some(path) = evidence.target_node.properties.get("path") {
+    if matches!(
+        evidence.target_node.kind.as_str(),
+        "file" | "symbol" | "route"
+    ) && let Some(path) = evidence.target_node.properties.get("path")
+    {
         files.insert(path.clone());
     }
 
@@ -12574,6 +12849,12 @@ fn conflict_matrix_candidate_from_evidence(
                 .unwrap_or_else(|| node.label.clone())
         })
         .collect::<Vec<_>>();
+    let semantic_related = evidence
+        .semantic_related
+        .iter()
+        .map(|node| conflict_matrix_semantic_ref(root, node))
+        .collect::<Vec<_>>();
+    let semantic_dispatch_score = semantic_related.len();
 
     ConflictMatrixCandidate {
         rank: 0,
@@ -12589,6 +12870,8 @@ fn conflict_matrix_candidate_from_evidence(
         config_files: sorted_set(&config_files),
         affected_tests,
         worker_context,
+        semantic_related,
+        semantic_dispatch_score,
         source_handles,
         staged_overlap,
         ownership: empty_conflict_matrix_ownership(&evidence.target),
@@ -12696,6 +12979,47 @@ fn markdown_list(values: &[String]) -> String {
         .join("\n")
 }
 
+fn conflict_matrix_expansion_commands(candidate: &ConflictMatrixCandidate) -> Vec<String> {
+    let mut commands = candidate
+        .source_handles
+        .iter()
+        .filter(|handle| !handle.expand.trim().is_empty())
+        .map(|handle| handle.expand.clone())
+        .chain(
+            candidate
+                .semantic_related
+                .iter()
+                .map(|semantic| semantic.expand.clone()),
+        )
+        .chain(candidate.affected_tests.iter().cloned())
+        .collect::<Vec<_>>();
+    if commands.is_empty() {
+        commands.push(format!(
+            "tsift graph-db evidence {} --depth 3 --limit 8 --json",
+            shell_quote(&candidate.target)
+        ));
+    }
+    dedupe_preserve_order(commands)
+}
+
+fn conflict_matrix_token_budget(
+    prompt: &str,
+    source_handles: &[ConflictMatrixSourceHandle],
+) -> ConflictMatrixTokenBudget {
+    let source_window_lines = source_handles
+        .iter()
+        .map(|handle| handle.end.saturating_sub(handle.start).saturating_add(1))
+        .sum::<usize>();
+    let max_context_bytes = source_window_lines.saturating_mul(120).max(prompt.len());
+    ConflictMatrixTokenBudget {
+        prompt_estimated_tokens: estimated_tokens_from_bytes(prompt.len()),
+        max_prompt_tokens: estimated_tokens_from_bytes(max_context_bytes),
+        source_window_count: source_handles.len(),
+        source_window_lines,
+        max_context_bytes,
+    }
+}
+
 fn apply_conflict_matrix_ownership_blocks(candidates: &mut [ConflictMatrixCandidate]) {
     let all_files_by_target = candidates
         .iter()
@@ -12724,27 +13048,129 @@ fn apply_conflict_matrix_ownership_blocks(candidates: &mut [ConflictMatrixCandid
         let read_only_files = sorted_set(&read_only);
         let forbidden_files = sorted_set(&forbidden);
         let expected_tests = candidate.affected_tests.clone();
+        let mut read_only_context = read_only_files.clone();
+        read_only_context.extend(
+            candidate
+                .worker_context
+                .iter()
+                .map(|summary| format!("worker_context: {summary}")),
+        );
+        read_only_context.extend(candidate.semantic_related.iter().map(|semantic| {
+            format!(
+                "semantic:{}:{}{}",
+                semantic.kind,
+                semantic.label,
+                semantic
+                    .source_file
+                    .as_ref()
+                    .map(|file| format!(" ({file})"))
+                    .unwrap_or_default()
+            )
+        }));
+        read_only_context = dedupe_preserve_order(read_only_context);
+        let expansion_commands = conflict_matrix_expansion_commands(candidate);
         let title = format!(
             "Worker {} owns {} ({})",
             candidate.rank, candidate.target, candidate.target_label
         );
-        let prompt = format!(
-            "{title}\n\nOwned files:\n{}\n\nOwned symbols:\n{}\n\nRead-only context:\n{}\n\nForbidden files:\n{}\n\nExpected tests:\n{}\n\nFail closed if the task requires a forbidden/shared file, an unowned config file, or a public contract change outside this ownership block.",
+        let prompt_body = format!(
+            "{title}\n\nOwned files:\n{}\n\nOwned symbols:\n{}\n\nRead-only context:\n{}\n\nForbidden files:\n{}\n\nExpected tests:\n{}\n\nExpansion commands:\n{}\n\nFail closed if the task requires a forbidden/shared file, an unowned config file, or a public contract change outside this ownership block.",
             markdown_list(&candidate.owned_files),
             markdown_list(&candidate.owned_symbols),
-            markdown_list(&read_only_files),
+            markdown_list(&read_only_context),
             markdown_list(&forbidden_files),
             markdown_list(&expected_tests),
+            markdown_list(&expansion_commands),
+        );
+        let token_budget = conflict_matrix_token_budget(&prompt_body, &candidate.source_handles);
+        let prompt = format!(
+            "{prompt_body}\n\nToken budget: prompt_estimated_tokens={} max_prompt_tokens={} source_windows={} source_window_lines={} max_context_bytes={}",
+            token_budget.prompt_estimated_tokens,
+            token_budget.max_prompt_tokens,
+            token_budget.source_window_count,
+            token_budget.source_window_lines,
+            token_budget.max_context_bytes,
         );
         candidate.ownership = ConflictMatrixOwnershipBlock {
             title,
             owned_files: candidate.owned_files.clone(),
             owned_symbols: candidate.owned_symbols.clone(),
+            read_only_context,
             read_only_files,
             forbidden_files,
             expected_tests,
+            expansion_commands,
+            token_budget,
             prompt,
         };
+    }
+}
+
+fn conflict_matrix_worker_prompt_packets(
+    candidates: &[ConflictMatrixCandidate],
+) -> Vec<ConflictMatrixWorkerPromptPacket> {
+    candidates
+        .iter()
+        .map(|candidate| ConflictMatrixWorkerPromptPacket {
+            target: candidate.target.clone(),
+            rank: candidate.rank,
+            risk: candidate.risk,
+            title: candidate.ownership.title.clone(),
+            owned_files: candidate.ownership.owned_files.clone(),
+            owned_symbols: candidate.ownership.owned_symbols.clone(),
+            read_only_context: candidate.ownership.read_only_context.clone(),
+            forbidden_files: candidate.ownership.forbidden_files.clone(),
+            expected_tests: candidate.ownership.expected_tests.clone(),
+            expansion_commands: candidate.ownership.expansion_commands.clone(),
+            token_budget: candidate.ownership.token_budget.clone(),
+            prompt: candidate.ownership.prompt.clone(),
+        })
+        .collect()
+}
+
+fn conflict_matrix_orchestration_observability(
+    freshness: &GraphDbFreshnessReport,
+    candidates: &[ConflictMatrixCandidate],
+    conflicts: &[ConflictMatrixPair],
+    next_commands: &[String],
+) -> ConflictMatrixOrchestrationObservability {
+    let evidence_packet_ids = candidates
+        .iter()
+        .map(|candidate| format!("{}:{}", candidate.target, candidate.target_node_id))
+        .collect::<Vec<_>>();
+    let mut conflict_matrix_decisions = candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "candidate #{} {} risk={} semantic_score={} owned_files={} forbidden_files={}",
+                candidate.rank,
+                candidate.target,
+                conflict_risk_label(candidate.risk),
+                candidate.semantic_dispatch_score,
+                candidate.ownership.owned_files.len(),
+                candidate.ownership.forbidden_files.len()
+            )
+        })
+        .collect::<Vec<_>>();
+    conflict_matrix_decisions.extend(conflicts.iter().map(|pair| {
+        format!(
+            "pair {}<->{} risk={} verdict={}",
+            pair.left,
+            pair.right,
+            conflict_risk_label(pair.risk),
+            pair.verdict
+        )
+    }));
+    let worker_ownership_blocks = candidates
+        .iter()
+        .map(|candidate| candidate.ownership.title.clone())
+        .collect::<Vec<_>>();
+    ConflictMatrixOrchestrationObservability {
+        projection_freshness: freshness.clone(),
+        evidence_packet_ids,
+        conflict_matrix_decisions,
+        worker_ownership_blocks,
+        follow_up_commands: next_commands.to_vec(),
     }
 }
 
@@ -12831,11 +13257,12 @@ fn print_conflict_matrix_human(report: &ConflictMatrixReport, compact: bool) {
     }
     for candidate in &report.candidates {
         println!(
-            "candidate #{} {} risk:{} score:{} files:{} symbols:{} tests:{}",
+            "candidate #{} {} risk:{} score:{} semantic:{} files:{} symbols:{} tests:{}",
             candidate.rank,
             candidate.target,
             conflict_risk_label(candidate.risk),
             candidate.risk_score,
+            candidate.semantic_dispatch_score,
             candidate.owned_files.len(),
             candidate.owned_symbols.len(),
             candidate.affected_tests.len()
@@ -12862,6 +13289,9 @@ fn print_conflict_matrix_human(report: &ConflictMatrixReport, compact: bool) {
     }
     for command in &report.next_commands {
         println!("next: {command}");
+    }
+    for packet in &report.worker_prompt_packets {
+        println!("worker-prompt #{} {}", packet.rank, packet.title);
     }
     for warning in &report.warnings {
         println!("warning: {warning}");
@@ -12929,6 +13359,7 @@ fn cmd_conflict_matrix(
         .with_context(|| format!("collecting graph-db evidence for {target}"))?;
         warnings.extend(evidence.warnings.clone());
         candidates.push(conflict_matrix_candidate_from_evidence(
+            &root,
             &evidence,
             &graph_nodes,
             &cached_diff,
@@ -12940,6 +13371,11 @@ fn cmd_conflict_matrix(
         left.risk
             .cmp(&right.risk)
             .then_with(|| left.risk_score.cmp(&right.risk_score))
+            .then_with(|| {
+                right
+                    .semantic_dispatch_score
+                    .cmp(&left.semantic_dispatch_score)
+            })
             .then_with(|| left.target.cmp(&right.target))
     });
     for (idx, candidate) in candidates.iter_mut().enumerate() {
@@ -12947,6 +13383,7 @@ fn cmd_conflict_matrix(
     }
     let conflicts = build_conflict_matrix_pairs(&candidates);
     apply_conflict_matrix_ownership_blocks(&mut candidates);
+    let worker_prompt_packets = conflict_matrix_worker_prompt_packets(&candidates);
 
     let fail_closed = candidates
         .iter()
@@ -12960,6 +13397,12 @@ fn cmd_conflict_matrix(
             .all(|pair| pair.risk <= ConflictMatrixRisk::Medium);
     let next_commands =
         conflict_matrix_next_commands(&root, path, scope, &targets, depth, limit, impact_limit);
+    let orchestration = conflict_matrix_orchestration_observability(
+        &freshness,
+        &candidates,
+        &conflicts,
+        &next_commands,
+    );
     let inputs = ConflictMatrixInputSummary {
         graph_db_evidence_targets: targets.clone(),
         context_pack_command: format!(
@@ -12991,7 +13434,9 @@ fn cmd_conflict_matrix(
         cached_diff,
         impact: impact_report,
         candidates,
+        worker_prompt_packets,
         conflicts,
+        orchestration,
         next_commands,
         warnings,
     };
@@ -14453,6 +14898,18 @@ struct SessionReviewNextContextBudgetReport {
 }
 
 #[derive(Serialize)]
+struct ContextPackGraphOrchestration {
+    graph_db_command: String,
+    projection_freshness: GraphDbFreshnessReport,
+    evidence_packet_ids: Vec<String>,
+    conflict_matrix_decisions: Vec<String>,
+    worker_ownership_blocks: Vec<String>,
+    follow_up_commands: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
 struct ContextPackReport {
     root: String,
     target: String,
@@ -14468,6 +14925,7 @@ struct ContextPackReport {
     test_digest: ContextPackOptionalSection<ContextPackTestPreview>,
     log_digest: ContextPackOptionalSection<ContextPackLogPreview>,
     exploration: ExplorationPacket,
+    graph_orchestration: ContextPackGraphOrchestration,
     resume_commands: Vec<String>,
 }
 
@@ -15813,6 +16271,8 @@ fn build_context_pack_report(
         &root,
         build_context_pack_exploration_packet(&root, &next_context, &diff_digest),
     )?;
+    let graph_orchestration =
+        context_pack_graph_orchestration(&root, path, &next_context, &exploration)?;
 
     Ok(ContextPackReport {
         root: review.root,
@@ -15827,6 +16287,7 @@ fn build_context_pack_report(
         test_digest,
         log_digest,
         exploration,
+        graph_orchestration,
         resume_commands: review.next_context.next_digest_commands,
     })
 }
@@ -15835,6 +16296,95 @@ fn context_pack_status_reminders(root: &Path) -> Vec<String> {
     status::check_status(root)
         .map(|report| report.reminders)
         .unwrap_or_default()
+}
+
+fn context_pack_graph_orchestration(
+    root: &Path,
+    path: &Path,
+    next_context: &SessionReviewNextContextBudgetReport,
+    exploration: &ExplorationPacket,
+) -> Result<ContextPackGraphOrchestration> {
+    let graph_db = graph_substrate_db_path(root, None);
+    let store = SqliteGraphStore::open(&graph_db)
+        .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
+    let projection_freshness = sqlite_graph_freshness(&store, "root")?;
+    let mut warnings = projection_freshness.diagnostics.clone();
+    let mut targets = next_context
+        .prompt_targets
+        .iter()
+        .flat_map(|prompt| extract_conflict_target_refs(prompt))
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        targets.extend(
+            exploration
+                .worker_context
+                .iter()
+                .flat_map(|worker| extract_conflict_target_refs(&worker.summary)),
+        );
+    }
+    targets = dedupe_preserve_order(targets);
+
+    let mut evidence_packet_ids = Vec::new();
+    let mut resolvable_targets = Vec::new();
+    for target in &targets {
+        match graph_db_resolve_evidence_target(&store, target)? {
+            Some(node) => {
+                evidence_packet_ids.push(format!("{target}:{}", node.id));
+                resolvable_targets.push(target.clone());
+            }
+            None => warnings.push(format!("graph evidence target not found: {target}")),
+        }
+    }
+
+    let mut follow_up_commands = vec![format!(
+        "tsift graph-db --path {} status --json",
+        shell_quote(root.to_string_lossy().as_ref())
+    )];
+    for target in &resolvable_targets {
+        follow_up_commands.push(format!(
+            "tsift graph-db --path {} evidence {} --depth 3 --limit 8 --json",
+            shell_quote(root.to_string_lossy().as_ref()),
+            shell_quote(target)
+        ));
+    }
+    if !resolvable_targets.is_empty() {
+        follow_up_commands.push(format!(
+            "tsift conflict-matrix --path {} {} --json",
+            shell_quote(path.to_string_lossy().as_ref()),
+            resolvable_targets
+                .iter()
+                .map(|target| shell_quote(target))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
+
+    let conflict_matrix_decisions = if resolvable_targets.is_empty() {
+        vec!["no resolvable backlog/job targets found for conflict-matrix".to_string()]
+    } else {
+        vec![format!(
+            "run conflict-matrix before parallel dispatch for {} target(s)",
+            resolvable_targets.len()
+        )]
+    };
+    let worker_ownership_blocks = exploration
+        .worker_context
+        .iter()
+        .map(|worker| format!("{} scopes {}", worker.handle, worker.summary))
+        .collect::<Vec<_>>();
+
+    Ok(ContextPackGraphOrchestration {
+        graph_db_command: format!(
+            "tsift graph-db --path {} status --json",
+            shell_quote(root.to_string_lossy().as_ref())
+        ),
+        projection_freshness,
+        evidence_packet_ids,
+        conflict_matrix_decisions,
+        worker_ownership_blocks,
+        follow_up_commands: dedupe_preserve_order(follow_up_commands),
+        warnings,
+    })
 }
 
 fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
@@ -15901,6 +16451,12 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
             report.exploration.source_windows.len(),
             report.exploration.relationship_map.len(),
             report.exploration.budget.project_size
+        );
+        println!(
+            "graph-orchestration freshness:{} evidence:{} ownership:{}",
+            report.graph_orchestration.projection_freshness.status,
+            report.graph_orchestration.evidence_packet_ids.len(),
+            report.graph_orchestration.worker_ownership_blocks.len()
         );
         return;
     }
@@ -16123,6 +16679,25 @@ fn print_context_pack_human(report: &ContextPackReport, compact: bool) {
             "  - relation {} -{}-> {}",
             relation.from, relation.relation, relation.to
         );
+    }
+
+    println!();
+    println!("Graph orchestration");
+    println!(
+        "  projection freshness:   {}",
+        report.graph_orchestration.projection_freshness.status
+    );
+    for evidence in &report.graph_orchestration.evidence_packet_ids {
+        println!("  - evidence: {evidence}");
+    }
+    for decision in &report.graph_orchestration.conflict_matrix_decisions {
+        println!("  - decision: {decision}");
+    }
+    for block in &report.graph_orchestration.worker_ownership_blocks {
+        println!("  - ownership: {block}");
+    }
+    for command in &report.graph_orchestration.follow_up_commands {
+        println!("  - next: {command}");
     }
 
     println!();
@@ -20238,6 +20813,93 @@ def list_items():
     }
 
     #[test]
+    fn conflict_matrix_uses_semantic_rows_as_dispatch_ranking_signal() {
+        let dir = setup_traversal_project();
+        seed_traversal_semantic_summaries(dir.path());
+        init_git_repo(dir.path());
+        let session = dir.path().join("tasks/software/tsift.md");
+        refresh_traversal_graph_store(dir.path(), &session, None).unwrap();
+        let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
+        let freshness = sqlite_graph_freshness(&store, "root").unwrap();
+        let evidence = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
+            root: dir.path(),
+            scope: None,
+            backend: "sqlite",
+            target: "kgnv",
+            depth: 4,
+            limit: 8,
+            store: &store,
+            freshness,
+            warnings: Vec::new(),
+        })
+        .unwrap();
+        assert!(
+            evidence
+                .semantic_related
+                .iter()
+                .any(|node| node.kind == "semantic_concept" && node.label == "graph navigation"),
+            "expected semantic evidence rows, got {:?}",
+            evidence
+                .semantic_related
+                .iter()
+                .map(|node| (&node.kind, &node.label))
+                .collect::<Vec<_>>()
+        );
+
+        let cached_diff = diff_digest::compute(
+            dir.path(),
+            diff_digest::DiffDigestOptions {
+                cached: true,
+                revision: None,
+            },
+        )
+        .unwrap();
+        let impact_report = impact::compute(
+            dir.path(),
+            impact::ImpactOptions {
+                cached: true,
+                revision: None,
+                scope: None,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        let graph_nodes = store.all_nodes().unwrap();
+        let semantic_candidate = conflict_matrix_candidate_from_evidence(
+            dir.path(),
+            &evidence,
+            &graph_nodes,
+            &cached_diff,
+            &impact_report,
+        );
+        assert!(semantic_candidate.semantic_dispatch_score > 0);
+        assert!(
+            semantic_candidate
+                .semantic_related
+                .iter()
+                .any(|item| item.label == "graph navigation")
+        );
+
+        let mut plain_candidate = semantic_candidate.clone();
+        plain_candidate.target = "plain".to_string();
+        plain_candidate.semantic_related.clear();
+        plain_candidate.semantic_dispatch_score = 0;
+        let mut ranked = [plain_candidate, semantic_candidate];
+        ranked.sort_by(|left, right| {
+            left.risk
+                .cmp(&right.risk)
+                .then_with(|| left.risk_score.cmp(&right.risk_score))
+                .then_with(|| {
+                    right
+                        .semantic_dispatch_score
+                        .cmp(&left.semantic_dispatch_score)
+                })
+                .then_with(|| left.target.cmp(&right.target))
+        });
+        assert_eq!(ranked[0].target, "kgnv");
+    }
+
+    #[test]
     fn traversal_projection_queries_match_sqlite_and_convex_stores() {
         let dir = setup_traversal_project();
         let source_graph = build_traversal_graph_source(dir.path(), dir.path(), None).unwrap();
@@ -24332,6 +24994,65 @@ tier = "private"
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn context_pack_records_graph_orchestration_observability() {
+        let dir = setup_traversal_project();
+        init_git_repo(dir.path());
+        let session = dir.path().join("tasks/software/tsift.md");
+        refresh_traversal_graph_store(dir.path(), &session, None).unwrap();
+
+        let report = build_context_pack_report(
+            &session,
+            None,
+            None,
+            None,
+            ResponseBudget::new(Some(4), Some(160)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            report
+                .graph_orchestration
+                .projection_freshness
+                .status
+                .as_str(),
+            "current"
+        );
+        assert!(
+            report
+                .graph_orchestration
+                .evidence_packet_ids
+                .iter()
+                .any(|id| id.starts_with("kgnv:")),
+            "{:?}",
+            report.graph_orchestration.evidence_packet_ids
+        );
+        assert!(
+            report
+                .graph_orchestration
+                .conflict_matrix_decisions
+                .iter()
+                .any(|decision| decision.contains("run conflict-matrix")),
+            "{:?}",
+            report.graph_orchestration.conflict_matrix_decisions
+        );
+        assert!(
+            report
+                .graph_orchestration
+                .follow_up_commands
+                .iter()
+                .any(|command| command.contains("conflict-matrix")),
+            "{:?}",
+            report.graph_orchestration.follow_up_commands
+        );
+        assert!(
+            !report
+                .graph_orchestration
+                .worker_ownership_blocks
+                .is_empty()
         );
     }
 

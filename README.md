@@ -55,9 +55,11 @@ mutations, and HTTP action for `tsift convex-sync --apply` live under
 `.tsift/graph.db` explicitly, `tsift graph-db status` to inspect projection
 version/hash/watermark and tombstone counts without refreshing, and
 `tsift graph-db evidence <backlog-id-or-job-handle>` for bounded
-worker-context/source-handle handoff packets. Use `tsift conflict-matrix` to
-rank candidate worker scopes, flag shared file/symbol/test/config ownership,
-and emit fail-closed prompt ownership blocks before parallel dispatch. Use
+worker-context/source-handle/semantic handoff packets. Use `tsift
+conflict-matrix` to rank candidate worker scopes, flag shared
+file/symbol/test/config ownership, and emit first-class worker prompt packets
+with expansion commands, token budgets, and fail-closed ownership blocks before
+parallel dispatch. Use
 `tsift graph-db doctor` to
 validate local `graph.db` and Convex snapshot metadata before trusting operator
 handoffs. `tsift traverse --format html` renders the selected GraphStore slice as

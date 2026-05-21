@@ -8,6 +8,9 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- `conflict-matrix` now emits first-class `worker_prompt_packets` with owned files/symbols, read-only context, forbidden files, expected tests, expansion commands, and token budgets; target-specific source ownership prevents unrelated workers from inheriting every visible source window.
+- Graph orchestration observability now carries projection freshness, evidence packet ids, conflict-matrix decisions, ownership block labels, and follow-up graph commands through `conflict-matrix`, `context-pack`, and `session-review --next-context`.
+- `graph-db evidence` now includes reachable semantic concept/entity rows, and `conflict-matrix` uses those semantic rows as a ranking signal without overriding file/symbol/test/config conflict gates.
 - Release verification now runs `cargo publish --locked --dry-run`, and the release docs/tests lock the `TSIFT_ENABLE_CRATES_PUBLISH` variable plus `CARGO_REGISTRY_TOKEN` secret contract for tagged crates.io publishes.
 - Added an opt-in live Convex graph backend acceptance harness that applies a temporary projection to a dedicated deployment, pulls the remote snapshot, and runs graph-db node/kind/neighborhood/path parity against SQLite.
 - Added `tsift graph-db doctor` for read-only SQLite `graph.db` and Convex snapshot diagnostics, including stale projection metadata, schema drift, orphan edges, duplicate ids, missing Convex index metadata, repair commands, and fail-closed exit codes.
