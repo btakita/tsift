@@ -26,10 +26,11 @@ cat fixtures/graph-db-operator-examples/agent-orchestration-acceptance-pack.json
 
 `agent-orchestration-acceptance-pack.json` is the golden agent-doc queue fixture:
 it contains sample queue lines, job_packet rows, worker_result rows,
-conflict-matrix/dispatch-trace replay commands, and the context-pack /
-session-review follow-up commands that agent-doc should consume. Its
-`regenerated_samples` block is produced by the graph conformance test from the
-same queue fixture, covering `graph-db refresh`, `graph-db evidence`,
+conflict-matrix/dispatch-trace replay commands, stale Convex repair commands,
+and the context-pack / session-review follow-up commands that agent-doc should
+consume. Its `regenerated_samples` block is produced by the graph conformance
+test from the same queue fixture, covering `graph-db refresh`, `status`,
+`doctor`, `evidence`, stale Convex `drift`, stale `convex-sync`,
 `conflict-matrix`, `dispatch-trace` JSON/HTML, `context-pack`, and
 `session-review`; CI fails when those normalized live outputs drift from the
 checked-in pack.
@@ -70,13 +71,37 @@ Worker-feedback closure warnings for repeated blockage, stale expected tests,
 or follow-up debt are soft ranking signals; they can reorder equal-risk safe
 candidates, but shared file/symbol/test/config gates remain authoritative.
 
+The acceptance pack records the full operator replay spine. `graph-db refresh`
+is the only mutating local graph step; `graph-db status` must replay its counts
+without refreshing, `graph-db doctor` must stay read-only, and stale Convex
+snapshot reads must go through `drift` / `doctor` diagnostics before any
+`graph-db --backend convex-snapshot ...` read is trusted.
+
 ## Convex Sync Dry Run
 
 ```bash
+tsift graph-db --path . \
+  --backend convex-snapshot \
+  --convex-snapshot fixtures/graph-db-operator-examples/stale-convex-snapshot.json \
+  drift \
+  --json
+
+tsift graph-db --path . \
+  --backend convex-snapshot \
+  --convex-snapshot fixtures/graph-db-operator-examples/stale-convex-snapshot.json \
+  doctor \
+  --json
+
 tsift convex-sync . --snapshot fixtures/graph-db-operator-examples/stale-convex-snapshot.json --chunk-size 25 --json
 ```
 
-The stale fixture intentionally omits the local projection metadata, so freshness should report a fail-closed plan with node and edge upserts.
+The stale fixture intentionally omits the local projection metadata and Convex
+index metadata while carrying one stale remote node and edge. `drift` and
+`doctor` should fail closed, emit repair commands that point to
+`convex-sync --snapshot ...` and `convex-sync --remote-snapshot --apply`, and
+block Convex-backed graph reads until the plan is applied. `convex-sync` should
+plan edge tombstones before node tombstones, then node upserts before edge
+upserts.
 
 ## Convex Apply
 

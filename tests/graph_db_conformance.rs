@@ -376,6 +376,11 @@ fn agent_orchestration_acceptance_pack_fixture() -> Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
+fn stale_convex_snapshot_fixture_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/graph-db-operator-examples/stale-convex-snapshot.json")
+}
+
 fn contract_entry<'a>(fixture: &'a Value, name: &str) -> &'a Value {
     fixture["contracts"]
         .as_array()
@@ -523,6 +528,17 @@ fn worker_prompt_packet_summaries(report: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn chunk_operations(report: &Value) -> Vec<String> {
+    report["chunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|chunk| chunk["operation"].as_str().unwrap().to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn node_kind_counts(nodes: &Value) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for node in nodes.as_array().unwrap() {
@@ -549,6 +565,8 @@ fn commands_contain_all(commands: &Value, needles: &[&str]) -> bool {
 
 fn regenerate_agent_orchestration_acceptance_samples(project: &Path, session: &Path) -> Value {
     let refresh = graph_db_json(project, Backend::Sqlite, vec!["refresh".to_string()]);
+    let status = graph_db_json(project, Backend::Sqlite, vec!["status".to_string()]);
+    let doctor = graph_db_json(project, Backend::Sqlite, vec!["doctor".to_string()]);
     let evidence = graph_db_json(
         project,
         Backend::Sqlite,
@@ -561,6 +579,32 @@ fn regenerate_agent_orchestration_acceptance_samples(project: &Path, session: &P
             "8".to_string(),
         ],
     );
+    let stale_snapshot = stale_convex_snapshot_fixture_path();
+    let drift = assert_tsift_json(vec![
+        "graph-db".to_string(),
+        "--path".to_string(),
+        project.to_string_lossy().to_string(),
+        "--backend".to_string(),
+        "convex-snapshot".to_string(),
+        "--convex-snapshot".to_string(),
+        stale_snapshot.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "drift".to_string(),
+    ]);
+    let stale_sync = assert_tsift_json(vec![
+        "convex-sync".to_string(),
+        project.to_string_lossy().to_string(),
+        "--snapshot".to_string(),
+        stale_snapshot.to_string_lossy().to_string(),
+        "--chunk-size".to_string(),
+        "25".to_string(),
+        "--json".to_string(),
+    ]);
+    let (stale_doctor, _stderr) = assert_tsift_failure_json(graph_db_args(
+        project,
+        Backend::ConvexSnapshot(&stale_snapshot),
+        vec!["doctor".to_string()],
+    ));
     let conflict = assert_tsift_json(vec![
         "conflict-matrix".to_string(),
         "--path".to_string(),
@@ -621,6 +665,26 @@ fn regenerate_agent_orchestration_acceptance_samples(project: &Path, session: &P
             "status": refresh["status"],
             "projection_version": refresh["freshness"]["projection_version"],
             "content_hash_present": refresh["freshness"]["content_hash"].as_str().is_some(),
+            "next_mentions_status": commands_contain(&refresh["next_commands"], "status"),
+            "next_mentions_doctor": commands_contain(&refresh["next_commands"], "doctor"),
+            "next_mentions_drift": commands_contain(&refresh["next_commands"], "drift"),
+            "next_mentions_convex_sync": commands_contain(&refresh["next_commands"], "convex-sync"),
+        },
+        "graph_db_status": {
+            "operation": status["operation"],
+            "status": status["status"],
+            "materialized": status["materialized"],
+            "counts_match_refresh": status["counts"] == refresh["counts"],
+            "next_mentions_doctor": commands_contain(&status["next_commands"], "doctor"),
+            "next_mentions_drift": commands_contain(&status["next_commands"], "drift"),
+            "next_mentions_convex_sync": commands_contain(&status["next_commands"], "convex-sync"),
+        },
+        "graph_db_doctor": {
+            "status": doctor["status"],
+            "backend": doctor["backend"],
+            "fail_closed": doctor["fail_closed"],
+            "check_count": doctor["checks"].as_array().unwrap().len(),
+            "repair_command_count": doctor["repair_commands"].as_array().unwrap().len(),
         },
         "graph_db_evidence": {
             "contract_version": evidence["contract_version"],
@@ -635,6 +699,43 @@ fn regenerate_agent_orchestration_acceptance_samples(project: &Path, session: &P
             "replay_mentions_wfdb": commands_contain_all(&evidence["replay_commands"], &["evidence", "wfdb"]),
             "repair_mentions_refresh": commands_contain(&evidence["repair_commands"], "refresh"),
             "repair_mentions_doctor": commands_contain(&evidence["repair_commands"], "doctor"),
+        },
+        "stale_convex_snapshot_drift": {
+            "status": drift["status"],
+            "graph_reads_allowed": drift["graph_reads_allowed"],
+            "node_upserts_positive": drift["summary"]["node_upserts"].as_u64().unwrap() > 0,
+            "edge_upserts_positive": drift["summary"]["edge_upserts"].as_u64().unwrap() > 0,
+            "node_tombstones": drift["summary"]["node_tombstones"],
+            "edge_tombstones": drift["summary"]["edge_tombstones"],
+            "missing_required_indexes_positive": drift["summary"]["missing_required_indexes"].as_u64().unwrap() > 0,
+            "stale_projection_metadata_positive": drift["summary"]["stale_projection_metadata"].as_u64().unwrap() > 0,
+            "next_mentions_doctor": commands_contain(&drift["next_commands"], "doctor"),
+            "next_mentions_convex_sync_snapshot": commands_contain_all(&drift["next_commands"], &["convex-sync", "--snapshot"]),
+            "next_mentions_convex_apply": commands_contain_all(&drift["next_commands"], &["convex-sync", "--remote-snapshot", "--apply"]),
+        },
+        "stale_convex_snapshot_doctor": {
+            "status": stale_doctor["status"],
+            "backend": stale_doctor["backend"],
+            "fail_closed": stale_doctor["fail_closed"],
+            "required_index_count": stale_doctor["required_indexes"].as_array().unwrap().len(),
+            "repair_mentions_convex_sync": commands_contain(&stale_doctor["repair_commands"], "convex-sync"),
+            "repair_mentions_schema_example": commands_contain(&stale_doctor["repair_commands"], "examples/convex-graph/schema.ts"),
+        },
+        "stale_convex_snapshot_sync": {
+            "dry_run": stale_sync["dry_run"],
+            "freshness_status": stale_sync["freshness"]["status"],
+            "freshness_fail_closed": stale_sync["freshness"]["fail_closed"],
+            "node_upserts_positive": !stale_sync["node_upserts"].as_array().unwrap().is_empty(),
+            "edge_upserts_positive": !stale_sync["edge_upserts"].as_array().unwrap().is_empty(),
+            "node_tombstones": stale_sync["node_tombstones"],
+            "edge_tombstones": stale_sync["edge_tombstones"],
+            "chunk_operations": chunk_operations(&stale_sync),
+            "required_index_count": stale_sync["required_indexes"].as_array().unwrap().len(),
+            "diagnostics_mention_fail_closed": stale_sync["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic.as_str().unwrap().contains("fail closed")),
         },
         "conflict_matrix": {
             "contract_version": conflict["contract_version"],
@@ -1746,10 +1847,58 @@ fn agent_orchestration_acceptance_pack_fixture_matches_queue_contract_terms() {
             .as_array()
             .unwrap()
             .iter()
+            .any(|command| command
+                .as_str()
+                .unwrap()
+                .contains("graph-db --path . status")),
+        "{fixture}"
+    );
+    assert!(
+        fixture["command_sequence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command
+                .as_str()
+                .unwrap()
+                .contains("graph-db --path . doctor")),
+        "{fixture}"
+    );
+    assert!(
+        fixture["command_sequence"]
+            .as_array()
+            .unwrap()
+            .iter()
             .any(
                 |command| command.as_str().unwrap().contains("dispatch-trace")
                     && command.as_str().unwrap().contains("--format html")
             ),
+        "{fixture}"
+    );
+    assert!(
+        fixture["command_sequence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| {
+                let command = command.as_str().unwrap();
+                command.contains("convex-snapshot")
+                    && command.contains("stale-convex-snapshot.json")
+                    && command.contains("drift")
+            }),
+        "{fixture}"
+    );
+    assert!(
+        fixture["command_sequence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| {
+                let command = command.as_str().unwrap();
+                command.contains("convex-sync")
+                    && command.contains("stale-convex-snapshot.json")
+                    && command.contains("--chunk-size 25")
+            }),
         "{fixture}"
     );
     assert!(
@@ -1785,6 +1934,13 @@ fn agent_orchestration_acceptance_pack_fixture_matches_queue_contract_terms() {
             .unwrap()
             .iter()
             .any(|link| link.as_str().unwrap().contains("replay_commands")),
+        "{fixture}"
+    );
+    assert!(
+        fixture["expected_contracts"]["operator_replay"]["stale_convex_repair_rule"]
+            .as_str()
+            .unwrap()
+            .contains("convex-sync"),
         "{fixture}"
     );
 }

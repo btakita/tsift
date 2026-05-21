@@ -4,10 +4,15 @@
   "purpose": "Golden agent-doc orchestration rows and commands for validating graph-backed dispatch handoffs.",
   "command_sequence": [
     "tsift graph-db --path . refresh --json",
+    "tsift graph-db --path . status --json",
+    "tsift graph-db --path . doctor --json",
     "tsift graph-db --path . evidence wfdb --depth 3 --limit 8 --json",
     "tsift conflict-matrix --path tasks/software/tsift.md wfdb wfok --json",
     "tsift dispatch-trace --path tasks/software/tsift.md wfdb wfok --json",
     "tsift dispatch-trace --path tasks/software/tsift.md wfdb --format html",
+    "tsift graph-db --path . --backend convex-snapshot --convex-snapshot fixtures/graph-db-operator-examples/stale-convex-snapshot.json drift --json",
+    "tsift graph-db --path . --backend convex-snapshot --convex-snapshot fixtures/graph-db-operator-examples/stale-convex-snapshot.json doctor --json",
+    "tsift convex-sync . --snapshot fixtures/graph-db-operator-examples/stale-convex-snapshot.json --chunk-size 25 --json",
     "tsift --envelope context-pack tasks/software/tsift.md --budget normal --json",
     "tsift session-review tasks/software/tsift.md --next-context --budget normal --json"
   ],
@@ -97,6 +102,11 @@
         "shrd"
       ],
       "hard_gate_rule": "closure controls can reorder equal-risk candidates but must not add file/symbol/test/config risk reasons"
+    },
+    "operator_replay": {
+      "refresh_status_rule": "status must replay the refresh projection counts without mutating graph.db",
+      "doctor_rule": "doctor must be read-only and emit no repair commands when SQLite graph.db is current",
+      "stale_convex_repair_rule": "stale Convex snapshot drift/doctor must fail closed and point operators to convex-sync repair commands before Convex-backed reads"
     }
   },
   "required_trace_links": [
@@ -111,7 +121,27 @@
     "graph_db_refresh": {
       "status": "current",
       "projection_version": "tsift-traversal-v1",
-      "content_hash_present": true
+      "content_hash_present": true,
+      "next_mentions_status": false,
+      "next_mentions_doctor": true,
+      "next_mentions_drift": true,
+      "next_mentions_convex_sync": true
+    },
+    "graph_db_status": {
+      "operation": "status",
+      "status": "current",
+      "materialized": true,
+      "counts_match_refresh": true,
+      "next_mentions_doctor": true,
+      "next_mentions_drift": true,
+      "next_mentions_convex_sync": true
+    },
+    "graph_db_doctor": {
+      "status": "ok",
+      "backend": "sqlite",
+      "fail_closed": false,
+      "check_count": 7,
+      "repair_command_count": 0
     },
     "graph_db_evidence": {
       "contract_version": "graph-db-evidence-v1",
@@ -138,6 +168,48 @@
       "replay_mentions_wfdb": true,
       "repair_mentions_refresh": true,
       "repair_mentions_doctor": true
+    },
+    "stale_convex_snapshot_drift": {
+      "status": "fail_closed",
+      "graph_reads_allowed": false,
+      "node_upserts_positive": true,
+      "edge_upserts_positive": true,
+      "node_tombstones": 1,
+      "edge_tombstones": 1,
+      "missing_required_indexes_positive": true,
+      "stale_projection_metadata_positive": true,
+      "next_mentions_doctor": true,
+      "next_mentions_convex_sync_snapshot": true,
+      "next_mentions_convex_apply": true
+    },
+    "stale_convex_snapshot_doctor": {
+      "status": "fail_closed",
+      "backend": "convex-snapshot",
+      "fail_closed": true,
+      "required_index_count": 5,
+      "repair_mentions_convex_sync": true,
+      "repair_mentions_schema_example": true
+    },
+    "stale_convex_snapshot_sync": {
+      "dry_run": true,
+      "freshness_status": "stale",
+      "freshness_fail_closed": true,
+      "node_upserts_positive": true,
+      "edge_upserts_positive": true,
+      "node_tombstones": [
+        "stale-node"
+      ],
+      "edge_tombstones": [
+        "stale-edge"
+      ],
+      "chunk_operations": [
+        "delete_edges",
+        "delete_nodes",
+        "upsert_edges",
+        "upsert_nodes"
+      ],
+      "required_index_count": 5,
+      "diagnostics_mention_fail_closed": true
     },
     "conflict_matrix": {
       "contract_version": "conflict-matrix-v1",
