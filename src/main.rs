@@ -8031,12 +8031,12 @@ fn graph_db_schema() -> GraphDbSchema {
             GraphDbSchemaContract {
                 name: "worker_prompt_packet",
                 version: WORKER_PROMPT_PACKET_CONTRACT_VERSION,
-                description: "conflict-matrix worker prompt packet with owned scope, read-only context, forbidden files, expected tests, expansion commands, token budget, semantic ranking reasons, and fail-closed prompt text",
+                description: "conflict-matrix worker prompt packet with owned scope, read-only context, forbidden files, expected tests, expansion commands, token budget, semantic ranking reasons, worker feedback closure controls, and fail-closed prompt text",
             },
             GraphDbSchemaContract {
                 name: "conflict_matrix",
                 version: CONFLICT_MATRIX_CONTRACT_VERSION,
-                description: "parallel-dispatch decision report keyed by graph evidence packets and hard file/symbol/test/config gates",
+                description: "parallel-dispatch decision report keyed by graph evidence packets, hard file/symbol/test/config gates, and soft worker-feedback closure ranking",
             },
             GraphDbSchemaContract {
                 name: "context_pack_graph_orchestration",
@@ -8051,7 +8051,7 @@ fn graph_db_schema() -> GraphDbSchema {
             GraphDbSchemaContract {
                 name: "dispatch_trace",
                 version: DISPATCH_TRACE_CONTRACT_VERSION,
-                description: "operator review trace linking backlog, job packets, worker results, source handles, semantic rows, evidence packet ids, and worker prompt packets",
+                description: "operator review trace linking backlog, job packets, worker results, source handles, semantic rows, evidence packet ids, worker feedback closure controls, and worker prompt packets",
             },
         ],
         node_fields: vec![
@@ -8141,7 +8141,7 @@ fn graph_db_schema() -> GraphDbSchema {
             },
             GraphDbSchemaOperation {
                 command: "dispatch-trace [target...] --path <session> [--format json|html]",
-                description: "Export a compact graph-backed dispatch trace with evidence packet ids, worker-result feedback, graph links, and conflict-matrix worker prompt packets",
+                description: "Export a compact graph-backed dispatch trace with evidence packet ids, worker-result feedback closure summaries, graph links, and conflict-matrix worker prompt packets",
             },
             GraphDbSchemaOperation {
                 command: "schema",
@@ -12760,6 +12760,10 @@ struct ConflictMatrixWorkerFeedback {
     follow_up_ids: Vec<String>,
     outcome_history: Vec<String>,
     repeated_blockage: bool,
+    stale_expected_tests: Vec<String>,
+    follow_up_debt: Vec<String>,
+    closure_rank_score: usize,
+    closure_rank_reasons: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     warnings: Vec<String>,
 }
@@ -12798,6 +12802,7 @@ struct ConflictMatrixWorkerPromptPacket {
     token_budget: ConflictMatrixTokenBudget,
     semantic_dispatch_score: usize,
     semantic_dispatch_reasons: Vec<String>,
+    worker_feedback: ConflictMatrixWorkerFeedback,
     prompt: String,
 }
 
@@ -13294,7 +13299,91 @@ fn conflict_matrix_worker_feedback(
         follow_up_ids: follow_up_ids.into_iter().collect(),
         outcome_history,
         repeated_blockage,
+        stale_expected_tests: Vec::new(),
+        follow_up_debt: Vec::new(),
+        closure_rank_score: 0,
+        closure_rank_reasons: Vec::new(),
         warnings,
+    }
+}
+
+fn feedback_ref_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(",")
+    }
+}
+
+fn stale_expected_tests_for_candidate(candidate: &ConflictMatrixCandidate) -> Vec<String> {
+    if candidate.worker_feedback.expected_tests.is_empty() {
+        return Vec::new();
+    }
+    let current_tests = candidate
+        .affected_tests
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if current_tests.is_empty() {
+        return candidate.worker_feedback.expected_tests.clone();
+    }
+    candidate
+        .worker_feedback
+        .expected_tests
+        .iter()
+        .filter(|test| !current_tests.contains(*test))
+        .cloned()
+        .collect()
+}
+
+fn apply_conflict_matrix_worker_feedback_controls(candidates: &mut [ConflictMatrixCandidate]) {
+    for candidate in candidates.iter_mut() {
+        let stale_expected_tests = stale_expected_tests_for_candidate(candidate);
+        let follow_up_debt = candidate.worker_feedback.follow_up_ids.clone();
+        let mut score = 0usize;
+        let mut reasons = Vec::new();
+
+        if candidate.worker_feedback.repeated_blockage {
+            score += candidate.worker_feedback.blocked.saturating_mul(40);
+            reasons.push(format!(
+                "repeated blockage: {} blocked worker_result rows",
+                candidate.worker_feedback.blocked
+            ));
+        }
+        if !stale_expected_tests.is_empty() {
+            score += stale_expected_tests.len().saturating_mul(25);
+            let reason = if candidate.affected_tests.is_empty() {
+                format!(
+                    "stale expected tests: {} no longer match current impact output",
+                    feedback_ref_list(&stale_expected_tests)
+                )
+            } else {
+                format!(
+                    "stale expected tests: {} not in current impacted tests {}",
+                    feedback_ref_list(&stale_expected_tests),
+                    feedback_ref_list(&candidate.affected_tests)
+                )
+            };
+            reasons.push(reason.clone());
+            candidate.worker_feedback.warnings.push(format!(
+                "{reason}; refresh impact or rerun the listed tests before redispatch"
+            ));
+        }
+        if !follow_up_debt.is_empty() {
+            score += follow_up_debt.len().saturating_mul(10);
+            let reason = format!("follow-up debt: {}", feedback_ref_list(&follow_up_debt));
+            reasons.push(reason.clone());
+            candidate.worker_feedback.warnings.push(format!(
+                "{reason}; include or resolve the referenced backlog ids before closing dispatch"
+            ));
+        }
+
+        candidate.worker_feedback.stale_expected_tests = stale_expected_tests;
+        candidate.worker_feedback.follow_up_debt = follow_up_debt;
+        candidate.worker_feedback.closure_rank_score = score;
+        candidate.worker_feedback.closure_rank_reasons = reasons;
+        candidate.worker_feedback.warnings =
+            dedupe_preserve_order(std::mem::take(&mut candidate.worker_feedback.warnings));
     }
 }
 
@@ -13634,21 +13723,17 @@ fn apply_conflict_matrix_ownership_blocks(candidates: &mut [ConflictMatrixCandid
                 "worker_feedback: completed={} blocked={} touched_files={} expected_tests={} follow_up_ids={}",
                 candidate.worker_feedback.completed,
                 candidate.worker_feedback.blocked,
-                if candidate.worker_feedback.touched_files.is_empty() {
-                    "none".to_string()
-                } else {
-                    candidate.worker_feedback.touched_files.join(",")
-                },
-                if candidate.worker_feedback.expected_tests.is_empty() {
-                    "none".to_string()
-                } else {
-                    candidate.worker_feedback.expected_tests.join(" && ")
-                },
-                if candidate.worker_feedback.follow_up_ids.is_empty() {
-                    "none".to_string()
-                } else {
-                    candidate.worker_feedback.follow_up_ids.join(",")
-                },
+                feedback_ref_list(&candidate.worker_feedback.touched_files),
+                feedback_ref_list(&candidate.worker_feedback.expected_tests),
+                feedback_ref_list(&candidate.worker_feedback.follow_up_ids),
+            ));
+        }
+        if candidate.worker_feedback.closure_rank_score > 0 {
+            read_only_context.push(format!(
+                "worker_feedback_closure: score={} stale_expected_tests={} follow_up_debt={}",
+                candidate.worker_feedback.closure_rank_score,
+                feedback_ref_list(&candidate.worker_feedback.stale_expected_tests),
+                feedback_ref_list(&candidate.worker_feedback.follow_up_debt),
             ));
         }
         read_only_context.extend(
@@ -13731,6 +13816,7 @@ fn conflict_matrix_worker_prompt_packets(
             token_budget: candidate.ownership.token_budget.clone(),
             semantic_dispatch_score: candidate.semantic_dispatch_score,
             semantic_dispatch_reasons: candidate.semantic_dispatch_reasons.clone(),
+            worker_feedback: candidate.worker_feedback.clone(),
             prompt: candidate.ownership.prompt.clone(),
         })
         .collect()
@@ -13756,10 +13842,11 @@ fn conflict_matrix_orchestration_observability(
         .iter()
         .map(|candidate| {
             format!(
-                "candidate #{} {} risk={} semantic_score={} owned_files={} forbidden_files={}",
+                "candidate #{} {} risk={} closure_score={} semantic_score={} owned_files={} forbidden_files={}",
                 candidate.rank,
                 candidate.target,
                 conflict_risk_label(candidate.risk),
+                candidate.worker_feedback.closure_rank_score,
                 candidate.semantic_dispatch_score,
                 candidate.ownership.owned_files.len(),
                 candidate.ownership.forbidden_files.len()
@@ -13888,13 +13975,17 @@ fn print_conflict_matrix_human(report: &ConflictMatrixReport, compact: bool) {
         }
         if candidate.worker_feedback.total > 0 {
             println!(
-                "  worker feedback: completed:{} blocked:{} files:{} tests:{} follow-ups:{}",
+                "  worker feedback: completed:{} blocked:{} files:{} tests:{} follow-ups:{} closure:{}",
                 candidate.worker_feedback.completed,
                 candidate.worker_feedback.blocked,
                 candidate.worker_feedback.touched_files.len(),
                 candidate.worker_feedback.expected_tests.len(),
-                candidate.worker_feedback.follow_up_ids.len()
+                candidate.worker_feedback.follow_up_ids.len(),
+                candidate.worker_feedback.closure_rank_score
             );
+            for reason in &candidate.worker_feedback.closure_rank_reasons {
+                println!("  closure: {reason}");
+            }
             for warning in &candidate.worker_feedback.warnings {
                 println!("  warning: {warning}");
             }
@@ -14016,10 +14107,17 @@ fn build_conflict_matrix_report(
         ));
     }
 
+    apply_conflict_matrix_worker_feedback_controls(&mut candidates);
     candidates.sort_by(|left, right| {
         left.risk
             .cmp(&right.risk)
             .then_with(|| left.risk_score.cmp(&right.risk_score))
+            .then_with(|| {
+                right
+                    .worker_feedback
+                    .closure_rank_score
+                    .cmp(&left.worker_feedback.closure_rank_score)
+            })
             .then_with(|| {
                 right
                     .semantic_dispatch_score
@@ -14469,8 +14567,8 @@ function draw(){
     svg.appendChild(label);
   }
 }
-packets.innerHTML = report.worker_prompt_packets.map(packet => `<div class="row"><div class="kind">${escapeHtml(packet.contract_version)} - ${escapeHtml(packet.risk)}</div><div class="label">${escapeHtml(packet.title)}</div><div class="handle">${escapeHtml(packet.packet_id)}</div></div>`).join("") || "<div class=\"meta\">No packets.</div>";
-feedback.innerHTML = report.worker_feedback.map(item => `<div class="row"><div class="kind">completed ${item.completed} - blocked ${item.blocked}</div><div>files ${escapeHtml((item.touched_files||[]).join(", ") || "none")}</div><div>tests ${escapeHtml((item.expected_tests||[]).join(" && ") || "none")}</div>${item.repeated_blockage ? "<div class=\"label\">Repeated blockage</div>" : ""}</div>`).join("") || "<div class=\"meta\">No worker results.</div>";
+packets.innerHTML = report.worker_prompt_packets.map(packet => `<div class="row"><div class="kind">${escapeHtml(packet.contract_version)} - ${escapeHtml(packet.risk)} - closure ${packet.worker_feedback ? packet.worker_feedback.closure_rank_score : 0}</div><div class="label">${escapeHtml(packet.title)}</div><div class="handle">${escapeHtml(packet.packet_id)}</div></div>`).join("") || "<div class=\"meta\">No packets.</div>";
+feedback.innerHTML = report.worker_feedback.map(item => `<div class="row"><div class="kind">completed ${item.completed} - blocked ${item.blocked} - closure ${item.closure_rank_score}</div><div>files ${escapeHtml((item.touched_files||[]).join(", ") || "none")}</div><div>tests ${escapeHtml((item.expected_tests||[]).join(" && ") || "none")}</div>${item.repeated_blockage ? "<div class=\"label\">Repeated blockage</div>" : ""}${(item.stale_expected_tests||[]).length ? `<div class="label">Stale tests: ${escapeHtml(item.stale_expected_tests.join(", "))}</div>` : ""}${(item.follow_up_debt||[]).length ? `<div class="label">Follow-up debt: ${escapeHtml(item.follow_up_debt.join(", "))}</div>` : ""}</div>`).join("") || "<div class=\"meta\">No worker results.</div>";
 nodeList.innerHTML = nodes.map(node => `<div class="row"><div class="kind">${escapeHtml(node.kind)}</div><div class="label">${escapeHtml(node.label)}</div><div class="handle">${escapeHtml(node.id)}</div></div>`).join("");
 window.addEventListener("resize", () => { layout(); draw(); });
 layout(); draw();

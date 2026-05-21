@@ -10,15 +10,24 @@ fields that agent-doc should consume:
 - `graph-db-evidence-v1` for `graph-db evidence` packets with `packet_id`,
   `projection_hash`, `worker_results`, `replay_commands`, and `repair_commands`
 - `worker-prompt-packet-v1` for conflict-matrix `worker_prompt_packets`
-- `conflict-matrix-v1` for planner decisions keyed by evidence packet ids
+- `conflict-matrix-v1` for planner decisions keyed by evidence packet ids and
+  worker-feedback closure ranking controls
 - `context-pack-graph-orchestration-v1` for context-pack freshness/evidence
   observability
 - `session-review-follow-up-v1` for session-review next-context commands
+- `dispatch-trace-v1` for JSON/HTML replay views over backlog, job_packet,
+  worker_result, worker feedback, source_handle, and worker_prompt_packet rows
 
 ```bash
 tsift graph-db --path . schema --json
 cat fixtures/graph-db-operator-examples/graph-orchestration-contracts.json
+cat fixtures/graph-db-operator-examples/agent-orchestration-acceptance-pack.json
 ```
+
+`agent-orchestration-acceptance-pack.json` is the golden agent-doc queue fixture:
+it contains sample queue lines, job_packet rows, worker_result rows,
+conflict-matrix/dispatch-trace replay commands, and the context-pack /
+session-review follow-up commands that agent-doc should consume.
 
 ## SQLite Graph DB Reads
 
@@ -43,6 +52,8 @@ Run the operator path in order when preparing parallel worker dispatch:
 tsift graph-db --path . refresh --json
 tsift graph-db --path . evidence gsch --depth 3 --limit 8 --json
 tsift conflict-matrix --path tasks/software/tsift.md gsch grev wres --json
+tsift dispatch-trace --path tasks/software/tsift.md gsch grev wres --json
+tsift dispatch-trace --path tasks/software/tsift.md gsch --format html
 tsift --envelope context-pack tasks/software/tsift.md --budget normal --json
 tsift session-review tasks/software/tsift.md --next-context --json
 ```
@@ -50,6 +61,9 @@ tsift session-review tasks/software/tsift.md --next-context --json
 Use evidence `packet_id` plus `projection_hash` as replay proof. If a packet or
 conflict-matrix input reports stale/missing freshness, stop dispatch and run the
 emitted `repair_commands` before trusting the worker ownership blocks.
+Worker-feedback closure warnings for repeated blockage, stale expected tests,
+or follow-up debt are soft ranking signals; they can reorder equal-risk safe
+candidates, but shared file/symbol/test/config gates remain authoritative.
 
 ## Convex Sync Dry Run
 

@@ -70,6 +70,11 @@
         "token_budget",
         "semantic_dispatch_score",
         "semantic_dispatch_reasons",
+        "worker_feedback",
+        "worker_feedback.closure_rank_score",
+        "worker_feedback.closure_rank_reasons",
+        "worker_feedback.stale_expected_tests",
+        "worker_feedback.follow_up_debt",
         "prompt"
       ]
     },
@@ -83,7 +88,9 @@
         "worker_prompt_packets",
         "orchestration.projection_hashes",
         "orchestration.evidence_packet_ids",
-        "orchestration.conflict_matrix_decisions"
+        "orchestration.conflict_matrix_decisions",
+        "candidates.worker_feedback.closure_rank_score",
+        "candidates.worker_feedback.closure_rank_reasons"
       ]
     },
     {
@@ -121,6 +128,9 @@
         "evidence_packet_ids",
         "worker_prompt_packets",
         "worker_feedback",
+        "worker_feedback.closure_rank_score",
+        "worker_feedback.stale_expected_tests",
+        "worker_feedback.follow_up_debt",
         "nodes",
         "edges",
         "conflict_matrix_decisions",

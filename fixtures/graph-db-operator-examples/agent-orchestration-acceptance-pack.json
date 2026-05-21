@@ -1,0 +1,100 @@
+{
+  "name": "agent-orchestration-acceptance-pack",
+  "version": "agent-orchestration-acceptance-pack-v1",
+  "purpose": "Golden agent-doc orchestration rows and commands for validating graph-backed dispatch handoffs.",
+  "command_sequence": [
+    "tsift graph-db --path . refresh --json",
+    "tsift graph-db --path . evidence wfdb --depth 3 --limit 8 --json",
+    "tsift conflict-matrix --path tasks/software/tsift.md wfdb wfok --json",
+    "tsift dispatch-trace --path tasks/software/tsift.md wfdb wfok --json",
+    "tsift dispatch-trace --path tasks/software/tsift.md wfdb --format html",
+    "tsift --envelope context-pack tasks/software/tsift.md --budget normal --json",
+    "tsift session-review tasks/software/tsift.md --next-context --budget normal --json"
+  ],
+  "sample_session_markdown": {
+    "path": "tasks/software/tsift.md",
+    "queue": [
+      "preset #spec-test-build-install-commit-push",
+      "- do [#wfdb]",
+      "- do [#wfok]"
+    ],
+    "backlog": [
+      "- [ ] [#wfdb] Refresh closure worker feedback debt in closure module.",
+      "- [ ] [#wfok] Update clean worker result fixture in clean module."
+    ],
+    "exchange": [
+      "Blocked `#wfdb`; touched files `closure.rs`; tests `cargo test --test retired_closure`; follow-up `#shrd`.",
+      "Completed `#wfok`; touched files `clean.rs`."
+    ]
+  },
+  "sample_rows": {
+    "job_packets": [
+      {
+        "kind": "job_packet",
+        "properties": {
+          "ref_id": "wfdb",
+          "path": "tasks/software/tsift.md",
+          "label": "do #wfdb"
+        }
+      },
+      {
+        "kind": "job_packet",
+        "properties": {
+          "ref_id": "wfok",
+          "path": "tasks/software/tsift.md",
+          "label": "do #wfok"
+        }
+      }
+    ],
+    "worker_results": [
+      {
+        "kind": "worker_result",
+        "properties": {
+          "ref_id": "wfdb",
+          "status": "blocked",
+          "touched_files": "closure.rs",
+          "expected_tests": "cargo test --test retired_closure",
+          "follow_up_ids": "shrd"
+        }
+      },
+      {
+        "kind": "worker_result",
+        "properties": {
+          "ref_id": "wfok",
+          "status": "completed",
+          "touched_files": "clean.rs"
+        }
+      }
+    ]
+  },
+  "expected_contracts": {
+    "evidence_packet_id_prefix": "gevd-",
+    "worker_prompt_packet_id_prefix": "wpp-",
+    "contract_versions": [
+      "graph-db-evidence-v1",
+      "worker-prompt-packet-v1",
+      "conflict-matrix-v1",
+      "context-pack-graph-orchestration-v1",
+      "session-review-follow-up-v1",
+      "dispatch-trace-v1"
+    ],
+    "worker_feedback": {
+      "closure_rank_score": "positive for wfdb and zero for wfok",
+      "stale_expected_tests": [
+        "cargo test --test retired_closure"
+      ],
+      "follow_up_debt": [
+        "shrd"
+      ],
+      "hard_gate_rule": "closure controls can reorder equal-risk candidates but must not add file/symbol/test/config risk reasons"
+    }
+  },
+  "required_trace_links": [
+    "backlog -> worker_result",
+    "job_packet -> worker_result",
+    "backlog/job_packet -> source_handle",
+    "dispatch_trace.evidence_packet_ids -> conflict_matrix.orchestration.evidence_packet_ids",
+    "dispatch_trace.replay_commands -> conflict_matrix.next_commands",
+    "dispatch_trace.repair_commands -> graph-db refresh/doctor"
+  ]
+}

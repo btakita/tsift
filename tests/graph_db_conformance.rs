@@ -99,6 +99,26 @@ fn isolated_leaf() {}
 "#,
     )
     .unwrap();
+    fs::write(
+        dir.path().join("closure.rs"),
+        r#"pub fn closure_worker() {
+    closure_leaf();
+}
+
+fn closure_leaf() {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("clean.rs"),
+        r#"pub fn clean_worker() {
+    clean_leaf();
+}
+
+fn clean_leaf() {}
+"#,
+    )
+    .unwrap();
 
     let task_dir = dir.path().join("tasks/software");
     fs::create_dir_all(&task_dir).unwrap();
@@ -117,6 +137,8 @@ Completed `#gval`; touched files `main.rs`; tests `cargo test --test graph_db_co
 Completed `#solo`; touched files `isolated.rs`; tests `cargo test --test graph_db_conformance`; follow-up `#gval`.
 Blocked `#shrd`; touched files `main.rs`; tests `cargo test --test graph_db_conformance`; follow-up `#gval`.
 Blocked `#shrd`; touched files `main.rs`; tests `cargo test --test graph_db_conformance`; follow-up `#solo`.
+Blocked `#wfdb`; touched files `closure.rs`; tests `cargo test --test retired_closure`; follow-up `#shrd`.
+Completed `#wfok`; touched files `clean.rs`.
 <!-- /agent:exchange -->
 
 	<!-- agent:queue -->
@@ -124,6 +146,8 @@ Blocked `#shrd`; touched files `main.rs`; tests `cargo test --test graph_db_conf
 	- do [#gval]
 	- do [#shrd]
 		- do [#solo]
+	- do [#wfdb]
+	- do [#wfok]
 		<!-- /agent:queue -->
 
 		## Backlog
@@ -132,6 +156,8 @@ Blocked `#shrd`; touched files `main.rs`; tests `cargo test --test graph_db_conf
 	- [ ] [#gval] Verify helper bridge graph-db conformance.
 	- [ ] [#shrd] Adjust shared helper ownership in main module.
 	- [ ] [#solo] Update independent worker fixture in isolated module.
+	- [ ] [#wfdb] Refresh closure worker feedback debt in closure module.
+	- [ ] [#wfok] Update clean worker result fixture in clean module.
 	<!-- /agent:backlog -->
 	"#,
     )
@@ -340,6 +366,12 @@ fn assert_sorted(values: &[String]) {
 fn graph_orchestration_contract_fixture() -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures/graph-db-operator-examples/graph-orchestration-contracts.json");
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+fn agent_orchestration_acceptance_pack_fixture() -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/graph-db-operator-examples/agent-orchestration-acceptance-pack.json");
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
@@ -1062,11 +1094,50 @@ fn conflict_matrix_worker_feedback_warns_on_repeated_blockage_without_changing_h
         "{report}"
     );
     assert!(
+        candidate["worker_feedback"]["stale_expected_tests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|test| test == "cargo test --test graph_db_conformance"),
+        "{report}"
+    );
+    assert!(
+        candidate["worker_feedback"]["follow_up_debt"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == "solo"),
+        "{report}"
+    );
+    assert!(
+        candidate["worker_feedback"]["closure_rank_score"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "{report}"
+    );
+    assert!(
+        candidate["worker_feedback"]["closure_rank_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason.as_str().unwrap().contains("stale expected tests")),
+        "{report}"
+    );
+    assert!(
         report["warnings"]
             .as_array()
             .unwrap()
             .iter()
             .any(|warning| warning.as_str().unwrap().contains("repeated blockage")),
+        "{report}"
+    );
+    assert!(
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("follow-up debt")),
         "{report}"
     );
     assert!(
@@ -1076,6 +1147,72 @@ fn conflict_matrix_worker_feedback_warns_on_repeated_blockage_without_changing_h
             .iter()
             .all(|reason| !reason.as_str().unwrap().contains("repeated blockage")),
         "worker feedback should warn without weakening hard conflict gates: {report}"
+    );
+}
+
+#[test]
+fn conflict_matrix_worker_feedback_closure_score_reorders_safe_candidates() {
+    let project = graph_db_project();
+    init_git_repo(project.path());
+    let session = project.path().join("tasks/software/tsift.md");
+
+    let report = assert_tsift_json(vec![
+        "conflict-matrix".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "wfok".to_string(),
+        "wfdb".to_string(),
+    ]);
+
+    let candidates = report["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2, "{report}");
+    assert_eq!(candidates[0]["target"], "wfdb", "{report}");
+    assert_eq!(candidates[0]["risk"], "low", "{report}");
+    assert_eq!(candidates[1]["risk"], "low", "{report}");
+    assert!(
+        candidates[0]["worker_feedback"]["closure_rank_score"]
+            .as_u64()
+            .unwrap()
+            > candidates[1]["worker_feedback"]["closure_rank_score"]
+                .as_u64()
+                .unwrap(),
+        "{report}"
+    );
+    assert!(
+        candidates[0]["worker_feedback"]["stale_expected_tests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|test| test == "cargo test --test retired_closure"),
+        "{report}"
+    );
+    assert!(
+        candidates[0]["worker_feedback"]["follow_up_debt"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == "shrd"),
+        "{report}"
+    );
+    assert!(
+        candidates[0]["ownership"]["read_only_context"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.as_str().unwrap().contains("worker_feedback_closure")),
+        "{report}"
+    );
+    assert!(
+        candidates[0]["risk_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|reason| {
+                let reason = reason.as_str().unwrap();
+                !reason.contains("stale expected tests") && !reason.contains("follow-up debt")
+            }),
+        "{report}"
     );
 }
 
@@ -1182,6 +1319,72 @@ fn graph_orchestration_contract_fixture_matches_live_reports() {
 }
 
 #[test]
+fn agent_orchestration_acceptance_pack_fixture_matches_queue_contract_terms() {
+    let fixture = agent_orchestration_acceptance_pack_fixture();
+    assert_eq!(
+        fixture["version"], "agent-orchestration-acceptance-pack-v1",
+        "{fixture}"
+    );
+    assert!(
+        fixture["command_sequence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command
+                .as_str()
+                .unwrap()
+                .contains("graph-db --path . refresh")),
+        "{fixture}"
+    );
+    assert!(
+        fixture["command_sequence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |command| command.as_str().unwrap().contains("dispatch-trace")
+                    && command.as_str().unwrap().contains("--format html")
+            ),
+        "{fixture}"
+    );
+    assert!(
+        fixture["sample_rows"]["job_packets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["properties"]["ref_id"] == "wfdb"),
+        "{fixture}"
+    );
+    assert!(
+        fixture["sample_rows"]["worker_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| {
+                row["properties"]["ref_id"] == "wfdb"
+                    && row["properties"]["status"] == "blocked"
+                    && row["properties"]["expected_tests"] == "cargo test --test retired_closure"
+            }),
+        "{fixture}"
+    );
+    assert!(
+        fixture["expected_contracts"]["worker_feedback"]["hard_gate_rule"]
+            .as_str()
+            .unwrap()
+            .contains("must not add file/symbol/test/config risk reasons"),
+        "{fixture}"
+    );
+    assert!(
+        fixture["required_trace_links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|link| link.as_str().unwrap().contains("replay_commands")),
+        "{fixture}"
+    );
+}
+
+#[test]
 fn dispatch_trace_cli_exports_json_and_html_operator_views() {
     let project = graph_db_project();
     init_git_repo(project.path());
@@ -1231,6 +1434,171 @@ fn dispatch_trace_cli_exports_json_and_html_operator_views() {
     assert!(html.contains("id=\"graph-canvas\""), "{html}");
     assert!(html.contains("worker_prompt_packets"), "{html}");
     assert!(html.contains("dispatch-trace-v1"), "{html}");
+}
+
+#[test]
+fn dispatch_trace_replay_contract_matches_real_queue_graph_db_run() {
+    let project = graph_db_project();
+    init_git_repo(project.path());
+    let session = project.path().join("tasks/software/tsift.md");
+
+    let refresh = graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
+    assert_eq!(refresh["status"], "current", "{refresh}");
+
+    let evidence = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "evidence".to_string(),
+            "wfdb".to_string(),
+            "--depth".to_string(),
+            "3".to_string(),
+            "--limit".to_string(),
+            "8".to_string(),
+        ],
+    );
+    let evidence_packet = evidence["packet_id"].as_str().unwrap().to_string();
+    assert!(
+        evidence["repair_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("doctor")),
+        "{evidence}"
+    );
+
+    let conflict = assert_tsift_json(vec![
+        "conflict-matrix".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "wfdb".to_string(),
+        "wfok".to_string(),
+    ]);
+    assert!(
+        conflict["worker_prompt_packets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|packet| {
+                packet["target"] == "wfdb"
+                    && packet["worker_feedback"]["closure_rank_score"]
+                        .as_u64()
+                        .unwrap()
+                        > 0
+            }),
+        "{conflict}"
+    );
+
+    let trace = assert_tsift_json(vec![
+        "dispatch-trace".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "wfdb".to_string(),
+        "wfok".to_string(),
+    ]);
+    assert_eq!(
+        trace["evidence_packet_ids"], conflict["orchestration"]["evidence_packet_ids"],
+        "{trace}"
+    );
+    assert!(
+        trace["evidence_packet_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|packet| packet.as_str() == Some(evidence_packet.as_str())),
+        "{trace}"
+    );
+    assert_eq!(
+        trace["replay_commands"], conflict["next_commands"],
+        "{trace}"
+    );
+    assert!(
+        trace["repair_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("refresh")),
+        "{trace}"
+    );
+
+    let worker_rows = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "kind".to_string(),
+            "worker_result".to_string(),
+            "--property".to_string(),
+            "ref_id=wfdb".to_string(),
+            "--limit".to_string(),
+            "5".to_string(),
+        ],
+    );
+    let worker_ids = node_ids(&worker_rows);
+    assert!(!worker_ids.is_empty(), "{worker_rows}");
+    assert!(
+        worker_ids.iter().all(|id| trace["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["id"].as_str() == Some(id.as_str()))),
+        "{trace}"
+    );
+    assert!(
+        trace["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| { node["kind"] == "job_packet" && node["properties"]["ref_id"] == "wfdb" }),
+        "{trace}"
+    );
+    assert!(
+        trace["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["kind"] == "source_handle"),
+        "{trace}"
+    );
+    assert!(
+        trace["worker_feedback"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|feedback| {
+                feedback["stale_expected_tests"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|test| test == "cargo test --test retired_closure")
+                    && feedback["follow_up_debt"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|id| id == "shrd")
+            }),
+        "{trace}"
+    );
+
+    let output = run_tsift(vec![
+        "dispatch-trace".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--format".to_string(),
+        "html".to_string(),
+        "wfdb".to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "dispatch-trace html failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let html = String::from_utf8_lossy(&output.stdout);
+    assert!(html.contains(&evidence_packet), "{html}");
+    assert!(html.contains("Follow-up debt"), "{html}");
+    assert!(html.contains("closure"), "{html}");
 }
 
 #[test]
