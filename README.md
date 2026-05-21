@@ -80,5 +80,7 @@ GitHub release assets are built by the `Release` workflow for:
 - `x86_64-pc-windows-msvc`
 
 The crates.io package path is enabled after `cargo publish --dry-run` passes.
-The default lexical search adapter is maintained in-tree, so publishing no
-longer depends on an upstream git-only `sift` crate.
+The release workflow uses the `TSIFT_ENABLE_CRATES_PUBLISH=true` repository
+variable and `CARGO_REGISTRY_TOKEN` repository secret to turn on tagged
+crates.io publishes. The default lexical search adapter is maintained in-tree,
+so publishing no longer depends on an upstream git-only `sift` crate.

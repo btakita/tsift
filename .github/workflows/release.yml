@@ -56,6 +56,9 @@ jobs:
       - name: Full CI suite
         run: make ci-full
 
+      - name: Crate publish dry run
+        run: cargo publish --locked --dry-run
+
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}

@@ -71,6 +71,38 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
     !process_exists(pid)
 }
 
+#[test]
+fn release_publish_gate_requires_secret_variable_and_dry_run() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+    let spec = fs::read_to_string(root.join("SPEC.md")).unwrap();
+    let readme = fs::read_to_string(root.join("README.md")).unwrap();
+
+    assert!(
+        workflow.contains("cargo publish --locked --dry-run"),
+        "release verification should prove the crate package is publishable"
+    );
+    assert!(
+        workflow.contains("vars.TSIFT_ENABLE_CRATES_PUBLISH == 'true'"),
+        "publish job should remain opt-in through the repo variable"
+    );
+    assert!(
+        workflow.contains("CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}"),
+        "publish job should read the crates.io token from the repo secret"
+    );
+    assert!(
+        spec.contains("TSIFT_ENABLE_CRATES_PUBLISH=true")
+            && spec.contains("CARGO_REGISTRY_TOKEN")
+            && spec.contains("cargo publish --locked --dry-run"),
+        "release spec should document the publish gate"
+    );
+    assert!(
+        readme.contains("TSIFT_ENABLE_CRATES_PUBLISH=true")
+            && readme.contains("CARGO_REGISTRY_TOKEN"),
+        "README should document the repo variable and secret"
+    );
+}
+
 fn init_git_repo(path: &Path) {
     let status = Command::new("git")
         .args(["init"])
