@@ -1,5 +1,6 @@
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -414,6 +415,273 @@ fn assert_contract_fields(fixture: &Value, name: &str, report: &Value) {
             "{name} missing required field {field}: {report}"
         );
     }
+}
+
+fn string_values(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.as_str().unwrap().to_string())
+        .collect()
+}
+
+fn sorted_property_values(nodes: &Value, property: &str) -> Vec<String> {
+    nodes
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|node| node["properties"][property].as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn worker_result_summaries(nodes: &Value) -> Vec<Value> {
+    let mut summaries = nodes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| {
+            let properties = &node["properties"];
+            let ref_id = properties["ref_id"].as_str().unwrap_or("").to_string();
+            let status = properties["status"].as_str().unwrap_or("").to_string();
+            let summary = json!({
+                "ref_id": ref_id,
+                "status": status,
+                "touched_files": properties.get("touched_files").cloned().unwrap_or(Value::Null),
+                "expected_tests": properties.get("expected_tests").cloned().unwrap_or(Value::Null),
+                "follow_up_ids": properties.get("follow_up_ids").cloned().unwrap_or(Value::Null),
+            });
+            (format!("{ref_id}:{status}"), summary)
+        })
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| left.0.cmp(&right.0));
+    summaries.into_iter().map(|(_, summary)| summary).collect()
+}
+
+fn worker_feedback_summary(feedback: &Value) -> Value {
+    json!({
+        "completed": feedback["completed"],
+        "blocked": feedback["blocked"],
+        "repeated_blockage": feedback["repeated_blockage"],
+        "stale_expected_tests": feedback["stale_expected_tests"],
+        "follow_up_debt": feedback["follow_up_debt"],
+        "closure_rank_score": feedback["closure_rank_score"],
+        "closure_rank_reasons": feedback["closure_rank_reasons"],
+    })
+}
+
+fn conflict_candidate_summaries(report: &Value) -> Vec<Value> {
+    report["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|candidate| {
+            let read_only_context = string_values(&candidate["ownership"]["read_only_context"]);
+            json!({
+                "rank": candidate["rank"],
+                "target": candidate["target"],
+                "risk": candidate["risk"],
+                "owned_files": candidate["owned_files"],
+                "owned_symbols": candidate["owned_symbols"],
+                "affected_tests": candidate["affected_tests"],
+                "worker_feedback": worker_feedback_summary(&candidate["worker_feedback"]),
+                "read_only_context_has_worker_feedback": read_only_context
+                    .iter()
+                    .any(|entry| entry.contains("worker_feedback:")),
+                "read_only_context_has_closure_warning": read_only_context
+                    .iter()
+                    .any(|entry| entry.contains("worker_feedback_closure:")),
+            })
+        })
+        .collect()
+}
+
+fn worker_prompt_packet_summaries(report: &Value) -> Vec<Value> {
+    report["worker_prompt_packets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|packet| {
+            json!({
+                "contract_version": packet["contract_version"],
+                "target": packet["target"],
+                "rank": packet["rank"],
+                "risk": packet["risk"],
+                "packet_id_prefix": packet["packet_id"]
+                    .as_str()
+                    .unwrap()
+                    .split('-')
+                    .next()
+                    .unwrap(),
+                "owned_files": packet["owned_files"],
+                "worker_feedback": worker_feedback_summary(&packet["worker_feedback"]),
+            })
+        })
+        .collect()
+}
+
+fn node_kind_counts(nodes: &Value) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for node in nodes.as_array().unwrap() {
+        let kind = node["kind"].as_str().unwrap().to_string();
+        *counts.entry(kind).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn commands_contain(commands: &Value, needle: &str) -> bool {
+    commands
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|command| command.as_str().unwrap().contains(needle))
+}
+
+fn commands_contain_all(commands: &Value, needles: &[&str]) -> bool {
+    commands.as_array().unwrap().iter().any(|command| {
+        let command = command.as_str().unwrap();
+        needles.iter().all(|needle| command.contains(needle))
+    })
+}
+
+fn regenerate_agent_orchestration_acceptance_samples(project: &Path, session: &Path) -> Value {
+    let refresh = graph_db_json(project, Backend::Sqlite, vec!["refresh".to_string()]);
+    let evidence = graph_db_json(
+        project,
+        Backend::Sqlite,
+        vec![
+            "evidence".to_string(),
+            "wfdb".to_string(),
+            "--depth".to_string(),
+            "3".to_string(),
+            "--limit".to_string(),
+            "8".to_string(),
+        ],
+    );
+    let conflict = assert_tsift_json(vec![
+        "conflict-matrix".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "wfdb".to_string(),
+        "wfok".to_string(),
+    ]);
+    let trace = assert_tsift_json(vec![
+        "dispatch-trace".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "wfdb".to_string(),
+        "wfok".to_string(),
+    ]);
+    let html_output = run_tsift(vec![
+        "dispatch-trace".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--format".to_string(),
+        "html".to_string(),
+        "wfdb".to_string(),
+    ]);
+    assert!(
+        html_output.status.success(),
+        "dispatch-trace html failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&html_output.stdout),
+        String::from_utf8_lossy(&html_output.stderr)
+    );
+    let html = String::from_utf8_lossy(&html_output.stdout);
+    let context_pack = assert_tsift_json(vec![
+        "context-pack".to_string(),
+        session.to_string_lossy().to_string(),
+        "--budget".to_string(),
+        "normal".to_string(),
+        "--json".to_string(),
+    ]);
+    let session_review = assert_tsift_json(vec![
+        "session-review".to_string(),
+        session.to_string_lossy().to_string(),
+        "--next-context".to_string(),
+        "--budget".to_string(),
+        "normal".to_string(),
+        "--json".to_string(),
+    ]);
+
+    let trace_feedback = trace["worker_feedback"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(worker_feedback_summary)
+        .collect::<Vec<_>>();
+    let context_graph = &context_pack["graph_orchestration"];
+
+    json!({
+        "graph_db_refresh": {
+            "status": refresh["status"],
+            "projection_version": refresh["freshness"]["projection_version"],
+            "content_hash_present": refresh["freshness"]["content_hash"].as_str().is_some(),
+        },
+        "graph_db_evidence": {
+            "contract_version": evidence["contract_version"],
+            "target": evidence["target"],
+            "packet_id_prefix": evidence["packet_id"].as_str().unwrap().split('-').next().unwrap(),
+            "projection_hash_present": evidence["projection_hash"].as_str().is_some(),
+            "freshness_status": evidence["freshness"]["status"],
+            "target_kind": evidence["target_node"]["kind"],
+            "target_ref_id": evidence["target_node"]["properties"]["ref_id"],
+            "source_handle_files": sorted_property_values(&evidence["source_handles"], "file"),
+            "worker_results": worker_result_summaries(&evidence["worker_results"]),
+            "replay_mentions_wfdb": commands_contain_all(&evidence["replay_commands"], &["evidence", "wfdb"]),
+            "repair_mentions_refresh": commands_contain(&evidence["repair_commands"], "refresh"),
+            "repair_mentions_doctor": commands_contain(&evidence["repair_commands"], "doctor"),
+        },
+        "conflict_matrix": {
+            "contract_version": conflict["contract_version"],
+            "targets": conflict["targets"],
+            "can_parallel": conflict["can_parallel"],
+            "fail_closed": conflict["fail_closed"],
+            "candidate_summaries": conflict_candidate_summaries(&conflict),
+            "worker_prompt_packets": worker_prompt_packet_summaries(&conflict),
+            "evidence_packet_count": conflict["orchestration"]["evidence_packet_ids"].as_array().unwrap().len(),
+            "projection_hash_count": conflict["orchestration"]["projection_hashes"].as_array().unwrap().len(),
+        },
+        "dispatch_trace_json": {
+            "contract_version": trace["contract_version"],
+            "targets": trace["targets"],
+            "projection_hash_count": trace["projection_hashes"].as_array().unwrap().len(),
+            "evidence_packet_ids_match_conflict": trace["evidence_packet_ids"] == conflict["orchestration"]["evidence_packet_ids"],
+            "worker_prompt_packets": worker_prompt_packet_summaries(&trace),
+            "worker_feedback": trace_feedback,
+            "node_kind_counts": node_kind_counts(&trace["nodes"]),
+            "replay_commands_match_conflict": trace["replay_commands"] == conflict["next_commands"],
+            "repair_mentions_refresh": commands_contain(&trace["repair_commands"], "refresh"),
+            "repair_mentions_doctor": commands_contain(&trace["repair_commands"], "doctor"),
+        },
+        "dispatch_trace_html": {
+            "contains_graph_canvas": html.contains("id=\"graph-canvas\""),
+            "contains_contract_version": html.contains("dispatch-trace-v1"),
+            "contains_worker_prompt_packets": html.contains("worker_prompt_packets"),
+            "contains_follow_up_debt": html.contains("Follow-up debt"),
+            "contains_closure": html.contains("closure"),
+            "contains_evidence_packet": html.contains(evidence["packet_id"].as_str().unwrap()),
+        },
+        "context_pack": {
+            "graph_orchestration_contract_version": context_graph["contract_version"],
+            "projection_freshness_status": context_graph["projection_freshness"]["status"],
+            "evidence_packet_count": context_graph["evidence_packet_ids"].as_array().unwrap().len(),
+            "conflict_matrix_decisions": context_graph["conflict_matrix_decisions"],
+            "follow_up_mentions_conflict_matrix": commands_contain(&context_graph["follow_up_commands"], "conflict-matrix"),
+            "worker_ownership_block_count": context_graph["worker_ownership_blocks"].as_array().unwrap().len(),
+        },
+        "session_review": {
+            "contract_version": session_review["contract_version"],
+            "prompt_target_total": session_review["prompt_target_total"],
+            "prompt_targets": session_review["prompt_targets"],
+            "next_digest_mentions_conflict_matrix": commands_contain(&session_review["next_digest_commands"], "conflict-matrix"),
+            "next_digest_mentions_context_pack": commands_contain(&session_review["next_digest_commands"], "context-pack"),
+        },
+    })
 }
 
 fn symbol_id_by_ref(project: &Path, backend: Backend<'_>, ref_id: &str) -> String {
@@ -1381,6 +1649,25 @@ fn agent_orchestration_acceptance_pack_fixture_matches_queue_contract_terms() {
             .iter()
             .any(|link| link.as_str().unwrap().contains("replay_commands")),
         "{fixture}"
+    );
+}
+
+#[test]
+fn agent_orchestration_acceptance_pack_regenerates_from_real_queue_fixture() {
+    let project = graph_db_project();
+    init_git_repo(project.path());
+    let session = project.path().join("tasks/software/tsift.md");
+    let fixture = agent_orchestration_acceptance_pack_fixture();
+    let actual = regenerate_agent_orchestration_acceptance_samples(project.path(), &session);
+    let Some(expected) = fixture.get("regenerated_samples") else {
+        panic!(
+            "agent-orchestration acceptance fixture is missing regenerated_samples:\n{}",
+            serde_json::to_string_pretty(&actual).unwrap()
+        );
+    };
+    assert_eq!(
+        expected, &actual,
+        "agent-orchestration acceptance fixture drifted; update fixtures/graph-db-operator-examples/agent-orchestration-acceptance-pack.json regenerated_samples from the live queue fixture output"
     );
 }
 

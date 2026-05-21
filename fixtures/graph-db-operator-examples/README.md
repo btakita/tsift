@@ -27,7 +27,12 @@ cat fixtures/graph-db-operator-examples/agent-orchestration-acceptance-pack.json
 `agent-orchestration-acceptance-pack.json` is the golden agent-doc queue fixture:
 it contains sample queue lines, job_packet rows, worker_result rows,
 conflict-matrix/dispatch-trace replay commands, and the context-pack /
-session-review follow-up commands that agent-doc should consume.
+session-review follow-up commands that agent-doc should consume. Its
+`regenerated_samples` block is produced by the graph conformance test from the
+same queue fixture, covering `graph-db refresh`, `graph-db evidence`,
+`conflict-matrix`, `dispatch-trace` JSON/HTML, `context-pack`, and
+`session-review`; CI fails when those normalized live outputs drift from the
+checked-in pack.
 
 ## SQLite Graph DB Reads
 

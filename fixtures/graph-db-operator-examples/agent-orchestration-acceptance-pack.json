@@ -14,15 +14,25 @@
   "sample_session_markdown": {
     "path": "tasks/software/tsift.md",
     "queue": [
-      "preset #spec-test-build-install-commit-push",
+      "dispatch #spec-test-build-install-commit-push",
+      "- do [#gval]",
+      "- do [#shrd]",
+      "  - do [#solo]",
       "- do [#wfdb]",
       "- do [#wfok]"
     ],
     "backlog": [
+      "- [ ] [#gval] Verify helper bridge graph-db conformance.",
+      "- [ ] [#shrd] Adjust shared helper ownership in main module.",
+      "- [ ] [#solo] Update independent worker fixture in isolated module.",
       "- [ ] [#wfdb] Refresh closure worker feedback debt in closure module.",
       "- [ ] [#wfok] Update clean worker result fixture in clean module."
     ],
     "exchange": [
+      "Completed `#gval`; touched files `main.rs`; tests `cargo test --test graph_db_conformance`; follow-up `#solo`.",
+      "Completed `#solo`; touched files `isolated.rs`; tests `cargo test --test graph_db_conformance`; follow-up `#gval`.",
+      "Blocked `#shrd`; touched files `main.rs`; tests `cargo test --test graph_db_conformance`; follow-up `#gval`.",
+      "Blocked `#shrd`; touched files `main.rs`; tests `cargo test --test graph_db_conformance`; follow-up `#solo`.",
       "Blocked `#wfdb`; touched files `closure.rs`; tests `cargo test --test retired_closure`; follow-up `#shrd`.",
       "Completed `#wfok`; touched files `clean.rs`."
     ]
@@ -96,5 +106,294 @@
     "dispatch_trace.evidence_packet_ids -> conflict_matrix.orchestration.evidence_packet_ids",
     "dispatch_trace.replay_commands -> conflict_matrix.next_commands",
     "dispatch_trace.repair_commands -> graph-db refresh/doctor"
-  ]
+  ],
+  "regenerated_samples": {
+    "graph_db_refresh": {
+      "status": "current",
+      "projection_version": "tsift-traversal-v1",
+      "content_hash_present": true
+    },
+    "graph_db_evidence": {
+      "contract_version": "graph-db-evidence-v1",
+      "target": "wfdb",
+      "packet_id_prefix": "gevd",
+      "projection_hash_present": true,
+      "freshness_status": "current",
+      "target_kind": "backlog",
+      "target_ref_id": "wfdb",
+      "source_handle_files": [
+        "clean.rs",
+        "closure.rs",
+        "isolated.rs"
+      ],
+      "worker_results": [
+        {
+          "ref_id": "wfdb",
+          "status": "blocked",
+          "touched_files": "closure.rs",
+          "expected_tests": "cargo test --test retired_closure",
+          "follow_up_ids": "shrd"
+        }
+      ],
+      "replay_mentions_wfdb": true,
+      "repair_mentions_refresh": true,
+      "repair_mentions_doctor": true
+    },
+    "conflict_matrix": {
+      "contract_version": "conflict-matrix-v1",
+      "targets": [
+        "wfdb",
+        "wfok"
+      ],
+      "can_parallel": false,
+      "fail_closed": true,
+      "candidate_summaries": [
+        {
+          "rank": 1,
+          "target": "wfdb",
+          "risk": "low",
+          "owned_files": [
+            "clean.rs",
+            "closure.rs",
+            "isolated.rs"
+          ],
+          "owned_symbols": [
+            "clean_leaf",
+            "clean_worker",
+            "closure_leaf",
+            "closure_worker",
+            "independent_worker",
+            "isolated_leaf"
+          ],
+          "affected_tests": [],
+          "worker_feedback": {
+            "completed": 0,
+            "blocked": 1,
+            "repeated_blockage": false,
+            "stale_expected_tests": [
+              "cargo test --test retired_closure"
+            ],
+            "follow_up_debt": [
+              "shrd"
+            ],
+            "closure_rank_score": 35,
+            "closure_rank_reasons": [
+              "stale expected tests: cargo test --test retired_closure no longer match current impact output",
+              "follow-up debt: shrd"
+            ]
+          },
+          "read_only_context_has_worker_feedback": true,
+          "read_only_context_has_closure_warning": true
+        },
+        {
+          "rank": 2,
+          "target": "wfok",
+          "risk": "low",
+          "owned_files": [
+            "clean.rs",
+            "closure.rs",
+            "isolated.rs"
+          ],
+          "owned_symbols": [
+            "clean_leaf",
+            "clean_worker",
+            "closure_leaf",
+            "closure_worker",
+            "independent_worker",
+            "isolated_leaf"
+          ],
+          "affected_tests": [],
+          "worker_feedback": {
+            "completed": 1,
+            "blocked": 0,
+            "repeated_blockage": false,
+            "stale_expected_tests": [],
+            "follow_up_debt": [],
+            "closure_rank_score": 0,
+            "closure_rank_reasons": []
+          },
+          "read_only_context_has_worker_feedback": true,
+          "read_only_context_has_closure_warning": false
+        }
+      ],
+      "worker_prompt_packets": [
+        {
+          "contract_version": "worker-prompt-packet-v1",
+          "target": "wfdb",
+          "rank": 1,
+          "risk": "low",
+          "packet_id_prefix": "wpp",
+          "owned_files": [
+            "clean.rs",
+            "closure.rs",
+            "isolated.rs"
+          ],
+          "worker_feedback": {
+            "completed": 0,
+            "blocked": 1,
+            "repeated_blockage": false,
+            "stale_expected_tests": [
+              "cargo test --test retired_closure"
+            ],
+            "follow_up_debt": [
+              "shrd"
+            ],
+            "closure_rank_score": 35,
+            "closure_rank_reasons": [
+              "stale expected tests: cargo test --test retired_closure no longer match current impact output",
+              "follow-up debt: shrd"
+            ]
+          }
+        },
+        {
+          "contract_version": "worker-prompt-packet-v1",
+          "target": "wfok",
+          "rank": 2,
+          "risk": "low",
+          "packet_id_prefix": "wpp",
+          "owned_files": [
+            "clean.rs",
+            "closure.rs",
+            "isolated.rs"
+          ],
+          "worker_feedback": {
+            "completed": 1,
+            "blocked": 0,
+            "repeated_blockage": false,
+            "stale_expected_tests": [],
+            "follow_up_debt": [],
+            "closure_rank_score": 0,
+            "closure_rank_reasons": []
+          }
+        }
+      ],
+      "evidence_packet_count": 2,
+      "projection_hash_count": 1
+    },
+    "dispatch_trace_json": {
+      "contract_version": "dispatch-trace-v1",
+      "targets": [
+        "wfdb",
+        "wfok"
+      ],
+      "projection_hash_count": 1,
+      "evidence_packet_ids_match_conflict": true,
+      "worker_prompt_packets": [
+        {
+          "contract_version": "worker-prompt-packet-v1",
+          "target": "wfdb",
+          "rank": 1,
+          "risk": "low",
+          "packet_id_prefix": "wpp",
+          "owned_files": [
+            "clean.rs",
+            "closure.rs",
+            "isolated.rs"
+          ],
+          "worker_feedback": {
+            "completed": 0,
+            "blocked": 1,
+            "repeated_blockage": false,
+            "stale_expected_tests": [
+              "cargo test --test retired_closure"
+            ],
+            "follow_up_debt": [
+              "shrd"
+            ],
+            "closure_rank_score": 35,
+            "closure_rank_reasons": [
+              "stale expected tests: cargo test --test retired_closure no longer match current impact output",
+              "follow-up debt: shrd"
+            ]
+          }
+        },
+        {
+          "contract_version": "worker-prompt-packet-v1",
+          "target": "wfok",
+          "rank": 2,
+          "risk": "low",
+          "packet_id_prefix": "wpp",
+          "owned_files": [
+            "clean.rs",
+            "closure.rs",
+            "isolated.rs"
+          ],
+          "worker_feedback": {
+            "completed": 1,
+            "blocked": 0,
+            "repeated_blockage": false,
+            "stale_expected_tests": [],
+            "follow_up_debt": [],
+            "closure_rank_score": 0,
+            "closure_rank_reasons": []
+          }
+        }
+      ],
+      "worker_feedback": [
+        {
+          "completed": 0,
+          "blocked": 1,
+          "repeated_blockage": false,
+          "stale_expected_tests": [
+            "cargo test --test retired_closure"
+          ],
+          "follow_up_debt": [
+            "shrd"
+          ],
+          "closure_rank_score": 35,
+          "closure_rank_reasons": [
+            "stale expected tests: cargo test --test retired_closure no longer match current impact output",
+            "follow-up debt: shrd"
+          ]
+        },
+        {
+          "completed": 1,
+          "blocked": 0,
+          "repeated_blockage": false,
+          "stale_expected_tests": [],
+          "follow_up_debt": [],
+          "closure_rank_score": 0,
+          "closure_rank_reasons": []
+        }
+      ],
+      "node_kind_counts": {
+        "backlog": 5,
+        "file": 4,
+        "job_packet": 6,
+        "session": 1,
+        "source_handle": 4,
+        "symbol": 13,
+        "worker_context": 8,
+        "worker_result": 6
+      },
+      "replay_commands_match_conflict": true,
+      "repair_mentions_refresh": true,
+      "repair_mentions_doctor": true
+    },
+    "dispatch_trace_html": {
+      "contains_graph_canvas": true,
+      "contains_contract_version": true,
+      "contains_worker_prompt_packets": true,
+      "contains_follow_up_debt": true,
+      "contains_closure": true,
+      "contains_evidence_packet": true
+    },
+    "context_pack": {
+      "graph_orchestration_contract_version": "context-pack-graph-orchestration-v1",
+      "projection_freshness_status": "current",
+      "evidence_packet_count": 0,
+      "conflict_matrix_decisions": [
+        "no resolvable backlog/job targets found for conflict-matrix"
+      ],
+      "follow_up_mentions_conflict_matrix": false,
+      "worker_ownership_block_count": 4
+    },
+    "session_review": {
+      "contract_version": "session-review-follow-up-v1",
+      "prompt_target_total": 0,
+      "prompt_targets": [],
+      "next_digest_mentions_conflict_matrix": false,
+      "next_digest_mentions_context_pack": false
+    }
+  }
 }
