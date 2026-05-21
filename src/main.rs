@@ -8346,33 +8346,29 @@ fn graph_db_resolve_evidence_target(
         return Ok(Some(node));
     }
     let normalized = target.trim().trim_start_matches('#');
-    let mut candidates = store
-        .all_nodes()?
-        .into_iter()
-        .filter(|node| {
-            node.properties.get("handle").map(String::as_str) == Some(target)
-                || node.properties.get("ref_id").map(String::as_str) == Some(normalized)
-                || node.label == target
-                || node.label == format!("#{normalized}")
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        evidence_kind_rank(&left.kind)
-            .cmp(&evidence_kind_rank(&right.kind))
-            .then(left.id.cmp(&right.id))
-    });
-    Ok(candidates.into_iter().next())
-}
-
-fn evidence_kind_rank(kind: &str) -> usize {
-    match kind {
-        "backlog" => 0,
-        "job_packet" => 1,
-        "worker_result" => 2,
-        "worker_context" => 3,
-        "source_handle" => 4,
-        _ => 9,
+    for kind in [
+        "backlog",
+        "job_packet",
+        "worker_result",
+        "worker_context",
+        "source_handle",
+    ] {
+        let mut candidates = store
+            .nodes_by_kind(kind)?
+            .into_iter()
+            .filter(|node| {
+                node.properties.get("handle").map(String::as_str) == Some(target)
+                    || node.properties.get("ref_id").map(String::as_str) == Some(normalized)
+                    || node.label == target
+                    || node.label == format!("#{normalized}")
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.id.cmp(&right.id));
+        if let Some(candidate) = candidates.into_iter().next() {
+            return Ok(Some(candidate));
+        }
     }
+    Ok(None)
 }
 
 fn graph_db_reachable_nodes_by_kind(
@@ -8382,18 +8378,35 @@ fn graph_db_reachable_nodes_by_kind(
     depth: usize,
     limit: usize,
 ) -> Result<Vec<(SubstrateGraphNode, substrate::GraphPath)>> {
-    let mut rows = Vec::new();
-    for node in store
-        .all_nodes()?
-        .into_iter()
-        .filter(|node| node.kind == kind)
-    {
-        if let Some(path) =
-            graph_db_shortest_path_with_max_hops(store, from_id, &node.id, None, Some(depth))?
-        {
-            rows.push((node, path));
+    let mut rows = BTreeMap::<String, (SubstrateGraphNode, substrate::GraphPath)>::new();
+    let mut seen = BTreeSet::from([from_id.to_string()]);
+    let mut queue = VecDeque::from([(from_id.to_string(), vec![from_id.to_string()])]);
+
+    while let Some((current, path)) = queue.pop_front() {
+        let current_depth = path.len().saturating_sub(1);
+        if current_depth >= depth {
+            continue;
+        }
+        for edge in store.outgoing_edges(&current, None)? {
+            if !seen.insert(edge.to_id.clone()) {
+                continue;
+            }
+            let Some(node) = store.node(&edge.to_id)? else {
+                continue;
+            };
+            let mut next_path = path.clone();
+            next_path.push(edge.to_id.clone());
+            let graph_path = substrate::GraphPath {
+                hops: next_path.len().saturating_sub(1),
+                nodes: next_path.clone(),
+            };
+            if node.kind == kind {
+                rows.entry(node.id.clone()).or_insert((node, graph_path));
+            }
+            queue.push_back((edge.to_id, next_path));
         }
     }
+    let mut rows = rows.into_values().collect::<Vec<_>>();
     rows.sort_by(|(left_node, left_path), (right_node, right_path)| {
         left_path
             .hops
@@ -8405,6 +8418,48 @@ fn graph_db_reachable_nodes_by_kind(
         rows.truncate(limit);
     }
     Ok(rows)
+}
+
+fn graph_db_evidence_completed_queue_drift_warnings(
+    store: &impl GraphStore,
+    target: &SubstrateGraphNode,
+    worker_results: &[SubstrateGraphNode],
+) -> Result<Vec<String>> {
+    let ref_id = target.properties.get("ref_id").map(String::as_str);
+    let has_completed_result = worker_results.iter().any(|node| {
+        node.properties.get("status").map(String::as_str) == Some("completed")
+            && node.properties.get("ref_id").map(String::as_str) == ref_id
+    });
+    if !has_completed_result {
+        return Ok(Vec::new());
+    }
+    let active_jobs = store
+        .nodes_by_kind("job_packet")?
+        .into_iter()
+        .filter(|node| {
+            node.properties.get("ref_id").map(String::as_str) == ref_id
+                && node.label.starts_with("do #")
+        })
+        .collect::<Vec<_>>();
+    if active_jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let repair = match (target.properties.get("path"), ref_id) {
+        (Some(path), Some(id)) => format!(
+            "repair with `agent-doc write --commit {} --done {}` or the next `agent-doc finalize --done {}` closeout",
+            shell_quote(path),
+            shell_quote(id),
+            shell_quote(id)
+        ),
+        _ => {
+            "repair by marking the queue item done/reaping it in the agent-doc session".to_string()
+        }
+    };
+    Ok(vec![format!(
+        "queue-head drift: target {} has {} active queued do packet(s) but already has a completed worker_result; {repair}; do not redispatch or reactivate the completed item",
+        target.label,
+        active_jobs.len()
+    )])
 }
 
 fn graph_db_evidence_next_commands(
@@ -8588,6 +8643,11 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
         .iter()
         .map(|(node, _)| node.clone())
         .collect::<Vec<_>>();
+    warnings.extend(graph_db_evidence_completed_queue_drift_warnings(
+        store,
+        &target_node,
+        &worker_results,
+    )?);
     if worker_context.is_empty()
         && source_handles.is_empty()
         && worker_results.is_empty()
@@ -8908,8 +8968,25 @@ fn cmd_graph_db(
         }
         _ => {}
     }
-    let graph = build_traversal_graph(&root, path, scope)?;
     let graph_db = graph_substrate_db_path(&root, scope);
+    let mut warnings = Vec::new();
+    if let GraphDbQuery::Evidence { target, .. } = &query {
+        let needs_refresh = if graph_db.exists() {
+            let store = SqliteGraphStore::open(&graph_db)?;
+            sqlite_graph_freshness(&store, scope.unwrap_or("root"))?.fail_closed
+                || graph_db_resolve_evidence_target(&store, target)?.is_none()
+        } else {
+            true
+        };
+        if needs_refresh {
+            let (graph, _refresh) =
+                refresh_traversal_graph_store_with_options(&root, path, scope, true)?;
+            warnings = graph.warnings;
+        }
+    } else {
+        let (graph, _refresh) = refresh_traversal_graph_store(&root, path, scope)?;
+        warnings = graph.warnings;
+    }
     let report = match backend {
         GraphDbBackend::Sqlite => {
             let store = SqliteGraphStore::open(&graph_db)?;
@@ -8929,19 +9006,11 @@ fn cmd_graph_db(
                     limit: *limit,
                     store: &store,
                     freshness,
-                    warnings: graph.warnings,
+                    warnings,
                 })?;
                 return print_graph_db_evidence_report(&report, format);
             }
-            graph_db_report_from_store(
-                &root,
-                scope,
-                "sqlite",
-                query,
-                &store,
-                freshness,
-                graph.warnings,
-            )?
+            graph_db_report_from_store(&root, scope, "sqlite", query, &store, freshness, warnings)?
         }
         GraphDbBackend::ConvexSnapshot => {
             let snapshot_path = convex_snapshot
@@ -8968,7 +9037,7 @@ fn cmd_graph_db(
                     limit: *limit,
                     store: &store,
                     freshness,
-                    warnings: graph.warnings,
+                    warnings,
                 })?;
                 return print_graph_db_evidence_report(&report, format);
             }
@@ -8979,7 +9048,7 @@ fn cmd_graph_db(
                 query,
                 &store,
                 freshness,
-                graph.warnings,
+                warnings,
             )?
         }
     };
@@ -9315,6 +9384,9 @@ fn parse_worker_result_line(
     line: &str,
     files: &[TraversalFileIndexEntry],
 ) -> Vec<ParsedWorkerResult> {
+    if line.trim_start().starts_with("- [") {
+        return Vec::new();
+    }
     let lower = line.to_ascii_lowercase();
     let status =
         if lower.contains("completed") || lower.contains("code-complete") || lower.contains("done")
@@ -9365,7 +9437,22 @@ fn parse_worker_result_line(
         .collect()
 }
 
-fn markdown_files_for_traversal(root: &Path) -> Result<Vec<PathBuf>> {
+fn hinted_markdown_file(root: &Path, path_hint: &Path) -> Option<PathBuf> {
+    let hinted_path = if path_hint.is_absolute() {
+        path_hint.to_path_buf()
+    } else {
+        root.join(path_hint)
+    };
+    if hinted_path.extension().and_then(|ext| ext.to_str()) == Some("md") && hinted_path.is_file() {
+        return Some(hinted_path);
+    }
+    None
+}
+
+fn markdown_files_for_traversal(root: &Path, path_hint: &Path) -> Result<Vec<PathBuf>> {
+    if let Some(hinted_path) = hinted_markdown_file(root, path_hint) {
+        return Ok(vec![hinted_path]);
+    }
     let mut files = Vec::new();
     let walker = ignore::WalkBuilder::new(root)
         .hidden(true)
@@ -9476,12 +9563,13 @@ fn link_backlog_to_code_nodes(
 
 fn load_agent_doc_traversal_nodes(
     root: &Path,
+    path_hint: &Path,
     graph: &mut TraversalGraphBuild,
     symbols: &[TraversalSymbolIndexEntry],
     files: &[TraversalFileIndexEntry],
     routes: &[TraversalRouteIndexEntry],
 ) -> Result<()> {
-    for markdown_path in markdown_files_for_traversal(root)? {
+    for markdown_path in markdown_files_for_traversal(root, path_hint)? {
         let content = match fs::read_to_string(&markdown_path) {
             Ok(content) => content,
             Err(err) => {
@@ -9804,143 +9892,149 @@ fn add_raw_source_file_nodes(
     Ok(())
 }
 
-fn build_traversal_graph_source(
+fn build_traversal_graph_source_with_options(
     root: &Path,
     path_hint: &Path,
     scope: Option<&str>,
+    session_only: bool,
 ) -> Result<TraversalGraphBuild> {
     let mut graph = TraversalGraphBuild::default();
     let mut symbol_entries = Vec::new();
     let mut file_entries = Vec::new();
     let mut route_entries = Vec::new();
-    let gate = prepare_agent_doc_index_gate(root, path_hint, scope, "graph traversal packet");
-    graph.warnings.extend(gate.diagnostics);
+    if !session_only || hinted_markdown_file(root, path_hint).is_none() {
+        let gate = prepare_agent_doc_index_gate(root, path_hint, scope, "graph traversal packet");
+        graph.warnings.extend(gate.diagnostics);
 
-    match gate.db_path {
-        Some(db_path) if db_path.exists() => {
-            let db = index::IndexDb::open_read_only_resilient(&db_path)?;
-            let file_paths = db.file_paths()?;
-            for file in file_paths {
-                let node = traversal_file_node(root, &file);
-                let entry = TraversalFileIndexEntry {
-                    handle: node.handle.clone(),
-                    tokens: traversal_node_tokens(&node),
-                    node: node.clone(),
-                };
-                graph.add_node(node);
-                file_entries.push(entry);
-            }
+        match gate.db_path {
+            Some(db_path) if db_path.exists() => {
+                let db = index::IndexDb::open_read_only_resilient(&db_path)?;
+                let file_paths = db.file_paths()?;
+                for file in file_paths {
+                    let node = traversal_file_node(root, &file);
+                    let entry = TraversalFileIndexEntry {
+                        handle: node.handle.clone(),
+                        tokens: traversal_node_tokens(&node),
+                        node: node.clone(),
+                    };
+                    graph.add_node(node);
+                    file_entries.push(entry);
+                }
 
-            let symbols = db.all_symbols()?;
-            let mut symbol_by_file_name_line = HashMap::new();
-            let mut first_symbol_by_name = BTreeMap::<String, String>::new();
-            for symbol in &symbols {
-                let node = traversal_symbol_node(root, symbol);
-                let file = relativize(&symbol.file, root);
-                symbol_by_file_name_line.insert(
-                    format!("{file}:{}:{}", symbol.line, symbol.name),
-                    node.handle.clone(),
-                );
-                first_symbol_by_name
-                    .entry(symbol.name.clone())
-                    .or_insert_with(|| node.handle.clone());
-                let entry = TraversalSymbolIndexEntry {
-                    handle: node.handle.clone(),
-                    tokens: traversal_node_tokens(&node),
-                    node: node.clone(),
-                };
-                graph.add_node(node.clone());
-                if let Some(file_node) = file_entries
-                    .iter()
-                    .find(|entry| entry.node.path.as_deref() == Some(file.as_str()))
-                {
+                let symbols = db.all_symbols()?;
+                let mut symbol_by_file_name_line = HashMap::new();
+                let mut first_symbol_by_name = BTreeMap::<String, String>::new();
+                for symbol in &symbols {
+                    let node = traversal_symbol_node(root, symbol);
+                    let file = relativize(&symbol.file, root);
+                    symbol_by_file_name_line.insert(
+                        format!("{file}:{}:{}", symbol.line, symbol.name),
+                        node.handle.clone(),
+                    );
+                    first_symbol_by_name
+                        .entry(symbol.name.clone())
+                        .or_insert_with(|| node.handle.clone());
+                    let entry = TraversalSymbolIndexEntry {
+                        handle: node.handle.clone(),
+                        tokens: traversal_node_tokens(&node),
+                        node: node.clone(),
+                    };
+                    graph.add_node(node.clone());
+                    if let Some(file_node) = file_entries
+                        .iter()
+                        .find(|entry| entry.node.path.as_deref() == Some(file.as_str()))
+                    {
+                        graph.add_edge(
+                            &file_node.handle,
+                            &node.handle,
+                            "defines",
+                            Some("file defines symbol".to_string()),
+                            1,
+                        );
+                    }
+                    symbol_entries.push(entry);
+                }
+
+                for edge in db.all_stored_edges()? {
+                    let caller_file = relativize(&edge.caller_file, root);
+                    let caller_key =
+                        format!("{caller_file}:{}:{}", edge.caller_line, edge.caller_name);
+                    let Some(caller_handle) = symbol_by_file_name_line.get(&caller_key).cloned()
+                    else {
+                        continue;
+                    };
+                    let callee_handle =
+                        if let Some(handle) = first_symbol_by_name.get(&edge.callee_name) {
+                            handle.clone()
+                        } else {
+                            let node = traversal_unresolved_symbol_node(root, &edge.callee_name);
+                            let handle = node.handle.clone();
+                            graph.add_node(node);
+                            handle
+                        };
                     graph.add_edge(
-                        &file_node.handle,
-                        &node.handle,
-                        "defines",
-                        Some("file defines symbol".to_string()),
+                        &caller_handle,
+                        &callee_handle,
+                        "calls",
+                        Some(format!("call site {}:{}", caller_file, edge.call_site_line)),
                         1,
                     );
                 }
-                symbol_entries.push(entry);
-            }
 
-            for edge in db.all_stored_edges()? {
-                let caller_file = relativize(&edge.caller_file, root);
-                let caller_key = format!("{caller_file}:{}:{}", edge.caller_line, edge.caller_name);
-                let Some(caller_handle) = symbol_by_file_name_line.get(&caller_key).cloned() else {
-                    continue;
-                };
-                let callee_handle =
-                    if let Some(handle) = first_symbol_by_name.get(&edge.callee_name) {
-                        handle.clone()
-                    } else {
-                        let node = traversal_unresolved_symbol_node(root, &edge.callee_name);
-                        let handle = node.handle.clone();
-                        graph.add_node(node);
-                        handle
+                for route in db.all_routes()? {
+                    let node = traversal_route_node(root, &route);
+                    let entry = TraversalRouteIndexEntry {
+                        handle: node.handle.clone(),
+                        tokens: traversal_node_tokens(&node),
+                        node: node.clone(),
                     };
-                graph.add_edge(
-                    &caller_handle,
-                    &callee_handle,
-                    "calls",
-                    Some(format!("call site {}:{}", caller_file, edge.call_site_line)),
-                    1,
-                );
-            }
-
-            for route in db.all_routes()? {
-                let node = traversal_route_node(root, &route);
-                let entry = TraversalRouteIndexEntry {
-                    handle: node.handle.clone(),
-                    tokens: traversal_node_tokens(&node),
-                    node: node.clone(),
-                };
-                graph.add_node(node.clone());
-                if let Some(file_node) = file_entries
-                    .iter()
-                    .find(|entry| entry.node.path.as_deref() == node.path.as_deref())
-                {
+                    graph.add_node(node.clone());
+                    if let Some(file_node) = file_entries
+                        .iter()
+                        .find(|entry| entry.node.path.as_deref() == node.path.as_deref())
+                    {
+                        graph.add_edge(
+                            &file_node.handle,
+                            &node.handle,
+                            "defines_route",
+                            Some("file declares route".to_string()),
+                            1,
+                        );
+                    }
+                    let handler_handle =
+                        if let Some(handle) = first_symbol_by_name.get(&route.handler_name) {
+                            handle.clone()
+                        } else {
+                            let node = traversal_unresolved_symbol_node(root, &route.handler_name);
+                            let handle = node.handle.clone();
+                            graph.add_node(node);
+                            handle
+                        };
                     graph.add_edge(
-                        &file_node.handle,
-                        &node.handle,
-                        "defines_route",
-                        Some("file declares route".to_string()),
+                        &entry.handle,
+                        &handler_handle,
+                        "handled_by",
+                        Some("route handler reference".to_string()),
                         1,
                     );
+                    route_entries.push(entry);
                 }
-                let handler_handle =
-                    if let Some(handle) = first_symbol_by_name.get(&route.handler_name) {
-                        handle.clone()
-                    } else {
-                        let node = traversal_unresolved_symbol_node(root, &route.handler_name);
-                        let handle = node.handle.clone();
-                        graph.add_node(node);
-                        handle
-                    };
-                graph.add_edge(
-                    &entry.handle,
-                    &handler_handle,
-                    "handled_by",
-                    Some("route handler reference".to_string()),
-                    1,
-                );
-                route_entries.push(entry);
             }
-        }
-        _ => {
-            add_raw_source_file_nodes(root, &gate.source_root, &mut graph, &mut file_entries)
-                .with_context(|| {
+            _ => {
+                add_raw_source_file_nodes(root, &gate.source_root, &mut graph, &mut file_entries)
+                    .with_context(|| {
                     format!(
                         "loading raw source fallback nodes from {}",
                         gate.source_root.display()
                     )
                 })?;
+            }
         }
     }
 
     load_agent_doc_traversal_nodes(
         root,
+        path_hint,
         &mut graph,
         &symbol_entries,
         &file_entries,
@@ -9949,12 +10043,23 @@ fn build_traversal_graph_source(
     Ok(graph)
 }
 
-fn refresh_traversal_graph_store(
+#[cfg(test)]
+fn build_traversal_graph_source(
     root: &Path,
     path_hint: &Path,
     scope: Option<&str>,
+) -> Result<TraversalGraphBuild> {
+    build_traversal_graph_source_with_options(root, path_hint, scope, false)
+}
+
+fn refresh_traversal_graph_store_with_options(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+    session_only: bool,
 ) -> Result<(TraversalGraphBuild, SqliteProjectionRefresh)> {
-    let source_graph = build_traversal_graph_source(root, path_hint, scope)?;
+    let source_graph =
+        build_traversal_graph_source_with_options(root, path_hint, scope, session_only)?;
     let projection = traversal_projection_from_graph(root, scope, &source_graph)?;
     let graph_db = graph_substrate_db_path(root, scope);
     let mut store = SqliteGraphStore::open(&graph_db)?;
@@ -9967,6 +10072,14 @@ fn refresh_traversal_graph_store(
     let mut graph = traversal_graph_from_store(root, &store)?;
     graph.warnings = source_graph.warnings;
     Ok((graph, refresh))
+}
+
+fn refresh_traversal_graph_store(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+) -> Result<(TraversalGraphBuild, SqliteProjectionRefresh)> {
+    refresh_traversal_graph_store_with_options(root, path_hint, scope, false)
 }
 
 fn build_traversal_graph(

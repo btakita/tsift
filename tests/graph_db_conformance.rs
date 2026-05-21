@@ -1156,6 +1156,19 @@ fn graph_db_evidence_packet_covers_backlog_job_worker_context_and_source_handles
         "{backlog}"
     );
     assert!(
+        backlog["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| {
+                let warning = warning.as_str().unwrap();
+                warning.contains("queue-head drift")
+                    && warning.contains("agent-doc write --commit")
+                    && warning.contains("do not redispatch")
+            }),
+        "{backlog}"
+    );
+    assert!(
         backlog["shortest_paths"]
             .as_array()
             .unwrap()
@@ -1246,7 +1259,7 @@ agent_doc_format: template
 ## Backlog
 
 <!-- agent:backlog -->
-- [ ] [#zqxj] Triage lunar orchard handoff without code tokens.
+- [ ] [#zqxj] Triage completed queue guidance without code tokens.
 <!-- /agent:backlog -->
 "#,
     )
@@ -1280,6 +1293,10 @@ agent_doc_format: template
     assert!(
         !evidence["worker_context"].as_array().unwrap().is_empty(),
         "{evidence}"
+    );
+    assert!(
+        evidence["worker_results"].as_array().unwrap().is_empty(),
+        "backlog prose containing completed must not become worker_result evidence: {evidence}"
     );
     assert!(
         evidence["source_handles"]
@@ -2780,6 +2797,82 @@ fn graph_db_scale_caps_pagination_paths_doctor_and_sqlite_plans() {
     assert!(
         edge_plan.contains("idx_graph_edges_from_kind"),
         "expected graph_edges from/kind index in plan:\n{edge_plan}"
+    );
+}
+
+#[test]
+fn graph_db_evidence_stays_bounded_on_large_session_backlog_fixture() {
+    let project = large_graph_db_project(240);
+    let started = Instant::now();
+    let evidence = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "evidence".to_string(),
+            "b000".to_string(),
+            "--depth".to_string(),
+            "3".to_string(),
+            "--limit".to_string(),
+            "8".to_string(),
+        ],
+    );
+
+    assert_eq!(evidence["target_node"]["kind"], "backlog", "{evidence}");
+    assert!(
+        evidence["worker_context"].as_array().unwrap().len() <= 8,
+        "{evidence}"
+    );
+    assert!(
+        evidence["source_handles"].as_array().unwrap().len() <= 8,
+        "{evidence}"
+    );
+    assert!(
+        evidence["shortest_paths"].as_array().unwrap().len() <= 16,
+        "{evidence}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "graph-db evidence should stay bounded on large session fixtures"
+    );
+}
+
+#[test]
+fn graph_db_evidence_refreshes_only_hinted_agent_doc_session() {
+    let project = large_graph_db_project(80);
+    let noise_dir = project.path().join("tasks/noise");
+    fs::create_dir_all(&noise_dir).unwrap();
+    for idx in 0..120 {
+        fs::write(
+            noise_dir.join(format!("noise-{idx:03}.md")),
+            format!(
+                "<!-- agent:backlog -->\n- [ ] [#n{idx:03}] Background noise backlog item.\n<!-- /agent:backlog -->\n"
+            ),
+        )
+        .unwrap();
+    }
+    let session = project.path().join("tasks/software/tsift.md");
+    let started = Instant::now();
+    let evidence = assert_tsift_json(vec![
+        "graph-db".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "evidence".to_string(),
+        "b000".to_string(),
+        "--depth".to_string(),
+        "3".to_string(),
+        "--limit".to_string(),
+        "8".to_string(),
+    ]);
+
+    assert_eq!(evidence["target_node"]["kind"], "backlog", "{evidence}");
+    assert_eq!(
+        evidence["target_node"]["properties"]["path"], "tasks/software/tsift.md",
+        "{evidence}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "session-hinted graph-db evidence should not walk unrelated markdown"
     );
 }
 
