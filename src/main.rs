@@ -634,6 +634,32 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Export a graph-backed dispatch trace for operator review
+    DispatchTrace {
+        /// Candidate backlog ids, job handles, or graph node ids to trace
+        targets: Vec<String>,
+        /// Agent-doc session document or repo path to trace
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Restrict graph evidence to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Graph-db evidence depth for each target
+        #[arg(long, default_value = "3")]
+        depth: usize,
+        /// Max graph-db evidence rows per target (0 = unlimited)
+        #[arg(long, default_value = "8")]
+        limit: usize,
+        /// Maximum affected test targets to include from impact
+        #[arg(long, default_value = "20")]
+        impact_limit: usize,
+        /// Output format for the dispatch trace
+        #[arg(long, value_enum, default_value = "json")]
+        format: DispatchTraceFormat,
+        /// Output as JSON (equivalent to --format json)
+        #[arg(long)]
+        json: bool,
+    },
     /// Compare raw symbol output with compact tag-family preview envelopes
     TokenSavings {
         /// Fixture describing raw symbols, tagpath families, and minimum savings thresholds
@@ -767,6 +793,12 @@ enum Commands {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum TraverseFormat {
+    Json,
+    Html,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DispatchTraceFormat {
     Json,
     Html,
 }
@@ -1567,6 +1599,38 @@ fn main() -> Result<()> {
             depth,
             limit,
             impact_limit,
+            OutputFormat {
+                json_output: json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                schema,
+                envelope,
+            },
+        ),
+        Some(Commands::DispatchTrace {
+            targets,
+            path,
+            scope,
+            depth,
+            limit,
+            impact_limit,
+            format,
+            json,
+        }) => cmd_dispatch_trace(
+            DispatchTraceOptions {
+                path: &path,
+                scope: scope.as_deref(),
+                raw_targets: &targets,
+                depth,
+                limit,
+                impact_limit,
+                trace_format: if json {
+                    DispatchTraceFormat::Json
+                } else {
+                    format
+                },
+            },
             OutputFormat {
                 json_output: json || terse || schema || envelope,
                 compact,
@@ -4395,6 +4459,7 @@ const CONFLICT_MATRIX_CONTRACT_VERSION: &str = "conflict-matrix-v1";
 const CONTEXT_PACK_GRAPH_ORCHESTRATION_CONTRACT_VERSION: &str =
     "context-pack-graph-orchestration-v1";
 const SESSION_REVIEW_FOLLOW_UP_CONTRACT_VERSION: &str = "session-review-follow-up-v1";
+const DISPATCH_TRACE_CONTRACT_VERSION: &str = "dispatch-trace-v1";
 const GRAPH_PROJECTION_META_KIND: &str = "projection_meta";
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -6388,9 +6453,7 @@ struct GraphDbEvidenceReport {
     target_node: SubstrateGraphNode,
     worker_context: Vec<SubstrateGraphNode>,
     source_handles: Vec<SubstrateGraphNode>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     worker_results: Vec<SubstrateGraphNode>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     semantic_related: Vec<SubstrateGraphNode>,
     shortest_paths: Vec<GraphDbEvidencePath>,
     next_commands: Vec<String>,
@@ -7985,6 +8048,11 @@ fn graph_db_schema() -> GraphDbSchema {
                 version: SESSION_REVIEW_FOLLOW_UP_CONTRACT_VERSION,
                 description: "session-review next-context follow-up command contract for resumable digest/context-pack commands",
             },
+            GraphDbSchemaContract {
+                name: "dispatch_trace",
+                version: DISPATCH_TRACE_CONTRACT_VERSION,
+                description: "operator review trace linking backlog, job packets, worker results, source handles, semantic rows, evidence packet ids, and worker prompt packets",
+            },
         ],
         node_fields: vec![
             GraphDbSchemaField {
@@ -8070,6 +8138,10 @@ fn graph_db_schema() -> GraphDbSchema {
             GraphDbSchemaOperation {
                 command: "evidence <target> [--depth N] [--limit N]",
                 description: "Return a bounded versioned graph-db handoff packet for a backlog id or job packet handle, including packet_id, projection hash, worker_context rows, source_handle rows, worker_result rows, semantic_concept/entity rows, shortest paths, replay commands, repair commands, and next commands",
+            },
+            GraphDbSchemaOperation {
+                command: "dispatch-trace [target...] --path <session> [--format json|html]",
+                description: "Export a compact graph-backed dispatch trace with evidence packet ids, worker-result feedback, graph links, and conflict-matrix worker prompt packets",
             },
             GraphDbSchemaOperation {
                 command: "schema",
@@ -12678,6 +12750,20 @@ struct ConflictMatrixTokenBudget {
     max_context_bytes: usize,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+struct ConflictMatrixWorkerFeedback {
+    total: usize,
+    completed: usize,
+    blocked: usize,
+    touched_files: Vec<String>,
+    expected_tests: Vec<String>,
+    follow_up_ids: Vec<String>,
+    outcome_history: Vec<String>,
+    repeated_blockage: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct ConflictMatrixOwnershipBlock {
     contract_version: &'static str,
@@ -12711,7 +12797,6 @@ struct ConflictMatrixWorkerPromptPacket {
     expansion_commands: Vec<String>,
     token_budget: ConflictMatrixTokenBudget,
     semantic_dispatch_score: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     semantic_dispatch_reasons: Vec<String>,
     prompt: String,
 }
@@ -12737,6 +12822,7 @@ struct ConflictMatrixCandidate {
     semantic_related: Vec<ConflictMatrixSemanticRef>,
     semantic_dispatch_score: usize,
     semantic_dispatch_reasons: Vec<String>,
+    worker_feedback: ConflictMatrixWorkerFeedback,
     source_handles: Vec<ConflictMatrixSourceHandle>,
     staged_overlap: ConflictMatrixOverlap,
     ownership: ConflictMatrixOwnershipBlock,
@@ -13124,6 +13210,94 @@ fn conflict_matrix_staged_overlap(
     }
 }
 
+fn graph_node_list_property(node: &SubstrateGraphNode, key: &str) -> Vec<String> {
+    node.properties
+        .get(key)
+        .map(|value| {
+            value
+                .split([',', ';'])
+                .flat_map(|part| part.split("&&"))
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn conflict_matrix_worker_feedback(
+    worker_results: &[SubstrateGraphNode],
+) -> ConflictMatrixWorkerFeedback {
+    let mut touched_files = BTreeSet::new();
+    let mut expected_tests = BTreeSet::new();
+    let mut follow_up_ids = BTreeSet::new();
+    let mut outcome_history = Vec::new();
+    let mut completed = 0usize;
+    let mut blocked = 0usize;
+
+    let mut results = worker_results.iter().collect::<Vec<_>>();
+    results.sort_by(|left, right| {
+        left.properties
+            .get("line")
+            .and_then(|value| value.parse::<i64>().ok())
+            .cmp(
+                &right
+                    .properties
+                    .get("line")
+                    .and_then(|value| value.parse::<i64>().ok()),
+            )
+            .then(left.id.cmp(&right.id))
+    });
+
+    for node in results {
+        let status = node
+            .properties
+            .get("status")
+            .map(String::as_str)
+            .unwrap_or("unknown");
+        match status {
+            "completed" => completed += 1,
+            "blocked" => blocked += 1,
+            _ => {}
+        }
+        touched_files.extend(graph_node_list_property(node, "touched_files"));
+        expected_tests.extend(graph_node_list_property(node, "expected_tests"));
+        follow_up_ids.extend(graph_node_list_property(node, "follow_up_ids"));
+        let location = match (node.properties.get("path"), node.properties.get("line")) {
+            (Some(path), Some(line)) => format!("{path}:{line}"),
+            (Some(path), None) => path.clone(),
+            _ => node.id.clone(),
+        };
+        let detail = node
+            .properties
+            .get("detail")
+            .cloned()
+            .unwrap_or_else(|| node.label.clone());
+        outcome_history.push(format!("{status} at {location}: {detail}"));
+    }
+
+    let repeated_blockage = blocked > 1;
+    let warnings = if repeated_blockage {
+        vec![format!(
+            "repeated blockage observed in {blocked} worker_result rows; inspect outcome_history before redispatch"
+        )]
+    } else {
+        Vec::new()
+    };
+
+    ConflictMatrixWorkerFeedback {
+        total: worker_results.len(),
+        completed,
+        blocked,
+        touched_files: touched_files.into_iter().collect(),
+        expected_tests: expected_tests.into_iter().collect(),
+        follow_up_ids: follow_up_ids.into_iter().collect(),
+        outcome_history,
+        repeated_blockage,
+        warnings,
+    }
+}
+
 fn empty_conflict_matrix_ownership(target: &str) -> ConflictMatrixOwnershipBlock {
     ConflictMatrixOwnershipBlock {
         contract_version: WORKER_PROMPT_PACKET_CONTRACT_VERSION,
@@ -13232,6 +13406,7 @@ fn conflict_matrix_candidate_from_evidence(
         .collect::<Vec<_>>();
     let (semantic_dispatch_score, semantic_dispatch_reasons) =
         conflict_matrix_semantic_dispatch_score(&semantic_related, &files, &symbols);
+    let worker_feedback = conflict_matrix_worker_feedback(&evidence.worker_results);
 
     ConflictMatrixCandidate {
         rank: 0,
@@ -13252,6 +13427,7 @@ fn conflict_matrix_candidate_from_evidence(
         semantic_related,
         semantic_dispatch_score,
         semantic_dispatch_reasons,
+        worker_feedback,
         source_handles,
         staged_overlap,
         ownership: empty_conflict_matrix_ownership(&evidence.target),
@@ -13452,6 +13628,35 @@ fn apply_conflict_matrix_ownership_blocks(candidates: &mut [ConflictMatrixCandid
                 .semantic_dispatch_reasons
                 .iter()
                 .map(|reason| format!("semantic_rank: {reason}")),
+        );
+        if candidate.worker_feedback.total > 0 {
+            read_only_context.push(format!(
+                "worker_feedback: completed={} blocked={} touched_files={} expected_tests={} follow_up_ids={}",
+                candidate.worker_feedback.completed,
+                candidate.worker_feedback.blocked,
+                if candidate.worker_feedback.touched_files.is_empty() {
+                    "none".to_string()
+                } else {
+                    candidate.worker_feedback.touched_files.join(",")
+                },
+                if candidate.worker_feedback.expected_tests.is_empty() {
+                    "none".to_string()
+                } else {
+                    candidate.worker_feedback.expected_tests.join(" && ")
+                },
+                if candidate.worker_feedback.follow_up_ids.is_empty() {
+                    "none".to_string()
+                } else {
+                    candidate.worker_feedback.follow_up_ids.join(",")
+                },
+            ));
+        }
+        read_only_context.extend(
+            candidate
+                .worker_feedback
+                .warnings
+                .iter()
+                .map(|warning| format!("worker_feedback_warning: {warning}")),
         );
         read_only_context = dedupe_preserve_order(read_only_context);
         let expansion_commands = conflict_matrix_expansion_commands(candidate);
@@ -13681,6 +13886,19 @@ fn print_conflict_matrix_human(report: &ConflictMatrixReport, compact: bool) {
         for reason in &candidate.risk_reasons {
             println!("  reason: {reason}");
         }
+        if candidate.worker_feedback.total > 0 {
+            println!(
+                "  worker feedback: completed:{} blocked:{} files:{} tests:{} follow-ups:{}",
+                candidate.worker_feedback.completed,
+                candidate.worker_feedback.blocked,
+                candidate.worker_feedback.touched_files.len(),
+                candidate.worker_feedback.expected_tests.len(),
+                candidate.worker_feedback.follow_up_ids.len()
+            );
+            for warning in &candidate.worker_feedback.warnings {
+                println!("  warning: {warning}");
+            }
+        }
     }
     for pair in &report.conflicts {
         println!(
@@ -13709,15 +13927,14 @@ fn print_conflict_matrix_human(report: &ConflictMatrixReport, compact: bool) {
     }
 }
 
-fn cmd_conflict_matrix(
+fn build_conflict_matrix_report(
     path: &Path,
     scope: Option<&str>,
     raw_targets: &[String],
     depth: usize,
     limit: usize,
     impact_limit: usize,
-    format: OutputFormat,
-) -> Result<()> {
+) -> Result<ConflictMatrixReport> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     build_traversal_graph(&root, path, scope)
         .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
@@ -13813,6 +14030,13 @@ fn cmd_conflict_matrix(
     for (idx, candidate) in candidates.iter_mut().enumerate() {
         candidate.rank = idx + 1;
     }
+    warnings.extend(candidates.iter().flat_map(|candidate| {
+        candidate
+            .worker_feedback
+            .warnings
+            .iter()
+            .map(|warning| format!("{}: {warning}", candidate.target))
+    }));
     let conflicts = build_conflict_matrix_pairs(&candidates);
     apply_conflict_matrix_ownership_blocks(&mut candidates);
     let worker_prompt_packets = conflict_matrix_worker_prompt_packets(&candidates);
@@ -13856,7 +14080,7 @@ fn cmd_conflict_matrix(
         ),
     };
     let context_summary = conflict_matrix_context_summary(&context_pack);
-    let report = ConflictMatrixReport {
+    Ok(ConflictMatrixReport {
         contract_version: CONFLICT_MATRIX_CONTRACT_VERSION,
         root: root.to_string_lossy().to_string(),
         scope: scope.map(str::to_string),
@@ -13873,8 +14097,20 @@ fn cmd_conflict_matrix(
         orchestration,
         next_commands,
         warnings,
-    };
+    })
+}
 
+fn cmd_conflict_matrix(
+    path: &Path,
+    scope: Option<&str>,
+    raw_targets: &[String],
+    depth: usize,
+    limit: usize,
+    impact_limit: usize,
+    format: OutputFormat,
+) -> Result<()> {
+    let report =
+        build_conflict_matrix_report(path, scope, raw_targets, depth, limit, impact_limit)?;
     if format.json_output {
         print_json_or_envelope(
             &report,
@@ -13902,6 +14138,414 @@ fn cmd_conflict_matrix(
     } else {
         print_conflict_matrix_human(&report, format.compact);
         Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct DispatchTraceSummary {
+    backlog: usize,
+    job_packet: usize,
+    worker_result: usize,
+    worker_context: usize,
+    source_handle: usize,
+    semantic_rows: usize,
+}
+
+#[derive(Serialize)]
+struct DispatchTraceReport {
+    contract_version: &'static str,
+    root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    targets: Vec<String>,
+    projection_freshness: GraphDbFreshnessReport,
+    projection_hashes: Vec<String>,
+    evidence_packet_ids: Vec<String>,
+    worker_prompt_packets: Vec<ConflictMatrixWorkerPromptPacket>,
+    worker_feedback: Vec<ConflictMatrixWorkerFeedback>,
+    summary: DispatchTraceSummary,
+    nodes: Vec<SubstrateGraphNode>,
+    edges: Vec<SubstrateGraphEdge>,
+    conflict_matrix_decisions: Vec<String>,
+    replay_commands: Vec<String>,
+    repair_commands: Vec<String>,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+fn dispatch_trace_allowed_node_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "session"
+            | "backlog"
+            | "job_packet"
+            | "worker_result"
+            | "worker_context"
+            | "source_handle"
+            | "semantic_concept"
+            | "semantic_entity"
+            | "file"
+            | "symbol"
+            | "route"
+    )
+}
+
+fn dispatch_trace_kind_rank(kind: &str) -> usize {
+    match kind {
+        "backlog" => 0,
+        "job_packet" => 1,
+        "worker_result" => 2,
+        "worker_context" => 3,
+        "source_handle" => 4,
+        "file" => 5,
+        "symbol" => 6,
+        "route" => 7,
+        "semantic_concept" => 8,
+        "semantic_entity" => 9,
+        "session" => 10,
+        _ => 99,
+    }
+}
+
+fn dispatch_trace_summary(nodes: &[SubstrateGraphNode]) -> DispatchTraceSummary {
+    DispatchTraceSummary {
+        backlog: nodes.iter().filter(|node| node.kind == "backlog").count(),
+        job_packet: nodes
+            .iter()
+            .filter(|node| node.kind == "job_packet")
+            .count(),
+        worker_result: nodes
+            .iter()
+            .filter(|node| node.kind == "worker_result")
+            .count(),
+        worker_context: nodes
+            .iter()
+            .filter(|node| node.kind == "worker_context")
+            .count(),
+        source_handle: nodes
+            .iter()
+            .filter(|node| node.kind == "source_handle")
+            .count(),
+        semantic_rows: nodes
+            .iter()
+            .filter(|node| matches!(node.kind.as_str(), "semantic_concept" | "semantic_entity"))
+            .count(),
+    }
+}
+
+fn dispatch_trace_collect_ids(
+    targets: &[String],
+    candidates: &[ConflictMatrixCandidate],
+    graph_nodes: &[SubstrateGraphNode],
+    graph_edges: &[SubstrateGraphEdge],
+    depth: usize,
+    limit: usize,
+) -> (BTreeSet<String>, bool) {
+    let target_refs = targets
+        .iter()
+        .map(|target| target.trim_start_matches('#').to_string())
+        .collect::<BTreeSet<_>>();
+    let mut ids = BTreeSet::new();
+    for candidate in candidates {
+        ids.insert(candidate.target_node_id.clone());
+        for source in &candidate.source_handles {
+            ids.insert(source.handle.clone());
+        }
+        for semantic in &candidate.semantic_related {
+            ids.insert(semantic.handle.clone());
+        }
+    }
+    for node in graph_nodes {
+        if !dispatch_trace_allowed_node_kind(&node.kind) {
+            continue;
+        }
+        if node
+            .properties
+            .get("ref_id")
+            .is_some_and(|ref_id| target_refs.contains(ref_id))
+        {
+            ids.insert(node.id.clone());
+        }
+    }
+
+    let node_by_id = graph_nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect::<BTreeMap<_, _>>();
+    let max_nodes = if limit == 0 {
+        usize::MAX
+    } else {
+        limit
+            .saturating_mul(targets.len().max(1))
+            .saturating_mul(12)
+            .max(64)
+    };
+    let mut truncated = false;
+    for _ in 0..depth.max(1) {
+        let before = ids.len();
+        for edge in graph_edges {
+            if ids.len() >= max_nodes {
+                truncated = true;
+                break;
+            }
+            let touches = ids.contains(&edge.from_id) || ids.contains(&edge.to_id);
+            if !touches {
+                continue;
+            }
+            for endpoint in [&edge.from_id, &edge.to_id] {
+                let Some(node) = node_by_id.get(endpoint.as_str()) else {
+                    continue;
+                };
+                if dispatch_trace_allowed_node_kind(&node.kind) {
+                    ids.insert(endpoint.clone());
+                }
+            }
+        }
+        if ids.len() == before || truncated {
+            break;
+        }
+    }
+    (ids, truncated)
+}
+
+fn build_dispatch_trace_report(
+    path: &Path,
+    scope: Option<&str>,
+    raw_targets: &[String],
+    depth: usize,
+    limit: usize,
+    impact_limit: usize,
+) -> Result<DispatchTraceReport> {
+    let conflict =
+        build_conflict_matrix_report(path, scope, raw_targets, depth, limit, impact_limit)?;
+    let root = PathBuf::from(&conflict.root);
+    let graph_db = graph_substrate_db_path(&root, scope);
+    let store = SqliteGraphStore::open(&graph_db)
+        .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
+    let graph_nodes = store.all_nodes()?;
+    let graph_edges = store.all_edges()?;
+    let (ids, truncated) = dispatch_trace_collect_ids(
+        &conflict.targets,
+        &conflict.candidates,
+        &graph_nodes,
+        &graph_edges,
+        depth,
+        limit,
+    );
+    let mut nodes = graph_nodes
+        .into_iter()
+        .filter(|node| ids.contains(&node.id))
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| {
+        dispatch_trace_kind_rank(&left.kind)
+            .cmp(&dispatch_trace_kind_rank(&right.kind))
+            .then(left.id.cmp(&right.id))
+    });
+    let node_ids = nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut edges = graph_edges
+        .into_iter()
+        .filter(|edge| {
+            node_ids.contains(edge.from_id.as_str()) && node_ids.contains(edge.to_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    edges.sort_by(|left, right| {
+        left.from_id
+            .cmp(&right.from_id)
+            .then(left.kind.cmp(&right.kind))
+            .then(left.to_id.cmp(&right.to_id))
+    });
+
+    Ok(DispatchTraceReport {
+        contract_version: DISPATCH_TRACE_CONTRACT_VERSION,
+        root: conflict.root,
+        scope: conflict.scope,
+        targets: conflict.targets,
+        projection_freshness: conflict.orchestration.projection_freshness,
+        projection_hashes: conflict.orchestration.projection_hashes,
+        evidence_packet_ids: conflict.orchestration.evidence_packet_ids,
+        worker_prompt_packets: conflict.worker_prompt_packets,
+        worker_feedback: conflict
+            .candidates
+            .iter()
+            .map(|candidate| candidate.worker_feedback.clone())
+            .collect(),
+        summary: dispatch_trace_summary(&nodes),
+        nodes,
+        edges,
+        conflict_matrix_decisions: conflict.orchestration.conflict_matrix_decisions,
+        replay_commands: conflict.next_commands,
+        repair_commands: graph_db_repair_commands(&root, scope),
+        truncated,
+        warnings: conflict.warnings,
+    })
+}
+
+fn dispatch_trace_html(report: &DispatchTraceReport) -> Result<String> {
+    let json = serde_json::to_string(report)?.replace("</", "<\\/");
+    let mut html = String::new();
+    html.push_str(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>tsift dispatch trace</title>",
+    );
+    html.push_str(
+        r#"<style>
+:root{color-scheme:light dark;--bg:#f7f8fb;--panel:#fff;--text:#17202a;--muted:#5c6674;--line:#d7dce3;--edge:#8b98a8;--accent:#0f766e}
+@media (prefers-color-scheme:dark){:root{--bg:#111318;--panel:#1b2028;--text:#ecf1f7;--muted:#a8b3c1;--line:#323946;--edge:#667386;--accent:#2dd4bf}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,sans-serif;line-height:1.4}.page{max-width:1280px;margin:0 auto;padding:20px}.top{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:14px}.top h1{font-size:22px;margin:0}.meta{color:var(--muted);font-size:13px}.layout{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:14px}.panel,.side{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}.side{padding:14px;overflow:auto;max-height:720px}.side h2{font-size:15px;margin:12px 0 8px}.side h2:first-child{margin-top:0}.list{display:grid;gap:8px}.row{border:1px solid var(--line);border-radius:6px;padding:8px}.kind{font-size:11px;text-transform:uppercase;color:var(--muted);letter-spacing:.04em}.label{font-weight:650;overflow-wrap:anywhere}.handle,code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted);overflow-wrap:anywhere}svg{width:100%;height:680px;display:block}.edge{stroke:var(--edge);stroke-width:1.4;opacity:.72}.node{stroke:var(--panel);stroke-width:2}.node-label{font-size:12px;paint-order:stroke;stroke:var(--panel);stroke-width:4px;stroke-linejoin:round;fill:var(--text)}@media(max-width:900px){.top{display:block}.layout{grid-template-columns:1fr}.side{max-height:none}svg{height:560px}}
+</style>"#,
+    );
+    html.push_str("</head><body><div class=\"page\">");
+    html.push_str(&format!(
+        "<header class=\"top\"><div><h1>tsift dispatch trace</h1><div class=\"meta\">targets <code>{}</code> | evidence <code>{}</code> | nodes <code>{}</code> | worker_prompt_packets <code>{}</code></div></div><div class=\"meta\"><code>{}</code></div></header>",
+        html_escape(&report.targets.join(", ")),
+        report.evidence_packet_ids.len(),
+        report.nodes.len(),
+        report.worker_prompt_packets.len(),
+        html_escape(report.contract_version)
+    ));
+    html.push_str(
+        r#"<main class="layout"><section class="panel"><svg id="graph-canvas" role="img" aria-label="Dispatch trace graph"></svg></section><aside class="side"><h2>Worker Prompt Packets</h2><div id="packets" class="list"></div><h2>Worker Feedback</h2><div id="feedback" class="list"></div><h2>Nodes</h2><div id="nodes" class="list"></div></aside></main>"#,
+    );
+    html.push_str("<script id=\"trace-data\" type=\"application/json\">");
+    html.push_str(&json);
+    html.push_str(
+        r##"</script><script>
+const report = JSON.parse(document.getElementById("trace-data").textContent);
+const svg = document.getElementById("graph-canvas");
+const nodeList = document.getElementById("nodes");
+const packets = document.getElementById("packets");
+const feedback = document.getElementById("feedback");
+const nodes = report.nodes.map((node, index) => ({...node, index}));
+const nodeById = new Map(nodes.map(node => [node.id, node]));
+const edges = report.edges.filter(edge => nodeById.has(edge.from_id) && nodeById.has(edge.to_id));
+const colorByKind = new Map([["backlog","#dc2626"],["job_packet","#ea580c"],["worker_result","#15803d"],["worker_context","#475569"],["source_handle","#64748b"],["semantic_concept","#9a3412"],["semantic_entity","#b45309"],["file","#2563eb"],["symbol","#16a34a"],["route","#7c3aed"],["session","#0891b2"]]);
+function color(kind){return colorByKind.get(kind)||"#6b7280";}
+function text(value){return value == null ? "" : String(value);}
+function escapeHtml(value){return text(value).replace(/[&<>"']/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[ch]));}
+function layout(){
+  const rect = svg.getBoundingClientRect();
+  const width = rect.width || 900, height = rect.height || 680, cx = width / 2, cy = height / 2;
+  const kinds = [...new Set(nodes.map(node => node.kind))].sort();
+  const counts = new Map();
+  for (const node of nodes) counts.set(node.kind, (counts.get(node.kind)||0)+1);
+  const offsets = new Map();
+  for (const node of nodes) {
+    const group = kinds.indexOf(node.kind);
+    const index = offsets.get(node.kind) || 0;
+    offsets.set(node.kind, index + 1);
+    const total = counts.get(node.kind) || 1;
+    const ring = Math.min(width, height) * (0.18 + ((group % 4) * 0.09));
+    const angle = Math.PI * 2 * index / Math.max(total, 1) + group * 0.53;
+    node.x = cx + Math.cos(angle) * ring;
+    node.y = cy + Math.sin(angle) * ring;
+  }
+}
+function draw(){
+  svg.innerHTML = "";
+  for (const edge of edges) {
+    const from = nodeById.get(edge.from_id), to = nodeById.get(edge.to_id);
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", from.x); line.setAttribute("y1", from.y);
+    line.setAttribute("x2", to.x); line.setAttribute("y2", to.y);
+    line.setAttribute("class", "edge");
+    line.appendChild(document.createElementNS("http://www.w3.org/2000/svg", "title")).textContent = edge.kind;
+    svg.appendChild(line);
+  }
+  for (const node of nodes) {
+    const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    circle.setAttribute("cx", node.x); circle.setAttribute("cy", node.y);
+    circle.setAttribute("r", node.kind.startsWith("semantic_") ? 8 : 6);
+    circle.setAttribute("fill", color(node.kind));
+    circle.setAttribute("class", "node");
+    circle.appendChild(document.createElementNS("http://www.w3.org/2000/svg", "title")).textContent = node.kind + ": " + node.label;
+    svg.appendChild(circle);
+    const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    label.setAttribute("x", node.x + 9); label.setAttribute("y", node.y + 4);
+    label.setAttribute("class", "node-label");
+    label.textContent = node.label.length > 34 ? node.label.slice(0,31) + "..." : node.label;
+    svg.appendChild(label);
+  }
+}
+packets.innerHTML = report.worker_prompt_packets.map(packet => `<div class="row"><div class="kind">${escapeHtml(packet.contract_version)} - ${escapeHtml(packet.risk)}</div><div class="label">${escapeHtml(packet.title)}</div><div class="handle">${escapeHtml(packet.packet_id)}</div></div>`).join("") || "<div class=\"meta\">No packets.</div>";
+feedback.innerHTML = report.worker_feedback.map(item => `<div class="row"><div class="kind">completed ${item.completed} - blocked ${item.blocked}</div><div>files ${escapeHtml((item.touched_files||[]).join(", ") || "none")}</div><div>tests ${escapeHtml((item.expected_tests||[]).join(" && ") || "none")}</div>${item.repeated_blockage ? "<div class=\"label\">Repeated blockage</div>" : ""}</div>`).join("") || "<div class=\"meta\">No worker results.</div>";
+nodeList.innerHTML = nodes.map(node => `<div class="row"><div class="kind">${escapeHtml(node.kind)}</div><div class="label">${escapeHtml(node.label)}</div><div class="handle">${escapeHtml(node.id)}</div></div>`).join("");
+window.addEventListener("resize", () => { layout(); draw(); });
+layout(); draw();
+</script></div></body></html>"##,
+    );
+    Ok(html)
+}
+
+struct DispatchTraceOptions<'a> {
+    path: &'a Path,
+    scope: Option<&'a str>,
+    raw_targets: &'a [String],
+    depth: usize,
+    limit: usize,
+    impact_limit: usize,
+    trace_format: DispatchTraceFormat,
+}
+
+fn cmd_dispatch_trace(
+    options: DispatchTraceOptions<'_>,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let report = build_dispatch_trace_report(
+        options.path,
+        options.scope,
+        options.raw_targets,
+        options.depth,
+        options.limit,
+        options.impact_limit,
+    )?;
+    match options.trace_format {
+        DispatchTraceFormat::Json => {
+            if output_format.envelope {
+                print_json_or_envelope(
+                    &report,
+                    &output_format,
+                    "dispatch-trace",
+                    "operator-review",
+                    ToolEnvelopeSummary {
+                        text: format!(
+                            "Dispatch trace for {} target(s): {} graph node(s), {} worker prompt packet(s)",
+                            report.targets.len(),
+                            report.nodes.len(),
+                            report.worker_prompt_packets.len()
+                        ),
+                        metrics: vec![
+                            envelope_metric("targets", report.targets.len()),
+                            envelope_metric("nodes", report.nodes.len()),
+                            envelope_metric("edges", report.edges.len()),
+                            envelope_metric(
+                                "worker_prompt_packets",
+                                report.worker_prompt_packets.len(),
+                            ),
+                        ],
+                    },
+                    report.truncated,
+                    report.replay_commands.clone(),
+                )
+            } else {
+                println!(
+                    "{}",
+                    to_json_schema(
+                        &report,
+                        output_format.pretty,
+                        output_format.terse,
+                        output_format.schema
+                    )?
+                );
+                Ok(())
+            }
+        }
+        DispatchTraceFormat::Html => {
+            println!("{}", dispatch_trace_html(&report)?);
+            Ok(())
+        }
     }
 }
 
@@ -26294,6 +26938,37 @@ tier = "private"
                 assert!(json);
             }
             _ => panic!("expected ConflictMatrix command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_dispatch_trace_command() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "dispatch-trace",
+            "--path",
+            "tasks/software/tsift.md",
+            "--format",
+            "html",
+            "--depth",
+            "4",
+            "pwcm",
+            "#g6kf",
+        ]);
+        match cli.command {
+            Some(Commands::DispatchTrace {
+                targets,
+                path,
+                format,
+                depth,
+                ..
+            }) => {
+                assert_eq!(targets, vec!["pwcm".to_string(), "#g6kf".to_string()]);
+                assert_eq!(path, PathBuf::from("tasks/software/tsift.md"));
+                assert_eq!(format, DispatchTraceFormat::Html);
+                assert_eq!(depth, 4);
+            }
+            _ => panic!("expected DispatchTrace command"),
         }
     }
 

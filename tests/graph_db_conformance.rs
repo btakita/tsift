@@ -115,6 +115,8 @@ agent_doc_format: template
 ### Re: setup
 Completed `#gval`; touched files `main.rs`; tests `cargo test --test graph_db_conformance`; follow-up `#solo`.
 Completed `#solo`; touched files `isolated.rs`; tests `cargo test --test graph_db_conformance`; follow-up `#gval`.
+Blocked `#shrd`; touched files `main.rs`; tests `cargo test --test graph_db_conformance`; follow-up `#gval`.
+Blocked `#shrd`; touched files `main.rs`; tests `cargo test --test graph_db_conformance`; follow-up `#solo`.
 <!-- /agent:exchange -->
 
 	<!-- agent:queue -->
@@ -333,6 +335,53 @@ fn assert_sorted(values: &[String]) {
     let mut sorted = values.to_vec();
     sorted.sort();
     assert_eq!(values, sorted, "values should be deterministic and sorted");
+}
+
+fn graph_orchestration_contract_fixture() -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/graph-db-operator-examples/graph-orchestration-contracts.json");
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+fn contract_entry<'a>(fixture: &'a Value, name: &str) -> &'a Value {
+    fixture["contracts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .unwrap_or_else(|| panic!("missing contract fixture entry {name}: {fixture}"))
+}
+
+fn json_path_exists(value: &Value, path: &str) -> bool {
+    fn step(value: &Value, parts: &[&str]) -> bool {
+        if parts.is_empty() {
+            return !value.is_null();
+        }
+        match value {
+            Value::Array(items) => items.iter().any(|item| step(item, parts)),
+            Value::Object(map) => map
+                .get(parts[0])
+                .is_some_and(|next| step(next, &parts[1..])),
+            _ => false,
+        }
+    }
+    let parts = path.split('.').collect::<Vec<_>>();
+    step(value, &parts)
+}
+
+fn assert_contract_fields(fixture: &Value, name: &str, report: &Value) {
+    let contract = contract_entry(fixture, name);
+    assert_eq!(
+        report["contract_version"], contract["version"],
+        "{name} version mismatch: {report}"
+    );
+    for field in contract["required_fields"].as_array().unwrap() {
+        let field = field.as_str().unwrap();
+        assert!(
+            json_path_exists(report, field),
+            "{name} missing required field {field}: {report}"
+        );
+    }
 }
 
 fn symbol_id_by_ref(project: &Path, backend: Backend<'_>, ref_id: &str) -> String {
@@ -961,6 +1010,227 @@ fn conflict_matrix_multi_worker_fixture_blocks_shared_files_and_emits_prompt_pac
             .any(|decision| decision.as_str().unwrap().contains("candidate #")),
         "{report}"
     );
+}
+
+#[test]
+fn conflict_matrix_worker_feedback_warns_on_repeated_blockage_without_changing_hard_gates() {
+    let project = graph_db_project();
+    init_git_repo(project.path());
+    let session = project.path().join("tasks/software/tsift.md");
+
+    let report = assert_tsift_json(vec![
+        "conflict-matrix".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "shrd".to_string(),
+    ]);
+
+    let candidate = report["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["target"] == "shrd")
+        .unwrap();
+    assert_eq!(candidate["worker_feedback"]["blocked"], 2, "{report}");
+    assert_eq!(
+        candidate["worker_feedback"]["repeated_blockage"], true,
+        "{report}"
+    );
+    assert!(
+        candidate["worker_feedback"]["touched_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file == "main.rs"),
+        "{report}"
+    );
+    assert!(
+        candidate["worker_feedback"]["expected_tests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|test| test == "cargo test --test graph_db_conformance"),
+        "{report}"
+    );
+    assert!(
+        candidate["worker_feedback"]["follow_up_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == "gval"),
+        "{report}"
+    );
+    assert!(
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("repeated blockage")),
+        "{report}"
+    );
+    assert!(
+        candidate["risk_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|reason| !reason.as_str().unwrap().contains("repeated blockage")),
+        "worker feedback should warn without weakening hard conflict gates: {report}"
+    );
+}
+
+#[test]
+fn graph_orchestration_contract_fixture_matches_live_reports() {
+    let project = graph_db_project();
+    init_git_repo(project.path());
+    let session = project.path().join("tasks/software/tsift.md");
+    let fixture = graph_orchestration_contract_fixture();
+
+    let evidence = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "evidence".to_string(),
+            "gval".to_string(),
+            "--depth".to_string(),
+            "3".to_string(),
+            "--limit".to_string(),
+            "8".to_string(),
+        ],
+    );
+    assert_contract_fields(&fixture, "graph_db_evidence", &evidence);
+    assert!(evidence["packet_id"].as_str().unwrap().starts_with("gevd-"));
+    assert!(evidence["projection_hash"].as_str().is_some());
+
+    let conflict = assert_tsift_json(vec![
+        "conflict-matrix".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "gval".to_string(),
+        "solo".to_string(),
+    ]);
+    assert_contract_fields(&fixture, "conflict_matrix", &conflict);
+    for packet in conflict["worker_prompt_packets"].as_array().unwrap() {
+        assert_contract_fields(&fixture, "worker_prompt_packet", packet);
+    }
+
+    let context_pack = assert_tsift_json(vec![
+        "context-pack".to_string(),
+        session.to_string_lossy().to_string(),
+        "--budget".to_string(),
+        "normal".to_string(),
+        "--json".to_string(),
+    ]);
+    assert_contract_fields(
+        &fixture,
+        "context_pack_graph_orchestration",
+        &context_pack["graph_orchestration"],
+    );
+
+    let session_review = assert_tsift_json(vec![
+        "session-review".to_string(),
+        session.to_string_lossy().to_string(),
+        "--next-context".to_string(),
+        "--budget".to_string(),
+        "normal".to_string(),
+        "--json".to_string(),
+    ]);
+    assert_contract_fields(&fixture, "session_review_follow_up", &session_review);
+
+    let dispatch_trace = assert_tsift_json(vec![
+        "dispatch-trace".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "gval".to_string(),
+        "solo".to_string(),
+    ]);
+    assert_contract_fields(&fixture, "dispatch_trace", &dispatch_trace);
+    assert!(
+        dispatch_trace["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["kind"] == "job_packet"),
+        "{dispatch_trace}"
+    );
+    assert!(
+        dispatch_trace["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["kind"] == "worker_result"),
+        "{dispatch_trace}"
+    );
+    assert!(
+        dispatch_trace["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["kind"] == "source_handle"),
+        "{dispatch_trace}"
+    );
+    assert!(
+        dispatch_trace["worker_prompt_packets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|packet| packet["packet_id"].as_str().unwrap().starts_with("wpp-")),
+        "{dispatch_trace}"
+    );
+}
+
+#[test]
+fn dispatch_trace_cli_exports_json_and_html_operator_views() {
+    let project = graph_db_project();
+    init_git_repo(project.path());
+    let session = project.path().join("tasks/software/tsift.md");
+
+    let report = assert_tsift_json(vec![
+        "dispatch-trace".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "gval".to_string(),
+        "shrd".to_string(),
+    ]);
+    assert_eq!(report["contract_version"], "dispatch-trace-v1", "{report}");
+    assert!(
+        report["evidence_packet_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|packet| packet.as_str().unwrap().starts_with("gevd-")),
+        "{report}"
+    );
+    assert!(
+        report["worker_feedback"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|feedback| feedback["repeated_blockage"] == true),
+        "{report}"
+    );
+
+    let output = run_tsift(vec![
+        "dispatch-trace".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--format".to_string(),
+        "html".to_string(),
+        "gval".to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "dispatch-trace html failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let html = String::from_utf8_lossy(&output.stdout);
+    assert!(html.contains("id=\"graph-canvas\""), "{html}");
+    assert!(html.contains("worker_prompt_packets"), "{html}");
+    assert!(html.contains("dispatch-trace-v1"), "{html}");
 }
 
 #[test]

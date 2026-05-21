@@ -8,8 +8,9 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
-- Graph orchestration JSON surfaces now publish explicit contract versions and replay metadata: `graph-db evidence` emits `packet_id`, `projection_hash`, `worker_results`, `replay_commands`, and `repair_commands`; `conflict-matrix`, `worker_prompt_packets`, `context-pack graph_orchestration`, and `session-review --next-context` carry matching contract markers for agent-doc consumers.
-- Completed/blocked agent-doc worker responses now materialize as `worker_result` graph rows linked to backlog/job/source handles with status, touched files, expected tests, and follow-up ids, so later graph evidence can reason over prior worker outcomes.
+- Graph orchestration JSON surfaces now publish explicit contract versions and replay metadata: `graph-db evidence` emits `packet_id`, `projection_hash`, explicit worker/semantic result arrays, `replay_commands`, and `repair_commands`; `conflict-matrix`, `worker_prompt_packets`, `context-pack graph_orchestration`, `session-review --next-context`, and `dispatch-trace` carry matching contract markers for agent-doc consumers.
+- Completed/blocked agent-doc worker responses now materialize as `worker_result` graph rows linked to backlog/job/source handles with status, touched files, expected tests, and follow-up ids, and `conflict-matrix` summarizes them as worker feedback with repeated-blockage warnings that do not weaken hard conflict gates.
+- Added `tsift dispatch-trace --format json|html` for compact graph-backed operator review views linking backlog, job_packet, worker_result, source_handle, semantic rows, evidence packet ids, worker feedback, and worker_prompt_packets.
 - Semantic dispatch ranking now includes fixture-covered score explanations while keeping file/symbol/test/config overlap as the hard fail-closed gate.
 - Added `fixtures/graph-db-operator-examples/graph-orchestration-contracts.json` plus end-to-end refresh/evidence/conflict-matrix/context-pack/session-review operator commands for graph-backed dispatch.
 - `conflict-matrix` now emits first-class `worker_prompt_packets` with owned files/symbols, read-only context, forbidden files, expected tests, expansion commands, and token budgets; target-specific source ownership prevents unrelated workers from inheriting every visible source window.

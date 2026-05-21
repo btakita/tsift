@@ -110,6 +110,23 @@
         "unresolved_failures",
         "next_digest_commands"
       ]
+    },
+    {
+      "name": "dispatch_trace",
+      "version": "dispatch-trace-v1",
+      "required_fields": [
+        "contract_version",
+        "projection_freshness",
+        "projection_hashes",
+        "evidence_packet_ids",
+        "worker_prompt_packets",
+        "worker_feedback",
+        "nodes",
+        "edges",
+        "conflict_matrix_decisions",
+        "replay_commands",
+        "repair_commands"
+      ]
     }
   ]
 }

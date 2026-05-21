@@ -58,8 +58,11 @@ version/hash/watermark and tombstone counts without refreshing, and
 worker-context/source-handle/semantic handoff packets. Use `tsift
 conflict-matrix` to rank candidate worker scopes, flag shared
 file/symbol/test/config ownership, and emit first-class worker prompt packets
-with expansion commands, token budgets, and fail-closed ownership blocks before
-parallel dispatch. Those orchestration surfaces include stable contract versions,
+with worker-result feedback, expansion commands, token budgets, and fail-closed
+ownership blocks before parallel dispatch. Use `tsift dispatch-trace --format
+json|html` for a graph-backed operator review view linking backlog, job packets,
+worker results, source handles, semantic rows, evidence packet ids, and worker
+prompt packets. Those orchestration surfaces include stable contract versions,
 evidence packet ids, projection hashes, replay commands, and repair commands so
 agent-doc can consume them as JSON rather than parsing prose. Use `tsift
 graph-db doctor` to
