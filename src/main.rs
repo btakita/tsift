@@ -836,6 +836,38 @@ enum GraphDbBackend {
     ConvexSnapshot,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+enum GraphDbExperimentalBackend {
+    DuckdbDuckpgq,
+    Ladybug,
+}
+
+impl GraphDbExperimentalBackend {
+    fn name(self) -> &'static str {
+        match self {
+            Self::DuckdbDuckpgq => "duckdb-duckpgq",
+            Self::Ladybug => "ladybug",
+        }
+    }
+
+    fn adapter_label(self) -> &'static str {
+        match self {
+            Self::DuckdbDuckpgq => "DuckDB/DuckPGQ read-only prototype",
+            Self::Ladybug => "Ladybug read-only prototype",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "duckdb-duckpgq" | "duckdb" | "duckpgq" => Ok(Self::DuckdbDuckpgq),
+            "ladybug" => Ok(Self::Ladybug),
+            _ => {
+                bail!("unknown backend-eval candidate {raw:?}; expected duckdb-duckpgq or ladybug")
+            }
+        }
+    }
+}
+
 #[derive(Subcommand, Debug, Clone)]
 enum GraphDbQuery {
     /// Materialize or refresh the local SQLite graph.db projection for operator workflows
@@ -846,6 +878,15 @@ enum GraphDbQuery {
     Doctor,
     /// Compare the local SQLite projection against a Convex snapshot before apply/read operations
     Drift,
+    /// Benchmark experimental read-only GraphStore candidates against SQLite before promotion
+    BackendEval {
+        /// Candidate backend prototype to evaluate. Repeatable; defaults to DuckDB/DuckPGQ and Ladybug. Values: duckdb-duckpgq, ladybug.
+        #[arg(long = "candidate")]
+        candidates: Vec<String>,
+        /// Backlog ids, job handles, or graph node ids to use for evidence/planning benchmarks
+        #[arg(long = "target")]
+        targets: Vec<String>,
+    },
     /// Build a bounded worker handoff evidence packet from a backlog id or job packet handle
     Evidence {
         /// Backlog id, job packet handle, or graph node id
@@ -6377,6 +6418,216 @@ struct GraphDbReport {
     warnings: Vec<String>,
 }
 
+struct ExperimentalReadOnlyGraphStore {
+    backend: GraphDbExperimentalBackend,
+    nodes: BTreeMap<String, SubstrateGraphNode>,
+    edges: BTreeMap<String, SubstrateGraphEdge>,
+}
+
+impl ExperimentalReadOnlyGraphStore {
+    fn from_rows(backend: GraphDbExperimentalBackend, rows: ConvexProjectionRows) -> Result<Self> {
+        validate_convex_projection_rows(&rows)?;
+        let nodes = rows
+            .nodes
+            .into_iter()
+            .map(|row| {
+                let node = SubstrateGraphNode::from(row);
+                (node.id.clone(), node)
+            })
+            .collect();
+        let edges = rows
+            .edges
+            .into_iter()
+            .map(|row| {
+                let edge = SubstrateGraphEdge::from(row);
+                (graph_db_edge_key(&edge), edge)
+            })
+            .collect();
+        Ok(Self {
+            backend,
+            nodes,
+            edges,
+        })
+    }
+}
+
+impl GraphStore for ExperimentalReadOnlyGraphStore {
+    fn upsert_node(&self, _node: &SubstrateGraphNode) -> Result<()> {
+        bail!("{} backend-eval adapter is read-only", self.backend.name())
+    }
+
+    fn upsert_edge(&self, _edge: &SubstrateGraphEdge) -> Result<()> {
+        bail!("{} backend-eval adapter is read-only", self.backend.name())
+    }
+
+    fn delete_node(&self, _id: &str) -> Result<usize> {
+        bail!("{} backend-eval adapter is read-only", self.backend.name())
+    }
+
+    fn delete_edge(&self, _from_id: &str, _to_id: &str, _kind: &str) -> Result<usize> {
+        bail!("{} backend-eval adapter is read-only", self.backend.name())
+    }
+
+    fn node(&self, id: &str) -> Result<Option<SubstrateGraphNode>> {
+        Ok(self.nodes.get(id).cloned())
+    }
+
+    fn all_nodes(&self) -> Result<Vec<SubstrateGraphNode>> {
+        Ok(self.nodes.values().cloned().collect())
+    }
+
+    fn all_edges(&self) -> Result<Vec<SubstrateGraphEdge>> {
+        Ok(self.edges.values().cloned().collect())
+    }
+
+    fn nodes_by_kind(&self, kind: &str) -> Result<Vec<SubstrateGraphNode>> {
+        Ok(self
+            .nodes
+            .values()
+            .filter(|node| node.kind == kind)
+            .cloned()
+            .collect())
+    }
+
+    fn outgoing_edges(&self, from_id: &str, kind: Option<&str>) -> Result<Vec<SubstrateGraphEdge>> {
+        let mut edges = self
+            .edges
+            .values()
+            .filter(|edge| edge.from_id == from_id)
+            .filter(|edge| kind.is_none_or(|kind| edge.kind == kind))
+            .cloned()
+            .collect::<Vec<_>>();
+        edges.sort_by(|left, right| {
+            left.to_id
+                .cmp(&right.to_id)
+                .then(left.kind.cmp(&right.kind))
+        });
+        Ok(edges)
+    }
+
+    fn shortest_path(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        kind: Option<&str>,
+    ) -> Result<Option<substrate::GraphPath>> {
+        if from_id == to_id {
+            return Ok(Some(substrate::GraphPath {
+                nodes: vec![from_id.to_string()],
+                hops: 0,
+            }));
+        }
+
+        let mut queue = VecDeque::new();
+        let mut parent = BTreeMap::<String, String>::new();
+        parent.insert(from_id.to_string(), String::new());
+        queue.push_back(from_id.to_string());
+
+        while let Some(current) = queue.pop_front() {
+            for edge in self.outgoing_edges(&current, kind)? {
+                if parent.contains_key(&edge.to_id) {
+                    continue;
+                }
+                parent.insert(edge.to_id.clone(), current.clone());
+                if edge.to_id == to_id {
+                    let mut nodes = vec![to_id.to_string()];
+                    let mut cursor = to_id;
+                    while let Some(previous) = parent.get(cursor) {
+                        if previous.is_empty() {
+                            break;
+                        }
+                        nodes.push(previous.clone());
+                        cursor = previous;
+                    }
+                    nodes.reverse();
+                    return Ok(Some(substrate::GraphPath {
+                        hops: nodes.len().saturating_sub(1),
+                        nodes,
+                    }));
+                }
+                queue.push_back(edge.to_id);
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+#[derive(Serialize)]
+struct GraphDbBackendEvalConfig {
+    synthetic_nodes: usize,
+    synthetic_fanout: usize,
+    depth: usize,
+    limit: usize,
+    impact_limit: usize,
+}
+
+#[derive(Clone)]
+struct GraphDbBackendEvalSignature {
+    operation: String,
+    value: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct GraphDbBackendEvalOperation {
+    name: String,
+    supported: bool,
+    status: String,
+    duration_micros: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GraphDbBackendEvalParity {
+    matches_sqlite: bool,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GraphDbBackendEvalBackendReport {
+    backend: String,
+    adapter: String,
+    read_only: bool,
+    operations: Vec<GraphDbBackendEvalOperation>,
+    total_micros: u128,
+    parity: GraphDbBackendEvalParity,
+    lock_behavior: String,
+    install_portability: String,
+}
+
+#[derive(Serialize)]
+struct GraphDbBackendEvalDataset {
+    name: String,
+    target_count: usize,
+    nodes: usize,
+    edges: usize,
+    backends: Vec<GraphDbBackendEvalBackendReport>,
+}
+
+#[derive(Serialize)]
+struct GraphDbBackendPromotionDecision {
+    backend: String,
+    decision: String,
+    reasons: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GraphDbBackendEvalReport {
+    root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    baseline_backend: String,
+    candidates: Vec<String>,
+    targets: Vec<String>,
+    config: GraphDbBackendEvalConfig,
+    datasets: Vec<GraphDbBackendEvalDataset>,
+    promotion: Vec<GraphDbBackendPromotionDecision>,
+    warnings: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct GraphDbDoctorCheck {
     name: String,
@@ -8279,6 +8530,10 @@ fn graph_db_schema() -> GraphDbSchema {
                 description: "Compare local SQLite projection rows with a Convex snapshot and return upsert, tombstone, metadata, duplicate, orphan, and next-command diagnostics",
             },
             GraphDbSchemaOperation {
+                command: "backend-eval [--candidate duckdb-duckpgq|ladybug] [--target ID]",
+                description: "Benchmark experimental read-only GraphStore backend prototypes against SQLite on real and synthetic projections across refresh/status/evidence/conflict-matrix/dispatch-trace and emit promotion hold/eligibility gates",
+            },
+            GraphDbSchemaOperation {
                 command: "evidence <target> [--depth N] [--limit N]",
                 description: "Return a bounded versioned graph-db handoff packet for a backlog id or job packet handle, including packet_id, projection hash, worker_context rows, source_handle rows, worker_result rows, semantic_concept/entity rows, shortest paths, replay commands, repair commands, and next commands",
             },
@@ -8916,6 +9171,9 @@ fn graph_db_report_from_store(
         GraphDbQuery::Drift => {
             bail!("graph-db drift must be handled by the drift command path");
         }
+        GraphDbQuery::BackendEval { .. } => {
+            bail!("graph-db backend-eval must be handled by the benchmark command path");
+        }
         GraphDbQuery::Evidence { .. } => {
             bail!("graph-db evidence must be handled by the evidence command path");
         }
@@ -9031,6 +9289,784 @@ fn print_graph_db_human(report: &GraphDbReport, compact: bool) {
     }
 }
 
+fn graph_db_backend_eval_timed(
+    name: &str,
+    run: impl FnOnce() -> Result<(Option<usize>, serde_json::Value)>,
+) -> (
+    GraphDbBackendEvalOperation,
+    Option<GraphDbBackendEvalSignature>,
+) {
+    let started = Instant::now();
+    match run() {
+        Ok((rows, value)) => (
+            GraphDbBackendEvalOperation {
+                name: name.to_string(),
+                supported: true,
+                status: "ok".to_string(),
+                duration_micros: started.elapsed().as_micros(),
+                rows,
+                error: None,
+            },
+            Some(GraphDbBackendEvalSignature {
+                operation: name.to_string(),
+                value,
+            }),
+        ),
+        Err(err) => (
+            GraphDbBackendEvalOperation {
+                name: name.to_string(),
+                supported: false,
+                status: "error".to_string(),
+                duration_micros: started.elapsed().as_micros(),
+                rows: None,
+                error: Some(format!("{err:#}")),
+            },
+            None,
+        ),
+    }
+}
+
+fn graph_db_backend_eval_parity(
+    sqlite_signatures: Option<&[GraphDbBackendEvalSignature]>,
+    candidate_signatures: &[GraphDbBackendEvalSignature],
+) -> GraphDbBackendEvalParity {
+    let Some(sqlite_signatures) = sqlite_signatures else {
+        return GraphDbBackendEvalParity {
+            matches_sqlite: true,
+            diagnostics: Vec::new(),
+        };
+    };
+    let sqlite = sqlite_signatures
+        .iter()
+        .map(|signature| (signature.operation.as_str(), &signature.value))
+        .collect::<BTreeMap<_, _>>();
+    let candidate = candidate_signatures
+        .iter()
+        .map(|signature| (signature.operation.as_str(), &signature.value))
+        .collect::<BTreeMap<_, _>>();
+    let mut diagnostics = Vec::new();
+    for (operation, sqlite_value) in sqlite {
+        match candidate.get(operation) {
+            Some(candidate_value) if *candidate_value == sqlite_value => {}
+            Some(_) => diagnostics.push(format!("{operation} output differed from SQLite")),
+            None => diagnostics.push(format!(
+                "{operation} did not complete for candidate backend"
+            )),
+        }
+    }
+    GraphDbBackendEvalParity {
+        matches_sqlite: diagnostics.is_empty(),
+        diagnostics,
+    }
+}
+
+fn graph_db_backend_eval_targets(
+    store: &impl GraphStore,
+    requested: &[String],
+) -> Result<Vec<String>> {
+    let requested = requested
+        .iter()
+        .filter_map(|target| normalize_conflict_target(target))
+        .collect::<Vec<_>>();
+    if !requested.is_empty() {
+        return Ok(requested);
+    }
+
+    for kind in ["backlog", "job_packet"] {
+        let nodes = store.nodes_by_kind(kind)?;
+        if let Some(node) = nodes.first() {
+            if let Some(ref_id) = node.properties.get("ref_id") {
+                return Ok(vec![ref_id.clone()]);
+            }
+            return Ok(vec![node.id.clone()]);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn graph_db_backend_eval_evidence_signature(report: &GraphDbEvidenceReport) -> serde_json::Value {
+    serde_json::json!({
+        "target": report.target,
+        "target_node_id": report.target_node.id,
+        "target_kind": report.target_node.kind,
+        "worker_context": report.worker_context.iter().map(|node| &node.id).collect::<Vec<_>>(),
+        "source_handles": report.source_handles.iter().map(|node| &node.id).collect::<Vec<_>>(),
+        "worker_results": report.worker_results.iter().map(|node| &node.id).collect::<Vec<_>>(),
+        "semantic_related": report.semantic_related.iter().map(|node| &node.id).collect::<Vec<_>>(),
+        "path_count": report.shortest_paths.len(),
+    })
+}
+
+fn graph_db_backend_eval_conflict_signature(report: &ConflictMatrixReport) -> serde_json::Value {
+    serde_json::json!({
+        "targets": report.targets,
+        "can_parallel": report.can_parallel,
+        "fail_closed": report.fail_closed,
+        "cross_target_parallel_safe": report.cross_target_parallel_safe,
+        "per_target_fail_closed": report.per_target_fail_closed.iter().map(|target| &target.target).collect::<Vec<_>>(),
+        "candidates": report.candidates.iter().map(|candidate| {
+            serde_json::json!({
+                "target": candidate.target,
+                "risk": conflict_risk_label(candidate.risk),
+                "owned_files": candidate.owned_files,
+                "owned_symbols": candidate.owned_symbols,
+                "source_handles": candidate.source_handles.iter().map(|handle| &handle.handle).collect::<Vec<_>>(),
+                "previously_completed": candidate.previously_completed,
+                "parallel_safe": candidate.parallel_safe,
+            })
+        }).collect::<Vec<_>>(),
+        "conflicts": report.conflicts.iter().map(|pair| {
+            serde_json::json!({
+                "left": pair.left,
+                "right": pair.right,
+                "risk": conflict_risk_label(pair.risk),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn graph_db_backend_eval_dispatch_signature(report: &DispatchTraceReport) -> serde_json::Value {
+    serde_json::json!({
+        "targets": report.targets,
+        "node_ids": report.nodes.iter().map(|node| &node.id).collect::<Vec<_>>(),
+        "edge_keys": report.edges.iter().map(graph_db_edge_key).collect::<Vec<_>>(),
+        "evidence_packet_ids": report.evidence_packet_ids,
+        "worker_prompt_targets": report.worker_prompt_packets.iter().map(|packet| &packet.target).collect::<Vec<_>>(),
+        "truncated": report.truncated,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn graph_db_backend_eval_report_for_store<S: GraphStore>(
+    backend: &str,
+    adapter: &str,
+    read_only: bool,
+    root: &Path,
+    path: &Path,
+    scope: Option<&str>,
+    targets: &[String],
+    depth: usize,
+    limit: usize,
+    impact_limit: usize,
+    store: &S,
+    freshness: GraphDbFreshnessReport,
+    refresh_operation: GraphDbBackendEvalOperation,
+    refresh_signature: Option<GraphDbBackendEvalSignature>,
+    sqlite_signatures: Option<&[GraphDbBackendEvalSignature]>,
+    extra_warnings: Vec<String>,
+    prepared: &ConflictMatrixPreparedInputs,
+) -> (
+    GraphDbBackendEvalBackendReport,
+    Vec<GraphDbBackendEvalSignature>,
+) {
+    let mut operations = vec![refresh_operation];
+    let mut signatures = refresh_signature.into_iter().collect::<Vec<_>>();
+
+    let (operation, signature) = graph_db_backend_eval_timed("status", || {
+        let nodes = store.all_nodes()?;
+        let edges = store.all_edges()?;
+        Ok((
+            Some(nodes.len() + edges.len()),
+            serde_json::json!({
+                "freshness": freshness.status,
+                "nodes": nodes.len(),
+                "edges": edges.len(),
+            }),
+        ))
+    });
+    operations.push(operation);
+    signatures.extend(signature);
+
+    let (operation, signature) = graph_db_backend_eval_timed("evidence", || {
+        let target = targets
+            .first()
+            .context("backend-eval evidence requires at least one target")?;
+        let report = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
+            root,
+            scope,
+            backend,
+            target,
+            depth,
+            limit,
+            store,
+            freshness: freshness.clone(),
+            warnings: Vec::new(),
+        })?;
+        Ok((
+            Some(
+                report.worker_context.len()
+                    + report.source_handles.len()
+                    + report.worker_results.len()
+                    + report.semantic_related.len(),
+            ),
+            graph_db_backend_eval_evidence_signature(&report),
+        ))
+    });
+    operations.push(operation);
+    signatures.extend(signature);
+
+    let (operation, signature) = graph_db_backend_eval_timed("conflict_matrix", || {
+        let report = build_conflict_matrix_report_with_prepared(
+            root,
+            path,
+            scope,
+            targets,
+            depth,
+            limit,
+            impact_limit,
+            store,
+            freshness.clone(),
+            extra_warnings.clone(),
+            prepared,
+        )?;
+        Ok((
+            Some(report.candidates.len() + report.conflicts.len()),
+            graph_db_backend_eval_conflict_signature(&report),
+        ))
+    });
+    operations.push(operation);
+    signatures.extend(signature);
+
+    let (operation, signature) = graph_db_backend_eval_timed("dispatch_trace", || {
+        let report = build_dispatch_trace_report_with_prepared(
+            root,
+            path,
+            scope,
+            targets,
+            depth,
+            limit,
+            impact_limit,
+            store,
+            freshness.clone(),
+            extra_warnings.clone(),
+            prepared,
+        )?;
+        Ok((
+            Some(report.nodes.len() + report.edges.len()),
+            graph_db_backend_eval_dispatch_signature(&report),
+        ))
+    });
+    operations.push(operation);
+    signatures.extend(signature);
+
+    let total_micros = operations
+        .iter()
+        .map(|operation| operation.duration_micros)
+        .sum();
+    let parity = graph_db_backend_eval_parity(sqlite_signatures, &signatures);
+    let lock_behavior = if read_only {
+        "read-only snapshot/row adapter; no writer lock is taken during query benchmarks"
+    } else {
+        "SQLite WAL correctness store; refresh uses one transactional writer and read-only queries use snapshot recovery"
+    }
+    .to_string();
+    let install_portability = if read_only {
+        "prototype is dependency-free in this binary; a production engine adapter must remain optional before promotion"
+    } else {
+        "bundled rusqlite baseline; no external service or runtime required"
+    }
+    .to_string();
+    (
+        GraphDbBackendEvalBackendReport {
+            backend: backend.to_string(),
+            adapter: adapter.to_string(),
+            read_only,
+            operations,
+            total_micros,
+            parity,
+            lock_behavior,
+            install_portability,
+        },
+        signatures,
+    )
+}
+
+fn graph_db_backend_eval_refresh_operation(
+    duration_micros: u128,
+    rows: usize,
+    value: serde_json::Value,
+) -> (GraphDbBackendEvalOperation, GraphDbBackendEvalSignature) {
+    (
+        GraphDbBackendEvalOperation {
+            name: "refresh".to_string(),
+            supported: true,
+            status: "ok".to_string(),
+            duration_micros,
+            rows: Some(rows),
+            error: None,
+        },
+        GraphDbBackendEvalSignature {
+            operation: "refresh".to_string(),
+            value,
+        },
+    )
+}
+
+fn graph_db_backend_eval_synthetic_projection(nodes: usize, fanout: usize) -> GraphProjection {
+    let nodes = nodes.max(12);
+    let symbol_count = nodes.saturating_sub(9).max(1);
+    let source = GraphProvenance::new("backend-eval", "synthetic");
+    let mut projection_nodes = vec![
+        SubstrateGraphNode::new(
+            "projection:tsift-traversal:synthetic",
+            GRAPH_PROJECTION_META_KIND,
+            "synthetic projection",
+        )
+        .with_property("projection_version", GRAPH_PROJECTION_VERSION)
+        .with_property(
+            "content_hash",
+            format!("synthetic-{nodes}-{fanout}-{symbol_count}"),
+        )
+        .with_provenance(source.clone()),
+        SubstrateGraphNode::new("gses-synthetic", "session", "synthetic session")
+            .with_property("ref_id", "synthetic-session"),
+        SubstrateGraphNode::new("gbak-synthetic", "backlog", "#synthetic")
+            .with_property("ref_id", "synthetic")
+            .with_property("path", "tasks/software/synthetic.md")
+            .with_property("line", "1")
+            .with_property(
+                "expand",
+                "tsift source-read tasks/software/synthetic.md --start 1 --lines 40",
+            ),
+        SubstrateGraphNode::new("gjob-synthetic", "job_packet", "do #synthetic")
+            .with_property("ref_id", "synthetic"),
+        SubstrateGraphNode::new("gwctx-synthetic", "worker_context", "synthetic context")
+            .with_property("target", "synthetic")
+            .with_property("summary", "Synthetic worker owns synthetic.rs")
+            .with_property(
+                "expand",
+                "tsift source-read synthetic.rs --start 1 --lines 80",
+            ),
+        SubstrateGraphNode::new("gsrc-synthetic", "source_handle", "synthetic.rs:1-80")
+            .with_property("file", "synthetic.rs")
+            .with_property("start", "1")
+            .with_property("end", "80")
+            .with_property(
+                "expand",
+                "tsift source-read synthetic.rs --start 1 --lines 80",
+            ),
+        SubstrateGraphNode::new("gfil-synthetic", "file", "synthetic.rs")
+            .with_property("path", "synthetic.rs"),
+        SubstrateGraphNode::new("gsem-synthetic", "semantic_concept", "backend evaluation")
+            .with_property("label", "backend evaluation"),
+        SubstrateGraphNode::new("gwres-synthetic", "worker_result", "completed #synthetic")
+            .with_property("ref_id", "synthetic")
+            .with_property("status", "completed")
+            .with_property("touched_files", "synthetic.rs")
+            .with_property("expected_tests", "cargo test --test graph_db_conformance"),
+    ];
+    for idx in 0..symbol_count {
+        projection_nodes.push(
+            SubstrateGraphNode::new(
+                format!("gsym-synthetic-{idx:04}"),
+                "symbol",
+                format!("synthetic_symbol_{idx:04}"),
+            )
+            .with_property("ref_id", format!("synthetic_symbol_{idx:04}"))
+            .with_property("path", "synthetic.rs")
+            .with_property("line", (idx + 1).to_string()),
+        );
+    }
+
+    let mut projection_edges = vec![
+        SubstrateGraphEdge::new("gses-synthetic", "gbak-synthetic", "contains"),
+        SubstrateGraphEdge::new("gses-synthetic", "gjob-synthetic", "queues"),
+        SubstrateGraphEdge::new("gbak-synthetic", "gwctx-synthetic", "has_context"),
+        SubstrateGraphEdge::new("gjob-synthetic", "gwctx-synthetic", "has_context"),
+        SubstrateGraphEdge::new("gwctx-synthetic", "gsrc-synthetic", "uses_source"),
+        SubstrateGraphEdge::new("gbak-synthetic", "gwres-synthetic", "has_worker_result"),
+        SubstrateGraphEdge::new("gbak-synthetic", "gsem-synthetic", "mentions_concept"),
+        SubstrateGraphEdge::new("gsrc-synthetic", "gfil-synthetic", "reads_file"),
+        SubstrateGraphEdge::new("gfil-synthetic", "gsym-synthetic-0000", "defines"),
+    ];
+    for idx in 0..symbol_count {
+        let from = format!("gsym-synthetic-{idx:04}");
+        for offset in 1..=fanout.max(1).min(symbol_count) {
+            let to_idx = (idx + offset) % symbol_count;
+            if to_idx != idx {
+                projection_edges.push(SubstrateGraphEdge::new(
+                    from.clone(),
+                    format!("gsym-synthetic-{to_idx:04}"),
+                    "calls",
+                ));
+            }
+        }
+    }
+
+    GraphProjection {
+        nodes: projection_nodes,
+        edges: projection_edges
+            .into_iter()
+            .map(|edge| edge.with_provenance(source.clone()))
+            .collect(),
+    }
+}
+
+fn graph_db_backend_eval_promotion(
+    datasets: &[GraphDbBackendEvalDataset],
+    candidates: &[GraphDbExperimentalBackend],
+) -> Vec<GraphDbBackendPromotionDecision> {
+    let mut decisions = Vec::new();
+    for candidate in candidates {
+        let mut reasons = Vec::new();
+        let mut faster_everywhere = true;
+        let mut parity_everywhere = true;
+        for dataset in datasets {
+            let sqlite_total = dataset
+                .backends
+                .iter()
+                .find(|backend| backend.backend == "sqlite")
+                .map(|backend| backend.total_micros)
+                .unwrap_or(u128::MAX);
+            let Some(candidate_report) = dataset
+                .backends
+                .iter()
+                .find(|backend| backend.backend == candidate.name())
+            else {
+                parity_everywhere = false;
+                reasons.push(format!("{} dataset did not run", dataset.name));
+                continue;
+            };
+            if !candidate_report.parity.matches_sqlite {
+                parity_everywhere = false;
+                reasons.push(format!("{} parity differed from SQLite", dataset.name));
+            }
+            if candidate_report.total_micros >= sqlite_total {
+                faster_everywhere = false;
+                reasons.push(format!(
+                    "{} total {}us did not beat SQLite {}us",
+                    dataset.name, candidate_report.total_micros, sqlite_total
+                ));
+            }
+            if candidate_report
+                .operations
+                .iter()
+                .any(|operation| operation.status != "ok")
+            {
+                parity_everywhere = false;
+                reasons.push(format!("{} has failed benchmark operations", dataset.name));
+            }
+        }
+        let decision = if parity_everywhere && faster_everywhere {
+            reasons.push(
+                "prototype gate passed; production promotion still requires the real engine adapter to preserve SQLite's bundled install and multi-process lock behavior"
+                    .to_string(),
+            );
+            "eligible"
+        } else {
+            reasons.push(
+                "production promotion requires SQLite parity plus lower total time on every dataset without worse lock behavior or install portability"
+                    .to_string(),
+            );
+            "hold"
+        };
+        decisions.push(GraphDbBackendPromotionDecision {
+            backend: candidate.name().to_string(),
+            decision: decision.to_string(),
+            reasons: dedupe_preserve_order(reasons),
+        });
+    }
+    decisions
+}
+
+struct GraphDbBackendEvalOptions<'a> {
+    path: &'a Path,
+    scope: Option<&'a str>,
+    candidates: &'a [String],
+    targets: &'a [String],
+}
+
+#[allow(clippy::too_many_arguments)]
+fn graph_db_backend_eval_dataset(
+    name: &str,
+    root: &Path,
+    path: &Path,
+    scope: Option<&str>,
+    targets: &[String],
+    depth: usize,
+    limit: usize,
+    impact_limit: usize,
+    candidates: &[GraphDbExperimentalBackend],
+    sqlite_store: &SqliteGraphStore,
+    sqlite_freshness: GraphDbFreshnessReport,
+    sqlite_refresh: (GraphDbBackendEvalOperation, GraphDbBackendEvalSignature),
+    sqlite_rows: ConvexProjectionRows,
+    extra_warnings: Vec<String>,
+    prepared: &ConflictMatrixPreparedInputs,
+) -> Result<GraphDbBackendEvalDataset> {
+    let nodes = sqlite_store.all_nodes()?.len();
+    let edges = sqlite_store.all_edges()?.len();
+    let (sqlite_operation, sqlite_signature) = sqlite_refresh;
+    let (sqlite_report, sqlite_signatures) = graph_db_backend_eval_report_for_store(
+        "sqlite",
+        "SQLite GraphStore correctness baseline",
+        false,
+        root,
+        path,
+        scope,
+        targets,
+        depth,
+        limit,
+        impact_limit,
+        sqlite_store,
+        sqlite_freshness,
+        sqlite_operation,
+        Some(sqlite_signature),
+        None,
+        extra_warnings.clone(),
+        prepared,
+    );
+
+    let mut backends = vec![sqlite_report];
+    for candidate in candidates {
+        let started = Instant::now();
+        let store = ExperimentalReadOnlyGraphStore::from_rows(*candidate, sqlite_rows.clone())?;
+        let rows = store.all_nodes()?.len() + store.all_edges()?.len();
+        let refresh = graph_db_backend_eval_refresh_operation(
+            started.elapsed().as_micros(),
+            rows,
+            serde_json::json!({
+                "nodes": store.all_nodes()?.len(),
+                "edges": store.all_edges()?.len(),
+            }),
+        );
+        let freshness = sqlite_graph_freshness(sqlite_store, scope.unwrap_or("root"))?;
+        let (candidate_report, _signatures) = graph_db_backend_eval_report_for_store(
+            candidate.name(),
+            candidate.adapter_label(),
+            true,
+            root,
+            path,
+            scope,
+            targets,
+            depth,
+            limit,
+            impact_limit,
+            &store,
+            freshness,
+            refresh.0,
+            Some(refresh.1),
+            Some(&sqlite_signatures),
+            extra_warnings.clone(),
+            prepared,
+        );
+        backends.push(candidate_report);
+    }
+
+    Ok(GraphDbBackendEvalDataset {
+        name: name.to_string(),
+        target_count: targets.len(),
+        nodes,
+        edges,
+        backends,
+    })
+}
+
+fn cmd_graph_db_backend_eval(
+    options: GraphDbBackendEvalOptions<'_>,
+    format: OutputFormat,
+) -> Result<()> {
+    let GraphDbBackendEvalOptions {
+        path,
+        scope,
+        candidates,
+        targets,
+    } = options;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let candidates = if candidates.is_empty() {
+        vec![
+            GraphDbExperimentalBackend::DuckdbDuckpgq,
+            GraphDbExperimentalBackend::Ladybug,
+        ]
+    } else {
+        candidates
+            .iter()
+            .map(|candidate| GraphDbExperimentalBackend::parse(candidate))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let synthetic_nodes = 96;
+    let synthetic_fanout = 3;
+    let depth = 3;
+    let limit = 8;
+    let impact_limit = 20;
+
+    let refresh_started = Instant::now();
+    let (graph, _refresh) = refresh_traversal_graph_store(&root, path, scope)
+        .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
+    let refresh_micros = refresh_started.elapsed().as_micros();
+    let prepared = prepare_conflict_matrix_inputs(&root, path, scope, impact_limit)?;
+    let graph_db = graph_substrate_db_path(&root, scope);
+    let real_store = SqliteGraphStore::open_read_only_resilient(&graph_db)
+        .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
+    let real_freshness = sqlite_graph_freshness(&real_store, scope.unwrap_or("root"))?;
+    let real_targets = graph_db_backend_eval_targets(&real_store, targets)?;
+    let real_rows = convex_rows_from_graph_store(&real_store)?;
+    let real_refresh = graph_db_backend_eval_refresh_operation(
+        refresh_micros,
+        real_rows.nodes.len() + real_rows.edges.len(),
+        serde_json::json!({
+            "nodes": real_rows.nodes.len(),
+            "edges": real_rows.edges.len(),
+        }),
+    );
+    let mut real_warnings = graph.warnings;
+    if let Some(recovery) = real_store.read_only_recovery() {
+        real_warnings.push(graph_db_read_recovery_diagnostic(recovery));
+    }
+    let real_dataset = graph_db_backend_eval_dataset(
+        "real",
+        &root,
+        path,
+        scope,
+        &real_targets,
+        depth,
+        limit,
+        impact_limit,
+        &candidates,
+        &real_store,
+        real_freshness,
+        real_refresh,
+        real_rows,
+        real_warnings,
+        &prepared,
+    )?;
+
+    let synthetic_projection =
+        graph_db_backend_eval_synthetic_projection(synthetic_nodes, synthetic_fanout);
+    let synthetic_started = Instant::now();
+    let mut synthetic_store = SqliteGraphStore::in_memory()?;
+    let _synthetic_refresh = synthetic_store.replace_projection_with_version(
+        "root",
+        &synthetic_projection,
+        Some(GRAPH_PROJECTION_VERSION),
+        Some(format!("synthetic:{synthetic_nodes}:{synthetic_fanout}")),
+    )?;
+    let synthetic_micros = synthetic_started.elapsed().as_micros();
+    let synthetic_freshness = sqlite_graph_freshness(&synthetic_store, "root")?;
+    let synthetic_targets = graph_db_backend_eval_targets(&synthetic_store, &[])?;
+    let synthetic_rows = convex_rows_from_graph_store(&synthetic_store)?;
+    let synthetic_refresh = graph_db_backend_eval_refresh_operation(
+        synthetic_micros,
+        synthetic_rows.nodes.len() + synthetic_rows.edges.len(),
+        serde_json::json!({
+            "nodes": synthetic_rows.nodes.len(),
+            "edges": synthetic_rows.edges.len(),
+        }),
+    );
+    let synthetic_dataset = graph_db_backend_eval_dataset(
+        "synthetic",
+        &root,
+        path,
+        scope,
+        &synthetic_targets,
+        depth,
+        limit,
+        impact_limit,
+        &candidates,
+        &synthetic_store,
+        synthetic_freshness,
+        synthetic_refresh,
+        synthetic_rows,
+        Vec::new(),
+        &prepared,
+    )?;
+
+    let targets = real_targets
+        .iter()
+        .chain(synthetic_targets.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let datasets = vec![real_dataset, synthetic_dataset];
+    let promotion = graph_db_backend_eval_promotion(&datasets, &candidates);
+    let report = GraphDbBackendEvalReport {
+        root: root.to_string_lossy().to_string(),
+        scope: scope.map(str::to_string),
+        baseline_backend: "sqlite".to_string(),
+        candidates: candidates
+            .iter()
+            .map(|candidate| candidate.name().to_string())
+            .collect(),
+        targets,
+        config: GraphDbBackendEvalConfig {
+            synthetic_nodes,
+            synthetic_fanout,
+            depth,
+            limit,
+            impact_limit,
+        },
+        datasets,
+        promotion,
+        warnings: Vec::new(),
+    };
+
+    if format.json_output {
+        print_json_or_envelope(
+            &report,
+            &format,
+            "graph-db",
+            "backend-eval",
+            ToolEnvelopeSummary {
+                text: format!(
+                    "Graph DB backend evaluation ran {} dataset(s) against {} candidate(s)",
+                    report.datasets.len(),
+                    report.candidates.len()
+                ),
+                metrics: vec![
+                    envelope_metric("datasets", report.datasets.len()),
+                    envelope_metric("candidates", report.candidates.len()),
+                ],
+            },
+            false,
+            vec![format!(
+                "Re-run with `tsift graph-db --path {} backend-eval --json --target <id>` after adding a production candidate adapter",
+                shell_quote(root.to_string_lossy().as_ref())
+            )],
+        )
+    } else {
+        print_graph_db_backend_eval_human(&report);
+        Ok(())
+    }
+}
+
+fn print_graph_db_backend_eval_human(report: &GraphDbBackendEvalReport) {
+    println!(
+        "graph-db backend-eval baseline:{} candidates:{}",
+        report.baseline_backend,
+        report.candidates.join(", ")
+    );
+    for dataset in &report.datasets {
+        println!(
+            "dataset:{} targets:{} rows:{}",
+            dataset.name,
+            dataset.target_count,
+            dataset.nodes + dataset.edges
+        );
+        for backend in &dataset.backends {
+            println!(
+                "  backend:{} total:{}us parity:{}",
+                backend.backend, backend.total_micros, backend.parity.matches_sqlite
+            );
+            for operation in &backend.operations {
+                println!(
+                    "    {} {} {}us",
+                    operation.name, operation.status, operation.duration_micros
+                );
+            }
+            for diagnostic in &backend.parity.diagnostics {
+                println!("    parity: {diagnostic}");
+            }
+        }
+    }
+    for decision in &report.promotion {
+        println!("promotion {}: {}", decision.backend, decision.decision);
+        for reason in &decision.reasons {
+            println!("  reason: {reason}");
+        }
+    }
+}
+
 fn cmd_graph_db(
     path: &Path,
     scope: Option<&str>,
@@ -9052,6 +10088,20 @@ fn cmd_graph_db(
         }
         GraphDbQuery::Drift => {
             return cmd_graph_db_drift(&root, path, scope, convex_snapshot, format);
+        }
+        GraphDbQuery::BackendEval {
+            candidates,
+            targets,
+        } => {
+            return cmd_graph_db_backend_eval(
+                GraphDbBackendEvalOptions {
+                    path,
+                    scope,
+                    candidates,
+                    targets,
+                },
+                format,
+            );
         }
         _ => {}
     }
@@ -14543,17 +15593,18 @@ fn print_conflict_matrix_human(report: &ConflictMatrixReport, compact: bool) {
     }
 }
 
-fn build_conflict_matrix_report(
+struct ConflictMatrixPreparedInputs {
+    context_pack: ContextPackReport,
+    cached_diff: diff_digest::DiffDigestReport,
+    impact_report: impact::ImpactReport,
+}
+
+fn prepare_conflict_matrix_inputs(
+    root: &Path,
     path: &Path,
     scope: Option<&str>,
-    raw_targets: &[String],
-    depth: usize,
-    limit: usize,
     impact_limit: usize,
-) -> Result<ConflictMatrixReport> {
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
-    build_traversal_graph(&root, path, scope)
-        .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
+) -> Result<ConflictMatrixPreparedInputs> {
     let context_pack = build_context_pack_report(
         path,
         None,
@@ -14561,13 +15612,8 @@ fn build_conflict_matrix_report(
         None,
         ResponseBudget::from_cli(None, None, Some(ResponseBudgetPreset::Normal), false),
     )?;
-    let graph_db = graph_substrate_db_path(&root, scope);
-    let store = SqliteGraphStore::open_read_only_resilient(&graph_db)
-        .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
-    let freshness = sqlite_graph_freshness(&store, scope.unwrap_or("root"))?;
-    let targets = resolve_conflict_matrix_targets(&store, raw_targets, &context_pack)?;
     let cached_diff = diff_digest::compute(
-        &root,
+        root,
         diff_digest::DiffDigestOptions {
             cached: true,
             revision: None,
@@ -14575,7 +15621,7 @@ fn build_conflict_matrix_report(
     )
     .with_context(|| format!("computing cached diff digest for {}", root.display()))?;
     let impact_report = impact::compute(
-        &root,
+        root,
         impact::ImpactOptions {
             cached: true,
             revision: None,
@@ -14584,23 +15630,44 @@ fn build_conflict_matrix_report(
         },
     )
     .with_context(|| format!("computing cached impact report for {}", root.display()))?;
+    Ok(ConflictMatrixPreparedInputs {
+        context_pack,
+        cached_diff,
+        impact_report,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_conflict_matrix_report_with_prepared<S: GraphStore>(
+    root: &Path,
+    path: &Path,
+    scope: Option<&str>,
+    raw_targets: &[String],
+    depth: usize,
+    limit: usize,
+    impact_limit: usize,
+    store: &S,
+    freshness: GraphDbFreshnessReport,
+    extra_warnings: Vec<String>,
+    prepared: &ConflictMatrixPreparedInputs,
+) -> Result<ConflictMatrixReport> {
+    let context_pack = &prepared.context_pack;
+    let targets = resolve_conflict_matrix_targets(store, raw_targets, context_pack)?;
     let graph_nodes = store.all_nodes()?;
 
     let mut warnings = context_pack.status_reminders.clone();
-    if let Some(recovery) = store.read_only_recovery() {
-        warnings.push(graph_db_read_recovery_diagnostic(recovery));
-    }
+    warnings.extend(extra_warnings);
     let mut candidates = Vec::new();
     let mut evidence_packets = Vec::new();
     for target in &targets {
         let evidence = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
-            root: &root,
+            root,
             scope,
             backend: "sqlite",
             target,
             depth,
             limit,
-            store: &store,
+            store,
             freshness: freshness.clone(),
             warnings: Vec::new(),
         })
@@ -14627,7 +15694,188 @@ fn build_conflict_matrix_report(
                 }),
         });
         candidates.push(conflict_matrix_candidate_from_evidence(
-            &root,
+            root,
+            &evidence,
+            &graph_nodes,
+            &prepared.cached_diff,
+            &prepared.impact_report,
+        ));
+    }
+
+    apply_conflict_matrix_worker_feedback_controls(&mut candidates);
+    candidates.sort_by(|left, right| {
+        left.risk
+            .cmp(&right.risk)
+            .then_with(|| left.risk_score.cmp(&right.risk_score))
+            .then_with(|| {
+                right
+                    .worker_feedback
+                    .closure_rank_score
+                    .cmp(&left.worker_feedback.closure_rank_score)
+            })
+            .then_with(|| {
+                right
+                    .semantic_dispatch_score
+                    .cmp(&left.semantic_dispatch_score)
+            })
+            .then_with(|| left.target.cmp(&right.target))
+    });
+    for (idx, candidate) in candidates.iter_mut().enumerate() {
+        candidate.rank = idx + 1;
+    }
+    warnings.extend(candidates.iter().flat_map(|candidate| {
+        candidate
+            .worker_feedback
+            .warnings
+            .iter()
+            .map(|warning| format!("{}: {warning}", candidate.target))
+    }));
+    let conflicts = build_conflict_matrix_pairs(&candidates);
+    apply_conflict_matrix_ownership_blocks(&mut candidates);
+    apply_conflict_matrix_scheduler_fields(&mut candidates, &conflicts);
+    let worker_prompt_packets = conflict_matrix_worker_prompt_packets(&candidates);
+
+    let per_target_fail_closed = conflict_matrix_per_target_fail_closed(&candidates);
+    let cross_target_parallel_safe = conflicts
+        .iter()
+        .all(|pair| pair.risk <= ConflictMatrixRisk::Medium);
+    let fail_closed = !per_target_fail_closed.is_empty()
+        || conflicts
+            .iter()
+            .any(|pair| pair.risk == ConflictMatrixRisk::FailClosed);
+    let can_parallel = !fail_closed && cross_target_parallel_safe;
+    let next_commands =
+        conflict_matrix_next_commands(root, path, scope, &targets, depth, limit, impact_limit);
+    let orchestration = conflict_matrix_orchestration_observability(
+        &freshness,
+        &candidates,
+        &conflicts,
+        &next_commands,
+    );
+    let inputs = ConflictMatrixInputSummary {
+        graph_db_evidence_targets: targets.clone(),
+        evidence_packets,
+        context_pack_command: format!(
+            "tsift --envelope context-pack {} --budget normal",
+            shell_quote(path.to_string_lossy().as_ref())
+        ),
+        cached_diff_command: format!(
+            "tsift diff-digest --cached {} --json",
+            shell_quote(root.to_string_lossy().as_ref())
+        ),
+        impact_command: format!(
+            "tsift impact {} --cached{} --limit {} --json",
+            shell_quote(root.to_string_lossy().as_ref()),
+            scope
+                .map(|scope| format!(" --scope {}", shell_quote(scope)))
+                .unwrap_or_default(),
+            impact_limit
+        ),
+    };
+    let context_summary = conflict_matrix_context_summary(context_pack);
+    Ok(ConflictMatrixReport {
+        contract_version: CONFLICT_MATRIX_CONTRACT_VERSION,
+        root: root.to_string_lossy().to_string(),
+        scope: scope.map(str::to_string),
+        targets,
+        can_parallel,
+        fail_closed,
+        cross_target_parallel_safe,
+        per_target_fail_closed,
+        inputs,
+        context_pack: context_summary,
+        cached_diff: prepared.cached_diff.clone(),
+        impact: prepared.impact_report.clone(),
+        candidates,
+        worker_prompt_packets,
+        conflicts,
+        orchestration,
+        next_commands,
+        warnings,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_conflict_matrix_report_with_store<S: GraphStore>(
+    root: &Path,
+    path: &Path,
+    scope: Option<&str>,
+    raw_targets: &[String],
+    depth: usize,
+    limit: usize,
+    impact_limit: usize,
+    store: &S,
+    freshness: GraphDbFreshnessReport,
+    extra_warnings: Vec<String>,
+) -> Result<ConflictMatrixReport> {
+    let context_pack = build_context_pack_report(
+        path,
+        None,
+        None,
+        None,
+        ResponseBudget::from_cli(None, None, Some(ResponseBudgetPreset::Normal), false),
+    )?;
+    let targets = resolve_conflict_matrix_targets(store, raw_targets, &context_pack)?;
+    let cached_diff = diff_digest::compute(
+        root,
+        diff_digest::DiffDigestOptions {
+            cached: true,
+            revision: None,
+        },
+    )
+    .with_context(|| format!("computing cached diff digest for {}", root.display()))?;
+    let impact_report = impact::compute(
+        root,
+        impact::ImpactOptions {
+            cached: true,
+            revision: None,
+            scope,
+            limit: impact_limit,
+        },
+    )
+    .with_context(|| format!("computing cached impact report for {}", root.display()))?;
+    let graph_nodes = store.all_nodes()?;
+
+    let mut warnings = context_pack.status_reminders.clone();
+    warnings.extend(extra_warnings);
+    let mut candidates = Vec::new();
+    let mut evidence_packets = Vec::new();
+    for target in &targets {
+        let evidence = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
+            root,
+            scope,
+            backend: "sqlite",
+            target,
+            depth,
+            limit,
+            store,
+            freshness: freshness.clone(),
+            warnings: Vec::new(),
+        })
+        .with_context(|| format!("collecting graph-db evidence for {target}"))?;
+        warnings.extend(evidence.warnings.clone());
+        evidence_packets.push(ConflictMatrixEvidencePacketSummary {
+            target: evidence.target.clone(),
+            packet_id: evidence.packet_id.clone(),
+            target_node_id: evidence.target_node.id.clone(),
+            projection_hash: evidence.projection_hash.clone(),
+            replay_command: evidence
+                .replay_commands
+                .first()
+                .cloned()
+                .unwrap_or_else(|| {
+                    format!(
+                        "tsift graph-db --path {}{} evidence {} --depth {} --limit {} --json",
+                        shell_quote(root.to_string_lossy().as_ref()),
+                        graph_db_scope_arg(scope),
+                        shell_quote(target),
+                        depth,
+                        limit
+                    )
+                }),
+        });
+        candidates.push(conflict_matrix_candidate_from_evidence(
+            root,
             &evidence,
             &graph_nodes,
             &cached_diff,
@@ -14678,7 +15926,7 @@ fn build_conflict_matrix_report(
             .any(|pair| pair.risk == ConflictMatrixRisk::FailClosed);
     let can_parallel = !fail_closed && cross_target_parallel_safe;
     let next_commands =
-        conflict_matrix_next_commands(&root, path, scope, &targets, depth, limit, impact_limit);
+        conflict_matrix_next_commands(root, path, scope, &targets, depth, limit, impact_limit);
     let orchestration = conflict_matrix_orchestration_observability(
         &freshness,
         &candidates,
@@ -14726,6 +15974,39 @@ fn build_conflict_matrix_report(
         next_commands,
         warnings,
     })
+}
+
+fn build_conflict_matrix_report(
+    path: &Path,
+    scope: Option<&str>,
+    raw_targets: &[String],
+    depth: usize,
+    limit: usize,
+    impact_limit: usize,
+) -> Result<ConflictMatrixReport> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    build_traversal_graph(&root, path, scope)
+        .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
+    let graph_db = graph_substrate_db_path(&root, scope);
+    let store = SqliteGraphStore::open_read_only_resilient(&graph_db)
+        .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
+    let freshness = sqlite_graph_freshness(&store, scope.unwrap_or("root"))?;
+    let mut warnings = Vec::new();
+    if let Some(recovery) = store.read_only_recovery() {
+        warnings.push(graph_db_read_recovery_diagnostic(recovery));
+    }
+    build_conflict_matrix_report_with_store(
+        &root,
+        path,
+        scope,
+        raw_targets,
+        depth,
+        limit,
+        impact_limit,
+        &store,
+        freshness,
+        warnings,
+    )
 }
 
 fn cmd_conflict_matrix(
@@ -14925,12 +16206,13 @@ fn dispatch_trace_collect_ids(
     let mut truncated = false;
     for _ in 0..depth.max(1) {
         let before = ids.len();
+        let current_ids = ids.clone();
         for edge in graph_edges {
             if ids.len() >= max_nodes {
                 truncated = true;
                 break;
             }
-            let touches = ids.contains(&edge.from_id) || ids.contains(&edge.to_id);
+            let touches = current_ids.contains(&edge.from_id) || current_ids.contains(&edge.to_id);
             if !touches {
                 continue;
             }
@@ -14948,6 +16230,94 @@ fn dispatch_trace_collect_ids(
         }
     }
     (ids, truncated)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_dispatch_trace_report_with_prepared<S: GraphStore>(
+    root: &Path,
+    path: &Path,
+    scope: Option<&str>,
+    raw_targets: &[String],
+    depth: usize,
+    limit: usize,
+    impact_limit: usize,
+    store: &S,
+    freshness: GraphDbFreshnessReport,
+    extra_warnings: Vec<String>,
+    prepared: &ConflictMatrixPreparedInputs,
+) -> Result<DispatchTraceReport> {
+    let conflict = build_conflict_matrix_report_with_prepared(
+        root,
+        path,
+        scope,
+        raw_targets,
+        depth,
+        limit,
+        impact_limit,
+        store,
+        freshness,
+        extra_warnings,
+        prepared,
+    )?;
+    let graph_nodes = store.all_nodes()?;
+    let graph_edges = store.all_edges()?;
+    let (ids, truncated) = dispatch_trace_collect_ids(
+        &conflict.targets,
+        &conflict.candidates,
+        &graph_nodes,
+        &graph_edges,
+        depth,
+        limit,
+    );
+    let mut nodes = graph_nodes
+        .into_iter()
+        .filter(|node| ids.contains(&node.id))
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| {
+        dispatch_trace_kind_rank(&left.kind)
+            .cmp(&dispatch_trace_kind_rank(&right.kind))
+            .then(left.id.cmp(&right.id))
+    });
+    let node_ids = nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut edges = graph_edges
+        .into_iter()
+        .filter(|edge| {
+            node_ids.contains(edge.from_id.as_str()) && node_ids.contains(edge.to_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    edges.sort_by(|left, right| {
+        left.from_id
+            .cmp(&right.from_id)
+            .then(left.kind.cmp(&right.kind))
+            .then(left.to_id.cmp(&right.to_id))
+    });
+
+    Ok(DispatchTraceReport {
+        contract_version: DISPATCH_TRACE_CONTRACT_VERSION,
+        root: conflict.root,
+        scope: conflict.scope,
+        targets: conflict.targets,
+        projection_freshness: conflict.orchestration.projection_freshness,
+        projection_hashes: conflict.orchestration.projection_hashes,
+        evidence_packet_ids: conflict.orchestration.evidence_packet_ids,
+        worker_prompt_packets: conflict.worker_prompt_packets,
+        worker_feedback: conflict
+            .candidates
+            .iter()
+            .map(|candidate| candidate.worker_feedback.clone())
+            .collect(),
+        summary: dispatch_trace_summary(&nodes),
+        nodes,
+        edges,
+        conflict_matrix_decisions: conflict.orchestration.conflict_matrix_decisions,
+        replay_commands: conflict.next_commands,
+        repair_commands: graph_db_repair_commands(root, scope),
+        truncated,
+        warnings: conflict.warnings,
+    })
 }
 
 fn build_dispatch_trace_report(

@@ -738,7 +738,6 @@ impl SqliteGraphStore {
         Self::from_connection(conn)
     }
 
-    #[cfg(test)]
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.busy_timeout(Duration::from_secs(5))?;

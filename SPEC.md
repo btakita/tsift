@@ -40,6 +40,8 @@ The stable API surface is the `GraphStore` contract plus the `tsift graph-db` CL
 
 The first implementation is a local SQLite store with `graph_nodes`, `graph_edges`, `graph_projection_versions`, and `graph_tombstones` tables. SQLite is the development/offline/test correctness engine and a portable projection target; it is not the only intended backend. Refreshes are transactional: readers see the old projection or the new projection, never a half-swapped graph. Projection version rows record the traversal projection version, content hash, and source watermark; row-level tombstones record removed nodes and edges so incremental projection consumers can reconcile deletions. Opening a `graph.db` fails closed if the file advertises a newer schema version than the current binary supports.
 
+`tsift graph-db backend-eval --json` is the promotion gate for experimental substrate backends. It currently evaluates DuckDB/DuckPGQ and Ladybug read-only prototypes by loading the same provider-neutral rows behind the `GraphStore` contract, then benchmarks SQLite and each candidate on both the real refreshed projection and a synthetic graph. The benchmark covers refresh-equivalent projection load, status/count reads, `graph-db evidence`, `conflict-matrix`, and `dispatch-trace`; candidate output is compared against SQLite signatures for parity. Reports include per-operation timings, read-only lock-behavior notes, install-portability notes, and a promotion decision. A backend can only become eligible when it preserves SQLite parity and beats SQLite on every dataset without weakening SQLite's bundled install story or multi-process lock behavior; prototype-only adapters remain held until a real engine adapter satisfies that gate.
+
 Convex support is a projection backend for the same substrate contract. `GraphProjection::upsert_into` writes nodes before edges, so stores can fail closed when an edge references a missing node. The Convex adapter maps records onto two application tables:
 
 - `nodes`: `externalId`, `kind`, `label`, `properties`, `provenance`, and `freshness`
@@ -121,6 +123,7 @@ tsift convex-sync . --remote-snapshot --apply --endpoint https://... --json # li
 tsift graph-db --path . schema --json # stable provider-neutral graph DB JSON schema
 tsift graph-db --path . refresh --json # materialize graph.db and report projection/tombstone operator status
 tsift graph-db --path . status --json # inspect projection status without refreshing
+tsift graph-db --path . backend-eval --candidate duckdb-duckpgq --candidate ladybug --target cvxa --json # evaluate experimental GraphStore backend promotion gates
 tsift graph-db --path . node <id> --json # SQLite graph node lookup
 tsift graph-db --path . kind backlog --property ref_id=cvxa --limit 5 --json # paged SQLite graph kind scan
 tsift graph-db --path . evidence cvxa --depth 3 --limit 8 --json # backlog/job handoff evidence packet

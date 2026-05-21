@@ -1182,6 +1182,84 @@ fn graph_db_refresh_and_status_materialize_operator_report() {
 }
 
 #[test]
+fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
+    let project = graph_db_project();
+    init_git_repo(project.path());
+    let session = project.path().join("tasks/software/tsift.md");
+
+    let report = assert_tsift_json(vec![
+        "graph-db".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "backend-eval".to_string(),
+        "--candidate".to_string(),
+        "duckdb-duckpgq".to_string(),
+        "--candidate".to_string(),
+        "ladybug".to_string(),
+        "--target".to_string(),
+        "gval".to_string(),
+    ]);
+
+    assert_eq!(report["baseline_backend"], "sqlite", "{report}");
+    assert_eq!(
+        report["candidates"],
+        json!(["duckdb-duckpgq", "ladybug"]),
+        "{report}"
+    );
+    let datasets = report["datasets"].as_array().unwrap();
+    assert_eq!(datasets.len(), 2, "{report}");
+    assert!(
+        datasets.iter().any(|dataset| dataset["name"] == "real"),
+        "{report}"
+    );
+    assert!(
+        datasets
+            .iter()
+            .any(|dataset| dataset["name"] == "synthetic"),
+        "{report}"
+    );
+    for dataset in datasets {
+        assert!(dataset["nodes"].as_u64().unwrap() > 0, "{report}");
+        assert!(dataset["edges"].as_u64().unwrap() > 0, "{report}");
+        let backends = dataset["backends"].as_array().unwrap();
+        assert_eq!(backends.len(), 3, "{report}");
+        for backend in backends {
+            let operations = backend["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|operation| operation["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                operations,
+                vec![
+                    "refresh".to_string(),
+                    "status".to_string(),
+                    "evidence".to_string(),
+                    "conflict_matrix".to_string(),
+                    "dispatch_trace".to_string(),
+                ],
+                "{report}"
+            );
+            assert!(
+                backend["operations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|operation| operation["status"] == "ok"),
+                "{report}"
+            );
+            if backend["backend"] != "sqlite" {
+                assert_eq!(backend["read_only"], true, "{report}");
+                assert_eq!(backend["parity"]["matches_sqlite"], true, "{report}");
+            }
+        }
+    }
+    assert_eq!(report["promotion"].as_array().unwrap().len(), 2, "{report}");
+}
+
+#[test]
 fn graph_db_evidence_packet_covers_backlog_job_worker_context_and_source_handles() {
     let project = graph_db_project();
 

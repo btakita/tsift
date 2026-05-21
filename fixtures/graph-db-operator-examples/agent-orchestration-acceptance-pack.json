@@ -579,7 +579,7 @@
         "file": 4,
         "job_packet": 6,
         "session": 1,
-        "source_handle": 4,
+        "source_handle": 3,
         "symbol": 13,
         "worker_context": 8,
         "worker_result": 6
