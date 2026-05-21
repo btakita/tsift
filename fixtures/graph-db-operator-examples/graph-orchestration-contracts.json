@@ -83,6 +83,8 @@
       "version": "conflict-matrix-v1",
       "required_fields": [
         "contract_version",
+        "cross_target_parallel_safe",
+        "per_target_fail_closed",
         "inputs.evidence_packets",
         "candidates.evidence_packet_id",
         "worker_prompt_packets",

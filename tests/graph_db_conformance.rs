@@ -641,6 +641,8 @@ fn regenerate_agent_orchestration_acceptance_samples(project: &Path, session: &P
             "targets": conflict["targets"],
             "can_parallel": conflict["can_parallel"],
             "fail_closed": conflict["fail_closed"],
+            "cross_target_parallel_safe": conflict["cross_target_parallel_safe"],
+            "per_target_fail_closed": conflict["per_target_fail_closed"],
             "candidate_summaries": conflict_candidate_summaries(&conflict),
             "worker_prompt_packets": worker_prompt_packet_summaries(&conflict),
             "evidence_packet_count": conflict["orchestration"]["evidence_packet_ids"].as_array().unwrap().len(),
@@ -971,6 +973,19 @@ fn graph_db_refresh_and_status_materialize_operator_report() {
     assert!(refresh["counts"]["nodes"].as_u64().unwrap() > 0);
     assert!(refresh["counts"]["edges"].as_u64().unwrap() > 0);
     assert!(refresh["counts"]["tombstones"]["total"].as_u64().is_some());
+    assert!(
+        refresh["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| {
+                let warning = warning.as_str().unwrap();
+                warning.contains("summary cache empty")
+                    && warning.contains("tsift summarize --extract")
+                    && warning.contains("semantic rows are unavailable")
+            }),
+        "{refresh}"
+    );
     let refresh_commands = refresh["next_commands"].as_array().unwrap();
     assert!(
         refresh_commands
@@ -1113,6 +1128,88 @@ fn graph_db_evidence_packet_covers_backlog_job_worker_context_and_source_handles
 }
 
 #[test]
+fn graph_db_evidence_falls_back_to_session_line_for_unlinked_backlog() {
+    let project = graph_db_project();
+    let session = project.path().join("tasks/software/unlinked.md");
+    fs::write(
+        &session,
+        r#"---
+agent_doc_session: unlinked
+agent_doc_format: template
+---
+
+<!-- agent:queue -->
+- do [#zqxj]
+<!-- /agent:queue -->
+
+## Backlog
+
+<!-- agent:backlog -->
+- [ ] [#zqxj] Triage lunar orchard handoff without code tokens.
+<!-- /agent:backlog -->
+"#,
+    )
+    .unwrap();
+
+    let output = run_tsift(vec![
+        "index".to_string(),
+        project.path().to_string_lossy().to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "index failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let evidence = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "evidence".to_string(),
+            "zqxj".to_string(),
+            "--depth".to_string(),
+            "3".to_string(),
+            "--limit".to_string(),
+            "8".to_string(),
+        ],
+    );
+
+    assert_eq!(evidence["target_node"]["kind"], "backlog", "{evidence}");
+    assert!(
+        !evidence["worker_context"].as_array().unwrap().is_empty(),
+        "{evidence}"
+    );
+    assert!(
+        evidence["source_handles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["properties"]["file"] == "tasks/software/unlinked.md"),
+        "{evidence}"
+    );
+    assert!(
+        evidence["shortest_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path["kind"] == "source_handle" && !path["path"].is_null()),
+        "{evidence}"
+    );
+    assert!(
+        evidence["next_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| {
+                let command = command.as_str().unwrap();
+                command.contains("source-read") && command.contains("unlinked.md")
+            }),
+        "{evidence}"
+    );
+}
+
+#[test]
 fn conflict_matrix_cli_composes_planner_evidence_and_worker_ownership() {
     let project = graph_db_project();
     init_git_repo(project.path());
@@ -1128,6 +1225,14 @@ fn conflict_matrix_cli_composes_planner_evidence_and_worker_ownership() {
 
     assert_eq!(report["targets"], json!(["gval"]));
     assert_eq!(report["contract_version"], "conflict-matrix-v1", "{report}");
+    assert_eq!(report["cross_target_parallel_safe"], true, "{report}");
+    assert!(
+        report["per_target_fail_closed"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{report}"
+    );
     assert_eq!(report["cached_diff"]["mode"], "cached");
     assert_eq!(report["impact"]["mode"], "cached");
     assert!(
@@ -1177,6 +1282,38 @@ fn conflict_matrix_cli_composes_planner_evidence_and_worker_ownership() {
             .unwrap()
             .iter()
             .any(|command| command.as_str().unwrap().contains("graph-db --path")),
+        "{report}"
+    );
+}
+
+#[test]
+fn conflict_matrix_separates_per_target_fail_closed_from_cross_target_overlap() {
+    let project = graph_db_project();
+    init_git_repo(project.path());
+    let session = project.path().join("tasks/software/tsift.md");
+    let projection_id = "projection:tsift-traversal:root".to_string();
+
+    let report = assert_tsift_json(vec![
+        "conflict-matrix".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        projection_id.clone(),
+    ]);
+
+    assert_eq!(report["cross_target_parallel_safe"], true, "{report}");
+    assert_eq!(report["fail_closed"], true, "{report}");
+    assert_eq!(report["can_parallel"], false, "{report}");
+    let per_target = report["per_target_fail_closed"].as_array().unwrap();
+    assert_eq!(per_target.len(), 1, "{report}");
+    assert!(
+        per_target
+            .iter()
+            .any(|entry| entry["target"] == projection_id),
+        "{report}"
+    );
+    assert!(
+        report["conflicts"].as_array().unwrap().is_empty(),
         "{report}"
     );
 }

@@ -5204,6 +5204,16 @@ fn push_traversal_backlog_target_handles<'a>(
         if !matches!(target_node.kind.as_str(), "file" | "symbol" | "route") {
             continue;
         }
+        if target_node
+            .path
+            .as_deref()
+            .zip(backlog.path.as_deref())
+            .is_some_and(|(target_path, backlog_path)| {
+                target_path == backlog_path && target_path.ends_with(".md")
+            })
+        {
+            continue;
+        }
         if seen_target_nodes.insert(target_node.handle.clone()) {
             target_node_handles.push(target_node.handle.clone());
         }
@@ -5257,11 +5267,9 @@ fn append_traversal_context_projection_rows(
     let mut seen_windows = BTreeMap::<(String, usize, usize), String>::new();
     let mut source_handle_by_node = BTreeMap::<String, String>::new();
 
-    let mut worker_count = 0usize;
+    let mut code_context_count = 0usize;
+    let code_context_limit = budget.relationship_limit.min(8);
     for node in graph.nodes.values() {
-        if worker_count >= budget.relationship_limit.min(8) {
-            break;
-        }
         if !matches!(
             node.kind.as_str(),
             "backlog" | "job_packet" | "worker_result"
@@ -5269,6 +5277,7 @@ fn append_traversal_context_projection_rows(
             continue;
         }
         let mut target_node_handles = Vec::new();
+        let mut fallback_target_handles = Vec::new();
         let mut seen_target_nodes = BTreeSet::new();
         if node.kind == "backlog" || node.kind == "worker_result" {
             push_traversal_backlog_target_handles(
@@ -5279,6 +5288,7 @@ fn append_traversal_context_projection_rows(
                 &mut seen_target_nodes,
                 &mut target_node_handles,
             );
+            fallback_target_handles.push(node.handle.clone());
         } else {
             for edge in edges_by_from
                 .get(node.handle.as_str())
@@ -5289,6 +5299,7 @@ fn append_traversal_context_projection_rows(
                 let Some(backlog) = node_by_handle.get(edge.to.as_str()) else {
                     continue;
                 };
+                fallback_target_handles.push(backlog.handle.clone());
                 push_traversal_backlog_target_handles(
                     backlog,
                     &edges_by_from,
@@ -5301,6 +5312,15 @@ fn append_traversal_context_projection_rows(
                     break;
                 }
             }
+            if fallback_target_handles.is_empty() {
+                continue;
+            }
+        }
+        let code_context = !target_node_handles.is_empty();
+        if target_node_handles.is_empty() {
+            target_node_handles = dedupe_preserve_order(fallback_target_handles);
+        } else if code_context_count >= code_context_limit {
+            continue;
         }
 
         let mut worker_source_handles = Vec::new();
@@ -5370,7 +5390,9 @@ fn append_traversal_context_projection_rows(
                     .with_provenance(provenance.clone());
             edges.push(edge_with_content_freshness(scope_edge)?);
         }
-        worker_count += 1;
+        if code_context {
+            code_context_count += 1;
+        }
     }
 
     Ok(())
@@ -7750,6 +7772,41 @@ fn print_graph_db_operator_report(
     }
 }
 
+fn status_run_command_without_notes(run: &str) -> &str {
+    run.split_once("  (")
+        .map(|(command, _)| command)
+        .unwrap_or(run)
+}
+
+fn graph_db_operator_status_warnings(root: &Path, scope: Option<&str>) -> Vec<String> {
+    let report = match status::check_status(root) {
+        Ok(report) => report,
+        Err(err) => {
+            return vec![format!(
+                "status check unavailable after graph-db refresh: {err:#}"
+            )];
+        }
+    };
+
+    let mut warnings = report.reminders;
+    if matches!(report.summaries, status::SummaryStatus::None { .. }) {
+        let run = report
+            .recommendations
+            .run
+            .as_deref()
+            .filter(|command| command.contains("summarize --extract"))
+            .map(status_run_command_without_notes)
+            .unwrap_or("tsift summarize --extract .");
+        warnings.push(format!(
+            "summary cache empty: graph-db refresh materialized code/session rows but semantic rows are unavailable; run `{}` from {} and rerun `{}` before relying on semantic evidence",
+            run,
+            root.display(),
+            graph_db_refresh_command(root, scope)
+        ));
+    }
+    dedupe_preserve_order(warnings)
+}
+
 fn cmd_graph_db_status(root: &Path, scope: Option<&str>, format: OutputFormat) -> Result<()> {
     let graph_db = graph_substrate_db_path(root, scope);
     let report =
@@ -7765,6 +7822,9 @@ fn cmd_graph_db_refresh(
 ) -> Result<()> {
     let (graph, refresh) = refresh_traversal_graph_store(root, path, scope)?;
     let graph_db = graph_substrate_db_path(root, scope);
+    let mut warnings = graph.warnings;
+    warnings.extend(graph_db_operator_status_warnings(root, scope));
+    let warnings = dedupe_preserve_order(warnings);
     let refresh = GraphDbRefreshSummary {
         scope: refresh.scope,
         projection_version: refresh.projection_version,
@@ -7778,7 +7838,7 @@ fn cmd_graph_db_refresh(
         &graph_db,
         "refresh",
         Some(refresh),
-        graph.warnings,
+        warnings,
     )?;
     print_graph_db_operator_report(&report, format)
 }
@@ -8461,7 +8521,7 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
         limit,
         store,
         freshness,
-        warnings,
+        mut warnings,
     } = input;
     let repair_commands = graph_db_repair_commands(root, scope);
     if freshness.fail_closed {
@@ -8528,6 +8588,16 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
         .iter()
         .map(|(node, _)| node.clone())
         .collect::<Vec<_>>();
+    if worker_context.is_empty()
+        && source_handles.is_empty()
+        && worker_results.is_empty()
+        && semantic_related.is_empty()
+    {
+        warnings.push(format!(
+            "graph-db evidence target {} resolved to a {} node but has no projection-linked context rows; add source/file tokens to the backlog text or rerun graph-db refresh after the session document is indexed",
+            target, target_node.kind
+        ));
+    }
     let shortest_paths = worker_paths
         .iter()
         .chain(source_paths.iter())
@@ -12878,6 +12948,14 @@ struct ConflictMatrixContextSummary {
     status_reminders: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct ConflictMatrixPerTargetFailClosed {
+    target: String,
+    risk_reasons: Vec<String>,
+    owned_files: Vec<String>,
+    source_handle_count: usize,
+}
+
 #[derive(Serialize)]
 struct ConflictMatrixOrchestrationObservability {
     contract_version: &'static str,
@@ -12898,6 +12976,8 @@ struct ConflictMatrixReport {
     targets: Vec<String>,
     can_parallel: bool,
     fail_closed: bool,
+    cross_target_parallel_safe: bool,
+    per_target_fail_closed: Vec<ConflictMatrixPerTargetFailClosed>,
     inputs: ConflictMatrixInputSummary,
     context_pack: ConflictMatrixContextSummary,
     cached_diff: diff_digest::DiffDigestReport,
@@ -13613,6 +13693,21 @@ fn build_conflict_matrix_pairs(candidates: &[ConflictMatrixCandidate]) -> Vec<Co
     pairs
 }
 
+fn conflict_matrix_per_target_fail_closed(
+    candidates: &[ConflictMatrixCandidate],
+) -> Vec<ConflictMatrixPerTargetFailClosed> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.risk == ConflictMatrixRisk::FailClosed)
+        .map(|candidate| ConflictMatrixPerTargetFailClosed {
+            target: candidate.target.clone(),
+            risk_reasons: candidate.risk_reasons.clone(),
+            owned_files: candidate.owned_files.clone(),
+            source_handle_count: candidate.source_handles.len(),
+        })
+        .collect()
+}
+
 fn markdown_list(values: &[String]) -> String {
     if values.is_empty() {
         return "- none".to_string();
@@ -13945,18 +14040,28 @@ fn conflict_matrix_next_commands(
 fn print_conflict_matrix_human(report: &ConflictMatrixReport, compact: bool) {
     if compact {
         println!(
-            "conflict-matrix targets:{} candidates:{} conflicts:{} can_parallel:{} fail_closed:{}",
+            "conflict-matrix targets:{} candidates:{} conflicts:{} can_parallel:{} fail_closed:{} cross_safe:{} per_target_fail_closed:{}",
             report.targets.len(),
             report.candidates.len(),
             report.conflicts.len(),
             report.can_parallel,
-            report.fail_closed
+            report.fail_closed,
+            report.cross_target_parallel_safe,
+            report.per_target_fail_closed.len()
         );
     } else {
         println!("Conflict matrix");
         println!("  targets:      {}", report.targets.join(", "));
         println!("  can parallel: {}", report.can_parallel);
         println!("  fail closed:  {}", report.fail_closed);
+        println!(
+            "  cross target parallel safe: {}",
+            report.cross_target_parallel_safe
+        );
+        println!(
+            "  per target fail closed: {}",
+            report.per_target_fail_closed.len()
+        );
     }
     for candidate in &report.candidates {
         println!(
@@ -14015,6 +14120,21 @@ fn print_conflict_matrix_human(report: &ConflictMatrixReport, compact: bool) {
     }
     for warning in &report.warnings {
         println!("warning: {warning}");
+    }
+    if !report.per_target_fail_closed.is_empty() {
+        println!(
+            "per-target fail closed: {} target(s)",
+            report.per_target_fail_closed.len()
+        );
+        for target in &report.per_target_fail_closed {
+            println!(
+                "  {} source_handles:{} owned_files:{} reasons:{}",
+                target.target,
+                target.source_handle_count,
+                target.owned_files.len(),
+                target.risk_reasons.join("; ")
+            );
+        }
     }
 }
 
@@ -14139,16 +14259,15 @@ fn build_conflict_matrix_report(
     apply_conflict_matrix_ownership_blocks(&mut candidates);
     let worker_prompt_packets = conflict_matrix_worker_prompt_packets(&candidates);
 
-    let fail_closed = candidates
+    let per_target_fail_closed = conflict_matrix_per_target_fail_closed(&candidates);
+    let cross_target_parallel_safe = conflicts
         .iter()
-        .any(|candidate| candidate.risk == ConflictMatrixRisk::FailClosed)
+        .all(|pair| pair.risk <= ConflictMatrixRisk::Medium);
+    let fail_closed = !per_target_fail_closed.is_empty()
         || conflicts
             .iter()
             .any(|pair| pair.risk == ConflictMatrixRisk::FailClosed);
-    let can_parallel = !fail_closed
-        && conflicts
-            .iter()
-            .all(|pair| pair.risk <= ConflictMatrixRisk::Medium);
+    let can_parallel = !fail_closed && cross_target_parallel_safe;
     let next_commands =
         conflict_matrix_next_commands(&root, path, scope, &targets, depth, limit, impact_limit);
     let orchestration = conflict_matrix_orchestration_observability(
@@ -14185,6 +14304,8 @@ fn build_conflict_matrix_report(
         targets,
         can_parallel,
         fail_closed,
+        cross_target_parallel_safe,
+        per_target_fail_closed,
         inputs,
         context_pack: context_summary,
         cached_diff,
@@ -14217,10 +14338,12 @@ fn cmd_conflict_matrix(
             "parallel-planning",
             ToolEnvelopeSummary {
                 text: format!(
-                    "Conflict matrix for {} target(s): can_parallel={} fail_closed={}",
+                    "Conflict matrix for {} target(s): can_parallel={} fail_closed={} cross_target_parallel_safe={} per_target_fail_closed={}",
                     report.targets.len(),
                     report.can_parallel,
-                    report.fail_closed
+                    report.fail_closed,
+                    report.cross_target_parallel_safe,
+                    report.per_target_fail_closed.len()
                 ),
                 metrics: vec![
                     envelope_metric("targets", report.targets.len()),
@@ -14228,6 +14351,14 @@ fn cmd_conflict_matrix(
                     envelope_metric("conflicts", report.conflicts.len()),
                     envelope_metric("can_parallel", report.can_parallel),
                     envelope_metric("fail_closed", report.fail_closed),
+                    envelope_metric(
+                        "cross_target_parallel_safe",
+                        report.cross_target_parallel_safe,
+                    ),
+                    envelope_metric(
+                        "per_target_fail_closed",
+                        report.per_target_fail_closed.len(),
+                    ),
                 ],
             },
             report.fail_closed,

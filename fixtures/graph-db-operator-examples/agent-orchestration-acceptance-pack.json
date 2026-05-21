@@ -147,6 +147,8 @@
       ],
       "can_parallel": false,
       "fail_closed": true,
+      "cross_target_parallel_safe": false,
+      "per_target_fail_closed": [],
       "candidate_summaries": [
         {
           "rank": 1,
