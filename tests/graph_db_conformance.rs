@@ -490,9 +490,18 @@ fn conflict_candidate_summaries(report: &Value) -> Vec<Value> {
                 "target": candidate["target"],
                 "risk": candidate["risk"],
                 "previously_completed": candidate["previously_completed"],
+                "parallel_safe": candidate["parallel_safe"],
+                "blocks": candidate["blocks"],
+                "blocked_by": candidate["blocked_by"],
                 "owned_files": candidate["owned_files"],
                 "owned_symbols": candidate["owned_symbols"],
                 "affected_tests": candidate["affected_tests"],
+                "required_context_source_handles": candidate["required_context"]["source_handles"],
+                "graph_handle_prefixes": {
+                    "target_node": candidate["graph_handles"]["target_node_id"].as_str().unwrap_or("").split(':').next().unwrap_or(""),
+                    "evidence_packet": candidate["graph_handles"]["evidence_packet_id"].as_str().unwrap_or("").split('-').next().unwrap_or(""),
+                    "worker_prompt_packet": candidate["graph_handles"]["worker_prompt_packet_id"].as_str().unwrap_or("").split('-').next().unwrap_or(""),
+                },
                 "worker_feedback": worker_feedback_summary(&candidate["worker_feedback"]),
                 "read_only_context_has_worker_feedback": read_only_context
                     .iter()
@@ -517,6 +526,9 @@ fn worker_prompt_packet_summaries(report: &Value) -> Vec<Value> {
                 "rank": packet["rank"],
                 "risk": packet["risk"],
                 "previously_completed": packet["previously_completed"],
+                "parallel_safe": packet["parallel_safe"],
+                "blocks": packet["blocks"],
+                "blocked_by": packet["blocked_by"],
                 "packet_id_prefix": packet["packet_id"]
                     .as_str()
                     .unwrap()
@@ -524,6 +536,12 @@ fn worker_prompt_packet_summaries(report: &Value) -> Vec<Value> {
                     .next()
                     .unwrap(),
                 "owned_files": packet["owned_files"],
+                "required_context_source_handles": packet["required_context"]["source_handles"],
+                "graph_handle_prefixes": {
+                    "target_node": packet["graph_handles"]["target_node_id"].as_str().unwrap_or("").split(':').next().unwrap_or(""),
+                    "evidence_packet": packet["graph_handles"]["evidence_packet_id"].as_str().unwrap_or("").split('-').next().unwrap_or(""),
+                    "worker_prompt_packet": packet["graph_handles"]["worker_prompt_packet_id"].as_str().unwrap_or("").split('-').next().unwrap_or(""),
+                },
                 "worker_feedback": worker_feedback_summary(&packet["worker_feedback"]),
             })
         })
@@ -614,6 +632,23 @@ fn regenerate_agent_orchestration_acceptance_samples(project: &Path, session: &P
         "--json".to_string(),
         "wfdb".to_string(),
         "wfok".to_string(),
+    ]);
+    let dependency_dag = assert_tsift_json(vec![
+        "dependency-dag".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "wfdb".to_string(),
+        "shrd".to_string(),
+        "wfok".to_string(),
+    ]);
+    let dependency_dag_cycle = assert_tsift_json(vec![
+        "dependency-dag".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "gval".to_string(),
+        "solo".to_string(),
     ]);
     let trace = assert_tsift_json(vec![
         "dispatch-trace".to_string(),
@@ -751,6 +786,36 @@ fn regenerate_agent_orchestration_acceptance_samples(project: &Path, session: &P
             "evidence_packet_count": conflict["orchestration"]["evidence_packet_ids"].as_array().unwrap().len(),
             "projection_hash_count": conflict["orchestration"]["projection_hashes"].as_array().unwrap().len(),
         },
+        "dependency_dag": {
+            "contract_version": dependency_dag["contract_version"],
+            "targets": dependency_dag["targets"],
+            "projection_freshness_status": dependency_dag["projection_freshness"]["status"],
+            "projection_hash_count": dependency_dag["projection_hashes"].as_array().unwrap().len(),
+            "has_worker_result_follow_up": dependency_dag["edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|edge| edge["kind"] == "worker_result_follow_up"),
+            "has_topo_batches": !dependency_dag["topo_batches"].as_array().unwrap().is_empty(),
+            "has_cycles": dependency_dag["cycle_diagnostics"]["has_cycles"],
+            "blocked_nodes": dependency_dag["cycle_diagnostics"]["blocked_nodes"],
+            "replay_mentions_dependency_dag": commands_contain(&dependency_dag["replay_commands"], "dependency-dag"),
+            "repair_mentions_refresh": commands_contain(&dependency_dag["repair_commands"], "refresh"),
+            "repair_mentions_doctor": commands_contain(&dependency_dag["repair_commands"], "doctor"),
+        },
+        "dependency_dag_cycle": {
+            "contract_version": dependency_dag_cycle["contract_version"],
+            "targets": dependency_dag_cycle["targets"],
+            "projection_freshness_status": dependency_dag_cycle["projection_freshness"]["status"],
+            "has_cycles": dependency_dag_cycle["cycle_diagnostics"]["has_cycles"],
+            "blocked_nodes": dependency_dag_cycle["cycle_diagnostics"]["blocked_nodes"],
+            "cycle_edge_kinds": dependency_dag_cycle["cycle_diagnostics"]["cycle_edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|edge| edge["kind"].clone())
+                .collect::<Vec<_>>(),
+        },
         "dispatch_trace_json": {
             "contract_version": trace["contract_version"],
             "targets": trace["targets"],
@@ -767,6 +832,7 @@ fn regenerate_agent_orchestration_acceptance_samples(project: &Path, session: &P
             "contains_graph_canvas": html.contains("id=\"graph-canvas\""),
             "contains_contract_version": html.contains("dispatch-trace-v1"),
             "contains_worker_prompt_packets": html.contains("worker_prompt_packets"),
+            "contains_parallel_safe": html.contains("parallel_safe"),
             "contains_follow_up_debt": html.contains("Follow-up debt"),
             "contains_closure": html.contains("closure"),
             "contains_evidence_packet": html.contains(evidence["packet_id"].as_str().unwrap()),
@@ -1587,6 +1653,19 @@ fn conflict_matrix_multi_worker_fixture_blocks_shared_files_and_emits_prompt_pac
 
     let packets = report["worker_prompt_packets"].as_array().unwrap();
     assert_eq!(packets.len(), 3, "{report}");
+    assert!(
+        packets.iter().any(|packet| {
+            packet["blocks"].as_array().unwrap().is_empty()
+                != packet["blocked_by"].as_array().unwrap().is_empty()
+        }),
+        "shared file conflicts should emit explicit scheduler block edges: {report}"
+    );
+    assert!(
+        packets
+            .iter()
+            .any(|packet| packet["parallel_safe"] == false),
+        "unsafe shared ownership should mark affected packets not parallel_safe: {report}"
+    );
     let solo_packet = packets
         .iter()
         .find(|packet| packet["target"] == "solo")
@@ -1607,6 +1686,32 @@ fn conflict_matrix_multi_worker_fixture_blocks_shared_files_and_emits_prompt_pac
             .as_str()
             .unwrap()
             .contains("Expansion commands"),
+        "{report}"
+    );
+    assert!(
+        solo_packet["required_context"]["source_handles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|handle| !handle.as_str().unwrap().is_empty()),
+        "{report}"
+    );
+    assert!(
+        solo_packet["graph_handles"]["target_node_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("gbak-"),
+        "{report}"
+    );
+    assert!(
+        solo_packet["graph_handles"]["evidence_packet_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("gevd-"),
+        "{report}"
+    );
+    assert_eq!(
+        solo_packet["graph_handles"]["worker_prompt_packet_id"], solo_packet["packet_id"],
         "{report}"
     );
     assert!(
@@ -1917,6 +2022,17 @@ fn graph_orchestration_contract_fixture_matches_live_reports() {
         "shrd".to_string(),
     ]);
     assert_contract_fields(&fixture, "dependency_dag", &dependency_dag);
+    assert_eq!(
+        dependency_dag["projection_freshness"]["status"], "current",
+        "{dependency_dag}"
+    );
+    assert!(
+        !dependency_dag["projection_hashes"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{dependency_dag}"
+    );
     assert!(
         dependency_dag["edges"]
             .as_array()
@@ -1928,6 +2044,27 @@ fn graph_orchestration_contract_fixture_matches_live_reports() {
     assert!(
         dependency_dag["topo_batches"].is_array(),
         "{dependency_dag}"
+    );
+
+    let cyclic_dependency_dag = assert_tsift_json(vec![
+        "dependency-dag".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "gval".to_string(),
+        "solo".to_string(),
+    ]);
+    assert_eq!(
+        cyclic_dependency_dag["cycle_diagnostics"]["has_cycles"], true,
+        "{cyclic_dependency_dag}"
+    );
+    assert!(
+        cyclic_dependency_dag["cycle_diagnostics"]["cycle_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["kind"] == "worker_result_follow_up"),
+        "{cyclic_dependency_dag}"
     );
 }
 
@@ -1969,6 +2106,14 @@ fn agent_orchestration_acceptance_pack_fixture_matches_queue_contract_terms() {
                 .as_str()
                 .unwrap()
                 .contains("graph-db --path . doctor")),
+        "{fixture}"
+    );
+    assert!(
+        fixture["command_sequence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("dependency-dag")),
         "{fixture}"
     );
     assert!(
@@ -2036,11 +2181,35 @@ fn agent_orchestration_acceptance_pack_fixture_matches_queue_contract_terms() {
         "{fixture}"
     );
     assert!(
+        fixture["expected_contracts"]["contract_versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|version| version == "dependency-dag-v1"),
+        "{fixture}"
+    );
+    assert_eq!(
+        fixture["expected_contracts"]["scheduler_fields"]["parallel_safe"],
+        "per packet/candidate boolean; false when serial block edges or fail-closed ownership are present",
+        "{fixture}"
+    );
+    assert!(
         fixture["required_trace_links"]
             .as_array()
             .unwrap()
             .iter()
             .any(|link| link.as_str().unwrap().contains("replay_commands")),
+        "{fixture}"
+    );
+    assert!(
+        fixture["required_trace_links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|link| link
+                .as_str()
+                .unwrap()
+                .contains("dependency_dag.topo_batches")),
         "{fixture}"
     );
     assert!(
@@ -2102,6 +2271,21 @@ fn dispatch_trace_cli_exports_json_and_html_operator_views() {
             .any(|feedback| feedback["repeated_blockage"] == true),
         "{report}"
     );
+    assert!(
+        report["worker_prompt_packets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|packet| {
+                packet["required_context"]["source_handles"].is_array()
+                    && packet["graph_handles"]["evidence_packet_id"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("gevd-")
+                    && packet["graph_handles"]["worker_prompt_packet_id"] == packet["packet_id"]
+            }),
+        "{report}"
+    );
 
     let output = run_tsift(vec![
         "dispatch-trace".to_string(),
@@ -2120,6 +2304,7 @@ fn dispatch_trace_cli_exports_json_and_html_operator_views() {
     let html = String::from_utf8_lossy(&output.stdout);
     assert!(html.contains("id=\"graph-canvas\""), "{html}");
     assert!(html.contains("worker_prompt_packets"), "{html}");
+    assert!(html.contains("parallel_safe"), "{html}");
     assert!(html.contains("dispatch-trace-v1"), "{html}");
 }
 

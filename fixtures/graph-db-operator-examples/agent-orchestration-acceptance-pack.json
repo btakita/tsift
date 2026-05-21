@@ -8,6 +8,7 @@
     "tsift graph-db --path . doctor --json",
     "tsift graph-db --path . evidence wfdb --depth 3 --limit 8 --json",
     "tsift conflict-matrix --path tasks/software/tsift.md wfdb wfok --json",
+    "tsift dependency-dag --path tasks/software/tsift.md wfdb shrd wfok --json",
     "tsift dispatch-trace --path tasks/software/tsift.md wfdb wfok --json",
     "tsift dispatch-trace --path tasks/software/tsift.md wfdb --format html",
     "tsift graph-db --path . --backend convex-snapshot --convex-snapshot fixtures/graph-db-operator-examples/stale-convex-snapshot.json drift --json",
@@ -91,8 +92,16 @@
       "conflict-matrix-v1",
       "context-pack-graph-orchestration-v1",
       "session-review-follow-up-v1",
-      "dispatch-trace-v1"
+      "dispatch-trace-v1",
+      "dependency-dag-v1"
     ],
+    "scheduler_fields": {
+      "parallel_safe": "per packet/candidate boolean; false when serial block edges or fail-closed ownership are present",
+      "blocks": "target ids that must run after this packet because of unsafe overlap or worker-result follow-up debt",
+      "blocked_by": "target ids that must complete before this packet joins a topological antichain",
+      "required_context": "structured source_handle, worker_context, semantic, read-only file, and expansion-command handles",
+      "graph_handles": "stable target node, evidence packet, worker prompt packet, projection, source-handle, worker-context, and semantic-handle ids"
+    },
     "worker_feedback": {
       "closure_rank_score": "positive for wfdb and zero for wfok",
       "stale_expected_tests": [
@@ -115,6 +124,7 @@
     "backlog/job_packet -> source_handle",
     "dispatch_trace.evidence_packet_ids -> conflict_matrix.orchestration.evidence_packet_ids",
     "dispatch_trace.replay_commands -> conflict_matrix.next_commands",
+    "dependency_dag.topo_batches -> scheduler antichains",
     "dispatch_trace.repair_commands -> graph-db refresh/doctor"
   ],
   "regenerated_samples": {
@@ -227,6 +237,12 @@
           "target": "wfdb",
           "risk": "low",
           "previously_completed": false,
+          "parallel_safe": false,
+          "blocks": [
+            "shrd",
+            "wfok"
+          ],
+          "blocked_by": [],
           "owned_files": [
             "clean.rs",
             "closure.rs",
@@ -241,6 +257,16 @@
             "isolated_leaf"
           ],
           "affected_tests": [],
+          "required_context_source_handles": [
+            "xwin-af46af9803",
+            "xwin-ef94c56dbe",
+            "xwin-f553214abe"
+          ],
+          "graph_handle_prefixes": {
+            "target_node": "gbak-78ee4c1e3c",
+            "evidence_packet": "gevd",
+            "worker_prompt_packet": "wpp"
+          },
           "worker_feedback": {
             "completed": 0,
             "blocked": 1,
@@ -265,6 +291,11 @@
           "target": "wfok",
           "risk": "low",
           "previously_completed": true,
+          "parallel_safe": false,
+          "blocks": [],
+          "blocked_by": [
+            "wfdb"
+          ],
           "owned_files": [
             "clean.rs",
             "closure.rs",
@@ -279,6 +310,16 @@
             "isolated_leaf"
           ],
           "affected_tests": [],
+          "required_context_source_handles": [
+            "xwin-af46af9803",
+            "xwin-ef94c56dbe",
+            "xwin-f553214abe"
+          ],
+          "graph_handle_prefixes": {
+            "target_node": "gbak-9d1434e9c2",
+            "evidence_packet": "gevd",
+            "worker_prompt_packet": "wpp"
+          },
           "worker_feedback": {
             "completed": 1,
             "blocked": 0,
@@ -299,12 +340,28 @@
           "rank": 1,
           "risk": "low",
           "previously_completed": false,
+          "parallel_safe": false,
+          "blocks": [
+            "shrd",
+            "wfok"
+          ],
+          "blocked_by": [],
           "packet_id_prefix": "wpp",
           "owned_files": [
             "clean.rs",
             "closure.rs",
             "isolated.rs"
           ],
+          "required_context_source_handles": [
+            "xwin-af46af9803",
+            "xwin-ef94c56dbe",
+            "xwin-f553214abe"
+          ],
+          "graph_handle_prefixes": {
+            "target_node": "gbak-78ee4c1e3c",
+            "evidence_packet": "gevd",
+            "worker_prompt_packet": "wpp"
+          },
           "worker_feedback": {
             "completed": 0,
             "blocked": 1,
@@ -328,12 +385,27 @@
           "rank": 2,
           "risk": "low",
           "previously_completed": true,
+          "parallel_safe": false,
+          "blocks": [],
+          "blocked_by": [
+            "wfdb"
+          ],
           "packet_id_prefix": "wpp",
           "owned_files": [
             "clean.rs",
             "closure.rs",
             "isolated.rs"
           ],
+          "required_context_source_handles": [
+            "xwin-af46af9803",
+            "xwin-ef94c56dbe",
+            "xwin-f553214abe"
+          ],
+          "graph_handle_prefixes": {
+            "target_node": "gbak-9d1434e9c2",
+            "evidence_packet": "gevd",
+            "worker_prompt_packet": "wpp"
+          },
           "worker_feedback": {
             "completed": 1,
             "blocked": 0,
@@ -347,6 +419,41 @@
       ],
       "evidence_packet_count": 2,
       "projection_hash_count": 1
+    },
+    "dependency_dag": {
+      "contract_version": "dependency-dag-v1",
+      "targets": [
+        "shrd",
+        "wfdb",
+        "wfok"
+      ],
+      "projection_freshness_status": "current",
+      "projection_hash_count": 1,
+      "has_worker_result_follow_up": true,
+      "has_topo_batches": true,
+      "has_cycles": false,
+      "blocked_nodes": [],
+      "replay_mentions_dependency_dag": true,
+      "repair_mentions_refresh": true,
+      "repair_mentions_doctor": true
+    },
+    "dependency_dag_cycle": {
+      "contract_version": "dependency-dag-v1",
+      "targets": [
+        "gval",
+        "solo"
+      ],
+      "projection_freshness_status": "current",
+      "has_cycles": true,
+      "blocked_nodes": [
+        "gval",
+        "solo"
+      ],
+      "cycle_edge_kinds": [
+        "shared_resource",
+        "worker_result_follow_up",
+        "worker_result_follow_up"
+      ]
     },
     "dispatch_trace_json": {
       "contract_version": "dispatch-trace-v1",
@@ -363,12 +470,28 @@
           "rank": 1,
           "risk": "low",
           "previously_completed": false,
+          "parallel_safe": false,
+          "blocks": [
+            "shrd",
+            "wfok"
+          ],
+          "blocked_by": [],
           "packet_id_prefix": "wpp",
           "owned_files": [
             "clean.rs",
             "closure.rs",
             "isolated.rs"
           ],
+          "required_context_source_handles": [
+            "xwin-af46af9803",
+            "xwin-ef94c56dbe",
+            "xwin-f553214abe"
+          ],
+          "graph_handle_prefixes": {
+            "target_node": "gbak-78ee4c1e3c",
+            "evidence_packet": "gevd",
+            "worker_prompt_packet": "wpp"
+          },
           "worker_feedback": {
             "completed": 0,
             "blocked": 1,
@@ -392,12 +515,27 @@
           "rank": 2,
           "risk": "low",
           "previously_completed": true,
+          "parallel_safe": false,
+          "blocks": [],
+          "blocked_by": [
+            "wfdb"
+          ],
           "packet_id_prefix": "wpp",
           "owned_files": [
             "clean.rs",
             "closure.rs",
             "isolated.rs"
           ],
+          "required_context_source_handles": [
+            "xwin-af46af9803",
+            "xwin-ef94c56dbe",
+            "xwin-f553214abe"
+          ],
+          "graph_handle_prefixes": {
+            "target_node": "gbak-9d1434e9c2",
+            "evidence_packet": "gevd",
+            "worker_prompt_packet": "wpp"
+          },
           "worker_feedback": {
             "completed": 1,
             "blocked": 0,
@@ -454,6 +592,7 @@
       "contains_graph_canvas": true,
       "contains_contract_version": true,
       "contains_worker_prompt_packets": true,
+      "contains_parallel_safe": true,
       "contains_follow_up_debt": true,
       "contains_closure": true,
       "contains_evidence_packet": true

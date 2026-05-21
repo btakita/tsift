@@ -8169,12 +8169,12 @@ fn graph_db_schema() -> GraphDbSchema {
             GraphDbSchemaContract {
                 name: "worker_prompt_packet",
                 version: WORKER_PROMPT_PACKET_CONTRACT_VERSION,
-                description: "conflict-matrix worker prompt packet with owned scope, read-only context, forbidden files, expected tests, expansion commands, token budget, semantic ranking reasons, worker feedback closure controls, and fail-closed prompt text",
+                description: "conflict-matrix worker prompt packet with owned scope, scheduler fields, stable graph handles, expected tests, expansion commands, token budget, semantic ranking reasons, worker feedback closure controls, and fail-closed prompt text",
             },
             GraphDbSchemaContract {
                 name: "conflict_matrix",
                 version: CONFLICT_MATRIX_CONTRACT_VERSION,
-                description: "parallel-dispatch decision report keyed by graph evidence packets, hard file/symbol/test/config gates, and soft worker-feedback closure ranking",
+                description: "parallel-dispatch decision report keyed by graph evidence packets, scheduler block fields, hard file/symbol/test/config gates, and soft worker-feedback closure ranking",
             },
             GraphDbSchemaContract {
                 name: "context_pack_graph_orchestration",
@@ -8189,7 +8189,12 @@ fn graph_db_schema() -> GraphDbSchema {
             GraphDbSchemaContract {
                 name: "dispatch_trace",
                 version: DISPATCH_TRACE_CONTRACT_VERSION,
-                description: "operator review trace linking backlog, job packets, worker results, source handles, semantic rows, evidence packet ids, worker feedback closure controls, and worker prompt packets",
+                description: "operator review trace linking backlog, job packets, worker results, source handles, semantic rows, scheduler fields, evidence packet ids, worker feedback closure controls, and worker prompt packets",
+            },
+            GraphDbSchemaContract {
+                name: "dependency_dag",
+                version: DEPENDENCY_DAG_CONTRACT_VERSION,
+                description: "topological planning DAG for agent-doc backlog targets with replayable dependency edges, topo batches, and cycle diagnostics",
             },
         ],
         node_fields: vec![
@@ -13027,6 +13032,27 @@ struct ConflictMatrixTokenBudget {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+struct ConflictMatrixRequiredContext {
+    read_only_files: Vec<String>,
+    source_handles: Vec<String>,
+    worker_context_handles: Vec<String>,
+    semantic_handles: Vec<String>,
+    expansion_commands: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct ConflictMatrixGraphHandles {
+    target_node_id: String,
+    evidence_packet_id: String,
+    worker_prompt_packet_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projection_hash: Option<String>,
+    source_handles: Vec<String>,
+    worker_context_handles: Vec<String>,
+    semantic_handles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 struct ConflictMatrixWorkerFeedback {
     total: usize,
     completed: usize,
@@ -13067,6 +13093,11 @@ struct ConflictMatrixWorkerPromptPacket {
     rank: usize,
     risk: ConflictMatrixRisk,
     previously_completed: bool,
+    parallel_safe: bool,
+    blocks: Vec<String>,
+    blocked_by: Vec<String>,
+    required_context: ConflictMatrixRequiredContext,
+    graph_handles: ConflictMatrixGraphHandles,
     #[serde(skip_serializing_if = "Option::is_none")]
     projection_hash: Option<String>,
     title: String,
@@ -13095,6 +13126,11 @@ struct ConflictMatrixCandidate {
     target_label: String,
     risk: ConflictMatrixRisk,
     previously_completed: bool,
+    parallel_safe: bool,
+    blocks: Vec<String>,
+    blocked_by: Vec<String>,
+    required_context: ConflictMatrixRequiredContext,
+    graph_handles: ConflictMatrixGraphHandles,
     risk_score: usize,
     risk_reasons: Vec<String>,
     owned_files: Vec<String>,
@@ -13107,6 +13143,7 @@ struct ConflictMatrixCandidate {
     semantic_dispatch_reasons: Vec<String>,
     worker_feedback: ConflictMatrixWorkerFeedback,
     source_handles: Vec<ConflictMatrixSourceHandle>,
+    worker_context_handles: Vec<String>,
     staged_overlap: ConflictMatrixOverlap,
     ownership: ConflictMatrixOwnershipBlock,
 }
@@ -13784,6 +13821,16 @@ fn conflict_matrix_candidate_from_evidence(
                 .unwrap_or_else(|| node.label.clone())
         })
         .collect::<Vec<_>>();
+    let worker_context_handles = evidence
+        .worker_context
+        .iter()
+        .map(|node| {
+            node.properties
+                .get("handle")
+                .cloned()
+                .unwrap_or_else(|| node.id.clone())
+        })
+        .collect::<Vec<_>>();
     let semantic_related = evidence
         .semantic_related
         .iter()
@@ -13802,6 +13849,11 @@ fn conflict_matrix_candidate_from_evidence(
         target_label: evidence.target_node.label.clone(),
         risk,
         previously_completed,
+        parallel_safe: false,
+        blocks: Vec::new(),
+        blocked_by: Vec::new(),
+        required_context: ConflictMatrixRequiredContext::default(),
+        graph_handles: ConflictMatrixGraphHandles::default(),
         risk_score,
         risk_reasons,
         owned_files: sorted_set(&files),
@@ -13814,6 +13866,7 @@ fn conflict_matrix_candidate_from_evidence(
         semantic_dispatch_reasons,
         worker_feedback,
         source_handles,
+        worker_context_handles,
         staged_overlap,
         ownership: empty_conflict_matrix_ownership(&evidence.target),
     }
@@ -13977,6 +14030,61 @@ fn conflict_matrix_token_budget(
     }
 }
 
+fn conflict_matrix_worker_prompt_packet_id(candidate: &ConflictMatrixCandidate) -> String {
+    stable_handle(
+        "wpp",
+        &format!(
+            "{}:{}:{}:{}",
+            WORKER_PROMPT_PACKET_CONTRACT_VERSION,
+            candidate.target,
+            candidate.target_node_id,
+            candidate.projection_hash.as_deref().unwrap_or("no-hash")
+        ),
+    )
+}
+
+fn conflict_matrix_required_context(
+    candidate: &ConflictMatrixCandidate,
+) -> ConflictMatrixRequiredContext {
+    ConflictMatrixRequiredContext {
+        read_only_files: candidate.ownership.read_only_files.clone(),
+        source_handles: candidate
+            .source_handles
+            .iter()
+            .map(|handle| handle.handle.clone())
+            .collect(),
+        worker_context_handles: candidate.worker_context_handles.clone(),
+        semantic_handles: candidate
+            .semantic_related
+            .iter()
+            .map(|semantic| semantic.handle.clone())
+            .collect(),
+        expansion_commands: candidate.ownership.expansion_commands.clone(),
+    }
+}
+
+fn conflict_matrix_graph_handles(
+    candidate: &ConflictMatrixCandidate,
+) -> ConflictMatrixGraphHandles {
+    ConflictMatrixGraphHandles {
+        target_node_id: candidate.target_node_id.clone(),
+        evidence_packet_id: candidate.evidence_packet_id.clone(),
+        worker_prompt_packet_id: conflict_matrix_worker_prompt_packet_id(candidate),
+        projection_hash: candidate.projection_hash.clone(),
+        source_handles: candidate
+            .source_handles
+            .iter()
+            .map(|handle| handle.handle.clone())
+            .collect(),
+        worker_context_handles: candidate.worker_context_handles.clone(),
+        semantic_handles: candidate
+            .semantic_related
+            .iter()
+            .map(|semantic| semantic.handle.clone())
+            .collect(),
+    }
+}
+
 fn apply_conflict_matrix_ownership_blocks(candidates: &mut [ConflictMatrixCandidate]) {
     let all_files_by_target = candidates
         .iter()
@@ -14097,6 +14205,85 @@ fn apply_conflict_matrix_ownership_blocks(candidates: &mut [ConflictMatrixCandid
     }
 }
 
+fn conflict_matrix_pair_requires_serial(pair: &ConflictMatrixPair) -> bool {
+    matches!(
+        pair.risk,
+        ConflictMatrixRisk::High | ConflictMatrixRisk::FailClosed
+    )
+}
+
+fn apply_conflict_matrix_scheduler_fields(
+    candidates: &mut [ConflictMatrixCandidate],
+    conflicts: &[ConflictMatrixPair],
+) {
+    let rank_by_target = candidates
+        .iter()
+        .map(|candidate| (candidate.target.clone(), candidate.rank))
+        .collect::<BTreeMap<_, _>>();
+    let mut blocks = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut blocked_by = BTreeMap::<String, BTreeSet<String>>::new();
+
+    for pair in conflicts {
+        if !conflict_matrix_pair_requires_serial(pair) {
+            continue;
+        }
+        let left_rank = rank_by_target
+            .get(&pair.left)
+            .copied()
+            .unwrap_or(usize::MAX);
+        let right_rank = rank_by_target
+            .get(&pair.right)
+            .copied()
+            .unwrap_or(usize::MAX);
+        let (blocker, blocked) = if left_rank <= right_rank {
+            (&pair.left, &pair.right)
+        } else {
+            (&pair.right, &pair.left)
+        };
+        blocks
+            .entry(blocker.clone())
+            .or_default()
+            .insert(blocked.clone());
+        blocked_by
+            .entry(blocked.clone())
+            .or_default()
+            .insert(blocker.clone());
+    }
+
+    for candidate in candidates.iter() {
+        for follow_up in &candidate.worker_feedback.follow_up_debt {
+            blocks
+                .entry(candidate.target.clone())
+                .or_default()
+                .insert(follow_up.clone());
+            if rank_by_target.contains_key(follow_up) {
+                blocked_by
+                    .entry(follow_up.clone())
+                    .or_default()
+                    .insert(candidate.target.clone());
+            }
+        }
+    }
+
+    for candidate in candidates.iter_mut() {
+        let candidate_blocks: Vec<String> = blocks
+            .remove(&candidate.target)
+            .map(|values| values.into_iter().collect())
+            .unwrap_or_default();
+        let candidate_blocked_by: Vec<String> = blocked_by
+            .remove(&candidate.target)
+            .map(|values| values.into_iter().collect())
+            .unwrap_or_default();
+        let has_serial_edges = !candidate_blocks.is_empty() || !candidate_blocked_by.is_empty();
+        candidate.parallel_safe =
+            candidate.risk != ConflictMatrixRisk::FailClosed && !has_serial_edges;
+        candidate.blocks = candidate_blocks;
+        candidate.blocked_by = candidate_blocked_by;
+        candidate.required_context = conflict_matrix_required_context(candidate);
+        candidate.graph_handles = conflict_matrix_graph_handles(candidate);
+    }
+}
+
 fn conflict_matrix_worker_prompt_packets(
     candidates: &[ConflictMatrixCandidate],
 ) -> Vec<ConflictMatrixWorkerPromptPacket> {
@@ -14104,20 +14291,16 @@ fn conflict_matrix_worker_prompt_packets(
         .iter()
         .map(|candidate| ConflictMatrixWorkerPromptPacket {
             contract_version: WORKER_PROMPT_PACKET_CONTRACT_VERSION,
-            packet_id: stable_handle(
-                "wpp",
-                &format!(
-                    "{}:{}:{}:{}",
-                    WORKER_PROMPT_PACKET_CONTRACT_VERSION,
-                    candidate.target,
-                    candidate.target_node_id,
-                    candidate.projection_hash.as_deref().unwrap_or("no-hash")
-                ),
-            ),
+            packet_id: conflict_matrix_worker_prompt_packet_id(candidate),
             target: candidate.target.clone(),
             rank: candidate.rank,
             risk: candidate.risk,
             previously_completed: candidate.previously_completed,
+            parallel_safe: candidate.parallel_safe,
+            blocks: candidate.blocks.clone(),
+            blocked_by: candidate.blocked_by.clone(),
+            required_context: candidate.required_context.clone(),
+            graph_handles: candidate.graph_handles.clone(),
             projection_hash: candidate.projection_hash.clone(),
             title: candidate.ownership.title.clone(),
             owned_files: candidate.ownership.owned_files.clone(),
@@ -14482,6 +14665,7 @@ fn build_conflict_matrix_report(
     }));
     let conflicts = build_conflict_matrix_pairs(&candidates);
     apply_conflict_matrix_ownership_blocks(&mut candidates);
+    apply_conflict_matrix_scheduler_fields(&mut candidates, &conflicts);
     let worker_prompt_packets = conflict_matrix_worker_prompt_packets(&candidates);
 
     let per_target_fail_closed = conflict_matrix_per_target_fail_closed(&candidates);
@@ -14705,6 +14889,9 @@ fn dispatch_trace_collect_ids(
         ids.insert(candidate.target_node_id.clone());
         for source in &candidate.source_handles {
             ids.insert(source.handle.clone());
+        }
+        for handle in &candidate.worker_context_handles {
+            ids.insert(handle.clone());
         }
         for semantic in &candidate.semantic_related {
             ids.insert(semantic.handle.clone());
@@ -14931,7 +15118,7 @@ function draw(){
     svg.appendChild(label);
   }
 }
-packets.innerHTML = report.worker_prompt_packets.map(packet => `<div class="row"><div class="kind">${escapeHtml(packet.contract_version)} - ${escapeHtml(packet.risk)} - closure ${packet.worker_feedback ? packet.worker_feedback.closure_rank_score : 0}</div><div class="label">${escapeHtml(packet.title)}</div><div class="handle">${escapeHtml(packet.packet_id)}</div></div>`).join("") || "<div class=\"meta\">No packets.</div>";
+packets.innerHTML = report.worker_prompt_packets.map(packet => `<div class="row"><div class="kind">${escapeHtml(packet.contract_version)} - ${escapeHtml(packet.risk)} - parallel_safe ${packet.parallel_safe ? "true" : "false"} - closure ${packet.worker_feedback ? packet.worker_feedback.closure_rank_score : 0}</div><div class="label">${escapeHtml(packet.title)}</div><div class="handle">${escapeHtml(packet.packet_id)}</div><div class="handle">blocks ${escapeHtml((packet.blocks||[]).join(", ") || "none")} | blocked_by ${escapeHtml((packet.blocked_by||[]).join(", ") || "none")}</div></div>`).join("") || "<div class=\"meta\">No packets.</div>";
 feedback.innerHTML = report.worker_feedback.map(item => `<div class="row"><div class="kind">completed ${item.completed} - blocked ${item.blocked} - closure ${item.closure_rank_score}</div><div>files ${escapeHtml((item.touched_files||[]).join(", ") || "none")}</div><div>tests ${escapeHtml((item.expected_tests||[]).join(" && ") || "none")}</div>${item.repeated_blockage ? "<div class=\"label\">Repeated blockage</div>" : ""}${(item.stale_expected_tests||[]).length ? `<div class="label">Stale tests: ${escapeHtml(item.stale_expected_tests.join(", "))}</div>` : ""}${(item.follow_up_debt||[]).length ? `<div class="label">Follow-up debt: ${escapeHtml(item.follow_up_debt.join(", "))}</div>` : ""}</div>`).join("") || "<div class=\"meta\">No worker results.</div>";
 nodeList.innerHTML = nodes.map(node => `<div class="row"><div class="kind">${escapeHtml(node.kind)}</div><div class="label">${escapeHtml(node.label)}</div><div class="handle">${escapeHtml(node.id)}</div></div>`).join("");
 window.addEventListener("resize", () => { layout(); draw(); });
