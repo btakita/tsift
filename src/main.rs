@@ -6095,7 +6095,7 @@ fn build_convex_sync_report_with_snapshot(
         bail!("--chunk-size must be greater than zero");
     }
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    let graph = build_traversal_graph(&root, path, scope)?;
+    let (graph, _refresh) = write_traversal_graph_store(&root, path, scope)?;
     let graph_db = graph_substrate_db_path(&root, scope);
     let store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
     let local = convex_rows_from_graph_store(&store)?;
@@ -8145,7 +8145,7 @@ fn cmd_graph_db_refresh(
     scope: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
-    let (graph, refresh) = refresh_traversal_graph_store(root, path, scope)?;
+    let (graph, refresh) = write_traversal_graph_store(root, path, scope)?;
     let graph_db = graph_substrate_db_path(root, scope);
     let mut warnings = graph.warnings;
     warnings.extend(graph_db_operator_status_warnings(root, scope));
@@ -8248,7 +8248,7 @@ fn cmd_graph_db_drift(
 ) -> Result<()> {
     let snapshot_path =
         convex_snapshot.context("graph-db drift requires --convex-snapshot <rows.json>")?;
-    let graph = build_traversal_graph(root, path, scope)?;
+    let (graph, _refresh) = write_traversal_graph_store(root, path, scope)?;
     let graph_db = graph_substrate_db_path(root, scope);
     let store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
     let local = convex_rows_from_graph_store(&store)?;
@@ -9891,7 +9891,7 @@ fn cmd_graph_db_backend_eval(
     let impact_limit = 20;
 
     let refresh_started = Instant::now();
-    let (graph, _refresh) = refresh_traversal_graph_store(&root, path, scope)
+    let (graph, _refresh) = write_traversal_graph_store(&root, path, scope)
         .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
     let refresh_micros = refresh_started.elapsed().as_micros();
     let prepared = prepare_conflict_matrix_inputs(&root, path, scope, impact_limit)?;
@@ -10117,11 +10117,11 @@ fn cmd_graph_db(
         };
         if needs_refresh {
             let (graph, _refresh) =
-                refresh_traversal_graph_store_with_options(&root, path, scope, true)?;
+                write_traversal_graph_store_with_options(&root, path, scope, true)?;
             warnings = graph.warnings;
         }
     } else {
-        let (graph, _refresh) = refresh_traversal_graph_store(&root, path, scope)?;
+        let (graph, _refresh) = write_traversal_graph_store(&root, path, scope)?;
         warnings = graph.warnings;
     }
     let report = match backend {
@@ -11195,7 +11195,7 @@ fn build_traversal_graph_source(
     build_traversal_graph_source_with_options(root, path_hint, scope, false)
 }
 
-fn refresh_traversal_graph_store_with_options(
+fn write_traversal_graph_store_with_options(
     root: &Path,
     path_hint: &Path,
     scope: Option<&str>,
@@ -11212,6 +11212,27 @@ fn refresh_traversal_graph_store_with_options(
         Some(GRAPH_PROJECTION_VERSION),
         graph_projection_content_hash(&projection),
     )?;
+    Ok((source_graph, refresh))
+}
+
+fn write_traversal_graph_store(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+) -> Result<(TraversalGraphBuild, SqliteProjectionRefresh)> {
+    write_traversal_graph_store_with_options(root, path_hint, scope, false)
+}
+
+fn refresh_traversal_graph_store_with_options(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+    session_only: bool,
+) -> Result<(TraversalGraphBuild, SqliteProjectionRefresh)> {
+    let (source_graph, refresh) =
+        write_traversal_graph_store_with_options(root, path_hint, scope, session_only)?;
+    let graph_db = graph_substrate_db_path(root, scope);
+    let store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
     let mut graph = traversal_graph_from_store(root, &store)?;
     graph.warnings = source_graph.warnings;
     Ok((graph, refresh))
@@ -12036,7 +12057,7 @@ fn cmd_semantic_related(
     schema: bool,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    refresh_traversal_graph_store(&root, path, scope)?;
+    write_traversal_graph_store(&root, path, scope)?;
     let graph_db = graph_substrate_db_path(&root, scope);
     let store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
     let mut report = semantic_related_report_from_store(&root, scope, query, limit, kind, &store)?;
@@ -15985,7 +16006,7 @@ fn build_conflict_matrix_report(
     impact_limit: usize,
 ) -> Result<ConflictMatrixReport> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    build_traversal_graph(&root, path, scope)
+    write_traversal_graph_store(&root, path, scope)
         .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
     let graph_db = graph_substrate_db_path(&root, scope);
     let store = SqliteGraphStore::open_read_only_resilient(&graph_db)
@@ -17190,7 +17211,7 @@ fn build_dependency_dag_report(
     limit: usize,
 ) -> Result<DependencyDagReport> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    build_traversal_graph(&root, path, scope)
+    write_traversal_graph_store(&root, path, scope)
         .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
     let graph_db = graph_substrate_db_path(&root, scope);
     let store = SqliteGraphStore::open_read_only_resilient(&graph_db)

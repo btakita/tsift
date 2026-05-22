@@ -889,39 +889,43 @@ impl SqliteGraphStore {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM graph_edges", [])?;
         tx.execute("DELETE FROM graph_nodes", [])?;
-        for node in &projection.nodes {
-            tx.execute(
+        {
+            let mut insert_node = tx.prepare(
                 r#"
                 INSERT INTO graph_nodes
                     (id, kind, label, properties_json, provenance_json, freshness_json)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 "#,
-                (
+            )?;
+            for node in &projection.nodes {
+                insert_node.execute((
                     &node.id,
                     &node.kind,
                     &node.label,
                     to_json(&node.properties)?,
                     to_json(&node.provenance)?,
                     optional_to_json(&node.freshness)?,
-                ),
-            )?;
+                ))?;
+            }
         }
-        for edge in &projection.edges {
-            tx.execute(
+        {
+            let mut insert_edge = tx.prepare(
                 r#"
                 INSERT INTO graph_edges
                     (from_id, to_id, kind, properties_json, provenance_json, freshness_json)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 "#,
-                (
+            )?;
+            for edge in &projection.edges {
+                insert_edge.execute((
                     &edge.from_id,
                     &edge.to_id,
                     &edge.kind,
                     to_json(&edge.properties)?,
                     to_json(&edge.provenance)?,
                     optional_to_json(&edge.freshness)?,
-                ),
-            )?;
+                ))?;
+            }
         }
         tx.execute(
             r#"
@@ -942,8 +946,8 @@ impl SqliteGraphStore {
                 observed_at_unix,
             ),
         )?;
-        for id in &tombstoned_nodes {
-            tx.execute(
+        {
+            let mut insert_node_tombstone = tx.prepare(
                 r#"
                 INSERT INTO graph_tombstones (row_key, row_kind, deleted_at_unix)
                 VALUES (?1, 'node', ?2)
@@ -951,11 +955,13 @@ impl SqliteGraphStore {
                     row_kind = excluded.row_kind,
                     deleted_at_unix = excluded.deleted_at_unix
                 "#,
-                (format!("node:{id}"), observed_at_unix),
             )?;
+            for id in &tombstoned_nodes {
+                insert_node_tombstone.execute((format!("node:{id}"), observed_at_unix))?;
+            }
         }
-        for key in &tombstoned_edges {
-            tx.execute(
+        {
+            let mut insert_edge_tombstone = tx.prepare(
                 r#"
                 INSERT INTO graph_tombstones (row_key, row_kind, deleted_at_unix)
                 VALUES (?1, 'edge', ?2)
@@ -963,8 +969,10 @@ impl SqliteGraphStore {
                     row_kind = excluded.row_kind,
                     deleted_at_unix = excluded.deleted_at_unix
                 "#,
-                (format!("edge:{key}"), observed_at_unix),
             )?;
+            for key in &tombstoned_edges {
+                insert_edge_tombstone.execute((format!("edge:{key}"), observed_at_unix))?;
+            }
         }
         tx.commit()?;
         Ok(SqliteProjectionRefresh {
@@ -1655,5 +1663,80 @@ mod tests {
         let version = store.projection_version("root").unwrap().unwrap();
         assert_eq!(version.projection_version, "fixture-v2");
         assert_eq!(version.source_watermark.as_deref(), Some("commit-b"));
+    }
+
+    #[test]
+    fn sqlite_projection_refresh_handles_bulk_row_replacement() {
+        let mut store = SqliteGraphStore::in_memory().unwrap();
+        let source = GraphProvenance::new("fixture", "bulk");
+        let mut projection = GraphProjection::default();
+        for idx in 0..128 {
+            projection.nodes.push(
+                GraphNode::new(
+                    format!("node:{idx:03}"),
+                    if idx % 2 == 0 { "symbol" } else { "file" },
+                    format!("bulk node {idx:03}"),
+                )
+                .with_property("ordinal", idx.to_string())
+                .with_provenance(source.clone())
+                .with_freshness(GraphFreshness::content_hash(format!("node-hash-{idx:03}"))),
+            );
+        }
+        for idx in 0..127 {
+            projection.edges.push(
+                GraphEdge::new(
+                    format!("node:{idx:03}"),
+                    format!("node:{:03}", idx + 1),
+                    "next",
+                )
+                .with_property("ordinal", idx.to_string())
+                .with_provenance(source.clone())
+                .with_freshness(GraphFreshness::content_hash(format!("edge-hash-{idx:03}"))),
+            );
+        }
+
+        store
+            .replace_projection_with_version(
+                "root",
+                &projection,
+                Some("bulk-v1"),
+                Some("commit-a".to_string()),
+            )
+            .unwrap();
+
+        projection
+            .nodes
+            .retain(|node| !node.id.ends_with("000") && !node.id.ends_with("064"));
+        projection.edges.retain(|edge| {
+            !edge.from_id.ends_with("000")
+                && !edge.to_id.ends_with("000")
+                && !edge.from_id.ends_with("064")
+                && !edge.to_id.ends_with("064")
+        });
+        let refresh = store
+            .replace_projection_with_version(
+                "root",
+                &projection,
+                Some("bulk-v2"),
+                Some("commit-b".to_string()),
+            )
+            .unwrap();
+
+        assert_eq!(store.all_nodes().unwrap().len(), 126);
+        assert_eq!(store.all_edges().unwrap().len(), 124);
+        assert_eq!(
+            refresh.tombstoned_nodes,
+            vec!["node:000".to_string(), "node:064".to_string()]
+        );
+        assert_eq!(refresh.tombstoned_edges.len(), 3);
+        assert_eq!(
+            store
+                .projection_version("root")
+                .unwrap()
+                .unwrap()
+                .source_watermark
+                .as_deref(),
+            Some("commit-b")
+        );
     }
 }
