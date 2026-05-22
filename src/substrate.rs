@@ -1012,6 +1012,9 @@ pub struct SqliteProjectionRefresh {
     pub upserted_edges: usize,
     pub unchanged_nodes: usize,
     pub unchanged_edges: usize,
+    pub upserted_properties: usize,
+    pub unchanged_properties: usize,
+    pub deleted_properties: usize,
     pub deleted_nodes: usize,
     pub deleted_edges: usize,
     pub pruned_tombstones: usize,
@@ -1324,6 +1327,17 @@ impl SqliteGraphStore {
             [],
             |row| row.get(0),
         )?;
+        let unchanged_properties: usize = tx.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM next_graph_node_properties n
+            JOIN graph_node_properties g
+                ON g.node_id = n.node_id AND g.key = n.key
+            WHERE g.value = n.value
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
 
         let deleted_edges = tx.execute(
             r#"
@@ -1386,17 +1400,27 @@ impl SqliteGraphStore {
             "#,
             [],
         )?;
-        tx.execute(
+        let deleted_properties = tx.execute(
             r#"
             DELETE FROM graph_node_properties
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM next_graph_node_properties n
+                WHERE n.node_id = graph_node_properties.node_id
+                  AND n.key = graph_node_properties.key
+            )
             "#,
             [],
         )?;
-        tx.execute(
+        let upserted_properties = tx.execute(
             r#"
             INSERT INTO graph_node_properties (node_id, key, value)
             SELECT node_id, key, value
             FROM next_graph_node_properties
+            WHERE true
+            ON CONFLICT(node_id, key) DO UPDATE SET
+                value = excluded.value
+            WHERE graph_node_properties.value IS NOT excluded.value
             "#,
             [],
         )?;
@@ -1481,6 +1505,9 @@ impl SqliteGraphStore {
             upserted_edges: projection.edges.len().saturating_sub(unchanged_edges),
             unchanged_nodes,
             unchanged_edges,
+            upserted_properties,
+            unchanged_properties,
+            deleted_properties,
             deleted_nodes,
             deleted_edges,
             pruned_tombstones: pruned_node_tombstones + pruned_edge_tombstones,
@@ -2695,6 +2722,9 @@ mod tests {
         assert_eq!(refresh.deleted_edges, 1);
         assert_eq!(refresh.unchanged_nodes, 3);
         assert_eq!(refresh.upserted_nodes, 0);
+        assert_eq!(refresh.unchanged_properties, 3);
+        assert_eq!(refresh.upserted_properties, 0);
+        assert_eq!(refresh.deleted_properties, 0);
         let version = store.projection_version("root").unwrap().unwrap();
         assert_eq!(version.projection_version, "fixture-v2");
         assert_eq!(version.source_watermark.as_deref(), Some("commit-b"));
@@ -2911,6 +2941,8 @@ mod tests {
         assert_eq!(refresh.unchanged_edges, 124);
         assert_eq!(refresh.upserted_nodes, 0);
         assert_eq!(refresh.upserted_edges, 0);
+        assert_eq!(refresh.unchanged_properties, 126);
+        assert_eq!(refresh.upserted_properties, 0);
         assert_eq!(
             store
                 .projection_version("root")

@@ -59,7 +59,9 @@ mutations, and HTTP action for `tsift convex-sync --apply` live under
 `.tsift/graph.db` explicitly, `tsift graph-db status` to inspect projection
 version/hash/watermark and tombstone counts without refreshing, and
 `tsift graph-db compact` to inspect or apply the guarded post-reconciliation
-WAL checkpoint/VACUUM policy before pruning tombstones. Use
+WAL checkpoint/VACUUM policy before pruning tombstones. Refresh reports include
+node, edge, and materialized-property delta counts so unchanged property rows do
+not hide write amplification. Use
 `tsift graph-db evidence <backlog-id-or-job-handle>` for bounded
 worker-context/source-handle/semantic handoff packets. Use `tsift
 conflict-matrix` to rank candidate worker scopes, flag shared
@@ -75,10 +77,12 @@ worker-result follow-up edges, topological batches, and cycle diagnostics before
 running DAG-shaped dispatch. Those orchestration surfaces include stable
 contract versions, evidence packet ids, projection hashes, replay commands, and
 repair commands so agent-doc can consume them as JSON rather than parsing prose.
-Use `tsift
-graph-db doctor` to
-validate local `graph.db` and Convex snapshot metadata before trusting operator
-handoffs. `tsift traverse --format html` renders the selected GraphStore slice as
+Use `tsift graph-db backend-eval` to compare SQLite against experimental
+read-only candidates with adaptive path probes, per-operation promotion gates,
+and a `performance_gate`/`metric-digest` command for bounded regression review.
+Use `tsift graph-db doctor` to validate local `graph.db` and Convex snapshot
+metadata before trusting operator handoffs. `tsift traverse --format html`
+renders the selected GraphStore slice as
 an offline SVG graph, and `tsift semantic` queries cached summary concepts and
 entities from the same persisted graph rows without calling an API. The
 operator acceptance pack under `fixtures/graph-db-operator-examples` is

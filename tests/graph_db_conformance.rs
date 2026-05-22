@@ -1334,6 +1334,18 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         );
     }
     assert_eq!(report["config"]["path_max_hops"], 64, "{report}");
+    assert_eq!(report["config"]["path_direct_hop_budget"], 1, "{report}");
+    assert_eq!(
+        report["config"]["path_deep_chain_hop_budget"], 64,
+        "{report}"
+    );
+    assert!(
+        report["config"]["path_probe_strategy"]
+            .as_str()
+            .unwrap()
+            .contains("adaptive"),
+        "{report}"
+    );
     let datasets = report["datasets"].as_array().unwrap();
     assert_eq!(datasets.len(), 3, "{report}");
     assert!(
@@ -1391,6 +1403,34 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         }
     }
     assert_eq!(report["promotion"].as_array().unwrap().len(), 3, "{report}");
+    assert!(
+        report["promotion"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|decision| {
+                decision["decision"] == "eligible" || decision["decision"] == "hold"
+            }),
+        "{report}"
+    );
+    assert_eq!(
+        report["performance_gate"]["baseline_fixture"],
+        "fixtures/graph-db-performance-history.json",
+        "{report}"
+    );
+    assert_eq!(
+        report["performance_gate"]["allowed_regression_percent"],
+        json!(10.0),
+        "{report}"
+    );
+    assert!(
+        report["performance_gate"]["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|metric| metric == "real.refresh_phase.sqlite_delta_write.duration_micros"),
+        "{report}"
+    );
     assert!(
         report["metrics"]
             .as_object()

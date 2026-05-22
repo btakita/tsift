@@ -6451,6 +6451,8 @@ struct ExperimentalReadOnlyGraphStore {
     backend: GraphDbExperimentalBackend,
     nodes: BTreeMap<String, SubstrateGraphNode>,
     edges: BTreeMap<String, SubstrateGraphEdge>,
+    node_ids_by_kind: BTreeMap<String, Vec<String>>,
+    outgoing_edges_by_from: BTreeMap<String, Vec<SubstrateGraphEdge>>,
 }
 
 impl ExperimentalReadOnlyGraphStore {
@@ -6463,7 +6465,7 @@ impl ExperimentalReadOnlyGraphStore {
                 let node = SubstrateGraphNode::from(row);
                 (node.id.clone(), node)
             })
-            .collect();
+            .collect::<BTreeMap<_, _>>();
         let edges = rows
             .edges
             .into_iter()
@@ -6471,11 +6473,37 @@ impl ExperimentalReadOnlyGraphStore {
                 let edge = SubstrateGraphEdge::from(row);
                 (graph_db_edge_key(&edge), edge)
             })
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+        let mut node_ids_by_kind = BTreeMap::<String, Vec<String>>::new();
+        for node in nodes.values() {
+            node_ids_by_kind
+                .entry(node.kind.clone())
+                .or_default()
+                .push(node.id.clone());
+        }
+        for ids in node_ids_by_kind.values_mut() {
+            ids.sort();
+        }
+        let mut outgoing_edges_by_from = BTreeMap::<String, Vec<SubstrateGraphEdge>>::new();
+        for edge in edges.values() {
+            outgoing_edges_by_from
+                .entry(edge.from_id.clone())
+                .or_default()
+                .push(edge.clone());
+        }
+        for edges in outgoing_edges_by_from.values_mut() {
+            edges.sort_by(|left, right| {
+                left.to_id
+                    .cmp(&right.to_id)
+                    .then(left.kind.cmp(&right.kind))
+            });
+        }
         Ok(Self {
             backend,
             nodes,
             edges,
+            node_ids_by_kind,
+            outgoing_edges_by_from,
         })
     }
 }
@@ -6511,27 +6539,23 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
 
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<SubstrateGraphNode>> {
         Ok(self
-            .nodes
-            .values()
-            .filter(|node| node.kind == kind)
-            .cloned()
+            .node_ids_by_kind
+            .get(kind)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.nodes.get(id).cloned())
             .collect())
     }
 
     fn outgoing_edges(&self, from_id: &str, kind: Option<&str>) -> Result<Vec<SubstrateGraphEdge>> {
-        let mut edges = self
-            .edges
-            .values()
-            .filter(|edge| edge.from_id == from_id)
+        Ok(self
+            .outgoing_edges_by_from
+            .get(from_id)
+            .into_iter()
+            .flatten()
             .filter(|edge| kind.is_none_or(|kind| edge.kind == kind))
             .cloned()
-            .collect::<Vec<_>>();
-        edges.sort_by(|left, right| {
-            left.to_id
-                .cmp(&right.to_id)
-                .then(left.kind.cmp(&right.kind))
-        });
-        Ok(edges)
+            .collect())
     }
 
     fn shortest_path(
@@ -6580,9 +6604,81 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
 
         Ok(None)
     }
+
+    fn reachable_nodes_by_kinds(
+        &self,
+        from_id: &str,
+        kinds: &[&str],
+        depth: usize,
+        limit: usize,
+    ) -> Result<BTreeMap<String, Vec<(SubstrateGraphNode, substrate::GraphPath)>>> {
+        let requested = kinds.iter().copied().collect::<BTreeSet<_>>();
+        let mut rows = requested
+            .iter()
+            .map(|kind| {
+                (
+                    (*kind).to_string(),
+                    BTreeMap::<String, (SubstrateGraphNode, substrate::GraphPath)>::new(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if requested.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let mut seen = BTreeSet::from([from_id.to_string()]);
+        let mut queue = VecDeque::from([(from_id.to_string(), vec![from_id.to_string()])]);
+        while let Some((current, path)) = queue.pop_front() {
+            let current_depth = path.len().saturating_sub(1);
+            if current_depth >= depth {
+                continue;
+            }
+            for edge in self.outgoing_edges(&current, None)? {
+                if !seen.insert(edge.to_id.clone()) {
+                    continue;
+                }
+                let Some(node) = self.nodes.get(&edge.to_id).cloned() else {
+                    continue;
+                };
+                let mut next_path = path.clone();
+                next_path.push(edge.to_id.clone());
+                let graph_path = substrate::GraphPath {
+                    hops: next_path.len().saturating_sub(1),
+                    nodes: next_path.clone(),
+                };
+                if requested.contains(node.kind.as_str()) {
+                    rows.entry(node.kind.clone())
+                        .or_default()
+                        .entry(node.id.clone())
+                        .or_insert((node.clone(), graph_path));
+                }
+                queue.push_back((edge.to_id, next_path));
+            }
+        }
+
+        Ok(rows
+            .into_iter()
+            .map(|(kind, values)| {
+                let mut values = values.into_values().collect::<Vec<_>>();
+                values.sort_by(|(left_node, left_path), (right_node, right_path)| {
+                    left_path
+                        .hops
+                        .cmp(&right_path.hops)
+                        .then(left_node.label.cmp(&right_node.label))
+                        .then(left_node.id.cmp(&right_node.id))
+                });
+                if limit > 0 && values.len() > limit {
+                    values.truncate(limit);
+                }
+                (kind, values)
+            })
+            .collect())
+    }
 }
 
 const GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS: usize = 64;
+const GRAPH_DB_BACKEND_EVAL_DIRECT_PATH_HOPS: usize = 1;
+const GRAPH_DB_BACKEND_EVAL_ALLOWED_REGRESSION_PERCENT: f64 = 10.0;
 
 #[derive(Clone, Serialize)]
 struct GraphDbBackendEvalPhaseTiming {
@@ -6601,6 +6697,9 @@ struct GraphDbBackendEvalConfig {
     limit: usize,
     impact_limit: usize,
     path_max_hops: usize,
+    path_direct_hop_budget: usize,
+    path_deep_chain_hop_budget: usize,
+    path_probe_strategy: String,
 }
 
 #[derive(Clone)]
@@ -6656,6 +6755,16 @@ struct GraphDbBackendPromotionDecision {
 }
 
 #[derive(Serialize)]
+struct GraphDbBackendEvalPerformanceGate {
+    baseline_fixture: String,
+    ci_profile: String,
+    opt_in_real_profile: String,
+    allowed_regression_percent: f64,
+    required_metrics: Vec<String>,
+    digest_command: String,
+}
+
+#[derive(Serialize)]
 struct GraphDbBackendEvalReport {
     root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6668,6 +6777,7 @@ struct GraphDbBackendEvalReport {
     phase_timings: Vec<GraphDbBackendEvalPhaseTiming>,
     datasets: Vec<GraphDbBackendEvalDataset>,
     promotion: Vec<GraphDbBackendPromotionDecision>,
+    performance_gate: GraphDbBackendEvalPerformanceGate,
     metrics: BTreeMap<String, f64>,
     metric_digest_command: String,
     warnings: Vec<String>,
@@ -6782,6 +6892,9 @@ struct GraphDbRefreshSummary {
     upserted_edges: usize,
     unchanged_nodes: usize,
     unchanged_edges: usize,
+    upserted_properties: usize,
+    unchanged_properties: usize,
+    deleted_properties: usize,
     deleted_nodes: usize,
     deleted_edges: usize,
     pruned_tombstones: usize,
@@ -8335,11 +8448,14 @@ fn print_graph_db_operator_human(report: &GraphDbOperatorReport) {
             refresh.tombstoned_nodes, refresh.tombstoned_edges
         );
         println!(
-            "delta: {} node upsert(s), {} edge upsert(s), {} unchanged node(s), {} unchanged edge(s), {} pruned tombstone(s)",
+            "delta: {} node upsert(s), {} edge upsert(s), {} property row upsert(s), {} unchanged node(s), {} unchanged edge(s), {} unchanged property row(s), {} deleted property row(s), {} pruned tombstone(s)",
             refresh.upserted_nodes,
             refresh.upserted_edges,
+            refresh.upserted_properties,
             refresh.unchanged_nodes,
             refresh.unchanged_edges,
+            refresh.unchanged_properties,
+            refresh.deleted_properties,
             refresh.pruned_tombstones
         );
     }
@@ -8466,6 +8582,9 @@ fn cmd_graph_db_refresh(
         upserted_edges: refresh.upserted_edges,
         unchanged_nodes: refresh.unchanged_nodes,
         unchanged_edges: refresh.unchanged_edges,
+        upserted_properties: refresh.upserted_properties,
+        unchanged_properties: refresh.unchanged_properties,
+        deleted_properties: refresh.deleted_properties,
         deleted_nodes: refresh.deleted_nodes,
         deleted_edges: refresh.deleted_edges,
         pruned_tombstones: refresh.pruned_tombstones,
@@ -9781,7 +9900,11 @@ fn graph_db_backend_eval_path_targets(
         if outgoing.len() > 1
             && let Some(edge) = outgoing.first()
         {
-            return Ok(Some((edge.from_id.clone(), edge.to_id.clone(), 1)));
+            return Ok(Some((
+                edge.from_id.clone(),
+                edge.to_id.clone(),
+                GRAPH_DB_BACKEND_EVAL_DIRECT_PATH_HOPS,
+            )));
         }
         return Ok(Some((synthetic_from.to_string(), synthetic_to, max_hops)));
     }
@@ -9796,7 +9919,13 @@ fn graph_db_backend_eval_path_targets(
     Ok(edges
         .into_iter()
         .find(|edge| edge.from_id != edge.to_id)
-        .map(|edge| (edge.from_id, edge.to_id, 1)))
+        .map(|edge| {
+            (
+                edge.from_id,
+                edge.to_id,
+                GRAPH_DB_BACKEND_EVAL_DIRECT_PATH_HOPS,
+            )
+        }))
 }
 
 fn graph_db_backend_eval_evidence_signature(report: &GraphDbEvidenceReport) -> serde_json::Value {
@@ -10148,12 +10277,20 @@ fn graph_db_backend_eval_promotion(
         let mut faster_everywhere = true;
         let mut parity_everywhere = true;
         for dataset in datasets {
-            let sqlite_total = dataset
+            let Some(sqlite_report) = dataset
                 .backends
                 .iter()
                 .find(|backend| backend.backend == "sqlite")
-                .map(|backend| backend.total_micros)
-                .unwrap_or(u128::MAX);
+            else {
+                parity_everywhere = false;
+                faster_everywhere = false;
+                reasons.push(format!(
+                    "{} dataset is missing SQLite baseline",
+                    dataset.name
+                ));
+                continue;
+            };
+            let sqlite_total = sqlite_report.total_micros;
             let Some(candidate_report) = dataset
                 .backends
                 .iter()
@@ -10174,6 +10311,22 @@ fn graph_db_backend_eval_promotion(
                     dataset.name, candidate_report.total_micros, sqlite_total
                 ));
             }
+            let sqlite_operations = sqlite_report
+                .operations
+                .iter()
+                .map(|operation| (operation.name.as_str(), operation.duration_micros))
+                .collect::<BTreeMap<_, _>>();
+            for operation in &candidate_report.operations {
+                if let Some(sqlite_duration) = sqlite_operations.get(operation.name.as_str())
+                    && operation.duration_micros >= *sqlite_duration
+                {
+                    faster_everywhere = false;
+                    reasons.push(format!(
+                        "{} {} operation {}us did not beat SQLite {}us",
+                        dataset.name, operation.name, operation.duration_micros, sqlite_duration
+                    ));
+                }
+            }
             if candidate_report
                 .operations
                 .iter()
@@ -10191,7 +10344,7 @@ fn graph_db_backend_eval_promotion(
             "eligible"
         } else {
             reasons.push(
-                "production promotion requires SQLite parity plus lower total time on every dataset without worse lock behavior or install portability"
+                "production promotion requires SQLite parity plus lower total time for every measured operation on every dataset without worse lock behavior or install portability"
                     .to_string(),
             );
             "hold"
@@ -10248,6 +10401,31 @@ fn graph_db_backend_eval_metric_digest_command(root: &Path, scope: Option<&str>)
         shell_quote(root.to_string_lossy().as_ref()),
         graph_db_scope_arg(scope)
     )
+}
+
+fn graph_db_backend_eval_performance_gate(
+    root: &Path,
+    scope: Option<&str>,
+) -> GraphDbBackendEvalPerformanceGate {
+    GraphDbBackendEvalPerformanceGate {
+        baseline_fixture: "fixtures/graph-db-performance-history.json".to_string(),
+        ci_profile: "synthetic_high_degree + synthetic_deep_chain metrics are CI-safe and bounded"
+            .to_string(),
+        opt_in_real_profile:
+            "real projection metrics require an up-to-date local graph.db and remain opt-in"
+                .to_string(),
+        allowed_regression_percent: GRAPH_DB_BACKEND_EVAL_ALLOWED_REGRESSION_PERCENT,
+        required_metrics: vec![
+            "real.sqlite.refresh.duration_micros".to_string(),
+            "real.refresh_phase.sqlite_delta_write.duration_micros".to_string(),
+            "real.sqlite.conflict_matrix.duration_micros".to_string(),
+            "real.sqlite.dispatch_trace.duration_micros".to_string(),
+            "real.sqlite.path_max_hops.duration_micros".to_string(),
+            "synthetic_high_degree.sqlite.total_duration_micros".to_string(),
+            "synthetic_deep_chain.sqlite.path_max_hops.duration_micros".to_string(),
+        ],
+        digest_command: graph_db_backend_eval_metric_digest_command(root, scope),
+    }
 }
 
 struct GraphDbBackendEvalOptions<'a> {
@@ -10535,10 +10713,16 @@ fn cmd_graph_db_backend_eval(
             limit,
             impact_limit,
             path_max_hops: GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS,
+            path_direct_hop_budget: GRAPH_DB_BACKEND_EVAL_DIRECT_PATH_HOPS,
+            path_deep_chain_hop_budget: GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS,
+            path_probe_strategy:
+                "adaptive: use one-hop direct probes for high-degree/direct edges and 64-hop probes for deep-chain coverage"
+                    .to_string(),
         },
         phase_timings,
         datasets,
         promotion,
+        performance_gate: graph_db_backend_eval_performance_gate(&root, scope),
         metrics,
         metric_digest_command: graph_db_backend_eval_metric_digest_command(&root, scope),
         warnings: Vec::new(),
@@ -15162,8 +15346,32 @@ fn conflict_matrix_semantic_ref(
     }
 }
 
+struct ConflictMatrixGraphIndex {
+    symbols_by_file: BTreeMap<String, Vec<String>>,
+}
+
+fn conflict_matrix_graph_index(graph_nodes: &[SubstrateGraphNode]) -> ConflictMatrixGraphIndex {
+    let mut symbols_by_file = BTreeMap::<String, Vec<String>>::new();
+    for node in graph_nodes {
+        if node.kind != "symbol" {
+            continue;
+        }
+        if let Some(path) = node.properties.get("path") {
+            symbols_by_file
+                .entry(path.clone())
+                .or_default()
+                .push(node.label.clone());
+        }
+    }
+    for symbols in symbols_by_file.values_mut() {
+        symbols.sort();
+        symbols.dedup();
+    }
+    ConflictMatrixGraphIndex { symbols_by_file }
+}
+
 fn conflict_matrix_symbols_for_files(
-    graph_nodes: &[SubstrateGraphNode],
+    graph_index: &ConflictMatrixGraphIndex,
     files: &BTreeSet<String>,
     target_node: &SubstrateGraphNode,
 ) -> BTreeSet<String> {
@@ -15171,14 +15379,9 @@ fn conflict_matrix_symbols_for_files(
     if target_node.kind == "symbol" {
         symbols.insert(target_node.label.clone());
     }
-    for node in graph_nodes {
-        if node.kind != "symbol" {
-            continue;
-        }
-        if let Some(path) = node.properties.get("path")
-            && files.contains(path)
-        {
-            symbols.insert(node.label.clone());
+    for file in files {
+        if let Some(file_symbols) = graph_index.symbols_by_file.get(file) {
+            symbols.extend(file_symbols.iter().cloned());
         }
     }
     symbols
@@ -15477,7 +15680,7 @@ fn empty_conflict_matrix_ownership(target: &str) -> ConflictMatrixOwnershipBlock
 fn conflict_matrix_candidate_from_evidence(
     root: &Path,
     evidence: &GraphDbEvidenceReport,
-    graph_nodes: &[SubstrateGraphNode],
+    graph_index: &ConflictMatrixGraphIndex,
     cached_diff: &diff_digest::DiffDigestReport,
     impact_report: &impact::ImpactReport,
 ) -> ConflictMatrixCandidate {
@@ -15499,7 +15702,7 @@ fn conflict_matrix_candidate_from_evidence(
         files.insert(path.clone());
     }
 
-    let symbols = conflict_matrix_symbols_for_files(graph_nodes, &files, &evidence.target_node);
+    let symbols = conflict_matrix_symbols_for_files(graph_index, &files, &evidence.target_node);
     let config_files = files
         .iter()
         .filter(|file| is_planner_config_path(file))
@@ -16349,6 +16552,7 @@ fn build_conflict_matrix_report_with_prepared<S: GraphStore>(
     let context_pack = &prepared.context_pack;
     let targets = resolve_conflict_matrix_targets(store, raw_targets, context_pack)?;
     let graph_nodes = store.all_nodes()?;
+    let graph_index = conflict_matrix_graph_index(&graph_nodes);
 
     let mut warnings = context_pack.status_reminders.clone();
     warnings.extend(extra_warnings);
@@ -16391,7 +16595,7 @@ fn build_conflict_matrix_report_with_prepared<S: GraphStore>(
         candidates.push(conflict_matrix_candidate_from_evidence(
             root,
             &evidence,
-            &graph_nodes,
+            &graph_index,
             &prepared.cached_diff,
             &prepared.impact_report,
         ));
@@ -16530,6 +16734,7 @@ fn build_conflict_matrix_report_with_store<S: GraphStore>(
     )
     .with_context(|| format!("computing cached impact report for {}", root.display()))?;
     let graph_nodes = store.all_nodes()?;
+    let graph_index = conflict_matrix_graph_index(&graph_nodes);
 
     let mut warnings = context_pack.status_reminders.clone();
     warnings.extend(extra_warnings);
@@ -16572,7 +16777,7 @@ fn build_conflict_matrix_report_with_store<S: GraphStore>(
         candidates.push(conflict_matrix_candidate_from_evidence(
             root,
             &evidence,
-            &graph_nodes,
+            &graph_index,
             &cached_diff,
             &impact_report,
         ));
@@ -25497,10 +25702,11 @@ def list_items():
         )
         .unwrap();
         let graph_nodes = store.all_nodes().unwrap();
+        let graph_index = conflict_matrix_graph_index(&graph_nodes);
         let semantic_candidate = conflict_matrix_candidate_from_evidence(
             dir.path(),
             &evidence,
-            &graph_nodes,
+            &graph_index,
             &cached_diff,
             &impact_report,
         );
