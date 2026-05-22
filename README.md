@@ -35,11 +35,13 @@ tsift diff-digest .
 tsift --envelope session-review tasks/software/tsift.md --next-context --budget normal
 tsift graph-db --path . refresh --json
 tsift graph-db --path . status --json
+tsift graph-db --path . compact --json
 tsift graph-db --path . kind backlog --property ref_id=cvxa --limit 5 --json
 tsift graph-db --path . evidence cvxa --depth 3 --limit 8 --json
 tsift conflict-matrix --path tasks/software/tsift.md cvxa --json
 tsift dependency-dag --path tasks/software/tsift.md cvxa --json
 tsift graph-db --path . doctor --json
+tsift graph-db --path . backend-eval --json | tsift metric-digest --baseline fixtures/graph-db-performance-history.json
 tsift traverse --path . --format html > traversal.html
 tsift semantic "graph navigation" --path . --kind concept --json
 tsift convex-sync . --chunk-size 100 --json
@@ -55,6 +57,8 @@ mutations, and HTTP action for `tsift convex-sync --apply` live under
 `examples/convex-graph`. Use `tsift graph-db refresh` to materialize
 `.tsift/graph.db` explicitly, `tsift graph-db status` to inspect projection
 version/hash/watermark and tombstone counts without refreshing, and
+`tsift graph-db compact` to inspect or apply the guarded post-reconciliation
+WAL checkpoint/VACUUM policy before pruning tombstones. Use
 `tsift graph-db evidence <backlog-id-or-job-handle>` for bounded
 worker-context/source-handle/semantic handoff packets. Use `tsift
 conflict-matrix` to rank candidate worker scopes, flag shared

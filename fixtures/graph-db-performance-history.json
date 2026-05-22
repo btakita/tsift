@@ -1,0 +1,19 @@
+{
+  "runs": [
+    {
+      "label": "graph-db backend-eval baseline",
+      "id": "baseline-fixture",
+      "timestamp": "2026-05-21T00:00:00Z",
+      "metrics": {
+        "real.sqlite.total_duration_micros": 1000000,
+        "real.sqlite.evidence.duration_micros": 120000,
+        "real.sqlite.conflict_matrix.duration_micros": 240000,
+        "real.sqlite.dispatch_trace.duration_micros": 180000,
+        "synthetic_high_degree.sqlite.total_duration_micros": 200000,
+        "synthetic_high_degree.sqlite.evidence.duration_micros": 30000,
+        "synthetic_deep_chain.sqlite.total_duration_micros": 220000,
+        "synthetic_deep_chain.sqlite.evidence.duration_micros": 35000
+      }
+    }
+  ]
+}

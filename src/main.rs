@@ -879,6 +879,18 @@ enum GraphDbQuery {
     Doctor,
     /// Compare the local SQLite projection against a Convex snapshot before apply/read operations
     Drift,
+    /// Reclaim SQLite graph.db storage after refresh/Convex reconciliation
+    Compact {
+        /// Execute WAL checkpoint/VACUUM instead of returning the dry-run policy
+        #[arg(long)]
+        apply: bool,
+        /// Delete retained tombstone rows before VACUUM. Requires --confirmed-convex-reconciled.
+        #[arg(long = "prune-tombstones")]
+        prune_tombstones: bool,
+        /// Confirm Convex consumers have already reconciled deletion tombstones.
+        #[arg(long = "confirmed-convex-reconciled")]
+        confirmed_convex_reconciled: bool,
+    },
     /// Benchmark experimental read-only GraphStore candidates against SQLite before promotion
     BackendEval {
         /// Candidate backend prototype to evaluate. Repeatable; defaults to DuckDB/DuckPGQ and Ladybug. Values: duckdb-duckpgq, ladybug.
@@ -4643,6 +4655,16 @@ struct TraversalRouteIndexEntry {
     tokens: BTreeSet<String>,
 }
 
+struct TraversalCodeLookup<'a> {
+    symbols: &'a [TraversalSymbolIndexEntry],
+    files: &'a [TraversalFileIndexEntry],
+    routes: &'a [TraversalRouteIndexEntry],
+    symbol_index: HashMap<String, Vec<usize>>,
+    file_index: HashMap<String, Vec<usize>>,
+    route_index: HashMap<String, Vec<usize>>,
+    file_path_index: HashMap<String, String>,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 struct ExplorationBudget {
     project_size: String,
@@ -6556,8 +6578,10 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
 
 #[derive(Serialize)]
 struct GraphDbBackendEvalConfig {
-    synthetic_nodes: usize,
-    synthetic_fanout: usize,
+    high_degree_nodes: usize,
+    high_degree_fanout: usize,
+    deep_chain_nodes: usize,
+    deep_chain_fanout: usize,
     depth: usize,
     limit: usize,
     impact_limit: usize,
@@ -6620,12 +6644,15 @@ struct GraphDbBackendEvalReport {
     root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     scope: Option<String>,
+    label: String,
     baseline_backend: String,
     candidates: Vec<String>,
     targets: Vec<String>,
     config: GraphDbBackendEvalConfig,
     datasets: Vec<GraphDbBackendEvalDataset>,
     promotion: Vec<GraphDbBackendPromotionDecision>,
+    metrics: BTreeMap<String, f64>,
+    metric_digest_command: String,
     warnings: Vec<String>,
 }
 
@@ -6695,14 +6722,14 @@ struct GraphDbDriftReport {
     warnings: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct GraphDbTombstoneCounts {
     nodes: usize,
     edges: usize,
     total: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct GraphDbOperatorCounts {
     nodes: usize,
     edges: usize,
@@ -6711,6 +6738,19 @@ struct GraphDbOperatorCounts {
     file_size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     freelist_bytes: Option<u64>,
+}
+
+#[derive(Clone, Serialize)]
+struct GraphDbCompactionPolicy {
+    status: String,
+    tombstone_scan_rows: usize,
+    live_rows: usize,
+    file_size_bytes: Option<u64>,
+    freelist_bytes: Option<u64>,
+    safe_to_prune_tombstones: bool,
+    requires_convex_reconciliation: bool,
+    recommendations: Vec<String>,
+    proof: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -6747,8 +6787,27 @@ struct GraphDbOperatorReport {
     counts: GraphDbOperatorCounts,
     #[serde(skip_serializing_if = "Option::is_none")]
     refresh: Option<GraphDbRefreshSummary>,
+    compaction: GraphDbCompactionPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery: Option<index::ReadOnlyRecovery>,
+    next_commands: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GraphDbCompactionReport {
+    root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    graph_db: String,
+    applied: bool,
+    pruned_tombstones: usize,
+    counts_before: GraphDbOperatorCounts,
+    counts_after: GraphDbOperatorCounts,
+    compaction_before: GraphDbCompactionPolicy,
+    compaction_after: GraphDbCompactionPolicy,
+    reclaimed_bytes: i64,
     next_commands: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     warnings: Vec<String>,
@@ -6989,6 +7048,63 @@ fn sqlite_graph_counts(conn: &Connection) -> Result<GraphDbOperatorCounts> {
         file_size_bytes: sqlite_database_size_bytes(conn).ok(),
         freelist_bytes: sqlite_database_freelist_bytes(conn).ok(),
     })
+}
+
+fn graph_db_compaction_policy(
+    root: &Path,
+    scope: Option<&str>,
+    counts: &GraphDbOperatorCounts,
+    prune_confirmed: bool,
+) -> GraphDbCompactionPolicy {
+    let live_rows = counts.nodes + counts.edges;
+    let tombstone_scan_rows = counts.tombstones.total;
+    let tombstone_heavy = tombstone_scan_rows > live_rows.max(1);
+    let freelist_heavy = counts
+        .file_size_bytes
+        .zip(counts.freelist_bytes)
+        .is_some_and(|(file_size, freelist)| freelist > 0 && freelist >= file_size / 20);
+    let status = if tombstone_heavy || freelist_heavy {
+        "recommended"
+    } else {
+        "not_needed"
+    }
+    .to_string();
+    let mut recommendations = vec![
+        convex_refresh_command(root, scope),
+        graph_db_refresh_command(root, scope),
+        format!(
+            "tsift graph-db --path {}{} compact --apply --json",
+            shell_quote(root.to_string_lossy().as_ref()),
+            graph_db_scope_arg(scope)
+        ),
+    ];
+    if prune_confirmed {
+        recommendations.push(format!(
+            "tsift graph-db --path {}{} compact --apply --prune-tombstones --confirmed-convex-reconciled --json",
+            shell_quote(root.to_string_lossy().as_ref()),
+            graph_db_scope_arg(scope)
+        ));
+    }
+    let proof = vec![
+        format!("{live_rows} live graph row(s)"),
+        format!("{tombstone_scan_rows} retained tombstone row(s) scanned by status/doctor"),
+        format!(
+            "graph.db file_size={} byte(s), freelist={} byte(s)",
+            counts.file_size_bytes.unwrap_or(0),
+            counts.freelist_bytes.unwrap_or(0)
+        ),
+    ];
+    GraphDbCompactionPolicy {
+        status,
+        tombstone_scan_rows,
+        live_rows,
+        file_size_bytes: counts.file_size_bytes,
+        freelist_bytes: counts.freelist_bytes,
+        safe_to_prune_tombstones: prune_confirmed,
+        requires_convex_reconciliation: tombstone_scan_rows > 0 && !prune_confirmed,
+        recommendations,
+        proof,
+    }
 }
 
 fn sqlite_database_size_bytes(conn: &Connection) -> Result<u64> {
@@ -7247,6 +7363,7 @@ fn sqlite_graph_schema_diagnostics(conn: &Connection) -> Result<Vec<String>> {
             "graph_tombstones",
             vec!["row_key", "row_kind", "deleted_at_unix"],
         ),
+        ("graph_node_properties", vec!["node_id", "key", "value"]),
     ];
     for (table, required_columns) in required_tables {
         if !tables.contains(table) {
@@ -7271,6 +7388,7 @@ fn sqlite_graph_schema_diagnostics(conn: &Connection) -> Result<Vec<String>> {
         "idx_graph_nodes_kind",
         "idx_graph_edges_from_kind",
         "idx_graph_edges_to_kind",
+        "idx_graph_node_properties_key_value_node",
     ] {
         if !indexes.contains(index) {
             diagnostics.push(format!("graph.db schema drift: missing index {index}"));
@@ -7744,6 +7862,30 @@ fn append_sqlite_graph_doctor_checks(
         diagnostics: tombstone_diagnostics,
         repair_commands: Vec::new(),
     });
+    let compaction_check = match sqlite_graph_counts(conn.conn()) {
+        Ok(counts) => {
+            let policy = graph_db_compaction_policy(root, scope, &counts, false);
+            GraphDbDoctorCheck {
+                name: "sqlite_compaction_policy".to_string(),
+                status: policy.status.clone(),
+                fail_closed: false,
+                diagnostics: policy.proof,
+                repair_commands: if policy.status == "recommended" {
+                    policy.recommendations
+                } else {
+                    Vec::new()
+                },
+            }
+        }
+        Err(err) => GraphDbDoctorCheck {
+            name: "sqlite_compaction_policy".to_string(),
+            status: "warning".to_string(),
+            fail_closed: false,
+            diagnostics: vec![format!("graph compaction policy inspection failed: {err}")],
+            repair_commands: Vec::new(),
+        },
+    };
+    report.push_check(compaction_check);
 
     Some(conn)
 }
@@ -8051,6 +8193,17 @@ fn graph_db_operator_report_from_disk(
     warnings: Vec<String>,
 ) -> Result<GraphDbOperatorReport> {
     if !graph_db.exists() {
+        let counts = GraphDbOperatorCounts {
+            nodes: 0,
+            edges: 0,
+            tombstones: GraphDbTombstoneCounts {
+                nodes: 0,
+                edges: 0,
+                total: 0,
+            },
+            file_size_bytes: None,
+            freelist_bytes: None,
+        };
         return Ok(GraphDbOperatorReport {
             root: root.to_string_lossy().to_string(),
             scope: scope.map(str::to_string),
@@ -8069,18 +8222,9 @@ fn graph_db_operator_report_from_disk(
                         .to_string(),
                 ],
             },
-            counts: GraphDbOperatorCounts {
-                nodes: 0,
-                edges: 0,
-                tombstones: GraphDbTombstoneCounts {
-                    nodes: 0,
-                    edges: 0,
-                    total: 0,
-                },
-                file_size_bytes: None,
-                freelist_bytes: None,
-            },
+            counts: counts.clone(),
             refresh,
+            compaction: graph_db_compaction_policy(root, scope, &counts, false),
             recovery: None,
             next_commands: graph_db_operator_next_commands(root, scope, true),
             warnings,
@@ -8124,6 +8268,7 @@ fn graph_db_operator_report_from_disk(
         status,
         materialized: true,
         freshness,
+        compaction: graph_db_compaction_policy(root, scope, &counts, false),
         counts,
         refresh,
         recovery,
@@ -8181,6 +8326,15 @@ fn print_graph_db_operator_human(report: &GraphDbOperatorReport) {
             refresh.pruned_tombstones
         );
     }
+    println!(
+        "compaction: {} tombstone_scan_rows={} live_rows={}",
+        report.compaction.status,
+        report.compaction.tombstone_scan_rows,
+        report.compaction.live_rows
+    );
+    for proof in &report.compaction.proof {
+        println!("compaction proof: {proof}");
+    }
     if let Some(recovery) = report.recovery {
         println!("recovery: {}", graph_db_read_recovery_diagnostic(recovery));
     }
@@ -8220,6 +8374,7 @@ fn print_graph_db_operator_report(
                     envelope_metric("nodes", report.counts.nodes),
                     envelope_metric("edges", report.counts.edges),
                     envelope_metric("tombstones", report.counts.tombstones.total),
+                    envelope_metric("compaction", &report.compaction.status),
                 ],
             },
             false,
@@ -8443,6 +8598,136 @@ fn cmd_graph_db_drift(
     }
 }
 
+fn print_graph_db_compaction_human(report: &GraphDbCompactionReport) {
+    println!(
+        "graph-db compact applied:{} pruned_tombstones:{} reclaimed:{} byte(s)",
+        report.applied, report.pruned_tombstones, report.reclaimed_bytes
+    );
+    println!("graph_db: {}", report.graph_db);
+    println!(
+        "before: {} node(s), {} edge(s), {} tombstone(s), file={} free={}",
+        report.counts_before.nodes,
+        report.counts_before.edges,
+        report.counts_before.tombstones.total,
+        report.counts_before.file_size_bytes.unwrap_or(0),
+        report.counts_before.freelist_bytes.unwrap_or(0)
+    );
+    println!(
+        "after: {} node(s), {} edge(s), {} tombstone(s), file={} free={}",
+        report.counts_after.nodes,
+        report.counts_after.edges,
+        report.counts_after.tombstones.total,
+        report.counts_after.file_size_bytes.unwrap_or(0),
+        report.counts_after.freelist_bytes.unwrap_or(0)
+    );
+    for proof in &report.compaction_after.proof {
+        println!("proof: {proof}");
+    }
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    for command in &report.next_commands {
+        println!("next: {command}");
+    }
+}
+
+fn cmd_graph_db_compact(
+    root: &Path,
+    scope: Option<&str>,
+    apply: bool,
+    prune_tombstones: bool,
+    confirmed_convex_reconciled: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    if prune_tombstones && !confirmed_convex_reconciled {
+        bail!(
+            "graph-db compact --prune-tombstones requires --confirmed-convex-reconciled after Convex deletion reconciliation has completed"
+        );
+    }
+    let graph_db = graph_substrate_db_path(root, scope);
+    if apply && !graph_db.exists() {
+        bail!("graph-db compact --apply requires an existing graph.db; run graph-db refresh first");
+    }
+    let before =
+        graph_db_operator_report_from_disk(root, scope, &graph_db, "compact", None, Vec::new())?;
+    let mut warnings = before.warnings.clone();
+    let mut pruned_tombstones = 0usize;
+    if apply {
+        let mut store = SqliteGraphStore::open(&graph_db)?;
+        pruned_tombstones = store.compact_storage(prune_tombstones)?;
+        if prune_tombstones {
+            warnings.push(format!(
+                "pruned {pruned_tombstones} retained tombstone row(s) after explicit Convex reconciliation confirmation"
+            ));
+        }
+    }
+    let after = graph_db_operator_report_from_disk(
+        root,
+        scope,
+        &graph_db,
+        "compact",
+        None,
+        warnings.clone(),
+    )?;
+    let before_file = before.counts.file_size_bytes.unwrap_or(0) as i64;
+    let after_file = after.counts.file_size_bytes.unwrap_or(0) as i64;
+    let mut next_commands = after.compaction.recommendations.clone();
+    next_commands.push(format!(
+        "tsift graph-db --path {}{} status --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope)
+    ));
+    next_commands.push(format!(
+        "tsift graph-db --path {}{} doctor --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope)
+    ));
+    let compaction_after =
+        graph_db_compaction_policy(root, scope, &after.counts, confirmed_convex_reconciled);
+    let report = GraphDbCompactionReport {
+        root: root.to_string_lossy().to_string(),
+        scope: scope.map(str::to_string),
+        graph_db: graph_db.to_string_lossy().to_string(),
+        applied: apply,
+        pruned_tombstones,
+        counts_before: before.counts,
+        counts_after: after.counts,
+        compaction_before: before.compaction,
+        compaction_after,
+        reclaimed_bytes: before_file - after_file,
+        next_commands: dedupe_preserve_order(next_commands),
+        warnings,
+    };
+
+    if format.json_output {
+        print_json_or_envelope(
+            &report,
+            &format,
+            "graph-db",
+            "compact",
+            ToolEnvelopeSummary {
+                text: format!(
+                    "Graph DB compact {} with {} reclaimed byte(s) and {} tombstone row(s) pruned",
+                    if apply { "applied" } else { "dry-run" },
+                    report.reclaimed_bytes,
+                    report.pruned_tombstones
+                ),
+                metrics: vec![
+                    envelope_metric("applied", report.applied),
+                    envelope_metric("reclaimed_bytes", report.reclaimed_bytes),
+                    envelope_metric("pruned_tombstones", report.pruned_tombstones),
+                    envelope_metric("tombstones_after", report.counts_after.tombstones.total),
+                ],
+            },
+            false,
+            report.next_commands.clone(),
+        )
+    } else {
+        print_graph_db_compaction_human(&report);
+        Ok(())
+    }
+}
+
 fn parse_graph_db_property_filters(raw: &[String]) -> Result<Vec<GraphDbPropertyFilter>> {
     raw.iter()
         .map(|value| {
@@ -8628,6 +8913,10 @@ fn graph_db_schema() -> GraphDbSchema {
             GraphDbSchemaOperation {
                 command: "drift",
                 description: "Compare local SQLite projection rows with a Convex snapshot and return upsert, tombstone, metadata, duplicate, orphan, and next-command diagnostics",
+            },
+            GraphDbSchemaOperation {
+                command: "compact [--apply] [--prune-tombstones --confirmed-convex-reconciled]",
+                description: "Return or apply the post-reconciliation SQLite graph compaction policy, including WAL checkpoint/VACUUM proof and guarded tombstone pruning",
             },
             GraphDbSchemaOperation {
                 command: "backend-eval [--candidate duckdb-duckpgq|ladybug] [--target ID]",
@@ -8935,31 +9224,23 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
     let target_node = graph_db_resolve_evidence_target(store, target)?
         .with_context(|| format!("graph-db evidence target not found: {target}"))?;
     let max_rows = if limit == 0 { usize::MAX } else { limit };
-    let worker_paths = graph_db_reachable_nodes_by_kind(
-        store,
+    let mut reachable = store.reachable_nodes_by_kinds(
         &target_node.id,
-        "worker_context",
+        &[
+            "worker_context",
+            "source_handle",
+            "worker_result",
+            "semantic_concept",
+            "semantic_entity",
+        ],
         depth,
         max_rows,
     )?;
-    let source_paths =
-        graph_db_reachable_nodes_by_kind(store, &target_node.id, "source_handle", depth, max_rows)?;
-    let worker_result_paths =
-        graph_db_reachable_nodes_by_kind(store, &target_node.id, "worker_result", depth, max_rows)?;
-    let mut semantic_paths = graph_db_reachable_nodes_by_kind(
-        store,
-        &target_node.id,
-        "semantic_concept",
-        depth,
-        max_rows,
-    )?;
-    semantic_paths.extend(graph_db_reachable_nodes_by_kind(
-        store,
-        &target_node.id,
-        "semantic_entity",
-        depth,
-        max_rows,
-    )?);
+    let worker_paths = reachable.remove("worker_context").unwrap_or_default();
+    let source_paths = reachable.remove("source_handle").unwrap_or_default();
+    let worker_result_paths = reachable.remove("worker_result").unwrap_or_default();
+    let mut semantic_paths = reachable.remove("semantic_concept").unwrap_or_default();
+    semantic_paths.extend(reachable.remove("semantic_entity").unwrap_or_default());
     semantic_paths.sort_by(|(left_node, left_path), (right_node, right_path)| {
         left_path
             .hops
@@ -9173,6 +9454,9 @@ fn graph_db_report_from_store(
         }
         GraphDbQuery::Drift => {
             bail!("graph-db drift must be handled by the drift command path");
+        }
+        GraphDbQuery::Compact { .. } => {
+            bail!("graph-db compact must be handled by the compact command path");
         }
         GraphDbQuery::BackendEval { .. } => {
             bail!("graph-db backend-eval must be handled by the benchmark command path");
@@ -9773,6 +10057,39 @@ fn graph_db_backend_eval_promotion(
     decisions
 }
 
+fn graph_db_backend_eval_metrics(datasets: &[GraphDbBackendEvalDataset]) -> BTreeMap<String, f64> {
+    let mut metrics = BTreeMap::new();
+    for dataset in datasets {
+        metrics.insert(format!("{}.nodes", dataset.name), dataset.nodes as f64);
+        metrics.insert(format!("{}.edges", dataset.name), dataset.edges as f64);
+        for backend in &dataset.backends {
+            let prefix = format!("{}.{}", dataset.name, backend.backend.replace('-', "_"));
+            metrics.insert(
+                format!("{prefix}.total_duration_micros"),
+                backend.total_micros as f64,
+            );
+            for operation in &backend.operations {
+                metrics.insert(
+                    format!("{prefix}.{}.duration_micros", operation.name),
+                    operation.duration_micros as f64,
+                );
+                if let Some(rows) = operation.rows {
+                    metrics.insert(format!("{prefix}.{}.rows", operation.name), rows as f64);
+                }
+            }
+        }
+    }
+    metrics
+}
+
+fn graph_db_backend_eval_metric_digest_command(root: &Path, scope: Option<&str>) -> String {
+    format!(
+        "tsift graph-db --path {}{} backend-eval --json | tsift metric-digest --baseline fixtures/graph-db-performance-history.json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope)
+    )
+}
+
 struct GraphDbBackendEvalOptions<'a> {
     path: &'a Path,
     scope: Option<&'a str>,
@@ -9888,8 +10205,10 @@ fn cmd_graph_db_backend_eval(
             .map(|candidate| GraphDbExperimentalBackend::parse(candidate))
             .collect::<Result<Vec<_>>>()?
     };
-    let synthetic_nodes = 96;
-    let synthetic_fanout = 3;
+    let high_degree_nodes = 128;
+    let high_degree_fanout = 8;
+    let deep_chain_nodes = 192;
+    let deep_chain_fanout = 1;
     let depth = 3;
     let limit = 8;
     let impact_limit = 20;
@@ -9935,58 +10254,105 @@ fn cmd_graph_db_backend_eval(
         &prepared,
     )?;
 
-    let synthetic_projection =
-        graph_db_backend_eval_synthetic_projection(synthetic_nodes, synthetic_fanout);
-    let synthetic_started = Instant::now();
-    let mut synthetic_store = SqliteGraphStore::in_memory()?;
-    let _synthetic_refresh = synthetic_store.replace_projection_with_version(
+    let high_degree_projection =
+        graph_db_backend_eval_synthetic_projection(high_degree_nodes, high_degree_fanout);
+    let high_degree_started = Instant::now();
+    let mut high_degree_store = SqliteGraphStore::in_memory()?;
+    let _high_degree_refresh = high_degree_store.replace_projection_with_version(
         "root",
-        &synthetic_projection,
+        &high_degree_projection,
         Some(GRAPH_PROJECTION_VERSION),
-        Some(format!("synthetic:{synthetic_nodes}:{synthetic_fanout}")),
+        Some(format!(
+            "synthetic-high-degree:{high_degree_nodes}:{high_degree_fanout}"
+        )),
     )?;
-    let synthetic_micros = synthetic_started.elapsed().as_micros();
-    let synthetic_freshness = sqlite_graph_freshness(&synthetic_store, "root")?;
-    let synthetic_targets = graph_db_backend_eval_targets(&synthetic_store, &[])?;
-    let synthetic_rows = convex_rows_from_graph_store(&synthetic_store)?;
-    let synthetic_refresh = graph_db_backend_eval_refresh_operation(
-        synthetic_micros,
-        synthetic_rows.nodes.len() + synthetic_rows.edges.len(),
+    let high_degree_micros = high_degree_started.elapsed().as_micros();
+    let high_degree_freshness = sqlite_graph_freshness(&high_degree_store, "root")?;
+    let high_degree_targets = graph_db_backend_eval_targets(&high_degree_store, &[])?;
+    let high_degree_rows = convex_rows_from_graph_store(&high_degree_store)?;
+    let high_degree_refresh = graph_db_backend_eval_refresh_operation(
+        high_degree_micros,
+        high_degree_rows.nodes.len() + high_degree_rows.edges.len(),
         serde_json::json!({
-            "nodes": synthetic_rows.nodes.len(),
-            "edges": synthetic_rows.edges.len(),
+            "nodes": high_degree_rows.nodes.len(),
+            "edges": high_degree_rows.edges.len(),
         }),
     );
-    let synthetic_dataset = graph_db_backend_eval_dataset(
-        "synthetic",
+    let high_degree_dataset = graph_db_backend_eval_dataset(
+        "synthetic_high_degree",
         &root,
         path,
         scope,
-        &synthetic_targets,
+        &high_degree_targets,
         depth,
         limit,
         impact_limit,
         &candidates,
-        &synthetic_store,
-        synthetic_freshness,
-        synthetic_refresh,
-        synthetic_rows,
+        &high_degree_store,
+        high_degree_freshness,
+        high_degree_refresh,
+        high_degree_rows,
+        Vec::new(),
+        &prepared,
+    )?;
+
+    let deep_chain_projection =
+        graph_db_backend_eval_synthetic_projection(deep_chain_nodes, deep_chain_fanout);
+    let deep_chain_started = Instant::now();
+    let mut deep_chain_store = SqliteGraphStore::in_memory()?;
+    let _deep_chain_refresh = deep_chain_store.replace_projection_with_version(
+        "root",
+        &deep_chain_projection,
+        Some(GRAPH_PROJECTION_VERSION),
+        Some(format!(
+            "synthetic-deep-chain:{deep_chain_nodes}:{deep_chain_fanout}"
+        )),
+    )?;
+    let deep_chain_micros = deep_chain_started.elapsed().as_micros();
+    let deep_chain_freshness = sqlite_graph_freshness(&deep_chain_store, "root")?;
+    let deep_chain_targets = graph_db_backend_eval_targets(&deep_chain_store, &[])?;
+    let deep_chain_rows = convex_rows_from_graph_store(&deep_chain_store)?;
+    let deep_chain_refresh = graph_db_backend_eval_refresh_operation(
+        deep_chain_micros,
+        deep_chain_rows.nodes.len() + deep_chain_rows.edges.len(),
+        serde_json::json!({
+            "nodes": deep_chain_rows.nodes.len(),
+            "edges": deep_chain_rows.edges.len(),
+        }),
+    );
+    let deep_chain_dataset = graph_db_backend_eval_dataset(
+        "synthetic_deep_chain",
+        &root,
+        path,
+        scope,
+        &deep_chain_targets,
+        depth,
+        limit,
+        impact_limit,
+        &candidates,
+        &deep_chain_store,
+        deep_chain_freshness,
+        deep_chain_refresh,
+        deep_chain_rows,
         Vec::new(),
         &prepared,
     )?;
 
     let targets = real_targets
         .iter()
-        .chain(synthetic_targets.iter())
+        .chain(high_degree_targets.iter())
+        .chain(deep_chain_targets.iter())
         .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let datasets = vec![real_dataset, synthetic_dataset];
+    let datasets = vec![real_dataset, high_degree_dataset, deep_chain_dataset];
     let promotion = graph_db_backend_eval_promotion(&datasets, &candidates);
+    let metrics = graph_db_backend_eval_metrics(&datasets);
     let report = GraphDbBackendEvalReport {
         root: root.to_string_lossy().to_string(),
         scope: scope.map(str::to_string),
+        label: "graph-db backend-eval".to_string(),
         baseline_backend: "sqlite".to_string(),
         candidates: candidates
             .iter()
@@ -9994,14 +10360,18 @@ fn cmd_graph_db_backend_eval(
             .collect(),
         targets,
         config: GraphDbBackendEvalConfig {
-            synthetic_nodes,
-            synthetic_fanout,
+            high_degree_nodes,
+            high_degree_fanout,
+            deep_chain_nodes,
+            deep_chain_fanout,
             depth,
             limit,
             impact_limit,
         },
         datasets,
         promotion,
+        metrics,
+        metric_digest_command: graph_db_backend_eval_metric_digest_command(&root, scope),
         warnings: Vec::new(),
     };
 
@@ -10023,10 +10393,13 @@ fn cmd_graph_db_backend_eval(
                 ],
             },
             false,
-            vec![format!(
-                "Re-run with `tsift graph-db --path {} backend-eval --json --target <id>` after adding a production candidate adapter",
-                shell_quote(root.to_string_lossy().as_ref())
-            )],
+            vec![
+                format!(
+                    "Re-run with `tsift graph-db --path {} backend-eval --json --target <id>` after adding a production candidate adapter",
+                    shell_quote(root.to_string_lossy().as_ref())
+                ),
+                report.metric_digest_command.clone(),
+            ],
         )
     } else {
         print_graph_db_backend_eval_human(&report);
@@ -10069,6 +10442,7 @@ fn print_graph_db_backend_eval_human(report: &GraphDbBackendEvalReport) {
             println!("  reason: {reason}");
         }
     }
+    println!("metric-digest: {}", report.metric_digest_command);
 }
 
 fn cmd_graph_db(
@@ -10092,6 +10466,20 @@ fn cmd_graph_db(
         }
         GraphDbQuery::Drift => {
             return cmd_graph_db_drift(&root, path, scope, convex_snapshot, format);
+        }
+        GraphDbQuery::Compact {
+            apply,
+            prune_tombstones,
+            confirmed_convex_reconciled,
+        } => {
+            return cmd_graph_db_compact(
+                &root,
+                scope,
+                *apply,
+                *prune_tombstones,
+                *confirmed_convex_reconciled,
+                format,
+            );
         }
         GraphDbQuery::BackendEval {
             candidates,
@@ -10124,9 +10512,6 @@ fn cmd_graph_db(
                 write_traversal_graph_store_with_options(&root, path, scope, true)?;
             warnings = graph.warnings;
         }
-    } else {
-        let (graph, _refresh) = write_traversal_graph_store(&root, path, scope)?;
-        warnings = graph.warnings;
     }
     let report = match backend {
         GraphDbBackend::Sqlite => {
@@ -10527,9 +10912,88 @@ fn markdown_code_spans(input: &str) -> Vec<String> {
         .collect()
 }
 
+fn push_traversal_token_index(
+    index: &mut HashMap<String, Vec<usize>>,
+    tokens: &BTreeSet<String>,
+    entry_index: usize,
+) {
+    for token in tokens {
+        index.entry(token.clone()).or_default().push(entry_index);
+    }
+}
+
+impl<'a> TraversalCodeLookup<'a> {
+    fn new(
+        symbols: &'a [TraversalSymbolIndexEntry],
+        files: &'a [TraversalFileIndexEntry],
+        routes: &'a [TraversalRouteIndexEntry],
+    ) -> Self {
+        let mut symbol_index = HashMap::new();
+        for (idx, entry) in symbols.iter().enumerate() {
+            push_traversal_token_index(&mut symbol_index, &entry.tokens, idx);
+        }
+        let mut file_index = HashMap::new();
+        let mut file_path_index = HashMap::new();
+        for (idx, entry) in files.iter().enumerate() {
+            push_traversal_token_index(&mut file_index, &entry.tokens, idx);
+            if let Some(path) = entry.node.path.as_ref() {
+                file_path_index.insert(path.clone(), path.clone());
+            }
+        }
+        let mut route_index = HashMap::new();
+        for (idx, entry) in routes.iter().enumerate() {
+            push_traversal_token_index(&mut route_index, &entry.tokens, idx);
+        }
+        Self {
+            symbols,
+            files,
+            routes,
+            symbol_index,
+            file_index,
+            route_index,
+            file_path_index,
+        }
+    }
+
+    fn touched_files_for_line(&self, line: &str) -> Vec<String> {
+        let mut touched_files = BTreeSet::new();
+        for candidate in markdown_code_spans(line)
+            .into_iter()
+            .chain(line.split_whitespace().map(str::to_string))
+        {
+            for path in traversal_path_candidates(&candidate) {
+                if let Some(file) = self.file_path_index.get(&path) {
+                    touched_files.insert(file.clone());
+                }
+            }
+        }
+        touched_files.into_iter().collect()
+    }
+}
+
+fn traversal_path_candidates(candidate: &str) -> Vec<String> {
+    let trimmed = candidate.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '`' | '"' | '\'' | ',' | ';' | '.' | '!' | '?' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+    });
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut candidates = vec![trimmed.to_string()];
+    if let Some((path, line_suffix)) = trimmed.rsplit_once(':')
+        && !path.is_empty()
+        && line_suffix.chars().all(|ch| ch.is_ascii_digit())
+    {
+        candidates.push(path.to_string());
+    }
+    candidates
+}
+
 fn parse_worker_result_line(
     line: &str,
-    files: &[TraversalFileIndexEntry],
+    lookup: &TraversalCodeLookup<'_>,
 ) -> Vec<ParsedWorkerResult> {
     if line.trim_start().starts_with("- [") {
         return Vec::new();
@@ -10556,14 +11020,7 @@ fn parse_worker_result_line(
     let result_ids = ids.iter().cloned().collect::<BTreeSet<_>>();
     let all_ids = extract_conflict_target_refs(line);
 
-    let touched_files = files
-        .iter()
-        .filter_map(|entry| entry.node.path.as_ref())
-        .filter(|path| line.contains(path.as_str()))
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let touched_files = lookup.touched_files_for_line(line);
     let tests = markdown_code_spans(line)
         .into_iter()
         .filter(|span| span.to_ascii_lowercase().contains("test"))
@@ -10621,13 +11078,89 @@ fn markdown_files_for_traversal(root: &Path, path_hint: &Path) -> Result<Vec<Pat
     Ok(files)
 }
 
+fn ranked_symbol_matches<'a>(
+    query_tokens: &BTreeSet<String>,
+    entries: &'a [TraversalSymbolIndexEntry],
+    index: &HashMap<String, Vec<usize>>,
+) -> Vec<(usize, &'a TraversalSymbolIndexEntry)> {
+    let mut scores = BTreeMap::<usize, usize>::new();
+    for token in query_tokens {
+        if let Some(indices) = index.get(token) {
+            for idx in indices {
+                *scores.entry(*idx).or_default() += 1;
+            }
+        }
+    }
+    let mut matches = scores
+        .into_iter()
+        .map(|(idx, score)| (score, &entries[idx]))
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.node.label.cmp(&right.node.label))
+            .then_with(|| left.handle.cmp(&right.handle))
+    });
+    matches
+}
+
+fn ranked_file_matches<'a>(
+    query_tokens: &BTreeSet<String>,
+    entries: &'a [TraversalFileIndexEntry],
+    index: &HashMap<String, Vec<usize>>,
+) -> Vec<(usize, &'a TraversalFileIndexEntry)> {
+    let mut scores = BTreeMap::<usize, usize>::new();
+    for token in query_tokens {
+        if let Some(indices) = index.get(token) {
+            for idx in indices {
+                *scores.entry(*idx).or_default() += 1;
+            }
+        }
+    }
+    let mut matches = scores
+        .into_iter()
+        .map(|(idx, score)| (score, &entries[idx]))
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.node.label.cmp(&right.node.label))
+            .then_with(|| left.handle.cmp(&right.handle))
+    });
+    matches
+}
+
+fn ranked_route_matches<'a>(
+    query_tokens: &BTreeSet<String>,
+    entries: &'a [TraversalRouteIndexEntry],
+    index: &HashMap<String, Vec<usize>>,
+) -> Vec<(usize, &'a TraversalRouteIndexEntry)> {
+    let mut scores = BTreeMap::<usize, usize>::new();
+    for token in query_tokens {
+        if let Some(indices) = index.get(token) {
+            for idx in indices {
+                *scores.entry(*idx).or_default() += 1;
+            }
+        }
+    }
+    let mut matches = scores
+        .into_iter()
+        .map(|(idx, score)| (score, &entries[idx]))
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.node.label.cmp(&right.node.label))
+            .then_with(|| left.handle.cmp(&right.handle))
+    });
+    matches
+}
+
 fn link_backlog_to_code_nodes(
     graph: &mut TraversalGraphBuild,
     backlog: &TraversalNode,
     text: &str,
-    symbols: &[TraversalSymbolIndexEntry],
-    files: &[TraversalFileIndexEntry],
-    routes: &[TraversalRouteIndexEntry],
+    lookup: &TraversalCodeLookup<'_>,
     limit: usize,
 ) {
     let mut query_tokens = traversal_tokens(text);
@@ -10638,20 +11171,10 @@ fn link_backlog_to_code_nodes(
         return;
     }
 
-    let mut symbol_matches = symbols
-        .iter()
-        .filter_map(|entry| {
-            let score = query_tokens.intersection(&entry.tokens).count();
-            (score > 0).then_some((score, entry))
-        })
-        .collect::<Vec<_>>();
-    symbol_matches.sort_by(|(left_score, left), (right_score, right)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| left.node.label.cmp(&right.node.label))
-            .then_with(|| left.handle.cmp(&right.handle))
-    });
-    for (score, entry) in symbol_matches.into_iter().take(limit) {
+    for (score, entry) in ranked_symbol_matches(&query_tokens, lookup.symbols, &lookup.symbol_index)
+        .into_iter()
+        .take(limit)
+    {
         graph.add_edge(
             &backlog.handle,
             &entry.handle,
@@ -10661,20 +11184,10 @@ fn link_backlog_to_code_nodes(
         );
     }
 
-    let mut file_matches = files
-        .iter()
-        .filter_map(|entry| {
-            let score = query_tokens.intersection(&entry.tokens).count();
-            (score > 0).then_some((score, entry))
-        })
-        .collect::<Vec<_>>();
-    file_matches.sort_by(|(left_score, left), (right_score, right)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| left.node.label.cmp(&right.node.label))
-            .then_with(|| left.handle.cmp(&right.handle))
-    });
-    for (score, entry) in file_matches.into_iter().take(limit.min(5)) {
+    for (score, entry) in ranked_file_matches(&query_tokens, lookup.files, &lookup.file_index)
+        .into_iter()
+        .take(limit.min(5))
+    {
         graph.add_edge(
             &backlog.handle,
             &entry.handle,
@@ -10684,20 +11197,10 @@ fn link_backlog_to_code_nodes(
         );
     }
 
-    let mut route_matches = routes
-        .iter()
-        .filter_map(|entry| {
-            let score = query_tokens.intersection(&entry.tokens).count();
-            (score > 0).then_some((score, entry))
-        })
-        .collect::<Vec<_>>();
-    route_matches.sort_by(|(left_score, left), (right_score, right)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| left.node.label.cmp(&right.node.label))
-            .then_with(|| left.handle.cmp(&right.handle))
-    });
-    for (score, entry) in route_matches.into_iter().take(limit.min(5)) {
+    for (score, entry) in ranked_route_matches(&query_tokens, lookup.routes, &lookup.route_index)
+        .into_iter()
+        .take(limit.min(5))
+    {
         graph.add_edge(
             &backlog.handle,
             &entry.handle,
@@ -10712,9 +11215,7 @@ fn load_agent_doc_traversal_nodes(
     root: &Path,
     path_hint: &Path,
     graph: &mut TraversalGraphBuild,
-    symbols: &[TraversalSymbolIndexEntry],
-    files: &[TraversalFileIndexEntry],
-    routes: &[TraversalRouteIndexEntry],
+    lookup: &TraversalCodeLookup<'_>,
 ) -> Result<()> {
     for markdown_path in markdown_files_for_traversal(root, path_hint)? {
         let content = match fs::read_to_string(&markdown_path) {
@@ -10754,7 +11255,7 @@ fn load_agent_doc_traversal_nodes(
                 Some("session backlog item".to_string()),
                 1,
             );
-            link_backlog_to_code_nodes(graph, &backlog, &text, symbols, files, routes, 8);
+            link_backlog_to_code_nodes(graph, &backlog, &text, lookup, 8);
         }
 
         let mut in_queue = false;
@@ -10828,7 +11329,7 @@ fn load_agent_doc_traversal_nodes(
 
         let mut seen_results = BTreeSet::<(String, String, i64)>::new();
         for (idx, line) in lines.iter().enumerate() {
-            for parsed in parse_worker_result_line(line, files) {
+            for parsed in parse_worker_result_line(line, lookup) {
                 let line_no = idx as i64 + 1;
                 if !seen_results.insert((parsed.id.clone(), parsed.status.clone(), line_no)) {
                     continue;
@@ -10866,7 +11367,7 @@ fn load_agent_doc_traversal_nodes(
                     result_text.push(' ');
                     result_text.push_str(&parsed.touched_files.join(" "));
                 }
-                link_backlog_to_code_nodes(graph, &result, &result_text, symbols, files, routes, 8);
+                link_backlog_to_code_nodes(graph, &result, &result_text, lookup, 8);
             }
         }
     }
@@ -11057,6 +11558,7 @@ fn build_traversal_graph_source_with_options(
             Some(db_path) if db_path.exists() => {
                 let db = index::IndexDb::open_read_only_resilient(&db_path)?;
                 let file_paths = db.file_paths()?;
+                let mut file_handle_by_path = HashMap::<String, String>::new();
                 for file in file_paths {
                     let node = traversal_file_node(root, &file);
                     let entry = TraversalFileIndexEntry {
@@ -11064,6 +11566,9 @@ fn build_traversal_graph_source_with_options(
                         tokens: traversal_node_tokens(&node),
                         node: node.clone(),
                     };
+                    if let Some(path) = entry.node.path.as_ref() {
+                        file_handle_by_path.insert(path.clone(), entry.handle.clone());
+                    }
                     graph.add_node(node);
                     file_entries.push(entry);
                 }
@@ -11087,12 +11592,9 @@ fn build_traversal_graph_source_with_options(
                         node: node.clone(),
                     };
                     graph.add_node(node.clone());
-                    if let Some(file_node) = file_entries
-                        .iter()
-                        .find(|entry| entry.node.path.as_deref() == Some(file.as_str()))
-                    {
+                    if let Some(file_handle) = file_handle_by_path.get(&file) {
                         graph.add_edge(
-                            &file_node.handle,
+                            file_handle,
                             &node.handle,
                             "defines",
                             Some("file defines symbol".to_string()),
@@ -11136,12 +11638,11 @@ fn build_traversal_graph_source_with_options(
                         node: node.clone(),
                     };
                     graph.add_node(node.clone());
-                    if let Some(file_node) = file_entries
-                        .iter()
-                        .find(|entry| entry.node.path.as_deref() == node.path.as_deref())
+                    if let Some(path) = node.path.as_ref()
+                        && let Some(file_handle) = file_handle_by_path.get(path)
                     {
                         graph.add_edge(
-                            &file_node.handle,
+                            file_handle,
                             &node.handle,
                             "defines_route",
                             Some("file declares route".to_string()),
@@ -11179,14 +11680,8 @@ fn build_traversal_graph_source_with_options(
         }
     }
 
-    load_agent_doc_traversal_nodes(
-        root,
-        path_hint,
-        &mut graph,
-        &symbol_entries,
-        &file_entries,
-        &route_entries,
-    )?;
+    let code_lookup = TraversalCodeLookup::new(&symbol_entries, &file_entries, &route_entries);
+    load_agent_doc_traversal_nodes(root, path_hint, &mut graph, &code_lookup)?;
     Ok(graph)
 }
 
@@ -30002,6 +30497,35 @@ tier = "private"
                     _ => panic!("expected graph-db neighborhood query"),
                 }
             }
+            _ => panic!("expected GraphDb command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_db_compact_query() {
+        let cli = Cli::parse_from([
+            "tsift",
+            "graph-db",
+            "--path",
+            ".",
+            "compact",
+            "--apply",
+            "--prune-tombstones",
+            "--confirmed-convex-reconciled",
+        ]);
+        match cli.command {
+            Some(Commands::GraphDb { query, .. }) => match query {
+                GraphDbQuery::Compact {
+                    apply,
+                    prune_tombstones,
+                    confirmed_convex_reconciled,
+                } => {
+                    assert!(apply);
+                    assert!(prune_tombstones);
+                    assert!(confirmed_convex_reconciled);
+                }
+                _ => panic!("expected graph-db compact query"),
+            },
             _ => panic!("expected GraphDb command"),
         }
     }

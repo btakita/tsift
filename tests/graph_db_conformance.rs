@@ -915,6 +915,7 @@ fn assert_sqlite_page_uses_index(page: &Value, index: &str) {
 }
 
 fn assert_graph_db_snapshot_query_parity(project: &Path, snapshot: &Path) {
+    graph_db_json(project, Backend::Sqlite, vec!["refresh".to_string()]);
     let sqlite_schema = graph_db_json(project, Backend::Sqlite, vec!["schema".to_string()]);
     let convex_schema = graph_db_json(
         project,
@@ -938,6 +939,10 @@ fn assert_graph_db_snapshot_query_parity(project: &Path, snapshot: &Path) {
     assert_sorted(&sqlite_first_ids);
     assert_graph_db_page_semantics_match(&sqlite_first["page"], &convex_first["page"]);
     assert_sqlite_page_uses_index(&sqlite_first["page"], "idx_graph_nodes_kind");
+    assert_sqlite_page_uses_index(
+        &sqlite_first["page"],
+        "idx_graph_node_properties_key_value_node",
+    );
     assert!(sqlite_first["page"]["truncated"].as_bool().unwrap());
 
     let cursor = sqlite_first["page"]["next_cursor"].as_str().unwrap();
@@ -958,6 +963,10 @@ fn assert_graph_db_snapshot_query_parity(project: &Path, snapshot: &Path) {
     assert_sorted(&sqlite_second_ids);
     assert_graph_db_page_semantics_match(&sqlite_second["page"], &convex_second["page"]);
     assert_sqlite_page_uses_index(&sqlite_second["page"], "idx_graph_nodes_kind");
+    assert_sqlite_page_uses_index(
+        &sqlite_second["page"],
+        "idx_graph_node_properties_key_value_node",
+    );
 
     let main_id = symbol_id_by_ref(project, Backend::Sqlite, "main");
     let helper_id = symbol_id_by_ref(project, Backend::Sqlite, "helper");
@@ -1174,6 +1183,15 @@ fn graph_db_refresh_and_status_materialize_operator_report() {
     assert!(refresh["counts"]["nodes"].as_u64().unwrap() > 0);
     assert!(refresh["counts"]["edges"].as_u64().unwrap() > 0);
     assert!(refresh["counts"]["tombstones"]["total"].as_u64().is_some());
+    assert!(refresh["compaction"]["live_rows"].as_u64().unwrap() > 0);
+    assert!(
+        refresh["compaction"]["proof"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|proof| proof.as_str().unwrap().contains("retained tombstone")),
+        "{refresh}"
+    );
     assert!(
         refresh["warnings"]
             .as_array()
@@ -1211,6 +1229,67 @@ fn graph_db_refresh_and_status_materialize_operator_report() {
     assert_eq!(status["operation"], "status", "{status}");
     assert_eq!(status["status"], "current", "{status}");
     assert_eq!(status["counts"]["nodes"], refresh["counts"]["nodes"]);
+    assert_eq!(
+        status["compaction"]["live_rows"],
+        refresh["compaction"]["live_rows"]
+    );
+}
+
+#[test]
+fn graph_db_compact_reports_policy_and_guarded_apply() {
+    let project = graph_db_project();
+    let refresh = graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
+
+    let dry_run = graph_db_json(project.path(), Backend::Sqlite, vec!["compact".to_string()]);
+    assert_eq!(dry_run["applied"], false, "{dry_run}");
+    assert_eq!(
+        dry_run["counts_before"]["nodes"], refresh["counts"]["nodes"],
+        "{dry_run}"
+    );
+    assert!(
+        dry_run["next_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("convex-sync")),
+        "{dry_run}"
+    );
+
+    let guard = graph_db_failure(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "compact".to_string(),
+            "--apply".to_string(),
+            "--prune-tombstones".to_string(),
+        ],
+    );
+    assert!(guard.contains("--confirmed-convex-reconciled"), "{guard}");
+
+    let applied = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "compact".to_string(),
+            "--apply".to_string(),
+            "--prune-tombstones".to_string(),
+            "--confirmed-convex-reconciled".to_string(),
+        ],
+    );
+    assert_eq!(applied["applied"], true, "{applied}");
+    assert_eq!(applied["counts_after"]["nodes"], refresh["counts"]["nodes"]);
+    assert_eq!(
+        applied["compaction_after"]["safe_to_prune_tombstones"], true,
+        "{applied}"
+    );
+    assert!(
+        applied["next_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("doctor")),
+        "{applied}"
+    );
 }
 
 #[test]
@@ -1240,7 +1319,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "{report}"
     );
     let datasets = report["datasets"].as_array().unwrap();
-    assert_eq!(datasets.len(), 2, "{report}");
+    assert_eq!(datasets.len(), 3, "{report}");
     assert!(
         datasets.iter().any(|dataset| dataset["name"] == "real"),
         "{report}"
@@ -1248,7 +1327,13 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
     assert!(
         datasets
             .iter()
-            .any(|dataset| dataset["name"] == "synthetic"),
+            .any(|dataset| dataset["name"] == "synthetic_high_degree"),
+        "{report}"
+    );
+    assert!(
+        datasets
+            .iter()
+            .any(|dataset| dataset["name"] == "synthetic_deep_chain"),
         "{report}"
     );
     for dataset in datasets {
@@ -1289,6 +1374,20 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         }
     }
     assert_eq!(report["promotion"].as_array().unwrap().len(), 2, "{report}");
+    assert!(
+        report["metrics"]
+            .as_object()
+            .unwrap()
+            .contains_key("real.sqlite.total_duration_micros"),
+        "{report}"
+    );
+    assert!(
+        report["metric_digest_command"]
+            .as_str()
+            .unwrap()
+            .contains("metric-digest --baseline fixtures/graph-db-performance-history.json"),
+        "{report}"
+    );
 }
 
 #[test]
@@ -2742,7 +2841,7 @@ fn graph_db_drift_report_summarizes_snapshot_diff_and_failures() {
 #[test]
 fn graph_db_cli_fails_closed_for_newer_sqlite_schema() {
     let project = graph_db_project();
-    graph_db_json(project.path(), Backend::Sqlite, vec!["schema".to_string()]);
+    graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
 
     let conn = Connection::open(graph_db_path(project.path())).unwrap();
     conn.pragma_update(None, "user_version", 999).unwrap();
@@ -2758,11 +2857,7 @@ fn graph_db_cli_fails_closed_for_newer_sqlite_schema() {
 #[test]
 fn graph_db_cli_rolls_back_failed_sqlite_refresh() {
     let project = graph_db_project();
-    graph_db_json(
-        project.path(),
-        Backend::Sqlite,
-        vec!["kind".to_string(), "symbol".to_string()],
-    );
+    graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
     let db_path = graph_db_path(project.path());
     let before = sql_node_ids(&db_path, "symbol");
     assert!(!before.is_empty());
@@ -2780,11 +2875,7 @@ fn graph_db_cli_rolls_back_failed_sqlite_refresh() {
     .unwrap();
     drop(conn);
 
-    let stderr = graph_db_failure(
-        project.path(),
-        Backend::Sqlite,
-        vec!["kind".to_string(), "symbol".to_string()],
-    );
+    let stderr = graph_db_failure(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
     assert!(
         stderr.contains("forced graph edge insert failure"),
         "{stderr}"
@@ -2917,7 +3008,7 @@ fn graph_db_doctor_passes_for_current_sqlite_and_convex_snapshot() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|check| check["status"] == "ok"),
+            .all(|check| check["status"] == "ok" || check["status"] == "not_needed"),
         "{sqlite}"
     );
 
@@ -2933,7 +3024,7 @@ fn graph_db_doctor_passes_for_current_sqlite_and_convex_snapshot() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|check| check["status"] == "ok"),
+            .all(|check| check["status"] == "ok" || check["status"] == "not_needed"),
         "{convex}"
     );
 }
@@ -3070,6 +3161,7 @@ fn query_plan_details(db_path: &Path, sql: &str) -> Vec<String> {
 #[test]
 fn graph_db_scale_caps_pagination_paths_doctor_and_sqlite_plans() {
     let project = large_graph_db_project(120);
+    graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
     let first_id = symbol_id_by_ref(project.path(), Backend::Sqlite, "f000");
     let far_id = symbol_id_by_ref(project.path(), Backend::Sqlite, "f080");
 
