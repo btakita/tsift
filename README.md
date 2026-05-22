@@ -79,7 +79,8 @@ contract versions, evidence packet ids, projection hashes, replay commands, and
 repair commands so agent-doc can consume them as JSON rather than parsing prose.
 Use `tsift graph-db backend-eval` to compare SQLite against experimental
 read-only candidates with adaptive path probes, per-operation promotion gates,
-and a `performance_gate`/`metric-digest` command for bounded regression review.
+batched context-pack graph writes for source/worker context rows, and a
+`performance_gate`/`metric-digest` command for bounded regression review.
 Use `tsift graph-db doctor` to validate local `graph.db` and Convex snapshot
 metadata before trusting operator handoffs. `tsift traverse --format html`
 renders the selected GraphStore slice as

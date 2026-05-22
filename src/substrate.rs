@@ -1230,6 +1230,14 @@ impl SqliteGraphStore {
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 "#,
             )?;
+            let mut insert_property = tx.prepare(
+                r#"
+                INSERT INTO next_graph_node_properties (node_id, key, value)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(node_id, key) DO UPDATE SET
+                    value = excluded.value
+                "#,
+            )?;
             for node in &projection.nodes {
                 insert_node.execute((
                     &node.id,
@@ -1241,18 +1249,11 @@ impl SqliteGraphStore {
                     row_hash(node)?,
                     source_watermark.as_deref(),
                 ))?;
+                for (key, value) in &node.properties {
+                    insert_property.execute((&node.id, key, value))?;
+                }
             }
         }
-        tx.execute(
-            r#"
-            INSERT INTO next_graph_node_properties (node_id, key, value)
-            SELECT next_graph_nodes.id, json_each.key, CAST(json_each.value AS TEXT)
-            FROM next_graph_nodes, json_each(next_graph_nodes.properties_json)
-            WHERE json_each.key IS NOT NULL
-              AND json_each.value IS NOT NULL
-            "#,
-            [],
-        )?;
         {
             let mut insert_edge = tx.prepare(
                 r#"
@@ -1516,6 +1517,78 @@ impl SqliteGraphStore {
             tombstoned_nodes,
             tombstoned_edges,
         })
+    }
+
+    pub fn upsert_projection(&mut self, projection: &GraphProjection) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut insert_node = tx.prepare(
+                r#"
+                INSERT INTO graph_nodes
+                    (id, kind, label, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+                ON CONFLICT(id) DO UPDATE SET
+                    kind = excluded.kind,
+                    label = excluded.label,
+                    properties_json = excluded.properties_json,
+                    provenance_json = excluded.provenance_json,
+                    freshness_json = excluded.freshness_json,
+                    row_hash = excluded.row_hash,
+                    source_watermark = excluded.source_watermark
+                "#,
+            )?;
+            let mut delete_properties =
+                tx.prepare("DELETE FROM graph_node_properties WHERE node_id = ?1")?;
+            let mut insert_property = tx.prepare(
+                r#"
+                INSERT INTO graph_node_properties (node_id, key, value)
+                VALUES (?1, ?2, ?3)
+                "#,
+            )?;
+            for node in &projection.nodes {
+                insert_node.execute((
+                    &node.id,
+                    &node.kind,
+                    &node.label,
+                    to_json(&node.properties)?,
+                    to_json(&node.provenance)?,
+                    optional_to_json(&node.freshness)?,
+                    row_hash(node)?,
+                ))?;
+                delete_properties.execute([&node.id])?;
+                for (key, value) in &node.properties {
+                    insert_property.execute((&node.id, key, value))?;
+                }
+            }
+        }
+        {
+            let mut insert_edge = tx.prepare(
+                r#"
+                INSERT INTO graph_edges
+                    (from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+                ON CONFLICT(from_id, to_id, kind) DO UPDATE SET
+                    properties_json = excluded.properties_json,
+                    provenance_json = excluded.provenance_json,
+                    freshness_json = excluded.freshness_json,
+                    row_hash = excluded.row_hash,
+                    source_watermark = excluded.source_watermark
+                "#,
+            )?;
+            for edge in &projection.edges {
+                insert_edge.execute((
+                    &edge.from_id,
+                    &edge.to_id,
+                    &edge.kind,
+                    to_json(&edge.properties)?,
+                    to_json(&edge.provenance)?,
+                    optional_to_json(&edge.freshness)?,
+                    row_hash(edge)?,
+                ))?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn projection_version(&self, scope: &str) -> Result<Option<SqliteProjectionVersion>> {
@@ -2599,6 +2672,54 @@ mod tests {
 
         assert_crud_contract(&SqliteGraphStore::in_memory().unwrap());
         assert_crud_contract(&ConvexGraphStore::new(ConvexRowsGraphClient::default()));
+    }
+
+    #[test]
+    fn sqlite_upsert_projection_batches_rows_and_properties() {
+        let mut store = SqliteGraphStore::in_memory().unwrap();
+        let mut projection = sample_projection();
+        store.upsert_projection(&projection).unwrap();
+
+        let page = store
+            .paged_nodes_by_kind(
+                "document",
+                GraphQueryOptions {
+                    property_filters: vec![GraphPropertyFilter {
+                        key: "domain".to_string(),
+                        value: "livekit".to_string(),
+                    }],
+                    ..GraphQueryOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(page.nodes[0].id, "doc:livekit");
+
+        projection.nodes[0] = GraphNode::new("doc:livekit", "document", "LiveKit guide")
+            .with_property("domain", "recording");
+        store.upsert_projection(&projection).unwrap();
+
+        let old_property_count: usize = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_node_properties WHERE key = 'domain' AND value = 'livekit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let updated_page = store
+            .paged_nodes_by_kind(
+                "document",
+                GraphQueryOptions {
+                    property_filters: vec![GraphPropertyFilter {
+                        key: "domain".to_string(),
+                        value: "recording".to_string(),
+                    }],
+                    ..GraphQueryOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(old_property_count, 0);
+        assert_eq!(updated_page.nodes[0].id, "doc:livekit");
     }
 
     #[test]

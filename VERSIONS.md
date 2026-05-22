@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- Graph refresh now streams materialized node-property rows into the staged SQLite projection while node rows are inserted, and context-pack exploration uses one batched SQLite projection transaction for `source_handle` / `worker_context` rows instead of per-row autocommit writes.
 - SQLite graph DB schema v3 now maintains `graph_node_properties` rows so `graph-db kind` and `neighborhood --property KEY=VALUE` use an indexed materialized property table instead of JSON extraction scans; refresh/status/doctor expose compaction proof, and `graph-db compact` adds a guarded WAL checkpoint/VACUUM path with explicit Convex-reconciliation confirmation before tombstone pruning.
 - `graph-db evidence` now batches reachable worker-context, source-handle, worker-result, and semantic row expansion through one SQLite recursive CTE per target, preserving max-hop/limit ordering while avoiding per-family path walks.
 - `graph-db backend-eval` now measures real, synthetic high-degree, and synthetic deep-chain datasets, emits metric-digest-ready numeric metrics plus a replay command, and includes `fixtures/graph-db-performance-history.json` for repeatable performance-history comparisons.

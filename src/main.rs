@@ -20601,8 +20601,8 @@ fn materialize_context_pack_exploration_packet(
 ) -> Result<ExplorationPacket> {
     let projection = context_pack_exploration_projection(&packet)?;
     let graph_db = graph_substrate_db_path(root, None);
-    let store = SqliteGraphStore::open(&graph_db)?;
-    projection.upsert_into(&store)?;
+    let mut store = SqliteGraphStore::open(&graph_db)?;
+    store.upsert_projection(&projection)?;
 
     let mut source_windows = Vec::new();
     for window in &packet.source_windows {
