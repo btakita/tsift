@@ -840,6 +840,7 @@ enum GraphDbBackend {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 enum GraphDbExperimentalBackend {
     DuckdbDuckpgq,
+    Falkordb,
     Ladybug,
 }
 
@@ -847,6 +848,7 @@ impl GraphDbExperimentalBackend {
     fn name(self) -> &'static str {
         match self {
             Self::DuckdbDuckpgq => "duckdb-duckpgq",
+            Self::Falkordb => "falkordb",
             Self::Ladybug => "ladybug",
         }
     }
@@ -854,6 +856,7 @@ impl GraphDbExperimentalBackend {
     fn adapter_label(self) -> &'static str {
         match self {
             Self::DuckdbDuckpgq => "DuckDB/DuckPGQ read-only prototype",
+            Self::Falkordb => "FalkorDB read-only prototype",
             Self::Ladybug => "Ladybug read-only prototype",
         }
     }
@@ -861,9 +864,12 @@ impl GraphDbExperimentalBackend {
     fn parse(raw: &str) -> Result<Self> {
         match raw {
             "duckdb-duckpgq" | "duckdb" | "duckpgq" => Ok(Self::DuckdbDuckpgq),
+            "falkordb" | "falkor" => Ok(Self::Falkordb),
             "ladybug" => Ok(Self::Ladybug),
             _ => {
-                bail!("unknown backend-eval candidate {raw:?}; expected duckdb-duckpgq or ladybug")
+                bail!(
+                    "unknown backend-eval candidate {raw:?}; expected duckdb-duckpgq, falkordb, or ladybug"
+                )
             }
         }
     }
@@ -893,7 +899,7 @@ enum GraphDbQuery {
     },
     /// Benchmark experimental read-only GraphStore candidates against SQLite before promotion
     BackendEval {
-        /// Candidate backend prototype to evaluate. Repeatable; defaults to DuckDB/DuckPGQ and Ladybug. Values: duckdb-duckpgq, ladybug.
+        /// Candidate backend prototype to evaluate. Repeatable; defaults to DuckDB/DuckPGQ, FalkorDB, and Ladybug. Values: duckdb-duckpgq, falkordb, ladybug.
         #[arg(long = "candidate")]
         candidates: Vec<String>,
         /// Backlog ids, job handles, or graph node ids to use for evidence/planning benchmarks
@@ -6576,6 +6582,15 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
     }
 }
 
+const GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS: usize = 64;
+
+#[derive(Clone, Serialize)]
+struct GraphDbBackendEvalPhaseTiming {
+    name: String,
+    duration_micros: u128,
+    detail: String,
+}
+
 #[derive(Serialize)]
 struct GraphDbBackendEvalConfig {
     high_degree_nodes: usize,
@@ -6585,6 +6600,7 @@ struct GraphDbBackendEvalConfig {
     depth: usize,
     limit: usize,
     impact_limit: usize,
+    path_max_hops: usize,
 }
 
 #[derive(Clone)]
@@ -6649,6 +6665,7 @@ struct GraphDbBackendEvalReport {
     candidates: Vec<String>,
     targets: Vec<String>,
     config: GraphDbBackendEvalConfig,
+    phase_timings: Vec<GraphDbBackendEvalPhaseTiming>,
     datasets: Vec<GraphDbBackendEvalDataset>,
     promotion: Vec<GraphDbBackendPromotionDecision>,
     metrics: BTreeMap<String, f64>,
@@ -8919,8 +8936,8 @@ fn graph_db_schema() -> GraphDbSchema {
                 description: "Return or apply the post-reconciliation SQLite graph compaction policy, including WAL checkpoint/VACUUM proof and guarded tombstone pruning",
             },
             GraphDbSchemaOperation {
-                command: "backend-eval [--candidate duckdb-duckpgq|ladybug] [--target ID]",
-                description: "Benchmark experimental read-only GraphStore backend prototypes against SQLite on real and synthetic projections across refresh/status/evidence/conflict-matrix/dispatch-trace and emit promotion hold/eligibility gates",
+                command: "backend-eval [--candidate duckdb-duckpgq|falkordb|ladybug] [--target ID]",
+                description: "Benchmark experimental read-only GraphStore backend prototypes against SQLite on real and synthetic projections across refresh/status/path/evidence/conflict-matrix/dispatch-trace and emit promotion hold/eligibility gates",
             },
             GraphDbSchemaOperation {
                 command: "evidence <target> [--depth N] [--limit N]",
@@ -9577,6 +9594,87 @@ fn print_graph_db_human(report: &GraphDbReport, compact: bool) {
     }
 }
 
+fn graph_db_backend_eval_phase_timing(
+    name: &str,
+    duration_micros: u128,
+    detail: &str,
+) -> GraphDbBackendEvalPhaseTiming {
+    GraphDbBackendEvalPhaseTiming {
+        name: name.to_string(),
+        duration_micros,
+        detail: detail.to_string(),
+    }
+}
+
+fn graph_db_backend_eval_timed_phase<T>(
+    phases: &mut Vec<GraphDbBackendEvalPhaseTiming>,
+    name: &str,
+    detail: &str,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let started = Instant::now();
+    let result = run();
+    phases.push(graph_db_backend_eval_phase_timing(
+        name,
+        started.elapsed().as_micros(),
+        detail,
+    ));
+    result
+}
+
+fn graph_db_backend_eval_refresh_total_micros(phases: &[GraphDbBackendEvalPhaseTiming]) -> u128 {
+    phases
+        .iter()
+        .filter(|phase| phase.name != "conflict_matrix_preparation")
+        .map(|phase| phase.duration_micros)
+        .sum()
+}
+
+fn graph_db_backend_eval_refresh_with_profile(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+) -> Result<(
+    TraversalGraphBuild,
+    SqliteProjectionRefresh,
+    Vec<GraphDbBackendEvalPhaseTiming>,
+)> {
+    let mut phases = Vec::new();
+    let source_graph = graph_db_backend_eval_timed_phase(
+        &mut phases,
+        "source_graph_build",
+        "index/source loading plus agent-doc session markdown scan, source-handle construction, and semantic summary reads when summaries are cached",
+        || build_traversal_graph_source_with_options(root, path_hint, scope, false),
+    )?;
+    let projection = graph_db_backend_eval_timed_phase(
+        &mut phases,
+        "projection_rows",
+        "provider-neutral GraphStore node/edge row construction before SQLite persistence",
+        || traversal_projection_from_graph(root, scope, &source_graph),
+    )?;
+    let graph_db = graph_substrate_db_path(root, scope);
+    let mut store = graph_db_backend_eval_timed_phase(
+        &mut phases,
+        "sqlite_open",
+        "open the local SQLite graph.db with WAL and busy-timeout settings",
+        || SqliteGraphStore::open(&graph_db),
+    )?;
+    let refresh = graph_db_backend_eval_timed_phase(
+        &mut phases,
+        "sqlite_delta_write",
+        "replace_projection delta upserts/deletes, row-hash skips, metadata update, and refresh-time tombstone pruning",
+        || {
+            store.replace_projection_with_version(
+                scope.unwrap_or("root"),
+                &projection,
+                Some(GRAPH_PROJECTION_VERSION),
+                graph_projection_content_hash(&projection),
+            )
+        },
+    )?;
+    Ok((source_graph, refresh, phases))
+}
+
 fn graph_db_backend_eval_timed(
     name: &str,
     run: impl FnOnce() -> Result<(Option<usize>, serde_json::Value)>,
@@ -9672,6 +9770,35 @@ fn graph_db_backend_eval_targets(
     Ok(Vec::new())
 }
 
+fn graph_db_backend_eval_path_targets(
+    store: &impl GraphStore,
+    max_hops: usize,
+) -> Result<Option<(String, String, usize)>> {
+    let synthetic_from = "gsym-synthetic-0000";
+    let synthetic_to = format!("gsym-synthetic-{max_hops:04}");
+    if store.node(synthetic_from)?.is_some() && store.node(&synthetic_to)?.is_some() {
+        let outgoing = store.outgoing_edges(synthetic_from, None)?;
+        if outgoing.len() > 1
+            && let Some(edge) = outgoing.first()
+        {
+            return Ok(Some((edge.from_id.clone(), edge.to_id.clone(), 1)));
+        }
+        return Ok(Some((synthetic_from.to_string(), synthetic_to, max_hops)));
+    }
+
+    let mut edges = store.all_edges()?;
+    edges.sort_by(|left, right| {
+        left.from_id
+            .cmp(&right.from_id)
+            .then(left.kind.cmp(&right.kind))
+            .then(left.to_id.cmp(&right.to_id))
+    });
+    Ok(edges
+        .into_iter()
+        .find(|edge| edge.from_id != edge.to_id)
+        .map(|edge| (edge.from_id, edge.to_id, 1)))
+}
+
 fn graph_db_backend_eval_evidence_signature(report: &GraphDbEvidenceReport) -> serde_json::Value {
     serde_json::json!({
         "target": report.target,
@@ -9765,6 +9892,27 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
     operations.push(operation);
     signatures.extend(signature);
 
+    let (operation, signature) = graph_db_backend_eval_timed("path_max_hops", || {
+        let (from, to, effective_max_hops) =
+            graph_db_backend_eval_path_targets(store, GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS)?
+                .context("backend-eval path probe requires at least one traversable edge")?;
+        let path = store.shortest_path_with_max_hops(&from, &to, None, Some(effective_max_hops))?;
+        Ok((
+            path.as_ref().map(|path| path.nodes.len()),
+            serde_json::json!({
+                "from": from,
+                "to": to,
+                "configured_max_hops": GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS,
+                "effective_max_hops": effective_max_hops,
+                "hops": path.as_ref().map(|path| path.hops),
+                "nodes": path.as_ref().map(|path| &path.nodes),
+                "found": path.is_some(),
+            }),
+        ))
+    });
+    operations.push(operation);
+    signatures.extend(signature);
+
     let (operation, signature) = graph_db_backend_eval_timed("evidence", || {
         let target = targets
             .first()
@@ -9793,6 +9941,7 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
     operations.push(operation);
     signatures.extend(signature);
 
+    let mut conflict_for_trace = None;
     let (operation, signature) = graph_db_backend_eval_timed("conflict_matrix", || {
         let report = build_conflict_matrix_report_with_prepared(
             root,
@@ -9807,27 +9956,26 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
             extra_warnings.clone(),
             prepared,
         )?;
-        Ok((
-            Some(report.candidates.len() + report.conflicts.len()),
-            graph_db_backend_eval_conflict_signature(&report),
-        ))
+        let signature = graph_db_backend_eval_conflict_signature(&report);
+        let rows = report.candidates.len() + report.conflicts.len();
+        conflict_for_trace = Some(report);
+        Ok((Some(rows), signature))
     });
     operations.push(operation);
     signatures.extend(signature);
 
     let (operation, signature) = graph_db_backend_eval_timed("dispatch_trace", || {
-        let report = build_dispatch_trace_report_with_prepared(
+        let conflict = conflict_for_trace
+            .take()
+            .context("backend-eval dispatch-trace requires a completed conflict-matrix report")?;
+        let report = build_dispatch_trace_report_from_conflict(
             root,
-            path,
             scope,
-            targets,
+            conflict,
+            store,
             depth,
             limit,
-            impact_limit,
-            store,
-            freshness.clone(),
-            extra_warnings.clone(),
-            prepared,
+            Vec::new(),
         )?;
         Ok((
             Some(report.nodes.len() + report.edges.len()),
@@ -10082,6 +10230,18 @@ fn graph_db_backend_eval_metrics(datasets: &[GraphDbBackendEvalDataset]) -> BTre
     metrics
 }
 
+fn append_graph_db_backend_eval_phase_metrics(
+    metrics: &mut BTreeMap<String, f64>,
+    phases: &[GraphDbBackendEvalPhaseTiming],
+) {
+    for phase in phases {
+        metrics.insert(
+            format!("real.refresh_phase.{}.duration_micros", phase.name),
+            phase.duration_micros as f64,
+        );
+    }
+}
+
 fn graph_db_backend_eval_metric_digest_command(root: &Path, scope: Option<&str>) -> String {
     format!(
         "tsift graph-db --path {}{} backend-eval --json | tsift metric-digest --baseline fixtures/graph-db-performance-history.json",
@@ -10197,6 +10357,7 @@ fn cmd_graph_db_backend_eval(
     let candidates = if candidates.is_empty() {
         vec![
             GraphDbExperimentalBackend::DuckdbDuckpgq,
+            GraphDbExperimentalBackend::Falkordb,
             GraphDbExperimentalBackend::Ladybug,
         ]
     } else {
@@ -10213,11 +10374,16 @@ fn cmd_graph_db_backend_eval(
     let limit = 8;
     let impact_limit = 20;
 
-    let refresh_started = Instant::now();
-    let (graph, _refresh) = write_traversal_graph_store(&root, path, scope)
-        .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
-    let refresh_micros = refresh_started.elapsed().as_micros();
-    let prepared = prepare_conflict_matrix_inputs(&root, path, scope, impact_limit)?;
+    let (graph, _refresh, mut phase_timings) =
+        graph_db_backend_eval_refresh_with_profile(&root, path, scope)
+            .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
+    let refresh_micros = graph_db_backend_eval_refresh_total_micros(&phase_timings);
+    let prepared = graph_db_backend_eval_timed_phase(
+        &mut phase_timings,
+        "conflict_matrix_preparation",
+        "context-pack, cached diff digest, and cached impact inputs shared by conflict-matrix and dispatch-trace measurements",
+        || prepare_conflict_matrix_inputs(&root, path, scope, impact_limit),
+    )?;
     let graph_db = graph_substrate_db_path(&root, scope);
     let real_store = SqliteGraphStore::open_read_only_resilient(&graph_db)
         .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
@@ -10348,7 +10514,8 @@ fn cmd_graph_db_backend_eval(
         .collect::<Vec<_>>();
     let datasets = vec![real_dataset, high_degree_dataset, deep_chain_dataset];
     let promotion = graph_db_backend_eval_promotion(&datasets, &candidates);
-    let metrics = graph_db_backend_eval_metrics(&datasets);
+    let mut metrics = graph_db_backend_eval_metrics(&datasets);
+    append_graph_db_backend_eval_phase_metrics(&mut metrics, &phase_timings);
     let report = GraphDbBackendEvalReport {
         root: root.to_string_lossy().to_string(),
         scope: scope.map(str::to_string),
@@ -10367,7 +10534,9 @@ fn cmd_graph_db_backend_eval(
             depth,
             limit,
             impact_limit,
+            path_max_hops: GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS,
         },
+        phase_timings,
         datasets,
         promotion,
         metrics,
@@ -10413,6 +10582,12 @@ fn print_graph_db_backend_eval_human(report: &GraphDbBackendEvalReport) {
         report.baseline_backend,
         report.candidates.join(", ")
     );
+    for phase in &report.phase_timings {
+        println!(
+            "phase:{} {}us {}",
+            phase.name, phase.duration_micros, phase.detail
+        );
+    }
     for dataset in &report.datasets {
         println!(
             "dataset:{} targets:{} rows:{}",
@@ -16752,33 +16927,15 @@ fn dispatch_trace_collect_ids(
     (ids, truncated)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_dispatch_trace_report_with_prepared<S: GraphStore>(
+fn build_dispatch_trace_report_from_conflict<S: GraphStore>(
     root: &Path,
-    path: &Path,
     scope: Option<&str>,
-    raw_targets: &[String],
+    conflict: ConflictMatrixReport,
+    store: &S,
     depth: usize,
     limit: usize,
-    impact_limit: usize,
-    store: &S,
-    freshness: GraphDbFreshnessReport,
     extra_warnings: Vec<String>,
-    prepared: &ConflictMatrixPreparedInputs,
 ) -> Result<DispatchTraceReport> {
-    let conflict = build_conflict_matrix_report_with_prepared(
-        root,
-        path,
-        scope,
-        raw_targets,
-        depth,
-        limit,
-        impact_limit,
-        store,
-        freshness,
-        extra_warnings,
-        prepared,
-    )?;
     let graph_nodes = store.all_nodes()?;
     let graph_edges = store.all_edges()?;
     let (ids, truncated) = dispatch_trace_collect_ids(
@@ -16814,6 +16971,8 @@ fn build_dispatch_trace_report_with_prepared<S: GraphStore>(
             .then(left.kind.cmp(&right.kind))
             .then(left.to_id.cmp(&right.to_id))
     });
+    let mut warnings = conflict.warnings;
+    warnings.extend(extra_warnings);
 
     Ok(DispatchTraceReport {
         contract_version: DISPATCH_TRACE_CONTRACT_VERSION,
@@ -16836,7 +16995,7 @@ fn build_dispatch_trace_report_with_prepared<S: GraphStore>(
         replay_commands: conflict.next_commands,
         repair_commands: graph_db_repair_commands(root, scope),
         truncated,
-        warnings: conflict.warnings,
+        warnings,
     })
 }
 
@@ -16854,73 +17013,20 @@ fn build_dispatch_trace_report(
     let graph_db = graph_substrate_db_path(&root, scope);
     let store = SqliteGraphStore::open_read_only_resilient(&graph_db)
         .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
-    let trace_recovery_warning = store
+    let extra_warnings = store
         .read_only_recovery()
-        .map(graph_db_read_recovery_diagnostic);
-    let graph_nodes = store.all_nodes()?;
-    let graph_edges = store.all_edges()?;
-    let (ids, truncated) = dispatch_trace_collect_ids(
-        &conflict.targets,
-        &conflict.candidates,
-        &graph_nodes,
-        &graph_edges,
+        .map(graph_db_read_recovery_diagnostic)
+        .into_iter()
+        .collect::<Vec<_>>();
+    build_dispatch_trace_report_from_conflict(
+        &root,
+        scope,
+        conflict,
+        &store,
         depth,
         limit,
-    );
-    let mut nodes = graph_nodes
-        .into_iter()
-        .filter(|node| ids.contains(&node.id))
-        .collect::<Vec<_>>();
-    nodes.sort_by(|left, right| {
-        dispatch_trace_kind_rank(&left.kind)
-            .cmp(&dispatch_trace_kind_rank(&right.kind))
-            .then(left.id.cmp(&right.id))
-    });
-    let node_ids = nodes
-        .iter()
-        .map(|node| node.id.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut edges = graph_edges
-        .into_iter()
-        .filter(|edge| {
-            node_ids.contains(edge.from_id.as_str()) && node_ids.contains(edge.to_id.as_str())
-        })
-        .collect::<Vec<_>>();
-    edges.sort_by(|left, right| {
-        left.from_id
-            .cmp(&right.from_id)
-            .then(left.kind.cmp(&right.kind))
-            .then(left.to_id.cmp(&right.to_id))
-    });
-
-    let mut warnings = conflict.warnings;
-    if let Some(warning) = trace_recovery_warning {
-        warnings.push(warning);
-    }
-
-    Ok(DispatchTraceReport {
-        contract_version: DISPATCH_TRACE_CONTRACT_VERSION,
-        root: conflict.root,
-        scope: conflict.scope,
-        targets: conflict.targets,
-        projection_freshness: conflict.orchestration.projection_freshness,
-        projection_hashes: conflict.orchestration.projection_hashes,
-        evidence_packet_ids: conflict.orchestration.evidence_packet_ids,
-        worker_prompt_packets: conflict.worker_prompt_packets,
-        worker_feedback: conflict
-            .candidates
-            .iter()
-            .map(|candidate| candidate.worker_feedback.clone())
-            .collect(),
-        summary: dispatch_trace_summary(&nodes),
-        nodes,
-        edges,
-        conflict_matrix_decisions: conflict.orchestration.conflict_matrix_decisions,
-        replay_commands: conflict.next_commands,
-        repair_commands: graph_db_repair_commands(&root, scope),
-        truncated,
-        warnings,
-    })
+        extra_warnings,
+    )
 }
 
 fn dispatch_trace_html(report: &DispatchTraceReport) -> Result<String> {

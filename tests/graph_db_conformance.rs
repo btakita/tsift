@@ -1307,6 +1307,8 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "--candidate".to_string(),
         "duckdb-duckpgq".to_string(),
         "--candidate".to_string(),
+        "falkordb".to_string(),
+        "--candidate".to_string(),
         "ladybug".to_string(),
         "--target".to_string(),
         "gval".to_string(),
@@ -1315,9 +1317,23 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
     assert_eq!(report["baseline_backend"], "sqlite", "{report}");
     assert_eq!(
         report["candidates"],
-        json!(["duckdb-duckpgq", "ladybug"]),
+        json!(["duckdb-duckpgq", "falkordb", "ladybug"]),
         "{report}"
     );
+    let phases = report["phase_timings"].as_array().unwrap();
+    for phase in [
+        "source_graph_build",
+        "projection_rows",
+        "sqlite_open",
+        "sqlite_delta_write",
+        "conflict_matrix_preparation",
+    ] {
+        assert!(
+            phases.iter().any(|entry| entry["name"] == phase),
+            "missing phase {phase}: {report}"
+        );
+    }
+    assert_eq!(report["config"]["path_max_hops"], 64, "{report}");
     let datasets = report["datasets"].as_array().unwrap();
     assert_eq!(datasets.len(), 3, "{report}");
     assert!(
@@ -1340,7 +1356,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         assert!(dataset["nodes"].as_u64().unwrap() > 0, "{report}");
         assert!(dataset["edges"].as_u64().unwrap() > 0, "{report}");
         let backends = dataset["backends"].as_array().unwrap();
-        assert_eq!(backends.len(), 3, "{report}");
+        assert_eq!(backends.len(), 4, "{report}");
         for backend in backends {
             let operations = backend["operations"]
                 .as_array()
@@ -1353,6 +1369,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                 vec![
                     "refresh".to_string(),
                     "status".to_string(),
+                    "path_max_hops".to_string(),
                     "evidence".to_string(),
                     "conflict_matrix".to_string(),
                     "dispatch_trace".to_string(),
@@ -1373,12 +1390,26 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             }
         }
     }
-    assert_eq!(report["promotion"].as_array().unwrap().len(), 2, "{report}");
+    assert_eq!(report["promotion"].as_array().unwrap().len(), 3, "{report}");
     assert!(
         report["metrics"]
             .as_object()
             .unwrap()
             .contains_key("real.sqlite.total_duration_micros"),
+        "{report}"
+    );
+    assert!(
+        report["metrics"]
+            .as_object()
+            .unwrap()
+            .contains_key("synthetic_deep_chain.sqlite.path_max_hops.duration_micros"),
+        "{report}"
+    );
+    assert!(
+        report["metrics"]
+            .as_object()
+            .unwrap()
+            .contains_key("real.refresh_phase.sqlite_delta_write.duration_micros"),
         "{report}"
     );
     assert!(
@@ -1388,6 +1419,37 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .contains("metric-digest --baseline fixtures/graph-db-performance-history.json"),
         "{report}"
     );
+
+    let digest_dir = tempfile::tempdir().unwrap();
+    let current_report = digest_dir.path().join("backend-eval.json");
+    fs::write(&current_report, serde_json::to_vec(&report).unwrap()).unwrap();
+    let baseline = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/graph-db-performance-history.json");
+    let digest = assert_tsift_json(vec![
+        "metric-digest".to_string(),
+        "--input".to_string(),
+        current_report.to_string_lossy().to_string(),
+        "--baseline".to_string(),
+        baseline.to_string_lossy().to_string(),
+        "--json".to_string(),
+    ]);
+    let delta_metrics = digest["metric_deltas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|delta| delta["metric"].as_str())
+        .collect::<BTreeSet<_>>();
+    for metric in [
+        "real.sqlite.total_duration_micros",
+        "real.refresh_phase.sqlite_delta_write.duration_micros",
+        "synthetic_high_degree.sqlite.total_duration_micros",
+        "synthetic_deep_chain.sqlite.path_max_hops.duration_micros",
+    ] {
+        assert!(
+            delta_metrics.contains(metric),
+            "metric-digest should compare {metric}: {digest}"
+        );
+    }
 }
 
 #[test]
