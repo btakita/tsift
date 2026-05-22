@@ -150,7 +150,7 @@
       "status": "ok",
       "backend": "sqlite",
       "fail_closed": false,
-      "check_count": 7,
+      "check_count": 8,
       "repair_command_count": 0
     },
     "graph_db_evidence": {

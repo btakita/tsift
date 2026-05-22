@@ -15,8 +15,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use substrate::{
     ConvexEdgeRow, ConvexNodeRow, ConvexProjectionRows, GraphEdge as SubstrateGraphEdge,
-    GraphFreshness, GraphNode as SubstrateGraphNode, GraphProjection, GraphProvenance, GraphStore,
-    SQLITE_GRAPH_SCHEMA_VERSION, SqliteGraphStore, SqliteProjectionRefresh,
+    GraphFreshness, GraphNode as SubstrateGraphNode, GraphProjection, GraphPropertyFilter,
+    GraphProvenance, GraphQueryOptions, GraphQueryPage, GraphStore, SQLITE_GRAPH_SCHEMA_VERSION,
+    SqliteGraphStore, SqliteProjectionRefresh,
 };
 #[cfg(test)]
 use substrate::{ConvexGraphClient, ConvexGraphStore};
@@ -6706,6 +6707,10 @@ struct GraphDbOperatorCounts {
     nodes: usize,
     edges: usize,
     tombstones: GraphDbTombstoneCounts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freelist_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -6716,6 +6721,17 @@ struct GraphDbRefreshSummary {
     source_watermark: Option<String>,
     tombstoned_nodes: usize,
     tombstoned_edges: usize,
+    upserted_nodes: usize,
+    upserted_edges: usize,
+    unchanged_nodes: usize,
+    unchanged_edges: usize,
+    deleted_nodes: usize,
+    deleted_edges: usize,
+    pruned_tombstones: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_size_bytes_before: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_size_bytes_after: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -6970,7 +6986,79 @@ fn sqlite_graph_counts(conn: &Connection) -> Result<GraphDbOperatorCounts> {
         nodes,
         edges,
         tombstones: sqlite_tombstone_counts(conn)?,
+        file_size_bytes: sqlite_database_size_bytes(conn).ok(),
+        freelist_bytes: sqlite_database_freelist_bytes(conn).ok(),
     })
+}
+
+fn sqlite_database_size_bytes(conn: &Connection) -> Result<u64> {
+    let page_count: u64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    Ok(page_count.saturating_mul(page_size))
+}
+
+fn sqlite_database_freelist_bytes(conn: &Connection) -> Result<u64> {
+    let freelist_count: u64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+    let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    Ok(freelist_count.saturating_mul(page_size))
+}
+
+fn sqlite_graph_tombstone_retention_diagnostics(conn: &Connection) -> Result<Vec<String>> {
+    if !sqlite_table_exists(conn, "graph_tombstones")? {
+        return Ok(Vec::new());
+    }
+    let counts = sqlite_graph_counts(conn)?;
+    let live_rows = counts.nodes + counts.edges;
+    let file_size = counts.file_size_bytes.unwrap_or(0);
+    let freelist = counts.freelist_bytes.unwrap_or(0);
+    let mut live_keys = BTreeSet::new();
+    if sqlite_table_exists(conn, "graph_nodes")? {
+        let mut stmt = conn.prepare("SELECT id FROM graph_nodes")?;
+        for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
+            live_keys.insert(format!("node:{}", row?));
+        }
+    }
+    if sqlite_table_exists(conn, "graph_edges")? {
+        let mut stmt = conn.prepare("SELECT from_id, to_id, kind FROM graph_edges")?;
+        for row in stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (from_id, to_id, kind) = row?;
+            live_keys.insert(format!(
+                "edge:{}",
+                ConvexEdgeRow::stable_key(&from_id, &to_id, &kind)
+            ));
+        }
+    }
+    let mut stale_live_tombstones = 0usize;
+    let mut stmt = conn.prepare("SELECT row_key FROM graph_tombstones ORDER BY row_key")?;
+    for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
+        if live_keys.contains(&row?) {
+            stale_live_tombstones += 1;
+        }
+    }
+
+    let mut diagnostics = Vec::new();
+    if stale_live_tombstones > 0 {
+        diagnostics.push(format!(
+            "{stale_live_tombstones} tombstone(s) reference rows that are live again; the next graph-db refresh prunes those stale tombstones before inserting new deletion markers"
+        ));
+    }
+    if counts.tombstones.total > live_rows.max(1) {
+        diagnostics.push(format!(
+            "tombstone retention exceeds live graph rows: {} tombstone(s) vs {} live row(s); graph.db file_size={} byte(s), freelist={} byte(s), status/doctor tombstone scans inspect {} extra row(s). Run convex-sync against the remote snapshot before rebuild/compaction if a remote consumer may still need deletion reconciliation.",
+            counts.tombstones.total,
+            live_rows,
+            file_size,
+            freelist,
+            counts.tombstones.total
+        ));
+    }
+    Ok(diagnostics)
 }
 
 fn sqlite_graph_freshness_from_conn(
@@ -7128,6 +7216,8 @@ fn sqlite_graph_schema_diagnostics(conn: &Connection) -> Result<Vec<String>> {
                 "properties_json",
                 "provenance_json",
                 "freshness_json",
+                "row_hash",
+                "source_watermark",
             ],
         ),
         (
@@ -7139,6 +7229,8 @@ fn sqlite_graph_schema_diagnostics(conn: &Connection) -> Result<Vec<String>> {
                 "properties_json",
                 "provenance_json",
                 "freshness_json",
+                "row_hash",
+                "source_watermark",
             ],
         ),
         (
@@ -7635,6 +7727,24 @@ fn append_sqlite_graph_doctor_checks(
         vec![backup_rebuild],
     ));
 
+    let tombstone_diagnostics = sqlite_graph_tombstone_retention_diagnostics(conn.conn())
+        .unwrap_or_else(|err| {
+            vec![format!(
+                "graph tombstone retention inspection failed: {err}"
+            )]
+        });
+    report.push_check(GraphDbDoctorCheck {
+        name: "sqlite_tombstone_retention".to_string(),
+        status: if tombstone_diagnostics.is_empty() {
+            "ok".to_string()
+        } else {
+            "warning".to_string()
+        },
+        fail_closed: false,
+        diagnostics: tombstone_diagnostics,
+        repair_commands: Vec::new(),
+    });
+
     Some(conn)
 }
 
@@ -7967,6 +8077,8 @@ fn graph_db_operator_report_from_disk(
                     edges: 0,
                     total: 0,
                 },
+                file_size_bytes: None,
+                freelist_bytes: None,
             },
             refresh,
             recovery: None,
@@ -7990,6 +8102,13 @@ fn graph_db_operator_report_from_disk(
         freshness.status = "stale".to_string();
     }
     let counts = sqlite_graph_counts(conn.conn())?;
+    warnings.extend(
+        sqlite_graph_tombstone_retention_diagnostics(conn.conn()).unwrap_or_else(|err| {
+            vec![format!(
+                "graph tombstone retention inspection failed: {err}"
+            )]
+        }),
+    );
     let status = if freshness.fail_closed {
         "stale"
     } else {
@@ -8041,10 +8160,25 @@ fn print_graph_db_operator_human(report: &GraphDbOperatorReport) {
         "rows: {} node(s), {} edge(s), {} tombstone(s)",
         report.counts.nodes, report.counts.edges, report.counts.tombstones.total
     );
+    if let Some(file_size) = report.counts.file_size_bytes {
+        println!(
+            "storage: {} byte(s), {} free byte(s)",
+            file_size,
+            report.counts.freelist_bytes.unwrap_or(0)
+        );
+    }
     if let Some(refresh) = &report.refresh {
         println!(
             "refresh: {} tombstoned node(s), {} tombstoned edge(s)",
             refresh.tombstoned_nodes, refresh.tombstoned_edges
+        );
+        println!(
+            "delta: {} node upsert(s), {} edge upsert(s), {} unchanged node(s), {} unchanged edge(s), {} pruned tombstone(s)",
+            refresh.upserted_nodes,
+            refresh.upserted_edges,
+            refresh.unchanged_nodes,
+            refresh.unchanged_edges,
+            refresh.pruned_tombstones
         );
     }
     if let Some(recovery) = report.recovery {
@@ -8156,6 +8290,15 @@ fn cmd_graph_db_refresh(
         source_watermark: refresh.source_watermark,
         tombstoned_nodes: refresh.tombstoned_nodes.len(),
         tombstoned_edges: refresh.tombstoned_edges.len(),
+        upserted_nodes: refresh.upserted_nodes,
+        upserted_edges: refresh.upserted_edges,
+        unchanged_nodes: refresh.unchanged_nodes,
+        unchanged_edges: refresh.unchanged_edges,
+        deleted_nodes: refresh.deleted_nodes,
+        deleted_edges: refresh.deleted_edges,
+        pruned_tombstones: refresh.pruned_tombstones,
+        file_size_bytes_before: refresh.file_size_bytes_before,
+        file_size_bytes_after: refresh.file_size_bytes_after,
     };
     let report = graph_db_operator_report_from_disk(
         root,
@@ -8331,82 +8474,39 @@ fn graph_db_query_options(
     })
 }
 
-fn graph_db_node_matches_filters(
-    node: &SubstrateGraphNode,
-    filters: &[GraphDbPropertyFilter],
-) -> bool {
-    filters
-        .iter()
-        .all(|filter| node.properties.get(&filter.key) == Some(&filter.value))
+fn graph_db_query_options_for_store(options: &GraphDbQueryOptions) -> GraphQueryOptions {
+    GraphQueryOptions {
+        cursor: options.cursor.clone(),
+        limit: options.limit,
+        property_filters: options
+            .property_filters
+            .iter()
+            .map(|filter| GraphPropertyFilter {
+                key: filter.key.clone(),
+                value: filter.value.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn graph_db_page_report_from_store(
+    page: GraphQueryPage,
+    property_filters: Vec<GraphDbPropertyFilter>,
+) -> GraphDbPageReport {
+    GraphDbPageReport {
+        cursor: page.cursor,
+        limit: page.limit,
+        next_cursor: page.next_cursor,
+        returned_nodes: page.returned_nodes,
+        returned_edges: page.returned_edges,
+        truncated: page.truncated,
+        property_filters,
+        diagnostics: page.diagnostics,
+    }
 }
 
 fn graph_db_edge_key(edge: &SubstrateGraphEdge) -> String {
     substrate::ConvexEdgeRow::stable_key(&edge.from_id, &edge.to_id, &edge.kind)
-}
-
-fn apply_graph_db_node_page(
-    nodes: &mut Vec<SubstrateGraphNode>,
-    edges: &mut Vec<SubstrateGraphEdge>,
-    options: GraphDbQueryOptions,
-) -> GraphDbPageReport {
-    nodes.sort_by(|left, right| left.id.cmp(&right.id));
-    edges.sort_by_key(graph_db_edge_key);
-
-    let before_filter = nodes.len();
-    if !options.property_filters.is_empty() {
-        nodes.retain(|node| graph_db_node_matches_filters(node, &options.property_filters));
-    }
-    let after_filter = nodes.len();
-
-    if let Some(cursor) = &options.cursor {
-        nodes.retain(|node| node.id > *cursor);
-    }
-
-    let before_limit = nodes.len();
-    let mut next_cursor = None;
-    if let Some(limit) = options.limit
-        && nodes.len() > limit
-    {
-        next_cursor = nodes
-            .get(limit.saturating_sub(1))
-            .map(|node| node.id.clone());
-        nodes.truncate(limit);
-    }
-
-    let node_ids = nodes
-        .iter()
-        .map(|node| node.id.as_str())
-        .collect::<BTreeSet<_>>();
-    edges.retain(|edge| {
-        node_ids.contains(edge.from_id.as_str()) && node_ids.contains(edge.to_id.as_str())
-    });
-
-    let mut diagnostics = Vec::new();
-    if after_filter != before_filter {
-        diagnostics.push(format!(
-            "property filters removed {} node(s)",
-            before_filter.saturating_sub(after_filter)
-        ));
-    }
-    if options.cursor.is_some() {
-        diagnostics.push("cursor is exclusive and ordered by node id".to_string());
-    }
-    if next_cursor.is_some() {
-        diagnostics.push(
-            "result was truncated; pass page.next_cursor as --cursor for the next page".to_string(),
-        );
-    }
-
-    GraphDbPageReport {
-        cursor: options.cursor,
-        limit: options.limit,
-        next_cursor,
-        returned_nodes: nodes.len(),
-        returned_edges: edges.len(),
-        truncated: options.limit.is_some_and(|limit| before_limit > limit),
-        property_filters: options.property_filters,
-        diagnostics,
-    }
 }
 
 fn graph_db_schema() -> GraphDbSchema {
@@ -8515,15 +8615,15 @@ fn graph_db_schema() -> GraphDbSchema {
         operations: vec![
             GraphDbSchemaOperation {
                 command: "refresh",
-                description: "Materialize .tsift/graph.db explicitly and report projection metadata, row counts, tombstone counts, and operator next commands",
+                description: "Materialize .tsift/graph.db explicitly with delta upserts/deletes, row hash watermarks, tombstone pruning, projection metadata, row counts, and operator next commands",
             },
             GraphDbSchemaOperation {
                 command: "status",
-                description: "Inspect .tsift/graph.db freshness, projection metadata, row counts, tombstone counts, and operator next commands without refreshing",
+                description: "Inspect .tsift/graph.db freshness, projection metadata, row counts, tombstone counts, file-size impact, and operator next commands without refreshing",
             },
             GraphDbSchemaOperation {
                 command: "doctor",
-                description: "Validate graph.db or Convex snapshot health and return fail-closed repair diagnostics",
+                description: "Validate graph.db or Convex snapshot health and return fail-closed repair diagnostics plus non-fatal SQLite tombstone-retention warnings",
             },
             GraphDbSchemaOperation {
                 command: "drift",
@@ -8555,11 +8655,11 @@ fn graph_db_schema() -> GraphDbSchema {
             },
             GraphDbSchemaOperation {
                 command: "kind <kind> [--property KEY=VALUE] [--cursor ID] [--limit N]",
-                description: "Return nodes of one kind ordered by id with optional property filtering and cursor pagination",
+                description: "Return nodes of one kind ordered by id with SQLite-pushed property filtering/cursor pagination and query-plan diagnostics",
             },
             GraphDbSchemaOperation {
                 command: "neighborhood <id> --depth <n> [--edge-kind <kind>] [--property KEY=VALUE] [--cursor ID] [--limit N]",
-                description: "Return a directed outgoing subgraph around a node, optionally filtered and paged by node id",
+                description: "Return a directed outgoing subgraph around a node using batched SQLite recursive traversal plus pushed filters/paging when available",
             },
             GraphDbSchemaOperation {
                 command: "path <from> <to> [--edge-kind <kind>] [--max-hops N]",
@@ -8622,64 +8722,6 @@ fn convex_graph_freshness(
     }
 }
 
-fn graph_db_shortest_path_with_max_hops(
-    store: &impl GraphStore,
-    from_id: &str,
-    to_id: &str,
-    kind: Option<&str>,
-    max_hops: Option<usize>,
-) -> Result<Option<substrate::GraphPath>> {
-    let Some(max_hops) = max_hops else {
-        return store.shortest_path(from_id, to_id, kind);
-    };
-    if from_id == to_id {
-        return Ok(Some(substrate::GraphPath {
-            nodes: vec![from_id.to_string()],
-            hops: 0,
-        }));
-    }
-
-    let mut queue = VecDeque::new();
-    let mut parent = BTreeMap::<String, String>::new();
-    let mut depth = BTreeMap::<String, usize>::new();
-    parent.insert(from_id.to_string(), String::new());
-    depth.insert(from_id.to_string(), 0);
-    queue.push_back(from_id.to_string());
-
-    while let Some(current) = queue.pop_front() {
-        let current_depth = depth.get(&current).copied().unwrap_or(0);
-        if current_depth >= max_hops {
-            continue;
-        }
-        for edge in store.outgoing_edges(&current, kind)? {
-            if parent.contains_key(&edge.to_id) {
-                continue;
-            }
-            let next_depth = current_depth + 1;
-            parent.insert(edge.to_id.clone(), current.clone());
-            depth.insert(edge.to_id.clone(), next_depth);
-            if edge.to_id == to_id {
-                let mut nodes = vec![to_id.to_string()];
-                let mut cursor = to_id.to_string();
-                while let Some(prev) = parent.get(&cursor) {
-                    if prev.is_empty() {
-                        break;
-                    }
-                    nodes.push(prev.clone());
-                    cursor = prev.clone();
-                }
-                nodes.reverse();
-                return Ok(Some(substrate::GraphPath {
-                    hops: nodes.len().saturating_sub(1),
-                    nodes,
-                }));
-            }
-            queue.push_back(edge.to_id);
-        }
-    }
-    Ok(None)
-}
-
 fn graph_db_resolve_evidence_target(
     store: &impl GraphStore,
     target: &str,
@@ -8720,46 +8762,7 @@ fn graph_db_reachable_nodes_by_kind(
     depth: usize,
     limit: usize,
 ) -> Result<Vec<(SubstrateGraphNode, substrate::GraphPath)>> {
-    let mut rows = BTreeMap::<String, (SubstrateGraphNode, substrate::GraphPath)>::new();
-    let mut seen = BTreeSet::from([from_id.to_string()]);
-    let mut queue = VecDeque::from([(from_id.to_string(), vec![from_id.to_string()])]);
-
-    while let Some((current, path)) = queue.pop_front() {
-        let current_depth = path.len().saturating_sub(1);
-        if current_depth >= depth {
-            continue;
-        }
-        for edge in store.outgoing_edges(&current, None)? {
-            if !seen.insert(edge.to_id.clone()) {
-                continue;
-            }
-            let Some(node) = store.node(&edge.to_id)? else {
-                continue;
-            };
-            let mut next_path = path.clone();
-            next_path.push(edge.to_id.clone());
-            let graph_path = substrate::GraphPath {
-                hops: next_path.len().saturating_sub(1),
-                nodes: next_path.clone(),
-            };
-            if node.kind == kind {
-                rows.entry(node.id.clone()).or_insert((node, graph_path));
-            }
-            queue.push_back((edge.to_id, next_path));
-        }
-    }
-    let mut rows = rows.into_values().collect::<Vec<_>>();
-    rows.sort_by(|(left_node, left_path), (right_node, right_path)| {
-        left_path
-            .hops
-            .cmp(&right_path.hops)
-            .then(left_node.label.cmp(&right_node.label))
-            .then(left_node.id.cmp(&right_node.id))
-    });
-    if limit > 0 && rows.len() > limit {
-        rows.truncate(limit);
-    }
-    Ok(rows)
+    store.reachable_nodes_by_kind(from_id, kind, depth, limit)
 }
 
 fn graph_db_evidence_completed_queue_drift_warnings(
@@ -9189,12 +9192,14 @@ fn graph_db_report_from_store(
             limit,
             property_filters,
         } => {
-            report.nodes = store.nodes_by_kind(&kind)?;
             let options = graph_db_query_options(cursor, limit, &property_filters)?;
-            report.page = Some(apply_graph_db_node_page(
-                &mut report.nodes,
-                &mut report.edges,
-                options,
+            let paged =
+                store.paged_nodes_by_kind(&kind, graph_db_query_options_for_store(&options))?;
+            report.nodes = paged.nodes;
+            report.edges = paged.edges;
+            report.page = Some(graph_db_page_report_from_store(
+                paged.page,
+                options.property_filters,
             ));
         }
         GraphDbQuery::Neighborhood {
@@ -9205,14 +9210,18 @@ fn graph_db_report_from_store(
             limit,
             property_filters,
         } => {
-            if let Some(subgraph) = store.neighborhood(&id, depth, edge_kind.as_deref())? {
-                report.nodes = subgraph.nodes;
-                report.edges = subgraph.edges;
-                let options = graph_db_query_options(cursor, limit, &property_filters)?;
-                report.page = Some(apply_graph_db_node_page(
-                    &mut report.nodes,
-                    &mut report.edges,
-                    options,
+            let options = graph_db_query_options(cursor, limit, &property_filters)?;
+            if let Some(paged) = store.paged_neighborhood(
+                &id,
+                depth,
+                edge_kind.as_deref(),
+                graph_db_query_options_for_store(&options),
+            )? {
+                report.nodes = paged.nodes;
+                report.edges = paged.edges;
+                report.page = Some(graph_db_page_report_from_store(
+                    paged.page,
+                    options.property_filters,
                 ));
             }
         }
@@ -9222,13 +9231,8 @@ fn graph_db_report_from_store(
             edge_kind,
             max_hops,
         } => {
-            report.path = graph_db_shortest_path_with_max_hops(
-                store,
-                &from,
-                &to,
-                edge_kind.as_deref(),
-                max_hops,
-            )?;
+            report.path =
+                store.shortest_path_with_max_hops(&from, &to, edge_kind.as_deref(), max_hops)?;
             if let Some(max_hops) = max_hops
                 && report.path.is_none()
             {
@@ -25072,6 +25076,17 @@ def list_items():
             "expected backlog mention edge, got {:?}",
             report.edges
         );
+        assert!(
+            report
+                .page
+                .as_ref()
+                .unwrap()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("idx_graph_edges_from_kind")),
+            "expected SQLite neighborhood query plan diagnostics, got {:?}",
+            report.page.as_ref().unwrap().diagnostics
+        );
 
         let schema_report = graph_db_report_from_store(
             dir.path(),
@@ -25270,7 +25285,22 @@ def list_items():
         assert_eq!(sqlite_first_ids, convex_first_ids);
         assert_eq!(sqlite_first_page.next_cursor.as_deref(), Some("gbak-02"));
         assert!(sqlite_first_page.truncated);
-        assert_eq!(sqlite_first_page, convex_first_page);
+        assert_eq!(
+            sqlite_first_page.returned_nodes,
+            convex_first_page.returned_nodes
+        );
+        assert_eq!(
+            sqlite_first_page.property_filters,
+            convex_first_page.property_filters
+        );
+        assert!(
+            sqlite_first_page
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("idx_graph_nodes_kind")),
+            "expected SQLite kind query plan diagnostics, got {:?}",
+            sqlite_first_page.diagnostics
+        );
 
         let cursor = sqlite_first_page.next_cursor.as_deref();
         let (sqlite_next_ids, sqlite_next_page) = paged_graph_ids(&sqlite, cursor);
@@ -25279,7 +25309,14 @@ def list_items():
         assert_eq!(sqlite_next_ids, convex_next_ids);
         assert_eq!(sqlite_next_page.next_cursor, None);
         assert!(!sqlite_next_page.truncated);
-        assert_eq!(sqlite_next_page, convex_next_page);
+        assert_eq!(
+            sqlite_next_page.returned_nodes,
+            convex_next_page.returned_nodes
+        );
+        assert_eq!(
+            sqlite_next_page.property_filters,
+            convex_next_page.property_filters
+        );
     }
 
     #[test]

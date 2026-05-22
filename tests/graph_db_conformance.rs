@@ -888,6 +888,32 @@ fn sql_node_ids(db_path: &Path, kind: &str) -> Vec<String> {
         .unwrap()
 }
 
+fn assert_graph_db_page_semantics_match(sqlite_page: &Value, convex_page: &Value) {
+    for key in [
+        "cursor",
+        "limit",
+        "next_cursor",
+        "property_filters",
+        "returned_edges",
+        "returned_nodes",
+        "truncated",
+    ] {
+        assert_eq!(sqlite_page[key], convex_page[key], "page field {key}");
+    }
+}
+
+fn assert_sqlite_page_uses_index(page: &Value, index: &str) {
+    let diagnostics = page["diagnostics"]
+        .as_array()
+        .expect("page diagnostics should be an array");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.as_str().is_some_and(|raw| raw.contains(index))),
+        "expected SQLite page diagnostics to mention {index}, got {diagnostics:?}"
+    );
+}
+
 fn assert_graph_db_snapshot_query_parity(project: &Path, snapshot: &Path) {
     let sqlite_schema = graph_db_json(project, Backend::Sqlite, vec!["schema".to_string()]);
     let convex_schema = graph_db_json(
@@ -910,7 +936,8 @@ fn assert_graph_db_snapshot_query_parity(project: &Path, snapshot: &Path) {
     let sqlite_first_ids = node_ids(&sqlite_first);
     assert_eq!(sqlite_first_ids, node_ids(&convex_first));
     assert_sorted(&sqlite_first_ids);
-    assert_eq!(sqlite_first["page"], convex_first["page"]);
+    assert_graph_db_page_semantics_match(&sqlite_first["page"], &convex_first["page"]);
+    assert_sqlite_page_uses_index(&sqlite_first["page"], "idx_graph_nodes_kind");
     assert!(sqlite_first["page"]["truncated"].as_bool().unwrap());
 
     let cursor = sqlite_first["page"]["next_cursor"].as_str().unwrap();
@@ -929,7 +956,8 @@ fn assert_graph_db_snapshot_query_parity(project: &Path, snapshot: &Path) {
     let sqlite_second_ids = node_ids(&sqlite_second);
     assert_eq!(sqlite_second_ids, node_ids(&convex_second));
     assert_sorted(&sqlite_second_ids);
-    assert_eq!(sqlite_second["page"], convex_second["page"]);
+    assert_graph_db_page_semantics_match(&sqlite_second["page"], &convex_second["page"]);
+    assert_sqlite_page_uses_index(&sqlite_second["page"], "idx_graph_nodes_kind");
 
     let main_id = symbol_id_by_ref(project, Backend::Sqlite, "main");
     let helper_id = symbol_id_by_ref(project, Backend::Sqlite, "helper");
@@ -982,7 +1010,11 @@ fn assert_graph_db_snapshot_query_parity(project: &Path, snapshot: &Path) {
     let sqlite_edges = edge_keys(&sqlite_neighborhood);
     assert_eq!(sqlite_edges, edge_keys(&convex_neighborhood));
     assert!(!sqlite_edges.is_empty());
-    assert_eq!(sqlite_neighborhood["page"], convex_neighborhood["page"]);
+    assert_graph_db_page_semantics_match(
+        &sqlite_neighborhood["page"],
+        &convex_neighborhood["page"],
+    );
+    assert_sqlite_page_uses_index(&sqlite_neighborhood["page"], "idx_graph_edges_from_kind");
 
     let repeated_sqlite_neighborhood = graph_db_json(
         project,

@@ -1,13 +1,16 @@
 use crate::index::{ReadOnlyRecovery, copy_read_only_snapshot, read_only_snapshot_recovery};
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, types::Type};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Row, params_from_iter,
+    types::{Type, Value},
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const SQLITE_GRAPH_SCHEMA_VERSION: i64 = 1;
+pub const SQLITE_GRAPH_SCHEMA_VERSION: i64 = 2;
 const SQLITE_GRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +186,116 @@ impl GraphSubgraph {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphPropertyFilter {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphQueryOptions {
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+    pub property_filters: Vec<GraphPropertyFilter>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphQueryPage {
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+    pub next_cursor: Option<String>,
+    pub returned_nodes: usize,
+    pub returned_edges: usize,
+    pub truncated: bool,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphPagedSubgraph {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    pub page: GraphQueryPage,
+}
+
+fn graph_node_matches_filters(node: &GraphNode, filters: &[GraphPropertyFilter]) -> bool {
+    filters
+        .iter()
+        .all(|filter| node.properties.get(&filter.key) == Some(&filter.value))
+}
+
+fn apply_graph_query_page(
+    mut nodes: Vec<GraphNode>,
+    mut edges: Vec<GraphEdge>,
+    options: GraphQueryOptions,
+    mut diagnostics: Vec<String>,
+) -> GraphPagedSubgraph {
+    nodes.sort_by(|left, right| left.id.cmp(&right.id));
+    edges.sort_by(|left, right| {
+        left.from_id
+            .cmp(&right.from_id)
+            .then(left.kind.cmp(&right.kind))
+            .then(left.to_id.cmp(&right.to_id))
+    });
+
+    let before_filter = nodes.len();
+    if !options.property_filters.is_empty() {
+        nodes.retain(|node| graph_node_matches_filters(node, &options.property_filters));
+    }
+    let after_filter = nodes.len();
+
+    if let Some(cursor) = &options.cursor {
+        nodes.retain(|node| node.id > *cursor);
+    }
+
+    let before_limit = nodes.len();
+    let mut next_cursor = None;
+    if let Some(limit) = options.limit
+        && nodes.len() > limit
+    {
+        next_cursor = nodes
+            .get(limit.saturating_sub(1))
+            .map(|node| node.id.clone());
+        nodes.truncate(limit);
+    }
+
+    let node_ids = nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    edges.retain(|edge| {
+        node_ids.contains(edge.from_id.as_str()) && node_ids.contains(edge.to_id.as_str())
+    });
+
+    if after_filter != before_filter {
+        diagnostics.push(format!(
+            "property filters removed {} node(s)",
+            before_filter.saturating_sub(after_filter)
+        ));
+    }
+    if options.cursor.is_some() {
+        diagnostics.push("cursor is exclusive and ordered by node id".to_string());
+    }
+    if next_cursor.is_some() {
+        diagnostics.push(
+            "result was truncated; pass page.next_cursor as --cursor for the next page".to_string(),
+        );
+    }
+
+    GraphPagedSubgraph {
+        page: GraphQueryPage {
+            cursor: options.cursor,
+            limit: options.limit,
+            next_cursor,
+            returned_nodes: nodes.len(),
+            returned_edges: edges.len(),
+            truncated: options.limit.is_some_and(|limit| before_limit > limit),
+            diagnostics,
+        },
+        nodes,
+        edges,
+    }
+}
+
 pub trait GraphStore {
     fn upsert_node(&self, node: &GraphNode) -> Result<()>;
     fn upsert_edge(&self, edge: &GraphEdge) -> Result<()>;
@@ -199,6 +312,17 @@ pub trait GraphStore {
         to_id: &str,
         kind: Option<&str>,
     ) -> Result<Option<GraphPath>>;
+    fn shortest_path_with_max_hops(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        kind: Option<&str>,
+        max_hops: Option<usize>,
+    ) -> Result<Option<GraphPath>> {
+        shortest_path_using_outgoing(from_id, to_id, kind, max_hops, |current, kind| {
+            self.outgoing_edges(current, kind)
+        })
+    }
     fn neighborhood(
         &self,
         center_id: &str,
@@ -235,6 +359,77 @@ pub trait GraphStore {
             }
             .sorted(),
         ))
+    }
+    fn paged_nodes_by_kind(
+        &self,
+        kind: &str,
+        options: GraphQueryOptions,
+    ) -> Result<GraphPagedSubgraph> {
+        Ok(apply_graph_query_page(
+            self.nodes_by_kind(kind)?,
+            Vec::new(),
+            options,
+            Vec::new(),
+        ))
+    }
+    fn paged_neighborhood(
+        &self,
+        center_id: &str,
+        depth: usize,
+        kind: Option<&str>,
+        options: GraphQueryOptions,
+    ) -> Result<Option<GraphPagedSubgraph>> {
+        Ok(self.neighborhood(center_id, depth, kind)?.map(|subgraph| {
+            apply_graph_query_page(subgraph.nodes, subgraph.edges, options, Vec::new())
+        }))
+    }
+    fn reachable_nodes_by_kind(
+        &self,
+        from_id: &str,
+        kind: &str,
+        depth: usize,
+        limit: usize,
+    ) -> Result<Vec<(GraphNode, GraphPath)>> {
+        let mut rows = BTreeMap::<String, (GraphNode, GraphPath)>::new();
+        let mut seen = BTreeSet::from([from_id.to_string()]);
+        let mut queue = VecDeque::from([(from_id.to_string(), vec![from_id.to_string()])]);
+
+        while let Some((current, path)) = queue.pop_front() {
+            let current_depth = path.len().saturating_sub(1);
+            if current_depth >= depth {
+                continue;
+            }
+            for edge in self.outgoing_edges(&current, None)? {
+                if !seen.insert(edge.to_id.clone()) {
+                    continue;
+                }
+                let Some(node) = self.node(&edge.to_id)? else {
+                    continue;
+                };
+                let mut next_path = path.clone();
+                next_path.push(edge.to_id.clone());
+                let graph_path = GraphPath {
+                    hops: next_path.len().saturating_sub(1),
+                    nodes: next_path.clone(),
+                };
+                if node.kind == kind {
+                    rows.entry(node.id.clone()).or_insert((node, graph_path));
+                }
+                queue.push_back((edge.to_id, next_path));
+            }
+        }
+        let mut rows = rows.into_values().collect::<Vec<_>>();
+        rows.sort_by(|(left_node, left_path), (right_node, right_path)| {
+            left_path
+                .hops
+                .cmp(&right_path.hops)
+                .then(left_node.label.cmp(&right_node.label))
+                .then(left_node.id.cmp(&right_node.id))
+        });
+        if limit > 0 && rows.len() > limit {
+            rows.truncate(limit);
+        }
+        Ok(rows)
     }
 }
 
@@ -590,7 +785,7 @@ impl<C: ConvexGraphClient> GraphStore for ConvexGraphStore<C> {
         to_id: &str,
         kind: Option<&str>,
     ) -> Result<Option<GraphPath>> {
-        shortest_path_using_outgoing(from_id, to_id, kind, |current, kind| {
+        shortest_path_using_outgoing(from_id, to_id, kind, None, |current, kind| {
             self.outgoing_edges(current, kind)
         })
     }
@@ -659,6 +854,42 @@ fn configure_writable_graph_connection(conn: &Connection, db_path: &Path) -> Res
     Ok(())
 }
 
+fn sqlite_column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    if !sqlite_column_exists(conn, table, column)? {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_sqlite_graph_schema(conn: &Connection, old_version: i64) -> Result<()> {
+    if old_version < 2 {
+        add_column_if_missing(conn, "graph_nodes", "row_hash", "TEXT")?;
+        add_column_if_missing(conn, "graph_nodes", "source_watermark", "TEXT")?;
+        add_column_if_missing(conn, "graph_edges", "row_hash", "TEXT")?;
+        add_column_if_missing(conn, "graph_edges", "source_watermark", "TEXT")?;
+    }
+    Ok(())
+}
+
 pub fn open_graph_read_only_connection(db_path: &Path) -> Result<SqliteReadOnlyConnection> {
     let conn = Connection::open_with_flags(
         db_path,
@@ -717,6 +948,15 @@ pub struct SqliteProjectionRefresh {
     pub source_watermark: Option<String>,
     pub tombstoned_nodes: Vec<String>,
     pub tombstoned_edges: Vec<String>,
+    pub upserted_nodes: usize,
+    pub upserted_edges: usize,
+    pub unchanged_nodes: usize,
+    pub unchanged_edges: usize,
+    pub deleted_nodes: usize,
+    pub deleted_edges: usize,
+    pub pruned_tombstones: usize,
+    pub file_size_bytes_before: Option<u64>,
+    pub file_size_bytes_after: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -777,7 +1017,9 @@ impl SqliteGraphStore {
                 label TEXT NOT NULL,
                 properties_json TEXT NOT NULL DEFAULT '{}',
                 provenance_json TEXT NOT NULL DEFAULT '[]',
-                freshness_json TEXT
+                freshness_json TEXT,
+                row_hash TEXT,
+                source_watermark TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind
                 ON graph_nodes(kind);
@@ -789,6 +1031,8 @@ impl SqliteGraphStore {
                 properties_json TEXT NOT NULL DEFAULT '{}',
                 provenance_json TEXT NOT NULL DEFAULT '[]',
                 freshness_json TEXT,
+                row_hash TEXT,
+                source_watermark TEXT,
                 PRIMARY KEY (from_id, to_id, kind),
                 FOREIGN KEY (from_id) REFERENCES graph_nodes(id) ON DELETE CASCADE,
                 FOREIGN KEY (to_id) REFERENCES graph_nodes(id) ON DELETE CASCADE
@@ -814,6 +1058,7 @@ impl SqliteGraphStore {
             "#,
         )?;
         if user_version < SQLITE_GRAPH_SCHEMA_VERSION {
+            migrate_sqlite_graph_schema(&conn, user_version)?;
             conn.pragma_update(None, "user_version", SQLITE_GRAPH_SCHEMA_VERSION)?;
         }
         Ok(Self {
@@ -864,37 +1109,43 @@ impl SqliteGraphStore {
             .or_else(|| projection_version_from_nodes(&projection.nodes))
             .unwrap_or_else(|| "unversioned".to_string());
         let projection_hash = projection_hash_from_nodes(&projection.nodes);
-        let new_nodes = projection
-            .nodes
-            .iter()
-            .map(|node| node.id.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        let new_edges = projection
-            .edges
-            .iter()
-            .map(|edge| ConvexEdgeRow::stable_key(&edge.from_id, &edge.to_id, &edge.kind))
-            .collect::<std::collections::BTreeSet<_>>();
-        let existing_nodes = self.existing_node_ids()?;
-        let existing_edges = self.existing_edge_keys()?;
-        let tombstoned_nodes = existing_nodes
-            .into_iter()
-            .filter(|id| !new_nodes.contains(id.as_str()))
-            .collect::<Vec<_>>();
-        let tombstoned_edges = existing_edges
-            .into_iter()
-            .filter(|key| !new_edges.contains(key.as_str()))
-            .collect::<Vec<_>>();
         let observed_at_unix = unix_now();
+        let file_size_bytes_before = sqlite_database_size_bytes(&self.conn).ok();
 
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM graph_edges", [])?;
-        tx.execute("DELETE FROM graph_nodes", [])?;
+        tx.execute_batch(
+            r#"
+            CREATE TEMP TABLE IF NOT EXISTS next_graph_nodes (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                label TEXT NOT NULL,
+                properties_json TEXT NOT NULL,
+                provenance_json TEXT NOT NULL,
+                freshness_json TEXT,
+                row_hash TEXT NOT NULL,
+                source_watermark TEXT
+            );
+            CREATE TEMP TABLE IF NOT EXISTS next_graph_edges (
+                edge_key TEXT PRIMARY KEY,
+                from_id TEXT NOT NULL,
+                to_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                properties_json TEXT NOT NULL,
+                provenance_json TEXT NOT NULL,
+                freshness_json TEXT,
+                row_hash TEXT NOT NULL,
+                source_watermark TEXT
+            );
+            DELETE FROM next_graph_nodes;
+            DELETE FROM next_graph_edges;
+            "#,
+        )?;
         {
             let mut insert_node = tx.prepare(
                 r#"
-                INSERT INTO graph_nodes
-                    (id, kind, label, properties_json, provenance_json, freshness_json)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                INSERT INTO next_graph_nodes
+                    (id, kind, label, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 "#,
             )?;
             for node in &projection.nodes {
@@ -905,28 +1156,147 @@ impl SqliteGraphStore {
                     to_json(&node.properties)?,
                     to_json(&node.provenance)?,
                     optional_to_json(&node.freshness)?,
+                    row_hash(node)?,
+                    source_watermark.as_deref(),
                 ))?;
             }
         }
         {
             let mut insert_edge = tx.prepare(
                 r#"
-                INSERT INTO graph_edges
-                    (from_id, to_id, kind, properties_json, provenance_json, freshness_json)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                INSERT INTO next_graph_edges
+                    (edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 "#,
             )?;
             for edge in &projection.edges {
                 insert_edge.execute((
+                    ConvexEdgeRow::stable_key(&edge.from_id, &edge.to_id, &edge.kind),
                     &edge.from_id,
                     &edge.to_id,
                     &edge.kind,
                     to_json(&edge.properties)?,
                     to_json(&edge.provenance)?,
                     optional_to_json(&edge.freshness)?,
+                    row_hash(edge)?,
+                    source_watermark.as_deref(),
                 ))?;
             }
         }
+
+        let tombstoned_nodes = {
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT g.id
+                FROM graph_nodes g
+                LEFT JOIN next_graph_nodes n ON n.id = g.id
+                WHERE n.id IS NULL
+                ORDER BY g.id
+                "#,
+            )?;
+            collect_rows(stmt.query_map([], |row| row.get::<_, String>(0))?)?
+        };
+        let tombstoned_edges = {
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT g.from_id, g.to_id, g.kind
+                FROM graph_edges g
+                LEFT JOIN next_graph_edges n
+                    ON n.from_id = g.from_id AND n.to_id = g.to_id AND n.kind = g.kind
+                WHERE n.edge_key IS NULL
+                ORDER BY g.from_id, g.kind, g.to_id
+                "#,
+            )?;
+            collect_rows(stmt.query_map([], |row| {
+                let from_id: String = row.get(0)?;
+                let to_id: String = row.get(1)?;
+                let kind: String = row.get(2)?;
+                Ok(ConvexEdgeRow::stable_key(&from_id, &to_id, &kind))
+            })?)?
+        };
+        let unchanged_nodes: usize = tx.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM next_graph_nodes n
+            JOIN graph_nodes g ON g.id = n.id
+            WHERE g.row_hash = n.row_hash
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
+        let unchanged_edges: usize = tx.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM next_graph_edges n
+            JOIN graph_edges g
+                ON g.from_id = n.from_id AND g.to_id = n.to_id AND g.kind = n.kind
+            WHERE g.row_hash = n.row_hash
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
+
+        let deleted_edges = tx.execute(
+            r#"
+            DELETE FROM graph_edges
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM next_graph_edges n
+                WHERE n.from_id = graph_edges.from_id
+                  AND n.to_id = graph_edges.to_id
+                  AND n.kind = graph_edges.kind
+            )
+            "#,
+            [],
+        )?;
+        let deleted_nodes = tx.execute(
+            r#"
+            DELETE FROM graph_nodes
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM next_graph_nodes n
+                WHERE n.id = graph_nodes.id
+            )
+            "#,
+            [],
+        )?;
+
+        tx.execute(
+            r#"
+            INSERT INTO graph_nodes
+                (id, kind, label, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+            SELECT id, kind, label, properties_json, provenance_json, freshness_json, row_hash, source_watermark
+            FROM next_graph_nodes
+            WHERE true
+            ON CONFLICT(id) DO UPDATE SET
+                kind = excluded.kind,
+                label = excluded.label,
+                properties_json = excluded.properties_json,
+                provenance_json = excluded.provenance_json,
+                freshness_json = excluded.freshness_json,
+                row_hash = excluded.row_hash,
+                source_watermark = excluded.source_watermark
+            WHERE graph_nodes.row_hash IS NOT excluded.row_hash
+            "#,
+            [],
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO graph_edges
+                (from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+            SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark
+            FROM next_graph_edges
+            WHERE true
+            ON CONFLICT(from_id, to_id, kind) DO UPDATE SET
+                properties_json = excluded.properties_json,
+                provenance_json = excluded.provenance_json,
+                freshness_json = excluded.freshness_json,
+                row_hash = excluded.row_hash,
+                source_watermark = excluded.source_watermark
+            WHERE graph_edges.row_hash IS NOT excluded.row_hash
+            "#,
+            [],
+        )?;
         tx.execute(
             r#"
             INSERT INTO graph_projection_versions
@@ -945,6 +1315,30 @@ impl SqliteGraphStore {
                 &source_watermark,
                 observed_at_unix,
             ),
+        )?;
+        let pruned_node_tombstones = tx.execute(
+            r#"
+            DELETE FROM graph_tombstones
+            WHERE row_kind = 'node'
+              AND EXISTS (
+                SELECT 1
+                FROM next_graph_nodes n
+                WHERE graph_tombstones.row_key = 'node:' || n.id
+              )
+            "#,
+            [],
+        )?;
+        let pruned_edge_tombstones = tx.execute(
+            r#"
+            DELETE FROM graph_tombstones
+            WHERE row_kind = 'edge'
+              AND EXISTS (
+                SELECT 1
+                FROM next_graph_edges n
+                WHERE graph_tombstones.row_key = 'edge:' || n.edge_key
+              )
+            "#,
+            [],
         )?;
         {
             let mut insert_node_tombstone = tx.prepare(
@@ -975,10 +1369,20 @@ impl SqliteGraphStore {
             }
         }
         tx.commit()?;
+        let file_size_bytes_after = sqlite_database_size_bytes(&self.conn).ok();
         Ok(SqliteProjectionRefresh {
             scope,
             projection_version,
             source_watermark,
+            upserted_nodes: projection.nodes.len().saturating_sub(unchanged_nodes),
+            upserted_edges: projection.edges.len().saturating_sub(unchanged_edges),
+            unchanged_nodes,
+            unchanged_edges,
+            deleted_nodes,
+            deleted_edges,
+            pruned_tombstones: pruned_node_tombstones + pruned_edge_tombstones,
+            file_size_bytes_before,
+            file_size_bytes_after,
             tombstoned_nodes,
             tombstoned_edges,
         })
@@ -1005,24 +1409,103 @@ impl SqliteGraphStore {
             .map_err(Into::into)
     }
 
-    fn existing_node_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id FROM graph_nodes ORDER BY id")?;
-        collect_rows(stmt.query_map([], |row| row.get(0))?)
+    fn neighborhood_edges_for_page(
+        &self,
+        center_id: &str,
+        depth: usize,
+        kind: Option<&str>,
+        node_ids: &[String],
+    ) -> Result<Vec<GraphEdge>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", node_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut sql = String::from(
+            r#"
+            WITH RECURSIVE walk(id, depth) AS (
+                SELECT ?, 0
+                UNION
+                SELECT e.to_id, walk.depth + 1
+                FROM walk
+                JOIN graph_edges e INDEXED BY idx_graph_edges_from_kind
+                    ON e.from_id = walk.id
+                WHERE walk.depth < ?
+            "#,
+        );
+        let mut values = vec![
+            Value::Text(center_id.to_string()),
+            Value::Integer(depth as i64),
+        ];
+        if let Some(kind) = kind {
+            sql.push_str(" AND e.kind = ?");
+            values.push(Value::Text(kind.to_string()));
+        }
+        sql.push_str(
+            r#"
+            ),
+            walk_edges AS (
+                SELECT e.from_id, e.to_id, e.kind
+                FROM walk
+                JOIN graph_edges e INDEXED BY idx_graph_edges_from_kind
+                    ON e.from_id = walk.id
+                WHERE walk.depth < ?
+            "#,
+        );
+        values.push(Value::Integer(depth as i64));
+        if let Some(kind) = kind {
+            sql.push_str(" AND e.kind = ?");
+            values.push(Value::Text(kind.to_string()));
+        }
+        sql.push_str(&format!(
+            r#"
+            )
+            SELECT DISTINCT
+                g.from_id, g.to_id, g.kind, g.properties_json, g.provenance_json, g.freshness_json
+            FROM graph_edges g
+            JOIN walk_edges w
+                ON w.from_id = g.from_id AND w.to_id = g.to_id AND w.kind = g.kind
+            WHERE g.from_id IN ({placeholders})
+              AND g.to_id IN ({placeholders})
+            ORDER BY g.from_id, g.kind, g.to_id
+            "#
+        ));
+        values.extend(node_ids.iter().cloned().map(Value::Text));
+        values.extend(node_ids.iter().cloned().map(Value::Text));
+        let mut stmt = self.conn.prepare(&sql)?;
+        collect_rows(stmt.query_map(params_from_iter(values.iter()), edge_from_row)?)
     }
+}
 
-    fn existing_edge_keys(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT from_id, to_id, kind FROM graph_edges ORDER BY from_id, kind, to_id",
-        )?;
-        collect_rows(stmt.query_map([], |row| {
-            let from_id: String = row.get(0)?;
-            let to_id: String = row.get(1)?;
-            let kind: String = row.get(2)?;
-            Ok(ConvexEdgeRow::stable_key(&from_id, &to_id, &kind))
-        })?)
+fn sqlite_json_path(key: &str) -> Result<String> {
+    if key.is_empty() || key.chars().any(char::is_control) {
+        bail!("graph property filter key must be non-empty and printable");
     }
+    let escaped = key.replace('\\', "\\\\").replace('"', "\\\"");
+    Ok(format!("$.\"{escaped}\""))
+}
+
+fn sqlite_query_plan(conn: &Connection, sql: &str, values: &[Value]) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+    collect_rows(stmt.query_map(params_from_iter(values.iter()), |row| {
+        row.get::<_, String>(3)
+    })?)
+}
+
+fn sqlite_query_plan_diagnostics(plan: &[String], expected_index: &str) -> Vec<String> {
+    let mut diagnostics = vec![format!(
+        "sqlite query pushdown active; plan: {}",
+        plan.join(" | ")
+    )];
+    if plan.iter().any(|row| row.contains(expected_index)) {
+        diagnostics.push(format!("sqlite query plan uses {expected_index}"));
+    } else {
+        diagnostics.push(format!(
+            "sqlite query plan did not report {expected_index}; inspect before adding JSON-property indexes or materialized property rows"
+        ));
+    }
+    diagnostics
 }
 
 impl GraphStore for SqliteGraphStore {
@@ -1030,14 +1513,16 @@ impl GraphStore for SqliteGraphStore {
         self.conn.execute(
             r#"
             INSERT INTO graph_nodes
-                (id, kind, label, properties_json, provenance_json, freshness_json)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                (id, kind, label, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
             ON CONFLICT(id) DO UPDATE SET
                 kind = excluded.kind,
                 label = excluded.label,
                 properties_json = excluded.properties_json,
                 provenance_json = excluded.provenance_json,
-                freshness_json = excluded.freshness_json
+                freshness_json = excluded.freshness_json,
+                row_hash = excluded.row_hash,
+                source_watermark = excluded.source_watermark
             "#,
             (
                 &node.id,
@@ -1046,6 +1531,7 @@ impl GraphStore for SqliteGraphStore {
                 to_json(&node.properties)?,
                 to_json(&node.provenance)?,
                 optional_to_json(&node.freshness)?,
+                row_hash(node)?,
             ),
         )?;
         Ok(())
@@ -1055,12 +1541,14 @@ impl GraphStore for SqliteGraphStore {
         self.conn.execute(
             r#"
             INSERT INTO graph_edges
-                (from_id, to_id, kind, properties_json, provenance_json, freshness_json)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                (from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
             ON CONFLICT(from_id, to_id, kind) DO UPDATE SET
                 properties_json = excluded.properties_json,
                 provenance_json = excluded.provenance_json,
-                freshness_json = excluded.freshness_json
+                freshness_json = excluded.freshness_json,
+                row_hash = excluded.row_hash,
+                source_watermark = excluded.source_watermark
             "#,
             (
                 &edge.from_id,
@@ -1069,6 +1557,7 @@ impl GraphStore for SqliteGraphStore {
                 to_json(&edge.properties)?,
                 to_json(&edge.provenance)?,
                 optional_to_json(&edge.freshness)?,
+                row_hash(edge)?,
             ),
         )?;
         Ok(())
@@ -1138,6 +1627,78 @@ impl GraphStore for SqliteGraphStore {
         collect_rows(stmt.query_map([kind], node_from_row)?)
     }
 
+    fn paged_nodes_by_kind(
+        &self,
+        kind: &str,
+        options: GraphQueryOptions,
+    ) -> Result<GraphPagedSubgraph> {
+        let mut sql = String::from(
+            r#"
+            SELECT id, kind, label, properties_json, provenance_json, freshness_json
+            FROM graph_nodes
+            WHERE kind = ?
+            "#,
+        );
+        let mut values = vec![Value::Text(kind.to_string())];
+        for filter in &options.property_filters {
+            sql.push_str(" AND json_extract(properties_json, ?) = ?");
+            values.push(Value::Text(sqlite_json_path(&filter.key)?));
+            values.push(Value::Text(filter.value.clone()));
+        }
+        if let Some(cursor) = &options.cursor {
+            sql.push_str(" AND id > ?");
+            values.push(Value::Text(cursor.clone()));
+        }
+        sql.push_str(" ORDER BY id");
+        if let Some(limit) = options.limit {
+            sql.push_str(" LIMIT ?");
+            values.push(Value::Integer(limit.saturating_add(1) as i64));
+        }
+
+        let plan = sqlite_query_plan(&self.conn, &sql, &values)?;
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut nodes =
+            collect_rows(stmt.query_map(params_from_iter(values.iter()), node_from_row)?)?;
+        let before_limit = nodes.len();
+        let mut next_cursor = None;
+        if let Some(limit) = options.limit
+            && nodes.len() > limit
+        {
+            next_cursor = nodes
+                .get(limit.saturating_sub(1))
+                .map(|node| node.id.clone());
+            nodes.truncate(limit);
+        }
+        let mut diagnostics = sqlite_query_plan_diagnostics(&plan, "idx_graph_nodes_kind");
+        if !options.property_filters.is_empty() {
+            diagnostics.push(
+                "property filters were evaluated by SQLite json_extract before paging".to_string(),
+            );
+        }
+        if options.cursor.is_some() {
+            diagnostics.push("cursor is exclusive and pushed into SQLite by node id".to_string());
+        }
+        if next_cursor.is_some() {
+            diagnostics.push(
+                "result was truncated; pass page.next_cursor as --cursor for the next page"
+                    .to_string(),
+            );
+        }
+        Ok(GraphPagedSubgraph {
+            page: GraphQueryPage {
+                cursor: options.cursor,
+                limit: options.limit,
+                next_cursor,
+                returned_nodes: nodes.len(),
+                returned_edges: 0,
+                truncated: options.limit.is_some_and(|limit| before_limit > limit),
+                diagnostics,
+            },
+            nodes,
+            edges: Vec::new(),
+        })
+    }
+
     fn outgoing_edges(&self, from_id: &str, kind: Option<&str>) -> Result<Vec<GraphEdge>> {
         match kind {
             Some(kind) => {
@@ -1165,15 +1726,258 @@ impl GraphStore for SqliteGraphStore {
         }
     }
 
+    fn neighborhood(
+        &self,
+        center_id: &str,
+        depth: usize,
+        kind: Option<&str>,
+    ) -> Result<Option<GraphSubgraph>> {
+        self.paged_neighborhood(center_id, depth, kind, GraphQueryOptions::default())
+            .map(|result| {
+                result.map(|result| {
+                    GraphSubgraph {
+                        nodes: result.nodes,
+                        edges: result.edges,
+                    }
+                    .sorted()
+                })
+            })
+    }
+
+    fn paged_neighborhood(
+        &self,
+        center_id: &str,
+        depth: usize,
+        kind: Option<&str>,
+        options: GraphQueryOptions,
+    ) -> Result<Option<GraphPagedSubgraph>> {
+        if self.node(center_id)?.is_none() {
+            return Ok(None);
+        }
+        let mut node_sql = String::from(
+            r#"
+            WITH RECURSIVE walk(id, depth) AS (
+                SELECT ?, 0
+                UNION
+                SELECT e.to_id, walk.depth + 1
+                FROM walk
+                JOIN graph_edges e INDEXED BY idx_graph_edges_from_kind
+                    ON e.from_id = walk.id
+                WHERE walk.depth < ?
+            "#,
+        );
+        let mut values = vec![
+            Value::Text(center_id.to_string()),
+            Value::Integer(depth as i64),
+        ];
+        if let Some(kind) = kind {
+            node_sql.push_str(" AND e.kind = ?");
+            values.push(Value::Text(kind.to_string()));
+        }
+        node_sql.push_str(
+            r#"
+            )
+            SELECT DISTINCT n.id, n.kind, n.label, n.properties_json, n.provenance_json, n.freshness_json
+            FROM walk
+            JOIN graph_nodes n ON n.id = walk.id
+            WHERE 1 = 1
+            "#,
+        );
+        for filter in &options.property_filters {
+            node_sql.push_str(" AND json_extract(n.properties_json, ?) = ?");
+            values.push(Value::Text(sqlite_json_path(&filter.key)?));
+            values.push(Value::Text(filter.value.clone()));
+        }
+        if let Some(cursor) = &options.cursor {
+            node_sql.push_str(" AND n.id > ?");
+            values.push(Value::Text(cursor.clone()));
+        }
+        node_sql.push_str(" ORDER BY n.id");
+        if let Some(limit) = options.limit {
+            node_sql.push_str(" LIMIT ?");
+            values.push(Value::Integer(limit.saturating_add(1) as i64));
+        }
+        let plan = sqlite_query_plan(&self.conn, &node_sql, &values)?;
+        let mut stmt = self.conn.prepare(&node_sql)?;
+        let mut nodes =
+            collect_rows(stmt.query_map(params_from_iter(values.iter()), node_from_row)?)?;
+        let before_limit = nodes.len();
+        let mut next_cursor = None;
+        if let Some(limit) = options.limit
+            && nodes.len() > limit
+        {
+            next_cursor = nodes
+                .get(limit.saturating_sub(1))
+                .map(|node| node.id.clone());
+            nodes.truncate(limit);
+        }
+        let node_ids = nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>();
+        let edges = self.neighborhood_edges_for_page(center_id, depth, kind, &node_ids)?;
+        let mut diagnostics = sqlite_query_plan_diagnostics(&plan, "idx_graph_edges_from_kind");
+        if !options.property_filters.is_empty() {
+            diagnostics.push(
+                "property filters were evaluated by SQLite json_extract before paging".to_string(),
+            );
+        }
+        if options.cursor.is_some() {
+            diagnostics.push("cursor is exclusive and pushed into SQLite by node id".to_string());
+        }
+        if next_cursor.is_some() {
+            diagnostics.push(
+                "result was truncated; pass page.next_cursor as --cursor for the next page"
+                    .to_string(),
+            );
+        }
+        Ok(Some(GraphPagedSubgraph {
+            page: GraphQueryPage {
+                cursor: options.cursor,
+                limit: options.limit,
+                next_cursor,
+                returned_nodes: nodes.len(),
+                returned_edges: edges.len(),
+                truncated: options.limit.is_some_and(|limit| before_limit > limit),
+                diagnostics,
+            },
+            nodes,
+            edges,
+        }))
+    }
+
     fn shortest_path(
         &self,
         from_id: &str,
         to_id: &str,
         kind: Option<&str>,
     ) -> Result<Option<GraphPath>> {
-        shortest_path_using_outgoing(from_id, to_id, kind, |current, kind| {
-            self.outgoing_edges(current, kind)
-        })
+        self.shortest_path_with_max_hops(from_id, to_id, kind, None)
+    }
+
+    fn shortest_path_with_max_hops(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        kind: Option<&str>,
+        max_hops: Option<usize>,
+    ) -> Result<Option<GraphPath>> {
+        if from_id == to_id {
+            return Ok(Some(GraphPath {
+                nodes: vec![from_id.to_string()],
+                hops: 0,
+            }));
+        }
+        let mut sql = String::from(
+            r#"
+            WITH RECURSIVE walk(id, depth, path) AS (
+                SELECT ?, 0, char(31) || ? || char(31)
+                UNION ALL
+                SELECT e.to_id, walk.depth + 1, walk.path || e.to_id || char(31)
+                FROM walk
+                JOIN graph_edges e INDEXED BY idx_graph_edges_from_kind
+                    ON e.from_id = walk.id
+                WHERE instr(walk.path, char(31) || e.to_id || char(31)) = 0
+            "#,
+        );
+        let mut values = vec![
+            Value::Text(from_id.to_string()),
+            Value::Text(from_id.to_string()),
+        ];
+        if let Some(kind) = kind {
+            sql.push_str(" AND e.kind = ?");
+            values.push(Value::Text(kind.to_string()));
+        }
+        if let Some(max_hops) = max_hops {
+            sql.push_str(" AND walk.depth < ?");
+            values.push(Value::Integer(max_hops as i64));
+        }
+        sql.push_str(
+            r#"
+            )
+            SELECT path, depth
+            FROM walk
+            WHERE id = ?
+            ORDER BY depth
+            LIMIT 1
+            "#,
+        );
+        values.push(Value::Text(to_id.to_string()));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let row = stmt
+            .query_row(params_from_iter(values.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+            })
+            .optional()?;
+        Ok(row.map(|(path, hops)| GraphPath {
+            nodes: path
+                .split('\u{1f}')
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect(),
+            hops,
+        }))
+    }
+
+    fn reachable_nodes_by_kind(
+        &self,
+        from_id: &str,
+        kind: &str,
+        depth: usize,
+        limit: usize,
+    ) -> Result<Vec<(GraphNode, GraphPath)>> {
+        let mut sql = String::from(
+            r#"
+            WITH RECURSIVE walk(id, depth, path) AS (
+                SELECT ?, 0, char(31) || ? || char(31)
+                UNION ALL
+                SELECT e.to_id, walk.depth + 1, walk.path || e.to_id || char(31)
+                FROM walk
+                JOIN graph_edges e INDEXED BY idx_graph_edges_from_kind
+                    ON e.from_id = walk.id
+                WHERE walk.depth < ?
+                  AND instr(walk.path, char(31) || e.to_id || char(31)) = 0
+            ),
+            ranked AS (
+                SELECT
+                    n.id, n.kind, n.label, n.properties_json, n.provenance_json, n.freshness_json,
+                    walk.path, walk.depth,
+                    ROW_NUMBER() OVER (PARTITION BY n.id ORDER BY walk.depth, n.label, n.id) AS rn
+                FROM walk
+                JOIN graph_nodes n ON n.id = walk.id
+                WHERE n.kind = ? AND n.id <> ?
+            )
+            SELECT id, kind, label, properties_json, provenance_json, freshness_json, path, depth
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY depth, label, id
+            "#,
+        );
+        let mut values = vec![
+            Value::Text(from_id.to_string()),
+            Value::Text(from_id.to_string()),
+            Value::Integer(depth as i64),
+            Value::Text(kind.to_string()),
+            Value::Text(from_id.to_string()),
+        ];
+        if limit > 0 {
+            sql.push_str(" LIMIT ?");
+            values.push(Value::Integer(limit as i64));
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        collect_rows(stmt.query_map(params_from_iter(values.iter()), |row| {
+            let node = node_from_row(row)?;
+            let path: String = row.get(6)?;
+            let hops: usize = row.get(7)?;
+            Ok((
+                node,
+                GraphPath {
+                    nodes: path
+                        .split('\u{1f}')
+                        .filter(|part| !part.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                    hops,
+                },
+            ))
+        })?)
     }
 }
 
@@ -1181,6 +1985,7 @@ fn shortest_path_using_outgoing(
     from_id: &str,
     to_id: &str,
     kind: Option<&str>,
+    max_hops: Option<usize>,
     mut outgoing_edges: impl FnMut(&str, Option<&str>) -> Result<Vec<GraphEdge>>,
 ) -> Result<Option<GraphPath>> {
     if from_id == to_id {
@@ -1196,6 +2001,10 @@ fn shortest_path_using_outgoing(
     queue.push_back(from_id.to_string());
 
     while let Some(current) = queue.pop_front() {
+        let current_depth = parent_depth(&parent, &current);
+        if max_hops.is_some_and(|max_hops| current_depth >= max_hops) {
+            continue;
+        }
         for edge in outgoing_edges(&current, kind)? {
             if parent.contains_key(&edge.to_id) {
                 continue;
@@ -1222,8 +2031,26 @@ fn shortest_path_using_outgoing(
     Ok(None)
 }
 
+fn parent_depth(parent: &BTreeMap<String, String>, id: &str) -> usize {
+    let mut depth = 0usize;
+    let mut cursor = id;
+    while let Some(previous) = parent.get(cursor) {
+        if previous.is_empty() {
+            break;
+        }
+        depth += 1;
+        cursor = previous;
+    }
+    depth
+}
+
 fn to_json<T: Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(value).map_err(Into::into)
+}
+
+fn row_hash<T: Serialize>(value: &T) -> Result<String> {
+    let payload = serde_json::to_vec(value)?;
+    Ok(blake3::hash(&payload).to_hex().to_string())
 }
 
 fn optional_to_json<T: Serialize>(value: &Option<T>) -> Result<Option<String>> {
@@ -1296,6 +2123,12 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default()
+}
+
+fn sqlite_database_size_bytes(conn: &Connection) -> Result<u64> {
+    let page_count: u64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    Ok(page_count.saturating_mul(page_size))
 }
 
 #[cfg(test)]
@@ -1660,9 +2493,27 @@ mod tests {
         assert_eq!(refresh.source_watermark.as_deref(), Some("commit-b"));
         assert_eq!(refresh.tombstoned_nodes, vec!["topic:egress".to_string()]);
         assert_eq!(refresh.tombstoned_edges.len(), 1);
+        assert_eq!(refresh.deleted_nodes, 1);
+        assert_eq!(refresh.deleted_edges, 1);
+        assert_eq!(refresh.unchanged_nodes, 3);
+        assert_eq!(refresh.upserted_nodes, 0);
         let version = store.projection_version("root").unwrap().unwrap();
         assert_eq!(version.projection_version, "fixture-v2");
         assert_eq!(version.source_watermark.as_deref(), Some("commit-b"));
+
+        projection
+            .nodes
+            .push(GraphNode::new("topic:egress", "topic", "Egress"));
+        let refresh = store
+            .replace_projection_with_version(
+                "root",
+                &projection,
+                Some("fixture-v3"),
+                Some("commit-c".to_string()),
+            )
+            .unwrap();
+        assert_eq!(refresh.pruned_tombstones, 1);
+        assert_eq!(refresh.tombstoned_nodes, Vec::<String>::new());
     }
 
     #[test]
@@ -1729,6 +2580,12 @@ mod tests {
             vec!["node:000".to_string(), "node:064".to_string()]
         );
         assert_eq!(refresh.tombstoned_edges.len(), 3);
+        assert_eq!(refresh.deleted_nodes, 2);
+        assert_eq!(refresh.deleted_edges, 3);
+        assert_eq!(refresh.unchanged_nodes, 126);
+        assert_eq!(refresh.unchanged_edges, 124);
+        assert_eq!(refresh.upserted_nodes, 0);
+        assert_eq!(refresh.upserted_edges, 0);
         assert_eq!(
             store
                 .projection_version("root")
