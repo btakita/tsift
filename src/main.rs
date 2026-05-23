@@ -842,6 +842,7 @@ enum GraphDbExperimentalBackend {
     DuckdbDuckpgq,
     Falkordb,
     Ladybug,
+    Kuzu,
 }
 
 impl GraphDbExperimentalBackend {
@@ -850,6 +851,7 @@ impl GraphDbExperimentalBackend {
             Self::DuckdbDuckpgq => "duckdb-duckpgq",
             Self::Falkordb => "falkordb",
             Self::Ladybug => "ladybug",
+            Self::Kuzu => "kuzu",
         }
     }
 
@@ -858,6 +860,38 @@ impl GraphDbExperimentalBackend {
             Self::DuckdbDuckpgq => "DuckDB/DuckPGQ read-only prototype",
             Self::Falkordb => "FalkorDB read-only prototype",
             Self::Ladybug => "Ladybug read-only prototype",
+            Self::Kuzu => "Kuzu (Vela-Engineering/kuzu) read-only prototype",
+        }
+    }
+
+    fn projection_load(self) -> &'static str {
+        match self {
+            Self::Kuzu => {
+                "provider-neutral rows loaded into a Kuzu-compatible in-process read snapshot for parity and performance gates; production Vela-Engineering/kuzu storage remains behind a future optional adapter"
+            }
+            _ => {
+                "provider-neutral rows loaded into a dependency-free in-process read snapshot for parity and performance gates"
+            }
+        }
+    }
+
+    fn lock_behavior(self) -> &'static str {
+        match self {
+            Self::Kuzu => {
+                "read-only Kuzu prototype snapshot; no SQLite writer lock is taken during benchmarks, and production Vela-Engineering/kuzu promotion must prove concurrent writer semantics before replacing SQLite"
+            }
+            _ => "read-only snapshot/row adapter; no writer lock is taken during query benchmarks",
+        }
+    }
+
+    fn install_portability(self) -> &'static str {
+        match self {
+            Self::Kuzu => {
+                "prototype is dependency-free in this binary; production Vela-Engineering/kuzu integration must stay optional so cargo build/install works without a native Kuzu toolchain"
+            }
+            _ => {
+                "prototype is dependency-free in this binary; a production engine adapter must remain optional before promotion"
+            }
         }
     }
 
@@ -866,9 +900,10 @@ impl GraphDbExperimentalBackend {
             "duckdb-duckpgq" | "duckdb" | "duckpgq" => Ok(Self::DuckdbDuckpgq),
             "falkordb" | "falkor" => Ok(Self::Falkordb),
             "ladybug" => Ok(Self::Ladybug),
+            "kuzu" | "vela-kuzu" => Ok(Self::Kuzu),
             _ => {
                 bail!(
-                    "unknown backend-eval candidate {raw:?}; expected duckdb-duckpgq, falkordb, or ladybug"
+                    "unknown backend-eval candidate {raw:?}; expected duckdb-duckpgq, falkordb, ladybug, or kuzu"
                 )
             }
         }
@@ -899,7 +934,7 @@ enum GraphDbQuery {
     },
     /// Benchmark experimental read-only GraphStore candidates against SQLite before promotion
     BackendEval {
-        /// Candidate backend prototype to evaluate. Repeatable; defaults to DuckDB/DuckPGQ, FalkorDB, and Ladybug. Values: duckdb-duckpgq, falkordb, ladybug.
+        /// Candidate backend prototype to evaluate. Repeatable; defaults to DuckDB/DuckPGQ, FalkorDB, Ladybug, and Kuzu. Values: duckdb-duckpgq, falkordb, ladybug, kuzu.
         #[arg(long = "candidate")]
         candidates: Vec<String>,
         /// Backlog ids, job handles, or graph node ids to use for evidence/planning benchmarks
@@ -6731,6 +6766,7 @@ struct GraphDbBackendEvalBackendReport {
     backend: String,
     adapter: String,
     read_only: bool,
+    projection_load: String,
     operations: Vec<GraphDbBackendEvalOperation>,
     total_micros: u128,
     parity: GraphDbBackendEvalParity,
@@ -9055,7 +9091,7 @@ fn graph_db_schema() -> GraphDbSchema {
                 description: "Return or apply the post-reconciliation SQLite graph compaction policy, including WAL checkpoint/VACUUM proof and guarded tombstone pruning",
             },
             GraphDbSchemaOperation {
-                command: "backend-eval [--candidate duckdb-duckpgq|falkordb|ladybug] [--target ID]",
+                command: "backend-eval [--candidate duckdb-duckpgq|falkordb|ladybug|kuzu] [--target ID]",
                 description: "Benchmark experimental read-only GraphStore backend prototypes against SQLite on real and synthetic projections across refresh/status/path/evidence/conflict-matrix/dispatch-trace and emit promotion hold/eligibility gates",
             },
             GraphDbSchemaOperation {
@@ -9999,6 +10035,9 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
     sqlite_signatures: Option<&[GraphDbBackendEvalSignature]>,
     extra_warnings: Vec<String>,
     prepared: &ConflictMatrixPreparedInputs,
+    projection_load: &str,
+    lock_behavior: &str,
+    install_portability: &str,
 ) -> (
     GraphDbBackendEvalBackendReport,
     Vec<GraphDbBackendEvalSignature>,
@@ -10119,28 +10158,17 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
         .map(|operation| operation.duration_micros)
         .sum();
     let parity = graph_db_backend_eval_parity(sqlite_signatures, &signatures);
-    let lock_behavior = if read_only {
-        "read-only snapshot/row adapter; no writer lock is taken during query benchmarks"
-    } else {
-        "SQLite WAL correctness store; refresh uses one transactional writer and read-only queries use snapshot recovery"
-    }
-    .to_string();
-    let install_portability = if read_only {
-        "prototype is dependency-free in this binary; a production engine adapter must remain optional before promotion"
-    } else {
-        "bundled rusqlite baseline; no external service or runtime required"
-    }
-    .to_string();
     (
         GraphDbBackendEvalBackendReport {
             backend: backend.to_string(),
             adapter: adapter.to_string(),
             read_only,
+            projection_load: projection_load.to_string(),
             operations,
             total_micros,
             parity,
-            lock_behavior,
-            install_portability,
+            lock_behavior: lock_behavior.to_string(),
+            install_portability: install_portability.to_string(),
         },
         signatures,
     )
@@ -10474,6 +10502,9 @@ fn graph_db_backend_eval_dataset(
         None,
         extra_warnings.clone(),
         prepared,
+        "SQLite refresh writes provider-neutral projection rows into graph.db transactionally",
+        "SQLite WAL correctness store; refresh uses one transactional writer and read-only queries use snapshot recovery",
+        "bundled rusqlite baseline; no external service or runtime required",
     );
 
     let mut backends = vec![sqlite_report];
@@ -10508,6 +10539,9 @@ fn graph_db_backend_eval_dataset(
             Some(&sqlite_signatures),
             extra_warnings.clone(),
             prepared,
+            candidate.projection_load(),
+            candidate.lock_behavior(),
+            candidate.install_portability(),
         );
         backends.push(candidate_report);
     }
@@ -10537,6 +10571,7 @@ fn cmd_graph_db_backend_eval(
             GraphDbExperimentalBackend::DuckdbDuckpgq,
             GraphDbExperimentalBackend::Falkordb,
             GraphDbExperimentalBackend::Ladybug,
+            GraphDbExperimentalBackend::Kuzu,
         ]
     } else {
         candidates
@@ -10784,6 +10819,9 @@ fn print_graph_db_backend_eval_human(report: &GraphDbBackendEvalReport) {
                 "  backend:{} total:{}us parity:{}",
                 backend.backend, backend.total_micros, backend.parity.matches_sqlite
             );
+            println!("    projection-load: {}", backend.projection_load);
+            println!("    lock-behavior: {}", backend.lock_behavior);
+            println!("    install-portability: {}", backend.install_portability);
             for operation in &backend.operations {
                 println!(
                     "    {} {} {}us",

@@ -41,7 +41,7 @@ tsift graph-db --path . evidence cvxa --depth 3 --limit 8 --json
 tsift conflict-matrix --path tasks/software/tsift.md cvxa --json
 tsift dependency-dag --path tasks/software/tsift.md cvxa --json
 tsift graph-db --path . doctor --json
-tsift graph-db --path . backend-eval --candidate falkordb --json
+tsift graph-db --path . backend-eval --candidate kuzu --json
 tsift graph-db --path . backend-eval --json | tsift metric-digest --baseline fixtures/graph-db-performance-history.json
 tsift traverse --path . --format html > traversal.html
 tsift semantic "graph navigation" --path . --kind concept --json
@@ -78,9 +78,11 @@ running DAG-shaped dispatch. Those orchestration surfaces include stable
 contract versions, evidence packet ids, projection hashes, replay commands, and
 repair commands so agent-doc can consume them as JSON rather than parsing prose.
 Use `tsift graph-db backend-eval` to compare SQLite against experimental
-read-only candidates with adaptive path probes, per-operation promotion gates,
-batched context-pack graph writes for source/worker context rows, and a
-`performance_gate`/`metric-digest` command for bounded regression review.
+read-only candidates, including the dependency-free Vela-Engineering/kuzu row
+prototype, with adaptive path probes, per-operation promotion gates, projection
+load/concurrent-writer/install-portability notes, batched context-pack graph
+writes for source/worker context rows, and a `performance_gate`/`metric-digest`
+command for bounded regression review.
 Use `tsift graph-db doctor` to validate local `graph.db` and Convex snapshot
 metadata before trusting operator handoffs. `tsift traverse --format html`
 renders the selected GraphStore slice as
