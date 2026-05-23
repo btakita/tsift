@@ -2139,6 +2139,10 @@ fn conflict_matrix_cli_composes_planner_evidence_and_worker_ownership() {
         json!(1),
         "{report}"
     );
+    assert_eq!(
+        report["inputs"]["shared_preparation"]["evidence_cache_status"], "computed",
+        "{report}"
+    );
     assert!(
         report["inputs"]["shared_preparation"]["source_handles"]
             .as_u64()
@@ -2189,6 +2193,22 @@ fn conflict_matrix_cli_composes_planner_evidence_and_worker_ownership() {
             .iter()
             .any(|command| command.as_str().unwrap().contains("graph-db --path")),
         "{report}"
+    );
+
+    let cached_report = assert_tsift_json(vec![
+        "conflict-matrix".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "gval".to_string(),
+    ]);
+    assert_eq!(
+        cached_report["inputs"]["preparation_cache"]["status"], "disk_hit",
+        "{cached_report}"
+    );
+    assert_eq!(
+        cached_report["inputs"]["shared_preparation"]["evidence_cache_status"], "disk_hit",
+        "{cached_report}"
     );
 }
 

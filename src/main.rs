@@ -6478,7 +6478,7 @@ struct GraphDbSchema {
     operations: Vec<GraphDbSchemaOperation>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct GraphDbFreshnessReport {
     status: String,
     fail_closed: bool,
@@ -6816,8 +6816,9 @@ const GRAPH_DB_BACKEND_EVAL_ALLOWED_REGRESSION_PERCENT: f64 = 10.0;
 const GRAPH_DB_BACKEND_EVAL_NORMALIZATION_ROW_UNIT: f64 = 1000.0;
 const GRAPH_DB_BACKEND_EVAL_MIN_SAMPLE_RUNS: usize = 3;
 const CONFLICT_MATRIX_PREPARATION_CACHE_VERSION: &str = "conflict-matrix-prep-v1";
+const CONFLICT_MATRIX_GRAPH_PREPARATION_CACHE_VERSION: &str = "conflict-matrix-graph-prep-v1";
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct GraphDbBackendEvalPhaseTiming {
     name: String,
     duration_micros: u128,
@@ -7091,7 +7092,7 @@ struct GraphDbCompactionReport {
     warnings: Vec<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct GraphDbEvidencePath {
     to: String,
     kind: String,
@@ -7102,20 +7103,20 @@ struct GraphDbEvidencePath {
     expand: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct GraphDbFixtureCoverage {
     test: String,
     fixture: String,
     assertions: Vec<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct GraphDbEvidenceReport {
     root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     scope: Option<String>,
     backend: String,
-    contract_version: &'static str,
+    contract_version: String,
     target: String,
     packet_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9699,7 +9700,7 @@ fn graph_db_evidence_report_from_store<S: GraphStore>(
         root: root.to_string_lossy().to_string(),
         scope: scope.map(str::to_string),
         backend: backend.to_string(),
-        contract_version: GRAPH_DB_EVIDENCE_CONTRACT_VERSION,
+        contract_version: GRAPH_DB_EVIDENCE_CONTRACT_VERSION.to_string(),
         target: target.to_string(),
         packet_id,
         projection_hash,
@@ -10646,7 +10647,8 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
         let graph_prepared = if let Some((targets, evidence)) = evidence_for_report.take() {
             let graph =
                 conflict_matrix_target_scoped_graph_snapshot(store, &evidence, depth, limit)?;
-            let shared_preparation = conflict_matrix_shared_preparation_summary(&graph, &evidence);
+            let shared_preparation =
+                conflict_matrix_shared_preparation_summary(&graph, &evidence, "memory_reuse");
             ConflictMatrixGraphPreparedInputs {
                 targets,
                 graph,
@@ -10659,7 +10661,7 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
                 scope,
                 backend,
                 targets,
-                &prepared.context_pack,
+                prepared,
                 depth,
                 limit,
                 store,
@@ -16005,7 +16007,57 @@ struct ConflictMatrixInputSummary {
     impact_command: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
+struct ConflictMatrixPreparedSourceWindow {
+    file: String,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ConflictMatrixPreparedContext {
+    target: String,
+    target_kind: String,
+    status_reminders: Vec<String>,
+    prompt_targets: Vec<String>,
+    touched_files: Vec<String>,
+    touched_symbols: Vec<String>,
+    files_changed: usize,
+    worker_context: Vec<String>,
+    source_windows: Vec<ConflictMatrixPreparedSourceWindow>,
+}
+
+impl ConflictMatrixPreparedContext {
+    fn from_context_pack(context_pack: &ContextPackReport) -> Self {
+        Self {
+            target: context_pack.target.clone(),
+            target_kind: context_pack.target_kind.clone(),
+            status_reminders: context_pack.status_reminders.clone(),
+            prompt_targets: context_pack.next_context.prompt_targets.clone(),
+            touched_files: context_pack.next_context.touched_files.clone(),
+            touched_symbols: context_pack.next_context.touched_symbols.clone(),
+            files_changed: context_pack.diff_digest.files_changed,
+            worker_context: context_pack
+                .exploration
+                .worker_context
+                .iter()
+                .map(|worker| worker.summary.clone())
+                .collect(),
+            source_windows: context_pack
+                .exploration
+                .source_windows
+                .iter()
+                .map(|window| ConflictMatrixPreparedSourceWindow {
+                    file: window.file.clone(),
+                    start: window.start,
+                    end: window.end,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct ConflictMatrixEvidencePacketSummary {
     target: String,
     packet_id: String,
@@ -16015,8 +16067,9 @@ struct ConflictMatrixEvidencePacketSummary {
     replay_command: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ConflictMatrixSharedPreparationSummary {
+    evidence_cache_status: String,
     graph_nodes: usize,
     graph_edges: usize,
     evidence_packets: usize,
@@ -16028,7 +16081,7 @@ struct ConflictMatrixSharedPreparationSummary {
     dispatch_trace_snapshot_edges: usize,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ConflictMatrixPreparationCacheSummary {
     version: String,
     key: String,
@@ -16146,14 +16199,14 @@ fn extract_conflict_target_refs(input: &str) -> Vec<String> {
 
 fn conflict_targets_from_context_pack(
     store: &impl GraphStore,
-    context_pack: &ContextPackReport,
+    context_pack: &ConflictMatrixPreparedContext,
 ) -> Result<Vec<String>> {
     let mut candidates = Vec::new();
-    for prompt in &context_pack.next_context.prompt_targets {
+    for prompt in &context_pack.prompt_targets {
         candidates.extend(extract_conflict_target_refs(prompt));
     }
-    for worker in &context_pack.exploration.worker_context {
-        candidates.extend(extract_conflict_target_refs(&worker.summary));
+    for worker in &context_pack.worker_context {
+        candidates.extend(extract_conflict_target_refs(worker));
     }
 
     let mut targets = Vec::new();
@@ -16172,7 +16225,7 @@ fn conflict_targets_from_context_pack(
 fn resolve_conflict_matrix_targets(
     store: &impl GraphStore,
     raw_targets: &[String],
-    context_pack: &ContextPackReport,
+    context_pack: &ConflictMatrixPreparedContext,
 ) -> Result<Vec<String>> {
     let mut targets = raw_targets
         .iter()
@@ -17253,23 +17306,17 @@ fn conflict_matrix_orchestration_observability(
 }
 
 fn conflict_matrix_context_summary(
-    context_pack: &ContextPackReport,
+    context_pack: &ConflictMatrixPreparedContext,
 ) -> ConflictMatrixContextSummary {
     ConflictMatrixContextSummary {
         target: context_pack.target.clone(),
         target_kind: context_pack.target_kind.clone(),
-        prompt_targets: context_pack.next_context.prompt_targets.clone(),
-        touched_files: context_pack.next_context.touched_files.clone(),
-        touched_symbols: context_pack.next_context.touched_symbols.clone(),
-        files_changed: context_pack.diff_digest.files_changed,
-        worker_context: context_pack
-            .exploration
-            .worker_context
-            .iter()
-            .map(|worker| worker.summary.clone())
-            .collect(),
+        prompt_targets: context_pack.prompt_targets.clone(),
+        touched_files: context_pack.touched_files.clone(),
+        touched_symbols: context_pack.touched_symbols.clone(),
+        files_changed: context_pack.files_changed,
+        worker_context: context_pack.worker_context.clone(),
         source_windows: context_pack
-            .exploration
             .source_windows
             .iter()
             .map(|window| format!("{}:{}-{}", window.file, window.start, window.end))
@@ -17421,9 +17468,9 @@ fn print_conflict_matrix_human(report: &ConflictMatrixReport, compact: bool) {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ConflictMatrixPreparedInputs {
-    context_pack: ContextPackReport,
+    context_pack: ConflictMatrixPreparedContext,
     cached_diff: diff_digest::DiffDigestReport,
     impact_report: impact::ImpactReport,
     preparation_cache: ConflictMatrixPreparationCacheSummary,
@@ -17436,7 +17483,7 @@ struct ConflictMatrixGraphSnapshot {
     index: ConflictMatrixGraphIndex,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ConflictMatrixPreparedEvidence {
     report: GraphDbEvidenceReport,
     summary: ConflictMatrixEvidencePacketSummary,
@@ -17445,6 +17492,17 @@ struct ConflictMatrixPreparedEvidence {
 struct ConflictMatrixGraphPreparedInputs {
     targets: Vec<String>,
     graph: ConflictMatrixGraphSnapshot,
+    evidence: Vec<ConflictMatrixPreparedEvidence>,
+    shared_preparation: ConflictMatrixSharedPreparationSummary,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ConflictMatrixGraphPreparedCache {
+    version: String,
+    key: String,
+    targets: Vec<String>,
+    nodes: Vec<SubstrateGraphNode>,
+    edges: Vec<SubstrateGraphEdge>,
     evidence: Vec<ConflictMatrixPreparedEvidence>,
     shared_preparation: ConflictMatrixSharedPreparationSummary,
 }
@@ -17460,6 +17518,39 @@ fn conflict_matrix_preparation_cache()
 
 fn hash_bytes_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
+}
+
+fn conflict_matrix_disk_cache_dir(root: &Path) -> PathBuf {
+    root.join(".tsift/conflict-matrix-cache")
+}
+
+fn conflict_matrix_disk_cache_path(root: &Path, kind: &str, key: &str) -> PathBuf {
+    conflict_matrix_disk_cache_dir(root)
+        .join(kind)
+        .join(format!("{key}.json"))
+}
+
+fn conflict_matrix_read_disk_cache<T: for<'de> Deserialize<'de>>(
+    root: &Path,
+    kind: &str,
+    key: &str,
+) -> Option<T> {
+    let path = conflict_matrix_disk_cache_path(root, kind, key);
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn conflict_matrix_write_disk_cache<T: Serialize>(root: &Path, kind: &str, key: &str, value: &T) {
+    let path = conflict_matrix_disk_cache_path(root, kind, key);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    if let Ok(bytes) = serde_json::to_vec(value) {
+        let _ = fs::write(path, bytes);
+    }
 }
 
 fn conflict_matrix_document_watermark(path: &Path) -> Result<String> {
@@ -17514,6 +17605,23 @@ fn conflict_matrix_preparation_cache_summary(
     })
 }
 
+fn conflict_matrix_prepared_inputs_cache_hit(
+    mut cached: ConflictMatrixPreparedInputs,
+    status: &str,
+    duration_micros: u128,
+    detail: &str,
+) -> ConflictMatrixPreparedInputs {
+    cached.preparation_cache.status = status.to_string();
+    cached
+        .preparation_timings
+        .retain(|phase| phase.name != "preparation_cache_lookup");
+    cached.preparation_timings.insert(
+        0,
+        graph_db_backend_eval_phase_timing("preparation_cache_lookup", duration_micros, detail),
+    );
+    cached
+}
+
 fn prepare_conflict_matrix_inputs(
     root: &Path,
     path: &Path,
@@ -17522,21 +17630,34 @@ fn prepare_conflict_matrix_inputs(
 ) -> Result<ConflictMatrixPreparedInputs> {
     let cache_lookup_started = Instant::now();
     let mut cache_summary = conflict_matrix_preparation_cache_summary(root, path, scope)?;
-    if let Some(mut cached) = conflict_matrix_preparation_cache()
+    if let Some(cached) = conflict_matrix_preparation_cache()
         .lock()
         .map_err(|_| anyhow::anyhow!("conflict-matrix preparation cache lock poisoned"))?
         .get(&cache_summary.key)
         .cloned()
     {
-        cached.preparation_cache.status = "memory_hit".to_string();
-        cached.preparation_timings.insert(
-            0,
-            graph_db_backend_eval_phase_timing(
-                "preparation_cache_lookup",
-                cache_lookup_started.elapsed().as_micros(),
-                "reused prepared context-pack, staged diff, and impact packet by source/document/staged-diff watermark",
-            ),
+        return Ok(conflict_matrix_prepared_inputs_cache_hit(
+            cached,
+            "memory_hit",
+            cache_lookup_started.elapsed().as_micros(),
+            "reused prepared context-pack, staged diff, and impact packet from memory by source/document/staged-diff watermark",
+        ));
+    }
+    if let Some(cached) = conflict_matrix_read_disk_cache::<ConflictMatrixPreparedInputs>(
+        root,
+        "inputs",
+        &cache_summary.key,
+    ) {
+        let cached = conflict_matrix_prepared_inputs_cache_hit(
+            cached,
+            "disk_hit",
+            cache_lookup_started.elapsed().as_micros(),
+            "reused prepared context-pack, staged diff, and impact packet from .tsift/conflict-matrix-cache by source/document/staged-diff watermark",
         );
+        conflict_matrix_preparation_cache()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("conflict-matrix preparation cache lock poisoned"))?
+            .insert(cached.preparation_cache.key.clone(), cached.clone());
         return Ok(cached);
     }
 
@@ -17546,7 +17667,7 @@ fn prepare_conflict_matrix_inputs(
         "no prepared packet matched the source/document/staged-diff watermark",
     )];
     cache_summary.status = "computed".to_string();
-    let (context_pack, context_pack_timings) = build_context_pack_report_with_profile(
+    let (context_pack_report, context_pack_timings) = build_context_pack_report_with_profile(
         path,
         None,
         None,
@@ -17554,6 +17675,7 @@ fn prepare_conflict_matrix_inputs(
         ResponseBudget::from_cli(None, None, Some(ResponseBudgetPreset::Normal), false),
     )?;
     preparation_timings.extend(context_pack_timings);
+    let context_pack = ConflictMatrixPreparedContext::from_context_pack(&context_pack_report);
     let cached_diff = graph_db_backend_eval_timed_phase(
         &mut preparation_timings,
         "staged_diff",
@@ -17597,6 +17719,7 @@ fn prepare_conflict_matrix_inputs(
         .lock()
         .map_err(|_| anyhow::anyhow!("conflict-matrix preparation cache lock poisoned"))?
         .insert(prepared.preparation_cache.key.clone(), prepared.clone());
+    conflict_matrix_write_disk_cache(root, "inputs", &prepared.preparation_cache.key, &prepared);
     Ok(prepared)
 }
 
@@ -17633,8 +17756,10 @@ fn conflict_matrix_evidence_packet_summary(
 fn conflict_matrix_shared_preparation_summary(
     graph: &ConflictMatrixGraphSnapshot,
     evidence: &[ConflictMatrixPreparedEvidence],
+    evidence_cache_status: &str,
 ) -> ConflictMatrixSharedPreparationSummary {
     ConflictMatrixSharedPreparationSummary {
+        evidence_cache_status: evidence_cache_status.to_string(),
         graph_nodes: graph.nodes.len(),
         graph_edges: graph.edges.len(),
         evidence_packets: evidence.len(),
@@ -17900,31 +18025,105 @@ fn collect_conflict_matrix_evidence_packets<S: GraphStore>(
     Ok(evidence)
 }
 
+fn conflict_matrix_graph_preparation_cache_key(
+    prepared: &ConflictMatrixPreparedInputs,
+    scope: Option<&str>,
+    backend: &str,
+    targets: &[String],
+    depth: usize,
+    limit: usize,
+    freshness: &GraphDbFreshnessReport,
+) -> Result<String> {
+    content_hash(&serde_json::json!({
+        "version": CONFLICT_MATRIX_GRAPH_PREPARATION_CACHE_VERSION,
+        "prepared_inputs_key": prepared.preparation_cache.key.as_str(),
+        "scope": scope.unwrap_or("root"),
+        "backend": backend,
+        "targets": targets,
+        "depth": depth,
+        "limit": limit,
+        "projection_version": freshness.projection_version.as_deref(),
+        "projection_hash": freshness.content_hash.as_deref(),
+        "source_watermark": freshness.source_watermark.as_deref(),
+    }))
+}
+
+fn conflict_matrix_graph_prepared_cache_hit(
+    cached: ConflictMatrixGraphPreparedCache,
+    status: &str,
+) -> ConflictMatrixGraphPreparedInputs {
+    let mut shared_preparation = cached.shared_preparation;
+    shared_preparation.evidence_cache_status = status.to_string();
+    let index = conflict_matrix_graph_index(&cached.nodes);
+    ConflictMatrixGraphPreparedInputs {
+        targets: cached.targets,
+        graph: ConflictMatrixGraphSnapshot {
+            nodes: cached.nodes,
+            edges: cached.edges,
+            index,
+        },
+        evidence: cached.evidence,
+        shared_preparation,
+    }
+}
+
+fn conflict_matrix_graph_prepared_cache_from_inputs(
+    key: &str,
+    prepared: &ConflictMatrixGraphPreparedInputs,
+) -> ConflictMatrixGraphPreparedCache {
+    ConflictMatrixGraphPreparedCache {
+        version: CONFLICT_MATRIX_GRAPH_PREPARATION_CACHE_VERSION.to_string(),
+        key: key.to_string(),
+        targets: prepared.targets.clone(),
+        nodes: prepared.graph.nodes.clone(),
+        edges: prepared.graph.edges.clone(),
+        evidence: prepared.evidence.clone(),
+        shared_preparation: prepared.shared_preparation.clone(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_conflict_matrix_graph_orchestration<S: GraphStore>(
     root: &Path,
     scope: Option<&str>,
     backend: &str,
     raw_targets: &[String],
-    context_pack: &ContextPackReport,
+    prepared: &ConflictMatrixPreparedInputs,
     depth: usize,
     limit: usize,
     store: &S,
     freshness: GraphDbFreshnessReport,
 ) -> Result<ConflictMatrixGraphPreparedInputs> {
-    let targets = resolve_conflict_matrix_targets(store, raw_targets, context_pack)?;
+    let targets = resolve_conflict_matrix_targets(store, raw_targets, &prepared.context_pack)?;
+    let graph_cache_key = conflict_matrix_graph_preparation_cache_key(
+        prepared, scope, backend, &targets, depth, limit, &freshness,
+    )?;
+    if let Some(cached) = conflict_matrix_read_disk_cache::<ConflictMatrixGraphPreparedCache>(
+        root,
+        "graph",
+        &graph_cache_key,
+    ) && cached.version == CONFLICT_MATRIX_GRAPH_PREPARATION_CACHE_VERSION
+        && cached.key == graph_cache_key
+        && cached.targets == targets
+    {
+        return Ok(conflict_matrix_graph_prepared_cache_hit(cached, "disk_hit"));
+    }
     let evidence = collect_conflict_matrix_evidence_packets(
         root, scope, backend, &targets, depth, limit, store, freshness,
     )?;
     let graph = conflict_matrix_target_scoped_graph_snapshot(store, &evidence, depth, limit)?;
-    let shared_preparation = conflict_matrix_shared_preparation_summary(&graph, &evidence);
+    let shared_preparation =
+        conflict_matrix_shared_preparation_summary(&graph, &evidence, "computed");
 
-    Ok(ConflictMatrixGraphPreparedInputs {
+    let prepared_graph = ConflictMatrixGraphPreparedInputs {
         targets,
         graph,
         evidence,
         shared_preparation,
-    })
+    };
+    let cache = conflict_matrix_graph_prepared_cache_from_inputs(&graph_cache_key, &prepared_graph);
+    conflict_matrix_write_disk_cache(root, "graph", &graph_cache_key, &cache);
+    Ok(prepared_graph)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -18076,7 +18275,7 @@ fn build_conflict_matrix_report_with_prepared<S: GraphStore>(
         scope,
         "sqlite",
         raw_targets,
-        &prepared.context_pack,
+        prepared,
         depth,
         limit,
         store,
@@ -18312,6 +18511,11 @@ fn dispatch_trace_shared_preparation_summary(
     conflict: &ConflictMatrixReport,
 ) -> ConflictMatrixSharedPreparationSummary {
     ConflictMatrixSharedPreparationSummary {
+        evidence_cache_status: conflict
+            .inputs
+            .shared_preparation
+            .evidence_cache_status
+            .clone(),
         graph_nodes: graph_nodes.len(),
         graph_edges: graph_edges.len(),
         evidence_packets: conflict.orchestration.evidence_packet_ids.len(),
@@ -18523,7 +18727,7 @@ fn build_dispatch_trace_report(
         scope,
         "sqlite",
         raw_targets,
-        &prepared.context_pack,
+        &prepared,
         depth,
         limit,
         &store,

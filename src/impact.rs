@@ -6,7 +6,7 @@ use crate::lint;
 use crate::summarize;
 use crate::walk;
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -18,7 +18,7 @@ pub struct ImpactOptions<'a> {
     pub limit: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImpactTestTarget {
     pub path: String,
     pub reasons: Vec<String>,
@@ -27,7 +27,7 @@ pub struct ImpactTestTarget {
     pub commands: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImpactReport {
     pub root: String,
     pub mode: diff_digest::DiffDigestMode,

@@ -3,12 +3,12 @@ use crate::lang::Lang;
 use crate::lint;
 use crate::summarize::{self, SummaryDb};
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffDigestMode {
     WorkingTree,
@@ -22,7 +22,7 @@ pub struct DiffDigestOptions<'a> {
     pub revision: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffDigestFileStatus {
     Added,
@@ -30,7 +30,7 @@ pub enum DiffDigestFileStatus {
     Deleted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffDigestSummaryState {
     Current,
@@ -39,13 +39,13 @@ pub enum DiffDigestSummaryState {
     Unavailable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffDigestSummarySnippet {
     pub symbol: String,
     pub summary: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffDigestFile {
     pub path: String,
     pub status: DiffDigestFileStatus,
@@ -59,7 +59,7 @@ pub struct DiffDigestFile {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffDigestReport {
     pub root: String,
     pub mode: DiffDigestMode,
