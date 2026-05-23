@@ -12,6 +12,7 @@ use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use substrate::{
     ConvexEdgeRow, ConvexNodeRow, ConvexProjectionRows, GraphEdge as SubstrateGraphEdge,
@@ -866,6 +867,9 @@ impl GraphDbExperimentalBackend {
 
     fn projection_load(self) -> &'static str {
         match self {
+            Self::Falkordb => {
+                "provider-neutral rows loaded into a FalkorDB-shaped read snapshot for parity and timing only; production FalkorDB storage remains behind backend-eval until a real adapter passes the full-projection gate"
+            }
             Self::Kuzu => {
                 "provider-neutral rows loaded into a Kuzu-compatible in-process read snapshot for parity and performance gates; production Vela-Engineering/kuzu storage remains behind a future optional adapter"
             }
@@ -877,6 +881,9 @@ impl GraphDbExperimentalBackend {
 
     fn lock_behavior(self) -> &'static str {
         match self {
+            Self::Falkordb => {
+                "read-only FalkorDB prototype snapshot; production promotion must prove multi-process writer behavior and local fallback semantics before replacing SQLite"
+            }
             Self::Kuzu => {
                 "read-only Kuzu prototype snapshot; no SQLite writer lock is taken during benchmarks, and production Vela-Engineering/kuzu promotion must prove concurrent writer semantics before replacing SQLite"
             }
@@ -886,12 +893,24 @@ impl GraphDbExperimentalBackend {
 
     fn install_portability(self) -> &'static str {
         match self {
+            Self::Falkordb => {
+                "prototype is dependency-free in this binary; production FalkorDB promotion must keep install optional and preserve cargo build/install without a service"
+            }
             Self::Kuzu => {
                 "prototype is dependency-free in this binary; production Vela-Engineering/kuzu integration must stay optional so cargo build/install works without a native Kuzu toolchain"
             }
             _ => {
                 "prototype is dependency-free in this binary; a production engine adapter must remain optional before promotion"
             }
+        }
+    }
+
+    fn prototype_hold_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Falkordb => Some(
+                "FalkorDB remains behind backend-eval until a production adapter beats SQLite on full_projection conflict-matrix, evidence, dispatch-trace, path tiers, install portability, and lock behavior",
+            ),
+            _ => None,
         }
     }
 
@@ -940,6 +959,9 @@ enum GraphDbQuery {
         /// Backlog ids, job handles, or graph node ids to use for evidence/planning benchmarks
         #[arg(long = "target")]
         targets: Vec<String>,
+        /// Include an opt-in full-project projection dataset in addition to the bounded path-hinted dataset
+        #[arg(long = "full-projection")]
+        full_projection: bool,
     },
     /// Build a bounded worker handoff evidence packet from a backlog id or job packet handle
     Evidence {
@@ -6788,10 +6810,12 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
 }
 
 const GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS: usize = 64;
+const GRAPH_DB_BACKEND_EVAL_EXTENDED_PATH_HOPS: [usize; 2] = [128, 256];
 const GRAPH_DB_BACKEND_EVAL_DIRECT_PATH_HOPS: usize = 1;
 const GRAPH_DB_BACKEND_EVAL_ALLOWED_REGRESSION_PERCENT: f64 = 10.0;
 const GRAPH_DB_BACKEND_EVAL_NORMALIZATION_ROW_UNIT: f64 = 1000.0;
 const GRAPH_DB_BACKEND_EVAL_MIN_SAMPLE_RUNS: usize = 3;
+const CONFLICT_MATRIX_PREPARATION_CACHE_VERSION: &str = "conflict-matrix-prep-v1";
 
 #[derive(Clone, Serialize)]
 struct GraphDbBackendEvalPhaseTiming {
@@ -6812,7 +6836,11 @@ struct GraphDbBackendEvalConfig {
     path_max_hops: usize,
     path_direct_hop_budget: usize,
     path_deep_chain_hop_budget: usize,
+    path_extended_hop_budgets: Vec<usize>,
     path_probe_strategy: String,
+    path_query_plan_checks: Vec<String>,
+    full_projection_enabled: bool,
+    full_projection_profile: String,
     normalization_row_unit: usize,
 }
 
@@ -9281,8 +9309,8 @@ fn graph_db_schema() -> GraphDbSchema {
                 description: "Return or apply the post-reconciliation SQLite graph compaction policy, including WAL checkpoint/VACUUM proof and guarded tombstone pruning",
             },
             GraphDbSchemaOperation {
-                command: "backend-eval [--candidate duckdb-duckpgq|falkordb|ladybug|kuzu] [--target ID]",
-                description: "Benchmark experimental read-only GraphStore backend prototypes against SQLite on real and synthetic projections across refresh/status/path/evidence/conflict-matrix/dispatch-trace and emit promotion hold/eligibility gates",
+                command: "backend-eval [--candidate duckdb-duckpgq|falkordb|ladybug|kuzu] [--target ID] [--full-projection]",
+                description: "Benchmark experimental read-only GraphStore backend prototypes against SQLite on bounded real, optional full-project, and synthetic projections across refresh/status/path tiers/evidence/conflict-matrix/dispatch-trace and emit promotion hold/eligibility gates",
             },
             GraphDbSchemaOperation {
                 command: "evidence <target> [--depth N] [--limit N]",
@@ -10306,6 +10334,51 @@ fn graph_db_backend_eval_path_targets(
     }))
 }
 
+fn graph_db_backend_eval_path_operation<S: GraphStore>(
+    store: &S,
+    configured_max_hops: usize,
+) -> (
+    GraphDbBackendEvalOperation,
+    Option<GraphDbBackendEvalSignature>,
+) {
+    let operation_name = if configured_max_hops == GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS {
+        "path_max_hops".to_string()
+    } else {
+        format!("path_max_hops_{configured_max_hops}")
+    };
+    graph_db_backend_eval_timed(&operation_name, || {
+        let (from, to, effective_max_hops) =
+            graph_db_backend_eval_path_targets(store, configured_max_hops)?
+                .context("backend-eval path probe requires at least one traversable edge")?;
+        let path = store.shortest_path_with_max_hops(&from, &to, None, Some(effective_max_hops))?;
+        let warning = if configured_max_hops > GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS {
+            Some(format!(
+                "{configured_max_hops}-hop tier is measured only; keep user-facing defaults at {} until repeated samples and SQLite query-plan checks pass",
+                GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS
+            ))
+        } else if path.is_none() && effective_max_hops == configured_max_hops {
+            Some(format!(
+                "path probe truncated at {configured_max_hops} hops before a route was found"
+            ))
+        } else {
+            None
+        };
+        Ok((
+            path.as_ref().map(|path| path.nodes.len()),
+            serde_json::json!({
+                "from": from,
+                "to": to,
+                "configured_max_hops": configured_max_hops,
+                "effective_max_hops": effective_max_hops,
+                "hops": path.as_ref().map(|path| path.hops),
+                "nodes": path.as_ref().map(|path| &path.nodes),
+                "found": path.is_some(),
+                "warning": warning,
+            }),
+        ))
+    })
+}
+
 fn graph_db_backend_eval_evidence_signature(report: &GraphDbEvidenceReport) -> serde_json::Value {
     serde_json::json!({
         "target": report.target,
@@ -10509,26 +10582,14 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
     operations.push(operation);
     signatures.extend(signature);
 
-    let (operation, signature) = graph_db_backend_eval_timed("path_max_hops", || {
-        let (from, to, effective_max_hops) =
-            graph_db_backend_eval_path_targets(store, GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS)?
-                .context("backend-eval path probe requires at least one traversable edge")?;
-        let path = store.shortest_path_with_max_hops(&from, &to, None, Some(effective_max_hops))?;
-        Ok((
-            path.as_ref().map(|path| path.nodes.len()),
-            serde_json::json!({
-                "from": from,
-                "to": to,
-                "configured_max_hops": GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS,
-                "effective_max_hops": effective_max_hops,
-                "hops": path.as_ref().map(|path| path.hops),
-                "nodes": path.as_ref().map(|path| &path.nodes),
-                "found": path.is_some(),
-            }),
-        ))
-    });
-    operations.push(operation);
-    signatures.extend(signature);
+    for configured_max_hops in std::iter::once(GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS)
+        .chain(GRAPH_DB_BACKEND_EVAL_EXTENDED_PATH_HOPS)
+    {
+        let (operation, signature) =
+            graph_db_backend_eval_path_operation(store, configured_max_hops);
+        operations.push(operation);
+        signatures.extend(signature);
+    }
 
     let (operation, signature) = graph_db_backend_eval_timed("evidence_target_resolution", || {
         let resolved = targets
@@ -10865,7 +10926,14 @@ fn graph_db_backend_eval_promotion(
                 reasons.push(format!("{} has failed benchmark operations", dataset.name));
             }
         }
-        let decision = if parity_everywhere && faster_everywhere {
+        let decision = if let Some(reason) = candidate.prototype_hold_reason() {
+            reasons.push(reason.to_string());
+            reasons.push(
+                "current bounded prototype timings are benchmark evidence, not a backend switch approval"
+                    .to_string(),
+            );
+            "hold"
+        } else if parity_everywhere && faster_everywhere {
             reasons.push(
                 "prototype gate passed; production promotion still requires the real engine adapter to preserve SQLite's bundled install and multi-process lock behavior"
                     .to_string(),
@@ -11002,7 +11070,7 @@ fn graph_db_backend_eval_performance_gate(
         ci_profile: "synthetic_high_degree + synthetic_deep_chain metrics are CI-safe and bounded"
             .to_string(),
         opt_in_real_profile:
-            "real projection metrics require an up-to-date local graph.db and remain opt-in"
+            "pass --full-projection to add the full-project dataset when checking for large projection regressions"
                 .to_string(),
         allowed_regression_percent: GRAPH_DB_BACKEND_EVAL_ALLOWED_REGRESSION_PERCENT,
         minimum_sample_runs: GRAPH_DB_BACKEND_EVAL_MIN_SAMPLE_RUNS,
@@ -11029,8 +11097,14 @@ fn graph_db_backend_eval_performance_gate(
             "synthetic_high_degree.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows".to_string(),
             "synthetic_deep_chain.sqlite.incident_edges.duration_micros_per_1k_graph_rows".to_string(),
             "synthetic_deep_chain.sqlite.path_max_hops.duration_micros".to_string(),
+            "synthetic_deep_chain.sqlite.path_max_hops_128.duration_micros".to_string(),
+            "synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros".to_string(),
             "synthetic_deep_chain.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows".to_string(),
             "synthetic_deep_chain.sqlite.path_max_hops.duration_micros_per_1k_graph_rows"
+                .to_string(),
+            "synthetic_deep_chain.sqlite.path_max_hops_128.duration_micros_per_1k_graph_rows"
+                .to_string(),
+            "synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros_per_1k_graph_rows"
                 .to_string(),
         ],
         digest_command: graph_db_backend_eval_metric_digest_command(root, scope),
@@ -11043,6 +11117,7 @@ struct GraphDbBackendEvalOptions<'a> {
     scope: Option<&'a str>,
     candidates: &'a [String],
     targets: &'a [String],
+    full_projection: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11146,6 +11221,7 @@ fn cmd_graph_db_backend_eval(
         scope,
         candidates,
         targets,
+        full_projection,
     } = options;
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     let candidates = if candidates.is_empty() {
@@ -11163,7 +11239,7 @@ fn cmd_graph_db_backend_eval(
     };
     let high_degree_nodes = 128;
     let high_degree_fanout = 8;
-    let deep_chain_nodes = 192;
+    let deep_chain_nodes = 320;
     let deep_chain_fanout = 1;
     let depth = 3;
     let limit = 8;
@@ -11180,6 +11256,13 @@ fn cmd_graph_db_backend_eval(
         "context-pack, cached diff digest, and cached impact inputs shared by conflict-matrix and dispatch-trace measurements",
         || prepare_conflict_matrix_inputs(&root, path, scope, impact_limit),
     )?;
+    phase_timings.extend(prepared.preparation_timings.iter().map(|phase| {
+        GraphDbBackendEvalPhaseTiming {
+            name: format!("conflict_matrix_preparation.{}", phase.name),
+            duration_micros: phase.duration_micros,
+            detail: phase.detail.clone(),
+        }
+    }));
     if !reused_cached_projection {
         graph_db_backend_eval_update_source_watermark(&root, path, scope)?;
     }
@@ -11303,15 +11386,66 @@ fn cmd_graph_db_backend_eval(
         &prepared,
     )?;
 
-    let targets = real_targets
+    let mut all_targets = real_targets
         .iter()
         .chain(high_degree_targets.iter())
         .chain(deep_chain_targets.iter())
         .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let datasets = vec![real_dataset, high_degree_dataset, deep_chain_dataset];
+        .collect::<BTreeSet<_>>();
+    let mut datasets = vec![real_dataset, high_degree_dataset, deep_chain_dataset];
+    if full_projection {
+        let full_source = graph_db_backend_eval_timed_phase(
+            &mut phase_timings,
+            "full_projection.source_graph_build",
+            "opt-in full-project source graph build; uses the project root as the path hint so bounded session projections cannot hide full-graph regressions",
+            || build_traversal_graph_source_with_options(&root, &root, scope, false),
+        )?;
+        let full_projection_rows = graph_db_backend_eval_timed_phase(
+            &mut phase_timings,
+            "full_projection.projection_rows",
+            "provider-neutral row construction for the opt-in full-project projection dataset",
+            || traversal_projection_from_graph(&root, scope, &full_source),
+        )?;
+        let full_projection_started = Instant::now();
+        let mut full_store = SqliteGraphStore::in_memory()?;
+        let _full_refresh = full_store.replace_projection_with_version(
+            scope.unwrap_or("root"),
+            &full_projection_rows,
+            Some(GRAPH_PROJECTION_VERSION),
+            graph_projection_content_hash(&full_projection_rows),
+        )?;
+        let full_projection_micros = full_projection_started.elapsed().as_micros();
+        let full_freshness = sqlite_graph_freshness(&full_store, scope.unwrap_or("root"))?;
+        let full_targets = graph_db_backend_eval_targets(&full_store, targets)?;
+        all_targets.extend(full_targets.iter().cloned());
+        let full_rows = convex_rows_from_graph_store(&full_store)?;
+        let full_refresh = graph_db_backend_eval_refresh_operation(
+            full_projection_micros,
+            full_rows.nodes.len() + full_rows.edges.len(),
+            serde_json::json!({
+                "nodes": full_rows.nodes.len(),
+                "edges": full_rows.edges.len(),
+            }),
+        );
+        datasets.push(graph_db_backend_eval_dataset(
+            "full_projection",
+            &root,
+            path,
+            scope,
+            &full_targets,
+            depth,
+            limit,
+            impact_limit,
+            &candidates,
+            &full_store,
+            full_freshness,
+            full_refresh,
+            full_rows,
+            full_source.warnings,
+            &prepared,
+        )?);
+    }
+    let targets = all_targets.into_iter().collect::<Vec<_>>();
     let promotion = graph_db_backend_eval_promotion(&datasets, &candidates);
     let mut metrics = graph_db_backend_eval_metrics(&datasets);
     if let Some(real_dataset) = datasets.iter().find(|dataset| dataset.name == "real") {
@@ -11343,9 +11477,21 @@ fn cmd_graph_db_backend_eval(
             path_max_hops: GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS,
             path_direct_hop_budget: GRAPH_DB_BACKEND_EVAL_DIRECT_PATH_HOPS,
             path_deep_chain_hop_budget: GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS,
+            path_extended_hop_budgets: GRAPH_DB_BACKEND_EVAL_EXTENDED_PATH_HOPS.to_vec(),
             path_probe_strategy:
-                "adaptive: use one-hop direct probes for high-degree/direct edges and 64-hop probes for deep-chain coverage"
+                "adaptive: use one-hop direct probes for high-degree/direct edges, 64-hop deep-chain default coverage, and measured 128/256-hop tiers without raising user-facing defaults"
                     .to_string(),
+            path_query_plan_checks: vec![
+                "SQLite bounded path probes must continue using idx_graph_edges_from_kind for frontier expansion".to_string(),
+                "128/256-hop tiers are benchmark fixtures until repeated samples and query-plan checks pass".to_string(),
+            ],
+            full_projection_enabled: full_projection,
+            full_projection_profile: if full_projection {
+                "included opt-in full_projection dataset built from the project root".to_string()
+            } else {
+                "disabled by default; pass --full-projection to add the full-project dataset"
+                    .to_string()
+            },
             normalization_row_unit: GRAPH_DB_BACKEND_EVAL_NORMALIZATION_ROW_UNIT as usize,
         },
         phase_timings,
@@ -11479,6 +11625,7 @@ fn cmd_graph_db(
         GraphDbQuery::BackendEval {
             candidates,
             targets,
+            full_projection,
         } => {
             return cmd_graph_db_backend_eval(
                 GraphDbBackendEvalOptions {
@@ -11486,6 +11633,7 @@ fn cmd_graph_db(
                     scope,
                     candidates,
                     targets,
+                    full_projection: *full_projection,
                 },
                 format,
             );
@@ -15850,6 +15998,8 @@ struct ConflictMatrixInputSummary {
     graph_db_evidence_targets: Vec<String>,
     evidence_packets: Vec<ConflictMatrixEvidencePacketSummary>,
     shared_preparation: ConflictMatrixSharedPreparationSummary,
+    preparation_cache: ConflictMatrixPreparationCacheSummary,
+    preparation_timings: Vec<GraphDbBackendEvalPhaseTiming>,
     context_pack_command: String,
     cached_diff_command: String,
     impact_command: String,
@@ -15876,6 +16026,16 @@ struct ConflictMatrixSharedPreparationSummary {
     semantic_rows: usize,
     dispatch_trace_snapshot_nodes: usize,
     dispatch_trace_snapshot_edges: usize,
+}
+
+#[derive(Clone, Serialize)]
+struct ConflictMatrixPreparationCacheSummary {
+    version: String,
+    key: String,
+    status: String,
+    source_watermark: String,
+    document_watermark: String,
+    staged_diff_watermark: String,
 }
 
 #[derive(Serialize)]
@@ -17261,10 +17421,13 @@ fn print_conflict_matrix_human(report: &ConflictMatrixReport, compact: bool) {
     }
 }
 
+#[derive(Clone)]
 struct ConflictMatrixPreparedInputs {
     context_pack: ContextPackReport,
     cached_diff: diff_digest::DiffDigestReport,
     impact_report: impact::ImpactReport,
+    preparation_cache: ConflictMatrixPreparationCacheSummary,
+    preparation_timings: Vec<GraphDbBackendEvalPhaseTiming>,
 }
 
 struct ConflictMatrixGraphSnapshot {
@@ -17286,42 +17449,155 @@ struct ConflictMatrixGraphPreparedInputs {
     shared_preparation: ConflictMatrixSharedPreparationSummary,
 }
 
+static CONFLICT_MATRIX_PREPARATION_CACHE: OnceLock<
+    Mutex<BTreeMap<String, ConflictMatrixPreparedInputs>>,
+> = OnceLock::new();
+
+fn conflict_matrix_preparation_cache()
+-> &'static Mutex<BTreeMap<String, ConflictMatrixPreparedInputs>> {
+    CONFLICT_MATRIX_PREPARATION_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn hash_bytes_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+fn conflict_matrix_document_watermark(path: &Path) -> Result<String> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("reading conflict-matrix document {}", path.display()))?;
+    Ok(hash_bytes_hex(&bytes))
+}
+
+fn conflict_matrix_staged_diff_watermark(root: &Path) -> String {
+    match Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--cached", "--raw", "--no-ext-diff"])
+        .output()
+    {
+        Ok(output) => {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(output.status.to_string().as_bytes());
+            bytes.extend_from_slice(&output.stdout);
+            bytes.extend_from_slice(&output.stderr);
+            hash_bytes_hex(&bytes)
+        }
+        Err(err) => hash_bytes_hex(format!("git-diff-cached-unavailable:{err:#}").as_bytes()),
+    }
+}
+
+fn conflict_matrix_preparation_cache_summary(
+    root: &Path,
+    path: &Path,
+    scope: Option<&str>,
+) -> Result<ConflictMatrixPreparationCacheSummary> {
+    let source_watermark = traversal_source_watermark(root, path, scope, false)?
+        .unwrap_or_else(|| "unavailable".to_string());
+    let document_watermark = conflict_matrix_document_watermark(path)?;
+    let staged_diff_watermark = conflict_matrix_staged_diff_watermark(root);
+    let key = content_hash(&vec![
+        format!("version:{CONFLICT_MATRIX_PREPARATION_CACHE_VERSION}"),
+        format!("root:{}", root.display()),
+        format!("path:{}", path.display()),
+        format!("scope:{}", scope.unwrap_or("root")),
+        format!("source:{source_watermark}"),
+        format!("document:{document_watermark}"),
+        format!("staged_diff:{staged_diff_watermark}"),
+    ])?;
+    Ok(ConflictMatrixPreparationCacheSummary {
+        version: CONFLICT_MATRIX_PREPARATION_CACHE_VERSION.to_string(),
+        key,
+        status: "memory_miss".to_string(),
+        source_watermark,
+        document_watermark,
+        staged_diff_watermark,
+    })
+}
+
 fn prepare_conflict_matrix_inputs(
     root: &Path,
     path: &Path,
     scope: Option<&str>,
     impact_limit: usize,
 ) -> Result<ConflictMatrixPreparedInputs> {
-    let context_pack = build_context_pack_report(
+    let cache_lookup_started = Instant::now();
+    let mut cache_summary = conflict_matrix_preparation_cache_summary(root, path, scope)?;
+    if let Some(mut cached) = conflict_matrix_preparation_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("conflict-matrix preparation cache lock poisoned"))?
+        .get(&cache_summary.key)
+        .cloned()
+    {
+        cached.preparation_cache.status = "memory_hit".to_string();
+        cached.preparation_timings.insert(
+            0,
+            graph_db_backend_eval_phase_timing(
+                "preparation_cache_lookup",
+                cache_lookup_started.elapsed().as_micros(),
+                "reused prepared context-pack, staged diff, and impact packet by source/document/staged-diff watermark",
+            ),
+        );
+        return Ok(cached);
+    }
+
+    let mut preparation_timings = vec![graph_db_backend_eval_phase_timing(
+        "preparation_cache_lookup",
+        cache_lookup_started.elapsed().as_micros(),
+        "no prepared packet matched the source/document/staged-diff watermark",
+    )];
+    cache_summary.status = "computed".to_string();
+    let (context_pack, context_pack_timings) = build_context_pack_report_with_profile(
         path,
         None,
         None,
         None,
         ResponseBudget::from_cli(None, None, Some(ResponseBudgetPreset::Normal), false),
     )?;
-    let cached_diff = diff_digest::compute(
-        root,
-        diff_digest::DiffDigestOptions {
-            cached: true,
-            revision: None,
+    preparation_timings.extend(context_pack_timings);
+    let cached_diff = graph_db_backend_eval_timed_phase(
+        &mut preparation_timings,
+        "staged_diff",
+        "cached/staged diff digest used for ownership overlap checks",
+        || {
+            diff_digest::compute(
+                root,
+                diff_digest::DiffDigestOptions {
+                    cached: true,
+                    revision: None,
+                },
+            )
+            .with_context(|| format!("computing cached diff digest for {}", root.display()))
         },
-    )
-    .with_context(|| format!("computing cached diff digest for {}", root.display()))?;
-    let impact_report = impact::compute(
-        root,
-        impact::ImpactOptions {
-            cached: true,
-            revision: None,
-            scope,
-            limit: impact_limit,
+    )?;
+    let impact_report = graph_db_backend_eval_timed_phase(
+        &mut preparation_timings,
+        "impact",
+        "cached impact analysis used for affected-test ownership checks",
+        || {
+            impact::compute(
+                root,
+                impact::ImpactOptions {
+                    cached: true,
+                    revision: None,
+                    scope,
+                    limit: impact_limit,
+                },
+            )
+            .with_context(|| format!("computing cached impact report for {}", root.display()))
         },
-    )
-    .with_context(|| format!("computing cached impact report for {}", root.display()))?;
-    Ok(ConflictMatrixPreparedInputs {
+    )?;
+    let prepared = ConflictMatrixPreparedInputs {
         context_pack,
         cached_diff,
         impact_report,
-    })
+        preparation_cache: cache_summary,
+        preparation_timings,
+    };
+    conflict_matrix_preparation_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("conflict-matrix preparation cache lock poisoned"))?
+        .insert(prepared.preparation_cache.key.clone(), prepared.clone());
+    Ok(prepared)
 }
 
 fn conflict_matrix_evidence_packet_summary(
@@ -17739,6 +18015,8 @@ fn build_conflict_matrix_report_from_prepared_graph(
         graph_db_evidence_targets: targets.clone(),
         evidence_packets,
         shared_preparation: graph_prepared.shared_preparation.clone(),
+        preparation_cache: prepared.preparation_cache.clone(),
+        preparation_timings: prepared.preparation_timings.clone(),
         context_pack_command: format!(
             "tsift --envelope context-pack {} --budget normal",
             shell_quote(path.to_string_lossy().as_ref())
@@ -20604,7 +20882,7 @@ fn cmd_session_review_with_budget(
     Ok(())
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct SessionReviewBudgetSessionPreview {
     handle: String,
     source: String,
@@ -20617,7 +20895,7 @@ struct SessionReviewBudgetSessionPreview {
     expand: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct SessionReviewBudgetPromptPreview {
     handle: String,
     text: String,
@@ -20625,7 +20903,7 @@ struct SessionReviewBudgetPromptPreview {
     expand: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct SessionReviewBudgetFailurePreview {
     handle: String,
     kind: String,
@@ -20638,7 +20916,7 @@ struct SessionReviewBudgetFailurePreview {
     expand: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct SessionReviewBudgetReport {
     target: String,
     target_kind: String,
@@ -20660,7 +20938,7 @@ struct SessionReviewBudgetReport {
     warnings: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct SessionReviewNextContextBudgetReport {
     contract_version: &'static str,
     target: String,
@@ -20680,7 +20958,7 @@ struct SessionReviewNextContextBudgetReport {
     next_digest_commands: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ContextPackGraphOrchestration {
     contract_version: &'static str,
     graph_db_command: String,
@@ -20694,7 +20972,7 @@ struct ContextPackGraphOrchestration {
     warnings: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ContextPackReport {
     root: String,
     target: String,
@@ -20714,7 +20992,7 @@ struct ContextPackReport {
     resume_commands: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ContextPackOptionalSection<T> {
     status: String,
     command: String,
@@ -20724,7 +21002,7 @@ struct ContextPackOptionalSection<T> {
     report: Option<T>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ContextPackDiffPreview {
     mode: String,
     files_changed: usize,
@@ -20736,7 +21014,7 @@ struct ContextPackDiffPreview {
     files: Vec<ContextPackDiffFilePreview>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ContextPackDiffFilePreview {
     path: String,
     status: String,
@@ -20751,7 +21029,7 @@ struct ContextPackDiffFilePreview {
     warnings: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ContextPackSummaryRefPreview {
     handle: String,
     symbol: String,
@@ -20763,7 +21041,7 @@ struct ContextPackSummaryRefPreview {
     expand: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ContextPackTestPreview {
     runner: String,
     failures: usize,
@@ -20774,7 +21052,7 @@ struct ContextPackTestPreview {
     warnings: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ContextPackTestCounts {
     #[serde(skip_serializing_if = "Option::is_none")]
     passed: Option<usize>,
@@ -20784,7 +21062,7 @@ struct ContextPackTestCounts {
     skipped: Option<usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ContextPackTestFailurePreview {
     tests: Vec<String>,
     message: String,
@@ -20798,7 +21076,7 @@ struct ContextPackTestFailurePreview {
     summary_refs: Vec<ContextPackSummaryRefPreview>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ContextPackLogPreview {
     total_lines: usize,
     non_empty_lines: usize,
@@ -20815,7 +21093,7 @@ struct ContextPackLogPreview {
     warnings: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ContextPackLogSignalPreview {
     severity: String,
     message: String,
@@ -20829,13 +21107,13 @@ struct ContextPackLogSignalPreview {
     summary_refs: Vec<ContextPackSummaryRefPreview>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ContextPackLogRepeatedLinePreview {
     line: String,
     occurrences: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ContextPackLogFileRefPreview {
     path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20846,7 +21124,7 @@ struct ContextPackLogFileRefPreview {
     summary_refs: Vec<ContextPackSummaryRefPreview>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ContextPackLogSymbolRefPreview {
     handle: String,
     symbol: String,
@@ -21968,28 +22246,60 @@ fn build_context_pack_report(
     log_input: Option<&Path>,
     budget: ResponseBudget,
 ) -> Result<ContextPackReport> {
+    Ok(build_context_pack_report_with_profile(path, test_input, runner, log_input, budget)?.0)
+}
+
+fn build_context_pack_report_with_profile(
+    path: &Path,
+    test_input: Option<&Path>,
+    runner: Option<&str>,
+    log_input: Option<&Path>,
+    budget: ResponseBudget,
+) -> Result<(ContextPackReport, Vec<GraphDbBackendEvalPhaseTiming>)> {
     let budget = effective_context_budget(budget);
-    let review = session_review::compute(path)?;
+    let mut phases = Vec::new();
+    let review = graph_db_backend_eval_timed_phase(
+        &mut phases,
+        "session_review_compute",
+        "session-review prompt/touched-file/touched-symbol/failure aggregation for the context-pack handoff",
+        || session_review::compute(path),
+    )?;
     let root = PathBuf::from(&review.root);
-    let gate = prepare_agent_doc_index_gate(&root, path, None, "context-pack handoff");
-    let mut status_reminders = gate.diagnostics;
-    status_reminders.extend(context_pack_status_reminders(&root));
-    let ontology = load_tag_ontology_preview_context(&root);
+    let (status_reminders, ontology) = graph_db_backend_eval_timed_phase(
+        &mut phases,
+        "status_index_gate",
+        "agent-doc index gate, tsift status reminders, and ontology preview loading",
+        || {
+            let gate = prepare_agent_doc_index_gate(&root, path, None, "context-pack handoff");
+            let mut status_reminders = gate.diagnostics;
+            status_reminders.extend(context_pack_status_reminders(&root));
+            Ok((status_reminders, load_tag_ontology_preview_context(&root)))
+        },
+    )?;
     let ontology_ref = ontology.as_ref();
     let mut next_context =
         build_session_review_next_context_budget_report(&review, budget, ontology_ref);
-    let diff_digest = build_context_pack_diff_preview(
-        &diff_digest::compute(
-            &root,
-            diff_digest::DiffDigestOptions {
-                cached: false,
-                revision: None,
-            },
-        )
-        .with_context(|| format!("computing context-pack diff digest for {}", root.display()))?,
-        budget,
-        ontology_ref,
-    );
+    let diff_digest = graph_db_backend_eval_timed_phase(
+        &mut phases,
+        "context_pack_diff",
+        "working-tree diff digest preview used to enrich next-context symbols",
+        || {
+            Ok(build_context_pack_diff_preview(
+                &diff_digest::compute(
+                    &root,
+                    diff_digest::DiffDigestOptions {
+                        cached: false,
+                        revision: None,
+                    },
+                )
+                .with_context(|| {
+                    format!("computing context-pack diff digest for {}", root.display())
+                })?,
+                budget,
+                ontology_ref,
+            ))
+        },
+    )?;
     enrich_next_context_with_diff_symbols(&mut next_context, &diff_digest, ontology_ref);
     let test_digest = match test_input {
         Some(file_path) => {
@@ -22053,29 +22363,43 @@ fn build_context_pack_report(
 
     let ontology_refs =
         collect_context_pack_ontology_refs(&next_context, &diff_digest, &test_digest, &log_digest);
-    let exploration = materialize_context_pack_exploration_packet(
-        &root,
-        build_context_pack_exploration_packet(&root, &next_context, &diff_digest),
+    let exploration = graph_db_backend_eval_timed_phase(
+        &mut phases,
+        "exploration_materialization",
+        "context-pack source-window and worker-context exploration packet projection",
+        || {
+            materialize_context_pack_exploration_packet(
+                &root,
+                build_context_pack_exploration_packet(&root, &next_context, &diff_digest),
+            )
+        },
     )?;
-    let graph_orchestration =
-        context_pack_graph_orchestration(&root, path, &next_context, &exploration)?;
+    let graph_orchestration = graph_db_backend_eval_timed_phase(
+        &mut phases,
+        "graph_orchestration",
+        "context-pack graph freshness, evidence packet ids, and conflict-matrix follow-up commands",
+        || context_pack_graph_orchestration(&root, path, &next_context, &exploration),
+    )?;
 
-    Ok(ContextPackReport {
-        root: review.root,
-        target: review.target,
-        target_kind: review.target_kind,
-        max_items: budget.preview_items(),
-        max_bytes: budget.preview_bytes(),
-        status_reminders,
-        ontology_refs,
-        next_context,
-        diff_digest,
-        test_digest,
-        log_digest,
-        exploration,
-        graph_orchestration,
-        resume_commands: review.next_context.next_digest_commands,
-    })
+    Ok((
+        ContextPackReport {
+            root: review.root,
+            target: review.target,
+            target_kind: review.target_kind,
+            max_items: budget.preview_items(),
+            max_bytes: budget.preview_bytes(),
+            status_reminders,
+            ontology_refs,
+            next_context,
+            diff_digest,
+            test_digest,
+            log_digest,
+            exploration,
+            graph_orchestration,
+            resume_commands: review.next_context.next_digest_commands,
+        },
+        phases,
+    ))
 }
 
 fn context_pack_status_reminders(root: &Path) -> Vec<String> {

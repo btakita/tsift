@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- `graph-db backend-eval` now has an opt-in `--full-projection` dataset, reports 128/256-hop path-tier probes alongside the 64-hop default and one-hop direct probes, and keeps FalkorDB on a hold decision until a production adapter beats SQLite across full-projection conflict-matrix/evidence/dispatch-trace/path/install/lock gates.
+- `conflict-matrix` preparation now exposes split timings for cache lookup, session-review compute, status/index gate, context-pack diff, exploration materialization, graph orchestration, staged diff, and impact, plus a source/document/staged-diff cache key for reusing the prepared packet within an orchestration run.
 - Normal `graph-db refresh`, `conflict-matrix`, and `dispatch-trace` now reuse the same source-watermark cached projection path as backend-eval when source inputs are unchanged, and conflict/trace preparation builds target-scoped graph snapshots instead of loading every graph node and edge.
 - GraphStore now exposes cheap count and sample-edge probes; SQLite backs them with `COUNT(*)` / indexed `LIMIT 1` queries so backend-eval status and `path_max_hops` selection avoid full row materialization before timing the measured operation.
 - Graph refresh now streams materialized node-property rows into the staged SQLite projection while node rows are inserted, and context-pack exploration uses one batched SQLite projection transaction for `source_handle` / `worker_context` rows instead of per-row autocommit writes.

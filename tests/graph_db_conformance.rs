@@ -1369,11 +1369,31 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         report["config"]["path_deep_chain_hop_budget"], 64,
         "{report}"
     );
+    assert_eq!(
+        report["config"]["path_extended_hop_budgets"],
+        json!([128, 256]),
+        "{report}"
+    );
+    assert_eq!(
+        report["config"]["full_projection_enabled"], false,
+        "{report}"
+    );
+    assert!(
+        report["config"]["path_query_plan_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check
+                .as_str()
+                .unwrap()
+                .contains("idx_graph_edges_from_kind")),
+        "{report}"
+    );
     assert!(
         report["config"]["path_probe_strategy"]
             .as_str()
             .unwrap()
-            .contains("adaptive"),
+            .contains("128/256-hop"),
         "{report}"
     );
     assert_eq!(report["config"]["normalization_row_unit"], 1000, "{report}");
@@ -1416,6 +1436,8 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                     "edge_property_scan".to_string(),
                     "incident_edges".to_string(),
                     "path_max_hops".to_string(),
+                    "path_max_hops_128".to_string(),
+                    "path_max_hops_256".to_string(),
                     "evidence_target_resolution".to_string(),
                     "evidence".to_string(),
                     "conflict_matrix".to_string(),
@@ -1462,6 +1484,22 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                         .as_str()
                         .unwrap()
                         .contains("cargo build/install"),
+                    "{report}"
+                );
+            }
+            if backend["backend"] == "falkordb" {
+                assert!(
+                    backend["projection_load"]
+                        .as_str()
+                        .unwrap()
+                        .contains("production FalkorDB"),
+                    "{report}"
+                );
+                assert!(
+                    backend["lock_behavior"]
+                        .as_str()
+                        .unwrap()
+                        .contains("multi-process writer"),
                     "{report}"
                 );
             }
@@ -1619,6 +1657,20 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "{report}"
     );
     assert!(
+        report["metrics"]
+            .as_object()
+            .unwrap()
+            .contains_key("synthetic_deep_chain.sqlite.path_max_hops_128.duration_micros"),
+        "{report}"
+    );
+    assert!(
+        report["metrics"]
+            .as_object()
+            .unwrap()
+            .contains_key("synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros"),
+        "{report}"
+    );
+    assert!(
         report["metrics"].as_object().unwrap().contains_key(
             "synthetic_high_degree.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows"
         ),
@@ -1684,6 +1736,31 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .contains("for sample in 1 2 3"),
         "{report}"
     );
+    assert!(
+        report["performance_gate"]["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|metric| metric
+                == "synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros"),
+        "{report}"
+    );
+    assert!(
+        report["promotion"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|decision| decision["backend"] == "falkordb")
+            .unwrap()["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason
+                .as_str()
+                .unwrap()
+                .contains("full_projection conflict-matrix")),
+        "{report}"
+    );
     let cached_report = assert_tsift_json(backend_eval_args());
     let cached_source_phase = cached_report["phase_timings"]
         .as_array()
@@ -1705,6 +1782,30 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .iter()
             .any(|entry| entry["name"] == "sqlite_property_row_staging"),
         "cached backend-eval should skip SQLite row staging: {cached_report}"
+    );
+    assert!(
+        cached_report["phase_timings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "conflict_matrix_preparation.preparation_cache_lookup"),
+        "cached backend-eval should expose preparation cache lookup timing: {cached_report}"
+    );
+
+    let mut full_projection_args = backend_eval_args();
+    full_projection_args.push("--full-projection".to_string());
+    let full_projection_report = assert_tsift_json(full_projection_args);
+    assert_eq!(
+        full_projection_report["config"]["full_projection_enabled"], true,
+        "{full_projection_report}"
+    );
+    assert!(
+        full_projection_report["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|dataset| dataset["name"] == "full_projection"),
+        "{full_projection_report}"
     );
 
     let digest_dir = tempfile::tempdir().unwrap();
@@ -1737,7 +1838,10 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "synthetic_high_degree.sqlite.total_duration_micros",
         "synthetic_high_degree.sqlite.total_duration_micros_per_1k_graph_rows",
         "synthetic_deep_chain.sqlite.path_max_hops.duration_micros",
+        "synthetic_deep_chain.sqlite.path_max_hops_128.duration_micros",
+        "synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros",
         "synthetic_deep_chain.sqlite.path_max_hops.duration_micros_per_1k_graph_rows",
+        "synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros_per_1k_graph_rows",
     ] {
         assert!(
             delta_metrics.contains(metric),
@@ -1986,6 +2090,32 @@ fn conflict_matrix_cli_composes_planner_evidence_and_worker_ownership() {
     );
     assert_eq!(report["cached_diff"]["mode"], "cached");
     assert_eq!(report["impact"]["mode"], "cached");
+    assert_eq!(
+        report["inputs"]["preparation_cache"]["version"], "conflict-matrix-prep-v1",
+        "{report}"
+    );
+    assert_eq!(
+        report["inputs"]["preparation_cache"]["status"], "computed",
+        "{report}"
+    );
+    let preparation_phases = report["inputs"]["preparation_timings"].as_array().unwrap();
+    for phase in [
+        "preparation_cache_lookup",
+        "session_review_compute",
+        "status_index_gate",
+        "context_pack_diff",
+        "exploration_materialization",
+        "graph_orchestration",
+        "staged_diff",
+        "impact",
+    ] {
+        assert!(
+            preparation_phases
+                .iter()
+                .any(|entry| entry["name"] == phase),
+            "missing preparation phase {phase}: {report}"
+        );
+    }
     assert!(
         report["inputs"]["cached_diff_command"]
             .as_str()
