@@ -2843,7 +2843,6 @@ fn dispatch_trace_replay_contract_matches_real_queue_graph_db_run() {
 }
 
 #[test]
-#[ignore = "requires a dedicated live Convex deployment"]
 fn live_convex_graph_backend_acceptance_applies_and_matches_graph_db_queries() {
     if !live_convex_acceptance_enabled() {
         eprintln!(

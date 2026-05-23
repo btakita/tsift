@@ -381,7 +381,6 @@ fn sim_world_fast_seed_corpus_preserves_core_invariants() {
 }
 
 #[test]
-#[ignore = "wider deterministic sim corpus; run in CI with `make ci-full`"]
 fn sim_world_medium_seed_corpus_runs_wider_deterministic_budget() {
     let mut coverage = Coverage::default();
     for seed in 0..MEDIUM_CORPUS_SEEDS {
