@@ -1834,6 +1834,23 @@ fn conflict_matrix_cli_composes_planner_evidence_and_worker_ownership() {
             ),
         "{report}"
     );
+    assert_eq!(
+        report["inputs"]["shared_preparation"]["evidence_packets"],
+        json!(1),
+        "{report}"
+    );
+    assert!(
+        report["inputs"]["shared_preparation"]["source_handles"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "{report}"
+    );
+    assert_eq!(
+        report["inputs"]["shared_preparation"]["dispatch_trace_snapshot_nodes"],
+        report["inputs"]["shared_preparation"]["graph_nodes"],
+        "{report}"
+    );
     let candidates = report["candidates"].as_array().unwrap();
     assert_eq!(candidates.len(), 1, "{report}");
     assert!(
@@ -2656,6 +2673,20 @@ fn dispatch_trace_cli_exports_json_and_html_operator_views() {
             .unwrap()
             .iter()
             .all(|packet| packet.as_str().unwrap().starts_with("gevd-")),
+        "{report}"
+    );
+    assert_eq!(
+        report["shared_preparation"]["evidence_packets"]
+            .as_u64()
+            .unwrap(),
+        report["evidence_packet_ids"].as_array().unwrap().len() as u64,
+        "{report}"
+    );
+    assert!(
+        report["shared_preparation"]["dispatch_trace_snapshot_edges"]
+            .as_u64()
+            .unwrap()
+            > 0,
         "{report}"
     );
     assert!(

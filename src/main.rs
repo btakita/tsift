@@ -6981,7 +6981,7 @@ struct GraphDbCompactionReport {
     warnings: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct GraphDbEvidencePath {
     to: String,
     kind: String,
@@ -6992,14 +6992,14 @@ struct GraphDbEvidencePath {
     expand: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct GraphDbFixtureCoverage {
     test: String,
     fixture: String,
     assertions: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct GraphDbEvidenceReport {
     root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10255,52 +10255,74 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
     operations.push(operation);
     signatures.extend(signature);
 
+    let mut graph_prepared_for_report = None;
+    let mut graph_snapshot_for_trace = None;
     let (operation, signature) = graph_db_backend_eval_timed("evidence", || {
-        let target = targets
-            .first()
-            .context("backend-eval evidence requires at least one target")?;
-        let report = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
+        let graph_prepared = prepare_conflict_matrix_graph_orchestration(
             root,
             scope,
             backend,
-            target,
+            targets,
+            &prepared.context_pack,
             depth,
             limit,
             store,
-            freshness: freshness.clone(),
-            warnings: Vec::new(),
-        })?;
-        Ok((
-            Some(
-                report.worker_context.len()
-                    + report.source_handles.len()
-                    + report.worker_results.len()
-                    + report.semantic_related.len(),
-            ),
-            graph_db_backend_eval_evidence_signature(&report),
-        ))
+            freshness.clone(),
+        )?;
+        let report = &graph_prepared
+            .evidence
+            .first()
+            .context("backend-eval evidence requires at least one target")?
+            .report;
+        let rows = graph_prepared
+            .evidence
+            .iter()
+            .map(|entry| {
+                entry.report.worker_context.len()
+                    + entry.report.source_handles.len()
+                    + entry.report.worker_results.len()
+                    + entry.report.semantic_related.len()
+            })
+            .sum();
+        let signature = graph_db_backend_eval_evidence_signature(report);
+        graph_prepared_for_report = Some(graph_prepared);
+        Ok((Some(rows), signature))
     });
     operations.push(operation);
     signatures.extend(signature);
 
     let mut conflict_for_trace = None;
     let (operation, signature) = graph_db_backend_eval_timed("conflict_matrix", || {
-        let report = build_conflict_matrix_report_with_prepared(
+        let graph_prepared = match graph_prepared_for_report.take() {
+            Some(graph_prepared) => graph_prepared,
+            None => prepare_conflict_matrix_graph_orchestration(
+                root,
+                scope,
+                backend,
+                targets,
+                &prepared.context_pack,
+                depth,
+                limit,
+                store,
+                freshness.clone(),
+            )?,
+        };
+        let report = build_conflict_matrix_report_from_prepared_graph(
             root,
             path,
             scope,
-            targets,
             depth,
             limit,
             impact_limit,
-            store,
             freshness.clone(),
             extra_warnings.clone(),
             prepared,
+            &graph_prepared,
         )?;
         let signature = graph_db_backend_eval_conflict_signature(&report);
         let rows = report.candidates.len() + report.conflicts.len();
         conflict_for_trace = Some(report);
+        graph_snapshot_for_trace = Some(graph_prepared.graph);
         Ok((Some(rows), signature))
     });
     operations.push(operation);
@@ -10310,11 +10332,15 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
         let conflict = conflict_for_trace
             .take()
             .context("backend-eval dispatch-trace requires a completed conflict-matrix report")?;
-        let report = build_dispatch_trace_report_from_conflict(
+        let graph = graph_snapshot_for_trace
+            .take()
+            .context("backend-eval dispatch-trace requires conflict-matrix graph preparation")?;
+        let report = build_dispatch_trace_report_from_conflict_snapshot(
             root,
             scope,
             conflict,
-            store,
+            graph.nodes,
+            graph.edges,
             depth,
             limit,
             Vec::new(),
@@ -15426,6 +15452,7 @@ struct ConflictMatrixPair {
 struct ConflictMatrixInputSummary {
     graph_db_evidence_targets: Vec<String>,
     evidence_packets: Vec<ConflictMatrixEvidencePacketSummary>,
+    shared_preparation: ConflictMatrixSharedPreparationSummary,
     context_pack_command: String,
     cached_diff_command: String,
     impact_command: String,
@@ -15439,6 +15466,19 @@ struct ConflictMatrixEvidencePacketSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     projection_hash: Option<String>,
     replay_command: String,
+}
+
+#[derive(Clone, Serialize)]
+struct ConflictMatrixSharedPreparationSummary {
+    graph_nodes: usize,
+    graph_edges: usize,
+    evidence_packets: usize,
+    source_handles: usize,
+    worker_context: usize,
+    worker_results: usize,
+    semantic_rows: usize,
+    dispatch_trace_snapshot_nodes: usize,
+    dispatch_trace_snapshot_edges: usize,
 }
 
 #[derive(Serialize)]
@@ -15678,6 +15718,7 @@ fn conflict_matrix_semantic_ref(
     }
 }
 
+#[derive(Clone)]
 struct ConflictMatrixGraphIndex {
     symbols_by_file: BTreeMap<String, Vec<String>>,
 }
@@ -16829,6 +16870,24 @@ struct ConflictMatrixPreparedInputs {
     impact_report: impact::ImpactReport,
 }
 
+struct ConflictMatrixGraphSnapshot {
+    nodes: Vec<SubstrateGraphNode>,
+    edges: Vec<SubstrateGraphEdge>,
+    index: ConflictMatrixGraphIndex,
+}
+
+struct ConflictMatrixPreparedEvidence {
+    report: GraphDbEvidenceReport,
+    summary: ConflictMatrixEvidencePacketSummary,
+}
+
+struct ConflictMatrixGraphPreparedInputs {
+    targets: Vec<String>,
+    graph: ConflictMatrixGraphSnapshot,
+    evidence: Vec<ConflictMatrixPreparedEvidence>,
+    shared_preparation: ConflictMatrixSharedPreparationSummary,
+}
+
 fn prepare_conflict_matrix_inputs(
     root: &Path,
     path: &Path,
@@ -16867,34 +16926,93 @@ fn prepare_conflict_matrix_inputs(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_conflict_matrix_report_with_prepared<S: GraphStore>(
+fn conflict_matrix_evidence_packet_summary(
     root: &Path,
-    path: &Path,
     scope: Option<&str>,
-    raw_targets: &[String],
+    target: &str,
     depth: usize,
     limit: usize,
-    impact_limit: usize,
+    evidence: &GraphDbEvidenceReport,
+) -> ConflictMatrixEvidencePacketSummary {
+    ConflictMatrixEvidencePacketSummary {
+        target: evidence.target.clone(),
+        packet_id: evidence.packet_id.clone(),
+        target_node_id: evidence.target_node.id.clone(),
+        projection_hash: evidence.projection_hash.clone(),
+        replay_command: evidence
+            .replay_commands
+            .first()
+            .cloned()
+            .unwrap_or_else(|| {
+                format!(
+                    "tsift graph-db --path {}{} evidence {} --depth {} --limit {} --json",
+                    shell_quote(root.to_string_lossy().as_ref()),
+                    graph_db_scope_arg(scope),
+                    shell_quote(target),
+                    depth,
+                    limit
+                )
+            }),
+    }
+}
+
+fn conflict_matrix_shared_preparation_summary(
+    graph: &ConflictMatrixGraphSnapshot,
+    evidence: &[ConflictMatrixPreparedEvidence],
+) -> ConflictMatrixSharedPreparationSummary {
+    ConflictMatrixSharedPreparationSummary {
+        graph_nodes: graph.nodes.len(),
+        graph_edges: graph.edges.len(),
+        evidence_packets: evidence.len(),
+        source_handles: evidence
+            .iter()
+            .map(|entry| entry.report.source_handles.len())
+            .sum(),
+        worker_context: evidence
+            .iter()
+            .map(|entry| entry.report.worker_context.len())
+            .sum(),
+        worker_results: evidence
+            .iter()
+            .map(|entry| entry.report.worker_results.len())
+            .sum(),
+        semantic_rows: evidence
+            .iter()
+            .map(|entry| entry.report.semantic_related.len())
+            .sum(),
+        dispatch_trace_snapshot_nodes: graph.nodes.len(),
+        dispatch_trace_snapshot_edges: graph.edges.len(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_conflict_matrix_graph_orchestration<S: GraphStore>(
+    root: &Path,
+    scope: Option<&str>,
+    backend: &str,
+    raw_targets: &[String],
+    context_pack: &ContextPackReport,
+    depth: usize,
+    limit: usize,
     store: &S,
     freshness: GraphDbFreshnessReport,
-    extra_warnings: Vec<String>,
-    prepared: &ConflictMatrixPreparedInputs,
-) -> Result<ConflictMatrixReport> {
-    let context_pack = &prepared.context_pack;
+) -> Result<ConflictMatrixGraphPreparedInputs> {
     let targets = resolve_conflict_matrix_targets(store, raw_targets, context_pack)?;
-    let graph_nodes = store.all_nodes()?;
-    let graph_index = conflict_matrix_graph_index(&graph_nodes);
+    let nodes = store.all_nodes()?;
+    let edges = store.all_edges()?;
+    let index = conflict_matrix_graph_index(&nodes);
+    let graph = ConflictMatrixGraphSnapshot {
+        nodes,
+        edges,
+        index,
+    };
 
-    let mut warnings = context_pack.status_reminders.clone();
-    warnings.extend(extra_warnings);
-    let mut candidates = Vec::new();
-    let mut evidence_packets = Vec::new();
+    let mut evidence = Vec::new();
     for target in &targets {
-        let evidence = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
+        let report = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
             root,
             scope,
-            backend: "sqlite",
+            backend,
             target,
             depth,
             limit,
@@ -16903,31 +17021,49 @@ fn build_conflict_matrix_report_with_prepared<S: GraphStore>(
             warnings: Vec::new(),
         })
         .with_context(|| format!("collecting graph-db evidence for {target}"))?;
+        let summary =
+            conflict_matrix_evidence_packet_summary(root, scope, target, depth, limit, &report);
+        evidence.push(ConflictMatrixPreparedEvidence { report, summary });
+    }
+    let shared_preparation = conflict_matrix_shared_preparation_summary(&graph, &evidence);
+
+    Ok(ConflictMatrixGraphPreparedInputs {
+        targets,
+        graph,
+        evidence,
+        shared_preparation,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_conflict_matrix_report_from_prepared_graph(
+    root: &Path,
+    path: &Path,
+    scope: Option<&str>,
+    depth: usize,
+    limit: usize,
+    impact_limit: usize,
+    freshness: GraphDbFreshnessReport,
+    extra_warnings: Vec<String>,
+    prepared: &ConflictMatrixPreparedInputs,
+    graph_prepared: &ConflictMatrixGraphPreparedInputs,
+) -> Result<ConflictMatrixReport> {
+    let context_pack = &prepared.context_pack;
+    let targets = graph_prepared.targets.clone();
+    let graph_index = &graph_prepared.graph.index;
+
+    let mut warnings = context_pack.status_reminders.clone();
+    warnings.extend(extra_warnings);
+    let mut candidates = Vec::new();
+    let mut evidence_packets = Vec::new();
+    for prepared_evidence in &graph_prepared.evidence {
+        let evidence = &prepared_evidence.report;
         warnings.extend(evidence.warnings.clone());
-        evidence_packets.push(ConflictMatrixEvidencePacketSummary {
-            target: evidence.target.clone(),
-            packet_id: evidence.packet_id.clone(),
-            target_node_id: evidence.target_node.id.clone(),
-            projection_hash: evidence.projection_hash.clone(),
-            replay_command: evidence
-                .replay_commands
-                .first()
-                .cloned()
-                .unwrap_or_else(|| {
-                    format!(
-                        "tsift graph-db --path {}{} evidence {} --depth {} --limit {} --json",
-                        shell_quote(root.to_string_lossy().as_ref()),
-                        graph_db_scope_arg(scope),
-                        shell_quote(target),
-                        depth,
-                        limit
-                    )
-                }),
-        });
+        evidence_packets.push(prepared_evidence.summary.clone());
         candidates.push(conflict_matrix_candidate_from_evidence(
             root,
-            &evidence,
-            &graph_index,
+            evidence,
+            graph_index,
             &prepared.cached_diff,
             &prepared.impact_report,
         ));
@@ -16986,6 +17122,7 @@ fn build_conflict_matrix_report_with_prepared<S: GraphStore>(
     let inputs = ConflictMatrixInputSummary {
         graph_db_evidence_targets: targets.clone(),
         evidence_packets,
+        shared_preparation: graph_prepared.shared_preparation.clone(),
         context_pack_command: format!(
             "tsift --envelope context-pack {} --budget normal",
             shell_quote(path.to_string_lossy().as_ref())
@@ -17027,6 +17164,45 @@ fn build_conflict_matrix_report_with_prepared<S: GraphStore>(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn build_conflict_matrix_report_with_prepared<S: GraphStore>(
+    root: &Path,
+    path: &Path,
+    scope: Option<&str>,
+    raw_targets: &[String],
+    depth: usize,
+    limit: usize,
+    impact_limit: usize,
+    store: &S,
+    freshness: GraphDbFreshnessReport,
+    extra_warnings: Vec<String>,
+    prepared: &ConflictMatrixPreparedInputs,
+) -> Result<ConflictMatrixReport> {
+    let graph_prepared = prepare_conflict_matrix_graph_orchestration(
+        root,
+        scope,
+        "sqlite",
+        raw_targets,
+        &prepared.context_pack,
+        depth,
+        limit,
+        store,
+        freshness.clone(),
+    )?;
+    build_conflict_matrix_report_from_prepared_graph(
+        root,
+        path,
+        scope,
+        depth,
+        limit,
+        impact_limit,
+        freshness,
+        extra_warnings,
+        prepared,
+        &graph_prepared,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_conflict_matrix_report_with_store<S: GraphStore>(
     root: &Path,
     path: &Path,
@@ -17039,173 +17215,20 @@ fn build_conflict_matrix_report_with_store<S: GraphStore>(
     freshness: GraphDbFreshnessReport,
     extra_warnings: Vec<String>,
 ) -> Result<ConflictMatrixReport> {
-    let context_pack = build_context_pack_report(
+    let prepared = prepare_conflict_matrix_inputs(root, path, scope, impact_limit)?;
+    build_conflict_matrix_report_with_prepared(
+        root,
         path,
-        None,
-        None,
-        None,
-        ResponseBudget::from_cli(None, None, Some(ResponseBudgetPreset::Normal), false),
-    )?;
-    let targets = resolve_conflict_matrix_targets(store, raw_targets, &context_pack)?;
-    let cached_diff = diff_digest::compute(
-        root,
-        diff_digest::DiffDigestOptions {
-            cached: true,
-            revision: None,
-        },
+        scope,
+        raw_targets,
+        depth,
+        limit,
+        impact_limit,
+        store,
+        freshness,
+        extra_warnings,
+        &prepared,
     )
-    .with_context(|| format!("computing cached diff digest for {}", root.display()))?;
-    let impact_report = impact::compute(
-        root,
-        impact::ImpactOptions {
-            cached: true,
-            revision: None,
-            scope,
-            limit: impact_limit,
-        },
-    )
-    .with_context(|| format!("computing cached impact report for {}", root.display()))?;
-    let graph_nodes = store.all_nodes()?;
-    let graph_index = conflict_matrix_graph_index(&graph_nodes);
-
-    let mut warnings = context_pack.status_reminders.clone();
-    warnings.extend(extra_warnings);
-    let mut candidates = Vec::new();
-    let mut evidence_packets = Vec::new();
-    for target in &targets {
-        let evidence = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
-            root,
-            scope,
-            backend: "sqlite",
-            target,
-            depth,
-            limit,
-            store,
-            freshness: freshness.clone(),
-            warnings: Vec::new(),
-        })
-        .with_context(|| format!("collecting graph-db evidence for {target}"))?;
-        warnings.extend(evidence.warnings.clone());
-        evidence_packets.push(ConflictMatrixEvidencePacketSummary {
-            target: evidence.target.clone(),
-            packet_id: evidence.packet_id.clone(),
-            target_node_id: evidence.target_node.id.clone(),
-            projection_hash: evidence.projection_hash.clone(),
-            replay_command: evidence
-                .replay_commands
-                .first()
-                .cloned()
-                .unwrap_or_else(|| {
-                    format!(
-                        "tsift graph-db --path {}{} evidence {} --depth {} --limit {} --json",
-                        shell_quote(root.to_string_lossy().as_ref()),
-                        graph_db_scope_arg(scope),
-                        shell_quote(target),
-                        depth,
-                        limit
-                    )
-                }),
-        });
-        candidates.push(conflict_matrix_candidate_from_evidence(
-            root,
-            &evidence,
-            &graph_index,
-            &cached_diff,
-            &impact_report,
-        ));
-    }
-
-    apply_conflict_matrix_worker_feedback_controls(&mut candidates);
-    candidates.sort_by(|left, right| {
-        left.risk
-            .cmp(&right.risk)
-            .then_with(|| left.risk_score.cmp(&right.risk_score))
-            .then_with(|| {
-                right
-                    .worker_feedback
-                    .closure_rank_score
-                    .cmp(&left.worker_feedback.closure_rank_score)
-            })
-            .then_with(|| {
-                right
-                    .semantic_dispatch_score
-                    .cmp(&left.semantic_dispatch_score)
-            })
-            .then_with(|| left.target.cmp(&right.target))
-    });
-    for (idx, candidate) in candidates.iter_mut().enumerate() {
-        candidate.rank = idx + 1;
-    }
-    warnings.extend(candidates.iter().flat_map(|candidate| {
-        candidate
-            .worker_feedback
-            .warnings
-            .iter()
-            .map(|warning| format!("{}: {warning}", candidate.target))
-    }));
-    let conflicts = build_conflict_matrix_pairs(&candidates);
-    apply_conflict_matrix_ownership_blocks(&mut candidates);
-    apply_conflict_matrix_scheduler_fields(&mut candidates, &conflicts);
-    let worker_prompt_packets = conflict_matrix_worker_prompt_packets(&candidates);
-
-    let per_target_fail_closed = conflict_matrix_per_target_fail_closed(&candidates);
-    let cross_target_parallel_safe = conflicts
-        .iter()
-        .all(|pair| pair.risk <= ConflictMatrixRisk::Medium);
-    let fail_closed = !per_target_fail_closed.is_empty()
-        || conflicts
-            .iter()
-            .any(|pair| pair.risk == ConflictMatrixRisk::FailClosed);
-    let can_parallel = !fail_closed && cross_target_parallel_safe;
-    let next_commands =
-        conflict_matrix_next_commands(root, path, scope, &targets, depth, limit, impact_limit);
-    let orchestration = conflict_matrix_orchestration_observability(
-        &freshness,
-        &candidates,
-        &conflicts,
-        &next_commands,
-    );
-    let inputs = ConflictMatrixInputSummary {
-        graph_db_evidence_targets: targets.clone(),
-        evidence_packets,
-        context_pack_command: format!(
-            "tsift --envelope context-pack {} --budget normal",
-            shell_quote(path.to_string_lossy().as_ref())
-        ),
-        cached_diff_command: format!(
-            "tsift diff-digest --cached {} --json",
-            shell_quote(root.to_string_lossy().as_ref())
-        ),
-        impact_command: format!(
-            "tsift impact {} --cached{} --limit {} --json",
-            shell_quote(root.to_string_lossy().as_ref()),
-            scope
-                .map(|scope| format!(" --scope {}", shell_quote(scope)))
-                .unwrap_or_default(),
-            impact_limit
-        ),
-    };
-    let context_summary = conflict_matrix_context_summary(&context_pack);
-    Ok(ConflictMatrixReport {
-        contract_version: CONFLICT_MATRIX_CONTRACT_VERSION,
-        root: root.to_string_lossy().to_string(),
-        scope: scope.map(str::to_string),
-        targets,
-        can_parallel,
-        fail_closed,
-        cross_target_parallel_safe,
-        per_target_fail_closed,
-        inputs,
-        context_pack: context_summary,
-        cached_diff,
-        impact: impact_report,
-        candidates,
-        worker_prompt_packets,
-        conflicts,
-        orchestration,
-        next_commands,
-        warnings,
-    })
 }
 
 fn build_conflict_matrix_report(
@@ -17312,6 +17335,7 @@ struct DispatchTraceReport {
     projection_freshness: GraphDbFreshnessReport,
     projection_hashes: Vec<String>,
     evidence_packet_ids: Vec<String>,
+    shared_preparation: ConflictMatrixSharedPreparationSummary,
     worker_prompt_packets: Vec<ConflictMatrixWorkerPromptPacket>,
     worker_feedback: Vec<ConflictMatrixWorkerFeedback>,
     summary: DispatchTraceSummary,
@@ -17382,6 +17406,40 @@ fn dispatch_trace_summary(nodes: &[SubstrateGraphNode]) -> DispatchTraceSummary 
             .iter()
             .filter(|node| matches!(node.kind.as_str(), "semantic_concept" | "semantic_entity"))
             .count(),
+    }
+}
+
+fn dispatch_trace_shared_preparation_summary(
+    graph_nodes: &[SubstrateGraphNode],
+    graph_edges: &[SubstrateGraphEdge],
+    conflict: &ConflictMatrixReport,
+) -> ConflictMatrixSharedPreparationSummary {
+    ConflictMatrixSharedPreparationSummary {
+        graph_nodes: graph_nodes.len(),
+        graph_edges: graph_edges.len(),
+        evidence_packets: conflict.orchestration.evidence_packet_ids.len(),
+        source_handles: conflict
+            .candidates
+            .iter()
+            .map(|candidate| candidate.source_handles.len())
+            .sum(),
+        worker_context: conflict
+            .candidates
+            .iter()
+            .map(|candidate| candidate.worker_context_handles.len())
+            .sum(),
+        worker_results: conflict
+            .candidates
+            .iter()
+            .map(|candidate| candidate.worker_feedback.total)
+            .sum(),
+        semantic_rows: conflict
+            .candidates
+            .iter()
+            .map(|candidate| candidate.semantic_related.len())
+            .sum(),
+        dispatch_trace_snapshot_nodes: graph_nodes.len(),
+        dispatch_trace_snapshot_edges: graph_edges.len(),
     }
 }
 
@@ -17464,17 +17522,19 @@ fn dispatch_trace_collect_ids(
     (ids, truncated)
 }
 
-fn build_dispatch_trace_report_from_conflict<S: GraphStore>(
+#[allow(clippy::too_many_arguments)]
+fn build_dispatch_trace_report_from_conflict_snapshot(
     root: &Path,
     scope: Option<&str>,
     conflict: ConflictMatrixReport,
-    store: &S,
+    graph_nodes: Vec<SubstrateGraphNode>,
+    graph_edges: Vec<SubstrateGraphEdge>,
     depth: usize,
     limit: usize,
     extra_warnings: Vec<String>,
 ) -> Result<DispatchTraceReport> {
-    let graph_nodes = store.all_nodes()?;
-    let graph_edges = store.all_edges()?;
+    let shared_preparation =
+        dispatch_trace_shared_preparation_summary(&graph_nodes, &graph_edges, &conflict);
     let (ids, truncated) = dispatch_trace_collect_ids(
         &conflict.targets,
         &conflict.candidates,
@@ -17519,6 +17579,7 @@ fn build_dispatch_trace_report_from_conflict<S: GraphStore>(
         projection_freshness: conflict.orchestration.projection_freshness,
         projection_hashes: conflict.orchestration.projection_hashes,
         evidence_packet_ids: conflict.orchestration.evidence_packet_ids,
+        shared_preparation,
         worker_prompt_packets: conflict.worker_prompt_packets,
         worker_feedback: conflict
             .candidates
@@ -17544,22 +17605,48 @@ fn build_dispatch_trace_report(
     limit: usize,
     impact_limit: usize,
 ) -> Result<DispatchTraceReport> {
-    let conflict =
-        build_conflict_matrix_report(path, scope, raw_targets, depth, limit, impact_limit)?;
-    let root = PathBuf::from(&conflict.root);
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    write_traversal_graph_store(&root, path, scope)
+        .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
     let graph_db = graph_substrate_db_path(&root, scope);
     let store = SqliteGraphStore::open_read_only_resilient(&graph_db)
         .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
+    let freshness = sqlite_graph_freshness(&store, scope.unwrap_or("root"))?;
     let extra_warnings = store
         .read_only_recovery()
         .map(graph_db_read_recovery_diagnostic)
         .into_iter()
         .collect::<Vec<_>>();
-    build_dispatch_trace_report_from_conflict(
+    let prepared = prepare_conflict_matrix_inputs(&root, path, scope, impact_limit)?;
+    let graph_prepared = prepare_conflict_matrix_graph_orchestration(
+        &root,
+        scope,
+        "sqlite",
+        raw_targets,
+        &prepared.context_pack,
+        depth,
+        limit,
+        &store,
+        freshness.clone(),
+    )?;
+    let conflict = build_conflict_matrix_report_from_prepared_graph(
+        &root,
+        path,
+        scope,
+        depth,
+        limit,
+        impact_limit,
+        freshness,
+        extra_warnings.clone(),
+        &prepared,
+        &graph_prepared,
+    )?;
+    build_dispatch_trace_report_from_conflict_snapshot(
         &root,
         scope,
         conflict,
-        &store,
+        graph_prepared.graph.nodes,
+        graph_prepared.graph.edges,
         depth,
         limit,
         extra_warnings,
