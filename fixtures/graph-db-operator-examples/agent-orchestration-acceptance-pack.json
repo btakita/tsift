@@ -575,14 +575,13 @@
         }
       ],
       "node_kind_counts": {
-        "backlog": 5,
-        "file": 4,
-        "job_packet": 6,
-        "session": 1,
+        "backlog": 2,
+        "file": 3,
+        "job_packet": 2,
         "source_handle": 3,
-        "symbol": 13,
-        "worker_context": 8,
-        "worker_result": 6
+        "symbol": 6,
+        "worker_context": 2,
+        "worker_result": 2
       },
       "replay_commands_match_conflict": true,
       "repair_mentions_refresh": true,

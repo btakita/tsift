@@ -304,6 +304,24 @@ pub trait GraphStore {
     fn node(&self, id: &str) -> Result<Option<GraphNode>>;
     fn all_nodes(&self) -> Result<Vec<GraphNode>>;
     fn all_edges(&self) -> Result<Vec<GraphEdge>>;
+    fn graph_counts(&self) -> Result<(usize, usize)> {
+        Ok((self.all_nodes()?.len(), self.all_edges()?.len()))
+    }
+    fn sample_edge(&self, kind: Option<&str>) -> Result<Option<GraphEdge>> {
+        let mut edges = self
+            .all_edges()?
+            .into_iter()
+            .filter(|edge| edge.from_id != edge.to_id)
+            .filter(|edge| kind.is_none_or(|kind| edge.kind == kind))
+            .collect::<Vec<_>>();
+        edges.sort_by(|left, right| {
+            left.from_id
+                .cmp(&right.from_id)
+                .then(left.kind.cmp(&right.kind))
+                .then(left.to_id.cmp(&right.to_id))
+        });
+        Ok(edges.into_iter().next())
+    }
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>>;
     fn outgoing_edges(&self, from_id: &str, kind: Option<&str>) -> Result<Vec<GraphEdge>>;
     fn shortest_path(
@@ -794,6 +812,13 @@ impl<C: ConvexGraphClient> GraphStore for ConvexGraphStore<C> {
         Ok(edges)
     }
 
+    fn graph_counts(&self) -> Result<(usize, usize)> {
+        Ok((
+            self.client.node_rows()?.len(),
+            self.client.edge_rows()?.len(),
+        ))
+    }
+
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>> {
         let mut nodes: Vec<GraphNode> = self
             .client
@@ -1126,6 +1151,23 @@ impl SqliteGraphStore {
 
     pub fn read_only_recovery(&self) -> Option<ReadOnlyRecovery> {
         self.read_only_recovery
+    }
+
+    pub fn has_user_triggers(&self) -> Result<bool> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM sqlite_master
+                    WHERE type = 'trigger'
+                      AND name NOT LIKE 'sqlite_%'
+                )
+                "#,
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
     }
 
     fn from_connection(conn: Connection) -> Result<Self> {
@@ -2038,6 +2080,55 @@ impl GraphStore for SqliteGraphStore {
             "#,
         )?;
         collect_rows(stmt.query_map([], edge_from_row)?)
+    }
+
+    fn graph_counts(&self) -> Result<(usize, usize)> {
+        let nodes = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM graph_nodes", [], |row| {
+                row.get::<_, usize>(0)
+            })?;
+        let edges = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM graph_edges", [], |row| {
+                row.get::<_, usize>(0)
+            })?;
+        Ok((nodes, edges))
+    }
+
+    fn sample_edge(&self, kind: Option<&str>) -> Result<Option<GraphEdge>> {
+        match kind {
+            Some(kind) => self
+                .conn
+                .query_row(
+                    r#"
+                    SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                    FROM graph_edges INDEXED BY idx_graph_edges_from_kind
+                    WHERE from_id <> to_id AND kind = ?1
+                    ORDER BY from_id, kind, to_id
+                    LIMIT 1
+                    "#,
+                    [kind],
+                    edge_from_row,
+                )
+                .optional()
+                .map_err(Into::into),
+            None => self
+                .conn
+                .query_row(
+                    r#"
+                    SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                    FROM graph_edges INDEXED BY idx_graph_edges_from_kind
+                    WHERE from_id <> to_id
+                    ORDER BY from_id, kind, to_id
+                    LIMIT 1
+                    "#,
+                    [],
+                    edge_from_row,
+                )
+                .optional()
+                .map_err(Into::into),
+        }
     }
 
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>> {
@@ -3054,6 +3145,11 @@ mod tests {
         let calls = store.outgoing_edges("a", Some("calls")).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].to_id, "b");
+        assert_eq!(store.graph_counts().unwrap(), (3, 3));
+        assert_eq!(
+            store.sample_edge(Some("calls")).unwrap().unwrap().to_id,
+            "b"
+        );
 
         let path = store
             .shortest_path("a", "c", Some("calls"))

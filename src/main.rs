@@ -6572,6 +6572,27 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
         Ok(self.edges.values().cloned().collect())
     }
 
+    fn graph_counts(&self) -> Result<(usize, usize)> {
+        Ok((self.nodes.len(), self.edges.len()))
+    }
+
+    fn sample_edge(&self, kind: Option<&str>) -> Result<Option<SubstrateGraphEdge>> {
+        let mut edges = self
+            .edges
+            .values()
+            .filter(|edge| edge.from_id != edge.to_id)
+            .filter(|edge| kind.is_none_or(|kind| edge.kind == kind))
+            .cloned()
+            .collect::<Vec<_>>();
+        edges.sort_by(|left, right| {
+            left.from_id
+                .cmp(&right.from_id)
+                .then(left.kind.cmp(&right.kind))
+                .then(left.to_id.cmp(&right.to_id))
+        });
+        Ok(edges.into_iter().next())
+    }
+
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<SubstrateGraphNode>> {
         Ok(self
             .node_ids_by_kind
@@ -8682,9 +8703,26 @@ fn cmd_graph_db_refresh(
     scope: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
-    let (graph, refresh) = write_traversal_graph_store(root, path, scope)?;
+    let source_watermark = traversal_source_watermark(root, path, scope, false)?;
+    let cached_refresh =
+        graph_db_backend_eval_cached_refresh(root, scope, source_watermark.as_deref())?;
+    let (mut warnings, refresh, phase_timings) =
+        if let Some((_graph, refresh, phase_timings)) = cached_refresh {
+            (Vec::new(), refresh, phase_timings)
+        } else {
+            let (graph, refresh) = write_traversal_graph_store(root, path, scope)?;
+            let phase_timings = refresh
+                .phase_timings
+                .iter()
+                .map(|phase| GraphDbBackendEvalPhaseTiming {
+                    name: phase.name.clone(),
+                    duration_micros: phase.duration_micros,
+                    detail: phase.detail.clone(),
+                })
+                .collect::<Vec<_>>();
+            (graph.warnings, refresh, phase_timings)
+        };
     let graph_db = graph_substrate_db_path(root, scope);
-    let mut warnings = graph.warnings;
     warnings.extend(graph_db_operator_status_warnings(root, scope));
     let warnings = dedupe_preserve_order(warnings);
     let refresh = GraphDbRefreshSummary {
@@ -8705,15 +8743,7 @@ fn cmd_graph_db_refresh(
         pruned_tombstones: refresh.pruned_tombstones,
         file_size_bytes_before: refresh.file_size_bytes_before,
         file_size_bytes_after: refresh.file_size_bytes_after,
-        phase_timings: refresh
-            .phase_timings
-            .into_iter()
-            .map(|phase| GraphDbBackendEvalPhaseTiming {
-                name: phase.name,
-                duration_micros: phase.duration_micros,
-                detail: phase.detail,
-            })
-            .collect(),
+        phase_timings,
     };
     let report = graph_db_operator_report_from_disk(
         root,
@@ -9880,6 +9910,9 @@ fn graph_db_backend_eval_cached_refresh(
         Ok(store) => store,
         Err(_) => return Ok(None),
     };
+    if store.has_user_triggers().unwrap_or(true) {
+        return Ok(None);
+    }
     let freshness = sqlite_graph_freshness(&store, scope.unwrap_or("root"))?;
     if freshness.fail_closed || freshness.source_watermark.as_deref() != Some(source_watermark) {
         return Ok(None);
@@ -10125,23 +10158,13 @@ fn graph_db_backend_eval_path_targets(
         return Ok(Some((synthetic_from.to_string(), synthetic_to, max_hops)));
     }
 
-    let mut edges = store.all_edges()?;
-    edges.sort_by(|left, right| {
-        left.from_id
-            .cmp(&right.from_id)
-            .then(left.kind.cmp(&right.kind))
-            .then(left.to_id.cmp(&right.to_id))
-    });
-    Ok(edges
-        .into_iter()
-        .find(|edge| edge.from_id != edge.to_id)
-        .map(|edge| {
-            (
-                edge.from_id,
-                edge.to_id,
-                GRAPH_DB_BACKEND_EVAL_DIRECT_PATH_HOPS,
-            )
-        }))
+    Ok(store.sample_edge(None)?.map(|edge| {
+        (
+            edge.from_id,
+            edge.to_id,
+            GRAPH_DB_BACKEND_EVAL_DIRECT_PATH_HOPS,
+        )
+    }))
 }
 
 fn graph_db_backend_eval_evidence_signature(report: &GraphDbEvidenceReport) -> serde_json::Value {
@@ -10241,14 +10264,13 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
     let mut signatures = refresh_signature.into_iter().collect::<Vec<_>>();
 
     let (operation, signature) = graph_db_backend_eval_timed("status", || {
-        let nodes = store.all_nodes()?;
-        let edges = store.all_edges()?;
+        let (nodes, edges) = store.graph_counts()?;
         Ok((
-            Some(nodes.len() + edges.len()),
+            Some(nodes + edges),
             serde_json::json!({
                 "freshness": freshness.status,
-                "nodes": nodes.len(),
-                "edges": edges.len(),
+                "nodes": nodes,
+                "edges": edges,
             }),
         ))
     });
@@ -10329,7 +10351,8 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
     let mut conflict_for_trace = None;
     let (operation, signature) = graph_db_backend_eval_timed("conflict_matrix", || {
         let graph_prepared = if let Some((targets, evidence)) = evidence_for_report.take() {
-            let graph = conflict_matrix_graph_snapshot(store)?;
+            let graph =
+                conflict_matrix_target_scoped_graph_snapshot(store, &evidence, depth, limit)?;
             let shared_preparation = conflict_matrix_shared_preparation_summary(&graph, &evidence);
             ConflictMatrixGraphPreparedInputs {
                 targets,
@@ -10799,8 +10822,7 @@ fn graph_db_backend_eval_dataset(
     extra_warnings: Vec<String>,
     prepared: &ConflictMatrixPreparedInputs,
 ) -> Result<GraphDbBackendEvalDataset> {
-    let nodes = sqlite_store.all_nodes()?.len();
-    let edges = sqlite_store.all_edges()?.len();
+    let (nodes, edges) = sqlite_store.graph_counts()?;
     let (sqlite_operation, sqlite_signature) = sqlite_refresh;
     let (sqlite_report, sqlite_signatures) = graph_db_backend_eval_report_for_store(
         "sqlite",
@@ -10829,13 +10851,14 @@ fn graph_db_backend_eval_dataset(
     for candidate in candidates {
         let started = Instant::now();
         let store = ExperimentalReadOnlyGraphStore::from_rows(*candidate, sqlite_rows.clone())?;
-        let rows = store.all_nodes()?.len() + store.all_edges()?.len();
+        let (candidate_nodes, candidate_edges) = store.graph_counts()?;
+        let rows = candidate_nodes + candidate_edges;
         let refresh = graph_db_backend_eval_refresh_operation(
             started.elapsed().as_micros(),
             rows,
             serde_json::json!({
-                "nodes": store.all_nodes()?.len(),
-                "edges": store.all_edges()?.len(),
+                "nodes": candidate_nodes,
+                "edges": candidate_edges,
             }),
         );
         let freshness = sqlite_graph_freshness(sqlite_store, scope.unwrap_or("root"))?;
@@ -12551,11 +12574,15 @@ fn write_traversal_graph_store_with_options(
     let projection = traversal_projection_from_graph(root, scope, &source_graph)?;
     let graph_db = graph_substrate_db_path(root, scope);
     let mut store = SqliteGraphStore::open(&graph_db)?;
+    let source_watermark = traversal_source_watermark(root, path_hint, scope, session_only)
+        .ok()
+        .flatten()
+        .or_else(|| graph_projection_content_hash(&projection));
     let refresh = store.replace_projection_with_version(
         scope.unwrap_or("root"),
         &projection,
         Some(GRAPH_PROJECTION_VERSION),
-        graph_projection_content_hash(&projection),
+        source_watermark,
     )?;
     Ok((source_graph, refresh))
 }
@@ -17115,9 +17142,211 @@ fn conflict_matrix_shared_preparation_summary(
     }
 }
 
+#[allow(dead_code)]
 fn conflict_matrix_graph_snapshot(store: &impl GraphStore) -> Result<ConflictMatrixGraphSnapshot> {
     let nodes = store.all_nodes()?;
     let edges = store.all_edges()?;
+    let index = conflict_matrix_graph_index(&nodes);
+    Ok(ConflictMatrixGraphSnapshot {
+        nodes,
+        edges,
+        index,
+    })
+}
+
+fn insert_conflict_graph_node(
+    nodes: &mut BTreeMap<String, SubstrateGraphNode>,
+    node: SubstrateGraphNode,
+) {
+    nodes.entry(node.id.clone()).or_insert(node);
+}
+
+fn insert_conflict_graph_edge(
+    edges: &mut BTreeMap<(String, String, String), SubstrateGraphEdge>,
+    edge: SubstrateGraphEdge,
+) {
+    edges
+        .entry((edge.from_id.clone(), edge.kind.clone(), edge.to_id.clone()))
+        .or_insert(edge);
+}
+
+fn conflict_matrix_files_from_evidence(evidence: &GraphDbEvidenceReport) -> BTreeSet<String> {
+    let mut files = BTreeSet::new();
+    if matches!(
+        evidence.target_node.kind.as_str(),
+        "file" | "symbol" | "route"
+    ) && let Some(path) = evidence.target_node.properties.get("path")
+    {
+        files.insert(path.clone());
+    }
+    for node in &evidence.source_handles {
+        if let Some(handle) = conflict_matrix_source_handle(node) {
+            files.insert(handle.file);
+        }
+    }
+    files
+}
+
+fn conflict_matrix_add_path_nodes<S: GraphStore>(
+    store: &S,
+    nodes: &mut BTreeMap<String, SubstrateGraphNode>,
+    evidence: &GraphDbEvidenceReport,
+) -> Result<()> {
+    for path in &evidence.shortest_paths {
+        let Some(graph_path) = &path.path else {
+            continue;
+        };
+        for id in &graph_path.nodes {
+            if nodes.contains_key(id) {
+                continue;
+            }
+            if let Some(node) = store.node(id)? {
+                insert_conflict_graph_node(nodes, node);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn conflict_matrix_add_file_symbol_nodes<S: GraphStore>(
+    store: &S,
+    nodes: &mut BTreeMap<String, SubstrateGraphNode>,
+    files: &BTreeSet<String>,
+) -> Result<()> {
+    for file in files {
+        for kind in ["file", "route", "symbol"] {
+            let page = store.paged_nodes_by_kind(
+                kind,
+                GraphQueryOptions {
+                    property_filters: vec![GraphPropertyFilter {
+                        key: "path".to_string(),
+                        value: file.clone(),
+                    }],
+                    ..GraphQueryOptions::default()
+                },
+            )?;
+            for node in page.nodes {
+                insert_conflict_graph_node(nodes, node);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn conflict_matrix_add_target_ref_nodes<S: GraphStore>(
+    store: &S,
+    nodes: &mut BTreeMap<String, SubstrateGraphNode>,
+    target_node: &SubstrateGraphNode,
+) -> Result<()> {
+    let Some(ref_id) = target_node.properties.get("ref_id") else {
+        return Ok(());
+    };
+    for kind in ["backlog", "job_packet", "worker_result"] {
+        let page = store.paged_nodes_by_kind(
+            kind,
+            GraphQueryOptions {
+                property_filters: vec![GraphPropertyFilter {
+                    key: "ref_id".to_string(),
+                    value: ref_id.clone(),
+                }],
+                ..GraphQueryOptions::default()
+            },
+        )?;
+        for node in page.nodes {
+            insert_conflict_graph_node(nodes, node);
+        }
+    }
+    Ok(())
+}
+
+fn conflict_matrix_add_target_neighborhood<S: GraphStore>(
+    store: &S,
+    nodes: &mut BTreeMap<String, SubstrateGraphNode>,
+    edges: &mut BTreeMap<(String, String, String), SubstrateGraphEdge>,
+    target_node: &SubstrateGraphNode,
+    depth: usize,
+    limit: usize,
+) -> Result<()> {
+    let node_limit = if limit == 0 {
+        None
+    } else {
+        Some(limit.saturating_mul(depth.max(1)).saturating_mul(8).max(64))
+    };
+    if let Some(page) = store.paged_neighborhood(
+        &target_node.id,
+        depth,
+        None,
+        GraphQueryOptions {
+            limit: node_limit,
+            ..GraphQueryOptions::default()
+        },
+    )? {
+        for node in page.nodes {
+            insert_conflict_graph_node(nodes, node);
+        }
+        for edge in page.edges {
+            insert_conflict_graph_edge(edges, edge);
+        }
+    }
+    Ok(())
+}
+
+fn conflict_matrix_add_scoped_edges<S: GraphStore>(
+    store: &S,
+    nodes: &BTreeMap<String, SubstrateGraphNode>,
+    edges: &mut BTreeMap<(String, String, String), SubstrateGraphEdge>,
+) -> Result<()> {
+    let node_ids = nodes.keys().cloned().collect::<BTreeSet<_>>();
+    for id in &node_ids {
+        for edge in store.outgoing_edges(id, None)? {
+            if node_ids.contains(&edge.to_id) {
+                insert_conflict_graph_edge(edges, edge);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn conflict_matrix_target_scoped_graph_snapshot<S: GraphStore>(
+    store: &S,
+    evidence: &[ConflictMatrixPreparedEvidence],
+    depth: usize,
+    limit: usize,
+) -> Result<ConflictMatrixGraphSnapshot> {
+    let mut nodes = BTreeMap::<String, SubstrateGraphNode>::new();
+    let mut edges = BTreeMap::<(String, String, String), SubstrateGraphEdge>::new();
+    let mut files = BTreeSet::new();
+
+    for prepared in evidence {
+        let report = &prepared.report;
+        insert_conflict_graph_node(&mut nodes, report.target_node.clone());
+        for node in report
+            .worker_context
+            .iter()
+            .chain(report.source_handles.iter())
+            .chain(report.worker_results.iter())
+            .chain(report.semantic_related.iter())
+        {
+            insert_conflict_graph_node(&mut nodes, node.clone());
+        }
+        files.extend(conflict_matrix_files_from_evidence(report));
+        conflict_matrix_add_target_ref_nodes(store, &mut nodes, &report.target_node)?;
+        conflict_matrix_add_path_nodes(store, &mut nodes, report)?;
+        conflict_matrix_add_target_neighborhood(
+            store,
+            &mut nodes,
+            &mut edges,
+            &report.target_node,
+            depth,
+            limit,
+        )?;
+    }
+
+    conflict_matrix_add_file_symbol_nodes(store, &mut nodes, &files)?;
+    conflict_matrix_add_scoped_edges(store, &nodes, &mut edges)?;
+
+    let nodes = nodes.into_values().collect::<Vec<_>>();
+    let edges = edges.into_values().collect::<Vec<_>>();
     let index = conflict_matrix_graph_index(&nodes);
     Ok(ConflictMatrixGraphSnapshot {
         nodes,
@@ -17171,10 +17400,10 @@ fn prepare_conflict_matrix_graph_orchestration<S: GraphStore>(
     freshness: GraphDbFreshnessReport,
 ) -> Result<ConflictMatrixGraphPreparedInputs> {
     let targets = resolve_conflict_matrix_targets(store, raw_targets, context_pack)?;
-    let graph = conflict_matrix_graph_snapshot(store)?;
     let evidence = collect_conflict_matrix_evidence_packets(
         root, scope, backend, &targets, depth, limit, store, freshness,
     )?;
+    let graph = conflict_matrix_target_scoped_graph_snapshot(store, &evidence, depth, limit)?;
     let shared_preparation = conflict_matrix_shared_preparation_summary(&graph, &evidence);
 
     Ok(ConflictMatrixGraphPreparedInputs {
@@ -17390,8 +17619,11 @@ fn build_conflict_matrix_report(
     impact_limit: usize,
 ) -> Result<ConflictMatrixReport> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    write_traversal_graph_store(&root, path, scope)
-        .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
+    let source_watermark = traversal_source_watermark(&root, path, scope, false)?;
+    if graph_db_backend_eval_cached_refresh(&root, scope, source_watermark.as_deref())?.is_none() {
+        write_traversal_graph_store(&root, path, scope)
+            .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
+    }
     let graph_db = graph_substrate_db_path(&root, scope);
     let store = SqliteGraphStore::open_read_only_resilient(&graph_db)
         .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
@@ -17756,8 +17988,11 @@ fn build_dispatch_trace_report(
     impact_limit: usize,
 ) -> Result<DispatchTraceReport> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    write_traversal_graph_store(&root, path, scope)
-        .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
+    let source_watermark = traversal_source_watermark(&root, path, scope, false)?;
+    if graph_db_backend_eval_cached_refresh(&root, scope, source_watermark.as_deref())?.is_none() {
+        write_traversal_graph_store(&root, path, scope)
+            .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
+    }
     let graph_db = graph_substrate_db_path(&root, scope);
     let store = SqliteGraphStore::open_read_only_resilient(&graph_db)
         .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;

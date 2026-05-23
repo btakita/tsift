@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- Normal `graph-db refresh`, `conflict-matrix`, and `dispatch-trace` now reuse the same source-watermark cached projection path as backend-eval when source inputs are unchanged, and conflict/trace preparation builds target-scoped graph snapshots instead of loading every graph node and edge.
+- GraphStore now exposes cheap count and sample-edge probes; SQLite backs them with `COUNT(*)` / indexed `LIMIT 1` queries so backend-eval status and `path_max_hops` selection avoid full row materialization before timing the measured operation.
 - Graph refresh now streams materialized node-property rows into the staged SQLite projection while node rows are inserted, and context-pack exploration uses one batched SQLite projection transaction for `source_handle` / `worker_context` rows instead of per-row autocommit writes.
 - SQLite graph DB schema v3 now maintains `graph_node_properties` rows so `graph-db kind` and `neighborhood --property KEY=VALUE` use an indexed materialized property table instead of JSON extraction scans; refresh/status/doctor expose compaction proof, and `graph-db compact` adds a guarded WAL checkpoint/VACUUM path with explicit Convex-reconciliation confirmation before tombstone pruning.
 - `graph-db evidence` now batches reachable worker-context, source-handle, worker-result, and semantic row expansion through one SQLite recursive CTE per target, preserving max-hop/limit ordering while avoiding per-family path walks.

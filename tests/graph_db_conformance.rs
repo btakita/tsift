@@ -1225,6 +1225,28 @@ fn graph_db_refresh_and_status_materialize_operator_report() {
         "{refresh}"
     );
 
+    let cached_refresh =
+        graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
+    assert_eq!(cached_refresh["status"], "current", "{cached_refresh}");
+    assert_eq!(
+        cached_refresh["counts"]["nodes"],
+        refresh["counts"]["nodes"]
+    );
+    assert!(
+        cached_refresh["refresh"]["phase_timings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|phase| {
+                phase["name"] == "source_graph_build"
+                    && phase["detail"]
+                        .as_str()
+                        .unwrap()
+                        .contains("reused current graph.db projection")
+            }),
+        "{cached_refresh}"
+    );
+
     let status = graph_db_json(project.path(), Backend::Sqlite, vec!["status".to_string()]);
     assert_eq!(status["operation"], "status", "{status}");
     assert_eq!(status["status"], "current", "{status}");
@@ -1948,6 +1970,14 @@ fn conflict_matrix_cli_composes_planner_evidence_and_worker_ownership() {
         report["inputs"]["shared_preparation"]["dispatch_trace_snapshot_nodes"],
         report["inputs"]["shared_preparation"]["graph_nodes"],
         "{report}"
+    );
+    let status = graph_db_json(project.path(), Backend::Sqlite, vec!["status".to_string()]);
+    assert!(
+        report["inputs"]["shared_preparation"]["graph_nodes"]
+            .as_u64()
+            .unwrap()
+            < status["counts"]["nodes"].as_u64().unwrap(),
+        "conflict-matrix should use a target-scoped graph snapshot: {report}"
     );
     let candidates = report["candidates"].as_array().unwrap();
     assert_eq!(candidates.len(), 1, "{report}");
