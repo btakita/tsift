@@ -324,6 +324,19 @@ pub trait GraphStore {
     }
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>>;
     fn outgoing_edges(&self, from_id: &str, kind: Option<&str>) -> Result<Vec<GraphEdge>>;
+    fn edges_between_nodes(&self, node_ids: &BTreeSet<String>) -> Result<Vec<GraphEdge>> {
+        let mut edges = BTreeMap::<(String, String, String), GraphEdge>::new();
+        for from_id in node_ids {
+            for edge in self.outgoing_edges(from_id, None)? {
+                if node_ids.contains(&edge.to_id) {
+                    edges
+                        .entry((edge.from_id.clone(), edge.kind.clone(), edge.to_id.clone()))
+                        .or_insert(edge);
+                }
+            }
+        }
+        Ok(edges.into_values().collect())
+    }
     fn shortest_path(
         &self,
         from_id: &str,
@@ -1306,6 +1319,7 @@ impl SqliteGraphStore {
         let projection_hash = projection_hash_from_nodes(&projection.nodes);
         let observed_at_unix = unix_now();
         let file_size_bytes_before = sqlite_database_size_bytes(&self.conn).ok();
+        let force_refresh_writes = self.has_user_triggers().unwrap_or(true);
         let mut phase_timings = Vec::new();
 
         let tx = self.conn.transaction()?;
@@ -1513,7 +1527,7 @@ impl SqliteGraphStore {
             [],
         )?;
 
-        tx.execute(
+        let upsert_nodes_sql = if force_refresh_writes {
             r#"
             INSERT INTO graph_nodes
                 (id, kind, label, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
@@ -1529,10 +1543,36 @@ impl SqliteGraphStore {
                 row_hash = excluded.row_hash,
                 source_watermark = excluded.source_watermark
             WHERE graph_nodes.row_hash IS NOT excluded.row_hash
-            "#,
-            [],
-        )?;
-        tx.execute(
+            "#
+        } else {
+            r#"
+            INSERT INTO graph_nodes
+                (id, kind, label, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+            SELECT
+                n.id,
+                n.kind,
+                n.label,
+                n.properties_json,
+                n.provenance_json,
+                n.freshness_json,
+                n.row_hash,
+                n.source_watermark
+            FROM next_graph_nodes n
+            LEFT JOIN graph_nodes g ON g.id = n.id
+            WHERE g.id IS NULL OR g.row_hash IS NOT n.row_hash
+            ON CONFLICT(id) DO UPDATE SET
+                kind = excluded.kind,
+                label = excluded.label,
+                properties_json = excluded.properties_json,
+                provenance_json = excluded.provenance_json,
+                freshness_json = excluded.freshness_json,
+                row_hash = excluded.row_hash,
+                source_watermark = excluded.source_watermark
+            WHERE graph_nodes.row_hash IS NOT excluded.row_hash
+            "#
+        };
+        tx.execute(upsert_nodes_sql, [])?;
+        let upsert_edges_sql = if force_refresh_writes {
             r#"
             INSERT INTO graph_edges
                 (from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
@@ -1546,9 +1586,34 @@ impl SqliteGraphStore {
                 row_hash = excluded.row_hash,
                 source_watermark = excluded.source_watermark
             WHERE graph_edges.row_hash IS NOT excluded.row_hash
-            "#,
-            [],
-        )?;
+            "#
+        } else {
+            r#"
+            INSERT INTO graph_edges
+                (from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+            SELECT
+                n.from_id,
+                n.to_id,
+                n.kind,
+                n.properties_json,
+                n.provenance_json,
+                n.freshness_json,
+                n.row_hash,
+                n.source_watermark
+            FROM next_graph_edges n
+            LEFT JOIN graph_edges g
+                ON g.from_id = n.from_id AND g.to_id = n.to_id AND g.kind = n.kind
+            WHERE g.from_id IS NULL OR g.row_hash IS NOT n.row_hash
+            ON CONFLICT(from_id, to_id, kind) DO UPDATE SET
+                properties_json = excluded.properties_json,
+                provenance_json = excluded.provenance_json,
+                freshness_json = excluded.freshness_json,
+                row_hash = excluded.row_hash,
+                source_watermark = excluded.source_watermark
+            WHERE graph_edges.row_hash IS NOT excluded.row_hash
+            "#
+        };
+        tx.execute(upsert_edges_sql, [])?;
         let deleted_properties = tx.execute(
             r#"
             DELETE FROM graph_node_properties
@@ -1561,7 +1626,7 @@ impl SqliteGraphStore {
             "#,
             [],
         )?;
-        let upserted_properties = tx.execute(
+        let upsert_properties_sql = if force_refresh_writes {
             r#"
             INSERT INTO graph_node_properties (node_id, key, value)
             SELECT node_id, key, value
@@ -1570,9 +1635,21 @@ impl SqliteGraphStore {
             ON CONFLICT(node_id, key) DO UPDATE SET
                 value = excluded.value
             WHERE graph_node_properties.value IS NOT excluded.value
-            "#,
-            [],
-        )?;
+            "#
+        } else {
+            r#"
+            INSERT INTO graph_node_properties (node_id, key, value)
+            SELECT n.node_id, n.key, n.value
+            FROM next_graph_node_properties n
+            LEFT JOIN graph_node_properties g
+                ON g.node_id = n.node_id AND g.key = n.key
+            WHERE g.node_id IS NULL OR g.value IS NOT n.value
+            ON CONFLICT(node_id, key) DO UPDATE SET
+                value = excluded.value
+            WHERE graph_node_properties.value IS NOT excluded.value
+            "#
+        };
+        let upserted_properties = tx.execute(upsert_properties_sql, [])?;
         tx.execute(
             r#"
             INSERT INTO graph_projection_versions
@@ -2252,6 +2329,48 @@ impl GraphStore for SqliteGraphStore {
         }
     }
 
+    fn edges_between_nodes(&self, node_ids: &BTreeSet<String>) -> Result<Vec<GraphEdge>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let node_ids = node_ids.iter().cloned().collect::<Vec<_>>();
+        let mut edges = BTreeMap::<(String, String, String), GraphEdge>::new();
+        for from_chunk in node_ids.chunks(450) {
+            let from_placeholders = std::iter::repeat_n("?", from_chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            for to_chunk in node_ids.chunks(450) {
+                let to_placeholders = std::iter::repeat_n("?", to_chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    r#"
+                    SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                    FROM graph_edges INDEXED BY idx_graph_edges_from_kind
+                    WHERE from_id IN ({from_placeholders})
+                      AND to_id IN ({to_placeholders})
+                    ORDER BY from_id, kind, to_id
+                    "#
+                );
+                let mut values = from_chunk
+                    .iter()
+                    .cloned()
+                    .map(Value::Text)
+                    .collect::<Vec<_>>();
+                values.extend(to_chunk.iter().cloned().map(Value::Text));
+                let mut stmt = self.conn.prepare(&sql)?;
+                for edge in
+                    collect_rows(stmt.query_map(params_from_iter(values.iter()), edge_from_row)?)?
+                {
+                    edges
+                        .entry((edge.from_id.clone(), edge.kind.clone(), edge.to_id.clone()))
+                        .or_insert(edge);
+                }
+            }
+        }
+        Ok(edges.into_values().collect())
+    }
+
     fn neighborhood(
         &self,
         center_id: &str,
@@ -2409,33 +2528,77 @@ impl GraphStore for SqliteGraphStore {
         let mut visited = BTreeSet::from([from_id.to_string()]);
         let mut parent = BTreeMap::<String, String>::from([(from_id.to_string(), String::new())]);
         let mut frontier = vec![from_id.to_string()];
+        let mut single_frontier_stmt = if kind.is_none() {
+            Some(self.conn.prepare(
+                r#"
+                SELECT from_id, to_id
+                FROM graph_edges INDEXED BY idx_graph_edges_from_kind
+                WHERE from_id = ?1
+                ORDER BY from_id, to_id, kind
+                "#,
+            )?)
+        } else {
+            None
+        };
+        let mut single_frontier_kind_stmt = if kind.is_some() {
+            Some(self.conn.prepare(
+                r#"
+                SELECT from_id, to_id
+                FROM graph_edges INDEXED BY idx_graph_edges_from_kind
+                WHERE from_id = ?1 AND kind = ?2
+                ORDER BY from_id, to_id, kind
+                "#,
+            )?)
+        } else {
+            None
+        };
         for _depth in 0..hop_limit {
             if frontier.is_empty() {
                 break;
             }
             let mut next_frontier = BTreeSet::new();
             for chunk in frontier.chunks(256) {
-                let placeholders = std::iter::repeat_n("?", chunk.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let mut sql = format!(
-                    r#"
-                    SELECT from_id, to_id
-                    FROM graph_edges INDEXED BY idx_graph_edges_from_kind
-                    WHERE from_id IN ({placeholders})
-                    "#
-                );
-                let mut values = chunk.iter().cloned().map(Value::Text).collect::<Vec<_>>();
-                if let Some(kind) = kind {
-                    sql.push_str(" AND kind = ?");
-                    values.push(Value::Text(kind.to_string()));
-                }
-                sql.push_str(" ORDER BY from_id, to_id, kind");
-                let mut stmt = self.conn.prepare(&sql)?;
-                let edges =
+                let edges = if chunk.len() == 1 {
+                    match kind {
+                        Some(kind) => {
+                            let stmt = single_frontier_kind_stmt
+                                .as_mut()
+                                .context("single-frontier kind statement missing")?;
+                            collect_rows(stmt.query_map((chunk[0].as_str(), kind), |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                            })?)?
+                        }
+                        None => {
+                            let stmt = single_frontier_stmt
+                                .as_mut()
+                                .context("single-frontier statement missing")?;
+                            collect_rows(stmt.query_map([chunk[0].as_str()], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                            })?)?
+                        }
+                    }
+                } else {
+                    let placeholders = std::iter::repeat_n("?", chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let mut sql = format!(
+                        r#"
+                        SELECT from_id, to_id
+                        FROM graph_edges INDEXED BY idx_graph_edges_from_kind
+                        WHERE from_id IN ({placeholders})
+                        "#
+                    );
+                    let mut values = chunk.iter().cloned().map(Value::Text).collect::<Vec<_>>();
+                    if let Some(kind) = kind {
+                        sql.push_str(" AND kind = ?");
+                        values.push(Value::Text(kind.to_string()));
+                    }
+                    sql.push_str(" ORDER BY from_id, to_id, kind");
+                    let mut stmt = self.conn.prepare(&sql)?;
                     collect_rows(stmt.query_map(params_from_iter(values.iter()), |row| {
                         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?)?;
+                    })?)?
+                };
                 for (from, next) in edges {
                     if !visited.insert(next.clone()) {
                         continue;
@@ -3163,6 +3326,42 @@ mod tests {
                 .shortest_path("c", "a", Some("calls"))
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn sqlite_store_batches_edges_between_node_sets() {
+        let store = SqliteGraphStore::in_memory().unwrap();
+        for id in ["a", "b", "c", "outside"] {
+            store
+                .upsert_node(&GraphNode::new(id, "symbol", id))
+                .unwrap();
+        }
+        for edge in [
+            GraphEdge::new("a", "b", "calls"),
+            GraphEdge::new("b", "c", "calls"),
+            GraphEdge::new("a", "outside", "calls"),
+            GraphEdge::new("outside", "c", "calls"),
+        ] {
+            store.upsert_edge(&edge).unwrap();
+        }
+
+        let scoped = ["a".to_string(), "b".to_string(), "c".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let edge_keys = store
+            .edges_between_nodes(&scoped)
+            .unwrap()
+            .into_iter()
+            .map(|edge| (edge.from_id, edge.kind, edge.to_id))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            edge_keys,
+            vec![
+                ("a".to_string(), "calls".to_string(), "b".to_string()),
+                ("b".to_string(), "calls".to_string(), "c".to_string()),
+            ]
         );
     }
 

@@ -6614,6 +6614,15 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
             .collect())
     }
 
+    fn edges_between_nodes(&self, node_ids: &BTreeSet<String>) -> Result<Vec<SubstrateGraphEdge>> {
+        Ok(self
+            .edges
+            .values()
+            .filter(|edge| node_ids.contains(&edge.from_id) && node_ids.contains(&edge.to_id))
+            .cloned()
+            .collect())
+    }
+
     fn shortest_path(
         &self,
         from_id: &str,
@@ -17297,12 +17306,8 @@ fn conflict_matrix_add_scoped_edges<S: GraphStore>(
     edges: &mut BTreeMap<(String, String, String), SubstrateGraphEdge>,
 ) -> Result<()> {
     let node_ids = nodes.keys().cloned().collect::<BTreeSet<_>>();
-    for id in &node_ids {
-        for edge in store.outgoing_edges(id, None)? {
-            if node_ids.contains(&edge.to_id) {
-                insert_conflict_graph_edge(edges, edge);
-            }
-        }
+    for edge in store.edges_between_nodes(&node_ids)? {
+        insert_conflict_graph_edge(edges, edge);
     }
     Ok(())
 }
