@@ -6938,6 +6938,8 @@ struct GraphDbRefreshSummary {
     file_size_bytes_before: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     file_size_bytes_after: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    phase_timings: Vec<GraphDbBackendEvalPhaseTiming>,
 }
 
 #[derive(Serialize)]
@@ -7196,7 +7198,58 @@ fn sqlite_tombstone_counts(conn: &Connection) -> Result<GraphDbTombstoneCounts> 
     })
 }
 
-fn sqlite_graph_counts(conn: &Connection) -> Result<GraphDbOperatorCounts> {
+fn sqlite_graph_counts_from_cache(
+    conn: &Connection,
+    scope: &str,
+) -> Result<Option<GraphDbOperatorCounts>> {
+    if !sqlite_table_exists(conn, "graph_operator_stats")? {
+        return Ok(None);
+    }
+    let row = conn
+        .query_row(
+            r#"
+        SELECT nodes, edges, tombstone_nodes, tombstone_edges, file_size_bytes, freelist_bytes
+        FROM graph_operator_stats
+        WHERE scope = ?1
+        "#,
+            [scope],
+            |row| {
+                Ok((
+                    row.get::<_, usize>(0)?,
+                    row.get::<_, usize>(1)?,
+                    row.get::<_, usize>(2)?,
+                    row.get::<_, usize>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(row.map(
+        |(nodes, edges, tombstone_nodes, tombstone_edges, file_size_bytes, freelist_bytes)| {
+            GraphDbOperatorCounts {
+                nodes,
+                edges,
+                tombstones: GraphDbTombstoneCounts {
+                    nodes: tombstone_nodes,
+                    edges: tombstone_edges,
+                    total: tombstone_nodes + tombstone_edges,
+                },
+                file_size_bytes: file_size_bytes
+                    .and_then(|value| u64::try_from(value).ok())
+                    .or_else(|| sqlite_database_size_bytes(conn).ok()),
+                freelist_bytes: freelist_bytes
+                    .and_then(|value| u64::try_from(value).ok())
+                    .or_else(|| sqlite_database_freelist_bytes(conn).ok()),
+            }
+        },
+    ))
+}
+
+fn sqlite_graph_counts(conn: &Connection, scope: &str) -> Result<GraphDbOperatorCounts> {
+    if let Some(counts) = sqlite_graph_counts_from_cache(conn, scope)? {
+        return Ok(counts);
+    }
     let nodes = if sqlite_table_exists(conn, "graph_nodes")? {
         sqlite_known_table_count(conn, "graph_nodes")?
     } else {
@@ -7285,44 +7338,56 @@ fn sqlite_database_freelist_bytes(conn: &Connection) -> Result<u64> {
     Ok(freelist_count.saturating_mul(page_size))
 }
 
-fn sqlite_graph_tombstone_retention_diagnostics(conn: &Connection) -> Result<Vec<String>> {
+fn sqlite_graph_tombstone_retention_diagnostics(
+    conn: &Connection,
+    scope: &str,
+) -> Result<Vec<String>> {
     if !sqlite_table_exists(conn, "graph_tombstones")? {
         return Ok(Vec::new());
     }
-    let counts = sqlite_graph_counts(conn)?;
+    let cached = sqlite_graph_counts_from_cache(conn, scope)?;
+    let counts = match cached.clone() {
+        Some(counts) => counts,
+        None => sqlite_graph_counts(conn, scope)?,
+    };
     let live_rows = counts.nodes + counts.edges;
     let file_size = counts.file_size_bytes.unwrap_or(0);
     let freelist = counts.freelist_bytes.unwrap_or(0);
-    let mut live_keys = BTreeSet::new();
-    if sqlite_table_exists(conn, "graph_nodes")? {
-        let mut stmt = conn.prepare("SELECT id FROM graph_nodes")?;
+    let stale_live_tombstones = if cached.is_some() {
+        0
+    } else {
+        let mut live_keys = BTreeSet::new();
+        if sqlite_table_exists(conn, "graph_nodes")? {
+            let mut stmt = conn.prepare("SELECT id FROM graph_nodes")?;
+            for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
+                live_keys.insert(format!("node:{}", row?));
+            }
+        }
+        if sqlite_table_exists(conn, "graph_edges")? {
+            let mut stmt = conn.prepare("SELECT from_id, to_id, kind FROM graph_edges")?;
+            for row in stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })? {
+                let (from_id, to_id, kind) = row?;
+                live_keys.insert(format!(
+                    "edge:{}",
+                    ConvexEdgeRow::stable_key(&from_id, &to_id, &kind)
+                ));
+            }
+        }
+        let mut stale_live_tombstones = 0usize;
+        let mut stmt = conn.prepare("SELECT row_key FROM graph_tombstones ORDER BY row_key")?;
         for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
-            live_keys.insert(format!("node:{}", row?));
+            if live_keys.contains(&row?) {
+                stale_live_tombstones += 1;
+            }
         }
-    }
-    if sqlite_table_exists(conn, "graph_edges")? {
-        let mut stmt = conn.prepare("SELECT from_id, to_id, kind FROM graph_edges")?;
-        for row in stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })? {
-            let (from_id, to_id, kind) = row?;
-            live_keys.insert(format!(
-                "edge:{}",
-                ConvexEdgeRow::stable_key(&from_id, &to_id, &kind)
-            ));
-        }
-    }
-    let mut stale_live_tombstones = 0usize;
-    let mut stmt = conn.prepare("SELECT row_key FROM graph_tombstones ORDER BY row_key")?;
-    for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
-        if live_keys.contains(&row?) {
-            stale_live_tombstones += 1;
-        }
-    }
+        stale_live_tombstones
+    };
 
     let mut diagnostics = Vec::new();
     if stale_live_tombstones > 0 {
@@ -7331,10 +7396,16 @@ fn sqlite_graph_tombstone_retention_diagnostics(conn: &Connection) -> Result<Vec
         ));
     }
     if counts.tombstones.total > live_rows.max(1) {
+        let source = if cached.is_some() {
+            "cached refresh stats"
+        } else {
+            "live row scan"
+        };
         diagnostics.push(format!(
-            "tombstone retention exceeds live graph rows: {} tombstone(s) vs {} live row(s); graph.db file_size={} byte(s), freelist={} byte(s), status/doctor tombstone scans inspect {} extra row(s). Run convex-sync against the remote snapshot before rebuild/compaction if a remote consumer may still need deletion reconciliation.",
+            "tombstone retention exceeds live graph rows: {} tombstone(s) vs {} live row(s) from {}; graph.db file_size={} byte(s), freelist={} byte(s), status/doctor tombstone scans inspect {} extra row(s). Run convex-sync against the remote snapshot before rebuild/compaction if a remote consumer may still need deletion reconciliation.",
             counts.tombstones.total,
             live_rows,
+            source,
             file_size,
             freelist,
             counts.tombstones.total
@@ -8011,12 +8082,13 @@ fn append_sqlite_graph_doctor_checks(
         vec![backup_rebuild],
     ));
 
-    let tombstone_diagnostics = sqlite_graph_tombstone_retention_diagnostics(conn.conn())
-        .unwrap_or_else(|err| {
-            vec![format!(
-                "graph tombstone retention inspection failed: {err}"
-            )]
-        });
+    let tombstone_diagnostics =
+        sqlite_graph_tombstone_retention_diagnostics(conn.conn(), scope.unwrap_or("root"))
+            .unwrap_or_else(|err| {
+                vec![format!(
+                    "graph tombstone retention inspection failed: {err}"
+                )]
+            });
     report.push_check(GraphDbDoctorCheck {
         name: "sqlite_tombstone_retention".to_string(),
         status: if tombstone_diagnostics.is_empty() {
@@ -8028,7 +8100,7 @@ fn append_sqlite_graph_doctor_checks(
         diagnostics: tombstone_diagnostics,
         repair_commands: Vec::new(),
     });
-    let compaction_check = match sqlite_graph_counts(conn.conn()) {
+    let compaction_check = match sqlite_graph_counts(conn.conn(), scope.unwrap_or("root")) {
         Ok(counts) => {
             let policy = graph_db_compaction_policy(root, scope, &counts, false);
             GraphDbDoctorCheck {
@@ -8411,13 +8483,14 @@ fn graph_db_operator_report_from_disk(
         freshness.fail_closed = true;
         freshness.status = "stale".to_string();
     }
-    let counts = sqlite_graph_counts(conn.conn())?;
+    let counts = sqlite_graph_counts(conn.conn(), scope.unwrap_or("root"))?;
     warnings.extend(
-        sqlite_graph_tombstone_retention_diagnostics(conn.conn()).unwrap_or_else(|err| {
-            vec![format!(
-                "graph tombstone retention inspection failed: {err}"
-            )]
-        }),
+        sqlite_graph_tombstone_retention_diagnostics(conn.conn(), scope.unwrap_or("root"))
+            .unwrap_or_else(|err| {
+                vec![format!(
+                    "graph tombstone retention inspection failed: {err}"
+                )]
+            }),
     );
     let status = if freshness.fail_closed {
         "stale"
@@ -8626,6 +8699,15 @@ fn cmd_graph_db_refresh(
         pruned_tombstones: refresh.pruned_tombstones,
         file_size_bytes_before: refresh.file_size_bytes_before,
         file_size_bytes_after: refresh.file_size_bytes_after,
+        phase_timings: refresh
+            .phase_timings
+            .into_iter()
+            .map(|phase| GraphDbBackendEvalPhaseTiming {
+                name: phase.name,
+                duration_micros: phase.duration_micros,
+                detail: phase.detail,
+            })
+            .collect(),
     };
     let report = graph_db_operator_report_from_disk(
         root,
@@ -9187,33 +9269,16 @@ fn graph_db_resolve_evidence_target(
     store: &impl GraphStore,
     target: &str,
 ) -> Result<Option<SubstrateGraphNode>> {
-    if let Some(node) = store.node(target)? {
-        return Ok(Some(node));
-    }
-    let normalized = target.trim().trim_start_matches('#');
-    for kind in [
-        "backlog",
-        "job_packet",
-        "worker_result",
-        "worker_context",
-        "source_handle",
-    ] {
-        let mut candidates = store
-            .nodes_by_kind(kind)?
-            .into_iter()
-            .filter(|node| {
-                node.properties.get("handle").map(String::as_str) == Some(target)
-                    || node.properties.get("ref_id").map(String::as_str) == Some(normalized)
-                    || node.label == target
-                    || node.label == format!("#{normalized}")
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| left.id.cmp(&right.id));
-        if let Some(candidate) = candidates.into_iter().next() {
-            return Ok(Some(candidate));
-        }
-    }
-    Ok(None)
+    store.resolve_evidence_target(
+        target,
+        &[
+            "backlog",
+            "job_packet",
+            "worker_result",
+            "worker_context",
+            "source_handle",
+        ],
+    )
 }
 
 fn graph_db_reachable_nodes_by_kind(
@@ -9814,19 +9879,22 @@ fn graph_db_backend_eval_refresh_with_profile(
         "open the local SQLite graph.db with WAL and busy-timeout settings",
         || SqliteGraphStore::open(&graph_db),
     )?;
-    let refresh = graph_db_backend_eval_timed_phase(
-        &mut phases,
-        "sqlite_delta_write",
-        "replace_projection delta upserts/deletes, row-hash skips, metadata update, and refresh-time tombstone pruning",
-        || {
-            store.replace_projection_with_version(
-                scope.unwrap_or("root"),
-                &projection,
-                Some(GRAPH_PROJECTION_VERSION),
-                graph_projection_content_hash(&projection),
-            )
-        },
+    let refresh = store.replace_projection_with_version(
+        scope.unwrap_or("root"),
+        &projection,
+        Some(GRAPH_PROJECTION_VERSION),
+        graph_projection_content_hash(&projection),
     )?;
+    phases.extend(
+        refresh
+            .phase_timings
+            .iter()
+            .map(|phase| GraphDbBackendEvalPhaseTiming {
+                name: phase.name.clone(),
+                duration_micros: phase.duration_micros,
+                detail: phase.detail.clone(),
+            }),
+    );
     Ok((source_graph, refresh, phases))
 }
 
@@ -10446,6 +10514,7 @@ fn graph_db_backend_eval_performance_gate(
         required_metrics: vec![
             "real.sqlite.refresh.duration_micros".to_string(),
             "real.refresh_phase.sqlite_delta_write.duration_micros".to_string(),
+            "real.refresh_phase.sqlite_property_row_staging.duration_micros".to_string(),
             "real.sqlite.conflict_matrix.duration_micros".to_string(),
             "real.sqlite.dispatch_trace.duration_micros".to_string(),
             "real.sqlite.path_max_hops.duration_micros".to_string(),

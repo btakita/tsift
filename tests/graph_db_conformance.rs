@@ -1327,6 +1327,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "source_graph_build",
         "projection_rows",
         "sqlite_open",
+        "sqlite_property_row_staging",
         "sqlite_delta_write",
         "conflict_matrix_preparation",
     ] {
@@ -1464,6 +1465,16 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "{report}"
     );
     assert!(
+        report["performance_gate"]["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |metric| metric == "real.refresh_phase.sqlite_property_row_staging.duration_micros"
+            ),
+        "{report}"
+    );
+    assert!(
         report["metrics"]
             .as_object()
             .unwrap()
@@ -1482,6 +1493,13 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .as_object()
             .unwrap()
             .contains_key("real.refresh_phase.sqlite_delta_write.duration_micros"),
+        "{report}"
+    );
+    assert!(
+        report["metrics"]
+            .as_object()
+            .unwrap()
+            .contains_key("real.refresh_phase.sqlite_property_row_staging.duration_micros"),
         "{report}"
     );
     assert!(
@@ -1521,6 +1539,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
     for metric in [
         "real.sqlite.total_duration_micros",
         "real.refresh_phase.sqlite_delta_write.duration_micros",
+        "real.refresh_phase.sqlite_property_row_staging.duration_micros",
         "synthetic_high_degree.sqlite.total_duration_micros",
         "synthetic_deep_chain.sqlite.path_max_hops.duration_micros",
     ] {

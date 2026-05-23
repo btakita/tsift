@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-pub const SQLITE_GRAPH_SCHEMA_VERSION: i64 = 3;
+pub const SQLITE_GRAPH_SCHEMA_VERSION: i64 = 4;
 const SQLITE_GRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,6 +447,30 @@ pub trait GraphStore {
             );
         }
         Ok(rows)
+    }
+
+    fn resolve_evidence_target(&self, target: &str, kinds: &[&str]) -> Result<Option<GraphNode>> {
+        if let Some(node) = self.node(target)? {
+            return Ok(Some(node));
+        }
+        let normalized = target.trim().trim_start_matches('#');
+        for kind in kinds {
+            let mut candidates = self
+                .nodes_by_kind(kind)?
+                .into_iter()
+                .filter(|node| {
+                    node.properties.get("handle").map(String::as_str) == Some(target)
+                        || node.properties.get("ref_id").map(String::as_str) == Some(normalized)
+                        || node.label == target
+                        || node.label == format!("#{normalized}")
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| left.id.cmp(&right.id));
+            if let Some(candidate) = candidates.into_iter().next() {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -907,6 +931,29 @@ fn migrate_sqlite_graph_schema(conn: &Connection, old_version: i64) -> Result<()
     if old_version < 3 {
         rebuild_graph_node_properties(conn)?;
     }
+    if old_version < 4 {
+        ensure_sqlite_graph_operator_stats_schema(conn)?;
+    }
+    Ok(())
+}
+
+fn ensure_sqlite_graph_operator_stats_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind_label
+            ON graph_nodes(kind, label, id);
+        CREATE TABLE IF NOT EXISTS graph_operator_stats (
+            scope TEXT PRIMARY KEY,
+            nodes INTEGER NOT NULL,
+            edges INTEGER NOT NULL,
+            tombstone_nodes INTEGER NOT NULL,
+            tombstone_edges INTEGER NOT NULL,
+            file_size_bytes INTEGER,
+            freelist_bytes INTEGER,
+            observed_at_unix INTEGER NOT NULL
+        );
+        "#,
+    )?;
     Ok(())
 }
 
@@ -1002,6 +1049,13 @@ fn open_graph_read_only_snapshot(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SqliteProjectionRefreshPhase {
+    pub name: String,
+    pub duration_micros: u128,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SqliteProjectionRefresh {
     pub scope: String,
     pub projection_version: String,
@@ -1020,6 +1074,7 @@ pub struct SqliteProjectionRefresh {
     pub pruned_tombstones: usize,
     pub file_size_bytes_before: Option<u64>,
     pub file_size_bytes_after: Option<u64>,
+    pub phase_timings: Vec<SqliteProjectionRefreshPhase>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1027,6 +1082,18 @@ pub struct SqliteProjectionVersion {
     pub projection_version: String,
     pub content_hash: Option<String>,
     pub source_watermark: Option<String>,
+}
+
+fn sqlite_refresh_phase_timing(
+    name: &str,
+    started: Instant,
+    detail: &str,
+) -> SqliteProjectionRefreshPhase {
+    SqliteProjectionRefreshPhase {
+        name: name.to_string(),
+        duration_micros: started.elapsed().as_micros(),
+        detail: detail.to_string(),
+    }
 }
 
 impl SqliteGraphStore {
@@ -1086,6 +1153,8 @@ impl SqliteGraphStore {
             );
             CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind
                 ON graph_nodes(kind);
+            CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind_label
+                ON graph_nodes(kind, label, id);
 
             CREATE TABLE IF NOT EXISTS graph_edges (
                 from_id TEXT NOT NULL,
@@ -1128,6 +1197,17 @@ impl SqliteGraphStore {
             );
             CREATE INDEX IF NOT EXISTS idx_graph_node_properties_key_value_node
                 ON graph_node_properties(key, value, node_id);
+
+            CREATE TABLE IF NOT EXISTS graph_operator_stats (
+                scope TEXT PRIMARY KEY,
+                nodes INTEGER NOT NULL,
+                edges INTEGER NOT NULL,
+                tombstone_nodes INTEGER NOT NULL,
+                tombstone_edges INTEGER NOT NULL,
+                file_size_bytes INTEGER,
+                freelist_bytes INTEGER,
+                observed_at_unix INTEGER NOT NULL
+            );
             "#,
         )?;
         if user_version < SQLITE_GRAPH_SCHEMA_VERSION {
@@ -1184,8 +1264,10 @@ impl SqliteGraphStore {
         let projection_hash = projection_hash_from_nodes(&projection.nodes);
         let observed_at_unix = unix_now();
         let file_size_bytes_before = sqlite_database_size_bytes(&self.conn).ok();
+        let mut phase_timings = Vec::new();
 
         let tx = self.conn.transaction()?;
+        let started = Instant::now();
         tx.execute_batch(
             r#"
             CREATE TEMP TABLE IF NOT EXISTS next_graph_nodes (
@@ -1222,20 +1304,18 @@ impl SqliteGraphStore {
             DELETE FROM next_graph_node_properties;
             "#,
         )?;
+        phase_timings.push(sqlite_refresh_phase_timing(
+            "sqlite_temp_table_prepare",
+            started,
+            "create and clear refresh staging tables before row loading",
+        ));
         {
+            let started = Instant::now();
             let mut insert_node = tx.prepare(
                 r#"
                 INSERT INTO next_graph_nodes
                     (id, kind, label, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                "#,
-            )?;
-            let mut insert_property = tx.prepare(
-                r#"
-                INSERT INTO next_graph_node_properties (node_id, key, value)
-                VALUES (?1, ?2, ?3)
-                ON CONFLICT(node_id, key) DO UPDATE SET
-                    value = excluded.value
                 "#,
             )?;
             for node in &projection.nodes {
@@ -1249,12 +1329,32 @@ impl SqliteGraphStore {
                     row_hash(node)?,
                     source_watermark.as_deref(),
                 ))?;
-                for (key, value) in &node.properties {
-                    insert_property.execute((&node.id, key, value))?;
-                }
             }
+            phase_timings.push(sqlite_refresh_phase_timing(
+                "sqlite_node_staging",
+                started,
+                "stage graph_nodes rows with row hashes before delta comparison",
+            ));
         }
         {
+            let started = Instant::now();
+            tx.execute_batch(
+                r#"
+                INSERT INTO next_graph_node_properties (node_id, key, value)
+                SELECT n.id, json_each.key, CAST(json_each.value AS TEXT)
+                FROM next_graph_nodes n, json_each(n.properties_json)
+                WHERE json_each.key IS NOT NULL
+                  AND json_each.value IS NOT NULL
+                "#,
+            )?;
+            phase_timings.push(sqlite_refresh_phase_timing(
+                "sqlite_property_row_staging",
+                started,
+                "derive materialized property rows from staged node JSON inside SQLite",
+            ));
+        }
+        {
+            let started = Instant::now();
             let mut insert_edge = tx.prepare(
                 r#"
                 INSERT INTO next_graph_edges
@@ -1275,8 +1375,14 @@ impl SqliteGraphStore {
                     source_watermark.as_deref(),
                 ))?;
             }
+            phase_timings.push(sqlite_refresh_phase_timing(
+                "sqlite_edge_staging",
+                started,
+                "stage graph_edges rows with row hashes before delta comparison",
+            ));
         }
 
+        let delta_started = Instant::now();
         let tombstoned_nodes = {
             let mut stmt = tx.prepare(
                 r#"
@@ -1496,8 +1602,74 @@ impl SqliteGraphStore {
                 insert_edge_tombstone.execute((format!("edge:{key}"), observed_at_unix))?;
             }
         }
+        let tombstone_node_count: usize = tx.query_row(
+            "SELECT COUNT(*) FROM graph_tombstones WHERE row_kind = 'node'",
+            [],
+            |row| row.get(0),
+        )?;
+        let tombstone_edge_count: usize = tx.query_row(
+            "SELECT COUNT(*) FROM graph_tombstones WHERE row_kind = 'edge'",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO graph_operator_stats
+                (scope, nodes, edges, tombstone_nodes, tombstone_edges, file_size_bytes, freelist_bytes, observed_at_unix)
+            VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)
+            ON CONFLICT(scope) DO UPDATE SET
+                nodes = excluded.nodes,
+                edges = excluded.edges,
+                tombstone_nodes = excluded.tombstone_nodes,
+                tombstone_edges = excluded.tombstone_edges,
+                file_size_bytes = excluded.file_size_bytes,
+                freelist_bytes = excluded.freelist_bytes,
+                observed_at_unix = excluded.observed_at_unix
+            "#,
+            (
+                &scope,
+                projection.nodes.len() as i64,
+                projection.edges.len() as i64,
+                tombstone_node_count as i64,
+                tombstone_edge_count as i64,
+                observed_at_unix,
+            ),
+        )?;
+        phase_timings.push(sqlite_refresh_phase_timing(
+            "sqlite_delta_write",
+            delta_started,
+            "apply row/property deltas, projection metadata, tombstones, and cached operator counts",
+        ));
+        let commit_started = Instant::now();
         tx.commit()?;
+        phase_timings.push(sqlite_refresh_phase_timing(
+            "sqlite_commit",
+            commit_started,
+            "commit refresh transaction and publish old-or-new graph visibility",
+        ));
         let file_size_bytes_after = sqlite_database_size_bytes(&self.conn).ok();
+        let freelist_bytes_after = sqlite_database_freelist_bytes(&self.conn).ok();
+        let stats_started = Instant::now();
+        self.conn.execute(
+            r#"
+            UPDATE graph_operator_stats
+            SET file_size_bytes = ?2,
+                freelist_bytes = ?3,
+                observed_at_unix = ?4
+            WHERE scope = ?1
+            "#,
+            (
+                &scope,
+                file_size_bytes_after.map(|value| value as i64),
+                freelist_bytes_after.map(|value| value as i64),
+                unix_now(),
+            ),
+        )?;
+        phase_timings.push(sqlite_refresh_phase_timing(
+            "sqlite_stats_cache_update",
+            stats_started,
+            "persist post-commit file and freelist proof for status/doctor",
+        ));
         Ok(SqliteProjectionRefresh {
             scope,
             projection_version,
@@ -1516,6 +1688,7 @@ impl SqliteGraphStore {
             file_size_bytes_after,
             tombstoned_nodes,
             tombstoned_edges,
+            phase_timings,
         })
     }
 
@@ -2121,55 +2294,68 @@ impl GraphStore for SqliteGraphStore {
                 hops: 0,
             }));
         }
-        let mut sql = String::from(
-            r#"
-            WITH RECURSIVE walk(id, depth, path) AS (
-                SELECT ?, 0, char(31) || ? || char(31)
-                UNION ALL
-                SELECT e.to_id, walk.depth + 1, walk.path || e.to_id || char(31)
-                FROM walk
-                JOIN graph_edges e INDEXED BY idx_graph_edges_from_kind
-                    ON e.from_id = walk.id
-                WHERE instr(walk.path, char(31) || e.to_id || char(31)) = 0
-            "#,
-        );
-        let mut values = vec![
-            Value::Text(from_id.to_string()),
-            Value::Text(from_id.to_string()),
-        ];
-        if let Some(kind) = kind {
-            sql.push_str(" AND e.kind = ?");
-            values.push(Value::Text(kind.to_string()));
+        let hop_limit = max_hops.unwrap_or(usize::MAX);
+        if hop_limit == 0 {
+            return Ok(None);
         }
-        if let Some(max_hops) = max_hops {
-            sql.push_str(" AND walk.depth < ?");
-            values.push(Value::Integer(max_hops as i64));
+
+        let mut visited = BTreeSet::from([from_id.to_string()]);
+        let mut parent = BTreeMap::<String, String>::from([(from_id.to_string(), String::new())]);
+        let mut frontier = vec![from_id.to_string()];
+        for _depth in 0..hop_limit {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next_frontier = BTreeSet::new();
+            for chunk in frontier.chunks(256) {
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut sql = format!(
+                    r#"
+                    SELECT from_id, to_id
+                    FROM graph_edges INDEXED BY idx_graph_edges_from_kind
+                    WHERE from_id IN ({placeholders})
+                    "#
+                );
+                let mut values = chunk.iter().cloned().map(Value::Text).collect::<Vec<_>>();
+                if let Some(kind) = kind {
+                    sql.push_str(" AND kind = ?");
+                    values.push(Value::Text(kind.to_string()));
+                }
+                sql.push_str(" ORDER BY from_id, to_id, kind");
+                let mut stmt = self.conn.prepare(&sql)?;
+                let edges =
+                    collect_rows(stmt.query_map(params_from_iter(values.iter()), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?)?;
+                for (from, next) in edges {
+                    if !visited.insert(next.clone()) {
+                        continue;
+                    }
+                    parent.insert(next.clone(), from);
+                    if next == to_id {
+                        let mut nodes = vec![to_id.to_string()];
+                        let mut cursor = to_id;
+                        while let Some(previous) = parent.get(cursor) {
+                            if previous.is_empty() {
+                                break;
+                            }
+                            nodes.push(previous.clone());
+                            cursor = previous;
+                        }
+                        nodes.reverse();
+                        return Ok(Some(GraphPath {
+                            hops: nodes.len().saturating_sub(1),
+                            nodes,
+                        }));
+                    }
+                    next_frontier.insert(next);
+                }
+            }
+            frontier = next_frontier.into_iter().collect();
         }
-        sql.push_str(
-            r#"
-            )
-            SELECT path, depth
-            FROM walk
-            WHERE id = ?
-            ORDER BY depth
-            LIMIT 1
-            "#,
-        );
-        values.push(Value::Text(to_id.to_string()));
-        let mut stmt = self.conn.prepare(&sql)?;
-        let row = stmt
-            .query_row(params_from_iter(values.iter()), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
-            })
-            .optional()?;
-        Ok(row.map(|(path, hops)| GraphPath {
-            nodes: path
-                .split('\u{1f}')
-                .filter(|part| !part.is_empty())
-                .map(str::to_string)
-                .collect(),
-            hops,
-        }))
+        Ok(None)
     }
 
     fn reachable_nodes_by_kind(
@@ -2276,6 +2462,66 @@ impl GraphStore for SqliteGraphStore {
                 .push((node, path));
         }
         Ok(results)
+    }
+
+    fn resolve_evidence_target(&self, target: &str, kinds: &[&str]) -> Result<Option<GraphNode>> {
+        if let Some(node) = self.node(target)? {
+            return Ok(Some(node));
+        }
+        if kinds.is_empty() {
+            return Ok(None);
+        }
+
+        let normalized = target.trim().trim_start_matches('#');
+        let kind_placeholders = std::iter::repeat_n("?", kinds.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let kind_rank = kinds
+            .iter()
+            .enumerate()
+            .map(|(rank, _)| format!("WHEN ? THEN {rank}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sql = format!(
+            r#"
+            SELECT n.id, n.kind, n.label, n.properties_json, n.provenance_json, n.freshness_json
+            FROM graph_nodes n
+            WHERE n.kind IN ({kind_placeholders})
+              AND (
+                EXISTS (
+                    SELECT 1
+                    FROM graph_node_properties p_handle INDEXED BY idx_graph_node_properties_key_value_node
+                    WHERE p_handle.node_id = n.id
+                      AND p_handle.key = 'handle'
+                      AND p_handle.value = ?
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM graph_node_properties p_ref INDEXED BY idx_graph_node_properties_key_value_node
+                    WHERE p_ref.node_id = n.id
+                      AND p_ref.key = 'ref_id'
+                      AND p_ref.value = ?
+                )
+                OR n.label = ?
+                OR n.label = ?
+              )
+            ORDER BY CASE n.kind {kind_rank} ELSE 999 END, n.id
+            LIMIT 1
+            "#
+        );
+        let mut values = kinds
+            .iter()
+            .map(|kind| Value::Text((*kind).to_string()))
+            .collect::<Vec<_>>();
+        values.push(Value::Text(target.to_string()));
+        values.push(Value::Text(normalized.to_string()));
+        values.push(Value::Text(target.to_string()));
+        values.push(Value::Text(format!("#{normalized}")));
+        values.extend(kinds.iter().map(|kind| Value::Text((*kind).to_string())));
+        self.conn
+            .query_row(&sql, params_from_iter(values.iter()), node_from_row)
+            .optional()
+            .map_err(Into::into)
     }
 }
 
@@ -2427,6 +2673,12 @@ fn sqlite_database_size_bytes(conn: &Connection) -> Result<u64> {
     let page_count: u64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
     let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
     Ok(page_count.saturating_mul(page_size))
+}
+
+fn sqlite_database_freelist_bytes(conn: &Connection) -> Result<u64> {
+    let freelist_count: u64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+    let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    Ok(freelist_count.saturating_mul(page_size))
 }
 
 #[cfg(test)]
@@ -2846,9 +3098,30 @@ mod tests {
         assert_eq!(refresh.unchanged_properties, 3);
         assert_eq!(refresh.upserted_properties, 0);
         assert_eq!(refresh.deleted_properties, 0);
+        assert!(
+            refresh
+                .phase_timings
+                .iter()
+                .any(|phase| phase.name == "sqlite_property_row_staging"),
+            "{:?}",
+            refresh.phase_timings
+        );
         let version = store.projection_version("root").unwrap().unwrap();
         assert_eq!(version.projection_version, "fixture-v2");
         assert_eq!(version.source_watermark.as_deref(), Some("commit-b"));
+        let cached_counts: (usize, usize, usize, usize) = store
+            .conn
+            .query_row(
+                r#"
+                SELECT nodes, edges, tombstone_nodes, tombstone_edges
+                FROM graph_operator_stats
+                WHERE scope = 'root'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(cached_counts, (3, 1, 1, 1));
 
         projection
             .nodes
@@ -2863,6 +3136,79 @@ mod tests {
             .unwrap();
         assert_eq!(refresh.pruned_tombstones, 1);
         assert_eq!(refresh.tombstoned_nodes, Vec::<String>::new());
+    }
+
+    #[test]
+    fn sqlite_shortest_path_uses_bounded_frontier() {
+        let store = SqliteGraphStore::in_memory().unwrap();
+        for idx in 0..80 {
+            store
+                .upsert_node(&GraphNode::new(
+                    format!("node:{idx:02}"),
+                    "symbol",
+                    format!("node {idx:02}"),
+                ))
+                .unwrap();
+        }
+        for idx in 0..79 {
+            store
+                .upsert_edge(&GraphEdge::new(
+                    format!("node:{idx:02}"),
+                    format!("node:{:02}", idx + 1),
+                    "calls",
+                ))
+                .unwrap();
+        }
+        store
+            .upsert_edge(&GraphEdge::new("node:00", "node:79", "mentions"))
+            .unwrap();
+
+        assert!(
+            store
+                .shortest_path_with_max_hops("node:00", "node:79", Some("calls"), Some(64))
+                .unwrap()
+                .is_none()
+        );
+        let path = store
+            .shortest_path_with_max_hops("node:00", "node:79", Some("calls"), Some(79))
+            .unwrap()
+            .unwrap();
+        assert_eq!(path.hops, 79);
+        assert_eq!(path.nodes.first().map(String::as_str), Some("node:00"));
+        assert_eq!(path.nodes.last().map(String::as_str), Some("node:79"));
+
+        let direct = store
+            .shortest_path_with_max_hops("node:00", "node:79", Some("mentions"), Some(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(direct.nodes, vec!["node:00", "node:79"]);
+    }
+
+    #[test]
+    fn sqlite_resolves_evidence_targets_with_indexed_properties() {
+        let store = SqliteGraphStore::in_memory().unwrap();
+        for node in [
+            GraphNode::new("gbak-refresh", "backlog", "#refresh")
+                .with_property("ref_id", "refresh")
+                .with_property("handle", "backlog-handle"),
+            GraphNode::new("gjob-refresh", "job_packet", "do #refresh")
+                .with_property("ref_id", "refresh"),
+            GraphNode::new("gwres-refresh", "worker_result", "completed #refresh")
+                .with_property("ref_id", "refresh"),
+        ] {
+            store.upsert_node(&node).unwrap();
+        }
+
+        let by_ref = store
+            .resolve_evidence_target("#refresh", &["backlog", "job_packet", "worker_result"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_ref.id, "gbak-refresh");
+        let by_handle = store
+            .resolve_evidence_target("backlog-handle", &["backlog"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_handle.id, "gbak-refresh");
     }
 
     #[test]

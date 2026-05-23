@@ -225,6 +225,7 @@
         "real.refresh_phase.source_graph_build.duration_micros": 14203329.0,
         "real.refresh_phase.sqlite_delta_write.duration_micros": 7969044.0,
         "real.refresh_phase.sqlite_open.duration_micros": 522.0,
+        "real.refresh_phase.sqlite_property_row_staging.duration_micros": 2140000.0,
         "real.sqlite.conflict_matrix.duration_micros": 913281.0,
         "real.sqlite.conflict_matrix.rows": 1.0,
         "real.sqlite.dispatch_trace.duration_micros": 1491115.0,
