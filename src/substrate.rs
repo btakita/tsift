@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub const SQLITE_GRAPH_SCHEMA_VERSION: i64 = 4;
+pub const SQLITE_GRAPH_SCHEMA_VERSION: i64 = 5;
 const SQLITE_GRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +96,8 @@ impl GraphNode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphEdge {
+    #[serde(default)]
+    pub id: String,
     pub from_id: String,
     pub to_id: String,
     pub kind: String,
@@ -108,15 +110,23 @@ pub struct GraphEdge {
 }
 
 impl GraphEdge {
+    pub fn stable_id(from_id: &str, to_id: &str, kind: &str) -> String {
+        stable_graph_edge_id(from_id, to_id, kind)
+    }
+
     pub fn new(
         from_id: impl Into<String>,
         to_id: impl Into<String>,
         kind: impl Into<String>,
     ) -> Self {
+        let from_id = from_id.into();
+        let to_id = to_id.into();
+        let kind = kind.into();
         Self {
-            from_id: from_id.into(),
-            to_id: to_id.into(),
-            kind: kind.into(),
+            id: stable_graph_edge_id(&from_id, &to_id, &kind),
+            from_id,
+            to_id,
+            kind,
             properties: BTreeMap::new(),
             provenance: Vec::new(),
             freshness: None,
@@ -136,6 +146,19 @@ impl GraphEdge {
     pub fn with_freshness(mut self, freshness: GraphFreshness) -> Self {
         self.freshness = Some(freshness);
         self
+    }
+}
+
+fn stable_graph_edge_id(from_id: &str, to_id: &str, kind: &str) -> String {
+    let raw = serde_json::json!([from_id, kind, to_id]).to_string();
+    format!("edge:{}", blake3::hash(raw.as_bytes()).to_hex())
+}
+
+fn graph_edge_id(edge: &GraphEdge) -> String {
+    if edge.id.is_empty() {
+        stable_graph_edge_id(&edge.from_id, &edge.to_id, &edge.kind)
+    } else {
+        edge.id.clone()
     }
 }
 
@@ -181,6 +204,7 @@ impl GraphSubgraph {
                 .cmp(&right.from_id)
                 .then(left.kind.cmp(&right.kind))
                 .then(left.to_id.cmp(&right.to_id))
+                .then_with(|| graph_edge_id(left).cmp(&graph_edge_id(right)))
         });
         self
     }
@@ -221,6 +245,12 @@ fn graph_node_matches_filters(node: &GraphNode, filters: &[GraphPropertyFilter])
     filters
         .iter()
         .all(|filter| node.properties.get(&filter.key) == Some(&filter.value))
+}
+
+fn graph_edge_matches_filters(edge: &GraphEdge, filters: &[GraphPropertyFilter]) -> bool {
+    filters
+        .iter()
+        .all(|filter| edge.properties.get(&filter.key) == Some(&filter.value))
 }
 
 fn apply_graph_query_page(
@@ -296,6 +326,62 @@ fn apply_graph_query_page(
     }
 }
 
+fn apply_graph_edge_query_page(
+    mut edges: Vec<GraphEdge>,
+    options: GraphQueryOptions,
+    mut diagnostics: Vec<String>,
+) -> GraphPagedSubgraph {
+    edges.sort_by_key(graph_edge_id);
+
+    let before_filter = edges.len();
+    if !options.property_filters.is_empty() {
+        edges.retain(|edge| graph_edge_matches_filters(edge, &options.property_filters));
+    }
+    let after_filter = edges.len();
+
+    if let Some(cursor) = &options.cursor {
+        edges.retain(|edge| graph_edge_id(edge) > *cursor);
+    }
+
+    let before_limit = edges.len();
+    let mut next_cursor = None;
+    if let Some(limit) = options.limit
+        && edges.len() > limit
+    {
+        next_cursor = edges.get(limit.saturating_sub(1)).map(graph_edge_id);
+        edges.truncate(limit);
+    }
+
+    if after_filter != before_filter {
+        diagnostics.push(format!(
+            "edge property filters removed {} edge(s)",
+            before_filter.saturating_sub(after_filter)
+        ));
+    }
+    if options.cursor.is_some() {
+        diagnostics.push("cursor is exclusive and ordered by edge id".to_string());
+    }
+    if next_cursor.is_some() {
+        diagnostics.push(
+            "result was truncated; pass page.next_cursor as --cursor for the next page".to_string(),
+        );
+    }
+
+    GraphPagedSubgraph {
+        page: GraphQueryPage {
+            cursor: options.cursor,
+            limit: options.limit,
+            next_cursor,
+            returned_nodes: 0,
+            returned_edges: edges.len(),
+            truncated: options.limit.is_some_and(|limit| before_limit > limit),
+            diagnostics,
+        },
+        nodes: Vec::new(),
+        edges,
+    }
+}
+
 pub trait GraphStore {
     fn upsert_node(&self, node: &GraphNode) -> Result<()>;
     fn upsert_edge(&self, edge: &GraphEdge) -> Result<()>;
@@ -304,6 +390,12 @@ pub trait GraphStore {
     fn node(&self, id: &str) -> Result<Option<GraphNode>>;
     fn all_nodes(&self) -> Result<Vec<GraphNode>>;
     fn all_edges(&self) -> Result<Vec<GraphEdge>>;
+    fn edge(&self, edge_id: &str) -> Result<Option<GraphEdge>> {
+        Ok(self
+            .all_edges()?
+            .into_iter()
+            .find(|edge| graph_edge_id(edge) == edge_id))
+    }
     fn graph_counts(&self) -> Result<(usize, usize)> {
         Ok((self.all_nodes()?.len(), self.all_edges()?.len()))
     }
@@ -324,6 +416,40 @@ pub trait GraphStore {
     }
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>>;
     fn outgoing_edges(&self, from_id: &str, kind: Option<&str>) -> Result<Vec<GraphEdge>>;
+    fn incident_edges(&self, node_id: &str, kind: Option<&str>) -> Result<Vec<GraphEdge>> {
+        let mut edges = self
+            .all_edges()?
+            .into_iter()
+            .filter(|edge| edge.from_id == node_id || edge.to_id == node_id)
+            .filter(|edge| kind.is_none_or(|kind| edge.kind == kind))
+            .collect::<Vec<_>>();
+        edges.sort_by_key(graph_edge_id);
+        Ok(edges)
+    }
+    fn paged_edges(
+        &self,
+        kind: Option<&str>,
+        options: GraphQueryOptions,
+    ) -> Result<GraphPagedSubgraph> {
+        let edges = self
+            .all_edges()?
+            .into_iter()
+            .filter(|edge| kind.is_none_or(|kind| edge.kind == kind))
+            .collect::<Vec<_>>();
+        Ok(apply_graph_edge_query_page(edges, options, Vec::new()))
+    }
+    fn paged_incident_edges(
+        &self,
+        node_id: &str,
+        kind: Option<&str>,
+        options: GraphQueryOptions,
+    ) -> Result<GraphPagedSubgraph> {
+        Ok(apply_graph_edge_query_page(
+            self.incident_edges(node_id, kind)?,
+            options,
+            Vec::new(),
+        ))
+    }
     fn edges_between_nodes(&self, node_ids: &BTreeSet<String>) -> Result<Vec<GraphEdge>> {
         let mut edges = BTreeMap::<(String, String, String), GraphEdge>::new();
         for from_id in node_ids {
@@ -578,15 +704,14 @@ pub struct ConvexEdgeRow {
 
 impl ConvexEdgeRow {
     pub fn stable_key(from_id: &str, to_id: &str, kind: &str) -> String {
-        let raw = serde_json::json!([from_id, kind, to_id]).to_string();
-        format!("edge:{}", blake3::hash(raw.as_bytes()).to_hex())
+        stable_graph_edge_id(from_id, to_id, kind)
     }
 }
 
 impl From<&GraphEdge> for ConvexEdgeRow {
     fn from(edge: &GraphEdge) -> Self {
         Self {
-            edge_key: ConvexEdgeRow::stable_key(&edge.from_id, &edge.to_id, &edge.kind),
+            edge_key: graph_edge_id(edge),
             from_external_id: edge.from_id.clone(),
             to_external_id: edge.to_id.clone(),
             kind: edge.kind.clone(),
@@ -600,6 +725,7 @@ impl From<&GraphEdge> for ConvexEdgeRow {
 impl From<ConvexEdgeRow> for GraphEdge {
     fn from(row: ConvexEdgeRow) -> Self {
         Self {
+            id: row.edge_key,
             from_id: row.from_external_id,
             to_id: row.to_external_id,
             kind: row.kind,
@@ -819,8 +945,8 @@ impl<C: ConvexGraphClient> GraphStore for ConvexGraphStore<C> {
         edges.sort_by(|left, right| {
             left.from_id
                 .cmp(&right.from_id)
-                .then(left.to_id.cmp(&right.to_id))
                 .then(left.kind.cmp(&right.kind))
+                .then(left.to_id.cmp(&right.to_id))
         });
         Ok(edges)
     }
@@ -959,6 +1085,45 @@ fn add_column_if_missing(
     Ok(())
 }
 
+fn backfill_graph_edge_keys(conn: &Connection) -> Result<()> {
+    if !sqlite_column_exists(conn, "graph_edges", "edge_key")? {
+        return Ok(());
+    }
+    let rows = {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT from_id, to_id, kind
+            FROM graph_edges
+            WHERE edge_key IS NULL OR edge_key = ''
+            ORDER BY from_id, kind, to_id
+            "#,
+        )?;
+        collect_rows(stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?)?
+    };
+    let mut update = conn.prepare(
+        r#"
+        UPDATE graph_edges
+        SET edge_key = ?4
+        WHERE from_id = ?1 AND to_id = ?2 AND kind = ?3
+        "#,
+    )?;
+    for (from_id, to_id, kind) in rows {
+        update.execute((
+            &from_id,
+            &to_id,
+            &kind,
+            stable_graph_edge_id(&from_id, &to_id, &kind),
+        ))?;
+    }
+    Ok(())
+}
+
 fn migrate_sqlite_graph_schema(conn: &Connection, old_version: i64) -> Result<()> {
     if old_version < 2 {
         add_column_if_missing(conn, "graph_nodes", "row_hash", "TEXT")?;
@@ -971,6 +1136,12 @@ fn migrate_sqlite_graph_schema(conn: &Connection, old_version: i64) -> Result<()
     }
     if old_version < 4 {
         ensure_sqlite_graph_operator_stats_schema(conn)?;
+    }
+    if old_version < 5 {
+        add_column_if_missing(conn, "graph_edges", "edge_key", "TEXT")?;
+        backfill_graph_edge_keys(conn)?;
+        ensure_sqlite_graph_edge_properties_schema(conn)?;
+        rebuild_graph_edge_properties(conn)?;
     }
     Ok(())
 }
@@ -990,6 +1161,25 @@ fn ensure_sqlite_graph_operator_stats_schema(conn: &Connection) -> Result<()> {
             freelist_bytes INTEGER,
             observed_at_unix INTEGER NOT NULL
         );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn ensure_sqlite_graph_edge_properties_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_edge_key
+            ON graph_edges(edge_key);
+        CREATE TABLE IF NOT EXISTS graph_edge_properties (
+            edge_key TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (edge_key, key),
+            FOREIGN KEY (edge_key) REFERENCES graph_edges(edge_key) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_graph_edge_properties_key_value_edge
+            ON graph_edge_properties(key, value, edge_key);
         "#,
     )?;
     Ok(())
@@ -1018,6 +1208,29 @@ fn replace_node_properties(
     Ok(())
 }
 
+fn replace_edge_properties(
+    conn: &Connection,
+    edge_key: &str,
+    properties: &BTreeMap<String, String>,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM graph_edge_properties WHERE edge_key = ?1",
+        [edge_key],
+    )?;
+    let mut insert = conn.prepare(
+        r#"
+        INSERT INTO graph_edge_properties (edge_key, key, value)
+        VALUES (?1, ?2, ?3)
+        ON CONFLICT(edge_key, key) DO UPDATE SET
+            value = excluded.value
+        "#,
+    )?;
+    for (key, value) in properties {
+        insert.execute((edge_key, key, value))?;
+    }
+    Ok(())
+}
+
 fn rebuild_graph_node_properties(conn: &Connection) -> Result<()> {
     if !sqlite_column_exists(conn, "graph_nodes", "properties_json")? {
         return Ok(());
@@ -1029,6 +1242,27 @@ fn rebuild_graph_node_properties(conn: &Connection) -> Result<()> {
         SELECT graph_nodes.id, json_each.key, CAST(json_each.value AS TEXT)
         FROM graph_nodes, json_each(graph_nodes.properties_json)
         WHERE json_each.key IS NOT NULL
+          AND json_each.value IS NOT NULL
+        "#,
+    )?;
+    Ok(())
+}
+
+fn rebuild_graph_edge_properties(conn: &Connection) -> Result<()> {
+    if !sqlite_column_exists(conn, "graph_edges", "properties_json")?
+        || !sqlite_column_exists(conn, "graph_edges", "edge_key")?
+    {
+        return Ok(());
+    }
+    conn.execute_batch(
+        r#"
+        DELETE FROM graph_edge_properties;
+        INSERT INTO graph_edge_properties (edge_key, key, value)
+        SELECT graph_edges.edge_key, json_each.key, CAST(json_each.value AS TEXT)
+        FROM graph_edges, json_each(graph_edges.properties_json)
+        WHERE graph_edges.edge_key IS NOT NULL
+          AND graph_edges.edge_key <> ''
+          AND json_each.key IS NOT NULL
           AND json_each.value IS NOT NULL
         "#,
     )?;
@@ -1212,6 +1446,7 @@ impl SqliteGraphStore {
                 ON graph_nodes(kind, label, id);
 
             CREATE TABLE IF NOT EXISTS graph_edges (
+                edge_key TEXT NOT NULL UNIQUE,
                 from_id TEXT NOT NULL,
                 to_id TEXT NOT NULL,
                 kind TEXT NOT NULL,
@@ -1355,9 +1590,16 @@ impl SqliteGraphStore {
                 value TEXT NOT NULL,
                 PRIMARY KEY (node_id, key)
             );
+            CREATE TEMP TABLE IF NOT EXISTS next_graph_edge_properties (
+                edge_key TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (edge_key, key)
+            );
             DELETE FROM next_graph_nodes;
             DELETE FROM next_graph_edges;
             DELETE FROM next_graph_node_properties;
+            DELETE FROM next_graph_edge_properties;
             "#,
         )?;
         phase_timings.push(sqlite_refresh_phase_timing(
@@ -1406,7 +1648,7 @@ impl SqliteGraphStore {
             phase_timings.push(sqlite_refresh_phase_timing(
                 "sqlite_property_row_staging",
                 started,
-                "derive materialized property rows from staged node JSON inside SQLite",
+                "derive materialized node property rows from staged node JSON inside SQLite",
             ));
         }
         {
@@ -1419,8 +1661,9 @@ impl SqliteGraphStore {
                 "#,
             )?;
             for edge in &projection.edges {
+                let edge_key = graph_edge_id(edge);
                 insert_edge.execute((
-                    ConvexEdgeRow::stable_key(&edge.from_id, &edge.to_id, &edge.kind),
+                    &edge_key,
                     &edge.from_id,
                     &edge.to_id,
                     &edge.kind,
@@ -1435,6 +1678,23 @@ impl SqliteGraphStore {
                 "sqlite_edge_staging",
                 started,
                 "stage graph_edges rows with row hashes before delta comparison",
+            ));
+        }
+        {
+            let started = Instant::now();
+            tx.execute_batch(
+                r#"
+                INSERT INTO next_graph_edge_properties (edge_key, key, value)
+                SELECT e.edge_key, json_each.key, CAST(json_each.value AS TEXT)
+                FROM next_graph_edges e, json_each(e.properties_json)
+                WHERE json_each.key IS NOT NULL
+                  AND json_each.value IS NOT NULL
+                "#,
+            )?;
+            phase_timings.push(sqlite_refresh_phase_timing(
+                "sqlite_edge_property_row_staging",
+                started,
+                "derive materialized edge property rows from staged edge JSON inside SQLite",
             ));
         }
 
@@ -1454,20 +1714,15 @@ impl SqliteGraphStore {
         let tombstoned_edges = {
             let mut stmt = tx.prepare(
                 r#"
-                SELECT g.from_id, g.to_id, g.kind
+                SELECT g.edge_key
                 FROM graph_edges g
                 LEFT JOIN next_graph_edges n
-                    ON n.from_id = g.from_id AND n.to_id = g.to_id AND n.kind = g.kind
+                    ON n.edge_key = g.edge_key
                 WHERE n.edge_key IS NULL
-                ORDER BY g.from_id, g.kind, g.to_id
+                ORDER BY g.edge_key
                 "#,
             )?;
-            collect_rows(stmt.query_map([], |row| {
-                let from_id: String = row.get(0)?;
-                let to_id: String = row.get(1)?;
-                let kind: String = row.get(2)?;
-                Ok(ConvexEdgeRow::stable_key(&from_id, &to_id, &kind))
-            })?)?
+            collect_rows(stmt.query_map([], |row| row.get::<_, String>(0))?)?
         };
         let unchanged_nodes: usize = tx.query_row(
             r#"
@@ -1484,13 +1739,13 @@ impl SqliteGraphStore {
             SELECT COUNT(*)
             FROM next_graph_edges n
             JOIN graph_edges g
-                ON g.from_id = n.from_id AND g.to_id = n.to_id AND g.kind = n.kind
+                ON g.edge_key = n.edge_key
             WHERE g.row_hash = n.row_hash
             "#,
             [],
             |row| row.get(0),
         )?;
-        let unchanged_properties: usize = tx.query_row(
+        let unchanged_node_properties: usize = tx.query_row(
             r#"
             SELECT COUNT(*)
             FROM next_graph_node_properties n
@@ -1501,6 +1756,18 @@ impl SqliteGraphStore {
             [],
             |row| row.get(0),
         )?;
+        let unchanged_edge_properties: usize = tx.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM next_graph_edge_properties n
+            JOIN graph_edge_properties g
+                ON g.edge_key = n.edge_key AND g.key = n.key
+            WHERE g.value = n.value
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
+        let unchanged_properties = unchanged_node_properties + unchanged_edge_properties;
 
         let deleted_edges = tx.execute(
             r#"
@@ -1508,9 +1775,7 @@ impl SqliteGraphStore {
             WHERE NOT EXISTS (
                 SELECT 1
                 FROM next_graph_edges n
-                WHERE n.from_id = graph_edges.from_id
-                  AND n.to_id = graph_edges.to_id
-                  AND n.kind = graph_edges.kind
+                WHERE n.edge_key = graph_edges.edge_key
             )
             "#,
             [],
@@ -1575,11 +1840,12 @@ impl SqliteGraphStore {
         let upsert_edges_sql = if force_refresh_writes {
             r#"
             INSERT INTO graph_edges
-                (from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
-            SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark
+                (edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+            SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark
             FROM next_graph_edges
             WHERE true
             ON CONFLICT(from_id, to_id, kind) DO UPDATE SET
+                edge_key = excluded.edge_key,
                 properties_json = excluded.properties_json,
                 provenance_json = excluded.provenance_json,
                 freshness_json = excluded.freshness_json,
@@ -1590,8 +1856,9 @@ impl SqliteGraphStore {
         } else {
             r#"
             INSERT INTO graph_edges
-                (from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+                (edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
             SELECT
+                n.edge_key,
                 n.from_id,
                 n.to_id,
                 n.kind,
@@ -1602,9 +1869,10 @@ impl SqliteGraphStore {
                 n.source_watermark
             FROM next_graph_edges n
             LEFT JOIN graph_edges g
-                ON g.from_id = n.from_id AND g.to_id = n.to_id AND g.kind = n.kind
-            WHERE g.from_id IS NULL OR g.row_hash IS NOT n.row_hash
+                ON g.edge_key = n.edge_key
+            WHERE g.edge_key IS NULL OR g.row_hash IS NOT n.row_hash
             ON CONFLICT(from_id, to_id, kind) DO UPDATE SET
+                edge_key = excluded.edge_key,
                 properties_json = excluded.properties_json,
                 provenance_json = excluded.provenance_json,
                 freshness_json = excluded.freshness_json,
@@ -1614,7 +1882,7 @@ impl SqliteGraphStore {
             "#
         };
         tx.execute(upsert_edges_sql, [])?;
-        let deleted_properties = tx.execute(
+        let deleted_node_properties = tx.execute(
             r#"
             DELETE FROM graph_node_properties
             WHERE NOT EXISTS (
@@ -1626,6 +1894,19 @@ impl SqliteGraphStore {
             "#,
             [],
         )?;
+        let deleted_edge_properties = tx.execute(
+            r#"
+            DELETE FROM graph_edge_properties
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM next_graph_edge_properties n
+                WHERE n.edge_key = graph_edge_properties.edge_key
+                  AND n.key = graph_edge_properties.key
+            )
+            "#,
+            [],
+        )?;
+        let deleted_properties = deleted_node_properties + deleted_edge_properties;
         let upsert_properties_sql = if force_refresh_writes {
             r#"
             INSERT INTO graph_node_properties (node_id, key, value)
@@ -1649,7 +1930,32 @@ impl SqliteGraphStore {
             WHERE graph_node_properties.value IS NOT excluded.value
             "#
         };
-        let upserted_properties = tx.execute(upsert_properties_sql, [])?;
+        let upserted_node_properties = tx.execute(upsert_properties_sql, [])?;
+        let upsert_edge_properties_sql = if force_refresh_writes {
+            r#"
+            INSERT INTO graph_edge_properties (edge_key, key, value)
+            SELECT edge_key, key, value
+            FROM next_graph_edge_properties
+            WHERE true
+            ON CONFLICT(edge_key, key) DO UPDATE SET
+                value = excluded.value
+            WHERE graph_edge_properties.value IS NOT excluded.value
+            "#
+        } else {
+            r#"
+            INSERT INTO graph_edge_properties (edge_key, key, value)
+            SELECT n.edge_key, n.key, n.value
+            FROM next_graph_edge_properties n
+            LEFT JOIN graph_edge_properties g
+                ON g.edge_key = n.edge_key AND g.key = n.key
+            WHERE g.edge_key IS NULL OR g.value IS NOT n.value
+            ON CONFLICT(edge_key, key) DO UPDATE SET
+                value = excluded.value
+            WHERE graph_edge_properties.value IS NOT excluded.value
+            "#
+        };
+        let upserted_edge_properties = tx.execute(upsert_edge_properties_sql, [])?;
+        let upserted_properties = upserted_node_properties + upserted_edge_properties;
         tx.execute(
             r#"
             INSERT INTO graph_projection_versions
@@ -1857,9 +2163,10 @@ impl SqliteGraphStore {
             let mut insert_edge = tx.prepare(
                 r#"
                 INSERT INTO graph_edges
-                    (from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+                    (edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
                 ON CONFLICT(from_id, to_id, kind) DO UPDATE SET
+                    edge_key = excluded.edge_key,
                     properties_json = excluded.properties_json,
                     provenance_json = excluded.provenance_json,
                     freshness_json = excluded.freshness_json,
@@ -1867,8 +2174,18 @@ impl SqliteGraphStore {
                     source_watermark = excluded.source_watermark
                 "#,
             )?;
+            let mut delete_properties =
+                tx.prepare("DELETE FROM graph_edge_properties WHERE edge_key = ?1")?;
+            let mut insert_property = tx.prepare(
+                r#"
+                INSERT INTO graph_edge_properties (edge_key, key, value)
+                VALUES (?1, ?2, ?3)
+                "#,
+            )?;
             for edge in &projection.edges {
+                let edge_key = graph_edge_id(edge);
                 insert_edge.execute((
+                    &edge_key,
                     &edge.from_id,
                     &edge.to_id,
                     &edge.kind,
@@ -1877,6 +2194,10 @@ impl SqliteGraphStore {
                     optional_to_json(&edge.freshness)?,
                     row_hash(edge)?,
                 ))?;
+                delete_properties.execute([&edge_key])?;
+                for (key, value) in &edge.properties {
+                    insert_property.execute((&edge_key, key, value))?;
+                }
             }
         }
         tx.commit()?;
@@ -1988,7 +2309,7 @@ impl SqliteGraphStore {
             r#"
             )
             SELECT DISTINCT
-                g.from_id, g.to_id, g.kind, g.properties_json, g.provenance_json, g.freshness_json
+                g.edge_key, g.from_id, g.to_id, g.kind, g.properties_json, g.provenance_json, g.freshness_json
             FROM graph_edges g
             JOIN walk_edges w
                 ON w.from_id = g.from_id AND w.to_id = g.to_id AND w.kind = g.kind
@@ -2051,6 +2372,29 @@ fn push_sqlite_property_filter_exists(
     }
 }
 
+fn push_sqlite_edge_property_filter_exists(
+    sql: &mut String,
+    values: &mut Vec<Value>,
+    edge_alias: &str,
+    filters: &[GraphPropertyFilter],
+) {
+    for (index, filter) in filters.iter().enumerate() {
+        sql.push_str(&format!(
+            r#"
+            AND EXISTS (
+                SELECT 1
+                FROM graph_edge_properties ep{index} INDEXED BY idx_graph_edge_properties_key_value_edge
+                WHERE ep{index}.edge_key = {edge_alias}.edge_key
+                  AND ep{index}.key = ?
+                  AND ep{index}.value = ?
+            )
+            "#
+        ));
+        values.push(Value::Text(filter.key.clone()));
+        values.push(Value::Text(filter.value.clone()));
+    }
+}
+
 impl GraphStore for SqliteGraphStore {
     fn upsert_node(&self, node: &GraphNode) -> Result<()> {
         self.conn.execute(
@@ -2082,12 +2426,14 @@ impl GraphStore for SqliteGraphStore {
     }
 
     fn upsert_edge(&self, edge: &GraphEdge) -> Result<()> {
+        let edge_key = graph_edge_id(edge);
         self.conn.execute(
             r#"
             INSERT INTO graph_edges
-                (from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+                (edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
             ON CONFLICT(from_id, to_id, kind) DO UPDATE SET
+                edge_key = excluded.edge_key,
                 properties_json = excluded.properties_json,
                 provenance_json = excluded.provenance_json,
                 freshness_json = excluded.freshness_json,
@@ -2095,6 +2441,7 @@ impl GraphStore for SqliteGraphStore {
                 source_watermark = excluded.source_watermark
             "#,
             (
+                &edge_key,
                 &edge.from_id,
                 &edge.to_id,
                 &edge.kind,
@@ -2104,6 +2451,7 @@ impl GraphStore for SqliteGraphStore {
                 row_hash(edge)?,
             ),
         )?;
+        replace_edge_properties(&self.conn, &edge_key, &edge.properties)?;
         Ok(())
     }
 
@@ -2151,12 +2499,27 @@ impl GraphStore for SqliteGraphStore {
     fn all_edges(&self) -> Result<Vec<GraphEdge>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json
+            SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
             FROM graph_edges
-            ORDER BY from_id, to_id, kind
+            ORDER BY from_id, kind, to_id
             "#,
         )?;
         collect_rows(stmt.query_map([], edge_from_row)?)
+    }
+
+    fn edge(&self, edge_id: &str) -> Result<Option<GraphEdge>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                FROM graph_edges INDEXED BY idx_graph_edges_edge_key
+                WHERE edge_key = ?1
+                "#,
+                [edge_id],
+                edge_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     fn graph_counts(&self) -> Result<(usize, usize)> {
@@ -2179,7 +2542,7 @@ impl GraphStore for SqliteGraphStore {
                 .conn
                 .query_row(
                     r#"
-                    SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                    SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
                     FROM graph_edges INDEXED BY idx_graph_edges_from_kind
                     WHERE from_id <> to_id AND kind = ?1
                     ORDER BY from_id, kind, to_id
@@ -2194,7 +2557,7 @@ impl GraphStore for SqliteGraphStore {
                 .conn
                 .query_row(
                     r#"
-                    SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                    SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
                     FROM graph_edges INDEXED BY idx_graph_edges_from_kind
                     WHERE from_id <> to_id
                     ORDER BY from_id, kind, to_id
@@ -2307,7 +2670,7 @@ impl GraphStore for SqliteGraphStore {
             Some(kind) => {
                 let mut stmt = self.conn.prepare(
                     r#"
-                    SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                    SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
                     FROM graph_edges
                     WHERE from_id = ?1 AND kind = ?2
                     ORDER BY to_id, kind
@@ -2318,7 +2681,7 @@ impl GraphStore for SqliteGraphStore {
             None => {
                 let mut stmt = self.conn.prepare(
                     r#"
-                    SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                    SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
                     FROM graph_edges
                     WHERE from_id = ?1
                     ORDER BY to_id, kind
@@ -2327,6 +2690,194 @@ impl GraphStore for SqliteGraphStore {
                 collect_rows(stmt.query_map([from_id], edge_from_row)?)
             }
         }
+    }
+
+    fn incident_edges(&self, node_id: &str, kind: Option<&str>) -> Result<Vec<GraphEdge>> {
+        let mut sql = String::from(
+            r#"
+            SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
+            FROM graph_edges
+            WHERE (from_id = ?1 OR to_id = ?1)
+            "#,
+        );
+        let mut values = vec![Value::Text(node_id.to_string())];
+        if let Some(kind) = kind {
+            sql.push_str(" AND kind = ?2");
+            values.push(Value::Text(kind.to_string()));
+        }
+        sql.push_str(" ORDER BY edge_key");
+        let mut stmt = self.conn.prepare(&sql)?;
+        collect_rows(stmt.query_map(params_from_iter(values.iter()), edge_from_row)?)
+    }
+
+    fn paged_edges(
+        &self,
+        kind: Option<&str>,
+        options: GraphQueryOptions,
+    ) -> Result<GraphPagedSubgraph> {
+        let mut sql = String::from(
+            r#"
+            SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
+            FROM graph_edges e
+            WHERE 1 = 1
+            "#,
+        );
+        let mut values = Vec::new();
+        if let Some(kind) = kind {
+            sql.push_str(" AND e.kind = ?");
+            values.push(Value::Text(kind.to_string()));
+        }
+        push_sqlite_edge_property_filter_exists(
+            &mut sql,
+            &mut values,
+            "e",
+            &options.property_filters,
+        );
+        if let Some(cursor) = &options.cursor {
+            sql.push_str(" AND e.edge_key > ?");
+            values.push(Value::Text(cursor.clone()));
+        }
+        sql.push_str(" ORDER BY e.edge_key");
+        if let Some(limit) = options.limit {
+            sql.push_str(" LIMIT ?");
+            values.push(Value::Integer(limit.saturating_add(1) as i64));
+        }
+
+        let plan = sqlite_query_plan(&self.conn, &sql, &values)?;
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut edges =
+            collect_rows(stmt.query_map(params_from_iter(values.iter()), edge_from_row)?)?;
+        let before_limit = edges.len();
+        let mut next_cursor = None;
+        if let Some(limit) = options.limit
+            && edges.len() > limit
+        {
+            next_cursor = edges.get(limit.saturating_sub(1)).map(graph_edge_id);
+            edges.truncate(limit);
+        }
+        let expected_indexes = if options.property_filters.is_empty() {
+            vec!["idx_graph_edges_edge_key"]
+        } else {
+            vec!["idx_graph_edge_properties_key_value_edge"]
+        };
+        let mut diagnostics = sqlite_query_plan_diagnostics(&plan, &expected_indexes);
+        if !options.property_filters.is_empty() {
+            diagnostics.push(
+                "edge property filters were evaluated by SQLite materialized property rows before paging"
+                    .to_string(),
+            );
+        }
+        if options.cursor.is_some() {
+            diagnostics.push("cursor is exclusive and pushed into SQLite by edge id".to_string());
+        }
+        if next_cursor.is_some() {
+            diagnostics.push(
+                "result was truncated; pass page.next_cursor as --cursor for the next page"
+                    .to_string(),
+            );
+        }
+        Ok(GraphPagedSubgraph {
+            page: GraphQueryPage {
+                cursor: options.cursor,
+                limit: options.limit,
+                next_cursor,
+                returned_nodes: 0,
+                returned_edges: edges.len(),
+                truncated: options.limit.is_some_and(|limit| before_limit > limit),
+                diagnostics,
+            },
+            nodes: Vec::new(),
+            edges,
+        })
+    }
+
+    fn paged_incident_edges(
+        &self,
+        node_id: &str,
+        kind: Option<&str>,
+        options: GraphQueryOptions,
+    ) -> Result<GraphPagedSubgraph> {
+        let mut sql = String::from(
+            r#"
+            SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
+            FROM graph_edges e
+            WHERE (e.from_id = ? OR e.to_id = ?)
+            "#,
+        );
+        let mut values = vec![
+            Value::Text(node_id.to_string()),
+            Value::Text(node_id.to_string()),
+        ];
+        if let Some(kind) = kind {
+            sql.push_str(" AND e.kind = ?");
+            values.push(Value::Text(kind.to_string()));
+        }
+        push_sqlite_edge_property_filter_exists(
+            &mut sql,
+            &mut values,
+            "e",
+            &options.property_filters,
+        );
+        if let Some(cursor) = &options.cursor {
+            sql.push_str(" AND e.edge_key > ?");
+            values.push(Value::Text(cursor.clone()));
+        }
+        sql.push_str(" ORDER BY e.edge_key");
+        if let Some(limit) = options.limit {
+            sql.push_str(" LIMIT ?");
+            values.push(Value::Integer(limit.saturating_add(1) as i64));
+        }
+
+        let plan = sqlite_query_plan(&self.conn, &sql, &values)?;
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut edges =
+            collect_rows(stmt.query_map(params_from_iter(values.iter()), edge_from_row)?)?;
+        let before_limit = edges.len();
+        let mut next_cursor = None;
+        if let Some(limit) = options.limit
+            && edges.len() > limit
+        {
+            next_cursor = edges.get(limit.saturating_sub(1)).map(graph_edge_id);
+            edges.truncate(limit);
+        }
+        let expected_indexes = if options.property_filters.is_empty() {
+            vec!["idx_graph_edges_from_kind", "idx_graph_edges_to_kind"]
+        } else {
+            vec![
+                "idx_graph_edges_from_kind",
+                "idx_graph_edges_to_kind",
+                "idx_graph_edge_properties_key_value_edge",
+            ]
+        };
+        let mut diagnostics = sqlite_query_plan_diagnostics(&plan, &expected_indexes);
+        if !options.property_filters.is_empty() {
+            diagnostics.push(
+                "edge property filters were evaluated by SQLite materialized property rows before paging"
+                    .to_string(),
+            );
+        }
+        if options.cursor.is_some() {
+            diagnostics.push("cursor is exclusive and pushed into SQLite by edge id".to_string());
+        }
+        if next_cursor.is_some() {
+            diagnostics.push(
+                "result was truncated; pass page.next_cursor as --cursor for the next page"
+                    .to_string(),
+            );
+        }
+        Ok(GraphPagedSubgraph {
+            page: GraphQueryPage {
+                cursor: options.cursor,
+                limit: options.limit,
+                next_cursor,
+                returned_nodes: 0,
+                returned_edges: edges.len(),
+                truncated: options.limit.is_some_and(|limit| before_limit > limit),
+                diagnostics,
+            },
+            nodes: Vec::new(),
+            edges,
+        })
     }
 
     fn edges_between_nodes(&self, node_ids: &BTreeSet<String>) -> Result<Vec<GraphEdge>> {
@@ -2345,7 +2896,7 @@ impl GraphStore for SqliteGraphStore {
                     .join(", ");
                 let sql = format!(
                     r#"
-                    SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                    SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
                     FROM graph_edges INDEXED BY idx_graph_edges_from_kind
                     WHERE from_id IN ({from_placeholders})
                       AND to_id IN ({to_placeholders})
@@ -2893,16 +3444,17 @@ fn node_from_row(row: &Row<'_>) -> rusqlite::Result<GraphNode> {
 }
 
 fn edge_from_row(row: &Row<'_>) -> rusqlite::Result<GraphEdge> {
-    let properties_json: String = row.get(3)?;
-    let provenance_json: String = row.get(4)?;
-    let freshness_json: Option<String> = row.get(5)?;
+    let properties_json: String = row.get(4)?;
+    let provenance_json: String = row.get(5)?;
+    let freshness_json: Option<String> = row.get(6)?;
     Ok(GraphEdge {
-        from_id: row.get(0)?,
-        to_id: row.get(1)?,
-        kind: row.get(2)?,
-        properties: from_json(3, &properties_json)?,
-        provenance: from_json(4, &provenance_json)?,
-        freshness: optional_from_json(5, freshness_json)?,
+        id: row.get(0)?,
+        from_id: row.get(1)?,
+        to_id: row.get(2)?,
+        kind: row.get(3)?,
+        properties: from_json(4, &properties_json)?,
+        provenance: from_json(5, &provenance_json)?,
+        freshness: optional_from_json(6, freshness_json)?,
     })
 }
 
@@ -3123,6 +3675,77 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_materializes_edge_properties_and_scans_first_class_edges() {
+        let store = SqliteGraphStore::in_memory().unwrap();
+        for node in [
+            GraphNode::new("doc:livekit", "document", "LiveKit guide"),
+            GraphNode::new("topic:rooms", "topic", "Rooms"),
+            GraphNode::new("topic:egress", "topic", "Egress"),
+        ] {
+            store.upsert_node(&node).unwrap();
+        }
+        let edge = GraphEdge::new("doc:livekit", "topic:rooms", "mentions")
+            .with_property("confidence", "0.91");
+        let edge_id = edge.id.clone();
+        store.upsert_edge(&edge).unwrap();
+        store
+            .upsert_edge(
+                &GraphEdge::new("topic:egress", "topic:rooms", "related_to")
+                    .with_property("confidence", "0.42"),
+            )
+            .unwrap();
+
+        assert_eq!(store.edge(&edge_id).unwrap(), Some(edge));
+        let mut expected_incident_ids = vec![
+            GraphEdge::stable_id("doc:livekit", "topic:rooms", "mentions"),
+            GraphEdge::stable_id("topic:egress", "topic:rooms", "related_to"),
+        ];
+        expected_incident_ids.sort();
+        assert_eq!(
+            store
+                .incident_edges("topic:rooms", None)
+                .unwrap()
+                .into_iter()
+                .map(|edge| edge.id)
+                .collect::<Vec<_>>(),
+            expected_incident_ids
+        );
+
+        let page = store
+            .paged_edges(
+                Some("mentions"),
+                GraphQueryOptions {
+                    property_filters: vec![GraphPropertyFilter {
+                        key: "confidence".to_string(),
+                        value: "0.91".to_string(),
+                    }],
+                    ..GraphQueryOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(page.edges.len(), 1);
+        assert_eq!(page.edges[0].id, edge_id);
+        assert!(
+            page.page
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("idx_graph_edge_properties_key_value_edge")),
+            "{:?}",
+            page.page.diagnostics
+        );
+
+        let property_rows: usize = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_edge_properties WHERE key = 'confidence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(property_rows, 2);
+    }
+
+    #[test]
     fn graph_projection_round_trips_through_backend_agnostic_store_contract() {
         let sqlite = SqliteGraphStore::in_memory().unwrap();
         assert_projection_store_contract(&sqlite);
@@ -3242,6 +3865,15 @@ mod tests {
             .unwrap();
         assert_eq!(old_property_count, 0);
         assert_eq!(updated_page.nodes[0].id, "doc:livekit");
+        let edge_property_count: usize = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_edge_properties WHERE key = 'confidence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge_property_count, 1);
     }
 
     #[test]
@@ -3406,7 +4038,7 @@ mod tests {
         assert_eq!(refresh.deleted_edges, 1);
         assert_eq!(refresh.unchanged_nodes, 3);
         assert_eq!(refresh.upserted_nodes, 0);
-        assert_eq!(refresh.unchanged_properties, 3);
+        assert_eq!(refresh.unchanged_properties, 4);
         assert_eq!(refresh.upserted_properties, 0);
         assert_eq!(refresh.deleted_properties, 0);
         assert!(
@@ -3414,6 +4046,14 @@ mod tests {
                 .phase_timings
                 .iter()
                 .any(|phase| phase.name == "sqlite_property_row_staging"),
+            "{:?}",
+            refresh.phase_timings
+        );
+        assert!(
+            refresh
+                .phase_timings
+                .iter()
+                .any(|phase| phase.name == "sqlite_edge_property_row_staging"),
             "{:?}",
             refresh.phase_timings
         );
@@ -3569,6 +4209,10 @@ mod tests {
             VALUES
                 ('topic:rooms', 'topic', 'Rooms', '{"domain":"livekit"}', '[]'),
                 ('topic:egress', 'topic', 'Egress', '{"domain":"recording"}', '[]');
+            INSERT INTO graph_edges
+                (from_id, to_id, kind, properties_json, provenance_json)
+            VALUES
+                ('topic:rooms', 'topic:egress', 'mentions', '{"confidence":"0.91"}', '[]');
             "#,
         )
         .unwrap();
@@ -3588,6 +4232,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(property_rows, 2);
+        let edge_property_rows: usize = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_edge_properties WHERE key = 'confidence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge_property_rows, 1);
+        let edge = store
+            .edge(&GraphEdge::stable_id(
+                "topic:rooms",
+                "topic:egress",
+                "mentions",
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(edge.properties.get("confidence"), Some(&"0.91".to_string()));
 
         let page = store
             .paged_nodes_by_kind(
@@ -3719,7 +4381,7 @@ mod tests {
         assert_eq!(refresh.unchanged_edges, 124);
         assert_eq!(refresh.upserted_nodes, 0);
         assert_eq!(refresh.upserted_edges, 0);
-        assert_eq!(refresh.unchanged_properties, 126);
+        assert_eq!(refresh.unchanged_properties, 250);
         assert_eq!(refresh.upserted_properties, 0);
         assert_eq!(
             store

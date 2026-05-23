@@ -959,6 +959,43 @@ enum GraphDbQuery {
         /// Stable graph node id
         id: String,
     },
+    /// Look up one edge by stable edge id
+    Edge {
+        /// Stable graph edge id
+        id: String,
+    },
+    /// Scan graph edges
+    Edges {
+        /// Restrict scanned edges to this kind
+        #[arg(long)]
+        edge_kind: Option<String>,
+        /// Return records after this edge id cursor
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum edge records to return (0 = unlimited)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Require an edge property match, formatted KEY=VALUE. Repeatable.
+        #[arg(long = "property", value_name = "KEY=VALUE")]
+        property_filters: Vec<String>,
+    },
+    /// Scan incoming and outgoing edges incident to a node
+    Incident {
+        /// Stable graph node id
+        id: String,
+        /// Restrict scanned edges to this kind
+        #[arg(long)]
+        edge_kind: Option<String>,
+        /// Return records after this edge id cursor
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum edge records to return (0 = unlimited)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Require an edge property match, formatted KEY=VALUE. Repeatable.
+        #[arg(long = "property", value_name = "KEY=VALUE")]
+        property_filters: Vec<String>,
+    },
     /// Scan nodes by kind
     Kind {
         /// Node kind to scan
@@ -6470,6 +6507,8 @@ struct GraphDbReport {
     schema: Option<GraphDbSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node: Option<SubstrateGraphNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edge: Option<SubstrateGraphEdge>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     nodes: Vec<SubstrateGraphNode>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -6569,7 +6608,14 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
     }
 
     fn all_edges(&self) -> Result<Vec<SubstrateGraphEdge>> {
-        Ok(self.edges.values().cloned().collect())
+        let mut edges = self.edges.values().cloned().collect::<Vec<_>>();
+        edges.sort_by(|left, right| {
+            left.from_id
+                .cmp(&right.from_id)
+                .then(left.kind.cmp(&right.kind))
+                .then(left.to_id.cmp(&right.to_id))
+        });
+        Ok(edges)
     }
 
     fn graph_counts(&self) -> Result<(usize, usize)> {
@@ -7400,19 +7446,9 @@ fn sqlite_graph_tombstone_retention_diagnostics(
             }
         }
         if sqlite_table_exists(conn, "graph_edges")? {
-            let mut stmt = conn.prepare("SELECT from_id, to_id, kind FROM graph_edges")?;
-            for row in stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })? {
-                let (from_id, to_id, kind) = row?;
-                live_keys.insert(format!(
-                    "edge:{}",
-                    ConvexEdgeRow::stable_key(&from_id, &to_id, &kind)
-                ));
+            let mut stmt = conn.prepare("SELECT edge_key FROM graph_edges")?;
+            for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
+                live_keys.insert(format!("edge:{}", row?));
             }
         }
         let mut stale_live_tombstones = 0usize;
@@ -7612,6 +7648,7 @@ fn sqlite_graph_schema_diagnostics(conn: &Connection) -> Result<Vec<String>> {
         (
             "graph_edges",
             vec![
+                "edge_key",
                 "from_id",
                 "to_id",
                 "kind",
@@ -7637,6 +7674,7 @@ fn sqlite_graph_schema_diagnostics(conn: &Connection) -> Result<Vec<String>> {
             vec!["row_key", "row_kind", "deleted_at_unix"],
         ),
         ("graph_node_properties", vec!["node_id", "key", "value"]),
+        ("graph_edge_properties", vec!["edge_key", "key", "value"]),
     ];
     for (table, required_columns) in required_tables {
         if !tables.contains(table) {
@@ -7661,7 +7699,9 @@ fn sqlite_graph_schema_diagnostics(conn: &Connection) -> Result<Vec<String>> {
         "idx_graph_nodes_kind",
         "idx_graph_edges_from_kind",
         "idx_graph_edges_to_kind",
+        "idx_graph_edges_edge_key",
         "idx_graph_node_properties_key_value_node",
+        "idx_graph_edge_properties_key_value_edge",
     ] {
         if !indexes.contains(index) {
             diagnostics.push(format!("graph.db schema drift: missing index {index}"));
@@ -7724,6 +7764,16 @@ fn sqlite_graph_duplicate_diagnostics(conn: &Connection) -> Result<Vec<String>> 
         ORDER BY from_id, kind, to_id
         "#,
     )?);
+    diagnostics.extend(sqlite_query_diagnostics(
+        conn,
+        r#"
+        SELECT 'duplicate graph_edges.edge_key ' || edge_key || ' (' || COUNT(*) || ' rows)'
+        FROM graph_edges
+        GROUP BY edge_key
+        HAVING COUNT(*) > 1
+        ORDER BY edge_key
+        "#,
+    )?);
     Ok(diagnostics)
 }
 
@@ -7778,7 +7828,7 @@ fn sqlite_graph_json_diagnostics(conn: &Connection) -> Result<Vec<String>> {
     }
 
     let mut edge_stmt = conn.prepare(
-        "SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json FROM graph_edges ORDER BY from_id, kind, to_id",
+        "SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json FROM graph_edges ORDER BY from_id, kind, to_id",
     )?;
     let edge_rows = edge_stmt.query_map([], |row| {
         Ok((
@@ -7787,12 +7837,14 @@ fn sqlite_graph_json_diagnostics(conn: &Connection) -> Result<Vec<String>> {
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
-            row.get::<_, Option<String>>(5)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(6)?,
         ))
     })?;
     for row in edge_rows {
-        let (from_id, to_id, kind, properties_json, provenance_json, freshness_json) = row?;
-        let edge = format!("{from_id} -{kind}-> {to_id}");
+        let (edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json) =
+            row?;
+        let edge = format!("{edge_key} {from_id} -{kind}-> {to_id}");
         if let Err(err) = serde_json::from_str::<BTreeMap<String, String>>(&properties_json) {
             diagnostics.push(format!(
                 "graph_edges {edge} properties_json is invalid: {err}"
@@ -7912,16 +7964,17 @@ fn sqlite_convex_rows_from_conn(conn: &Connection) -> Result<ConvexProjectionRow
     }
 
     let mut edge_stmt = conn.prepare(
-        "SELECT from_id, to_id, kind, properties_json, provenance_json, freshness_json FROM graph_edges ORDER BY from_id, kind, to_id",
+        "SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json FROM graph_edges ORDER BY from_id, kind, to_id",
     )?;
     let edge_rows = edge_stmt.query_map([], |row| {
-        let properties_json: String = row.get(3)?;
-        let provenance_json: String = row.get(4)?;
-        let freshness_json: Option<String> = row.get(5)?;
+        let properties_json: String = row.get(4)?;
+        let provenance_json: String = row.get(5)?;
+        let freshness_json: Option<String> = row.get(6)?;
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
             properties_json,
             provenance_json,
             freshness_json,
@@ -7930,6 +7983,7 @@ fn sqlite_convex_rows_from_conn(conn: &Connection) -> Result<ConvexProjectionRow
     let mut edges = Vec::new();
     for row in edge_rows {
         let (
+            edge_key,
             from_external_id,
             to_external_id,
             kind,
@@ -7938,7 +7992,7 @@ fn sqlite_convex_rows_from_conn(conn: &Connection) -> Result<ConvexProjectionRow
             freshness_json,
         ) = row?;
         edges.push(ConvexEdgeRow {
-            edge_key: ConvexEdgeRow::stable_key(&from_external_id, &to_external_id, &kind),
+            edge_key,
             from_external_id,
             to_external_id,
             kind,
@@ -9090,7 +9144,11 @@ fn graph_db_page_report_from_store(
 }
 
 fn graph_db_edge_key(edge: &SubstrateGraphEdge) -> String {
-    substrate::ConvexEdgeRow::stable_key(&edge.from_id, &edge.to_id, &edge.kind)
+    if edge.id.is_empty() {
+        substrate::ConvexEdgeRow::stable_key(&edge.from_id, &edge.to_id, &edge.kind)
+    } else {
+        edge.id.clone()
+    }
 }
 
 fn graph_db_schema() -> GraphDbSchema {
@@ -9166,6 +9224,11 @@ fn graph_db_schema() -> GraphDbSchema {
         ],
         edge_fields: vec![
             GraphDbSchemaField {
+                name: "id",
+                value_type: "string",
+                description: "Stable provider-neutral edge id derived from from_id, kind, and to_id",
+            },
+            GraphDbSchemaField {
                 name: "from_id",
                 value_type: "string",
                 description: "Source node id",
@@ -9240,6 +9303,18 @@ fn graph_db_schema() -> GraphDbSchema {
             GraphDbSchemaOperation {
                 command: "node <id>",
                 description: "Return one node by stable id",
+            },
+            GraphDbSchemaOperation {
+                command: "edge <id>",
+                description: "Return one edge by stable edge id",
+            },
+            GraphDbSchemaOperation {
+                command: "edges [--edge-kind <kind>] [--property KEY=VALUE] [--cursor EDGE_ID] [--limit N]",
+                description: "Return edge records ordered by stable edge id with SQLite-pushed edge-property filtering and cursor pagination",
+            },
+            GraphDbSchemaOperation {
+                command: "incident <id> [--edge-kind <kind>] [--property KEY=VALUE] [--cursor EDGE_ID] [--limit N]",
+                description: "Return incoming and outgoing edges incident to one node, ordered by stable edge id with optional kind and edge-property filters",
             },
             GraphDbSchemaOperation {
                 command: "kind <kind> [--property KEY=VALUE] [--cursor ID] [--limit N]",
@@ -9717,6 +9792,7 @@ fn graph_db_report_from_store(
         freshness,
         schema: None,
         node: None,
+        edge: None,
         nodes: Vec::new(),
         edges: Vec::new(),
         path: None,
@@ -9751,6 +9827,45 @@ fn graph_db_report_from_store(
         }
         GraphDbQuery::Node { id } => {
             report.node = store.node(&id)?;
+        }
+        GraphDbQuery::Edge { id } => {
+            report.edge = store.edge(&id)?;
+        }
+        GraphDbQuery::Edges {
+            edge_kind,
+            cursor,
+            limit,
+            property_filters,
+        } => {
+            let options = graph_db_query_options(cursor, limit, &property_filters)?;
+            let paged = store.paged_edges(
+                edge_kind.as_deref(),
+                graph_db_query_options_for_store(&options),
+            )?;
+            report.edges = paged.edges;
+            report.page = Some(graph_db_page_report_from_store(
+                paged.page,
+                options.property_filters,
+            ));
+        }
+        GraphDbQuery::Incident {
+            id,
+            edge_kind,
+            cursor,
+            limit,
+            property_filters,
+        } => {
+            let options = graph_db_query_options(cursor, limit, &property_filters)?;
+            let paged = store.paged_incident_edges(
+                &id,
+                edge_kind.as_deref(),
+                graph_db_query_options_for_store(&options),
+            )?;
+            report.edges = paged.edges;
+            report.page = Some(graph_db_page_report_from_store(
+                paged.page,
+                options.property_filters,
+            ));
         }
         GraphDbQuery::Kind {
             kind,
@@ -9819,7 +9934,7 @@ fn print_graph_db_human(report: &GraphDbReport, compact: bool) {
             report.backend,
             report.query,
             report.nodes.len() + usize::from(report.node.is_some()),
-            report.edges.len(),
+            report.edges.len() + usize::from(report.edge.is_some()),
             report.freshness.status
         );
         return;
@@ -9837,11 +9952,26 @@ fn print_graph_db_human(report: &GraphDbReport, compact: bool) {
     if let Some(node) = &report.node {
         println!("node: {} [{}] {}", node.id, node.kind, node.label);
     }
+    if let Some(edge) = &report.edge {
+        println!(
+            "edge: {} {} -{}-> {}",
+            graph_db_edge_key(edge),
+            edge.from_id,
+            edge.kind,
+            edge.to_id
+        );
+    }
     for node in &report.nodes {
         println!("node: {} [{}] {}", node.id, node.kind, node.label);
     }
     for edge in &report.edges {
-        println!("edge: {} -{}-> {}", edge.from_id, edge.kind, edge.to_id);
+        println!(
+            "edge: {} {} -{}-> {}",
+            graph_db_edge_key(edge),
+            edge.from_id,
+            edge.kind,
+            edge.to_id
+        );
     }
     if let Some(path) = &report.path {
         println!("path: {} hop(s) {}", path.hops, path.nodes.join(" -> "));
@@ -10243,6 +10373,30 @@ fn graph_db_backend_eval_dispatch_signature(report: &DispatchTraceReport) -> ser
     })
 }
 
+fn graph_db_backend_eval_edge_scan_probe(
+    store: &impl GraphStore,
+) -> Result<(SubstrateGraphEdge, Vec<GraphPropertyFilter>)> {
+    let edges = store.all_edges()?;
+    let edge = edges
+        .iter()
+        .find(|edge| !edge.properties.is_empty())
+        .cloned()
+        .or_else(|| edges.first().cloned())
+        .context("backend-eval edge scan requires at least one edge")?;
+    let filters = edge
+        .properties
+        .iter()
+        .next()
+        .map(|(key, value)| {
+            vec![GraphPropertyFilter {
+                key: key.clone(),
+                value: value.clone(),
+            }]
+        })
+        .unwrap_or_default();
+    Ok((edge, filters))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn graph_db_backend_eval_report_for_store<S: GraphStore>(
     backend: &str,
@@ -10280,6 +10434,75 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
                 "freshness": freshness.status,
                 "nodes": nodes,
                 "edges": edges,
+            }),
+        ))
+    });
+    operations.push(operation);
+    signatures.extend(signature);
+
+    let (operation, signature) = graph_db_backend_eval_timed("edge_lookup", || {
+        let edge = store
+            .sample_edge(None)?
+            .context("backend-eval edge lookup requires at least one edge")?;
+        let edge_id = graph_db_edge_key(&edge);
+        let found = store
+            .edge(&edge_id)?
+            .with_context(|| format!("backend-eval edge lookup missed {edge_id}"))?;
+        Ok((
+            Some(1),
+            serde_json::json!({
+                "edge_id": edge_id,
+                "from_id": found.from_id,
+                "to_id": found.to_id,
+                "kind": found.kind,
+            }),
+        ))
+    });
+    operations.push(operation);
+    signatures.extend(signature);
+
+    let (operation, signature) = graph_db_backend_eval_timed("edge_property_scan", || {
+        let (edge, filters) = graph_db_backend_eval_edge_scan_probe(store)?;
+        let page = store.paged_edges(
+            Some(&edge.kind),
+            GraphQueryOptions {
+                limit: Some(limit.max(1)),
+                property_filters: filters.clone(),
+                ..GraphQueryOptions::default()
+            },
+        )?;
+        Ok((
+            Some(page.edges.len()),
+            serde_json::json!({
+                "kind": edge.kind,
+                "filters": filters.iter().map(|filter| format!("{}={}", filter.key, filter.value)).collect::<Vec<_>>(),
+                "edge_ids": page.edges.iter().map(graph_db_edge_key).collect::<Vec<_>>(),
+                "truncated": page.page.truncated,
+            }),
+        ))
+    });
+    operations.push(operation);
+    signatures.extend(signature);
+
+    let (operation, signature) = graph_db_backend_eval_timed("incident_edges", || {
+        let edge = store
+            .sample_edge(None)?
+            .context("backend-eval incident edge scan requires at least one edge")?;
+        let page = store.paged_incident_edges(
+            &edge.from_id,
+            Some(&edge.kind),
+            GraphQueryOptions {
+                limit: Some(limit.max(1)),
+                ..GraphQueryOptions::default()
+            },
+        )?;
+        Ok((
+            Some(page.edges.len()),
+            serde_json::json!({
+                "node_id": edge.from_id,
+                "kind": edge.kind,
+                "edge_ids": page.edges.iter().map(graph_db_edge_key).collect::<Vec<_>>(),
+                "truncated": page.page.truncated,
             }),
         ))
     });
@@ -10565,7 +10788,10 @@ fn graph_db_backend_eval_synthetic_projection(nodes: usize, fanout: usize) -> Gr
         nodes: projection_nodes,
         edges: projection_edges
             .into_iter()
-            .map(|edge| edge.with_provenance(source.clone()))
+            .map(|edge| {
+                edge.with_property("dataset", "synthetic")
+                    .with_provenance(source.clone())
+            })
             .collect(),
     }
 }
@@ -10784,18 +11010,24 @@ fn graph_db_backend_eval_performance_gate(
         required_metrics: vec![
             "real.sqlite.refresh.duration_micros".to_string(),
             "real.sqlite.refresh.duration_micros_per_1k_graph_rows".to_string(),
+            "real.sqlite.edge_lookup.duration_micros_per_1k_graph_rows".to_string(),
+            "real.sqlite.edge_property_scan.duration_micros_per_1k_graph_rows".to_string(),
+            "real.sqlite.incident_edges.duration_micros_per_1k_graph_rows".to_string(),
             "real.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows".to_string(),
             "real.sqlite.evidence.duration_micros_per_1k_graph_rows".to_string(),
             "real.sqlite.total_duration_micros_per_1k_graph_rows".to_string(),
             "real.refresh_phase.source_graph_build.duration_micros_per_1k_graph_rows".to_string(),
             "real.refresh_phase.sqlite_delta_write.duration_micros".to_string(),
             "real.refresh_phase.sqlite_property_row_staging.duration_micros".to_string(),
+            "real.refresh_phase.sqlite_edge_property_row_staging.duration_micros".to_string(),
             "real.sqlite.conflict_matrix.duration_micros".to_string(),
             "real.sqlite.dispatch_trace.duration_micros".to_string(),
             "real.sqlite.path_max_hops.duration_micros".to_string(),
             "synthetic_high_degree.sqlite.total_duration_micros".to_string(),
             "synthetic_high_degree.sqlite.total_duration_micros_per_1k_graph_rows".to_string(),
+            "synthetic_high_degree.sqlite.edge_property_scan.duration_micros_per_1k_graph_rows".to_string(),
             "synthetic_high_degree.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows".to_string(),
+            "synthetic_deep_chain.sqlite.incident_edges.duration_micros_per_1k_graph_rows".to_string(),
             "synthetic_deep_chain.sqlite.path_max_hops.duration_micros".to_string(),
             "synthetic_deep_chain.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows".to_string(),
             "synthetic_deep_chain.sqlite.path_max_hops.duration_micros_per_1k_graph_rows"
@@ -24527,6 +24759,34 @@ fn cmd_search_worker(
 mod tests {
     use super::*;
 
+    fn parse_cli<I, T>(itr: I) -> Cli
+    where
+        I: IntoIterator<Item = T> + Send + 'static,
+        T: Into<std::ffi::OsString> + Clone + Send + 'static,
+    {
+        std::thread::Builder::new()
+            .name("cli-parse".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::parse_from(itr))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn try_parse_cli<I, T>(itr: I) -> std::result::Result<Cli, clap::Error>
+    where
+        I: IntoIterator<Item = T> + Send + 'static,
+        T: Into<std::ffi::OsString> + Clone + Send + 'static,
+    {
+        std::thread::Builder::new()
+            .name("cli-try-parse".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(itr))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
     #[derive(Default)]
     struct MemoryConvexGraphClient {
         nodes: RefCell<BTreeMap<String, ConvexNodeRow>>,
@@ -24697,7 +24957,7 @@ mod tests {
 
     #[test]
     fn cli_accepts_global_compact_flag() {
-        let cli = Cli::parse_from(["tsift", "--compact", "status"]);
+        let cli = parse_cli(["tsift", "--compact", "status"]);
         assert!(cli.compact);
         assert!(matches!(cli.command, Some(Commands::Status { .. })));
     }
@@ -26702,6 +26962,77 @@ def list_items():
                 .any(|diagnostic| diagnostic.contains("idx_graph_edges_from_kind")),
             "expected SQLite neighborhood query plan diagnostics, got {:?}",
             report.page.as_ref().unwrap().diagnostics
+        );
+        let edge_id = graph_db_edge_key(
+            report
+                .edges
+                .iter()
+                .find(|edge| edge.from_id == backlog.handle && edge.kind == "mentions")
+                .unwrap(),
+        );
+
+        let edge_report = graph_db_report_from_store(
+            dir.path(),
+            None,
+            "sqlite",
+            GraphDbQuery::Edge {
+                id: edge_id.clone(),
+            },
+            &store,
+            sqlite_graph_freshness(&store, "root").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            edge_report.edge.as_ref().map(graph_db_edge_key),
+            Some(edge_id.clone())
+        );
+
+        let edges_report = graph_db_report_from_store(
+            dir.path(),
+            None,
+            "sqlite",
+            GraphDbQuery::Edges {
+                edge_kind: Some("mentions".to_string()),
+                cursor: None,
+                limit: Some(2),
+                property_filters: Vec::new(),
+            },
+            &store,
+            sqlite_graph_freshness(&store, "root").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(edges_report.edges.iter().any(|edge| edge.id == edge_id));
+        assert_eq!(
+            edges_report.page.as_ref().unwrap().returned_edges,
+            edges_report.edges.len()
+        );
+
+        let incident_report = graph_db_report_from_store(
+            dir.path(),
+            None,
+            "sqlite",
+            GraphDbQuery::Incident {
+                id: backlog.handle.clone(),
+                edge_kind: Some("mentions".to_string()),
+                cursor: None,
+                limit: Some(1),
+                property_filters: Vec::new(),
+            },
+            &store,
+            sqlite_graph_freshness(&store, "root").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(incident_report.page.as_ref().unwrap().returned_edges, 1);
+        assert!(
+            incident_report
+                .edges
+                .iter()
+                .all(|edge| edge.from_id == backlog.handle || edge.to_id == backlog.handle),
+            "{:?}",
+            incident_report.edges
         );
 
         let schema_report = graph_db_report_from_store(
@@ -29528,7 +29859,7 @@ tier = "private"
 
     #[test]
     fn cli_workflow_defaults_to_search_topic() {
-        let cli = Cli::parse_from(["tsift", "workflow"]);
+        let cli = parse_cli(["tsift", "workflow"]);
         match cli.command {
             Some(Commands::Workflow { topic, json }) => {
                 assert_eq!(topic, "search");
@@ -29715,14 +30046,14 @@ tier = "private"
 
     #[test]
     fn cli_accepts_global_schema_flag() {
-        let cli = Cli::parse_from(["tsift", "--schema", "search", "test"]);
+        let cli = parse_cli(["tsift", "--schema", "search", "test"]);
         assert!(cli.schema);
         assert!(matches!(cli.command, Some(Commands::Search { .. })));
     }
 
     #[test]
     fn cli_accepts_global_envelope_flag() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "--envelope",
             "context-pack",
@@ -29734,13 +30065,13 @@ tier = "private"
 
     #[test]
     fn cli_accepts_locks_command() {
-        let cli = Cli::parse_from(["tsift", "locks"]);
+        let cli = parse_cli(["tsift", "locks"]);
         assert!(matches!(cli.command, Some(Commands::Locks { .. })));
     }
 
     #[test]
     fn cli_locks_accepts_scope_flag() {
-        let cli = Cli::parse_from(["tsift", "locks", "--scope", "alpha"]);
+        let cli = parse_cli(["tsift", "locks", "--scope", "alpha"]);
         match cli.command {
             Some(Commands::Locks { scope, .. }) => {
                 assert_eq!(scope.as_deref(), Some("alpha"));
@@ -29751,7 +30082,7 @@ tier = "private"
 
     #[test]
     fn cli_search_accepts_autoindex_flag() {
-        let cli = Cli::parse_from(["tsift", "search", "test", "--autoindex"]);
+        let cli = parse_cli(["tsift", "search", "test", "--autoindex"]);
         match cli.command {
             Some(Commands::Search {
                 autoindex,
@@ -29767,7 +30098,7 @@ tier = "private"
 
     #[test]
     fn cli_search_accepts_exact_flag() {
-        let cli = Cli::parse_from(["tsift", "search", "test", "--exact"]);
+        let cli = parse_cli(["tsift", "search", "test", "--exact"]);
         match cli.command {
             Some(Commands::Search {
                 exact, strategy, ..
@@ -29781,7 +30112,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_diff_digest_command() {
-        let cli = Cli::parse_from(["tsift", "diff-digest", "--json", "."]);
+        let cli = parse_cli(["tsift", "diff-digest", "--json", "."]);
         match cli.command {
             Some(Commands::DiffDigest {
                 json,
@@ -29800,7 +30131,7 @@ tier = "private"
 
     #[test]
     fn cli_rejects_conflicting_diff_digest_modes() {
-        match Cli::try_parse_from([
+        match try_parse_cli([
             "tsift",
             "diff-digest",
             "--cached",
@@ -29818,7 +30149,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_test_digest_command() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "test-digest",
             "--path",
@@ -29847,7 +30178,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_log_digest_command() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "log-digest",
             "--path",
@@ -29868,7 +30199,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_metric_digest_command() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "metric-digest",
             "--input",
@@ -29910,7 +30241,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_dci_benchmark_command() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "dci-benchmark",
             "--fixture",
@@ -29928,7 +30259,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_session_digest_command() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "session-digest",
             "--path",
@@ -29957,7 +30288,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_session_cost_command() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "session-cost",
             "--input",
@@ -29982,7 +30313,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_session_review_command() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "session-review",
             "tasks/software/tsift.md",
@@ -30006,7 +30337,7 @@ tier = "private"
 
     #[test]
     fn cli_search_accepts_budget_flags() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "search",
             "alpha_helper",
@@ -30030,7 +30361,7 @@ tier = "private"
 
     #[test]
     fn cli_search_accepts_budget_preset() {
-        let cli = Cli::parse_from(["tsift", "search", "alpha_helper", "--budget", "small"]);
+        let cli = parse_cli(["tsift", "search", "alpha_helper", "--budget", "small"]);
         match cli.command {
             Some(Commands::Search { budget, .. }) => {
                 assert_eq!(budget, Some(ResponseBudgetPreset::Small));
@@ -30058,7 +30389,7 @@ tier = "private"
 
     #[test]
     fn cli_explain_accepts_budget_flags() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "explain",
             "alpha_helper",
@@ -30082,7 +30413,7 @@ tier = "private"
 
     #[test]
     fn cli_session_review_accepts_budget_flags() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "session-review",
             "tasks/software/tsift.md",
@@ -30106,7 +30437,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_context_pack_command() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "context-pack",
             "tasks/software/tsift.md",
@@ -30150,7 +30481,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_token_savings_command() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "token-savings",
             "--fixture",
@@ -31358,7 +31689,7 @@ tier = "private"
 
     #[test]
     fn cli_search_rejects_exact_with_strategy_flag() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_cli([
             "tsift",
             "search",
             "test",
@@ -31371,7 +31702,7 @@ tier = "private"
 
     #[test]
     fn cli_search_autoindexes_by_default() {
-        let cli = Cli::parse_from(["tsift", "search", "test"]);
+        let cli = parse_cli(["tsift", "search", "test"]);
         match cli.command {
             Some(Commands::Search {
                 autoindex,
@@ -31388,7 +31719,7 @@ tier = "private"
 
     #[test]
     fn cli_search_accepts_no_autoindex_flag() {
-        let cli = Cli::parse_from(["tsift", "search", "test", "--no-autoindex"]);
+        let cli = parse_cli(["tsift", "search", "test", "--no-autoindex"]);
         match cli.command {
             Some(Commands::Search {
                 autoindex,
@@ -31404,7 +31735,7 @@ tier = "private"
 
     #[test]
     fn cli_search_rejects_conflicting_autoindex_flags() {
-        let cli = Cli::try_parse_from(["tsift", "search", "test", "--autoindex", "--no-autoindex"]);
+        let cli = try_parse_cli(["tsift", "search", "test", "--autoindex", "--no-autoindex"]);
         assert!(cli.is_err());
     }
 
@@ -31412,42 +31743,42 @@ tier = "private"
 
     #[test]
     fn cli_accepts_global_absolute_flag() {
-        let cli = Cli::parse_from(["tsift", "--absolute", "status"]);
+        let cli = parse_cli(["tsift", "--absolute", "status"]);
         assert!(cli.absolute);
         assert!(matches!(cli.command, Some(Commands::Status { .. })));
     }
 
     #[test]
     fn cli_accepts_global_tabular_flag() {
-        let cli = Cli::parse_from(["tsift", "--tabular", "search", "test"]);
+        let cli = parse_cli(["tsift", "--tabular", "search", "test"]);
         assert!(cli.tabular);
         assert!(matches!(cli.command, Some(Commands::Search { .. })));
     }
 
     #[test]
     fn cli_tabular_with_graph() {
-        let cli = Cli::parse_from(["tsift", "--tabular", "graph", "main"]);
+        let cli = parse_cli(["tsift", "--tabular", "graph", "main"]);
         assert!(cli.tabular);
         assert!(matches!(cli.command, Some(Commands::Graph { .. })));
     }
 
     #[test]
     fn cli_tabular_with_communities() {
-        let cli = Cli::parse_from(["tsift", "--tabular", "communities"]);
+        let cli = parse_cli(["tsift", "--tabular", "communities"]);
         assert!(cli.tabular);
         assert!(matches!(cli.command, Some(Commands::Communities { .. })));
     }
 
     #[test]
     fn cli_tabular_with_explain() {
-        let cli = Cli::parse_from(["tsift", "--tabular", "explain", "main"]);
+        let cli = parse_cli(["tsift", "--tabular", "explain", "main"]);
         assert!(cli.tabular);
         assert!(matches!(cli.command, Some(Commands::Explain { .. })));
     }
 
     #[test]
     fn cli_traverse_accepts_path_target_and_html_format() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift", "traverse", "#kgnv", "--to", "main", "--path", ".", "--format", "html",
         ]);
         match cli.command {
@@ -31469,7 +31800,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_semantic_related_command() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "semantic",
             "graph navigation",
@@ -31502,7 +31833,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_convex_sync_command() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "convex-sync",
             ".",
@@ -31531,7 +31862,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_convex_sync_live_flags() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "convex-sync",
             ".",
@@ -31564,7 +31895,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_graph_db_query() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "graph-db",
             "--backend",
@@ -31624,7 +31955,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_graph_db_compact_query() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "graph-db",
             "--path",
@@ -31653,7 +31984,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_impact_command() {
-        let cli = Cli::parse_from(["tsift", "impact", ".", "--cached", "--limit", "5"]);
+        let cli = parse_cli(["tsift", "impact", ".", "--cached", "--limit", "5"]);
         match cli.command {
             Some(Commands::Impact {
                 path,
@@ -31671,7 +32002,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_conflict_matrix_command() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "conflict-matrix",
             "--path",
@@ -31709,7 +32040,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_dispatch_trace_command() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "dispatch-trace",
             "--path",
@@ -31740,7 +32071,7 @@ tier = "private"
 
     #[test]
     fn cli_parses_dependency_dag_command() {
-        let cli = Cli::parse_from([
+        let cli = parse_cli([
             "tsift",
             "dependency-dag",
             "--path",
@@ -31837,7 +32168,7 @@ tier = "private"
 
     #[test]
     fn cli_graph_accepts_limit_flag() {
-        let cli = Cli::parse_from(["tsift", "graph", "main", "--limit", "5"]);
+        let cli = parse_cli(["tsift", "graph", "main", "--limit", "5"]);
         match cli.command {
             Some(Commands::Graph { limit, .. }) => assert_eq!(limit, 5),
             _ => panic!("expected Graph command"),
@@ -31846,7 +32177,7 @@ tier = "private"
 
     #[test]
     fn cli_graph_default_limit_is_20() {
-        let cli = Cli::parse_from(["tsift", "graph", "main"]);
+        let cli = parse_cli(["tsift", "graph", "main"]);
         match cli.command {
             Some(Commands::Graph { limit, .. }) => assert_eq!(limit, 20),
             _ => panic!("expected Graph command"),
@@ -31855,7 +32186,7 @@ tier = "private"
 
     #[test]
     fn cli_communities_accepts_limit_flag() {
-        let cli = Cli::parse_from(["tsift", "communities", "--limit", "3"]);
+        let cli = parse_cli(["tsift", "communities", "--limit", "3"]);
         match cli.command {
             Some(Commands::Communities { limit, .. }) => assert_eq!(limit, 3),
             _ => panic!("expected Communities command"),
@@ -31864,7 +32195,7 @@ tier = "private"
 
     #[test]
     fn cli_communities_default_limit_is_10() {
-        let cli = Cli::parse_from(["tsift", "communities"]);
+        let cli = parse_cli(["tsift", "communities"]);
         match cli.command {
             Some(Commands::Communities { limit, .. }) => assert_eq!(limit, 10),
             _ => panic!("expected Communities command"),
@@ -31873,7 +32204,7 @@ tier = "private"
 
     #[test]
     fn cli_explain_accepts_limit_flag() {
-        let cli = Cli::parse_from(["tsift", "explain", "main", "--limit", "7"]);
+        let cli = parse_cli(["tsift", "explain", "main", "--limit", "7"]);
         match cli.command {
             Some(Commands::Explain { limit, .. }) => assert_eq!(limit, 7),
             _ => panic!("expected Explain command"),
@@ -31882,7 +32213,7 @@ tier = "private"
 
     #[test]
     fn cli_explain_default_limit_is_15() {
-        let cli = Cli::parse_from(["tsift", "explain", "main"]);
+        let cli = parse_cli(["tsift", "explain", "main"]);
         match cli.command {
             Some(Commands::Explain { limit, .. }) => assert_eq!(limit, 15),
             _ => panic!("expected Explain command"),
@@ -31891,7 +32222,7 @@ tier = "private"
 
     #[test]
     fn cli_limit_zero_means_unlimited() {
-        let cli = Cli::parse_from(["tsift", "graph", "main", "--limit", "0"]);
+        let cli = parse_cli(["tsift", "graph", "main", "--limit", "0"]);
         match cli.command {
             Some(Commands::Graph { limit, .. }) => assert_eq!(limit, 0),
             _ => panic!("expected Graph command"),
