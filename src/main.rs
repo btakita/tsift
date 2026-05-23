@@ -9850,6 +9850,100 @@ fn graph_db_backend_eval_refresh_total_micros(phases: &[GraphDbBackendEvalPhaseT
         .sum()
 }
 
+fn graph_db_backend_eval_cached_refresh(
+    root: &Path,
+    scope: Option<&str>,
+    source_watermark: Option<&str>,
+) -> Result<
+    Option<(
+        TraversalGraphBuild,
+        SqliteProjectionRefresh,
+        Vec<GraphDbBackendEvalPhaseTiming>,
+    )>,
+> {
+    let Some(source_watermark) = source_watermark else {
+        return Ok(None);
+    };
+    let graph_db = graph_substrate_db_path(root, scope);
+    if !graph_db.exists() {
+        return Ok(None);
+    }
+
+    let started = Instant::now();
+    let store = match SqliteGraphStore::open_read_only_resilient(&graph_db) {
+        Ok(store) => store,
+        Err(_) => return Ok(None),
+    };
+    let freshness = sqlite_graph_freshness(&store, scope.unwrap_or("root"))?;
+    if freshness.fail_closed || freshness.source_watermark.as_deref() != Some(source_watermark) {
+        return Ok(None);
+    }
+
+    let phases = vec![
+        graph_db_backend_eval_phase_timing(
+            "source_graph_build",
+            started.elapsed().as_micros(),
+            "reused current graph.db projection because the source watermark matched; skipped code-index loading, session markdown scanning, source-handle construction, and semantic summary reads",
+        ),
+        graph_db_backend_eval_phase_timing(
+            "projection_rows",
+            0,
+            "reused cached provider-neutral projection rows from graph.db",
+        ),
+        graph_db_backend_eval_phase_timing(
+            "sqlite_open",
+            0,
+            "reused existing graph.db projection without opening a write transaction",
+        ),
+    ];
+    let refresh = SqliteProjectionRefresh {
+        scope: scope.unwrap_or("root").to_string(),
+        projection_version: freshness
+            .projection_version
+            .unwrap_or_else(|| GRAPH_PROJECTION_VERSION.to_string()),
+        source_watermark: Some(source_watermark.to_string()),
+        tombstoned_nodes: Vec::new(),
+        tombstoned_edges: Vec::new(),
+        upserted_nodes: 0,
+        upserted_edges: 0,
+        unchanged_nodes: 0,
+        unchanged_edges: 0,
+        upserted_properties: 0,
+        unchanged_properties: 0,
+        deleted_properties: 0,
+        deleted_nodes: 0,
+        deleted_edges: 0,
+        pruned_tombstones: 0,
+        file_size_bytes_before: None,
+        file_size_bytes_after: None,
+        phase_timings: Vec::new(),
+    };
+    Ok(Some((TraversalGraphBuild::default(), refresh, phases)))
+}
+
+fn graph_db_backend_eval_reused_cached_projection(
+    phases: &[GraphDbBackendEvalPhaseTiming],
+) -> bool {
+    phases.iter().any(|phase| {
+        phase.name == "source_graph_build"
+            && phase.detail.contains("reused current graph.db projection")
+    })
+}
+
+fn graph_db_backend_eval_update_source_watermark(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+) -> Result<()> {
+    let Some(source_watermark) = traversal_source_watermark(root, path_hint, scope, false)? else {
+        return Ok(());
+    };
+    let graph_db = graph_substrate_db_path(root, scope);
+    let mut store = SqliteGraphStore::open(&graph_db)?;
+    store.update_projection_source_watermark(scope.unwrap_or("root"), Some(source_watermark))?;
+    Ok(())
+}
+
 fn graph_db_backend_eval_refresh_with_profile(
     root: &Path,
     path_hint: &Path,
@@ -9859,6 +9953,13 @@ fn graph_db_backend_eval_refresh_with_profile(
     SqliteProjectionRefresh,
     Vec<GraphDbBackendEvalPhaseTiming>,
 )> {
+    let source_watermark = traversal_source_watermark(root, path_hint, scope, false)?;
+    if let Some(cached) =
+        graph_db_backend_eval_cached_refresh(root, scope, source_watermark.as_deref())?
+    {
+        return Ok(cached);
+    }
+
     let mut phases = Vec::new();
     let source_graph = graph_db_backend_eval_timed_phase(
         &mut phases,
@@ -9879,11 +9980,16 @@ fn graph_db_backend_eval_refresh_with_profile(
         "open the local SQLite graph.db with WAL and busy-timeout settings",
         || SqliteGraphStore::open(&graph_db),
     )?;
+    let refreshed_source_watermark = traversal_source_watermark(root, path_hint, scope, false)
+        .ok()
+        .flatten();
     let refresh = store.replace_projection_with_version(
         scope.unwrap_or("root"),
         &projection,
         Some(GRAPH_PROJECTION_VERSION),
-        graph_projection_content_hash(&projection),
+        refreshed_source_watermark
+            .or(source_watermark)
+            .or_else(|| graph_projection_content_hash(&projection)),
     )?;
     phases.extend(
         refresh
@@ -10660,12 +10766,16 @@ fn cmd_graph_db_backend_eval(
         graph_db_backend_eval_refresh_with_profile(&root, path, scope)
             .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
     let refresh_micros = graph_db_backend_eval_refresh_total_micros(&phase_timings);
+    let reused_cached_projection = graph_db_backend_eval_reused_cached_projection(&phase_timings);
     let prepared = graph_db_backend_eval_timed_phase(
         &mut phase_timings,
         "conflict_matrix_preparation",
         "context-pack, cached diff digest, and cached impact inputs shared by conflict-matrix and dispatch-trace measurements",
         || prepare_conflict_matrix_inputs(&root, path, scope, impact_limit),
     )?;
+    if !reused_cached_projection {
+        graph_db_backend_eval_update_source_watermark(&root, path, scope)?;
+    }
     let graph_db = graph_substrate_db_path(&root, scope);
     let real_store = SqliteGraphStore::open_read_only_resilient(&graph_db)
         .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
@@ -11542,6 +11652,121 @@ fn markdown_files_for_traversal(root: &Path, path_hint: &Path) -> Result<Vec<Pat
     }
     files.sort();
     Ok(files)
+}
+
+fn traversal_watermark_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn push_traversal_metadata_watermark_part(
+    root: &Path,
+    path: &Path,
+    label: &str,
+    parts: &mut Vec<String>,
+) {
+    let display = traversal_watermark_path(root, path);
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            let (secs, nanos) = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
+                .unwrap_or((0, 0));
+            parts.push(format!(
+                "{label}:{display}:len={}:mtime={secs}.{nanos}",
+                metadata.len()
+            ));
+        }
+        Err(_) => parts.push(format!("{label}:{display}:missing")),
+    }
+}
+
+fn traversal_path_is_generated_artifact(root: &Path, source_root: &Path, path: &Path) -> bool {
+    [source_root, root].iter().any(|base| {
+        path.strip_prefix(base)
+            .ok()
+            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            .is_some_and(|relative| {
+                relative == ".tsift"
+                    || relative.starts_with(".tsift/")
+                    || relative == "target"
+                    || relative.starts_with("target/")
+                    || relative.contains("/target/")
+            })
+    })
+}
+
+fn traversal_index_snapshot_part_is_generated(root: &Path, source_root: &Path, part: &str) -> bool {
+    let Some(rest) = part.strip_prefix("file:") else {
+        return false;
+    };
+    let path = rest.split(':').next().unwrap_or(rest);
+    traversal_path_is_generated_artifact(root, source_root, Path::new(path))
+}
+
+fn traversal_source_watermark(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+    session_only: bool,
+) -> Result<Option<String>> {
+    let mut parts = vec![
+        format!("projection_version:{GRAPH_PROJECTION_VERSION}"),
+        format!("scope:{}", scope.unwrap_or("root")),
+        format!("path_hint:{}", traversal_watermark_path(root, path_hint)),
+        format!("session_only:{session_only}"),
+    ];
+
+    if !session_only || hinted_markdown_file(root, path_hint).is_none() {
+        let targets = match resolve_search_index_targets(root, path_hint, scope, false) {
+            Ok(targets) => targets,
+            Err(_) => return Ok(None),
+        };
+        let Some(target) = targets.into_iter().next() else {
+            return Ok(None);
+        };
+        let db = match index::IndexDb::open_read_only_resilient(&target.db_path) {
+            Ok(db) => db,
+            Err(_) => return Ok(None),
+        };
+        parts.push(format!("index_label:{}", target.label));
+        parts.push(format!(
+            "index_scope:{}",
+            target.scope_name.as_deref().unwrap_or("root")
+        ));
+        parts.push(format!(
+            "index_source_root:{}",
+            traversal_watermark_path(root, &target.source_root)
+        ));
+        let mut snapshot_rows = 0usize;
+        for part in db.source_snapshot_parts()? {
+            if traversal_index_snapshot_part_is_generated(root, &target.source_root, &part) {
+                continue;
+            }
+            snapshot_rows += 1;
+            parts.push(format!("index_snapshot:{part}"));
+        }
+        parts.push(format!("index_snapshot_rows:{snapshot_rows}"));
+    }
+
+    let markdown_files = markdown_files_for_traversal(root, path_hint)?;
+    parts.push(format!("markdown_count:{}", markdown_files.len()));
+    for markdown_path in markdown_files {
+        push_traversal_metadata_watermark_part(root, &markdown_path, "markdown", &mut parts);
+    }
+
+    push_traversal_metadata_watermark_part(
+        root,
+        &root.join(".tsift/summaries.db"),
+        "summaries_db",
+        &mut parts,
+    );
+
+    Ok(Some(content_hash(&parts)?))
 }
 
 fn ranked_symbol_matches<'a>(

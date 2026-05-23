@@ -1785,6 +1785,22 @@ impl SqliteGraphStore {
             .map_err(Into::into)
     }
 
+    pub fn update_projection_source_watermark(
+        &mut self,
+        scope: &str,
+        source_watermark: Option<String>,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            UPDATE graph_projection_versions
+            SET source_watermark = ?2
+            WHERE scope = ?1
+            "#,
+            (scope, source_watermark),
+        )?;
+        Ok(())
+    }
+
     pub fn compact_storage(&mut self, prune_tombstones: bool) -> Result<usize> {
         let pruned_tombstones = if prune_tombstones {
             self.conn.execute("DELETE FROM graph_tombstones", [])?

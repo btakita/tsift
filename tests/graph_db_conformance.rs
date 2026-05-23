@@ -1298,23 +1298,27 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
     init_git_repo(project.path());
     let session = project.path().join("tasks/software/tsift.md");
 
-    let report = assert_tsift_json(vec![
-        "graph-db".to_string(),
-        "--path".to_string(),
-        session.to_string_lossy().to_string(),
-        "--json".to_string(),
-        "backend-eval".to_string(),
-        "--candidate".to_string(),
-        "duckdb-duckpgq".to_string(),
-        "--candidate".to_string(),
-        "falkordb".to_string(),
-        "--candidate".to_string(),
-        "ladybug".to_string(),
-        "--candidate".to_string(),
-        "kuzu".to_string(),
-        "--target".to_string(),
-        "gval".to_string(),
-    ]);
+    let backend_eval_args = || {
+        vec![
+            "graph-db".to_string(),
+            "--path".to_string(),
+            session.to_string_lossy().to_string(),
+            "--json".to_string(),
+            "backend-eval".to_string(),
+            "--candidate".to_string(),
+            "duckdb-duckpgq".to_string(),
+            "--candidate".to_string(),
+            "falkordb".to_string(),
+            "--candidate".to_string(),
+            "ladybug".to_string(),
+            "--candidate".to_string(),
+            "kuzu".to_string(),
+            "--target".to_string(),
+            "gval".to_string(),
+        ]
+    };
+
+    let report = assert_tsift_json(backend_eval_args());
 
     assert_eq!(report["baseline_backend"], "sqlite", "{report}");
     assert_eq!(
@@ -1515,6 +1519,28 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .unwrap()
             .contains("metric-digest --baseline fixtures/graph-db-performance-history.json"),
         "{report}"
+    );
+    let cached_report = assert_tsift_json(backend_eval_args());
+    let cached_source_phase = cached_report["phase_timings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "source_graph_build")
+        .unwrap();
+    assert!(
+        cached_source_phase["detail"]
+            .as_str()
+            .unwrap()
+            .contains("reused current graph.db projection"),
+        "{cached_report}"
+    );
+    assert!(
+        !cached_report["phase_timings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "sqlite_property_row_staging"),
+        "cached backend-eval should skip SQLite row staging: {cached_report}"
     );
 
     let digest_dir = tempfile::tempdir().unwrap();

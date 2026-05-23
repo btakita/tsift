@@ -916,6 +916,26 @@ impl IndexDb {
             .map_err(Into::into)
     }
 
+    pub fn source_snapshot_parts(&self) -> Result<Vec<String>> {
+        let mut parts = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT path, mtime_secs, mtime_nanos, language FROM file_state ORDER BY path",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(format!(
+                "file:{}:{}:{}:{}",
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, u32>(2)?,
+                row.get::<_, String>(3)?
+            ))
+        })?;
+        for row in rows {
+            parts.push(row?);
+        }
+        Ok(parts)
+    }
+
     pub fn symbol_count(&self) -> Result<usize> {
         let count: i64 = self
             .conn
