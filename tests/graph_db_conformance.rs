@@ -1353,6 +1353,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .contains("adaptive"),
         "{report}"
     );
+    assert_eq!(report["config"]["normalization_row_unit"], 1000, "{report}");
     let datasets = report["datasets"].as_array().unwrap();
     assert_eq!(datasets.len(), 3, "{report}");
     assert!(
@@ -1460,6 +1461,14 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         json!(10.0),
         "{report}"
     );
+    assert_eq!(
+        report["performance_gate"]["minimum_sample_runs"], 3,
+        "{report}"
+    );
+    assert_eq!(
+        report["performance_gate"]["normalized_metric_unit"], "duration_micros_per_1k_graph_rows",
+        "{report}"
+    );
     assert!(
         report["performance_gate"]["required_metrics"]
             .as_array()
@@ -1479,6 +1488,15 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "{report}"
     );
     assert!(
+        report["performance_gate"]["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|metric| metric
+                == "real.refresh_phase.source_graph_build.duration_micros_per_1k_graph_rows"),
+        "{report}"
+    );
+    assert!(
         report["metrics"]
             .as_object()
             .unwrap()
@@ -1489,7 +1507,34 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         report["metrics"]
             .as_object()
             .unwrap()
+            .contains_key("real.graph_rows"),
+        "{report}"
+    );
+    assert!(
+        report["metrics"]
+            .as_object()
+            .unwrap()
+            .contains_key("real.sqlite.total_duration_micros_per_1k_graph_rows"),
+        "{report}"
+    );
+    assert!(
+        report["metrics"]
+            .as_object()
+            .unwrap()
+            .contains_key("real.sqlite.evidence.duration_micros_per_1k_graph_rows"),
+        "{report}"
+    );
+    assert!(
+        report["metrics"]
+            .as_object()
+            .unwrap()
             .contains_key("synthetic_deep_chain.sqlite.path_max_hops.duration_micros"),
+        "{report}"
+    );
+    assert!(
+        report["metrics"].as_object().unwrap().contains_key(
+            "synthetic_deep_chain.sqlite.path_max_hops.duration_micros_per_1k_graph_rows"
+        ),
         "{report}"
     );
     assert!(
@@ -1507,6 +1552,12 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "{report}"
     );
     assert!(
+        report["metrics"].as_object().unwrap().contains_key(
+            "real.refresh_phase.source_graph_build.duration_micros_per_1k_graph_rows"
+        ),
+        "{report}"
+    );
+    assert!(
         report["metrics"]
             .as_object()
             .unwrap()
@@ -1518,6 +1569,13 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .as_str()
             .unwrap()
             .contains("metric-digest --baseline fixtures/graph-db-performance-history.json"),
+        "{report}"
+    );
+    assert!(
+        report["performance_gate"]["repeated_sample_command"]
+            .as_str()
+            .unwrap()
+            .contains("for sample in 1 2 3"),
         "{report}"
     );
     let cached_report = assert_tsift_json(backend_eval_args());
@@ -1564,10 +1622,15 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         .collect::<BTreeSet<_>>();
     for metric in [
         "real.sqlite.total_duration_micros",
+        "real.sqlite.total_duration_micros_per_1k_graph_rows",
+        "real.sqlite.evidence.duration_micros_per_1k_graph_rows",
         "real.refresh_phase.sqlite_delta_write.duration_micros",
+        "real.refresh_phase.source_graph_build.duration_micros_per_1k_graph_rows",
         "real.refresh_phase.sqlite_property_row_staging.duration_micros",
         "synthetic_high_degree.sqlite.total_duration_micros",
+        "synthetic_high_degree.sqlite.total_duration_micros_per_1k_graph_rows",
         "synthetic_deep_chain.sqlite.path_max_hops.duration_micros",
+        "synthetic_deep_chain.sqlite.path_max_hops.duration_micros_per_1k_graph_rows",
     ] {
         assert!(
             delta_metrics.contains(metric),

@@ -6714,6 +6714,8 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
 const GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS: usize = 64;
 const GRAPH_DB_BACKEND_EVAL_DIRECT_PATH_HOPS: usize = 1;
 const GRAPH_DB_BACKEND_EVAL_ALLOWED_REGRESSION_PERCENT: f64 = 10.0;
+const GRAPH_DB_BACKEND_EVAL_NORMALIZATION_ROW_UNIT: f64 = 1000.0;
+const GRAPH_DB_BACKEND_EVAL_MIN_SAMPLE_RUNS: usize = 3;
 
 #[derive(Clone, Serialize)]
 struct GraphDbBackendEvalPhaseTiming {
@@ -6735,6 +6737,7 @@ struct GraphDbBackendEvalConfig {
     path_direct_hop_budget: usize,
     path_deep_chain_hop_budget: usize,
     path_probe_strategy: String,
+    normalization_row_unit: usize,
 }
 
 #[derive(Clone)]
@@ -6796,8 +6799,11 @@ struct GraphDbBackendEvalPerformanceGate {
     ci_profile: String,
     opt_in_real_profile: String,
     allowed_regression_percent: f64,
+    minimum_sample_runs: usize,
+    normalized_metric_unit: String,
     required_metrics: Vec<String>,
     digest_command: String,
+    repeated_sample_command: String,
 }
 
 #[derive(Serialize)]
@@ -10589,18 +10595,35 @@ fn graph_db_backend_eval_promotion(
 fn graph_db_backend_eval_metrics(datasets: &[GraphDbBackendEvalDataset]) -> BTreeMap<String, f64> {
     let mut metrics = BTreeMap::new();
     for dataset in datasets {
+        let graph_rows = graph_db_backend_eval_graph_rows(dataset);
         metrics.insert(format!("{}.nodes", dataset.name), dataset.nodes as f64);
         metrics.insert(format!("{}.edges", dataset.name), dataset.edges as f64);
+        metrics.insert(format!("{}.graph_rows", dataset.name), graph_rows as f64);
         for backend in &dataset.backends {
             let prefix = format!("{}.{}", dataset.name, backend.backend.replace('-', "_"));
             metrics.insert(
                 format!("{prefix}.total_duration_micros"),
                 backend.total_micros as f64,
             );
+            append_graph_db_backend_eval_normalized_duration_metric(
+                &mut metrics,
+                &format!("{prefix}.total_duration_micros_per_1k_graph_rows"),
+                backend.total_micros,
+                graph_rows,
+            );
             for operation in &backend.operations {
                 metrics.insert(
                     format!("{prefix}.{}.duration_micros", operation.name),
                     operation.duration_micros as f64,
+                );
+                append_graph_db_backend_eval_normalized_duration_metric(
+                    &mut metrics,
+                    &format!(
+                        "{prefix}.{}.duration_micros_per_1k_graph_rows",
+                        operation.name
+                    ),
+                    operation.duration_micros,
+                    graph_rows,
                 );
                 if let Some(rows) = operation.rows {
                     metrics.insert(format!("{prefix}.{}.rows", operation.name), rows as f64);
@@ -10611,23 +10634,67 @@ fn graph_db_backend_eval_metrics(datasets: &[GraphDbBackendEvalDataset]) -> BTre
     metrics
 }
 
+fn graph_db_backend_eval_graph_rows(dataset: &GraphDbBackendEvalDataset) -> usize {
+    dataset.nodes + dataset.edges
+}
+
+fn append_graph_db_backend_eval_normalized_duration_metric(
+    metrics: &mut BTreeMap<String, f64>,
+    key: &str,
+    duration_micros: u128,
+    graph_rows: usize,
+) {
+    if graph_rows == 0 {
+        return;
+    }
+    metrics.insert(
+        key.to_string(),
+        duration_micros as f64 / graph_rows as f64 * GRAPH_DB_BACKEND_EVAL_NORMALIZATION_ROW_UNIT,
+    );
+}
+
 fn append_graph_db_backend_eval_phase_metrics(
     metrics: &mut BTreeMap<String, f64>,
+    dataset: &str,
+    graph_rows: usize,
     phases: &[GraphDbBackendEvalPhaseTiming],
 ) {
     for phase in phases {
         metrics.insert(
-            format!("real.refresh_phase.{}.duration_micros", phase.name),
+            format!("{dataset}.refresh_phase.{}.duration_micros", phase.name),
             phase.duration_micros as f64,
+        );
+        append_graph_db_backend_eval_normalized_duration_metric(
+            metrics,
+            &format!(
+                "{dataset}.refresh_phase.{}.duration_micros_per_1k_graph_rows",
+                phase.name
+            ),
+            phase.duration_micros,
+            graph_rows,
         );
     }
 }
 
-fn graph_db_backend_eval_metric_digest_command(root: &Path, scope: Option<&str>) -> String {
+fn graph_db_backend_eval_base_command(root: &Path, scope: Option<&str>) -> String {
     format!(
-        "tsift graph-db --path {}{} backend-eval --json | tsift metric-digest --baseline fixtures/graph-db-performance-history.json",
+        "tsift graph-db --path {}{} backend-eval --json",
         shell_quote(root.to_string_lossy().as_ref()),
         graph_db_scope_arg(scope)
+    )
+}
+
+fn graph_db_backend_eval_metric_digest_command(root: &Path, scope: Option<&str>) -> String {
+    format!(
+        "{} | tsift metric-digest --baseline fixtures/graph-db-performance-history.json",
+        graph_db_backend_eval_base_command(root, scope)
+    )
+}
+
+fn graph_db_backend_eval_repeated_sample_command(root: &Path, scope: Option<&str>) -> String {
+    format!(
+        "for sample in 1 2 3; do {}; done | tsift metric-digest --baseline fixtures/graph-db-performance-history.json",
+        graph_db_backend_eval_base_command(root, scope)
     )
 }
 
@@ -10643,17 +10710,27 @@ fn graph_db_backend_eval_performance_gate(
             "real projection metrics require an up-to-date local graph.db and remain opt-in"
                 .to_string(),
         allowed_regression_percent: GRAPH_DB_BACKEND_EVAL_ALLOWED_REGRESSION_PERCENT,
+        minimum_sample_runs: GRAPH_DB_BACKEND_EVAL_MIN_SAMPLE_RUNS,
+        normalized_metric_unit: "duration_micros_per_1k_graph_rows".to_string(),
         required_metrics: vec![
             "real.sqlite.refresh.duration_micros".to_string(),
+            "real.sqlite.refresh.duration_micros_per_1k_graph_rows".to_string(),
+            "real.sqlite.evidence.duration_micros_per_1k_graph_rows".to_string(),
+            "real.sqlite.total_duration_micros_per_1k_graph_rows".to_string(),
+            "real.refresh_phase.source_graph_build.duration_micros_per_1k_graph_rows".to_string(),
             "real.refresh_phase.sqlite_delta_write.duration_micros".to_string(),
             "real.refresh_phase.sqlite_property_row_staging.duration_micros".to_string(),
             "real.sqlite.conflict_matrix.duration_micros".to_string(),
             "real.sqlite.dispatch_trace.duration_micros".to_string(),
             "real.sqlite.path_max_hops.duration_micros".to_string(),
             "synthetic_high_degree.sqlite.total_duration_micros".to_string(),
+            "synthetic_high_degree.sqlite.total_duration_micros_per_1k_graph_rows".to_string(),
             "synthetic_deep_chain.sqlite.path_max_hops.duration_micros".to_string(),
+            "synthetic_deep_chain.sqlite.path_max_hops.duration_micros_per_1k_graph_rows"
+                .to_string(),
         ],
         digest_command: graph_db_backend_eval_metric_digest_command(root, scope),
+        repeated_sample_command: graph_db_backend_eval_repeated_sample_command(root, scope),
     }
 }
 
@@ -10933,7 +11010,14 @@ fn cmd_graph_db_backend_eval(
     let datasets = vec![real_dataset, high_degree_dataset, deep_chain_dataset];
     let promotion = graph_db_backend_eval_promotion(&datasets, &candidates);
     let mut metrics = graph_db_backend_eval_metrics(&datasets);
-    append_graph_db_backend_eval_phase_metrics(&mut metrics, &phase_timings);
+    if let Some(real_dataset) = datasets.iter().find(|dataset| dataset.name == "real") {
+        append_graph_db_backend_eval_phase_metrics(
+            &mut metrics,
+            "real",
+            graph_db_backend_eval_graph_rows(real_dataset),
+            &phase_timings,
+        );
+    }
     let report = GraphDbBackendEvalReport {
         root: root.to_string_lossy().to_string(),
         scope: scope.map(str::to_string),
@@ -10958,6 +11042,7 @@ fn cmd_graph_db_backend_eval(
             path_probe_strategy:
                 "adaptive: use one-hop direct probes for high-degree/direct edges and 64-hop probes for deep-chain coverage"
                     .to_string(),
+            normalization_row_unit: GRAPH_DB_BACKEND_EVAL_NORMALIZATION_ROW_UNIT as usize,
         },
         phase_timings,
         datasets,
@@ -11045,6 +11130,10 @@ fn print_graph_db_backend_eval_human(report: &GraphDbBackendEvalReport) {
         }
     }
     println!("metric-digest: {}", report.metric_digest_command);
+    println!(
+        "repeat-samples: {}",
+        report.performance_gate.repeated_sample_command
+    );
 }
 
 fn cmd_graph_db(
