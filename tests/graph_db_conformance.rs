@@ -1390,6 +1390,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                     "refresh".to_string(),
                     "status".to_string(),
                     "path_max_hops".to_string(),
+                    "evidence_target_resolution".to_string(),
                     "evidence".to_string(),
                     "conflict_matrix".to_string(),
                     "dispatch_trace".to_string(),
@@ -1493,6 +1494,15 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .unwrap()
             .iter()
             .any(|metric| metric
+                == "real.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows"),
+        "{report}"
+    );
+    assert!(
+        report["performance_gate"]["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|metric| metric
                 == "real.refresh_phase.source_graph_build.duration_micros_per_1k_graph_rows"),
         "{report}"
     );
@@ -1528,7 +1538,32 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         report["metrics"]
             .as_object()
             .unwrap()
+            .contains_key("real.sqlite.evidence_target_resolution.duration_micros"),
+        "{report}"
+    );
+    assert!(
+        report["metrics"].as_object().unwrap().contains_key(
+            "real.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows"
+        ),
+        "{report}"
+    );
+    assert!(
+        report["metrics"]
+            .as_object()
+            .unwrap()
             .contains_key("synthetic_deep_chain.sqlite.path_max_hops.duration_micros"),
+        "{report}"
+    );
+    assert!(
+        report["metrics"].as_object().unwrap().contains_key(
+            "synthetic_high_degree.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows"
+        ),
+        "{report}"
+    );
+    assert!(
+        report["metrics"].as_object().unwrap().contains_key(
+            "synthetic_deep_chain.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows"
+        ),
         "{report}"
     );
     assert!(

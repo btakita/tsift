@@ -10157,6 +10157,21 @@ fn graph_db_backend_eval_evidence_signature(report: &GraphDbEvidenceReport) -> s
     })
 }
 
+fn graph_db_backend_eval_target_resolution_signature(
+    resolved: &[(String, SubstrateGraphNode)],
+) -> serde_json::Value {
+    serde_json::json!({
+        "targets": resolved.iter().map(|(target, node)| {
+            serde_json::json!({
+                "target": target,
+                "target_node_id": node.id,
+                "target_kind": node.kind,
+                "target_label": node.label,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
 fn graph_db_backend_eval_conflict_signature(report: &ConflictMatrixReport) -> serde_json::Value {
     serde_json::json!({
         "targets": report.targets,
@@ -10261,27 +10276,41 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
     operations.push(operation);
     signatures.extend(signature);
 
-    let mut graph_prepared_for_report = None;
+    let (operation, signature) = graph_db_backend_eval_timed("evidence_target_resolution", || {
+        let resolved = targets
+            .iter()
+            .map(|target| {
+                let node = graph_db_resolve_evidence_target(store, target)?
+                    .with_context(|| format!("backend-eval target not found: {target}"))?;
+                Ok((target.clone(), node))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let signature = graph_db_backend_eval_target_resolution_signature(&resolved);
+        Ok((Some(resolved.len()), signature))
+    });
+    operations.push(operation);
+    signatures.extend(signature);
+
+    let mut evidence_for_report = None;
     let mut graph_snapshot_for_trace = None;
     let (operation, signature) = graph_db_backend_eval_timed("evidence", || {
-        let graph_prepared = prepare_conflict_matrix_graph_orchestration(
+        let resolved_targets =
+            resolve_conflict_matrix_targets(store, targets, &prepared.context_pack)?;
+        let evidence = collect_conflict_matrix_evidence_packets(
             root,
             scope,
             backend,
-            targets,
-            &prepared.context_pack,
+            &resolved_targets,
             depth,
             limit,
             store,
             freshness.clone(),
         )?;
-        let report = &graph_prepared
-            .evidence
+        let report = &evidence
             .first()
             .context("backend-eval evidence requires at least one target")?
             .report;
-        let rows = graph_prepared
-            .evidence
+        let rows = evidence
             .iter()
             .map(|entry| {
                 entry.report.worker_context.len()
@@ -10291,7 +10320,7 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
             })
             .sum();
         let signature = graph_db_backend_eval_evidence_signature(report);
-        graph_prepared_for_report = Some(graph_prepared);
+        evidence_for_report = Some((resolved_targets, evidence));
         Ok((Some(rows), signature))
     });
     operations.push(operation);
@@ -10299,9 +10328,17 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
 
     let mut conflict_for_trace = None;
     let (operation, signature) = graph_db_backend_eval_timed("conflict_matrix", || {
-        let graph_prepared = match graph_prepared_for_report.take() {
-            Some(graph_prepared) => graph_prepared,
-            None => prepare_conflict_matrix_graph_orchestration(
+        let graph_prepared = if let Some((targets, evidence)) = evidence_for_report.take() {
+            let graph = conflict_matrix_graph_snapshot(store)?;
+            let shared_preparation = conflict_matrix_shared_preparation_summary(&graph, &evidence);
+            ConflictMatrixGraphPreparedInputs {
+                targets,
+                graph,
+                evidence,
+                shared_preparation,
+            }
+        } else {
+            prepare_conflict_matrix_graph_orchestration(
                 root,
                 scope,
                 backend,
@@ -10311,7 +10348,7 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
                 limit,
                 store,
                 freshness.clone(),
-            )?,
+            )?
         };
         let report = build_conflict_matrix_report_from_prepared_graph(
             root,
@@ -10715,6 +10752,7 @@ fn graph_db_backend_eval_performance_gate(
         required_metrics: vec![
             "real.sqlite.refresh.duration_micros".to_string(),
             "real.sqlite.refresh.duration_micros_per_1k_graph_rows".to_string(),
+            "real.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows".to_string(),
             "real.sqlite.evidence.duration_micros_per_1k_graph_rows".to_string(),
             "real.sqlite.total_duration_micros_per_1k_graph_rows".to_string(),
             "real.refresh_phase.source_graph_build.duration_micros_per_1k_graph_rows".to_string(),
@@ -10725,7 +10763,9 @@ fn graph_db_backend_eval_performance_gate(
             "real.sqlite.path_max_hops.duration_micros".to_string(),
             "synthetic_high_degree.sqlite.total_duration_micros".to_string(),
             "synthetic_high_degree.sqlite.total_duration_micros_per_1k_graph_rows".to_string(),
+            "synthetic_high_degree.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows".to_string(),
             "synthetic_deep_chain.sqlite.path_max_hops.duration_micros".to_string(),
+            "synthetic_deep_chain.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows".to_string(),
             "synthetic_deep_chain.sqlite.path_max_hops.duration_micros_per_1k_graph_rows"
                 .to_string(),
         ],
@@ -16965,6 +17005,7 @@ struct ConflictMatrixGraphSnapshot {
     index: ConflictMatrixGraphIndex,
 }
 
+#[derive(Clone)]
 struct ConflictMatrixPreparedEvidence {
     report: GraphDbEvidenceReport,
     summary: ConflictMatrixEvidencePacketSummary,
@@ -17074,30 +17115,30 @@ fn conflict_matrix_shared_preparation_summary(
     }
 }
 
+fn conflict_matrix_graph_snapshot(store: &impl GraphStore) -> Result<ConflictMatrixGraphSnapshot> {
+    let nodes = store.all_nodes()?;
+    let edges = store.all_edges()?;
+    let index = conflict_matrix_graph_index(&nodes);
+    Ok(ConflictMatrixGraphSnapshot {
+        nodes,
+        edges,
+        index,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
-fn prepare_conflict_matrix_graph_orchestration<S: GraphStore>(
+fn collect_conflict_matrix_evidence_packets<S: GraphStore>(
     root: &Path,
     scope: Option<&str>,
     backend: &str,
-    raw_targets: &[String],
-    context_pack: &ContextPackReport,
+    targets: &[String],
     depth: usize,
     limit: usize,
     store: &S,
     freshness: GraphDbFreshnessReport,
-) -> Result<ConflictMatrixGraphPreparedInputs> {
-    let targets = resolve_conflict_matrix_targets(store, raw_targets, context_pack)?;
-    let nodes = store.all_nodes()?;
-    let edges = store.all_edges()?;
-    let index = conflict_matrix_graph_index(&nodes);
-    let graph = ConflictMatrixGraphSnapshot {
-        nodes,
-        edges,
-        index,
-    };
-
+) -> Result<Vec<ConflictMatrixPreparedEvidence>> {
     let mut evidence = Vec::new();
-    for target in &targets {
+    for target in targets {
         let report = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
             root,
             scope,
@@ -17114,6 +17155,26 @@ fn prepare_conflict_matrix_graph_orchestration<S: GraphStore>(
             conflict_matrix_evidence_packet_summary(root, scope, target, depth, limit, &report);
         evidence.push(ConflictMatrixPreparedEvidence { report, summary });
     }
+    Ok(evidence)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_conflict_matrix_graph_orchestration<S: GraphStore>(
+    root: &Path,
+    scope: Option<&str>,
+    backend: &str,
+    raw_targets: &[String],
+    context_pack: &ContextPackReport,
+    depth: usize,
+    limit: usize,
+    store: &S,
+    freshness: GraphDbFreshnessReport,
+) -> Result<ConflictMatrixGraphPreparedInputs> {
+    let targets = resolve_conflict_matrix_targets(store, raw_targets, context_pack)?;
+    let graph = conflict_matrix_graph_snapshot(store)?;
+    let evidence = collect_conflict_matrix_evidence_packets(
+        root, scope, backend, &targets, depth, limit, store, freshness,
+    )?;
     let shared_preparation = conflict_matrix_shared_preparation_summary(&graph, &evidence);
 
     Ok(ConflictMatrixGraphPreparedInputs {
