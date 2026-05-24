@@ -83,8 +83,9 @@ Vela-Engineering/kuzu row prototype, with adaptive 1/64/128/256-hop path probes,
 an opt-in `--full-projection` dataset, split conflict-matrix preparation
 timings/cache keys, per-operation promotion gates, projection
 load/concurrent-writer/install-portability notes, batched context-pack graph
-writes for source/worker context rows, and a `performance_gate`/`metric-digest`
-command for bounded regression review. FalkorDB remains held until a production
+writes for source/worker context rows, compressed full-projection cache footprint
+metrics, and a `performance_gate`/`metric-digest` command for bounded regression
+review. FalkorDB remains held until a production
 adapter beats SQLite across the full-projection promotion gate.
 Use `tsift graph-db doctor` to validate local `graph.db` and Convex snapshot
 metadata before trusting operator handoffs. `tsift traverse --format html`

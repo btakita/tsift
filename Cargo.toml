@@ -13,6 +13,7 @@ categories = ["command-line-utilities", "development-tools"]
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+flate2 = "1"
 fs4 = "0.13"
 ignore = "0.4"
 rusqlite = { version = "0.34", features = ["bundled"] }

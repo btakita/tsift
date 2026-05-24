@@ -2030,6 +2030,10 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         );
     }
     for metric in [
+        "full_projection.cache.hit",
+        "full_projection.cache.disk_bytes",
+        "full_projection.cache.compression_ratio",
+        "full_projection.refresh_phase.cache_lookup.duration_micros",
         "full_projection.refresh_phase.source_graph_build.duration_micros_per_1k_graph_rows",
         "full_projection.refresh_phase.projection_rows.duration_micros_per_1k_graph_rows",
         "full_projection.sqlite.total_duration_micros_per_1k_graph_rows",
@@ -2066,6 +2070,28 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .contains("--full-projection"),
         "{full_projection_report}"
     );
+    assert!(
+        full_projection_report["metrics"]["full_projection.cache.disk_bytes"]
+            .as_f64()
+            .unwrap()
+            > 0.0,
+        "{full_projection_report}"
+    );
+    assert!(
+        full_projection_report["metrics"]["full_projection.cache.compression_ratio"]
+            .as_f64()
+            .unwrap()
+            < 1.0,
+        "{full_projection_report}"
+    );
+    let stale_cache_dir = project
+        .path()
+        .join(".tsift/backend-eval-cache/full_projection");
+    fs::create_dir_all(&stale_cache_dir).unwrap();
+    let stale_legacy_cache = stale_cache_dir.join("pre-fix-stale.json");
+    let stale_compressed_cache = stale_cache_dir.join("pre-fix-stale.json.gz");
+    fs::write(&stale_legacy_cache, "{}").unwrap();
+    fs::write(&stale_compressed_cache, b"not a valid current cache").unwrap();
     let agent_doc_artifact = project
         .path()
         .join(".agent-doc/baselines/generated-session.md");
@@ -2090,6 +2116,38 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             "full_projection.source_graph_build"
         )
         .contains("reused cached full-project source graph"),
+        "{cached_full_projection_report}"
+    );
+    assert!(
+        !stale_legacy_cache.exists() && !stale_compressed_cache.exists(),
+        "full-projection cache hit should prune stale pre-fix artifacts"
+    );
+    let cache_entries = fs::read_dir(&stale_cache_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cache_entries.len(),
+        1,
+        "full-projection cache should keep one source-watermark entry: {cache_entries:?}"
+    );
+    assert!(
+        cache_entries[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".json.gz"),
+        "full-projection cache should store compressed JSON: {cache_entries:?}"
+    );
+    assert_eq!(
+        cached_full_projection_report["metrics"]["full_projection.cache.hit"], 1.0,
+        "{cached_full_projection_report}"
+    );
+    assert!(
+        cached_full_projection_report["metrics"]["full_projection.cache.pruned_files"]
+            .as_f64()
+            .unwrap()
+            >= 2.0,
         "{cached_full_projection_report}"
     );
 

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sift::{SearchInput, SearchOptions, Sift};
@@ -6600,25 +6601,40 @@ struct ExperimentalReadOnlyGraphStore {
     nodes: BTreeMap<String, SubstrateGraphNode>,
     edges: BTreeMap<String, SubstrateGraphEdge>,
     node_ids_by_kind: BTreeMap<String, Vec<String>>,
-    outgoing_edges_by_from: BTreeMap<String, Vec<SubstrateGraphEdge>>,
+    outgoing_edge_keys_by_from: BTreeMap<String, Vec<String>>,
 }
 
 impl ExperimentalReadOnlyGraphStore {
-    fn from_rows(backend: GraphDbExperimentalBackend, rows: ConvexProjectionRows) -> Result<Self> {
-        validate_convex_projection_rows(&rows)?;
+    fn from_rows(backend: GraphDbExperimentalBackend, rows: &ConvexProjectionRows) -> Result<Self> {
+        validate_convex_projection_rows(rows)?;
         let nodes = rows
             .nodes
-            .into_iter()
+            .iter()
             .map(|row| {
-                let node = SubstrateGraphNode::from(row);
+                let node = SubstrateGraphNode {
+                    id: row.external_id.clone(),
+                    kind: row.kind.clone(),
+                    label: row.label.clone(),
+                    properties: row.properties.clone(),
+                    provenance: row.provenance.clone(),
+                    freshness: row.freshness.clone(),
+                };
                 (node.id.clone(), node)
             })
             .collect::<BTreeMap<_, _>>();
         let edges = rows
             .edges
-            .into_iter()
+            .iter()
             .map(|row| {
-                let edge = SubstrateGraphEdge::from(row);
+                let edge = SubstrateGraphEdge {
+                    id: row.edge_key.clone(),
+                    from_id: row.from_external_id.clone(),
+                    to_id: row.to_external_id.clone(),
+                    kind: row.kind.clone(),
+                    properties: row.properties.clone(),
+                    provenance: row.provenance.clone(),
+                    freshness: row.freshness.clone(),
+                };
                 (graph_db_edge_key(&edge), edge)
             })
             .collect::<BTreeMap<_, _>>();
@@ -6632,18 +6648,21 @@ impl ExperimentalReadOnlyGraphStore {
         for ids in node_ids_by_kind.values_mut() {
             ids.sort();
         }
-        let mut outgoing_edges_by_from = BTreeMap::<String, Vec<SubstrateGraphEdge>>::new();
+        let mut outgoing_edge_keys_by_from = BTreeMap::<String, Vec<String>>::new();
         for edge in edges.values() {
-            outgoing_edges_by_from
+            outgoing_edge_keys_by_from
                 .entry(edge.from_id.clone())
                 .or_default()
-                .push(edge.clone());
+                .push(graph_db_edge_key(edge));
         }
-        for edges in outgoing_edges_by_from.values_mut() {
-            edges.sort_by(|left, right| {
+        for edge_keys in outgoing_edge_keys_by_from.values_mut() {
+            edge_keys.sort_by(|left_key, right_key| {
+                let left = &edges[left_key];
+                let right = &edges[right_key];
                 left.to_id
                     .cmp(&right.to_id)
                     .then(left.kind.cmp(&right.kind))
+                    .then(left_key.cmp(right_key))
             });
         }
         Ok(Self {
@@ -6651,7 +6670,7 @@ impl ExperimentalReadOnlyGraphStore {
             nodes,
             edges,
             node_ids_by_kind,
-            outgoing_edges_by_from,
+            outgoing_edge_keys_by_from,
         })
     }
 }
@@ -6753,10 +6772,11 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
 
     fn outgoing_edges(&self, from_id: &str, kind: Option<&str>) -> Result<Vec<SubstrateGraphEdge>> {
         Ok(self
-            .outgoing_edges_by_from
+            .outgoing_edge_keys_by_from
             .get(from_id)
             .into_iter()
             .flatten()
+            .filter_map(|key| self.edges.get(key))
             .filter(|edge| kind.is_none_or(|kind| edge.kind == kind))
             .cloned()
             .collect())
@@ -6897,7 +6917,7 @@ const GRAPH_DB_BACKEND_EVAL_NORMALIZATION_ROW_UNIT: f64 = 1000.0;
 const GRAPH_DB_BACKEND_EVAL_MIN_SAMPLE_RUNS: usize = 3;
 const CONFLICT_MATRIX_PREPARATION_CACHE_VERSION: &str = "conflict-matrix-prep-v1";
 const CONFLICT_MATRIX_GRAPH_PREPARATION_CACHE_VERSION: &str = "conflict-matrix-graph-prep-v1";
-const GRAPH_DB_BACKEND_EVAL_FULL_PROJECTION_CACHE_VERSION: &str = "backend-eval-full-projection-v1";
+const GRAPH_DB_BACKEND_EVAL_FULL_PROJECTION_CACHE_VERSION: &str = "backend-eval-full-projection-v2";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct GraphDbBackendEvalPhaseTiming {
@@ -6913,6 +6933,15 @@ struct GraphDbBackendEvalFullProjectionCache {
     source_watermark: String,
     projection: GraphProjection,
     warnings: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+struct GraphDbBackendEvalFullProjectionCacheStats {
+    hit: bool,
+    disk_bytes: u64,
+    json_bytes: u64,
+    pruned_files: usize,
+    pruned_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -10321,6 +10350,12 @@ fn graph_db_backend_eval_disk_cache_dir(root: &Path) -> PathBuf {
 fn graph_db_backend_eval_disk_cache_path(root: &Path, kind: &str, key: &str) -> PathBuf {
     graph_db_backend_eval_disk_cache_dir(root)
         .join(kind)
+        .join(format!("{key}.json.gz"))
+}
+
+fn graph_db_backend_eval_legacy_disk_cache_path(root: &Path, kind: &str, key: &str) -> PathBuf {
+    graph_db_backend_eval_disk_cache_dir(root)
+        .join(kind)
         .join(format!("{key}.json"))
 }
 
@@ -10328,10 +10363,22 @@ fn graph_db_backend_eval_read_disk_cache<T: for<'de> Deserialize<'de>>(
     root: &Path,
     kind: &str,
     key: &str,
-) -> Option<T> {
+) -> Option<(T, u64, u64)> {
     let path = graph_db_backend_eval_disk_cache_path(root, kind, key);
-    let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    if let Ok(bytes) = fs::read(&path) {
+        let mut decoder = GzDecoder::new(bytes.as_slice());
+        let mut decoded = Vec::new();
+        if decoder.read_to_end(&mut decoded).is_ok()
+            && let Ok(value) = serde_json::from_slice(&decoded)
+        {
+            return Some((value, bytes.len() as u64, decoded.len() as u64));
+        }
+    }
+
+    let legacy_path = graph_db_backend_eval_legacy_disk_cache_path(root, kind, key);
+    let bytes = fs::read(legacy_path).ok()?;
+    let value = serde_json::from_slice(&bytes).ok()?;
+    Some((value, bytes.len() as u64, bytes.len() as u64))
 }
 
 fn graph_db_backend_eval_write_disk_cache<T: Serialize>(
@@ -10339,17 +10386,56 @@ fn graph_db_backend_eval_write_disk_cache<T: Serialize>(
     kind: &str,
     key: &str,
     value: &T,
-) {
+) -> Option<(u64, u64)> {
     let path = graph_db_backend_eval_disk_cache_path(root, kind, key);
     let Some(parent) = path.parent() else {
-        return;
+        return None;
     };
     if fs::create_dir_all(parent).is_err() {
-        return;
+        return None;
     }
-    if let Ok(bytes) = serde_json::to_vec(value) {
-        let _ = fs::write(path, bytes);
+    let bytes = serde_json::to_vec(value).ok()?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    if encoder.write_all(&bytes).is_err() {
+        return None;
     }
+    let encoded = encoder.finish().ok()?;
+    if fs::write(&path, &encoded).is_err() {
+        return None;
+    }
+    Some((encoded.len() as u64, bytes.len() as u64))
+}
+
+fn graph_db_backend_eval_prune_disk_cache(root: &Path, kind: &str, keep_key: &str) -> (usize, u64) {
+    let dir = graph_db_backend_eval_disk_cache_dir(root).join(kind);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let keep_name = format!("{keep_key}.json.gz");
+    let mut pruned_files = 0usize;
+    let mut pruned_bytes = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name == keep_name {
+            continue;
+        }
+        let is_backend_eval_cache = name.ends_with(".json") || name.ends_with(".json.gz");
+        if !is_backend_eval_cache {
+            continue;
+        }
+        let bytes = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        if fs::remove_file(&path).is_ok() {
+            pruned_files += 1;
+            pruned_bytes += bytes;
+        }
+    }
+    (pruned_files, pruned_bytes)
 }
 
 fn graph_db_backend_eval_full_projection_cache_key(
@@ -10358,13 +10444,25 @@ fn graph_db_backend_eval_full_projection_cache_key(
 ) -> Result<(String, String)> {
     let source_watermark = traversal_source_watermark(root, root, scope, false)?
         .unwrap_or_else(|| "unavailable".to_string());
-    let key = content_hash(&serde_json::json!({
-        "version": GRAPH_DB_BACKEND_EVAL_FULL_PROJECTION_CACHE_VERSION,
-        "root": root.display().to_string(),
-        "scope": scope.unwrap_or("root"),
-        "source_watermark": source_watermark,
-    }))?;
+    let key = graph_db_backend_eval_full_projection_cache_key_for_watermark(
+        root,
+        scope,
+        &source_watermark,
+    )?;
     Ok((source_watermark, key))
+}
+
+fn graph_db_backend_eval_full_projection_cache_key_for_watermark(
+    root: &Path,
+    scope: Option<&str>,
+    source_watermark: &str,
+) -> Result<String> {
+    content_hash(&serde_json::json!({
+    "version": GRAPH_DB_BACKEND_EVAL_FULL_PROJECTION_CACHE_VERSION,
+    "root": root.display().to_string(),
+    "scope": scope.unwrap_or("root"),
+    "source_watermark": source_watermark,
+    }))
 }
 
 fn graph_db_backend_eval_full_projection_with_profile(
@@ -10374,16 +10472,26 @@ fn graph_db_backend_eval_full_projection_with_profile(
     GraphProjection,
     Vec<String>,
     Vec<GraphDbBackendEvalPhaseTiming>,
+    GraphDbBackendEvalFullProjectionCacheStats,
 )> {
     let (source_watermark, key) = graph_db_backend_eval_full_projection_cache_key(root, scope)?;
     let lookup_started = Instant::now();
-    if let Some(cached) = graph_db_backend_eval_read_disk_cache::<
+    if let Some((cached, disk_bytes, json_bytes)) = graph_db_backend_eval_read_disk_cache::<
         GraphDbBackendEvalFullProjectionCache,
     >(root, "full_projection", &key)
         && cached.version == GRAPH_DB_BACKEND_EVAL_FULL_PROJECTION_CACHE_VERSION
         && cached.key == key
         && cached.source_watermark == source_watermark
     {
+        let (pruned_files, pruned_bytes) =
+            graph_db_backend_eval_prune_disk_cache(root, "full_projection", &key);
+        let cache_stats = GraphDbBackendEvalFullProjectionCacheStats {
+            hit: true,
+            disk_bytes,
+            json_bytes,
+            pruned_files,
+            pruned_bytes,
+        };
         return Ok((
             cached.projection,
             cached.warnings,
@@ -10391,7 +10499,7 @@ fn graph_db_backend_eval_full_projection_with_profile(
                 graph_db_backend_eval_phase_timing(
                     "full_projection.cache_lookup",
                     lookup_started.elapsed().as_micros(),
-                    "reused opt-in full-project projection rows from .tsift/backend-eval-cache by source watermark",
+                    "reused compressed opt-in full-project projection rows from .tsift/backend-eval-cache by source watermark",
                 ),
                 graph_db_backend_eval_phase_timing(
                     "full_projection.source_graph_build",
@@ -10404,9 +10512,11 @@ fn graph_db_backend_eval_full_projection_with_profile(
                     "reused cached provider-neutral full-project projection rows",
                 ),
             ],
+            cache_stats,
         ));
     }
 
+    let mut cache_stats = GraphDbBackendEvalFullProjectionCacheStats::default();
     let mut phases = vec![graph_db_backend_eval_phase_timing(
         "full_projection.cache_lookup",
         lookup_started.elapsed().as_micros(),
@@ -10425,15 +10535,31 @@ fn graph_db_backend_eval_full_projection_with_profile(
         || traversal_projection_from_graph(root, scope, &full_source),
     )?;
     let warnings = full_source.warnings;
+    let refreshed_source_watermark = traversal_source_watermark(root, root, scope, false)?
+        .unwrap_or_else(|| source_watermark.clone());
+    let write_key = graph_db_backend_eval_full_projection_cache_key_for_watermark(
+        root,
+        scope,
+        &refreshed_source_watermark,
+    )?;
     let cache = GraphDbBackendEvalFullProjectionCache {
         version: GRAPH_DB_BACKEND_EVAL_FULL_PROJECTION_CACHE_VERSION.to_string(),
-        key: key.clone(),
-        source_watermark,
+        key: write_key.clone(),
+        source_watermark: refreshed_source_watermark,
         projection: projection.clone(),
         warnings: warnings.clone(),
     };
-    graph_db_backend_eval_write_disk_cache(root, "full_projection", &key, &cache);
-    Ok((projection, warnings, phases))
+    if let Some((disk_bytes, json_bytes)) =
+        graph_db_backend_eval_write_disk_cache(root, "full_projection", &write_key, &cache)
+    {
+        cache_stats.disk_bytes = disk_bytes;
+        cache_stats.json_bytes = json_bytes;
+    }
+    let (pruned_files, pruned_bytes) =
+        graph_db_backend_eval_prune_disk_cache(root, "full_projection", &write_key);
+    cache_stats.pruned_files = pruned_files;
+    cache_stats.pruned_bytes = pruned_bytes;
+    Ok((projection, warnings, phases, cache_stats))
 }
 
 fn graph_db_backend_eval_timed(
@@ -11339,6 +11465,10 @@ fn graph_db_backend_eval_performance_gate(
     ];
     if full_projection {
         required_metrics.extend([
+            "full_projection.cache.hit".to_string(),
+            "full_projection.cache.disk_bytes".to_string(),
+            "full_projection.cache.compression_ratio".to_string(),
+            "full_projection.refresh_phase.cache_lookup.duration_micros".to_string(),
             "full_projection.sqlite.total_duration_micros_per_1k_graph_rows".to_string(),
             "full_projection.refresh_phase.source_graph_build.duration_micros_per_1k_graph_rows"
                 .to_string(),
@@ -11422,7 +11552,7 @@ fn graph_db_backend_eval_dataset(
     let mut backends = vec![sqlite_report];
     for candidate in candidates {
         let started = Instant::now();
-        let store = ExperimentalReadOnlyGraphStore::from_rows(*candidate, sqlite_rows.clone())?;
+        let store = ExperimentalReadOnlyGraphStore::from_rows(*candidate, &sqlite_rows)?;
         let (candidate_nodes, candidate_edges) = store.graph_counts()?;
         let rows = candidate_nodes + candidate_edges;
         let refresh = graph_db_backend_eval_refresh_operation(
@@ -11650,11 +11780,13 @@ fn cmd_graph_db_backend_eval(
         .collect::<BTreeSet<_>>();
     let mut datasets = vec![real_dataset, high_degree_dataset, deep_chain_dataset];
     let mut full_projection_phase_timings = Vec::new();
+    let mut full_projection_cache_stats = None;
     if full_projection {
-        let (full_projection_rows, full_projection_warnings, full_phases) =
+        let (full_projection_rows, full_projection_warnings, full_phases, cache_stats) =
             graph_db_backend_eval_full_projection_with_profile(&root, scope)?;
         phase_timings.extend(full_phases.clone());
         full_projection_phase_timings = full_phases;
+        full_projection_cache_stats = Some(cache_stats);
         let full_projection_started = Instant::now();
         let mut full_store = SqliteGraphStore::in_memory()?;
         let _full_refresh = full_store.replace_projection_with_version(
@@ -11697,6 +11829,36 @@ fn cmd_graph_db_backend_eval(
     let targets = all_targets.into_iter().collect::<Vec<_>>();
     let promotion = graph_db_backend_eval_promotion(&datasets, &candidates);
     let mut metrics = graph_db_backend_eval_metrics(&datasets);
+    if let Some(cache_stats) = &full_projection_cache_stats {
+        metrics.insert(
+            "full_projection.cache.disk_bytes".to_string(),
+            cache_stats.disk_bytes as f64,
+        );
+        metrics.insert(
+            "full_projection.cache.json_bytes".to_string(),
+            cache_stats.json_bytes as f64,
+        );
+        metrics.insert(
+            "full_projection.cache.compression_ratio".to_string(),
+            if cache_stats.json_bytes == 0 {
+                0.0
+            } else {
+                cache_stats.disk_bytes as f64 / cache_stats.json_bytes as f64
+            },
+        );
+        metrics.insert(
+            "full_projection.cache.hit".to_string(),
+            if cache_stats.hit { 1.0 } else { 0.0 },
+        );
+        metrics.insert(
+            "full_projection.cache.pruned_files".to_string(),
+            cache_stats.pruned_files as f64,
+        );
+        metrics.insert(
+            "full_projection.cache.pruned_bytes".to_string(),
+            cache_stats.pruned_bytes as f64,
+        );
+    }
     if let Some(real_dataset) = datasets.iter().find(|dataset| dataset.name == "real") {
         let real_phase_timings = phase_timings
             .iter()
@@ -12494,6 +12656,9 @@ fn markdown_files_for_traversal(root: &Path, path_hint: &Path) -> Result<Vec<Pat
         let entry =
             result.with_context(|| format!("walking markdown files under {}", root.display()))?;
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        if traversal_path_is_generated_artifact(root, root, entry.path()) {
             continue;
         }
         if entry.path().extension().and_then(|ext| ext.to_str()) == Some("md") {
