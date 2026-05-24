@@ -2066,6 +2066,15 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .contains("--full-projection"),
         "{full_projection_report}"
     );
+    let agent_doc_artifact = project
+        .path()
+        .join(".agent-doc/baselines/generated-session.md");
+    fs::create_dir_all(agent_doc_artifact.parent().unwrap()).unwrap();
+    fs::write(
+        &agent_doc_artifact,
+        "# Generated agent-doc runtime snapshot\n\n<!-- agent:backlog -->\n- [ ] [#noise] Runtime artifact that must not invalidate backend-eval cache.\n<!-- /agent:backlog -->\n",
+    )
+    .unwrap();
     let cached_full_projection_report = assert_tsift_json(full_projection_args);
     assert!(
         phase_detail(

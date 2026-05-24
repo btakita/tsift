@@ -12541,6 +12541,10 @@ fn traversal_relative_path_is_generated_artifact(relative: &str) -> bool {
         || relative.starts_with(".tsift/")
         || relative.ends_with("/.tsift")
         || relative.contains("/.tsift/")
+        || relative == ".agent-doc"
+        || relative.starts_with(".agent-doc/")
+        || relative.ends_with("/.agent-doc")
+        || relative.contains("/.agent-doc/")
         || relative == "target"
         || relative.starts_with("target/")
         || relative.contains("/target/")

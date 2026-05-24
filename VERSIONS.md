@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- Traversal source watermarks now exclude `.agent-doc` runtime markdown snapshots/baselines, preventing backend-eval full-projection and conflict-matrix cache keys from being invalidated by agent-doc closeout artifacts.
 - `graph-db backend-eval` now has an opt-in `--full-projection` dataset, reports 128/256-hop path-tier probes alongside the 64-hop default and one-hop direct probes, and keeps FalkorDB on a hold decision until a production adapter beats SQLite across full-projection conflict-matrix/evidence/dispatch-trace/path/install/lock gates.
 - `conflict-matrix` preparation now exposes split timings for cache lookup, session-review compute, status/index gate, context-pack diff, exploration materialization, graph orchestration, staged diff, and impact, plus source/document/staged-diff keyed `.tsift/conflict-matrix-cache` reuse for prepared context, staged-diff, impact, evidence, and target-scoped graph packets across CLI invocations.
 - Normal `graph-db refresh`, `conflict-matrix`, and `dispatch-trace` now reuse the same source-watermark cached projection path as backend-eval when source inputs are unchanged, and conflict/trace preparation builds target-scoped graph snapshots instead of loading every graph node and edge.
