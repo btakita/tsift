@@ -1881,6 +1881,28 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                 .contains("native_falkordb_projection_load")),
         "{report}"
     );
+    let kuzu_gate = &report["promotion"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|decision| decision["backend"] == "kuzu")
+        .unwrap()["gate"];
+    assert_eq!(
+        kuzu_gate["status"], "hold_native_adapter_required",
+        "{report}"
+    );
+    assert_eq!(kuzu_gate["native_adapter_required"], true, "{report}");
+    assert!(
+        kuzu_gate["required_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check
+                .as_str()
+                .unwrap()
+                .contains("native_kuzu_projection_load")),
+        "{report}"
+    );
     let artifact_file_query = graph_db_json(
         &session,
         Backend::Sqlite,
@@ -1968,7 +1990,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
 
     let mut full_projection_args = backend_eval_args();
     full_projection_args.push("--full-projection".to_string());
-    let full_projection_report = assert_tsift_json(full_projection_args);
+    let full_projection_report = assert_tsift_json(full_projection_args.clone());
     assert_eq!(
         full_projection_report["config"]["full_projection_enabled"], true,
         "{full_projection_report}"
@@ -1980,6 +2002,74 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .iter()
             .any(|dataset| dataset["name"] == "full_projection"),
         "{full_projection_report}"
+    );
+    for phase in [
+        "full_projection.cache_lookup",
+        "full_projection.source_graph_build",
+        "full_projection.projection_rows",
+    ] {
+        assert!(
+            full_projection_report["phase_timings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == phase),
+            "missing phase {phase}: {full_projection_report}"
+        );
+    }
+    for metric in [
+        "full_projection.refresh_phase.source_graph_build.duration_micros_per_1k_graph_rows",
+        "full_projection.refresh_phase.projection_rows.duration_micros_per_1k_graph_rows",
+        "full_projection.sqlite.total_duration_micros_per_1k_graph_rows",
+        "full_projection.sqlite.conflict_matrix.duration_micros",
+        "full_projection.sqlite.dispatch_trace.duration_micros",
+    ] {
+        assert!(
+            full_projection_report["metrics"]
+                .as_object()
+                .unwrap()
+                .contains_key(metric),
+            "full-projection report should include {metric}: {full_projection_report}"
+        );
+        assert!(
+            full_projection_report["performance_gate"]["required_metrics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|required| required == metric),
+            "full-projection performance gate should require {metric}: {full_projection_report}"
+        );
+    }
+    assert!(
+        full_projection_report["metric_digest_command"]
+            .as_str()
+            .unwrap()
+            .contains("--full-projection"),
+        "{full_projection_report}"
+    );
+    assert!(
+        full_projection_report["performance_gate"]["repeated_sample_command"]
+            .as_str()
+            .unwrap()
+            .contains("--full-projection"),
+        "{full_projection_report}"
+    );
+    let cached_full_projection_report = assert_tsift_json(full_projection_args);
+    assert!(
+        phase_detail(
+            &cached_full_projection_report,
+            "full_projection.cache_lookup"
+        )
+        .contains(".tsift/backend-eval-cache"),
+        "second full-projection run should hit the source-watermark cache: {cached_full_projection_report}"
+    );
+    assert!(
+        phase_detail(
+            &cached_full_projection_report,
+            "full_projection.source_graph_build"
+        )
+        .contains("reused cached full-project source graph"),
+        "{cached_full_projection_report}"
     );
 
     let digest_dir = tempfile::tempdir().unwrap();
@@ -2385,6 +2475,23 @@ fn conflict_matrix_cli_composes_planner_evidence_and_worker_ownership() {
     assert_eq!(
         cached_report["inputs"]["shared_preparation"]["evidence_cache_status"], "disk_hit",
         "{cached_report}"
+    );
+
+    let directory_report = assert_tsift_json(vec![
+        "conflict-matrix".to_string(),
+        "--path".to_string(),
+        project.path().to_string_lossy().to_string(),
+        "--json".to_string(),
+        "gval".to_string(),
+    ]);
+    assert_eq!(directory_report["targets"], json!(["gval"]));
+    assert!(
+        directory_report["inputs"]["preparation_cache"]["document_watermark"]
+            .as_str()
+            .unwrap()
+            .len()
+            > 8,
+        "{directory_report}"
     );
 }
 

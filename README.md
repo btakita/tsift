@@ -41,8 +41,8 @@ tsift graph-db --path . evidence cvxa --depth 3 --limit 8 --json
 tsift conflict-matrix --path tasks/software/tsift.md cvxa --json
 tsift dependency-dag --path tasks/software/tsift.md cvxa --json
 tsift graph-db --path . doctor --json
-tsift graph-db --path . backend-eval --candidate kuzu --json
-tsift graph-db --path . backend-eval --json | tsift metric-digest --baseline fixtures/graph-db-performance-history.json
+tsift graph-db --path . --json backend-eval --candidate kuzu
+tsift graph-db --path . --json backend-eval | tsift metric-digest --baseline fixtures/graph-db-performance-history.json
 tsift traverse --path . --format html > traversal.html
 tsift semantic "graph navigation" --path . --kind concept --json
 tsift convex-sync . --chunk-size 100 --json

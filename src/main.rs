@@ -917,6 +917,9 @@ impl GraphDbExperimentalBackend {
             Self::Falkordb => Some(
                 "FalkorDB remains behind backend-eval until a production adapter beats SQLite on full_projection conflict-matrix, evidence, dispatch-trace, path tiers, install portability, and lock behavior",
             ),
+            Self::Kuzu => Some(
+                "Kuzu remains behind backend-eval until a native optional adapter proves projection writes/load, SQLite parity, full_projection wins, install portability, and lock behavior",
+            ),
             _ => None,
         }
     }
@@ -934,6 +937,20 @@ impl GraphDbExperimentalBackend {
                     "multi_process_writer_and_read_only_lock_behavior_match_or_beat_sqlite"
                         .to_string(),
                     "operator_install_cost_keeps_cargo_build_install_service_free_by_default"
+                        .to_string(),
+                ],
+            },
+            Self::Kuzu => GraphDbBackendPromotionGate {
+                status: "hold_native_adapter_required".to_string(),
+                native_adapter_required: true,
+                required_checks: vec![
+                    "native_kuzu_projection_load_writes_provider_neutral_rows_without_sqlite_row_replay"
+                        .to_string(),
+                    "freshness_and_parity_match_sqlite_on_real_and_full_projection_datasets"
+                        .to_string(),
+                    "concurrent_writer_and_read_only_lock_behavior_match_or_beat_sqlite"
+                        .to_string(),
+                    "operator_install_cost_keeps_cargo_build_install_native_kuzu_free_by_default"
                         .to_string(),
                 ],
             },
@@ -6852,12 +6869,22 @@ const GRAPH_DB_BACKEND_EVAL_NORMALIZATION_ROW_UNIT: f64 = 1000.0;
 const GRAPH_DB_BACKEND_EVAL_MIN_SAMPLE_RUNS: usize = 3;
 const CONFLICT_MATRIX_PREPARATION_CACHE_VERSION: &str = "conflict-matrix-prep-v1";
 const CONFLICT_MATRIX_GRAPH_PREPARATION_CACHE_VERSION: &str = "conflict-matrix-graph-prep-v1";
+const GRAPH_DB_BACKEND_EVAL_FULL_PROJECTION_CACHE_VERSION: &str = "backend-eval-full-projection-v1";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct GraphDbBackendEvalPhaseTiming {
     name: String,
     duration_micros: u128,
     detail: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GraphDbBackendEvalFullProjectionCache {
+    version: String,
+    key: String,
+    source_watermark: String,
+    projection: GraphProjection,
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -10259,6 +10286,128 @@ fn graph_db_backend_eval_refresh_with_profile(
     Ok((source_graph, refresh, phases))
 }
 
+fn graph_db_backend_eval_disk_cache_dir(root: &Path) -> PathBuf {
+    root.join(".tsift/backend-eval-cache")
+}
+
+fn graph_db_backend_eval_disk_cache_path(root: &Path, kind: &str, key: &str) -> PathBuf {
+    graph_db_backend_eval_disk_cache_dir(root)
+        .join(kind)
+        .join(format!("{key}.json"))
+}
+
+fn graph_db_backend_eval_read_disk_cache<T: for<'de> Deserialize<'de>>(
+    root: &Path,
+    kind: &str,
+    key: &str,
+) -> Option<T> {
+    let path = graph_db_backend_eval_disk_cache_path(root, kind, key);
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn graph_db_backend_eval_write_disk_cache<T: Serialize>(
+    root: &Path,
+    kind: &str,
+    key: &str,
+    value: &T,
+) {
+    let path = graph_db_backend_eval_disk_cache_path(root, kind, key);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    if let Ok(bytes) = serde_json::to_vec(value) {
+        let _ = fs::write(path, bytes);
+    }
+}
+
+fn graph_db_backend_eval_full_projection_cache_key(
+    root: &Path,
+    scope: Option<&str>,
+) -> Result<(String, String)> {
+    let source_watermark = traversal_source_watermark(root, root, scope, false)?
+        .unwrap_or_else(|| "unavailable".to_string());
+    let key = content_hash(&serde_json::json!({
+        "version": GRAPH_DB_BACKEND_EVAL_FULL_PROJECTION_CACHE_VERSION,
+        "root": root.display().to_string(),
+        "scope": scope.unwrap_or("root"),
+        "source_watermark": source_watermark,
+    }))?;
+    Ok((source_watermark, key))
+}
+
+fn graph_db_backend_eval_full_projection_with_profile(
+    root: &Path,
+    scope: Option<&str>,
+) -> Result<(
+    GraphProjection,
+    Vec<String>,
+    Vec<GraphDbBackendEvalPhaseTiming>,
+)> {
+    let (source_watermark, key) = graph_db_backend_eval_full_projection_cache_key(root, scope)?;
+    let lookup_started = Instant::now();
+    if let Some(cached) = graph_db_backend_eval_read_disk_cache::<
+        GraphDbBackendEvalFullProjectionCache,
+    >(root, "full_projection", &key)
+        && cached.version == GRAPH_DB_BACKEND_EVAL_FULL_PROJECTION_CACHE_VERSION
+        && cached.key == key
+        && cached.source_watermark == source_watermark
+    {
+        return Ok((
+            cached.projection,
+            cached.warnings,
+            vec![
+                graph_db_backend_eval_phase_timing(
+                    "full_projection.cache_lookup",
+                    lookup_started.elapsed().as_micros(),
+                    "reused opt-in full-project projection rows from .tsift/backend-eval-cache by source watermark",
+                ),
+                graph_db_backend_eval_phase_timing(
+                    "full_projection.source_graph_build",
+                    0,
+                    "reused cached full-project source graph; skipped code-index loading, session markdown scanning, source-handle construction, and semantic summary reads",
+                ),
+                graph_db_backend_eval_phase_timing(
+                    "full_projection.projection_rows",
+                    0,
+                    "reused cached provider-neutral full-project projection rows",
+                ),
+            ],
+        ));
+    }
+
+    let mut phases = vec![graph_db_backend_eval_phase_timing(
+        "full_projection.cache_lookup",
+        lookup_started.elapsed().as_micros(),
+        "no full-project projection cache entry matched the source watermark",
+    )];
+    let full_source = graph_db_backend_eval_timed_phase(
+        &mut phases,
+        "full_projection.source_graph_build",
+        "opt-in full-project source graph build; uses the project root as the path hint so bounded session projections cannot hide full-graph regressions",
+        || build_traversal_graph_source_with_options(root, root, scope, false),
+    )?;
+    let projection = graph_db_backend_eval_timed_phase(
+        &mut phases,
+        "full_projection.projection_rows",
+        "provider-neutral row construction for the opt-in full-project projection dataset",
+        || traversal_projection_from_graph(root, scope, &full_source),
+    )?;
+    let warnings = full_source.warnings;
+    let cache = GraphDbBackendEvalFullProjectionCache {
+        version: GRAPH_DB_BACKEND_EVAL_FULL_PROJECTION_CACHE_VERSION.to_string(),
+        key: key.clone(),
+        source_watermark,
+        projection: projection.clone(),
+        warnings: warnings.clone(),
+    };
+    graph_db_backend_eval_write_disk_cache(root, "full_projection", &key, &cache);
+    Ok((projection, warnings, phases))
+}
+
 fn graph_db_backend_eval_timed(
     name: &str,
     run: impl FnOnce() -> Result<(Option<usize>, serde_json::Value)>,
@@ -11090,32 +11239,99 @@ fn append_graph_db_backend_eval_phase_metrics(
     }
 }
 
-fn graph_db_backend_eval_base_command(root: &Path, scope: Option<&str>) -> String {
+fn graph_db_backend_eval_base_command(
+    root: &Path,
+    scope: Option<&str>,
+    full_projection: bool,
+) -> String {
+    let full_projection_arg = if full_projection {
+        " --full-projection"
+    } else {
+        ""
+    };
     format!(
-        "tsift graph-db --path {}{} backend-eval --json",
+        "tsift graph-db --path {}{} --json backend-eval{}",
         shell_quote(root.to_string_lossy().as_ref()),
-        graph_db_scope_arg(scope)
+        graph_db_scope_arg(scope),
+        full_projection_arg
     )
 }
 
-fn graph_db_backend_eval_metric_digest_command(root: &Path, scope: Option<&str>) -> String {
+fn graph_db_backend_eval_metric_digest_command(
+    root: &Path,
+    scope: Option<&str>,
+    full_projection: bool,
+) -> String {
     format!(
         "{} | tsift metric-digest --baseline fixtures/graph-db-performance-history.json",
-        graph_db_backend_eval_base_command(root, scope)
+        graph_db_backend_eval_base_command(root, scope, full_projection)
     )
 }
 
-fn graph_db_backend_eval_repeated_sample_command(root: &Path, scope: Option<&str>) -> String {
+fn graph_db_backend_eval_repeated_sample_command(
+    root: &Path,
+    scope: Option<&str>,
+    full_projection: bool,
+) -> String {
     format!(
         "for sample in 1 2 3; do {}; done | tsift metric-digest --baseline fixtures/graph-db-performance-history.json",
-        graph_db_backend_eval_base_command(root, scope)
+        graph_db_backend_eval_base_command(root, scope, full_projection)
     )
 }
 
 fn graph_db_backend_eval_performance_gate(
     root: &Path,
     scope: Option<&str>,
+    full_projection: bool,
 ) -> GraphDbBackendEvalPerformanceGate {
+    let mut required_metrics = vec![
+        "real.sqlite.refresh.duration_micros".to_string(),
+        "real.sqlite.refresh.duration_micros_per_1k_graph_rows".to_string(),
+        "real.sqlite.edge_lookup.duration_micros_per_1k_graph_rows".to_string(),
+        "real.sqlite.edge_property_scan.duration_micros_per_1k_graph_rows".to_string(),
+        "real.sqlite.incident_edges.duration_micros_per_1k_graph_rows".to_string(),
+        "real.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows".to_string(),
+        "real.sqlite.evidence.duration_micros_per_1k_graph_rows".to_string(),
+        "real.sqlite.total_duration_micros_per_1k_graph_rows".to_string(),
+        "real.refresh_phase.source_graph_build.duration_micros_per_1k_graph_rows".to_string(),
+        "real.refresh_phase.sqlite_delta_write.duration_micros".to_string(),
+        "real.refresh_phase.sqlite_property_row_staging.duration_micros".to_string(),
+        "real.refresh_phase.sqlite_edge_property_row_staging.duration_micros".to_string(),
+        "real.sqlite.conflict_matrix.duration_micros".to_string(),
+        "real.sqlite.dispatch_trace.duration_micros".to_string(),
+        "real.sqlite.path_max_hops.duration_micros".to_string(),
+        "synthetic_high_degree.sqlite.total_duration_micros".to_string(),
+        "synthetic_high_degree.sqlite.total_duration_micros_per_1k_graph_rows".to_string(),
+        "synthetic_high_degree.sqlite.edge_property_scan.duration_micros_per_1k_graph_rows"
+            .to_string(),
+        "synthetic_high_degree.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows"
+            .to_string(),
+        "synthetic_deep_chain.sqlite.incident_edges.duration_micros_per_1k_graph_rows".to_string(),
+        "synthetic_deep_chain.sqlite.path_max_hops.duration_micros".to_string(),
+        "synthetic_deep_chain.sqlite.path_max_hops_128.duration_micros".to_string(),
+        "synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros".to_string(),
+        "synthetic_deep_chain.sqlite.path_max_hops_512.duration_micros".to_string(),
+        "synthetic_deep_chain.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows"
+            .to_string(),
+        "synthetic_deep_chain.sqlite.path_max_hops.duration_micros_per_1k_graph_rows".to_string(),
+        "synthetic_deep_chain.sqlite.path_max_hops_128.duration_micros_per_1k_graph_rows"
+            .to_string(),
+        "synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros_per_1k_graph_rows"
+            .to_string(),
+        "synthetic_deep_chain.sqlite.path_max_hops_512.duration_micros_per_1k_graph_rows"
+            .to_string(),
+    ];
+    if full_projection {
+        required_metrics.extend([
+            "full_projection.sqlite.total_duration_micros_per_1k_graph_rows".to_string(),
+            "full_projection.refresh_phase.source_graph_build.duration_micros_per_1k_graph_rows"
+                .to_string(),
+            "full_projection.refresh_phase.projection_rows.duration_micros_per_1k_graph_rows"
+                .to_string(),
+            "full_projection.sqlite.conflict_matrix.duration_micros".to_string(),
+            "full_projection.sqlite.dispatch_trace.duration_micros".to_string(),
+        ]);
+    }
     GraphDbBackendEvalPerformanceGate {
         baseline_fixture: "fixtures/graph-db-performance-history.json".to_string(),
         ci_profile: "synthetic_high_degree + synthetic_deep_chain metrics are CI-safe and bounded"
@@ -11126,43 +11342,13 @@ fn graph_db_backend_eval_performance_gate(
         allowed_regression_percent: GRAPH_DB_BACKEND_EVAL_ALLOWED_REGRESSION_PERCENT,
         minimum_sample_runs: GRAPH_DB_BACKEND_EVAL_MIN_SAMPLE_RUNS,
         normalized_metric_unit: "duration_micros_per_1k_graph_rows".to_string(),
-        required_metrics: vec![
-            "real.sqlite.refresh.duration_micros".to_string(),
-            "real.sqlite.refresh.duration_micros_per_1k_graph_rows".to_string(),
-            "real.sqlite.edge_lookup.duration_micros_per_1k_graph_rows".to_string(),
-            "real.sqlite.edge_property_scan.duration_micros_per_1k_graph_rows".to_string(),
-            "real.sqlite.incident_edges.duration_micros_per_1k_graph_rows".to_string(),
-            "real.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows".to_string(),
-            "real.sqlite.evidence.duration_micros_per_1k_graph_rows".to_string(),
-            "real.sqlite.total_duration_micros_per_1k_graph_rows".to_string(),
-            "real.refresh_phase.source_graph_build.duration_micros_per_1k_graph_rows".to_string(),
-            "real.refresh_phase.sqlite_delta_write.duration_micros".to_string(),
-            "real.refresh_phase.sqlite_property_row_staging.duration_micros".to_string(),
-            "real.refresh_phase.sqlite_edge_property_row_staging.duration_micros".to_string(),
-            "real.sqlite.conflict_matrix.duration_micros".to_string(),
-            "real.sqlite.dispatch_trace.duration_micros".to_string(),
-            "real.sqlite.path_max_hops.duration_micros".to_string(),
-            "synthetic_high_degree.sqlite.total_duration_micros".to_string(),
-            "synthetic_high_degree.sqlite.total_duration_micros_per_1k_graph_rows".to_string(),
-            "synthetic_high_degree.sqlite.edge_property_scan.duration_micros_per_1k_graph_rows".to_string(),
-            "synthetic_high_degree.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows".to_string(),
-            "synthetic_deep_chain.sqlite.incident_edges.duration_micros_per_1k_graph_rows".to_string(),
-            "synthetic_deep_chain.sqlite.path_max_hops.duration_micros".to_string(),
-            "synthetic_deep_chain.sqlite.path_max_hops_128.duration_micros".to_string(),
-            "synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros".to_string(),
-            "synthetic_deep_chain.sqlite.path_max_hops_512.duration_micros".to_string(),
-            "synthetic_deep_chain.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows".to_string(),
-            "synthetic_deep_chain.sqlite.path_max_hops.duration_micros_per_1k_graph_rows"
-                .to_string(),
-            "synthetic_deep_chain.sqlite.path_max_hops_128.duration_micros_per_1k_graph_rows"
-                .to_string(),
-            "synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros_per_1k_graph_rows"
-                .to_string(),
-            "synthetic_deep_chain.sqlite.path_max_hops_512.duration_micros_per_1k_graph_rows"
-                .to_string(),
-        ],
-        digest_command: graph_db_backend_eval_metric_digest_command(root, scope),
-        repeated_sample_command: graph_db_backend_eval_repeated_sample_command(root, scope),
+        required_metrics,
+        digest_command: graph_db_backend_eval_metric_digest_command(root, scope, full_projection),
+        repeated_sample_command: graph_db_backend_eval_repeated_sample_command(
+            root,
+            scope,
+            full_projection,
+        ),
     }
 }
 
@@ -11447,19 +11633,12 @@ fn cmd_graph_db_backend_eval(
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut datasets = vec![real_dataset, high_degree_dataset, deep_chain_dataset];
+    let mut full_projection_phase_timings = Vec::new();
     if full_projection {
-        let full_source = graph_db_backend_eval_timed_phase(
-            &mut phase_timings,
-            "full_projection.source_graph_build",
-            "opt-in full-project source graph build; uses the project root as the path hint so bounded session projections cannot hide full-graph regressions",
-            || build_traversal_graph_source_with_options(&root, &root, scope, false),
-        )?;
-        let full_projection_rows = graph_db_backend_eval_timed_phase(
-            &mut phase_timings,
-            "full_projection.projection_rows",
-            "provider-neutral row construction for the opt-in full-project projection dataset",
-            || traversal_projection_from_graph(&root, scope, &full_source),
-        )?;
+        let (full_projection_rows, full_projection_warnings, full_phases) =
+            graph_db_backend_eval_full_projection_with_profile(&root, scope)?;
+        phase_timings.extend(full_phases.clone());
+        full_projection_phase_timings = full_phases;
         let full_projection_started = Instant::now();
         let mut full_store = SqliteGraphStore::in_memory()?;
         let _full_refresh = full_store.replace_projection_with_version(
@@ -11495,7 +11674,7 @@ fn cmd_graph_db_backend_eval(
             full_freshness,
             full_refresh,
             full_rows,
-            full_source.warnings,
+            full_projection_warnings,
             &prepared,
         )?);
     }
@@ -11503,11 +11682,37 @@ fn cmd_graph_db_backend_eval(
     let promotion = graph_db_backend_eval_promotion(&datasets, &candidates);
     let mut metrics = graph_db_backend_eval_metrics(&datasets);
     if let Some(real_dataset) = datasets.iter().find(|dataset| dataset.name == "real") {
+        let real_phase_timings = phase_timings
+            .iter()
+            .filter(|phase| !phase.name.starts_with("full_projection."))
+            .cloned()
+            .collect::<Vec<_>>();
         append_graph_db_backend_eval_phase_metrics(
             &mut metrics,
             "real",
             graph_db_backend_eval_graph_rows(real_dataset),
-            &phase_timings,
+            &real_phase_timings,
+        );
+    }
+    if let Some(full_dataset) = datasets
+        .iter()
+        .find(|dataset| dataset.name == "full_projection")
+    {
+        let normalized_full_projection_phases = full_projection_phase_timings
+            .iter()
+            .filter_map(|phase| {
+                Some(GraphDbBackendEvalPhaseTiming {
+                    name: phase.name.strip_prefix("full_projection.")?.to_string(),
+                    duration_micros: phase.duration_micros,
+                    detail: phase.detail.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        append_graph_db_backend_eval_phase_metrics(
+            &mut metrics,
+            "full_projection",
+            graph_db_backend_eval_graph_rows(full_dataset),
+            &normalized_full_projection_phases,
         );
     }
     let report = GraphDbBackendEvalReport {
@@ -11551,9 +11756,13 @@ fn cmd_graph_db_backend_eval(
         phase_timings,
         datasets,
         promotion,
-        performance_gate: graph_db_backend_eval_performance_gate(&root, scope),
+        performance_gate: graph_db_backend_eval_performance_gate(&root, scope, full_projection),
         metrics,
-        metric_digest_command: graph_db_backend_eval_metric_digest_command(&root, scope),
+        metric_digest_command: graph_db_backend_eval_metric_digest_command(
+            &root,
+            scope,
+            full_projection,
+        ),
         warnings: Vec::new(),
     };
 
@@ -11577,7 +11786,7 @@ fn cmd_graph_db_backend_eval(
             false,
             vec![
                 format!(
-                    "Re-run with `tsift graph-db --path {} backend-eval --json --target <id>` after adding a production candidate adapter",
+                    "Re-run with `tsift graph-db --path {} --json backend-eval --target <id>` after adding a production candidate adapter",
                     shell_quote(root.to_string_lossy().as_ref())
                 ),
                 report.metric_digest_command.clone(),
@@ -17649,6 +17858,12 @@ fn conflict_matrix_write_disk_cache<T: Serialize>(root: &Path, kind: &str, key: 
 }
 
 fn conflict_matrix_document_watermark(path: &Path) -> Result<String> {
+    if path.is_dir() {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        return Ok(hash_bytes_hex(
+            format!("directory:{}", canonical.display()).as_bytes(),
+        ));
+    }
     let bytes = fs::read(path)
         .with_context(|| format!("reading conflict-matrix document {}", path.display()))?;
     Ok(hash_bytes_hex(&bytes))
