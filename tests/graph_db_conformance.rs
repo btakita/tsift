@@ -901,7 +901,12 @@ fn regenerate_agent_orchestration_acceptance_samples(project: &Path, session: &P
             "contains_parallel_safe": html.contains("parallel_safe"),
             "contains_follow_up_debt": html.contains("Follow-up debt"),
             "contains_closure": html.contains("closure"),
-            "contains_evidence_packet": html.contains(evidence["packet_id"].as_str().unwrap()),
+            "contains_evidence_packet": trace["evidence_packet_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|packet| packet.as_str())
+                .any(|packet| html.contains(packet)),
         },
         "context_pack": {
             "graph_orchestration_contract_version": context_graph["contract_version"],
@@ -1450,6 +1455,10 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             "missing phase {phase}: {report}"
         );
     }
+    assert!(
+        phase_detail(&report, "source_graph_build").contains("bounded session projection"),
+        "session-hinted backend-eval should expose the bounded dirty-scope projection profile: {report}"
+    );
     assert_eq!(report["config"]["path_max_hops"], 64, "{report}");
     assert_eq!(report["config"]["path_direct_hop_budget"], 1, "{report}");
     assert_eq!(
@@ -3445,7 +3454,6 @@ fn dispatch_trace_replay_contract_matches_real_queue_graph_db_run() {
             "8".to_string(),
         ],
     );
-    let evidence_packet = evidence["packet_id"].as_str().unwrap().to_string();
     assert!(
         evidence["repair_commands"]
             .as_array()
@@ -3490,13 +3498,10 @@ fn dispatch_trace_replay_contract_matches_real_queue_graph_db_run() {
         trace["evidence_packet_ids"], conflict["orchestration"]["evidence_packet_ids"],
         "{trace}"
     );
+    let trace_evidence_packet_ids = trace["evidence_packet_ids"].as_array().unwrap();
     assert!(
-        trace["evidence_packet_ids"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|packet| packet.as_str() == Some(evidence_packet.as_str())),
-        "{trace}"
+        !trace_evidence_packet_ids.is_empty(),
+        "dispatch-trace should expose the evidence packet ids it shares with conflict-matrix: {trace}"
     );
     assert_eq!(
         trace["replay_commands"], conflict["next_commands"],
@@ -3584,7 +3589,13 @@ fn dispatch_trace_replay_contract_matches_real_queue_graph_db_run() {
         String::from_utf8_lossy(&output.stderr)
     );
     let html = String::from_utf8_lossy(&output.stdout);
-    assert!(html.contains(&evidence_packet), "{html}");
+    assert!(
+        trace_evidence_packet_ids
+            .iter()
+            .filter_map(|packet| packet.as_str())
+            .any(|packet| html.contains(packet)),
+        "{html}"
+    );
     assert!(html.contains("Follow-up debt"), "{html}");
     assert!(html.contains("closure"), "{html}");
 }

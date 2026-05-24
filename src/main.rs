@@ -10300,10 +10300,15 @@ fn graph_db_backend_eval_refresh_with_profile(
     }
 
     let mut phases = Vec::new();
+    let source_graph_detail = if hinted_markdown_file(root, path_hint).is_some() {
+        "bounded session projection: index/source loading plus agent-doc session markdown scan, source-handle construction, and semantic summary reads; skips global call-edge materialization because full-projection is the complete-call-graph regression guard"
+    } else {
+        "index/source loading plus agent-doc session markdown scan, source-handle construction, and semantic summary reads when summaries are cached"
+    };
     let source_graph = graph_db_backend_eval_timed_phase(
         &mut phases,
         "source_graph_build",
-        "index/source loading plus agent-doc session markdown scan, source-handle construction, and semantic summary reads when summaries are cached",
+        source_graph_detail,
         || build_traversal_graph_source_with_options(root, path_hint, scope, false),
     )?;
     let projection = graph_db_backend_eval_timed_phase(
@@ -10388,9 +10393,7 @@ fn graph_db_backend_eval_write_disk_cache<T: Serialize>(
     value: &T,
 ) -> Option<(u64, u64)> {
     let path = graph_db_backend_eval_disk_cache_path(root, kind, key);
-    let Some(parent) = path.parent() else {
-        return None;
-    };
+    let parent = path.parent()?;
     if fs::create_dir_all(parent).is_err() {
         return None;
     }
@@ -13157,6 +13160,9 @@ fn graph_fallback_source_root(root: &Path, path_hint: &Path, scope: Option<&str>
     if let Ok(Some(scope)) = config::Config::infer_submodule_from_path(root, path_hint) {
         return scope.source_root;
     }
+    if let Ok(Some(scope)) = infer_agent_doc_task_submodule(root, path_hint) {
+        return scope.source_root;
+    }
     root.to_path_buf()
 }
 
@@ -13272,6 +13278,7 @@ fn build_traversal_graph_source_with_options(
     let mut symbol_entries = Vec::new();
     let mut file_entries = Vec::new();
     let mut route_entries = Vec::new();
+    let bounded_session_projection = hinted_markdown_file(root, path_hint).is_some();
     if !session_only || hinted_markdown_file(root, path_hint).is_none() {
         let gate = prepare_agent_doc_index_gate(root, path_hint, scope, "graph traversal packet");
         graph.warnings.extend(gate.diagnostics);
@@ -13339,23 +13346,26 @@ fn build_traversal_graph_source_with_options(
                     symbol_entries.push(entry);
                 }
 
-                for edge in db.all_stored_edges()? {
-                    if traversal_path_is_generated_artifact(
-                        root,
-                        &gate.source_root,
-                        Path::new(&edge.caller_file),
-                    ) {
-                        continue;
-                    }
-                    let caller_file = relativize(&edge.caller_file, root);
-                    let caller_key =
-                        format!("{caller_file}:{}:{}", edge.caller_line, edge.caller_name);
-                    let Some(caller_handle) = symbol_by_file_name_line.get(&caller_key).cloned()
-                    else {
-                        continue;
-                    };
-                    let callee_handle =
-                        if let Some(handle) = first_symbol_by_name.get(&edge.callee_name) {
+                if !bounded_session_projection {
+                    for edge in db.all_stored_edges()? {
+                        if traversal_path_is_generated_artifact(
+                            root,
+                            &gate.source_root,
+                            Path::new(&edge.caller_file),
+                        ) {
+                            continue;
+                        }
+                        let caller_file = relativize(&edge.caller_file, root);
+                        let caller_key =
+                            format!("{caller_file}:{}:{}", edge.caller_line, edge.caller_name);
+                        let Some(caller_handle) =
+                            symbol_by_file_name_line.get(&caller_key).cloned()
+                        else {
+                            continue;
+                        };
+                        let callee_handle = if let Some(handle) =
+                            first_symbol_by_name.get(&edge.callee_name)
+                        {
                             handle.clone()
                         } else {
                             let node = traversal_unresolved_symbol_node(root, &edge.callee_name);
@@ -13363,13 +13373,14 @@ fn build_traversal_graph_source_with_options(
                             graph.add_node(node);
                             handle
                         };
-                    graph.add_edge(
-                        &caller_handle,
-                        &callee_handle,
-                        "calls",
-                        Some(format!("call site {}:{}", caller_file, edge.call_site_line)),
-                        1,
-                    );
+                        graph.add_edge(
+                            &caller_handle,
+                            &callee_handle,
+                            "calls",
+                            Some(format!("call site {}:{}", caller_file, edge.call_site_line)),
+                            1,
+                        );
+                    }
                 }
 
                 for route in db.all_routes()? {
@@ -24291,6 +24302,17 @@ fn resolve_search_index_targets(
         }]);
     }
 
+    if let Some(scope) = infer_agent_doc_task_submodule(root, path_hint)? {
+        let cfg = config::Config::load(root)?;
+        return Ok(vec![SearchIndexTarget {
+            label: format!("submodule `{}` index", scope.id),
+            db_path: cfg.db_path_for(root, &scope.id),
+            source_root: scope.source_root.clone(),
+            scope_name: Some(scope.id.clone()),
+            reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
+        }]);
+    }
+
     let scopes = config::Config::submodule_dirs(root)?;
     if !scopes.is_empty() {
         let root_db = root.join(".tsift/index.db");
@@ -24384,6 +24406,31 @@ fn is_active_writer_lock_error(err: &anyhow::Error) -> bool {
             .to_string()
             .contains("another tsift index writer is already active")
     })
+}
+
+fn infer_agent_doc_task_submodule(
+    root: &Path,
+    path_hint: &Path,
+) -> Result<Option<config::WorkspaceScope>> {
+    let hinted_path = if path_hint.is_absolute() {
+        path_hint.to_path_buf()
+    } else {
+        root.join(path_hint)
+    };
+    let Ok(relative) = hinted_path.strip_prefix(root) else {
+        return Ok(None);
+    };
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(first)) = components.next() else {
+        return Ok(None);
+    };
+    if first != "tasks" {
+        return Ok(None);
+    }
+    let Some(file_stem) = relative.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(None);
+    };
+    config::Config::find_submodule(root, file_stem)
 }
 
 fn degraded_search_target(
@@ -27567,6 +27614,54 @@ agent_doc_format: template
         assert!(graph.edges.iter().any(|edge| {
             edge.from == backlog.handle && edge.to == helper.handle && edge.relation == "mentions"
         }));
+    }
+
+    #[test]
+    fn session_hinted_traversal_skips_global_call_edges() {
+        let dir = setup_traversal_project();
+        let session = dir.path().join("tasks/software/tsift.md");
+        let bounded = build_traversal_graph_source(dir.path(), &session, None).unwrap();
+        let backlog = resolve_traversal_node(&bounded, "#kgnv").unwrap();
+        let helper = resolve_traversal_node(&bounded, "helper").unwrap();
+
+        assert!(bounded.edges.iter().any(|edge| {
+            edge.from == backlog.handle && edge.to == helper.handle && edge.relation == "mentions"
+        }));
+        assert!(
+            !bounded.edges.iter().any(|edge| edge.relation == "calls"),
+            "session-hinted graph-db projections should not materialize unrelated global call edges"
+        );
+
+        let full = build_traversal_graph_source(dir.path(), dir.path(), None).unwrap();
+        assert!(
+            full.edges.iter().any(|edge| edge.relation == "calls"),
+            "root/full projections still carry the complete indexed call graph"
+        );
+    }
+
+    #[test]
+    fn agent_doc_task_path_infers_matching_workspace_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/tsift")).unwrap();
+        std::fs::create_dir_all(dir.path().join("tasks/software")).unwrap();
+        std::fs::write(
+            dir.path().join(".gitmodules"),
+            "[submodule \"src/tsift\"]\n\tpath = src/tsift\n\turl = https://example.invalid/tsift.git\n",
+        )
+        .unwrap();
+        let task = dir.path().join("tasks/software/tsift.md");
+        std::fs::write(&task, "# tsift\n").unwrap();
+
+        let targets = resolve_search_index_targets(dir.path(), &task, None, false).unwrap();
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].scope_name.as_deref(), Some("tsift"));
+        assert_eq!(targets[0].source_root, dir.path().join("src/tsift"));
+        assert!(
+            targets[0]
+                .db_path
+                .ends_with(".tsift/indexes/tsift/index.db")
+        );
     }
 
     #[test]
