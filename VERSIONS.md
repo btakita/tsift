@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.45
+
+- `status_index_gate` is decomposed into three sub-phases reported as `conflict_matrix_preparation.status_index_gate.{prepare_agent_doc_index_gate, context_pack_status_reminders, load_tag_ontology_preview_context}`. Three-sample medians on agent-loop confirm `prepare_agent_doc_index_gate` (422 ms, 62%) and `context_pack_status_reminders` (266 ms, 39%) split the cost; ontology loading is effectively free. New `prepare_agent_doc_index_gate_cached` wraps the gate behind an in-process `(root, path_hint, scope, packet_label)` cache so repeated invocations within the same process — daemon use cases, tests, traversal+context-pack pipelines — reuse the inspection result. Single-shot CLI flows do not benefit yet because each helper currently fires only once per `backend-eval` pipeline; the cold-path inspection cost stays owned by future work. Cache-hit reports surface the new sub-phases as `0us` with the source/document/staged-diff watermark detail. Conformance suite asserts the sub-phases exist on cold runs.
+
 ## 0.1.44
 
 - `session_review` discovery now stat-walks Claude JSONL and Codex JSONL directories and only reads content for at most `MAX_RECENT_CANDIDATES_PER_SOURCE=64` newest files per source, and the per-file read is header-gated: a `BufReader` extracts the harness-specific `cwd` from the first 256 KB so files whose cwd does not match the target are skipped before any full read. Measured against agent-loop's ~2 GB / 2323-file Codex history and ~1.5 K Claude sessions, `conflict_matrix_preparation.session_review_compute.session_discovery` median drops from 3562 ms to 154 ms (-96%), `session_review_compute` parent drops from 3719 ms to 272 ms (-93%), and `conflict_matrix_preparation` overall drops from 5888 ms to 2148 ms (-64%), measured with `tsift graph-db --json backend-eval` three-sample medians on agent-loop using the new 0.1.43 sub-phase timers.

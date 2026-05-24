@@ -13133,10 +13133,58 @@ fn load_agent_doc_traversal_nodes(
 }
 
 #[derive(Debug)]
+#[derive(Clone)]
 struct AgentDocIndexGate {
     db_path: Option<PathBuf>,
     source_root: PathBuf,
     diagnostics: Vec<String>,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct AgentDocIndexGateCacheKey {
+    root: PathBuf,
+    path_hint: PathBuf,
+    scope: Option<String>,
+    packet_label: String,
+}
+
+fn agent_doc_index_gate_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<AgentDocIndexGateCacheKey, AgentDocIndexGate>>
+{
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<AgentDocIndexGateCacheKey, AgentDocIndexGate>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn prepare_agent_doc_index_gate_cached(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+    packet_label: &str,
+) -> (AgentDocIndexGate, String) {
+    let key = AgentDocIndexGateCacheKey {
+        root: root.to_path_buf(),
+        path_hint: path_hint.to_path_buf(),
+        scope: scope.map(str::to_string),
+        packet_label: packet_label.to_string(),
+    };
+    if let Ok(cache) = agent_doc_index_gate_cache().lock()
+        && let Some(cached) = cache.get(&key)
+    {
+        return (
+            cached.clone(),
+            "reused from in-process index gate cache by root/path_hint/scope key".to_string(),
+        );
+    }
+    let gate = prepare_agent_doc_index_gate(root, path_hint, scope, packet_label);
+    if let Ok(mut cache) = agent_doc_index_gate_cache().lock() {
+        cache.insert(key, gate.clone());
+    }
+    (
+        gate,
+        "fresh inspection/refresh — cache miss on this preparation key".to_string(),
+    )
 }
 
 fn index_reason_for_state(state: SearchIndexState) -> Option<RebuildSearchReason> {
@@ -13313,7 +13361,8 @@ fn build_traversal_graph_source_with_options(
     let mut route_entries = Vec::new();
     let bounded_session_projection = hinted_markdown_file(root, path_hint).is_some();
     if !session_only || hinted_markdown_file(root, path_hint).is_none() {
-        let gate = prepare_agent_doc_index_gate(root, path_hint, scope, "graph traversal packet");
+        let (gate, _cache_detail) =
+            prepare_agent_doc_index_gate_cached(root, path_hint, scope, "graph traversal packet");
         graph.warnings.extend(gate.diagnostics);
 
         match gate.db_path {
@@ -18188,6 +18237,21 @@ fn conflict_matrix_prepared_inputs_cache_hit(
             &cached_detail,
         ),
         graph_db_backend_eval_phase_timing("status_index_gate", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing(
+            "status_index_gate.prepare_agent_doc_index_gate",
+            0,
+            &cached_detail,
+        ),
+        graph_db_backend_eval_phase_timing(
+            "status_index_gate.context_pack_status_reminders",
+            0,
+            &cached_detail,
+        ),
+        graph_db_backend_eval_phase_timing(
+            "status_index_gate.load_tag_ontology_preview_context",
+            0,
+            &cached_detail,
+        ),
         graph_db_backend_eval_phase_timing("context_pack_diff", 0, &cached_detail),
         graph_db_backend_eval_phase_timing("exploration_materialization", 0, &cached_detail),
         graph_db_backend_eval_phase_timing("graph_orchestration", 0, &cached_detail),
@@ -23053,17 +23117,50 @@ fn build_context_pack_report_with_profile(
         ));
     }
     let root = PathBuf::from(&review.root);
-    let (status_reminders, ontology) = graph_db_backend_eval_timed_phase(
-        &mut phases,
+    let status_index_gate_started = Instant::now();
+    let mut status_index_gate_sub_phases: Vec<(String, u128, String)> = Vec::with_capacity(3);
+    let index_gate_started = Instant::now();
+    let (gate, gate_cache_detail) =
+        prepare_agent_doc_index_gate_cached(&root, path, None, "context-pack handoff");
+    let index_gate_micros = index_gate_started.elapsed().as_micros();
+    status_index_gate_sub_phases.push((
+        "prepare_agent_doc_index_gate".to_string(),
+        index_gate_micros,
+        gate_cache_detail,
+    ));
+
+    let reminders_started = Instant::now();
+    let mut status_reminders = gate.diagnostics.clone();
+    status_reminders.extend(context_pack_status_reminders(&root));
+    let reminders_micros = reminders_started.elapsed().as_micros();
+    status_index_gate_sub_phases.push((
+        "context_pack_status_reminders".to_string(),
+        reminders_micros,
+        "tsift status reminders for the cached preparation context".to_string(),
+    ));
+
+    let ontology_started = Instant::now();
+    let ontology = load_tag_ontology_preview_context(&root);
+    let ontology_micros = ontology_started.elapsed().as_micros();
+    status_index_gate_sub_phases.push((
+        "load_tag_ontology_preview_context".to_string(),
+        ontology_micros,
+        "tag ontology preview context load".to_string(),
+    ));
+
+    let status_index_gate_total_micros = status_index_gate_started.elapsed().as_micros();
+    phases.push(graph_db_backend_eval_phase_timing(
         "status_index_gate",
+        status_index_gate_total_micros,
         "agent-doc index gate, tsift status reminders, and ontology preview loading",
-        || {
-            let gate = prepare_agent_doc_index_gate(&root, path, None, "context-pack handoff");
-            let mut status_reminders = gate.diagnostics;
-            status_reminders.extend(context_pack_status_reminders(&root));
-            Ok((status_reminders, load_tag_ontology_preview_context(&root)))
-        },
-    )?;
+    ));
+    for (name, micros, detail) in &status_index_gate_sub_phases {
+        phases.push(graph_db_backend_eval_phase_timing(
+            &format!("status_index_gate.{name}"),
+            *micros,
+            detail,
+        ));
+    }
     let ontology_ref = ontology.as_ref();
     let mut next_context =
         build_session_review_next_context_budget_report(&review, budget, ontology_ref);
