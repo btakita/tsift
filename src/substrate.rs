@@ -2395,6 +2395,94 @@ fn push_sqlite_edge_property_filter_exists(
     }
 }
 
+struct SqliteIncidentEdgeBranch<'a> {
+    index_name: &'a str,
+    endpoint_column: &'a str,
+    node_id: &'a str,
+    kind: Option<&'a str>,
+    filters: &'a [GraphPropertyFilter],
+    cursor: Option<&'a str>,
+}
+
+fn push_sqlite_incident_edge_branch(
+    sql: &mut String,
+    values: &mut Vec<Value>,
+    branch: SqliteIncidentEdgeBranch<'_>,
+) {
+    sql.push_str(&format!(
+        r#"
+        SELECT
+            e.edge_key, e.from_id, e.to_id, e.kind, e.properties_json, e.provenance_json, e.freshness_json
+        FROM graph_edges e INDEXED BY {index_name}
+        WHERE e.{endpoint_column} = ?
+        "#,
+        index_name = branch.index_name,
+        endpoint_column = branch.endpoint_column,
+    ));
+    values.push(Value::Text(branch.node_id.to_string()));
+    if let Some(kind) = branch.kind {
+        sql.push_str(" AND e.kind = ?");
+        values.push(Value::Text(kind.to_string()));
+    }
+    push_sqlite_edge_property_filter_exists(sql, values, "e", branch.filters);
+    if let Some(cursor) = branch.cursor {
+        sql.push_str(" AND e.edge_key > ?");
+        values.push(Value::Text(cursor.to_string()));
+    }
+}
+
+fn sqlite_incident_edges_union_query(
+    node_id: &str,
+    kind: Option<&str>,
+    filters: &[GraphPropertyFilter],
+    cursor: Option<&str>,
+    limit: Option<usize>,
+) -> (String, Vec<Value>) {
+    let mut sql = String::from(
+        r#"
+        SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
+        FROM (
+        "#,
+    );
+    let mut values = Vec::new();
+    push_sqlite_incident_edge_branch(
+        &mut sql,
+        &mut values,
+        SqliteIncidentEdgeBranch {
+            index_name: "idx_graph_edges_from_kind",
+            endpoint_column: "from_id",
+            node_id,
+            kind,
+            filters,
+            cursor,
+        },
+    );
+    sql.push_str(" UNION ");
+    push_sqlite_incident_edge_branch(
+        &mut sql,
+        &mut values,
+        SqliteIncidentEdgeBranch {
+            index_name: "idx_graph_edges_to_kind",
+            endpoint_column: "to_id",
+            node_id,
+            kind,
+            filters,
+            cursor,
+        },
+    );
+    sql.push_str(
+        r#"
+        ) e
+        ORDER BY e.edge_key
+        "#,
+    );
+    if let Some(limit) = limit {
+        sql.push_str(" LIMIT ?");
+        values.push(Value::Integer(limit.saturating_add(1) as i64));
+    }
+    (sql, values)
+}
+
 impl GraphStore for SqliteGraphStore {
     fn upsert_node(&self, node: &GraphNode) -> Result<()> {
         self.conn.execute(
@@ -2693,19 +2781,7 @@ impl GraphStore for SqliteGraphStore {
     }
 
     fn incident_edges(&self, node_id: &str, kind: Option<&str>) -> Result<Vec<GraphEdge>> {
-        let mut sql = String::from(
-            r#"
-            SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
-            FROM graph_edges
-            WHERE (from_id = ?1 OR to_id = ?1)
-            "#,
-        );
-        let mut values = vec![Value::Text(node_id.to_string())];
-        if let Some(kind) = kind {
-            sql.push_str(" AND kind = ?2");
-            values.push(Value::Text(kind.to_string()));
-        }
-        sql.push_str(" ORDER BY edge_key");
+        let (sql, values) = sqlite_incident_edges_union_query(node_id, kind, &[], None, None);
         let mut stmt = self.conn.prepare(&sql)?;
         collect_rows(stmt.query_map(params_from_iter(values.iter()), edge_from_row)?)
     }
@@ -2797,37 +2873,13 @@ impl GraphStore for SqliteGraphStore {
         kind: Option<&str>,
         options: GraphQueryOptions,
     ) -> Result<GraphPagedSubgraph> {
-        let mut sql = String::from(
-            r#"
-            SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
-            FROM graph_edges e
-            WHERE (e.from_id = ? OR e.to_id = ?)
-            "#,
-        );
-        let mut values = vec![
-            Value::Text(node_id.to_string()),
-            Value::Text(node_id.to_string()),
-        ];
-        if let Some(kind) = kind {
-            sql.push_str(" AND e.kind = ?");
-            values.push(Value::Text(kind.to_string()));
-        }
-        push_sqlite_edge_property_filter_exists(
-            &mut sql,
-            &mut values,
-            "e",
+        let (sql, values) = sqlite_incident_edges_union_query(
+            node_id,
+            kind,
             &options.property_filters,
+            options.cursor.as_deref(),
+            options.limit,
         );
-        if let Some(cursor) = &options.cursor {
-            sql.push_str(" AND e.edge_key > ?");
-            values.push(Value::Text(cursor.clone()));
-        }
-        sql.push_str(" ORDER BY e.edge_key");
-        if let Some(limit) = options.limit {
-            sql.push_str(" LIMIT ?");
-            values.push(Value::Integer(limit.saturating_add(1) as i64));
-        }
-
         let plan = sqlite_query_plan(&self.conn, &sql, &values)?;
         let mut stmt = self.conn.prepare(&sql)?;
         let mut edges =
@@ -2850,6 +2902,10 @@ impl GraphStore for SqliteGraphStore {
             ]
         };
         let mut diagnostics = sqlite_query_plan_diagnostics(&plan, &expected_indexes);
+        diagnostics.push(
+            "incident edge scan uses UNION over from_id/to_id index probes instead of an OR predicate"
+                .to_string(),
+        );
         if !options.property_filters.is_empty() {
             diagnostics.push(
                 "edge property filters were evaluated by SQLite materialized property rows before paging"

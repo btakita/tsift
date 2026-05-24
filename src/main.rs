@@ -846,6 +846,13 @@ enum GraphDbExperimentalBackend {
     Kuzu,
 }
 
+#[derive(Serialize)]
+struct GraphDbBackendPromotionGate {
+    status: String,
+    native_adapter_required: bool,
+    required_checks: Vec<String>,
+}
+
 impl GraphDbExperimentalBackend {
     fn name(self) -> &'static str {
         match self {
@@ -911,6 +918,34 @@ impl GraphDbExperimentalBackend {
                 "FalkorDB remains behind backend-eval until a production adapter beats SQLite on full_projection conflict-matrix, evidence, dispatch-trace, path tiers, install portability, and lock behavior",
             ),
             _ => None,
+        }
+    }
+
+    fn promotion_gate(self) -> GraphDbBackendPromotionGate {
+        match self {
+            Self::Falkordb => GraphDbBackendPromotionGate {
+                status: "hold_native_adapter_required".to_string(),
+                native_adapter_required: true,
+                required_checks: vec![
+                    "native_falkordb_projection_load_writes_provider_neutral_rows_without_sqlite_row_replay"
+                        .to_string(),
+                    "freshness_and_parity_match_sqlite_on_real_and_full_projection_datasets"
+                        .to_string(),
+                    "multi_process_writer_and_read_only_lock_behavior_match_or_beat_sqlite"
+                        .to_string(),
+                    "operator_install_cost_keeps_cargo_build_install_service_free_by_default"
+                        .to_string(),
+                ],
+            },
+            _ => GraphDbBackendPromotionGate {
+                status: "prototype_read_only_benchmark".to_string(),
+                native_adapter_required: false,
+                required_checks: vec![
+                    "sqlite_parity_on_all_backend_eval_operations".to_string(),
+                    "lower_total_time_for_every_dataset_and_operation".to_string(),
+                    "production_adapter_must_remain_optional_before_promotion".to_string(),
+                ],
+            },
         }
     }
 
@@ -6810,7 +6845,7 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
 }
 
 const GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS: usize = 64;
-const GRAPH_DB_BACKEND_EVAL_EXTENDED_PATH_HOPS: [usize; 2] = [128, 256];
+const GRAPH_DB_BACKEND_EVAL_EXTENDED_PATH_HOPS: [usize; 3] = [128, 256, 512];
 const GRAPH_DB_BACKEND_EVAL_DIRECT_PATH_HOPS: usize = 1;
 const GRAPH_DB_BACKEND_EVAL_ALLOWED_REGRESSION_PERCENT: f64 = 10.0;
 const GRAPH_DB_BACKEND_EVAL_NORMALIZATION_ROW_UNIT: f64 = 1000.0;
@@ -6896,6 +6931,7 @@ struct GraphDbBackendPromotionDecision {
     backend: String,
     decision: String,
     reasons: Vec<String>,
+    gate: GraphDbBackendPromotionGate,
 }
 
 #[derive(Serialize)]
@@ -7031,6 +7067,7 @@ struct GraphDbCompactionPolicy {
 struct GraphDbRefreshSummary {
     scope: String,
     projection_version: String,
+    mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_watermark: Option<String>,
     tombstoned_nodes: usize,
@@ -8798,9 +8835,14 @@ fn cmd_graph_db_refresh(
     let source_watermark = traversal_source_watermark(root, path, scope, false)?;
     let cached_refresh =
         graph_db_backend_eval_cached_refresh(root, scope, source_watermark.as_deref())?;
-    let (mut warnings, refresh, phase_timings) =
+    let (mode, mut warnings, refresh, phase_timings) =
         if let Some((_graph, refresh, phase_timings)) = cached_refresh {
-            (Vec::new(), refresh, phase_timings)
+            (
+                "cached_source_watermark_reuse".to_string(),
+                Vec::new(),
+                refresh,
+                phase_timings,
+            )
         } else {
             let (graph, refresh) = write_traversal_graph_store(root, path, scope)?;
             let phase_timings = refresh
@@ -8812,7 +8854,12 @@ fn cmd_graph_db_refresh(
                     detail: phase.detail.clone(),
                 })
                 .collect::<Vec<_>>();
-            (graph.warnings, refresh, phase_timings)
+            (
+                "cold_source_graph_rebuild".to_string(),
+                graph.warnings,
+                refresh,
+                phase_timings,
+            )
         };
     let graph_db = graph_substrate_db_path(root, scope);
     warnings.extend(graph_db_operator_status_warnings(root, scope));
@@ -8820,6 +8867,7 @@ fn cmd_graph_db_refresh(
     let refresh = GraphDbRefreshSummary {
         scope: refresh.scope,
         projection_version: refresh.projection_version,
+        mode,
         source_watermark: refresh.source_watermark,
         tombstoned_nodes: refresh.tombstoned_nodes.len(),
         tombstoned_edges: refresh.tombstoned_edges.len(),
@@ -10952,6 +11000,7 @@ fn graph_db_backend_eval_promotion(
             backend: candidate.name().to_string(),
             decision: decision.to_string(),
             reasons: dedupe_preserve_order(reasons),
+            gate: candidate.promotion_gate(),
         });
     }
     decisions
@@ -11101,12 +11150,15 @@ fn graph_db_backend_eval_performance_gate(
             "synthetic_deep_chain.sqlite.path_max_hops.duration_micros".to_string(),
             "synthetic_deep_chain.sqlite.path_max_hops_128.duration_micros".to_string(),
             "synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros".to_string(),
+            "synthetic_deep_chain.sqlite.path_max_hops_512.duration_micros".to_string(),
             "synthetic_deep_chain.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows".to_string(),
             "synthetic_deep_chain.sqlite.path_max_hops.duration_micros_per_1k_graph_rows"
                 .to_string(),
             "synthetic_deep_chain.sqlite.path_max_hops_128.duration_micros_per_1k_graph_rows"
                 .to_string(),
             "synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros_per_1k_graph_rows"
+                .to_string(),
+            "synthetic_deep_chain.sqlite.path_max_hops_512.duration_micros_per_1k_graph_rows"
                 .to_string(),
         ],
         digest_command: graph_db_backend_eval_metric_digest_command(root, scope),
@@ -11241,7 +11293,7 @@ fn cmd_graph_db_backend_eval(
     };
     let high_degree_nodes = 128;
     let high_degree_fanout = 8;
-    let deep_chain_nodes = 320;
+    let deep_chain_nodes = 640;
     let deep_chain_fanout = 1;
     let depth = 3;
     let limit = 8;
@@ -11481,11 +11533,11 @@ fn cmd_graph_db_backend_eval(
             path_deep_chain_hop_budget: GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS,
             path_extended_hop_budgets: GRAPH_DB_BACKEND_EVAL_EXTENDED_PATH_HOPS.to_vec(),
             path_probe_strategy:
-                "adaptive: use one-hop direct probes for high-degree/direct edges, 64-hop deep-chain default coverage, and measured 128/256-hop tiers without raising user-facing defaults"
+                "adaptive: use one-hop direct probes for high-degree/direct edges, 64-hop deep-chain default coverage, and measured 128/256/512-hop tiers without raising user-facing defaults"
                     .to_string(),
             path_query_plan_checks: vec![
                 "SQLite bounded path probes must continue using idx_graph_edges_from_kind for frontier expansion".to_string(),
-                "128/256-hop tiers are benchmark fixtures until repeated samples and query-plan checks pass".to_string(),
+                "128/256/512-hop tiers are benchmark fixtures until repeated samples and query-plan checks pass".to_string(),
             ],
             full_projection_enabled: full_projection,
             full_projection_profile: if full_projection {
@@ -11577,8 +11629,12 @@ fn print_graph_db_backend_eval_human(report: &GraphDbBackendEvalReport) {
     }
     for decision in &report.promotion {
         println!("promotion {}: {}", decision.backend, decision.decision);
+        println!("  gate: {}", decision.gate.status);
         for reason in &decision.reasons {
             println!("  reason: {reason}");
+        }
+        for check in &decision.gate.required_checks {
+            println!("  check: {check}");
         }
     }
     println!("metric-digest: {}", report.metric_digest_command);

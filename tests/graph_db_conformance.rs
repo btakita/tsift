@@ -1241,6 +1241,10 @@ fn graph_db_refresh_and_status_materialize_operator_report() {
     assert_eq!(refresh["status"], "current", "{refresh}");
     assert_eq!(refresh["materialized"], true, "{refresh}");
     assert_eq!(
+        refresh["refresh"]["mode"], "cold_source_graph_rebuild",
+        "{refresh}"
+    );
+    assert_eq!(
         refresh["freshness"]["projection_version"], "tsift-traversal-v1",
         "{refresh}"
     );
@@ -1294,6 +1298,10 @@ fn graph_db_refresh_and_status_materialize_operator_report() {
     let cached_refresh =
         graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
     assert_eq!(cached_refresh["status"], "current", "{cached_refresh}");
+    assert_eq!(
+        cached_refresh["refresh"]["mode"], "cached_source_watermark_reuse",
+        "{cached_refresh}"
+    );
     assert_eq!(
         cached_refresh["counts"]["nodes"],
         refresh["counts"]["nodes"]
@@ -1438,7 +1446,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
     );
     assert_eq!(
         report["config"]["path_extended_hop_budgets"],
-        json!([128, 256]),
+        json!([128, 256, 512]),
         "{report}"
     );
     assert_eq!(
@@ -1460,7 +1468,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         report["config"]["path_probe_strategy"]
             .as_str()
             .unwrap()
-            .contains("128/256-hop"),
+            .contains("128/256/512-hop"),
         "{report}"
     );
     assert_eq!(report["config"]["normalization_row_unit"], 1000, "{report}");
@@ -1505,6 +1513,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                     "path_max_hops".to_string(),
                     "path_max_hops_128".to_string(),
                     "path_max_hops_256".to_string(),
+                    "path_max_hops_512".to_string(),
                     "evidence_target_resolution".to_string(),
                     "evidence".to_string(),
                     "conflict_matrix".to_string(),
@@ -1738,6 +1747,13 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "{report}"
     );
     assert!(
+        report["metrics"]
+            .as_object()
+            .unwrap()
+            .contains_key("synthetic_deep_chain.sqlite.path_max_hops_512.duration_micros"),
+        "{report}"
+    );
+    assert!(
         report["metrics"].as_object().unwrap().contains_key(
             "synthetic_high_degree.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows"
         ),
@@ -1752,6 +1768,12 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
     assert!(
         report["metrics"].as_object().unwrap().contains_key(
             "synthetic_deep_chain.sqlite.path_max_hops.duration_micros_per_1k_graph_rows"
+        ),
+        "{report}"
+    );
+    assert!(
+        report["metrics"].as_object().unwrap().contains_key(
+            "synthetic_deep_chain.sqlite.path_max_hops_512.duration_micros_per_1k_graph_rows"
         ),
         "{report}"
     );
@@ -1813,6 +1835,15 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "{report}"
     );
     assert!(
+        report["performance_gate"]["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|metric| metric
+                == "synthetic_deep_chain.sqlite.path_max_hops_512.duration_micros"),
+        "{report}"
+    );
+    assert!(
         report["promotion"]
             .as_array()
             .unwrap()
@@ -1826,6 +1857,28 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                 .as_str()
                 .unwrap()
                 .contains("full_projection conflict-matrix")),
+        "{report}"
+    );
+    let falkor_gate = &report["promotion"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|decision| decision["backend"] == "falkordb")
+        .unwrap()["gate"];
+    assert_eq!(
+        falkor_gate["status"], "hold_native_adapter_required",
+        "{report}"
+    );
+    assert_eq!(falkor_gate["native_adapter_required"], true, "{report}");
+    assert!(
+        falkor_gate["required_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check
+                .as_str()
+                .unwrap()
+                .contains("native_falkordb_projection_load")),
         "{report}"
     );
     let artifact_file_query = graph_db_json(
@@ -1961,8 +2014,10 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "synthetic_deep_chain.sqlite.path_max_hops.duration_micros",
         "synthetic_deep_chain.sqlite.path_max_hops_128.duration_micros",
         "synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros",
+        "synthetic_deep_chain.sqlite.path_max_hops_512.duration_micros",
         "synthetic_deep_chain.sqlite.path_max_hops.duration_micros_per_1k_graph_rows",
         "synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros_per_1k_graph_rows",
+        "synthetic_deep_chain.sqlite.path_max_hops_512.duration_micros_per_1k_graph_rows",
     ] {
         assert!(
             delta_metrics.contains(metric),
@@ -3823,6 +3878,19 @@ fn query_plan_details(db_path: &Path, sql: &str) -> Vec<String> {
         .unwrap()
 }
 
+fn query_text_column(db_path: &Path, sql: &str) -> Vec<String> {
+    let conn = Connection::open(db_path).unwrap();
+    let mut stmt = conn.prepare(sql).unwrap();
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 #[test]
 fn graph_db_scale_caps_pagination_paths_doctor_and_sqlite_plans() {
     let project = large_graph_db_project(120);
@@ -3931,14 +3999,107 @@ fn graph_db_scale_caps_pagination_paths_doctor_and_sqlite_plans() {
     let edge_plan = query_plan_details(
         &db_path,
         &format!(
-            "SELECT to_id FROM graph_edges INDEXED BY idx_graph_edges_from_kind WHERE from_id = '{}' AND kind = 'calls' ORDER BY to_id, kind",
-            first_id.replace('\'', "''")
+            "SELECT to_id FROM graph_edges INDEXED BY idx_graph_edges_from_kind WHERE from_id = {} AND kind = 'calls' ORDER BY to_id, kind",
+            sql_literal(&first_id)
         ),
     )
     .join("\n");
     assert!(
         edge_plan.contains("idx_graph_edges_from_kind"),
         "expected graph_edges from/kind index in plan:\n{edge_plan}"
+    );
+
+    let incident = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "incident".to_string(),
+            first_id.clone(),
+            "--edge-kind".to_string(),
+            "calls".to_string(),
+            "--property".to_string(),
+            "weight=1".to_string(),
+            "--limit".to_string(),
+            "10".to_string(),
+        ],
+    );
+    assert_eq!(incident["page"]["truncated"], false, "{incident}");
+    assert_sqlite_page_uses_index(&incident["page"], "idx_graph_edges_from_kind");
+    assert_sqlite_page_uses_index(&incident["page"], "idx_graph_edges_to_kind");
+    assert_sqlite_page_uses_index(
+        &incident["page"],
+        "idx_graph_edge_properties_key_value_edge",
+    );
+    assert!(
+        incident["page"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .as_str()
+                .unwrap()
+                .contains("UNION over from_id/to_id")),
+        "{incident}"
+    );
+
+    let escaped_first_id = sql_literal(&first_id);
+    let union_incident_sql = format!(
+        "SELECT edge_key FROM (
+            SELECT edge_key FROM graph_edges INDEXED BY idx_graph_edges_from_kind
+            WHERE from_id = {escaped_first_id} AND kind = 'calls'
+            UNION
+            SELECT edge_key FROM graph_edges INDEXED BY idx_graph_edges_to_kind
+            WHERE to_id = {escaped_first_id} AND kind = 'calls'
+        ) ORDER BY edge_key"
+    );
+    let or_incident_sql = format!(
+        "SELECT edge_key FROM graph_edges
+         WHERE (from_id = {escaped_first_id} OR to_id = {escaped_first_id})
+           AND kind = 'calls'
+         ORDER BY edge_key"
+    );
+    assert_eq!(
+        query_text_column(&db_path, &union_incident_sql),
+        query_text_column(&db_path, &or_incident_sql),
+        "UNION incident scan must preserve current OR predicate semantics"
+    );
+    let incident_plan = query_plan_details(&db_path, &union_incident_sql).join("\n");
+    assert!(
+        incident_plan.contains("idx_graph_edges_from_kind")
+            && incident_plan.contains("idx_graph_edges_to_kind"),
+        "expected incident UNION scan to use both directional indexes:\n{incident_plan}"
+    );
+
+    let first_edge_id = incident["edges"][0]["id"].as_str().unwrap();
+    let edge_lookup_plan = query_plan_details(
+        &db_path,
+        &format!(
+            "SELECT edge_key FROM graph_edges INDEXED BY idx_graph_edges_edge_key WHERE edge_key = {}",
+            sql_literal(first_edge_id)
+        ),
+    )
+    .join("\n");
+    assert!(
+        edge_lookup_plan.contains("idx_graph_edges_edge_key"),
+        "expected edge lookup index in plan:\n{edge_lookup_plan}"
+    );
+
+    let edge_property_scan = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "edges".to_string(),
+            "--edge-kind".to_string(),
+            "calls".to_string(),
+            "--property".to_string(),
+            "weight=1".to_string(),
+            "--limit".to_string(),
+            "10".to_string(),
+        ],
+    );
+    assert_sqlite_page_uses_index(
+        &edge_property_scan["page"],
+        "idx_graph_edge_properties_key_value_edge",
     );
 }
 
