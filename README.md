@@ -78,15 +78,18 @@ running DAG-shaped dispatch. Those orchestration surfaces include stable
 contract versions, evidence packet ids, projection hashes, replay commands, and
 repair commands so agent-doc can consume them as JSON rather than parsing prose.
 Use `tsift graph-db backend-eval` to compare SQLite against experimental
-read-only candidates, including FalkorDB and the dependency-free
-Vela-Engineering/kuzu row prototype, with adaptive 1/64/128/256-hop path probes,
-an opt-in `--full-projection` dataset, split conflict-matrix preparation
-timings/cache keys, per-operation promotion gates, projection
+read-only candidates, including DuckDB/DuckPGQ, FalkorDB, Ladybug, and the
+dependency-free Vela-Engineering/kuzu row prototype, with adaptive
+1/64/128/256/512-hop path probes that keep the default cap at 64 until real and
+synthetic extended-hop gates pass, an opt-in `--full-projection` dataset, split
+conflict-matrix preparation timings/cache keys that report skipped heavy phases
+on cache hits, per-operation promotion gates, projection
 load/concurrent-writer/install-portability notes, batched context-pack graph
 writes for source/worker context rows, compressed full-projection cache footprint
 metrics, and a `performance_gate`/`metric-digest` command for bounded regression
-review. FalkorDB remains held until a production
-adapter beats SQLite across the full-projection promotion gate.
+review. All read-only prototype backends remain held until a native production
+adapter beats SQLite across the full-projection promotion gate without weakening
+install or lock behavior.
 Use `tsift graph-db doctor` to validate local `graph.db` and Convex snapshot
 metadata before trusting operator handoffs. `tsift traverse --format html`
 renders the selected GraphStore slice as

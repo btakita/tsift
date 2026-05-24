@@ -915,18 +915,36 @@ impl GraphDbExperimentalBackend {
 
     fn prototype_hold_reason(self) -> Option<&'static str> {
         match self {
+            Self::DuckdbDuckpgq => Some(
+                "DuckDB/DuckPGQ remains behind backend-eval until a native production adapter proves projection writes, freshness/parity, full_projection wins, install portability, and lock behavior",
+            ),
             Self::Falkordb => Some(
                 "FalkorDB remains behind backend-eval until a production adapter beats SQLite on full_projection conflict-matrix, evidence, dispatch-trace, path tiers, install portability, and lock behavior",
+            ),
+            Self::Ladybug => Some(
+                "Ladybug remains behind backend-eval until a native production adapter proves projection writes, freshness/parity, full_projection wins, install portability, and lock behavior",
             ),
             Self::Kuzu => Some(
                 "Kuzu remains behind backend-eval until a native optional adapter proves projection writes/load, SQLite parity, full_projection wins, install portability, and lock behavior",
             ),
-            _ => None,
         }
     }
 
     fn promotion_gate(self) -> GraphDbBackendPromotionGate {
         match self {
+            Self::DuckdbDuckpgq => GraphDbBackendPromotionGate {
+                status: "hold_native_adapter_required".to_string(),
+                native_adapter_required: true,
+                required_checks: vec![
+                    "native_duckdb_duckpgq_projection_load_writes_provider_neutral_rows_without_sqlite_row_replay"
+                        .to_string(),
+                    "freshness_and_parity_match_sqlite_on_real_and_full_projection_datasets"
+                        .to_string(),
+                    "embedded_or_service_lock_behavior_match_or_beat_sqlite".to_string(),
+                    "operator_install_cost_keeps_cargo_build_install_duckdb_extension_free_by_default"
+                        .to_string(),
+                ],
+            },
             Self::Falkordb => GraphDbBackendPromotionGate {
                 status: "hold_native_adapter_required".to_string(),
                 native_adapter_required: true,
@@ -938,6 +956,20 @@ impl GraphDbExperimentalBackend {
                     "multi_process_writer_and_read_only_lock_behavior_match_or_beat_sqlite"
                         .to_string(),
                     "operator_install_cost_keeps_cargo_build_install_service_free_by_default"
+                        .to_string(),
+                ],
+            },
+            Self::Ladybug => GraphDbBackendPromotionGate {
+                status: "hold_native_adapter_required".to_string(),
+                native_adapter_required: true,
+                required_checks: vec![
+                    "native_ladybug_projection_load_writes_provider_neutral_rows_without_sqlite_row_replay"
+                        .to_string(),
+                    "freshness_and_parity_match_sqlite_on_real_and_full_projection_datasets"
+                        .to_string(),
+                    "concurrent_writer_and_read_only_lock_behavior_match_or_beat_sqlite"
+                        .to_string(),
+                    "operator_install_cost_keeps_cargo_build_install_ladybug_free_by_default"
                         .to_string(),
                 ],
             },
@@ -953,15 +985,6 @@ impl GraphDbExperimentalBackend {
                         .to_string(),
                     "operator_install_cost_keeps_cargo_build_install_native_kuzu_free_by_default"
                         .to_string(),
-                ],
-            },
-            _ => GraphDbBackendPromotionGate {
-                status: "prototype_read_only_benchmark".to_string(),
-                native_adapter_required: false,
-                required_checks: vec![
-                    "sqlite_parity_on_all_backend_eval_operations".to_string(),
-                    "lower_total_time_for_every_dataset_and_operation".to_string(),
-                    "production_adapter_must_remain_optional_before_promotion".to_string(),
                 ],
             },
         }
@@ -6957,6 +6980,7 @@ struct GraphDbBackendEvalConfig {
     path_direct_hop_budget: usize,
     path_deep_chain_hop_budget: usize,
     path_extended_hop_budgets: Vec<usize>,
+    path_hop_policy: String,
     path_probe_strategy: String,
     path_query_plan_checks: Vec<String>,
     full_projection_enabled: bool,
@@ -11445,6 +11469,12 @@ fn graph_db_backend_eval_performance_gate(
         "real.sqlite.conflict_matrix.duration_micros".to_string(),
         "real.sqlite.dispatch_trace.duration_micros".to_string(),
         "real.sqlite.path_max_hops.duration_micros".to_string(),
+        "real.sqlite.path_max_hops_128.duration_micros".to_string(),
+        "real.sqlite.path_max_hops_256.duration_micros".to_string(),
+        "real.sqlite.path_max_hops_512.duration_micros".to_string(),
+        "real.sqlite.path_max_hops_128.duration_micros_per_1k_graph_rows".to_string(),
+        "real.sqlite.path_max_hops_256.duration_micros_per_1k_graph_rows".to_string(),
+        "real.sqlite.path_max_hops_512.duration_micros_per_1k_graph_rows".to_string(),
         "synthetic_high_degree.sqlite.total_duration_micros".to_string(),
         "synthetic_high_degree.sqlite.total_duration_micros_per_1k_graph_rows".to_string(),
         "synthetic_high_degree.sqlite.edge_property_scan.duration_micros_per_1k_graph_rows"
@@ -11918,6 +11948,9 @@ fn cmd_graph_db_backend_eval(
             path_direct_hop_budget: GRAPH_DB_BACKEND_EVAL_DIRECT_PATH_HOPS,
             path_deep_chain_hop_budget: GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS,
             path_extended_hop_budgets: GRAPH_DB_BACKEND_EVAL_EXTENDED_PATH_HOPS.to_vec(),
+            path_hop_policy:
+                "default path reads stay capped at 64 hops; 128/256/512-hop probes are opt-in benchmark evidence until real and synthetic regression gates pass"
+                    .to_string(),
             path_probe_strategy:
                 "adaptive: use one-hop direct probes for high-degree/direct edges, 64-hop deep-chain default coverage, and measured 128/256/512-hop tiers without raising user-facing defaults"
                     .to_string(),
@@ -18118,13 +18151,19 @@ fn conflict_matrix_prepared_inputs_cache_hit(
     detail: &str,
 ) -> ConflictMatrixPreparedInputs {
     cached.preparation_cache.status = status.to_string();
-    cached
-        .preparation_timings
-        .retain(|phase| phase.name != "preparation_cache_lookup");
-    cached.preparation_timings.insert(
-        0,
-        graph_db_backend_eval_phase_timing("preparation_cache_lookup", duration_micros, detail),
+    let cached_detail = format!(
+        "reused from {status} conflict-matrix preparation cache by source/document/staged-diff watermark; cost accounted in preparation_cache_lookup"
     );
+    cached.preparation_timings = vec![
+        graph_db_backend_eval_phase_timing("preparation_cache_lookup", duration_micros, detail),
+        graph_db_backend_eval_phase_timing("session_review_compute", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing("status_index_gate", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing("context_pack_diff", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing("exploration_materialization", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing("graph_orchestration", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing("staged_diff", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing("impact", 0, &cached_detail),
+    ];
     cached
 }
 

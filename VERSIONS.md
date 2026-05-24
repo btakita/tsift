@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- Conflict-matrix cache hits now report session-review, status/index gate, context-pack diff, exploration, graph orchestration, staged-diff, and impact phases as skipped 0us reuse guarded by source/document/staged-diff watermarks; backend-eval also requires real 128/256/512-hop metrics before any higher path cap can be considered, and all read-only prototype backends stay on hold until a native production adapter proves projection writes/load, parity, install, and lock behavior.
 - Traversal source watermarks now exclude `.agent-doc` runtime markdown snapshots/baselines, preventing backend-eval full-projection and conflict-matrix cache keys from being invalidated by agent-doc closeout artifacts.
 - `graph-db backend-eval` now has an opt-in `--full-projection` dataset, reports 128/256-hop path-tier probes alongside the 64-hop default and one-hop direct probes, and keeps FalkorDB on a hold decision until a production adapter beats SQLite across full-projection conflict-matrix/evidence/dispatch-trace/path/install/lock gates.
 - `conflict-matrix` preparation now exposes split timings for cache lookup, session-review compute, status/index gate, context-pack diff, exploration materialization, graph orchestration, staged diff, and impact, plus source/document/staged-diff keyed `.tsift/conflict-matrix-cache` reuse for prepared context, staged-diff, impact, evidence, and target-scoped graph packets across CLI invocations.

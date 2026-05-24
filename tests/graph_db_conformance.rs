@@ -408,6 +408,16 @@ fn phase_detail<'a>(report: &'a Value, phase: &str) -> &'a str {
         .unwrap_or_else(|| panic!("missing phase {phase}: {report}"))
 }
 
+fn phase_duration(report: &Value, phase: &str) -> u64 {
+    report["phase_timings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == phase)
+        .and_then(|entry| entry["duration_micros"].as_u64())
+        .unwrap_or_else(|| panic!("missing phase {phase}: {report}"))
+}
+
 fn edge_keys(report: &Value) -> Vec<String> {
     report["edges"]
         .as_array()
@@ -1470,6 +1480,13 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         json!([128, 256, 512]),
         "{report}"
     );
+    assert!(
+        report["config"]["path_hop_policy"]
+            .as_str()
+            .unwrap()
+            .contains("default path reads stay capped at 64 hops"),
+        "{report}"
+    );
     assert_eq!(
         report["config"]["full_projection_enabled"], false,
         "{report}"
@@ -1852,6 +1869,15 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .unwrap()
             .iter()
             .any(|metric| metric
+                == "real.sqlite.path_max_hops_512.duration_micros_per_1k_graph_rows"),
+        "{report}"
+    );
+    assert!(
+        report["performance_gate"]["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|metric| metric
                 == "synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros"),
         "{report}"
     );
@@ -1880,17 +1906,29 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                 .contains("full_projection conflict-matrix")),
         "{report}"
     );
+    for backend in ["duckdb-duckpgq", "falkordb", "ladybug", "kuzu"] {
+        let decision = report["promotion"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|decision| decision["backend"] == backend)
+            .unwrap_or_else(|| panic!("missing promotion decision for {backend}: {report}"));
+        assert_eq!(decision["decision"], "hold", "{report}");
+        assert_eq!(
+            decision["gate"]["status"], "hold_native_adapter_required",
+            "{report}"
+        );
+        assert_eq!(
+            decision["gate"]["native_adapter_required"], true,
+            "{report}"
+        );
+    }
     let falkor_gate = &report["promotion"]
         .as_array()
         .unwrap()
         .iter()
         .find(|decision| decision["backend"] == "falkordb")
         .unwrap()["gate"];
-    assert_eq!(
-        falkor_gate["status"], "hold_native_adapter_required",
-        "{report}"
-    );
-    assert_eq!(falkor_gate["native_adapter_required"], true, "{report}");
     assert!(
         falkor_gate["required_checks"]
             .as_array()
@@ -1986,6 +2024,22 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .any(|entry| entry["name"] == "conflict_matrix_preparation.preparation_cache_lookup"),
         "cached backend-eval should expose preparation cache lookup timing: {cached_report}"
     );
+    for phase in [
+        "conflict_matrix_preparation.session_review_compute",
+        "conflict_matrix_preparation.status_index_gate",
+        "conflict_matrix_preparation.context_pack_diff",
+        "conflict_matrix_preparation.impact",
+    ] {
+        assert_eq!(
+            phase_duration(&cached_report, phase),
+            0,
+            "cached backend-eval should report {phase} as skipped on cache hit: {cached_report}"
+        );
+        assert!(
+            phase_detail(&cached_report, phase).contains("source/document/staged-diff watermark"),
+            "cached backend-eval should retain freshness guard detail for {phase}: {cached_report}"
+        );
+    }
     assert!(
         phase_detail(
             &cached_report,
@@ -2564,6 +2618,31 @@ fn conflict_matrix_cli_composes_planner_evidence_and_worker_ownership() {
         cached_report["inputs"]["shared_preparation"]["evidence_cache_status"], "disk_hit",
         "{cached_report}"
     );
+    let cached_preparation_phases = cached_report["inputs"]["preparation_timings"]
+        .as_array()
+        .unwrap();
+    for phase in [
+        "session_review_compute",
+        "status_index_gate",
+        "context_pack_diff",
+        "impact",
+    ] {
+        let timing = cached_preparation_phases
+            .iter()
+            .find(|entry| entry["name"] == phase)
+            .unwrap_or_else(|| panic!("missing cached preparation phase {phase}: {cached_report}"));
+        assert_eq!(
+            timing["duration_micros"], 0,
+            "cache hit should skip {phase}: {cached_report}"
+        );
+        assert!(
+            timing["detail"]
+                .as_str()
+                .unwrap()
+                .contains("source/document/staged-diff watermark"),
+            "cache hit should keep the freshness guard in {phase}: {cached_report}"
+        );
+    }
 
     let directory_report = assert_tsift_json(vec![
         "conflict-matrix".to_string(),
