@@ -8,6 +8,12 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.43
+
+- `session_review_compute` now reports `target_context_build`, `session_discovery`, `session_digest_total`, `session_cost_total`, `session_aggregation`, and `report_assembly` sub-phases under `conflict_matrix_preparation.session_review_compute.<sub>` so the dominant preparation hotspot can be resolved at sub-phase granularity instead of as one 3.3–4.6 s opaque cost. Cache-hit reports also surface the same sub-phases as `0us` skipped with the source/document/staged-diff watermark guard, and the graph-db conformance suite asserts the sub-phases exist on cold runs and stay within 50 ms instrumentation slack of the parent phase.
+
+## 0.1.42
+
 - Conflict-matrix cache hits now report session-review, status/index gate, context-pack diff, exploration, graph orchestration, staged-diff, and impact phases as skipped 0us reuse guarded by source/document/staged-diff watermarks; backend-eval also requires real 128/256/512-hop metrics before any higher path cap can be considered, and all read-only prototype backends stay on hold until a native production adapter proves projection writes/load, parity, install, and lock behavior.
 - Traversal source watermarks now exclude `.agent-doc` runtime markdown snapshots/baselines, preventing backend-eval full-projection and conflict-matrix cache keys from being invalidated by agent-doc closeout artifacts.
 - `graph-db backend-eval` now has an opt-in `--full-projection` dataset, reports 128/256-hop path-tier probes alongside the 64-hop default and one-hop direct probes, and keeps FalkorDB on a hold decision until a production adapter beats SQLite across full-projection conflict-matrix/evidence/dispatch-trace/path/install/lock gates.

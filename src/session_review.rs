@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Instant, UNIX_EPOCH};
 
 use crate::runtime_churn::RestartChurnSummary;
 use crate::{
@@ -19,6 +19,13 @@ const MAX_AGGREGATE_ITEMS: usize = 12;
 const MAX_LARGEST_TURNS: usize = 8;
 const MAX_WARNINGS: usize = 16;
 const MAX_LOOP_CLUSTERS: usize = 12;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionReviewPhaseTiming {
+    pub name: String,
+    pub duration_micros: u128,
+    pub detail: String,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionReviewSession {
@@ -326,11 +333,30 @@ pub fn compute(target: &Path) -> Result<SessionReviewReport> {
     compute_with_options(target, &SessionReviewOptions::default())
 }
 
+pub fn compute_with_phases(
+    target: &Path,
+) -> Result<(SessionReviewReport, Vec<SessionReviewPhaseTiming>)> {
+    compute_with_options_and_phases(target, &SessionReviewOptions::default())
+}
+
 pub fn compute_with_options(
     target: &Path,
     options: &SessionReviewOptions,
 ) -> Result<SessionReviewReport> {
+    compute_with_options_and_phases(target, options).map(|(report, _phases)| report)
+}
+
+pub fn compute_with_options_and_phases(
+    target: &Path,
+    options: &SessionReviewOptions,
+) -> Result<(SessionReviewReport, Vec<SessionReviewPhaseTiming>)> {
+    let mut phases: Vec<SessionReviewPhaseTiming> = Vec::with_capacity(6);
+
+    let target_context_started = Instant::now();
     let mut context = build_target_context(target)?;
+    let target_context_micros = target_context_started.elapsed().as_micros();
+
+    let session_discovery_started = Instant::now();
     let mut candidates = BTreeMap::<String, PendingSession>::new();
     let mut sessions_considered = 0_usize;
     let mut warnings = Vec::new();
@@ -379,6 +405,11 @@ pub fn compute_with_options(
             .then_with(|| left.path.cmp(&right.path))
     });
     sessions.truncate(MAX_SESSIONS);
+    let session_discovery_micros = session_discovery_started.elapsed().as_micros();
+
+    let mut session_digest_micros: u128 = 0;
+    let mut session_cost_micros: u128 = 0;
+    let session_loop_started = Instant::now();
 
     let mut prompt_targets = BTreeMap::<String, usize>::new();
     let mut commands = BTreeMap::<String, usize>::new();
@@ -417,12 +448,15 @@ pub fn compute_with_options(
     let mut last_verification = None::<SessionReviewVerificationState>;
 
     for pending in sessions {
+        let digest_started = Instant::now();
         let digest = session_digest::compute(
             &context.root,
             &pending.text,
             Some(pending.source.digest_source()),
         )
         .with_context(|| format!("digesting {}", pending.path.display()))?;
+        session_digest_micros += digest_started.elapsed().as_micros();
+        let cost_started = Instant::now();
         let cost = if pending.source.supports_cost() {
             Some(
                 session_cost::compute(&pending.text, Some(pending.source.digest_source()))
@@ -431,6 +465,7 @@ pub fn compute_with_options(
         } else {
             None
         };
+        session_cost_micros += cost_started.elapsed().as_micros();
 
         match pending.source {
             ReviewSource::ClaudeJsonl => claude_sessions += 1,
@@ -605,6 +640,11 @@ pub fn compute_with_options(
                 .map_or(0, |report| report.largest_turn_total_tokens),
         });
     }
+    let session_loop_total_micros = session_loop_started.elapsed().as_micros();
+    let session_aggregation_micros = session_loop_total_micros
+        .saturating_sub(session_digest_micros)
+        .saturating_sub(session_cost_micros);
+    let report_assembly_started = Instant::now();
 
     let cached_input_ratio = (prompt_tokens > 0).then_some(
         ((cached_input_tokens as f64) / (prompt_tokens as f64) * 10_000.0).round() / 100.0,
@@ -779,7 +819,7 @@ pub fn compute_with_options(
     warnings.sort();
     warnings.truncate(MAX_WARNINGS);
 
-    Ok(SessionReviewReport {
+    let report = SessionReviewReport {
         root: context.root.display().to_string(),
         target: context.canonical_target.display().to_string(),
         target_kind: context.kind.as_str().to_string(),
@@ -822,7 +862,41 @@ pub fn compute_with_options(
         sessions: session_rows,
         next_context,
         warnings,
-    })
+    };
+    let report_assembly_micros = report_assembly_started.elapsed().as_micros();
+
+    phases.push(SessionReviewPhaseTiming {
+        name: "target_context_build".to_string(),
+        duration_micros: target_context_micros,
+        detail: "build target context (root, canonical target, kind, aliases) before session discovery".to_string(),
+    });
+    phases.push(SessionReviewPhaseTiming {
+        name: "session_discovery".to_string(),
+        duration_micros: session_discovery_micros,
+        detail: "agent-doc + Claude JSONL + Codex JSONL session candidate discovery and ranking".to_string(),
+    });
+    phases.push(SessionReviewPhaseTiming {
+        name: "session_digest_total".to_string(),
+        duration_micros: session_digest_micros,
+        detail: "sum of session_digest::compute across matched sessions".to_string(),
+    });
+    phases.push(SessionReviewPhaseTiming {
+        name: "session_cost_total".to_string(),
+        duration_micros: session_cost_micros,
+        detail: "sum of session_cost::compute across matched sessions".to_string(),
+    });
+    phases.push(SessionReviewPhaseTiming {
+        name: "session_aggregation".to_string(),
+        duration_micros: session_aggregation_micros,
+        detail: "per-session prompt/file/symbol/failure aggregation into bounded BTreeMaps".to_string(),
+    });
+    phases.push(SessionReviewPhaseTiming {
+        name: "report_assembly".to_string(),
+        duration_micros: report_assembly_micros,
+        detail: "post-loop collect_strings + sort + next-context derivation + report construction".to_string(),
+    });
+
+    Ok((report, phases))
 }
 
 fn build_target_context(target: &Path) -> Result<TargetContext> {

@@ -18157,6 +18157,36 @@ fn conflict_matrix_prepared_inputs_cache_hit(
     cached.preparation_timings = vec![
         graph_db_backend_eval_phase_timing("preparation_cache_lookup", duration_micros, detail),
         graph_db_backend_eval_phase_timing("session_review_compute", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing(
+            "session_review_compute.target_context_build",
+            0,
+            &cached_detail,
+        ),
+        graph_db_backend_eval_phase_timing(
+            "session_review_compute.session_discovery",
+            0,
+            &cached_detail,
+        ),
+        graph_db_backend_eval_phase_timing(
+            "session_review_compute.session_digest_total",
+            0,
+            &cached_detail,
+        ),
+        graph_db_backend_eval_phase_timing(
+            "session_review_compute.session_cost_total",
+            0,
+            &cached_detail,
+        ),
+        graph_db_backend_eval_phase_timing(
+            "session_review_compute.session_aggregation",
+            0,
+            &cached_detail,
+        ),
+        graph_db_backend_eval_phase_timing(
+            "session_review_compute.report_assembly",
+            0,
+            &cached_detail,
+        ),
         graph_db_backend_eval_phase_timing("status_index_gate", 0, &cached_detail),
         graph_db_backend_eval_phase_timing("context_pack_diff", 0, &cached_detail),
         graph_db_backend_eval_phase_timing("exploration_materialization", 0, &cached_detail),
@@ -23007,12 +23037,21 @@ fn build_context_pack_report_with_profile(
 ) -> Result<(ContextPackReport, Vec<GraphDbBackendEvalPhaseTiming>)> {
     let budget = effective_context_budget(budget);
     let mut phases = Vec::new();
-    let review = graph_db_backend_eval_timed_phase(
-        &mut phases,
+    let session_review_started = Instant::now();
+    let (review, session_review_sub_phases) = session_review::compute_with_phases(path)?;
+    let session_review_total_micros = session_review_started.elapsed().as_micros();
+    phases.push(graph_db_backend_eval_phase_timing(
         "session_review_compute",
+        session_review_total_micros,
         "session-review prompt/touched-file/touched-symbol/failure aggregation for the context-pack handoff",
-        || session_review::compute(path),
-    )?;
+    ));
+    for sub_phase in &session_review_sub_phases {
+        phases.push(graph_db_backend_eval_phase_timing(
+            &format!("session_review_compute.{}", sub_phase.name),
+            sub_phase.duration_micros,
+            &sub_phase.detail,
+        ));
+    }
     let root = PathBuf::from(&review.root);
     let (status_reminders, ontology) = graph_db_backend_eval_timed_phase(
         &mut phases,

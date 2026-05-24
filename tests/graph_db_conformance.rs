@@ -1459,12 +1459,40 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "sqlite_edge_property_row_staging",
         "sqlite_delta_write",
         "conflict_matrix_preparation",
+        "conflict_matrix_preparation.session_review_compute",
+        "conflict_matrix_preparation.session_review_compute.target_context_build",
+        "conflict_matrix_preparation.session_review_compute.session_discovery",
+        "conflict_matrix_preparation.session_review_compute.session_digest_total",
+        "conflict_matrix_preparation.session_review_compute.session_cost_total",
+        "conflict_matrix_preparation.session_review_compute.session_aggregation",
+        "conflict_matrix_preparation.session_review_compute.report_assembly",
     ] {
         assert!(
             phases.iter().any(|entry| entry["name"] == phase),
             "missing phase {phase}: {report}"
         );
     }
+    let session_review_total =
+        phase_duration(&report, "conflict_matrix_preparation.session_review_compute");
+    let session_review_sub_sum: u64 = [
+        "conflict_matrix_preparation.session_review_compute.target_context_build",
+        "conflict_matrix_preparation.session_review_compute.session_discovery",
+        "conflict_matrix_preparation.session_review_compute.session_digest_total",
+        "conflict_matrix_preparation.session_review_compute.session_cost_total",
+        "conflict_matrix_preparation.session_review_compute.session_aggregation",
+        "conflict_matrix_preparation.session_review_compute.report_assembly",
+    ]
+    .iter()
+    .map(|name| phase_duration(&report, name))
+    .sum();
+    assert!(
+        session_review_sub_sum <= session_review_total + 50_000,
+        "session_review_compute sub-phase sum {session_review_sub_sum}us should not exceed parent {session_review_total}us by more than 50ms instrumentation slack: {report}"
+    );
+    assert!(
+        session_review_total <= session_review_sub_sum + 50_000,
+        "session_review_compute parent {session_review_total}us should not exceed sub-phase sum {session_review_sub_sum}us by more than 50ms instrumentation slack: {report}"
+    );
     assert!(
         phase_detail(&report, "source_graph_build").contains("bounded session projection"),
         "session-hinted backend-eval should expose the bounded dirty-scope projection profile: {report}"
@@ -2026,6 +2054,12 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
     );
     for phase in [
         "conflict_matrix_preparation.session_review_compute",
+        "conflict_matrix_preparation.session_review_compute.target_context_build",
+        "conflict_matrix_preparation.session_review_compute.session_discovery",
+        "conflict_matrix_preparation.session_review_compute.session_digest_total",
+        "conflict_matrix_preparation.session_review_compute.session_cost_total",
+        "conflict_matrix_preparation.session_review_compute.session_aggregation",
+        "conflict_matrix_preparation.session_review_compute.report_assembly",
         "conflict_matrix_preparation.status_index_gate",
         "conflict_matrix_preparation.context_pack_diff",
         "conflict_matrix_preparation.impact",
