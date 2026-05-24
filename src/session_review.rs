@@ -2,8 +2,11 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
+
+const SESSION_HEADER_PROBE_BUDGET_BYTES: usize = 256 * 1024;
 
 use crate::runtime_churn::RestartChurnSummary;
 use crate::{
@@ -19,6 +22,12 @@ const MAX_AGGREGATE_ITEMS: usize = 12;
 const MAX_LARGEST_TURNS: usize = 8;
 const MAX_WARNINGS: usize = 16;
 const MAX_LOOP_CLUSTERS: usize = 12;
+/// Per-source candidate budget for session discovery. Each source can collect at
+/// most this many most-recent files before content reads. Set generously above
+/// `MAX_SESSIONS` so the global top-N after cross-source merge still comes from
+/// the genuinely most recent matches even when a source has many rejected
+/// candidates near the head.
+const MAX_RECENT_CANDIDATES_PER_SOURCE: usize = 64;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionReviewPhaseTiming {
@@ -383,7 +392,11 @@ pub fn compute_with_options_and_phases(
     let claude_projects_dir = resolve_claude_projects_dir(&context.root, options);
     let claude_project_dir = claude_projects_dir.join(claude_project_slug(&context.root));
     if claude_project_dir.is_dir() {
-        for path in collect_files_with_extension(&claude_project_dir, "jsonl")? {
+        for path in collect_recent_files_with_extension(
+            &claude_project_dir,
+            "jsonl",
+            MAX_RECENT_CANDIDATES_PER_SOURCE,
+        )? {
             sessions_considered += 1;
             maybe_add_claude_candidate(&mut candidates, &context, &path)?;
         }
@@ -391,7 +404,11 @@ pub fn compute_with_options_and_phases(
 
     let codex_sessions_dir = resolve_codex_sessions_dir(&context.root, options);
     if codex_sessions_dir.is_dir() {
-        for path in collect_files_with_extension(&codex_sessions_dir, "jsonl")? {
+        for path in collect_recent_files_with_extension(
+            &codex_sessions_dir,
+            "jsonl",
+            MAX_RECENT_CANDIDATES_PER_SOURCE,
+        )? {
             sessions_considered += 1;
             maybe_add_codex_candidate(&mut candidates, &context, &path)?;
         }
@@ -1312,8 +1329,15 @@ fn maybe_add_claude_candidate(
     context: &TargetContext,
     path: &Path,
 ) -> Result<()> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading Claude session {}", path.display()))?;
+    let Some(text) = read_jsonl_session_text_if_cwd_matches(
+        path,
+        context,
+        "Claude session",
+        extract_claude_cwd_from_text,
+    )?
+    else {
+        return Ok(());
+    };
     let signals = extract_claude_match_signals(&text);
     if !cwd_matches_target(context, signals.cwd.as_deref()) {
         return Ok(());
@@ -1341,8 +1365,15 @@ fn maybe_add_codex_candidate(
     context: &TargetContext,
     path: &Path,
 ) -> Result<()> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("reading Codex session {}", path.display()))?;
+    let Some(text) = read_jsonl_session_text_if_cwd_matches(
+        path,
+        context,
+        "Codex session",
+        extract_codex_cwd_from_text,
+    )?
+    else {
+        return Ok(());
+    };
     let signals = extract_codex_match_signals(&text);
     if !cwd_matches_target(context, signals.cwd.as_deref()) {
         return Ok(());
@@ -1570,10 +1601,119 @@ fn normalize_relative_path(raw: &str, root: &Path) -> String {
         .replace('\\', "/")
 }
 
+fn extract_claude_cwd_from_text(text: &str) -> Option<PathBuf> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if let Some(cwd) = value.get("cwd").and_then(serde_json::Value::as_str) {
+            return Some(PathBuf::from(cwd));
+        }
+    }
+    None
+}
+
+fn extract_codex_cwd_from_text(text: &str) -> Option<PathBuf> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("session_meta")
+            && let Some(cwd) = value
+                .get("payload")
+                .and_then(|payload| payload.get("cwd"))
+                .and_then(serde_json::Value::as_str)
+        {
+            return Some(PathBuf::from(cwd));
+        }
+    }
+    None
+}
+
+fn read_jsonl_session_text_if_cwd_matches(
+    path: &Path,
+    context: &TargetContext,
+    label: &str,
+    extract_cwd: fn(&str) -> Option<PathBuf>,
+) -> Result<Option<String>> {
+    let file =
+        fs::File::open(path).with_context(|| format!("reading {label} {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut header = String::new();
+    let mut line = String::new();
+    let mut cwd: Option<PathBuf> = None;
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .with_context(|| format!("reading {label} {}", path.display()))?;
+        if bytes == 0 {
+            break;
+        }
+        header.push_str(&line);
+        cwd = extract_cwd(&header);
+        if cwd.is_some() || header.len() >= SESSION_HEADER_PROBE_BUDGET_BYTES {
+            break;
+        }
+    }
+    if !cwd_matches_target(context, cwd.as_deref()) {
+        return Ok(None);
+    }
+    let mut rest = String::new();
+    reader
+        .read_to_string(&mut rest)
+        .with_context(|| format!("reading {label} {}", path.display()))?;
+    header.push_str(&rest);
+    Ok(Some(header))
+}
+
 fn collect_files_with_extension(root: &Path, extension: &str) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_files_with_extension_inner(root, extension, &mut files)?;
     Ok(files)
+}
+
+fn collect_recent_files_with_extension(
+    root: &Path,
+    extension: &str,
+    limit: usize,
+) -> Result<Vec<PathBuf>> {
+    let mut entries: Vec<(Option<u64>, PathBuf)> = Vec::new();
+    collect_recent_files_with_extension_inner(root, extension, &mut entries)?;
+    entries.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    entries.truncate(limit);
+    Ok(entries.into_iter().map(|(_, path)| path).collect())
+}
+
+fn collect_recent_files_with_extension_inner(
+    root: &Path,
+    extension: &str,
+    entries: &mut Vec<(Option<u64>, PathBuf)>,
+) -> Result<()> {
+    for entry in fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_recent_files_with_extension_inner(&path, extension, entries)?;
+        } else if path.extension().and_then(|value| value.to_str()) == Some(extension) {
+            let modified = file_modified_unix_secs(&path).unwrap_or(None);
+            entries.push((modified, path));
+        }
+    }
+    Ok(())
 }
 
 fn collect_files_with_extension_inner(
@@ -1718,6 +1858,92 @@ fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collect_recent_files_with_extension_caps_and_sorts_by_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            let path = dir.path().join(format!("session-{i:02}.jsonl"));
+            fs::write(&path, format!("{{\"i\":{i}}}\n")).unwrap();
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let modified = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000 + i as u64 * 60);
+            file.set_modified(modified).unwrap();
+        }
+        fs::write(dir.path().join("ignored.txt"), "skip me").unwrap();
+
+        let recent = collect_recent_files_with_extension(dir.path(), "jsonl", 3).unwrap();
+        assert_eq!(recent.len(), 3, "should cap at 3 entries");
+        let names: Vec<String> = recent
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "session-09.jsonl".to_string(),
+                "session-08.jsonl".to_string(),
+                "session-07.jsonl".to_string(),
+            ],
+            "should return newest-first by mtime"
+        );
+
+        let all = collect_recent_files_with_extension(dir.path(), "jsonl", 100).unwrap();
+        assert_eq!(
+            all.len(),
+            10,
+            "limit above population should return everything"
+        );
+        assert!(
+            !all.iter()
+                .any(|p| p.extension().and_then(|s| s.to_str()) == Some("txt")),
+            "non-matching extensions must be filtered: {all:?}"
+        );
+    }
+
+    #[test]
+    fn read_jsonl_session_text_if_cwd_matches_skips_non_matching_files_without_full_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_root = dir.path().canonicalize().unwrap();
+        let target = target_root.join("plan.md");
+        fs::create_dir(target_root.join(".git")).unwrap();
+        fs::write(&target, "---\nagent_doc_session: x\n---\n").unwrap();
+        let context = build_target_context(&target).unwrap();
+
+        let matching = dir.path().join("matching.jsonl");
+        let matching_cwd = target_root.display().to_string();
+        let matching_body = format!(
+            "{{\"cwd\":\"{matching_cwd}\"}}\n{}\n",
+            "x".repeat(64 * 1024)
+        );
+        fs::write(&matching, &matching_body).unwrap();
+
+        let other = dir.path().join("other.jsonl");
+        fs::write(
+            &other,
+            format!(
+                "{{\"cwd\":\"/tmp/other-project-{}\"}}\n{}\n",
+                std::process::id(),
+                "y".repeat(64 * 1024)
+            ),
+        )
+        .unwrap();
+
+        let matched =
+            read_jsonl_session_text_if_cwd_matches(&matching, &context, "test", extract_claude_cwd_from_text)
+                .unwrap();
+        assert!(
+            matched.is_some(),
+            "file with matching cwd should return Some(text)"
+        );
+        let skipped =
+            read_jsonl_session_text_if_cwd_matches(&other, &context, "test", extract_claude_cwd_from_text)
+                .unwrap();
+        assert!(
+            skipped.is_none(),
+            "file with non-matching cwd should return None"
+        );
+    }
 
     #[test]
     fn session_review_discovers_cross_harness_logs_for_doc_target() {

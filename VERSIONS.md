@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.44
+
+- `session_review` discovery now stat-walks Claude JSONL and Codex JSONL directories and only reads content for at most `MAX_RECENT_CANDIDATES_PER_SOURCE=64` newest files per source, and the per-file read is header-gated: a `BufReader` extracts the harness-specific `cwd` from the first 256 KB so files whose cwd does not match the target are skipped before any full read. Measured against agent-loop's ~2 GB / 2323-file Codex history and ~1.5 K Claude sessions, `conflict_matrix_preparation.session_review_compute.session_discovery` median drops from 3562 ms to 154 ms (-96%), `session_review_compute` parent drops from 3719 ms to 272 ms (-93%), and `conflict_matrix_preparation` overall drops from 5888 ms to 2148 ms (-64%), measured with `tsift graph-db --json backend-eval` three-sample medians on agent-loop using the new 0.1.43 sub-phase timers.
+
 ## 0.1.43
 
 - `session_review_compute` now reports `target_context_build`, `session_discovery`, `session_digest_total`, `session_cost_total`, `session_aggregation`, and `report_assembly` sub-phases under `conflict_matrix_preparation.session_review_compute.<sub>` so the dominant preparation hotspot can be resolved at sub-phase granularity instead of as one 3.3–4.6 s opaque cost. Cache-hit reports also surface the same sub-phases as `0us` skipped with the source/document/staged-diff watermark guard, and the graph-db conformance suite asserts the sub-phases exist on cold runs and stay within 50 ms instrumentation slack of the parent phase.
