@@ -12254,19 +12254,31 @@ fn push_traversal_metadata_watermark_part(
     }
 }
 
+fn traversal_relative_path_is_generated_artifact(relative: &str) -> bool {
+    let relative = relative.trim_start_matches("./").replace('\\', "/");
+    relative == ".tsift"
+        || relative.starts_with(".tsift/")
+        || relative.ends_with("/.tsift")
+        || relative.contains("/.tsift/")
+        || relative == "target"
+        || relative.starts_with("target/")
+        || relative.contains("/target/")
+}
+
 fn traversal_path_is_generated_artifact(root: &Path, source_root: &Path, path: &Path) -> bool {
-    [source_root, root].iter().any(|base| {
-        path.strip_prefix(base)
-            .ok()
-            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-            .is_some_and(|relative| {
-                relative == ".tsift"
-                    || relative.starts_with(".tsift/")
-                    || relative == "target"
-                    || relative.starts_with("target/")
-                    || relative.contains("/target/")
-            })
-    })
+    let mut relatives = Vec::new();
+    if let Ok(relative) = path.strip_prefix(source_root) {
+        relatives.push(relative.to_string_lossy().replace('\\', "/"));
+    }
+    if let Ok(relative) = path.strip_prefix(root) {
+        relatives.push(relative.to_string_lossy().replace('\\', "/"));
+    }
+    if !path.is_absolute() {
+        relatives.push(path.to_string_lossy().replace('\\', "/"));
+    }
+    relatives
+        .iter()
+        .any(|relative| traversal_relative_path_is_generated_artifact(relative))
 }
 
 fn traversal_index_snapshot_part_is_generated(root: &Path, source_root: &Path, part: &str) -> bool {
@@ -12820,6 +12832,13 @@ fn build_traversal_graph_source_with_options(
                 let file_paths = db.file_paths()?;
                 let mut file_handle_by_path = HashMap::<String, String>::new();
                 for file in file_paths {
+                    if traversal_path_is_generated_artifact(
+                        root,
+                        &gate.source_root,
+                        Path::new(&file),
+                    ) {
+                        continue;
+                    }
                     let node = traversal_file_node(root, &file);
                     let entry = TraversalFileIndexEntry {
                         handle: node.handle.clone(),
@@ -12836,7 +12855,13 @@ fn build_traversal_graph_source_with_options(
                 let symbols = db.all_symbols()?;
                 let mut symbol_by_file_name_line = HashMap::new();
                 let mut first_symbol_by_name = BTreeMap::<String, String>::new();
-                for symbol in &symbols {
+                for symbol in symbols.iter().filter(|symbol| {
+                    !traversal_path_is_generated_artifact(
+                        root,
+                        &gate.source_root,
+                        Path::new(&symbol.file),
+                    )
+                }) {
                     let node = traversal_symbol_node(root, symbol);
                     let file = relativize(&symbol.file, root);
                     symbol_by_file_name_line.insert(
@@ -12865,6 +12890,13 @@ fn build_traversal_graph_source_with_options(
                 }
 
                 for edge in db.all_stored_edges()? {
+                    if traversal_path_is_generated_artifact(
+                        root,
+                        &gate.source_root,
+                        Path::new(&edge.caller_file),
+                    ) {
+                        continue;
+                    }
                     let caller_file = relativize(&edge.caller_file, root);
                     let caller_key =
                         format!("{caller_file}:{}:{}", edge.caller_line, edge.caller_name);
@@ -12891,6 +12923,13 @@ fn build_traversal_graph_source_with_options(
                 }
 
                 for route in db.all_routes()? {
+                    if traversal_path_is_generated_artifact(
+                        root,
+                        &gate.source_root,
+                        Path::new(&route.file),
+                    ) {
+                        continue;
+                    }
                     let node = traversal_route_node(root, &route);
                     let entry = TraversalRouteIndexEntry {
                         handle: node.handle.clone(),

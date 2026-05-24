@@ -209,6 +209,55 @@ fn init_git_repo(path: &Path) {
     assert!(status.success(), "git commit failed");
 }
 
+fn seed_conflict_matrix_cache_index_artifact(path: &Path) -> String {
+    let artifact = ".tsift/conflict-matrix-cache/generated.rs";
+    let artifact_path = path.join(artifact);
+    fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+    fs::write(&artifact_path, "fn cache_artifact_symbol() {}\n").unwrap();
+
+    let conn = Connection::open(path.join(".tsift/index.db")).unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO file_state (path, mtime_secs, mtime_nanos, language)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![artifact, 1_i64, 0_i64, "rust"],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO symbols (name, kind, language, signature, file, line, end_line, parent_module, visibility, tags)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL)",
+        rusqlite::params![
+            "cache_artifact_symbol",
+            "function",
+            "rust",
+            "fn cache_artifact_symbol()",
+            artifact,
+            1_i64,
+            1_i64
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO call_edges (caller_file, caller_name, caller_line, callee_name, call_site_line)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![artifact, "cache_artifact_symbol", 1_i64, "helper", 1_i64],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO route_nodes (framework, method, route_path, handler_name, file, line, handler_line)
+         VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            "test",
+            "/cache-artifact",
+            "cache_artifact_symbol",
+            artifact,
+            1_i64,
+            1_i64
+        ],
+    )
+    .unwrap();
+    artifact.to_string()
+}
+
 fn graph_db_path(project: &Path) -> PathBuf {
     project.join(".tsift/graph.db")
 }
@@ -340,6 +389,23 @@ fn node_ids(report: &Value) -> Vec<String> {
         .iter()
         .map(|node| node["id"].as_str().unwrap().to_string())
         .collect()
+}
+
+fn graph_db_nodes_empty(report: &Value) -> bool {
+    report["node"].is_null()
+        && report["nodes"]
+            .as_array()
+            .is_none_or(|nodes| nodes.is_empty())
+}
+
+fn phase_detail<'a>(report: &'a Value, phase: &str) -> &'a str {
+    report["phase_timings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == phase)
+        .and_then(|entry| entry["detail"].as_str())
+        .unwrap_or_else(|| panic!("missing phase {phase}: {report}"))
 }
 
 fn edge_keys(report: &Value) -> Vec<String> {
@@ -1319,6 +1385,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
     let project = graph_db_project();
     init_git_repo(project.path());
     let session = project.path().join("tasks/software/tsift.md");
+    let cache_artifact_path = seed_conflict_matrix_cache_index_artifact(project.path());
 
     let backend_eval_args = || {
         vec![
@@ -1761,6 +1828,38 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                 .contains("full_projection conflict-matrix")),
         "{report}"
     );
+    let artifact_file_query = graph_db_json(
+        &session,
+        Backend::Sqlite,
+        vec![
+            "kind".to_string(),
+            "file".to_string(),
+            "--property".to_string(),
+            format!("path={cache_artifact_path}"),
+            "--limit".to_string(),
+            "1".to_string(),
+        ],
+    );
+    assert!(
+        graph_db_nodes_empty(&artifact_file_query),
+        "conflict-matrix cache artifacts must not become indexed graph file inputs: {artifact_file_query}"
+    );
+    let artifact_symbol_query = graph_db_json(
+        &session,
+        Backend::Sqlite,
+        vec![
+            "kind".to_string(),
+            "symbol".to_string(),
+            "--property".to_string(),
+            format!("path={cache_artifact_path}"),
+            "--limit".to_string(),
+            "1".to_string(),
+        ],
+    );
+    assert!(
+        graph_db_nodes_empty(&artifact_symbol_query),
+        "conflict-matrix cache artifacts must not become indexed graph symbol inputs: {artifact_symbol_query}"
+    );
     let cached_report = assert_tsift_json(backend_eval_args());
     let cached_source_phase = cached_report["phase_timings"]
         .as_array()
@@ -1790,6 +1889,28 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .iter()
             .any(|entry| entry["name"] == "conflict_matrix_preparation.preparation_cache_lookup"),
         "cached backend-eval should expose preparation cache lookup timing: {cached_report}"
+    );
+    assert!(
+        phase_detail(
+            &cached_report,
+            "conflict_matrix_preparation.preparation_cache_lookup"
+        )
+        .contains(".tsift/conflict-matrix-cache"),
+        "second backend-eval run should hit the conflict-matrix disk cache: {cached_report}"
+    );
+    let third_cached_report = assert_tsift_json(backend_eval_args());
+    assert!(
+        phase_detail(&third_cached_report, "source_graph_build")
+            .contains("reused current graph.db projection"),
+        "{third_cached_report}"
+    );
+    assert!(
+        phase_detail(
+            &third_cached_report,
+            "conflict_matrix_preparation.preparation_cache_lookup"
+        )
+        .contains(".tsift/conflict-matrix-cache"),
+        "third backend-eval run should keep hitting the same conflict-matrix disk cache instead of self-invalidating: {third_cached_report}"
     );
 
     let mut full_projection_args = backend_eval_args();
