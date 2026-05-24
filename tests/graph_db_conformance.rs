@@ -980,6 +980,18 @@ fn assert_sqlite_page_uses_index(page: &Value, index: &str) {
     );
 }
 
+fn assert_sqlite_page_diagnostic_contains(page: &Value, expected: &str) {
+    let diagnostics = page["diagnostics"]
+        .as_array()
+        .expect("page diagnostics should be an array");
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic
+            .as_str()
+            .is_some_and(|raw| raw.contains(expected))),
+        "expected SQLite page diagnostics to mention {expected}, got {diagnostics:?}"
+    );
+}
+
 fn assert_graph_db_snapshot_query_parity(project: &Path, snapshot: &Path) {
     graph_db_json(project, Backend::Sqlite, vec!["refresh".to_string()]);
     let sqlite_schema = graph_db_json(project, Backend::Sqlite, vec!["schema".to_string()]);
@@ -4207,6 +4219,15 @@ fn graph_db_scale_caps_pagination_paths_doctor_and_sqlite_plans() {
     assert_sqlite_page_uses_index(
         &edge_property_scan["page"],
         "idx_graph_edge_properties_key_value_edge",
+    );
+    assert_sqlite_page_uses_index(&edge_property_scan["page"], "idx_graph_edges_edge_key");
+    assert_sqlite_page_diagnostic_contains(
+        &edge_property_scan["page"],
+        "edge property primary filter matched",
+    );
+    assert_sqlite_page_diagnostic_contains(
+        &edge_property_scan["page"],
+        "drives from SQLite materialized property rows",
     );
 }
 

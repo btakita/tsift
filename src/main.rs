@@ -6713,6 +6713,34 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
         Ok(edges.into_iter().next())
     }
 
+    fn sample_edge_with_property(
+        &self,
+    ) -> Result<Option<(SubstrateGraphEdge, GraphPropertyFilter)>> {
+        Ok(self
+            .edges
+            .values()
+            .filter(|edge| edge.from_id != edge.to_id)
+            .filter_map(|edge| {
+                edge.properties.iter().next().map(|(key, value)| {
+                    (
+                        edge,
+                        GraphPropertyFilter {
+                            key: key.clone(),
+                            value: value.clone(),
+                        },
+                    )
+                })
+            })
+            .min_by(|(left_edge, left_filter), (right_edge, right_filter)| {
+                left_filter
+                    .key
+                    .cmp(&right_filter.key)
+                    .then(left_filter.value.cmp(&right_filter.value))
+                    .then_with(|| graph_db_edge_key(left_edge).cmp(&graph_db_edge_key(right_edge)))
+            })
+            .map(|(edge, filter)| (edge.clone(), filter)))
+    }
+
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<SubstrateGraphNode>> {
         Ok(self
             .node_ids_by_kind
@@ -10647,25 +10675,13 @@ fn graph_db_backend_eval_dispatch_signature(report: &DispatchTraceReport) -> ser
 fn graph_db_backend_eval_edge_scan_probe(
     store: &impl GraphStore,
 ) -> Result<(SubstrateGraphEdge, Vec<GraphPropertyFilter>)> {
-    let edges = store.all_edges()?;
-    let edge = edges
-        .iter()
-        .find(|edge| !edge.properties.is_empty())
-        .cloned()
-        .or_else(|| edges.first().cloned())
+    if let Some((edge, filter)) = store.sample_edge_with_property()? {
+        return Ok((edge, vec![filter]));
+    }
+    let edge = store
+        .sample_edge(None)?
         .context("backend-eval edge scan requires at least one edge")?;
-    let filters = edge
-        .properties
-        .iter()
-        .next()
-        .map(|(key, value)| {
-            vec![GraphPropertyFilter {
-                key: key.clone(),
-                value: value.clone(),
-            }]
-        })
-        .unwrap_or_default();
-    Ok((edge, filters))
+    Ok((edge, Vec::new()))
 }
 
 #[allow(clippy::too_many_arguments)]

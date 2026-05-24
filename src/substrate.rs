@@ -414,6 +414,30 @@ pub trait GraphStore {
         });
         Ok(edges.into_iter().next())
     }
+    fn sample_edge_with_property(&self) -> Result<Option<(GraphEdge, GraphPropertyFilter)>> {
+        let mut probes = Vec::new();
+        for edge in self.all_edges()? {
+            if edge.from_id == edge.to_id {
+                continue;
+            }
+            if let Some((key, value)) = edge
+                .properties
+                .iter()
+                .next()
+                .map(|(key, value)| (key.clone(), value.clone()))
+            {
+                probes.push((edge, GraphPropertyFilter { key, value }));
+            }
+        }
+        probes.sort_by(|(left_edge, left_filter), (right_edge, right_filter)| {
+            left_filter
+                .key
+                .cmp(&right_filter.key)
+                .then(left_filter.value.cmp(&right_filter.value))
+                .then_with(|| graph_edge_id(left_edge).cmp(&graph_edge_id(right_edge)))
+        });
+        Ok(probes.into_iter().next())
+    }
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>>;
     fn outgoing_edges(&self, from_id: &str, kind: Option<&str>) -> Result<Vec<GraphEdge>>;
     fn incident_edges(&self, node_id: &str, kind: Option<&str>) -> Result<Vec<GraphEdge>> {
@@ -2659,6 +2683,34 @@ impl GraphStore for SqliteGraphStore {
         }
     }
 
+    fn sample_edge_with_property(&self) -> Result<Option<(GraphEdge, GraphPropertyFilter)>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT e.edge_key, e.from_id, e.to_id, e.kind, e.properties_json, e.provenance_json, e.freshness_json,
+                       ep.key, ep.value
+                FROM graph_edge_properties ep INDEXED BY idx_graph_edge_properties_key_value_edge
+                JOIN graph_edges e INDEXED BY idx_graph_edges_edge_key
+                  ON e.edge_key = ep.edge_key
+                WHERE e.from_id <> e.to_id
+                ORDER BY ep.key, ep.value, ep.edge_key
+                LIMIT 1
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        edge_from_row(row)?,
+                        GraphPropertyFilter {
+                            key: row.get(7)?,
+                            value: row.get(8)?,
+                        },
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>> {
         let mut stmt = self.conn.prepare(
             r#"
@@ -2791,14 +2843,30 @@ impl GraphStore for SqliteGraphStore {
         kind: Option<&str>,
         options: GraphQueryOptions,
     ) -> Result<GraphPagedSubgraph> {
-        let mut sql = String::from(
-            r#"
-            SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
-            FROM graph_edges e
-            WHERE 1 = 1
-            "#,
-        );
+        let primary_property_filter = options.property_filters.first();
         let mut values = Vec::new();
+        let mut sql = if let Some(filter) = primary_property_filter {
+            values.push(Value::Text(filter.key.clone()));
+            values.push(Value::Text(filter.value.clone()));
+            String::from(
+                r#"
+                SELECT e.edge_key, e.from_id, e.to_id, e.kind, e.properties_json, e.provenance_json, e.freshness_json
+                FROM graph_edge_properties ep0 INDEXED BY idx_graph_edge_properties_key_value_edge
+                JOIN graph_edges e INDEXED BY idx_graph_edges_edge_key
+                  ON e.edge_key = ep0.edge_key
+                WHERE ep0.key = ?
+                  AND ep0.value = ?
+                "#,
+            )
+        } else {
+            String::from(
+                r#"
+                SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                FROM graph_edges e
+                WHERE 1 = 1
+                "#,
+            )
+        };
         if let Some(kind) = kind {
             sql.push_str(" AND e.kind = ?");
             values.push(Value::Text(kind.to_string()));
@@ -2807,18 +2875,43 @@ impl GraphStore for SqliteGraphStore {
             &mut sql,
             &mut values,
             "e",
-            &options.property_filters,
+            if primary_property_filter.is_some() {
+                &options.property_filters[1..]
+            } else {
+                &options.property_filters
+            },
         );
         if let Some(cursor) = &options.cursor {
-            sql.push_str(" AND e.edge_key > ?");
+            if primary_property_filter.is_some() {
+                sql.push_str(" AND ep0.edge_key > ?");
+            } else {
+                sql.push_str(" AND e.edge_key > ?");
+            }
             values.push(Value::Text(cursor.clone()));
         }
-        sql.push_str(" ORDER BY e.edge_key");
+        if primary_property_filter.is_some() {
+            sql.push_str(" ORDER BY ep0.edge_key");
+        } else {
+            sql.push_str(" ORDER BY e.edge_key");
+        }
         if let Some(limit) = options.limit {
             sql.push_str(" LIMIT ?");
             values.push(Value::Integer(limit.saturating_add(1) as i64));
         }
 
+        let primary_property_row_count = if let Some(filter) = primary_property_filter {
+            Some(self.conn.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM graph_edge_properties INDEXED BY idx_graph_edge_properties_key_value_edge
+                WHERE key = ?1 AND value = ?2
+                "#,
+                (&filter.key, &filter.value),
+                |row| row.get::<_, usize>(0),
+            )?)
+        } else {
+            None
+        };
         let plan = sqlite_query_plan(&self.conn, &sql, &values)?;
         let mut stmt = self.conn.prepare(&sql)?;
         let mut edges =
@@ -2834,12 +2927,20 @@ impl GraphStore for SqliteGraphStore {
         let expected_indexes = if options.property_filters.is_empty() {
             vec!["idx_graph_edges_edge_key"]
         } else {
-            vec!["idx_graph_edge_properties_key_value_edge"]
+            vec![
+                "idx_graph_edge_properties_key_value_edge",
+                "idx_graph_edges_edge_key",
+            ]
         };
         let mut diagnostics = sqlite_query_plan_diagnostics(&plan, &expected_indexes);
         if !options.property_filters.is_empty() {
+            if let Some(row_count) = primary_property_row_count {
+                diagnostics.push(format!(
+                    "edge property primary filter matched {row_count} materialized row(s) before edge-kind/cursor paging"
+                ));
+            }
             diagnostics.push(
-                "edge property filters were evaluated by SQLite materialized property rows before paging"
+                "edge property scan drives from SQLite materialized property rows before joining graph_edges"
                     .to_string(),
             );
         }
@@ -3786,6 +3887,29 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.contains("idx_graph_edge_properties_key_value_edge")),
+            "{:?}",
+            page.page.diagnostics
+        );
+        assert!(
+            page.page
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("idx_graph_edges_edge_key")),
+            "{:?}",
+            page.page.diagnostics
+        );
+        assert!(
+            page.page.diagnostics.iter().any(|diagnostic| diagnostic
+                .contains("edge property primary filter matched 1 materialized row")),
+            "{:?}",
+            page.page.diagnostics
+        );
+        assert!(
+            page.page
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic
+                    .contains("drives from SQLite materialized property rows")),
             "{:?}",
             page.page.diagnostics
         );
