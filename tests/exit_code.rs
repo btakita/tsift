@@ -786,9 +786,138 @@ fn explain_json_combines_definition_edges_and_community() {
     assert!(callees.iter().any(|edge| edge["callee_name"] == "gamma"));
 
     let community_members = json["community"]["members"].as_array().unwrap();
-    assert!(community_members.iter().any(|member| member == "alpha"));
-    assert!(community_members.iter().any(|member| member == "beta"));
-    assert!(community_members.iter().any(|member| member == "gamma"));
+    let member_names: Vec<&str> = community_members
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert!(member_names.contains(&"alpha"));
+    assert!(member_names.contains(&"beta"));
+    assert!(member_names.contains(&"gamma"));
+    // Without a tagpath index in the fixture, no member should carry a handle.
+    for member in community_members {
+        assert!(
+            member.get("tagpath_handle").is_none(),
+            "unexpected handle in {member}"
+        );
+    }
+    // Definitions/callers/callees stay handle-free without a tagpath index.
+    for def in definitions {
+        assert!(def.get("tagpath_handle").is_none(), "{def}");
+    }
+    for caller in callers {
+        assert!(caller.get("tagpath_handle").is_none(), "{caller}");
+    }
+    for callee in callees {
+        assert!(callee.get("tagpath_handle").is_none(), "{callee}");
+    }
+}
+
+#[test]
+fn explain_json_omits_handles_when_no_tagpath_flag_set() {
+    let dir = indexed_cli_fixture();
+    write_fresh_tagpath_index(dir.path(), &[("alpha", "main.rs"), ("beta", "main.rs")]);
+
+    let output = tsift_bin()
+        .args([
+            "explain",
+            "alpha",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--no-tagpath",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "explain should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for def in json["definitions"].as_array().unwrap() {
+        assert!(
+            def.get("tagpath_handle").is_none(),
+            "--no-tagpath should suppress definition handles: {def}"
+        );
+    }
+    for caller in json["callers"].as_array().unwrap() {
+        assert!(
+            caller.get("tagpath_handle").is_none(),
+            "--no-tagpath should suppress caller handles: {caller}"
+        );
+    }
+    for callee in json["callees"].as_array().unwrap() {
+        assert!(
+            callee.get("tagpath_handle").is_none(),
+            "--no-tagpath should suppress callee handles: {callee}"
+        );
+    }
+    for member in json["community"]["members"].as_array().unwrap() {
+        assert!(
+            member.get("tagpath_handle").is_none(),
+            "--no-tagpath should suppress community handles: {member}"
+        );
+    }
+}
+
+#[test]
+fn explain_json_annotates_definitions_edges_and_community_when_index_is_fresh() {
+    let dir = indexed_cli_fixture();
+    let members: Vec<(&str, &str)> = vec![
+        ("alpha", "main.rs"),
+        ("beta", "main.rs"),
+        ("gamma", "main.rs"),
+        ("main", "main.rs"),
+    ];
+    write_fresh_tagpath_index(dir.path(), &members);
+
+    let output = tsift_bin()
+        .args(["explain", "alpha", dir.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "explain should succeed (stderr={})",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let definitions = json["definitions"].as_array().unwrap();
+    assert!(!definitions.is_empty());
+    for def in definitions {
+        let name = def["name"].as_str().unwrap();
+        let handle = def["tagpath_handle"]
+            .as_str()
+            .unwrap_or_else(|| panic!("definition {name} missing tagpath_handle"));
+        assert!(handle.starts_with("mem:"), "{name}: {handle}");
+    }
+
+    let callers = json["callers"].as_array().unwrap();
+    assert!(!callers.is_empty());
+    for caller in callers {
+        let caller_name = caller["caller_name"].as_str().unwrap();
+        let handle = caller["tagpath_handle"]
+            .as_str()
+            .unwrap_or_else(|| panic!("caller {caller_name} missing tagpath_handle"));
+        assert!(handle.starts_with("mem:"), "{caller_name}: {handle}");
+    }
+
+    let callees = json["callees"].as_array().unwrap();
+    assert!(!callees.is_empty());
+    for callee in callees {
+        let callee_name = callee["callee_name"].as_str().unwrap();
+        let handle = callee["tagpath_handle"]
+            .as_str()
+            .unwrap_or_else(|| panic!("callee {callee_name} missing tagpath_handle"));
+        assert!(handle.starts_with("mem:"), "{callee_name}: {handle}");
+    }
+
+    let community_members = json["community"]["members"].as_array().unwrap();
+    assert!(!community_members.is_empty());
+    for member in community_members {
+        let name = member["name"].as_str().unwrap();
+        let handle = member["tagpath_handle"]
+            .as_str()
+            .unwrap_or_else(|| panic!("community member {name} missing tagpath_handle"));
+        assert!(handle.starts_with("mem:"), "{name}: {handle}");
+    }
 }
 
 #[test]

@@ -322,6 +322,10 @@ pub struct StoredSymbol {
     pub parent_module: Option<String>,
     pub visibility: Option<String>,
     pub tags: Option<String>,
+    /// Optional `mem:` handle for the symbol when a fresh tagpath index is
+    /// available at the project root. See `tagpath::SPEC.md` §15.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tagpath_handle: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -331,6 +335,12 @@ pub struct StoredEdge {
     pub caller_line: i64,
     pub callee_name: String,
     pub call_site_line: i64,
+    /// `mem:` handle for the row symbol when a fresh tagpath index is
+    /// available. Populated by consumers (e.g. `cmd_explain`); the index
+    /// layer itself never writes this field. For caller rows the handle
+    /// names the caller; for callee rows it names the callee.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tagpath_handle: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1106,6 +1116,7 @@ impl IndexDb {
                 parent_module: row.get(7)?,
                 visibility: row.get(8)?,
                 tags: row.get(9)?,
+                tagpath_handle: None,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1145,6 +1156,7 @@ impl IndexDb {
                 parent_module: row.get(7)?,
                 visibility: row.get(8)?,
                 tags: row.get(9)?,
+                tagpath_handle: None,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1162,6 +1174,7 @@ impl IndexDb {
                 caller_line: row.get(2)?,
                 callee_name: row.get(3)?,
                 call_site_line: row.get(4)?,
+                tagpath_handle: None,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1202,6 +1215,7 @@ impl IndexDb {
                 parent_module: row.get(7)?,
                 visibility: row.get(8)?,
                 tags: row.get(9)?,
+                tagpath_handle: None,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1218,6 +1232,7 @@ impl IndexDb {
                 caller_line: row.get(2)?,
                 callee_name: row.get(3)?,
                 call_site_line: row.get(4)?,
+                tagpath_handle: None,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1234,6 +1249,7 @@ impl IndexDb {
                 caller_line: row.get(2)?,
                 callee_name: row.get(3)?,
                 call_site_line: row.get(4)?,
+                tagpath_handle: None,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

@@ -338,6 +338,13 @@ enum Commands {
         /// Named preview budget preset (auto adapts from context-window env vars)
         #[arg(long, value_enum)]
         budget: Option<ResponseBudgetPreset>,
+        /// Skip tagpath index lookup (do not annotate hits with `tagpath_handle`).
+        #[arg(long)]
+        no_tagpath: bool,
+        /// Fail closed when a tagpath index is present but stale, instead of
+        /// emitting a stale diagnostic and falling back silently.
+        #[arg(long)]
+        tagpath_strict: bool,
     },
     /// Build a Graphify-style traversal graph for files, symbols, sessions, and backlog items
     Traverse {
@@ -1569,6 +1576,8 @@ fn main() -> Result<()> {
             max_items,
             max_bytes,
             budget,
+            no_tagpath,
+            tagpath_strict,
         }) => cmd_explain_with_budget(
             &symbol,
             &path,
@@ -1583,6 +1592,10 @@ fn main() -> Result<()> {
             schema,
             envelope,
             ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
+            TagpathSearchOpts {
+                no_tagpath,
+                strict: tagpath_strict,
+            },
         ),
         Some(Commands::Traverse {
             node,
@@ -3388,6 +3401,213 @@ pub fn annotate_hits_with_tagpath(
             })
         }
         tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
+    }
+}
+
+/// Resolve a per-symbol-name `tagpath_handle` map for a batch of symbol
+/// names against a fresh tagpath index. Names whose definition file is not
+/// present in the index, or which have no matching handle, are simply
+/// absent from the returned map. `db.symbol_info` (first definition wins)
+/// supplies the file used for handle resolution when `file_hint` is `None`.
+fn resolve_tagpath_handles_for_names(
+    names: &[String],
+    db: &index::IndexDb,
+    root: &std::path::Path,
+    adapter: &tagpath_adapter::TagpathAdapter,
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Ok(syms) = db.symbol_info(name) else {
+            continue;
+        };
+        let Some(sym) = syms.into_iter().next() else {
+            continue;
+        };
+        let abs = if std::path::Path::new(&sym.file).is_absolute() {
+            std::path::PathBuf::from(&sym.file)
+        } else {
+            root.join(&sym.file)
+        };
+        if let Some(handle) = adapter.handle_for_member(&abs, name) {
+            out.insert(name.clone(), handle);
+        }
+    }
+    out
+}
+
+/// Annotate `StoredSymbol` definitions in-place with `tagpath_handle` when
+/// a fresh tagpath index is present at `root`. Same fallback matrix as
+/// [`annotate_hits_with_tagpath`].
+pub fn annotate_stored_symbols_with_tagpath(
+    symbols: &mut [index::StoredSymbol],
+    root: &std::path::Path,
+    opts: &TagpathSearchOpts,
+) -> Result<TagpathAnnotationDiagnostic> {
+    if opts.no_tagpath {
+        return Ok(TagpathAnnotationDiagnostic::default());
+    }
+    match tagpath_adapter::try_load(root) {
+        tagpath_adapter::LoadResult::Loaded(adapter) => {
+            for sym in symbols.iter_mut() {
+                let abs = if std::path::Path::new(&sym.file).is_absolute() {
+                    std::path::PathBuf::from(&sym.file)
+                } else {
+                    root.join(&sym.file)
+                };
+                if let Some(handle) = adapter.handle_for_member(&abs, &sym.name) {
+                    sym.tagpath_handle = Some(handle);
+                }
+            }
+            Ok(TagpathAnnotationDiagnostic {
+                stale: false,
+                reason: None,
+                loaded: true,
+            })
+        }
+        tagpath_adapter::LoadResult::Stale { reason, .. } => {
+            if opts.strict {
+                anyhow::bail!(
+                    "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
+                );
+            }
+            Ok(TagpathAnnotationDiagnostic {
+                stale: true,
+                reason: Some(reason),
+                loaded: false,
+            })
+        }
+        tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
+    }
+}
+
+/// Annotate `StoredEdge` rows in-place with `tagpath_handle` from the
+/// tagpath index. The handle names whichever endpoint the consumer cares
+/// about: pass `EdgeSide::Caller` for caller rows (uses `caller_file` +
+/// `caller_name` directly) and `EdgeSide::Callee` for callee rows
+/// (resolves the callee's definition file via `db.symbol_info`).
+pub fn annotate_stored_edges_with_tagpath(
+    edges: &mut [index::StoredEdge],
+    db: &index::IndexDb,
+    root: &std::path::Path,
+    side: EdgeSide,
+    opts: &TagpathSearchOpts,
+) -> Result<TagpathAnnotationDiagnostic> {
+    if opts.no_tagpath {
+        return Ok(TagpathAnnotationDiagnostic::default());
+    }
+    match tagpath_adapter::try_load(root) {
+        tagpath_adapter::LoadResult::Loaded(adapter) => {
+            match side {
+                EdgeSide::Caller => {
+                    for edge in edges.iter_mut() {
+                        let abs = if std::path::Path::new(&edge.caller_file).is_absolute() {
+                            std::path::PathBuf::from(&edge.caller_file)
+                        } else {
+                            root.join(&edge.caller_file)
+                        };
+                        if let Some(handle) =
+                            adapter.handle_for_member(&abs, &edge.caller_name)
+                        {
+                            edge.tagpath_handle = Some(handle);
+                        }
+                    }
+                }
+                EdgeSide::Callee => {
+                    let names: Vec<String> = edges
+                        .iter()
+                        .map(|edge| edge.callee_name.clone())
+                        .collect();
+                    let map = resolve_tagpath_handles_for_names(&names, db, root, &adapter);
+                    for edge in edges.iter_mut() {
+                        if let Some(handle) = map.get(&edge.callee_name) {
+                            edge.tagpath_handle = Some(handle.clone());
+                        }
+                    }
+                }
+            }
+            Ok(TagpathAnnotationDiagnostic {
+                stale: false,
+                reason: None,
+                loaded: true,
+            })
+        }
+        tagpath_adapter::LoadResult::Stale { reason, .. } => {
+            if opts.strict {
+                anyhow::bail!(
+                    "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
+                );
+            }
+            Ok(TagpathAnnotationDiagnostic {
+                stale: true,
+                reason: Some(reason),
+                loaded: false,
+            })
+        }
+        tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
+    }
+}
+
+/// Which endpoint of a `StoredEdge` is the row's primary symbol — caller
+/// (caller list) or callee (callee list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeSide {
+    Caller,
+    Callee,
+}
+
+/// Resolve `tagpath_handle` for each community member name. Members
+/// without a matching handle (or with no tagpath adapter loaded) are
+/// returned as `None`. Used by `cmd_explain` to enrich the community
+/// section of the JSON response without changing `graph::Community`'s
+/// stable shape used by the standalone `tsift communities` command.
+pub fn resolve_community_member_handles(
+    members: &[String],
+    db: &index::IndexDb,
+    root: &std::path::Path,
+    opts: &TagpathSearchOpts,
+) -> Result<(Vec<Option<String>>, TagpathAnnotationDiagnostic)> {
+    if opts.no_tagpath {
+        return Ok((
+            vec![None; members.len()],
+            TagpathAnnotationDiagnostic::default(),
+        ));
+    }
+    match tagpath_adapter::try_load(root) {
+        tagpath_adapter::LoadResult::Loaded(adapter) => {
+            let map = resolve_tagpath_handles_for_names(members, db, root, &adapter);
+            let handles = members.iter().map(|m| map.get(m).cloned()).collect();
+            Ok((
+                handles,
+                TagpathAnnotationDiagnostic {
+                    stale: false,
+                    reason: None,
+                    loaded: true,
+                },
+            ))
+        }
+        tagpath_adapter::LoadResult::Stale { reason, .. } => {
+            if opts.strict {
+                anyhow::bail!(
+                    "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
+                );
+            }
+            Ok((
+                vec![None; members.len()],
+                TagpathAnnotationDiagnostic {
+                    stale: true,
+                    reason: Some(reason),
+                    loaded: false,
+                },
+            ))
+        }
+        tagpath_adapter::LoadResult::Missing => Ok((
+            vec![None; members.len()],
+            TagpathAnnotationDiagnostic::default(),
+        )),
     }
 }
 
@@ -15302,6 +15522,7 @@ fn cmd_explain(
         schema,
         false,
         ResponseBudget::default(),
+        TagpathSearchOpts::default(),
     )
 }
 
@@ -15320,6 +15541,7 @@ fn cmd_explain_with_budget(
     schema: bool,
     envelope: bool,
     budget: ResponseBudget,
+    tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     let format = OutputFormat {
@@ -15335,6 +15557,35 @@ fn cmd_explain_with_budget(
     let mut symbols = db.symbol_info(symbol)?;
     let mut callers = db.callers_of(symbol)?;
     let mut callees = db.callees_of(symbol)?;
+
+    // Annotate against absolute paths so the tagpath adapter can resolve
+    // each symbol's source file. Relativization happens after annotation.
+    let def_diag = annotate_stored_symbols_with_tagpath(&mut symbols, &root, &tagpath_opts)?;
+    let caller_diag = annotate_stored_edges_with_tagpath(
+        &mut callers,
+        &db,
+        &root,
+        EdgeSide::Caller,
+        &tagpath_opts,
+    )?;
+    let callee_diag = annotate_stored_edges_with_tagpath(
+        &mut callees,
+        &db,
+        &root,
+        EdgeSide::Callee,
+        &tagpath_opts,
+    )?;
+    let tagpath_stale = def_diag.stale || caller_diag.stale || callee_diag.stale;
+    let tagpath_stale_reason = def_diag
+        .reason
+        .or(caller_diag.reason)
+        .or(callee_diag.reason);
+    if tagpath_stale && !tagpath_opts.no_tagpath {
+        eprintln!(
+            "tagpath_index_stale: true (reason={}); falling back to live extraction",
+            tagpath_stale_reason.as_deref().unwrap_or("unknown"),
+        );
+    }
     if !absolute {
         relativize_symbols(&mut symbols, &root);
         relativize_edges(&mut callers, &root);
@@ -15401,6 +15652,37 @@ fn cmd_explain_with_budget(
             print_explain_budget_human(&report);
         }
     } else if format.json_output {
+        let community_json = match community {
+            Some(comm) => {
+                let (handles, comm_diag) = resolve_community_member_handles(
+                    &comm.members,
+                    &db,
+                    &root,
+                    &tagpath_opts,
+                )?;
+                if comm_diag.stale && !tagpath_opts.no_tagpath && !tagpath_stale {
+                    eprintln!(
+                        "tagpath_index_stale: true (reason={}); falling back to live extraction",
+                        comm_diag.reason.as_deref().unwrap_or("unknown"),
+                    );
+                }
+                let members: Vec<serde_json::Value> = comm
+                    .members
+                    .iter()
+                    .zip(handles)
+                    .map(|(name, handle)| match handle {
+                        Some(h) => serde_json::json!({"name": name, "tagpath_handle": h}),
+                        None => serde_json::json!({"name": name}),
+                    })
+                    .collect();
+                serde_json::json!({
+                    "id": comm.id,
+                    "members": members,
+                    "modularity_contribution": comm.modularity_contribution,
+                })
+            }
+            None => serde_json::Value::Null,
+        };
         let out = serde_json::json!({
             "symbol": symbol,
             "definitions": symbols,
@@ -15410,7 +15692,7 @@ fn cmd_explain_with_budget(
             "callees": callees,
             "callees_total": callees_total,
             "callees_truncated": callees_truncated,
-            "community": community,
+            "community": community_json,
         });
         print_json_or_envelope(
             &out,
@@ -29131,6 +29413,7 @@ def list_items():
                 caller_line: 1,
                 callee_name: "helper".to_string(),
                 call_site_line: 2,
+                tagpath_handle: None,
             },
             index::StoredEdge {
                 caller_file: "src/main.rs".to_string(),
@@ -29138,6 +29421,7 @@ def list_items():
                 caller_line: 1,
                 callee_name: "render".to_string(),
                 call_site_line: 3,
+                tagpath_handle: None,
             },
         ];
         let lines = format_edge_groups(&edges, false);
@@ -29229,6 +29513,7 @@ def list_items():
                 caller_line: 1,
                 callee_name: "helper".to_string(),
                 call_site_line: 2,
+                tagpath_handle: None,
             },
             index::StoredEdge {
                 caller_file: "src/main.rs".to_string(),
@@ -29236,6 +29521,7 @@ def list_items():
                 caller_line: 5,
                 callee_name: "helper".to_string(),
                 call_site_line: 6,
+                tagpath_handle: None,
             },
             index::StoredEdge {
                 caller_file: "src/main.rs".to_string(),
@@ -29243,6 +29529,7 @@ def list_items():
                 caller_line: 9,
                 callee_name: "helper".to_string(),
                 call_site_line: 10,
+                tagpath_handle: None,
             },
         ];
         assert!(should_collapse_edge_groups(&edges));
@@ -32474,6 +32761,7 @@ tier = "private"
             parent_module: None,
             visibility: None,
             tags: None,
+            tagpath_handle: None,
         }];
         let callers = vec![
             index::StoredEdge {
@@ -32482,6 +32770,7 @@ tier = "private"
                 caller_line: 1,
                 callee_name: "alpha_helper".to_string(),
                 call_site_line: 3,
+                tagpath_handle: None,
             },
             index::StoredEdge {
                 caller_file: "src/worker.rs".to_string(),
@@ -32489,6 +32778,7 @@ tier = "private"
                 caller_line: 5,
                 callee_name: "alpha_helper".to_string(),
                 call_site_line: 8,
+                tagpath_handle: None,
             },
         ];
         let community = graph::Community {
@@ -33851,6 +34141,7 @@ tier = "private"
             caller_line: 1,
             callee_name: "helper".to_string(),
             call_site_line: 5,
+            tagpath_handle: None,
         }];
         relativize_edges(&mut edges, root);
         assert_eq!(edges[0].caller_file, "src/main.rs");
