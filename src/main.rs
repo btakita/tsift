@@ -491,6 +491,19 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Reconcile the tsift symbol index against the tagpath `.naming/index.json` source
+    /// set and report files covered by one but not the other.
+    AuditTagpath {
+        /// Path to the project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Restrict the audit to a single workspace scope/submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Lint markdown files — detect unannotated concepts (symbols, headings, bold terms)
     Lint {
         /// Markdown file to lint
@@ -1743,6 +1756,18 @@ fn main() -> Result<()> {
             report,
             json || terse || schema || envelope,
             compact,
+            pretty,
+            terse,
+            schema,
+        ),
+        Some(Commands::AuditTagpath {
+            path,
+            scope,
+            json,
+        }) => cmd_audit_tagpath(
+            &path,
+            scope.as_deref(),
+            json || terse || schema || envelope,
             pretty,
             terse,
             schema,
@@ -16459,6 +16484,192 @@ fn print_explain_budget_human(report: &ExplainBudgetReport) {
             report.max_items, report.max_bytes
         );
     }
+}
+
+/// Reconcile the tsift symbol index against the tagpath `.naming/index.json`
+/// source set and report files covered by one but not the other.
+///
+/// Today silent recall loss happens when tagpath's `[exclude]` / `extends`
+/// chain or its hard-coded `SKIP_DIRS` skip files or languages that tsift
+/// still indexes — the tsift symbols in those files cannot resolve a
+/// `tagpath_handle` even with a fresh tagpath index. This audit surfaces
+/// the diff so operators can decide whether to broaden the tagpath walk,
+/// add an `[exclude]` to tsift, or accept the gap.
+fn cmd_audit_tagpath(
+    path: &std::path::Path,
+    scope: Option<&str>,
+    json_output: bool,
+    pretty: bool,
+    terse: bool,
+    schema: bool,
+) -> Result<()> {
+    let workspace_root = lint::resolve_project_root_or_canonical_path(path)?;
+
+    // Choose the project root for tagpath + the index.db path for tsift
+    // based on whether the caller passed `--scope`. Scoped mode points
+    // both indexes at the submodule.
+    let (tagpath_root, db_path) = if let Some(scope_selector) = scope {
+        let cfg = config::Config::load(&workspace_root)?;
+        let resolved = config::Config::resolve_submodule(&workspace_root, scope_selector)?;
+        let db = cfg.db_path_for(&workspace_root, &resolved.id);
+        (resolved.source_root, db)
+    } else {
+        (workspace_root.clone(), workspace_root.join(".tsift/index.db"))
+    };
+
+    if !db_path.exists() {
+        bail!(
+            "no tsift index found at {}. Run `tsift index` first.",
+            db_path.display()
+        );
+    }
+    let db = index::IndexDb::open_read_only_resilient(&db_path)?;
+
+    // Collect tsift file paths and remember the absolute form so we can
+    // re-query `symbols_for_file` later. Tsift stores absolute paths;
+    // tagpath stores relative-to-root.
+    let mut tsift_abs_by_rel: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut tsift_files: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for raw in db.file_paths()? {
+        let path = std::path::Path::new(&raw);
+        let abs = if path.is_absolute() {
+            std::path::PathBuf::from(&raw)
+        } else {
+            tagpath_root.join(&raw)
+        };
+        let rel = abs
+            .strip_prefix(&tagpath_root)
+            .ok()
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| raw.clone());
+        tsift_files.insert(rel.clone());
+        tsift_abs_by_rel.insert(rel, raw);
+    }
+
+    let load = tagpath_adapter::try_load(&tagpath_root);
+    let (adapter, tagpath_state) = match load {
+        tagpath_adapter::LoadResult::Loaded(adapter) => (Some(adapter), "fresh"),
+        tagpath_adapter::LoadResult::Stale { reason, .. } => {
+            eprintln!(
+                "tagpath_index_stale: true (reason={reason}); audit results reflect the last loaded snapshot",
+            );
+            // Still load the on-disk index so the audit produces useful
+            // output; the staleness is reported in the response.
+            let idx_path = tagpath::index::index_path(&tagpath_root);
+            match tagpath::index::read(&idx_path) {
+                Ok(index) => (
+                    Some(tagpath_adapter::TagpathAdapter {
+                        project_root: tagpath_root.clone(),
+                        index,
+                    }),
+                    "stale",
+                ),
+                Err(_) => (None, "stale_unreadable"),
+            }
+        }
+        tagpath_adapter::LoadResult::Missing => (None, "missing"),
+    };
+
+    let tagpath_files: std::collections::BTreeSet<String> = adapter
+        .as_ref()
+        .map(|a| {
+            a.index
+                .sources
+                .iter()
+                .map(|s| s.path.replace('\\', "/"))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let tsift_only_files: Vec<String> = tsift_files
+        .iter()
+        .filter(|f| !tagpath_files.contains(*f))
+        .cloned()
+        .collect();
+    let tagpath_only_files: Vec<String> = tagpath_files
+        .iter()
+        .filter(|f| !tsift_files.contains(*f))
+        .cloned()
+        .collect();
+
+    // Aggregate tsift symbols whose definition file is in tsift_only_files
+    // (these are the symbols that lose `tagpath_handle` recall today).
+    let mut unindexed_symbol_count: usize = 0;
+    let mut unindexed_files_with_symbols: Vec<(String, usize)> = Vec::new();
+    for rel in &tsift_only_files {
+        let lookup = tsift_abs_by_rel
+            .get(rel)
+            .map(String::as_str)
+            .unwrap_or(rel.as_str());
+        let count = db.symbols_for_file(lookup).map(|v| v.len()).unwrap_or(0);
+        unindexed_symbol_count += count;
+        if count > 0 {
+            unindexed_files_with_symbols.push((rel.clone(), count));
+        }
+    }
+
+    if json_output {
+        let mut value = serde_json::json!({
+            "project_root": tagpath_root.to_string_lossy(),
+            "scope": scope,
+            "tagpath_state": tagpath_state,
+            "tsift_file_count": tsift_files.len(),
+            "tagpath_file_count": tagpath_files.len(),
+            "tsift_only_files": tsift_only_files,
+            "tagpath_only_files": tagpath_only_files,
+            "tsift_only_symbol_count": unindexed_symbol_count,
+            "tsift_only_files_with_symbols": unindexed_files_with_symbols
+                .iter()
+                .map(|(file, count)| serde_json::json!({ "file": file, "symbols": count }))
+                .collect::<Vec<_>>(),
+        });
+        if tagpath_state == "stale" {
+            inject_tagpath_stale_into_json(&mut value, true, Some("stale_snapshot_loaded"));
+        }
+        println!("{}", to_json_schema(&value, pretty, terse, schema)?);
+    } else {
+        println!("tagpath audit for {}", tagpath_root.display());
+        if let Some(scope) = scope {
+            println!("scope: {scope}");
+        }
+        println!("tagpath_state: {tagpath_state}");
+        println!(
+            "tsift files: {} | tagpath files: {}",
+            tsift_files.len(),
+            tagpath_files.len()
+        );
+        if tsift_only_files.is_empty() && tagpath_only_files.is_empty() {
+            println!("✓ tsift and tagpath cover the same source set.");
+        } else {
+            if !tsift_only_files.is_empty() {
+                println!(
+                    "\ntsift-only files ({} files, {} symbols miss tagpath_handle):",
+                    tsift_only_files.len(),
+                    unindexed_symbol_count
+                );
+                for (file, count) in &unindexed_files_with_symbols {
+                    println!("  {file}  ({count} sym{})", if *count == 1 { "" } else { "s" });
+                }
+                for file in &tsift_only_files {
+                    if !unindexed_files_with_symbols.iter().any(|(f, _)| f == file) {
+                        println!("  {file}  (0 syms)");
+                    }
+                }
+            }
+            if !tagpath_only_files.is_empty() {
+                println!(
+                    "\ntagpath-only files ({} files, no tsift symbols extracted):",
+                    tagpath_only_files.len()
+                );
+                for file in &tagpath_only_files {
+                    println!("  {file}");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

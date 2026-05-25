@@ -947,6 +947,92 @@ convention = "PascalCase"
     );
 }
 
+// `tsift audit-tagpath` reports files covered by one walker but not the
+// other so operators can decide whether to broaden tagpath, narrow tsift,
+// or accept the gap. Tagpath skips `__pycache__/` via SKIP_DIRS but tsift
+// indexes it, so a `.rs` file inside `__pycache__/` is a textbook
+// tsift-only file. Conversely, tagpath sources that no longer exist in
+// tsift (e.g. a file extension tsift ignores) show as tagpath-only.
+#[test]
+fn audit_tagpath_reports_walker_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    // tsift indexes both files; tagpath skips __pycache__/.
+    fs::create_dir_all(dir.path().join("__pycache__")).unwrap();
+    fs::write(
+        dir.path().join("__pycache__/lib.rs"),
+        "fn cached_helper() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn helper() {}\nfn caller() { helper(); }\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "tsift index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    write_fresh_tagpath_index(dir.path(), &[("helper", "main.rs")]);
+
+    let output = tsift_bin()
+        .args([
+            "audit-tagpath",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "audit-tagpath stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tagpath_state"], "fresh", "{json}");
+
+    let tsift_only = json["tsift_only_files"]
+        .as_array()
+        .expect("tsift_only_files array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert!(
+        tsift_only.iter().any(|f| f.contains("__pycache__/lib.rs")),
+        "expected __pycache__/lib.rs in tsift-only list: {json}"
+    );
+
+    let unindexed_count = json["tsift_only_symbol_count"]
+        .as_u64()
+        .expect("tsift_only_symbol_count");
+    assert!(
+        unindexed_count >= 1,
+        "expected at least 1 symbol in tsift-only files: {json}"
+    );
+
+    // Files-with-symbols breakdown should list cached_helper's file.
+    let files_with_syms = json["tsift_only_files_with_symbols"]
+        .as_array()
+        .expect("tsift_only_files_with_symbols");
+    assert!(
+        files_with_syms.iter().any(|entry| {
+            entry["file"]
+                .as_str()
+                .is_some_and(|f| f.contains("__pycache__/lib.rs"))
+                && entry["symbols"].as_u64().unwrap_or(0) >= 1
+        }),
+        "expected __pycache__/lib.rs symbol entry: {json}"
+    );
+}
+
 // Regression: stale-index diagnostic surfaces as top-level JSON fields
 // (`tagpath_index_stale: true` + `tagpath_stale_reason`) on every command
 // that previously emitted the signal only on stderr, so structured
