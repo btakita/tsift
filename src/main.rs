@@ -33765,6 +33765,43 @@ tier = "private"
         );
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn traversal_excludes_agent_doc_runtime_paths_from_source_watermark() {
+        // #gdbcacheprove: .agent-doc runtime markdown (snapshots, baselines, archives,
+        // session docs, runtime logs) must not contribute to the source watermark, or
+        // every agent-doc cycle would invalidate the graph-db backend-eval cache and
+        // force a full rebuild on the next run.
+        let cases = [
+            ".agent-doc",
+            ".agent-doc/snapshots/abc.md",
+            ".agent-doc/baselines/abc.md",
+            ".agent-doc/archives/2026.md",
+            ".agent-doc/runtime/run.jsonl",
+            "src/foo/.agent-doc",
+            "src/foo/.agent-doc/snapshots/x.md",
+            "./.agent-doc/snapshots/x.md",
+        ];
+        for path in cases {
+            assert!(
+                traversal_relative_path_is_generated_artifact(path),
+                "expected `{path}` to be excluded from source watermark"
+            );
+        }
+        // Real source paths must NOT be excluded.
+        for path in [
+            "src/main.rs",
+            "tests/perf_gate.rs",
+            "fixtures/x.json",
+            "agent-doc/src/lib.rs", // sibling dir without the leading dot
+            "src/.agent-doc-helper.rs",
+        ] {
+            assert!(
+                !traversal_relative_path_is_generated_artifact(path),
+                "expected `{path}` to be included in source watermark"
+            );
+        }
+    }
 }
 
 // --- SQL introspection ---
