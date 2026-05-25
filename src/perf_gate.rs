@@ -1,0 +1,687 @@
+//! Graph DB performance release gate.
+//!
+//! Turns repeated `tsift graph-db backend-eval` samples (recorded in
+//! `fixtures/graph-db-performance-history.json`) into a binding promotion
+//! decision for candidate `GraphStore` backends.
+//!
+//! Spec: see SPEC.md § "Graph DB Performance Release Gate".
+//!
+//! Four required workloads (canonical fixture prefix → human gate name):
+//!
+//! | Fixture metric prefix     | Gate workload name |
+//! |---------------------------|--------------------|
+//! | `real`                    | `default`          |
+//! | `full_projection`         | `full-projection`  |
+//! | `synthetic_high_degree`   | `high-degree`      |
+//! | `synthetic_deep_chain`    | `deep-chain`       |
+//!
+//! Promotion rule: a candidate backend (FalkorDB, Kuzu, DuckDB/DuckPGQ,
+//! Ladybug, ...) stays blocked until it beats the stabilized SQLite gate on
+//! **every** workload across **every** required metric — including
+//! `refresh.duration_micros` (projection write cost) and any
+//! `lock_wait_micros` / `lock_contention_micros` metric where applicable.
+//!
+//! At least three samples per workload are required before the gate emits a
+//! binding promote/block call.
+
+use anyhow::{Context, Result, bail};
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+/// SQLite is the stabilized baseline backend; every candidate must beat it.
+pub const BASELINE_BACKEND: &str = "sqlite";
+
+/// Minimum number of samples per workload before the gate's decision is binding.
+pub const MIN_SAMPLES_PER_WORKLOAD: usize = 3;
+
+/// Fixture metric prefixes for the four required gate workloads, in canonical
+/// fixture order.
+pub const GATE_WORKLOAD_PREFIXES: [&str; 4] = [
+    "real",
+    "full_projection",
+    "synthetic_high_degree",
+    "synthetic_deep_chain",
+];
+
+/// Mapping from fixture metric prefix to the human-readable gate workload
+/// name used in SPEC and operator-facing diagnostics.
+pub fn workload_display_name(prefix: &str) -> &'static str {
+    match prefix {
+        "real" => "default",
+        "full_projection" => "full-projection",
+        "synthetic_high_degree" => "high-degree",
+        "synthetic_deep_chain" => "deep-chain",
+        _ => "unknown",
+    }
+}
+
+/// Per-operation metrics that the gate considers binding on every workload.
+/// `refresh.duration_micros` is the projection write cost; SQLite's bundled
+/// install and lock behavior cannot be sacrificed for a faster read path on
+/// any other operation.
+pub const REQUIRED_GATE_METRICS: [&str; 2] = [
+    "refresh.duration_micros",
+    "total_duration_micros",
+];
+
+/// Lock-behavior metrics. If any candidate produces a lock-wait metric on a
+/// workload it must also be ≤ SQLite's median for that metric. Absent
+/// lock-wait metrics are not by themselves a block — sibling agents are still
+/// wiring projection-write lock instrumentation, and the gate refuses to
+/// invent evidence.
+pub const LOCK_BEHAVIOR_METRIC_SUFFIXES: [&str; 2] = [
+    "lock_wait_micros",
+    "lock_contention_micros",
+];
+
+/// A single fixture run entry, normalized for gate consumption.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GateSample {
+    pub label: String,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    /// Fixture workload prefix discovered in this sample (e.g. `real`,
+    /// `full_projection`). A single sample can carry one or more workloads.
+    pub workload_prefixes: Vec<String>,
+    /// Sample index parsed from the run id (`...sample-3` → `3`). Falls back
+    /// to `None` when the id does not encode an index.
+    pub sample_index: Option<usize>,
+    /// Backends present for each workload prefix (deduplicated, sorted).
+    pub backends_by_workload: BTreeMap<String, Vec<String>>,
+    /// All numeric metrics, keyed by the original fixture metric key.
+    pub metrics: BTreeMap<String, f64>,
+}
+
+/// Diagnostic verdict for a single workload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadVerdict {
+    /// Candidate beat SQLite by at least `threshold` on every required metric
+    /// and matched or beat SQLite on every observed lock-behavior metric.
+    Beats,
+    /// Candidate failed at least one required metric or lock-behavior metric.
+    Regresses,
+    /// Fewer than `MIN_SAMPLES_PER_WORKLOAD` samples; insufficient evidence.
+    InsufficientSamples,
+    /// No samples carried this workload at all.
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkloadEvaluation {
+    pub workload: String,
+    pub display_name: String,
+    pub sample_count: usize,
+    pub verdict: WorkloadVerdict,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateDecision {
+    Promote,
+    Block,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GateReport {
+    pub candidate_backend: String,
+    pub baseline_backend: String,
+    pub min_samples_per_workload: usize,
+    pub workload_evaluations: Vec<WorkloadEvaluation>,
+    pub decision: GateDecision,
+    pub diagnostics: Vec<String>,
+}
+
+/// Parse `fixtures/graph-db-performance-history.json` (or equivalent input)
+/// into normalized `GateSample` records.
+pub fn parse_history(raw: &str) -> Result<Vec<GateSample>> {
+    let value: Value =
+        serde_json::from_str(raw).context("perf_gate: failed to parse history JSON")?;
+    let runs = match value {
+        Value::Object(mut obj) => match obj.remove("runs") {
+            Some(Value::Array(arr)) => arr,
+            Some(other) => bail!(
+                "perf_gate: history `runs` field must be an array, got {}",
+                value_type(&other)
+            ),
+            None => bail!("perf_gate: history JSON object missing `runs` array"),
+        },
+        Value::Array(arr) => arr,
+        other => bail!(
+            "perf_gate: history root must be object or array, got {}",
+            value_type(&other)
+        ),
+    };
+
+    let mut samples = Vec::with_capacity(runs.len());
+    for (idx, run) in runs.into_iter().enumerate() {
+        let obj = run
+            .as_object()
+            .with_context(|| format!("perf_gate: run #{idx} must be a JSON object"))?;
+        let label = obj
+            .get("label")
+            .and_then(|v| v.as_str())
+            .with_context(|| format!("perf_gate: run #{idx} missing string `label`"))?
+            .to_string();
+        let id = obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .with_context(|| format!("perf_gate: run #{idx} missing string `id`"))?
+            .to_string();
+        let timestamp = obj
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let metrics_value = obj
+            .get("metrics")
+            .with_context(|| format!("perf_gate: run #{idx} missing `metrics` map"))?;
+        let metrics_obj = metrics_value
+            .as_object()
+            .with_context(|| format!("perf_gate: run #{idx} `metrics` must be an object"))?;
+        let mut metrics = BTreeMap::new();
+        for (key, value) in metrics_obj {
+            if let Some(n) = value.as_f64() {
+                metrics.insert(key.clone(), n);
+            }
+        }
+
+        let (workload_prefixes, backends_by_workload) = derive_workloads_and_backends(&metrics);
+        let sample_index = parse_sample_index(&id);
+
+        samples.push(GateSample {
+            label,
+            id,
+            timestamp,
+            workload_prefixes,
+            sample_index,
+            backends_by_workload,
+            metrics,
+        });
+    }
+    Ok(samples)
+}
+
+fn value_type(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn parse_sample_index(id: &str) -> Option<usize> {
+    // Convention: `<scope>-<workload>-<date>-sample-<N>`.
+    let tail = id.rsplit("sample-").next()?;
+    if tail == id {
+        return None;
+    }
+    tail.parse::<usize>().ok()
+}
+
+/// Discover every workload prefix + per-workload backend list present in this
+/// metrics map. We look at keys of the form `<workload>.<backend>.<...>`.
+fn derive_workloads_and_backends(
+    metrics: &BTreeMap<String, f64>,
+) -> (Vec<String>, BTreeMap<String, Vec<String>>) {
+    let mut by_workload: BTreeMap<String, BTreeMap<String, ()>> = BTreeMap::new();
+    for key in metrics.keys() {
+        let mut parts = key.splitn(3, '.');
+        let workload = match parts.next() {
+            Some(w) => w,
+            None => continue,
+        };
+        let backend = match parts.next() {
+            Some(b) => b,
+            None => continue,
+        };
+        // Skip workload-summary keys like `full_projection.edges` where the
+        // second segment is not a backend id (it has no further `.suffix`).
+        if parts.next().is_none() {
+            continue;
+        }
+        if !GATE_WORKLOAD_PREFIXES.contains(&workload) {
+            continue;
+        }
+        by_workload
+            .entry(workload.to_string())
+            .or_default()
+            .insert(backend.to_string(), ());
+    }
+    let mut workload_prefixes = Vec::with_capacity(by_workload.len());
+    let mut backends_by_workload = BTreeMap::new();
+    for (workload, backends) in by_workload {
+        workload_prefixes.push(workload.clone());
+        let mut backend_list: Vec<String> = backends.into_keys().collect();
+        backend_list.sort();
+        backends_by_workload.insert(workload, backend_list);
+    }
+    (workload_prefixes, backends_by_workload)
+}
+
+/// Compute the per-metric median across a slice of f64 samples. Returns
+/// `None` if the slice is empty. Uses the simple "middle element of a sorted
+/// copy" definition (averaging the two middle elements for even counts).
+fn median(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    if n.is_multiple_of(2) {
+        Some((sorted[n / 2 - 1] + sorted[n / 2]) / 2.0)
+    } else {
+        Some(sorted[n / 2])
+    }
+}
+
+/// Collect samples for `workload_prefix` from history, returning per-metric
+/// vectors keyed by `(backend, metric_suffix)`.
+fn collect_workload_metrics(
+    history: &[GateSample],
+    workload_prefix: &str,
+) -> (
+    usize,
+    BTreeMap<(String, String), Vec<f64>>,
+) {
+    let mut sample_count = 0usize;
+    let mut per_metric: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+    for sample in history {
+        if !sample.workload_prefixes.iter().any(|w| w == workload_prefix) {
+            continue;
+        }
+        sample_count += 1;
+        let prefix = format!("{workload_prefix}.");
+        for (key, value) in &sample.metrics {
+            let rest = match key.strip_prefix(&prefix) {
+                Some(r) => r,
+                None => continue,
+            };
+            let (backend, suffix) = match rest.split_once('.') {
+                Some(s) => s,
+                None => continue,
+            };
+            per_metric
+                .entry((backend.to_string(), suffix.to_string()))
+                .or_default()
+                .push(*value);
+        }
+    }
+    (sample_count, per_metric)
+}
+
+/// Evaluate the promotion gate for a candidate backend against the baseline
+/// (SQLite). `improvement_threshold` is the multiplicative improvement
+/// required for each required metric (e.g. `0.0` accepts parity, `0.05`
+/// requires the candidate to be ≥ 5% faster than SQLite's median).
+pub fn evaluate_promotion(
+    history: &[GateSample],
+    candidate_backend: &str,
+    improvement_threshold: f64,
+) -> GateReport {
+    let mut workload_evaluations = Vec::with_capacity(GATE_WORKLOAD_PREFIXES.len());
+    let mut top_level_diagnostics = Vec::new();
+    let mut any_block = false;
+
+    for prefix in GATE_WORKLOAD_PREFIXES {
+        let display = workload_display_name(prefix).to_string();
+        let (sample_count, per_metric) = collect_workload_metrics(history, prefix);
+        let mut diagnostics = Vec::new();
+
+        if sample_count == 0 {
+            workload_evaluations.push(WorkloadEvaluation {
+                workload: prefix.to_string(),
+                display_name: display.clone(),
+                sample_count,
+                verdict: WorkloadVerdict::Missing,
+                diagnostics: vec![format!(
+                    "workload `{display}` has no samples in history; gate blocks until at least {MIN_SAMPLES_PER_WORKLOAD} samples are recorded"
+                )],
+            });
+            any_block = true;
+            top_level_diagnostics.push(format!("`{display}`: missing"));
+            continue;
+        }
+        if sample_count < MIN_SAMPLES_PER_WORKLOAD {
+            workload_evaluations.push(WorkloadEvaluation {
+                workload: prefix.to_string(),
+                display_name: display.clone(),
+                sample_count,
+                verdict: WorkloadVerdict::InsufficientSamples,
+                diagnostics: vec![format!(
+                    "workload `{display}` has {sample_count} sample(s); gate requires {MIN_SAMPLES_PER_WORKLOAD}"
+                )],
+            });
+            any_block = true;
+            top_level_diagnostics.push(format!(
+                "`{display}`: only {sample_count}/{MIN_SAMPLES_PER_WORKLOAD} samples"
+            ));
+            continue;
+        }
+
+        // Verify the required metrics + lock-behavior metrics for this candidate.
+        let mut verdict = WorkloadVerdict::Beats;
+        for metric_suffix in REQUIRED_GATE_METRICS {
+            let baseline_values = per_metric
+                .get(&(BASELINE_BACKEND.to_string(), metric_suffix.to_string()))
+                .cloned()
+                .unwrap_or_default();
+            let candidate_values = per_metric
+                .get(&(candidate_backend.to_string(), metric_suffix.to_string()))
+                .cloned()
+                .unwrap_or_default();
+            let baseline_median = median(&baseline_values);
+            let candidate_median = median(&candidate_values);
+            match (baseline_median, candidate_median) {
+                (Some(base), Some(cand)) => {
+                    // Lower is better for duration metrics. Candidate must be
+                    // at most (1 - threshold) * baseline.
+                    let allowed = base * (1.0 - improvement_threshold);
+                    if cand <= allowed {
+                        diagnostics.push(format!(
+                            "`{metric_suffix}`: candidate median {cand:.1} ≤ allowed {allowed:.1} (baseline {base:.1})"
+                        ));
+                    } else {
+                        verdict = WorkloadVerdict::Regresses;
+                        diagnostics.push(format!(
+                            "`{metric_suffix}` REGRESSES: candidate median {cand:.1} > allowed {allowed:.1} (baseline {base:.1})"
+                        ));
+                    }
+                }
+                (Some(_), None) => {
+                    verdict = WorkloadVerdict::Regresses;
+                    diagnostics.push(format!(
+                        "`{metric_suffix}`: candidate `{candidate_backend}` produced no samples for this workload"
+                    ));
+                }
+                (None, _) => {
+                    verdict = WorkloadVerdict::Regresses;
+                    diagnostics.push(format!(
+                        "`{metric_suffix}`: baseline `{BASELINE_BACKEND}` produced no samples for this workload"
+                    ));
+                }
+            }
+        }
+
+        // Lock-behavior metrics: only enforce when the candidate actually
+        // reports them. Missing lock metrics are an instrumentation gap (sibling
+        // agents own that work), not a regression on this gate's part.
+        for suffix in LOCK_BEHAVIOR_METRIC_SUFFIXES {
+            let candidate_values = per_metric
+                .get(&(candidate_backend.to_string(), suffix.to_string()))
+                .cloned()
+                .unwrap_or_default();
+            if candidate_values.is_empty() {
+                continue;
+            }
+            let baseline_values = per_metric
+                .get(&(BASELINE_BACKEND.to_string(), suffix.to_string()))
+                .cloned()
+                .unwrap_or_default();
+            let baseline_median = median(&baseline_values);
+            let candidate_median = median(&candidate_values).unwrap_or(f64::INFINITY);
+            match baseline_median {
+                Some(base) if candidate_median <= base => {
+                    diagnostics.push(format!(
+                        "lock metric `{suffix}`: candidate {candidate_median:.1} ≤ baseline {base:.1}"
+                    ));
+                }
+                Some(base) => {
+                    verdict = WorkloadVerdict::Regresses;
+                    diagnostics.push(format!(
+                        "lock metric `{suffix}` REGRESSES: candidate {candidate_median:.1} > baseline {base:.1}"
+                    ));
+                }
+                None => {
+                    verdict = WorkloadVerdict::Regresses;
+                    diagnostics.push(format!(
+                        "lock metric `{suffix}`: candidate reports samples but baseline `{BASELINE_BACKEND}` does not — cannot prove parity"
+                    ));
+                }
+            }
+        }
+
+        if verdict != WorkloadVerdict::Beats {
+            any_block = true;
+            top_level_diagnostics.push(format!("`{display}`: candidate regresses"));
+        }
+        workload_evaluations.push(WorkloadEvaluation {
+            workload: prefix.to_string(),
+            display_name: display,
+            sample_count,
+            verdict,
+            diagnostics,
+        });
+    }
+
+    let decision = if any_block {
+        GateDecision::Block
+    } else {
+        GateDecision::Promote
+    };
+
+    GateReport {
+        candidate_backend: candidate_backend.to_string(),
+        baseline_backend: BASELINE_BACKEND.to_string(),
+        min_samples_per_workload: MIN_SAMPLES_PER_WORKLOAD,
+        workload_evaluations,
+        decision,
+        diagnostics: top_level_diagnostics,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synth_sample(id: &str, workload: &str, sample_idx: usize, sqlite_us: f64, cand_us: f64) -> Value {
+        let mut metrics = serde_json::Map::new();
+        metrics.insert(
+            format!("{workload}.sqlite.refresh.duration_micros"),
+            Value::from(sqlite_us),
+        );
+        metrics.insert(
+            format!("{workload}.sqlite.total_duration_micros"),
+            Value::from(sqlite_us * 2.0),
+        );
+        metrics.insert(
+            format!("{workload}.falkordb.refresh.duration_micros"),
+            Value::from(cand_us),
+        );
+        metrics.insert(
+            format!("{workload}.falkordb.total_duration_micros"),
+            Value::from(cand_us * 2.0),
+        );
+        let mut run = serde_json::Map::new();
+        run.insert("label".into(), Value::from(format!("synth {workload} sample {sample_idx}")));
+        run.insert("id".into(), Value::from(id.to_string()));
+        run.insert("timestamp".into(), Value::from("2026-05-24T00:00:00Z"));
+        run.insert("metrics".into(), Value::Object(metrics));
+        Value::Object(run)
+    }
+
+    fn build_history(samples: Vec<Value>) -> String {
+        let mut root = serde_json::Map::new();
+        root.insert("runs".into(), Value::Array(samples));
+        Value::Object(root).to_string()
+    }
+
+    #[test]
+    fn parse_history_extracts_workloads_and_sample_index() {
+        let raw = build_history(vec![synth_sample(
+            "agent-loop-full-projection-2026-05-24-sample-2",
+            "full_projection",
+            2,
+            1000.0,
+            500.0,
+        )]);
+        let samples = parse_history(&raw).unwrap();
+        assert_eq!(samples.len(), 1);
+        let s = &samples[0];
+        assert_eq!(s.workload_prefixes, vec!["full_projection".to_string()]);
+        assert_eq!(s.sample_index, Some(2));
+        assert!(s
+            .backends_by_workload
+            .get("full_projection")
+            .unwrap()
+            .contains(&"sqlite".to_string()));
+        assert!(s
+            .backends_by_workload
+            .get("full_projection")
+            .unwrap()
+            .contains(&"falkordb".to_string()));
+    }
+
+    fn full_history_three_samples_each(cand_us: f64) -> String {
+        let mut runs = Vec::new();
+        for prefix in GATE_WORKLOAD_PREFIXES {
+            for i in 1..=3 {
+                let id = format!("agent-loop-{prefix}-2026-05-24-sample-{i}");
+                runs.push(synth_sample(&id, prefix, i, 1000.0, cand_us));
+            }
+        }
+        build_history(runs)
+    }
+
+    #[test]
+    fn evaluate_promotion_blocks_when_candidate_does_not_beat_baseline() {
+        let raw = full_history_three_samples_each(2000.0); // candidate slower than sqlite
+        let history = parse_history(&raw).unwrap();
+        let report = evaluate_promotion(&history, "falkordb", 0.0);
+        assert_eq!(report.decision, GateDecision::Block);
+        assert!(report
+            .workload_evaluations
+            .iter()
+            .all(|w| matches!(w.verdict, WorkloadVerdict::Regresses)));
+    }
+
+    #[test]
+    fn evaluate_promotion_promotes_when_candidate_beats_baseline_on_every_workload() {
+        let raw = full_history_three_samples_each(500.0); // candidate 2x faster than sqlite
+        let history = parse_history(&raw).unwrap();
+        let report = evaluate_promotion(&history, "falkordb", 0.05);
+        assert_eq!(
+            report.decision,
+            GateDecision::Promote,
+            "diagnostics: {:?}",
+            report.diagnostics
+        );
+        assert!(report
+            .workload_evaluations
+            .iter()
+            .all(|w| matches!(w.verdict, WorkloadVerdict::Beats)));
+    }
+
+    #[test]
+    fn evaluate_promotion_blocks_when_any_workload_has_fewer_than_three_samples() {
+        // 3 samples for three workloads, 2 samples for the fourth.
+        let mut runs = Vec::new();
+        for prefix in ["real", "full_projection", "synthetic_high_degree"] {
+            for i in 1..=3 {
+                let id = format!("agent-loop-{prefix}-2026-05-24-sample-{i}");
+                runs.push(synth_sample(&id, prefix, i, 1000.0, 100.0));
+            }
+        }
+        for i in 1..=2 {
+            let id = format!("agent-loop-synthetic_deep_chain-2026-05-24-sample-{i}");
+            runs.push(synth_sample(
+                &id,
+                "synthetic_deep_chain",
+                i,
+                1000.0,
+                100.0,
+            ));
+        }
+        let raw = build_history(runs);
+        let history = parse_history(&raw).unwrap();
+        let report = evaluate_promotion(&history, "falkordb", 0.0);
+        assert_eq!(report.decision, GateDecision::Block);
+        let deep_chain = report
+            .workload_evaluations
+            .iter()
+            .find(|w| w.workload == "synthetic_deep_chain")
+            .unwrap();
+        assert_eq!(deep_chain.verdict, WorkloadVerdict::InsufficientSamples);
+        assert_eq!(deep_chain.sample_count, 2);
+    }
+
+    #[test]
+    fn evaluate_promotion_blocks_when_workload_is_missing() {
+        // Only `real` workload — `full_projection`, `synthetic_high_degree`,
+        // `synthetic_deep_chain` are absent.
+        let mut runs = Vec::new();
+        for i in 1..=3 {
+            let id = format!("agent-loop-real-2026-05-24-sample-{i}");
+            runs.push(synth_sample(&id, "real", i, 1000.0, 100.0));
+        }
+        let raw = build_history(runs);
+        let history = parse_history(&raw).unwrap();
+        let report = evaluate_promotion(&history, "falkordb", 0.0);
+        assert_eq!(report.decision, GateDecision::Block);
+        let missing_count = report
+            .workload_evaluations
+            .iter()
+            .filter(|w| w.verdict == WorkloadVerdict::Missing)
+            .count();
+        assert_eq!(missing_count, 3);
+    }
+
+    #[test]
+    fn lock_behavior_metric_blocks_when_candidate_worse_than_baseline() {
+        let mut runs = Vec::new();
+        for prefix in GATE_WORKLOAD_PREFIXES {
+            for i in 1..=3 {
+                let id = format!("agent-loop-{prefix}-2026-05-24-sample-{i}");
+                let mut metrics = serde_json::Map::new();
+                metrics.insert(
+                    format!("{prefix}.sqlite.refresh.duration_micros"),
+                    Value::from(1000.0),
+                );
+                metrics.insert(
+                    format!("{prefix}.sqlite.total_duration_micros"),
+                    Value::from(2000.0),
+                );
+                metrics.insert(
+                    format!("{prefix}.sqlite.lock_wait_micros"),
+                    Value::from(10.0),
+                );
+                metrics.insert(
+                    format!("{prefix}.falkordb.refresh.duration_micros"),
+                    Value::from(100.0),
+                );
+                metrics.insert(
+                    format!("{prefix}.falkordb.total_duration_micros"),
+                    Value::from(200.0),
+                );
+                metrics.insert(
+                    format!("{prefix}.falkordb.lock_wait_micros"),
+                    Value::from(5000.0), // candidate has nasty lock contention
+                );
+                let mut run = serde_json::Map::new();
+                run.insert("label".into(), Value::from(format!("lk {prefix} {i}")));
+                run.insert("id".into(), Value::from(id));
+                run.insert("metrics".into(), Value::Object(metrics));
+                runs.push(Value::Object(run));
+            }
+        }
+        let raw = build_history(runs);
+        let history = parse_history(&raw).unwrap();
+        let report = evaluate_promotion(&history, "falkordb", 0.0);
+        assert_eq!(report.decision, GateDecision::Block);
+        let regressing = report
+            .workload_evaluations
+            .iter()
+            .filter(|w| matches!(w.verdict, WorkloadVerdict::Regresses))
+            .count();
+        assert_eq!(regressing, GATE_WORKLOAD_PREFIXES.len());
+    }
+}

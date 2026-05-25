@@ -39,6 +39,7 @@ mod lang;
 pub mod lint;
 pub mod log_digest;
 pub mod metric_digest;
+pub mod perf_gate;
 pub mod runtime_churn;
 pub mod session_cost;
 pub mod session_digest;
@@ -10388,26 +10389,60 @@ fn graph_db_backend_eval_legacy_disk_cache_path(root: &Path, kind: &str, key: &s
         .join(format!("{key}.json"))
 }
 
+#[derive(Default, Clone)]
+struct GraphDbBackendEvalDiskCacheReadProfile {
+    file_read_micros: u128,
+    gzip_decode_micros: u128,
+    serde_decode_micros: u128,
+    legacy: bool,
+}
+
 fn graph_db_backend_eval_read_disk_cache<T: for<'de> Deserialize<'de>>(
     root: &Path,
     kind: &str,
     key: &str,
-) -> Option<(T, u64, u64)> {
+) -> Option<(T, u64, u64, GraphDbBackendEvalDiskCacheReadProfile)> {
+    let mut profile = GraphDbBackendEvalDiskCacheReadProfile::default();
     let path = graph_db_backend_eval_disk_cache_path(root, kind, key);
-    if let Ok(bytes) = fs::read(&path) {
+    let read_started = Instant::now();
+    let read_result = fs::read(&path);
+    profile.file_read_micros = read_started.elapsed().as_micros();
+    if let Ok(bytes) = read_result {
+        let decode_started = Instant::now();
         let mut decoder = GzDecoder::new(bytes.as_slice());
         let mut decoded = Vec::new();
-        if decoder.read_to_end(&mut decoded).is_ok()
-            && let Ok(value) = serde_json::from_slice(&decoded)
-        {
-            return Some((value, bytes.len() as u64, decoded.len() as u64));
+        let decode_ok = decoder.read_to_end(&mut decoded).is_ok();
+        profile.gzip_decode_micros = decode_started.elapsed().as_micros();
+        if decode_ok {
+            let serde_started = Instant::now();
+            let parsed: Option<T> = serde_json::from_slice(&decoded).ok();
+            profile.serde_decode_micros = serde_started.elapsed().as_micros();
+            if let Some(value) = parsed {
+                return Some((value, bytes.len() as u64, decoded.len() as u64, profile));
+            }
         }
     }
 
     let legacy_path = graph_db_backend_eval_legacy_disk_cache_path(root, kind, key);
+    let legacy_started = Instant::now();
     let bytes = fs::read(legacy_path).ok()?;
+    profile.file_read_micros = profile
+        .file_read_micros
+        .saturating_add(legacy_started.elapsed().as_micros());
+    let serde_started = Instant::now();
     let value = serde_json::from_slice(&bytes).ok()?;
-    Some((value, bytes.len() as u64, bytes.len() as u64))
+    profile.serde_decode_micros = profile
+        .serde_decode_micros
+        .saturating_add(serde_started.elapsed().as_micros());
+    profile.legacy = true;
+    Some((value, bytes.len() as u64, bytes.len() as u64, profile))
+}
+
+#[derive(Default, Clone)]
+struct GraphDbBackendEvalDiskCacheWriteProfile {
+    serde_encode_micros: u128,
+    gzip_encode_micros: u128,
+    file_write_micros: u128,
 }
 
 fn graph_db_backend_eval_write_disk_cache<T: Serialize>(
@@ -10415,22 +10450,29 @@ fn graph_db_backend_eval_write_disk_cache<T: Serialize>(
     kind: &str,
     key: &str,
     value: &T,
-) -> Option<(u64, u64)> {
+) -> Option<(u64, u64, GraphDbBackendEvalDiskCacheWriteProfile)> {
+    let mut profile = GraphDbBackendEvalDiskCacheWriteProfile::default();
     let path = graph_db_backend_eval_disk_cache_path(root, kind, key);
     let parent = path.parent()?;
     if fs::create_dir_all(parent).is_err() {
         return None;
     }
+    let serde_started = Instant::now();
     let bytes = serde_json::to_vec(value).ok()?;
+    profile.serde_encode_micros = serde_started.elapsed().as_micros();
+    let gzip_started = Instant::now();
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
     if encoder.write_all(&bytes).is_err() {
         return None;
     }
     let encoded = encoder.finish().ok()?;
+    profile.gzip_encode_micros = gzip_started.elapsed().as_micros();
+    let write_started = Instant::now();
     if fs::write(&path, &encoded).is_err() {
         return None;
     }
-    Some((encoded.len() as u64, bytes.len() as u64))
+    profile.file_write_micros = write_started.elapsed().as_micros();
+    Some((encoded.len() as u64, bytes.len() as u64, profile))
 }
 
 fn graph_db_backend_eval_prune_disk_cache(root: &Path, kind: &str, keep_key: &str) -> (usize, u64) {
@@ -10503,15 +10545,26 @@ fn graph_db_backend_eval_full_projection_with_profile(
 )> {
     let (source_watermark, key) = graph_db_backend_eval_full_projection_cache_key(root, scope)?;
     let lookup_started = Instant::now();
-    if let Some((cached, disk_bytes, json_bytes)) = graph_db_backend_eval_read_disk_cache::<
-        GraphDbBackendEvalFullProjectionCache,
-    >(root, "full_projection", &key)
+    if let Some((cached, disk_bytes, json_bytes, read_profile)) =
+        graph_db_backend_eval_read_disk_cache::<GraphDbBackendEvalFullProjectionCache>(
+            root,
+            "full_projection",
+            &key,
+        )
         && cached.version == GRAPH_DB_BACKEND_EVAL_FULL_PROJECTION_CACHE_VERSION
         && cached.key == key
         && cached.source_watermark == source_watermark
     {
+        let lookup_overhead_micros = lookup_started
+            .elapsed()
+            .as_micros()
+            .saturating_sub(read_profile.file_read_micros)
+            .saturating_sub(read_profile.gzip_decode_micros)
+            .saturating_sub(read_profile.serde_decode_micros);
+        let prune_started = Instant::now();
         let (pruned_files, pruned_bytes) =
             graph_db_backend_eval_prune_disk_cache(root, "full_projection", &key);
+        let prune_micros = prune_started.elapsed().as_micros();
         let cache_stats = GraphDbBackendEvalFullProjectionCacheStats {
             hit: true,
             disk_bytes,
@@ -10519,14 +10572,41 @@ fn graph_db_backend_eval_full_projection_with_profile(
             pruned_files,
             pruned_bytes,
         };
+        let read_detail_suffix = if read_profile.legacy {
+            " (legacy uncompressed cache path)"
+        } else {
+            ""
+        };
         return Ok((
             cached.projection,
             cached.warnings,
             vec![
                 graph_db_backend_eval_phase_timing(
                     "full_projection.cache_lookup",
-                    lookup_started.elapsed().as_micros(),
-                    "reused compressed opt-in full-project projection rows from .tsift/backend-eval-cache by source watermark",
+                    lookup_overhead_micros,
+                    "watermark/version check overhead around the cache load phases",
+                ),
+                graph_db_backend_eval_phase_timing(
+                    "full_projection.cache.file_read",
+                    read_profile.file_read_micros,
+                    &format!(
+                        "read compressed cache bytes from .tsift/backend-eval-cache{read_detail_suffix}"
+                    ),
+                ),
+                graph_db_backend_eval_phase_timing(
+                    "full_projection.cache.gzip_decode",
+                    read_profile.gzip_decode_micros,
+                    "gunzip the compressed projection cache bytes",
+                ),
+                graph_db_backend_eval_phase_timing(
+                    "full_projection.cache.serde_decode",
+                    read_profile.serde_decode_micros,
+                    "serde_json deserialize the decoded projection cache payload",
+                ),
+                graph_db_backend_eval_phase_timing(
+                    "full_projection.cache.prune",
+                    prune_micros,
+                    "prune sibling cache files older than the current key",
                 ),
                 graph_db_backend_eval_phase_timing(
                     "full_projection.source_graph_build",
@@ -10576,14 +10656,35 @@ fn graph_db_backend_eval_full_projection_with_profile(
         projection: projection.clone(),
         warnings: warnings.clone(),
     };
-    if let Some((disk_bytes, json_bytes)) =
+    if let Some((disk_bytes, json_bytes, write_profile)) =
         graph_db_backend_eval_write_disk_cache(root, "full_projection", &write_key, &cache)
     {
         cache_stats.disk_bytes = disk_bytes;
         cache_stats.json_bytes = json_bytes;
+        phases.push(graph_db_backend_eval_phase_timing(
+            "full_projection.cache.serde_encode",
+            write_profile.serde_encode_micros,
+            "serde_json serialize the projection cache payload before compression",
+        ));
+        phases.push(graph_db_backend_eval_phase_timing(
+            "full_projection.cache.gzip_encode",
+            write_profile.gzip_encode_micros,
+            "gzip-compress the serialized projection cache payload",
+        ));
+        phases.push(graph_db_backend_eval_phase_timing(
+            "full_projection.cache.file_write",
+            write_profile.file_write_micros,
+            "write the compressed projection cache bytes to .tsift/backend-eval-cache",
+        ));
     }
+    let prune_started = Instant::now();
     let (pruned_files, pruned_bytes) =
         graph_db_backend_eval_prune_disk_cache(root, "full_projection", &write_key);
+    phases.push(graph_db_backend_eval_phase_timing(
+        "full_projection.cache.prune",
+        prune_started.elapsed().as_micros(),
+        "prune sibling cache files older than the current key",
+    ));
     cache_stats.pruned_files = pruned_files;
     cache_stats.pruned_bytes = pruned_bytes;
     Ok((projection, warnings, phases, cache_stats))
@@ -11815,24 +11916,50 @@ fn cmd_graph_db_backend_eval(
     let mut full_projection_phase_timings = Vec::new();
     let mut full_projection_cache_stats = None;
     if full_projection {
-        let (full_projection_rows, full_projection_warnings, full_phases, cache_stats) =
+        let (full_projection_rows, full_projection_warnings, mut full_phases, cache_stats) =
             graph_db_backend_eval_full_projection_with_profile(&root, scope)?;
-        phase_timings.extend(full_phases.clone());
-        full_projection_phase_timings = full_phases;
         full_projection_cache_stats = Some(cache_stats);
-        let full_projection_started = Instant::now();
+        let sqlite_open_started = Instant::now();
         let mut full_store = SqliteGraphStore::in_memory()?;
-        let _full_refresh = full_store.replace_projection_with_version(
+        let sqlite_open_micros = sqlite_open_started.elapsed().as_micros();
+        full_phases.push(graph_db_backend_eval_phase_timing(
+            "full_projection.sqlite.in_memory_open",
+            sqlite_open_micros,
+            "open in-memory SQLite graph store for the opt-in full-project projection write",
+        ));
+        let sqlite_replace_started = Instant::now();
+        let full_refresh_op = full_store.replace_projection_with_version(
             scope.unwrap_or("root"),
             &full_projection_rows,
             Some(GRAPH_PROJECTION_VERSION),
             graph_projection_content_hash(&full_projection_rows),
         )?;
-        let full_projection_micros = full_projection_started.elapsed().as_micros();
+        let sqlite_replace_micros = sqlite_replace_started.elapsed().as_micros();
+        full_phases.push(graph_db_backend_eval_phase_timing(
+            "full_projection.sqlite.replace_projection_total",
+            sqlite_replace_micros,
+            "wall-clock total of the SQLite replace_projection_with_version write (see sub-phases below)",
+        ));
+        for sub_phase in full_refresh_op.phase_timings.iter() {
+            full_phases.push(GraphDbBackendEvalPhaseTiming {
+                name: format!("full_projection.sqlite.{}", sub_phase.name),
+                duration_micros: sub_phase.duration_micros,
+                detail: sub_phase.detail.clone(),
+            });
+        }
+        let post_write_started = Instant::now();
         let full_freshness = sqlite_graph_freshness(&full_store, scope.unwrap_or("root"))?;
         let full_targets = graph_db_backend_eval_targets(&full_store, targets)?;
         all_targets.extend(full_targets.iter().cloned());
         let full_rows = convex_rows_from_graph_store(&full_store)?;
+        let post_write_micros = post_write_started.elapsed().as_micros();
+        full_phases.push(graph_db_backend_eval_phase_timing(
+            "full_projection.sqlite.post_write_reads",
+            post_write_micros,
+            "post-write freshness, target resolution, and convex row materialization reads",
+        ));
+        let full_projection_micros =
+            sqlite_open_micros + sqlite_replace_micros + post_write_micros;
         let full_refresh = graph_db_backend_eval_refresh_operation(
             full_projection_micros,
             full_rows.nodes.len() + full_rows.edges.len(),
@@ -11841,6 +11968,8 @@ fn cmd_graph_db_backend_eval(
                 "edges": full_rows.edges.len(),
             }),
         );
+        phase_timings.extend(full_phases.clone());
+        full_projection_phase_timings = full_phases;
         datasets.push(graph_db_backend_eval_dataset(
             "full_projection",
             &root,

@@ -2224,10 +2224,10 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
     assert!(
         phase_detail(
             &cached_full_projection_report,
-            "full_projection.cache_lookup"
+            "full_projection.cache.file_read"
         )
         .contains(".tsift/backend-eval-cache"),
-        "second full-projection run should hit the source-watermark cache: {cached_full_projection_report}"
+        "second full-projection run should hit the source-watermark cache and emit a cache.file_read phase: {cached_full_projection_report}"
     );
     assert!(
         phase_detail(
@@ -2269,6 +2269,24 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             >= 2.0,
         "{cached_full_projection_report}"
     );
+    for cache_hit_phase in [
+        "full_projection.cache.file_read",
+        "full_projection.cache.gzip_decode",
+        "full_projection.cache.serde_decode",
+        "full_projection.cache.prune",
+        "full_projection.sqlite.in_memory_open",
+        "full_projection.sqlite.replace_projection_total",
+        "full_projection.sqlite.post_write_reads",
+    ] {
+        assert!(
+            cached_full_projection_report["phase_timings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == cache_hit_phase),
+            "cache-hit run should emit {cache_hit_phase}: {cached_full_projection_report}"
+        );
+    }
 
     let digest_dir = tempfile::tempdir().unwrap();
     let current_report = digest_dir.path().join("backend-eval.json");
