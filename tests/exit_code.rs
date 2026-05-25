@@ -947,6 +947,91 @@ convention = "PascalCase"
     );
 }
 
+// Regression: scoped search must annotate against the scope's source_root
+// (where the submodule's `.naming.toml` lives), not the workspace root.
+// Mirror of the federated bug closed in 0.1.57 (#p6tsifullfederated).
+#[test]
+fn search_scoped_json_annotates_handles_from_submodule_tagpath() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+"#,
+    )
+    .unwrap();
+    let scope_root = dir.path().join("src/alpha");
+    fs::create_dir_all(&scope_root).unwrap();
+    fs::write(
+        scope_root.join("lib.rs"),
+        "fn scoped_helper() {}\nfn caller() { scoped_helper(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        scope_root.join(".naming.toml"),
+        r#"version = 1
+name = "scope-test"
+convention = "snake_case"
+
+[contexts.function]
+convention = "snake_case"
+
+[contexts.type]
+convention = "PascalCase"
+"#,
+    )
+    .unwrap();
+    let index = tagpath::index::build(&tagpath::index::BuildOptions {
+        project_root: scope_root.clone(),
+    })
+    .expect("tagpath build");
+    let idx_path = tagpath::index::index_path(&scope_root);
+    fs::create_dir_all(idx_path.parent().unwrap()).unwrap();
+    tagpath::index::write(&index, &idx_path).expect("tagpath write");
+
+    // The workspace root has no `.naming.toml`; before the fix the
+    // annotation walks up from `&root` (workspace) and returns Missing,
+    // dropping the handle even though the submodule has a valid index.
+    let output = tsift_bin()
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "tsift workspace index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = tsift_bin()
+        .args([
+            "search",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--scope",
+            "alpha",
+            "--json",
+            "scoped_helper",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "scoped search stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let symbols = json["symbols"].as_array().expect("symbols array");
+    let scoped = symbols
+        .iter()
+        .find(|s| s["name"].as_str() == Some("scoped_helper"))
+        .unwrap_or_else(|| panic!("expected scoped_helper hit: {json}"));
+    let handle = scoped["tagpath_handle"]
+        .as_str()
+        .unwrap_or_else(|| panic!("scoped_helper missing tagpath_handle: {scoped}"));
+    assert!(handle.starts_with("mem:"), "{handle}");
+}
+
 // `tsift audit-tagpath` reports files covered by one walker but not the
 // other so operators can decide whether to broaden tagpath, narrow tsift,
 // or accept the gap. Tagpath skips `__pycache__/` via SKIP_DIRS but tsift

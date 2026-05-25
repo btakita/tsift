@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "tsift"
-version = "0.1.59"
+version = "0.1.60"
 dependencies = [
  "anyhow",
  "blake3",

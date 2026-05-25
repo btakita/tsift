@@ -26199,10 +26199,17 @@ fn cmd_search_with_budget(
     };
 
     let mut symbol_hits = symbol_hits;
+    // Use `sift_path` (which equals `scope.source_root` for scoped /
+    // inferred-scope paths and the workspace root otherwise) so the
+    // tagpath adapter walks for `.naming.toml` from the right project
+    // root. The previous behavior walked from the workspace root,
+    // which silently dropped handles when the submodule owned the
+    // tagpath project but the workspace did not — the same shape as
+    // the federated bug closed in #p6tsifullfederated (0.1.57).
     let tagpath_diag = if let Some(diag) = federated_tagpath_diag {
         diag
     } else {
-        annotate_hits_with_tagpath(&mut symbol_hits, &root, &tagpath_opts)?
+        annotate_hits_with_tagpath(&mut symbol_hits, &sift_path, &tagpath_opts)?
     };
     if !absolute {
         relativize_symbol_hits(&mut symbol_hits, &root);
