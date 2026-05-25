@@ -3485,13 +3485,124 @@ pub fn annotate_hits_with_tagpath(
     }
 }
 
+fn index_file_abs(file: &str, root: &std::path::Path) -> std::path::PathBuf {
+    if std::path::Path::new(file).is_absolute() {
+        std::path::PathBuf::from(file)
+    } else {
+        root.join(file)
+    }
+}
+
+fn index_file_key(file: &str, root: &std::path::Path) -> String {
+    let path = std::path::Path::new(file);
+    let rel = if path.is_absolute() {
+        path.strip_prefix(root).unwrap_or(path)
+    } else {
+        path
+    };
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+fn tagpath_handle_for_index_file(
+    file: &str,
+    name: &str,
+    root: &std::path::Path,
+    adapter: &tagpath_adapter::TagpathAdapter,
+) -> Option<String> {
+    adapter.handle_for_member(&index_file_abs(file, root), name)
+}
+
+fn tagpath_handle_candidates_for_symbol_rows(
+    name: &str,
+    syms: Vec<index::StoredSymbol>,
+    root: &std::path::Path,
+    adapter: &tagpath_adapter::TagpathAdapter,
+) -> Vec<(String, String)> {
+    syms.into_iter()
+        .filter_map(|sym| {
+            let handle = tagpath_handle_for_index_file(&sym.file, name, root, adapter)?;
+            Some((index_file_key(&sym.file, root), handle))
+        })
+        .collect()
+}
+
+fn file_communities_from_callers(
+    db: &index::IndexDb,
+    root: &std::path::Path,
+) -> Result<std::collections::HashMap<String, std::collections::HashSet<usize>>> {
+    let edges = db.all_edges()?;
+    if edges.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let communities = graph::detect_communities(&edges);
+    let mut community_by_symbol = std::collections::HashMap::new();
+    for community in communities.communities {
+        for member in community.members {
+            community_by_symbol.insert(member.name, community.id);
+        }
+    }
+
+    let mut communities_by_file: std::collections::HashMap<
+        String,
+        std::collections::HashSet<usize>,
+    > = std::collections::HashMap::new();
+    for sym in db.all_symbols()? {
+        if let Some(community_id) = community_by_symbol.get(&sym.name) {
+            communities_by_file
+                .entry(index_file_key(&sym.file, root))
+                .or_default()
+                .insert(*community_id);
+        }
+    }
+    for edge in db.all_stored_edges()? {
+        if let Some(community_id) = community_by_symbol.get(&edge.caller_name) {
+            communities_by_file
+                .entry(index_file_key(&edge.caller_file, root))
+                .or_default()
+                .insert(*community_id);
+        }
+    }
+    Ok(communities_by_file)
+}
+
+fn resolve_tagpath_handle_for_callee_edge(
+    edge: &index::StoredEdge,
+    db: &index::IndexDb,
+    root: &std::path::Path,
+    adapter: &tagpath_adapter::TagpathAdapter,
+    communities_by_file: &std::collections::HashMap<String, std::collections::HashSet<usize>>,
+) -> Option<String> {
+    let syms = db.symbol_info(&edge.callee_name).ok()?;
+    let candidates =
+        tagpath_handle_candidates_for_symbol_rows(&edge.callee_name, syms, root, adapter);
+    let caller_file = index_file_key(&edge.caller_file, root);
+
+    if let Some((_, handle)) = candidates
+        .iter()
+        .find(|(candidate_file, _)| candidate_file == &caller_file)
+    {
+        return Some(handle.clone());
+    }
+
+    if let Some(caller_communities) = communities_by_file.get(&caller_file) {
+        for (candidate_file, handle) in &candidates {
+            if let Some(candidate_communities) = communities_by_file.get(candidate_file)
+                && !caller_communities.is_disjoint(candidate_communities)
+            {
+                return Some(handle.clone());
+            }
+        }
+    }
+
+    candidates.first().map(|(_, handle)| handle.clone())
+}
+
 /// Resolve a per-symbol-name `tagpath_handle` map for a batch of symbol
 /// names against a fresh tagpath index. Names whose definition file is not
 /// present in the index, or which have no matching handle, are simply
-/// absent from the returned map. When multiple `db.symbol_info` rows share
-/// the same name across files, every row is probed and the first one that
-/// produces a tagpath handle wins, so a name collision against an
-/// out-of-tagpath file no longer drops a valid handle from another file.
+/// absent from the returned map. This helper has no caller context, so when
+/// multiple `db.symbol_info` rows share the same name across files, every
+/// row is probed and the first one that produces a tagpath handle wins.
 fn resolve_tagpath_handles_for_names(
     names: &[String],
     db: &index::IndexDb,
@@ -3507,16 +3618,12 @@ fn resolve_tagpath_handles_for_names(
         let Ok(syms) = db.symbol_info(name) else {
             continue;
         };
-        for sym in syms {
-            let abs = if std::path::Path::new(&sym.file).is_absolute() {
-                std::path::PathBuf::from(&sym.file)
-            } else {
-                root.join(&sym.file)
-            };
-            if let Some(handle) = adapter.handle_for_member(&abs, name) {
-                out.insert(name.clone(), handle);
-                break;
-            }
+        if let Some((_, handle)) =
+            tagpath_handle_candidates_for_symbol_rows(name, syms, root, adapter)
+                .into_iter()
+                .next()
+        {
+            out.insert(name.clone(), handle);
         }
     }
     out
@@ -3571,7 +3678,8 @@ pub fn annotate_stored_symbols_with_tagpath(
 /// tagpath index. The handle names whichever endpoint the consumer cares
 /// about: pass `EdgeSide::Caller` for caller rows (uses `caller_file` +
 /// `caller_name` directly) and `EdgeSide::Callee` for callee rows
-/// (resolves the callee's definition file via `db.symbol_info`).
+/// (resolves each callee edge via `db.symbol_info`, preferring the
+/// caller's file or community before the no-context first-handle fallback).
 pub fn annotate_stored_edges_with_tagpath(
     edges: &mut [index::StoredEdge],
     db: &index::IndexDb,
@@ -3600,14 +3708,17 @@ pub fn annotate_stored_edges_with_tagpath(
                     }
                 }
                 EdgeSide::Callee => {
-                    let names: Vec<String> = edges
-                        .iter()
-                        .map(|edge| edge.callee_name.clone())
-                        .collect();
-                    let map = resolve_tagpath_handles_for_names(&names, db, root, &adapter);
+                    let communities_by_file =
+                        file_communities_from_callers(db, root).unwrap_or_default();
                     for edge in edges.iter_mut() {
-                        if let Some(handle) = map.get(&edge.callee_name) {
-                            edge.tagpath_handle = Some(handle.clone());
+                        if let Some(handle) = resolve_tagpath_handle_for_callee_edge(
+                            edge,
+                            db,
+                            root,
+                            &adapter,
+                            &communities_by_file,
+                        ) {
+                            edge.tagpath_handle = Some(handle);
                         }
                     }
                 }

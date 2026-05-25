@@ -254,6 +254,19 @@ convention = "PascalCase"
     }
 }
 
+fn tagpath_member_handle(root: &Path, name: &str, file: &str) -> String {
+    let idx_path = tagpath::index::index_path(root);
+    let index = tagpath::index::read(&idx_path).expect("tagpath read");
+    index
+        .families
+        .iter()
+        .flat_map(|f| f.members.iter())
+        .find(|m| m.name == name && m.path.ends_with(file))
+        .unwrap_or_else(|| panic!("tagpath fixture missing handle for ({name}, {file})"))
+        .handle
+        .clone()
+}
+
 fn indexed_cli_fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     build_cli_fixture(dir.path());
@@ -1556,6 +1569,72 @@ fn communities_json_resolves_handle_through_name_collision() {
     for handle in &helper_handles {
         assert!(handle.starts_with("mem:"), "{handle}");
     }
+}
+
+#[test]
+fn graph_json_resolves_callee_handle_with_caller_file_name_collision() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("a_vendor")).unwrap();
+    fs::write(
+        dir.path().join("a_vendor/main.rs"),
+        "fn helper() {}\nfn vendor_caller() { helper(); }\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/main.rs"),
+        "fn helper() {}\nfn src_caller() { helper(); }\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    write_fresh_tagpath_index(
+        dir.path(),
+        &[
+            ("helper", "a_vendor/main.rs"),
+            ("helper", "src/main.rs"),
+            ("src_caller", "src/main.rs"),
+        ],
+    );
+    let expected = tagpath_member_handle(dir.path(), "helper", "src/main.rs");
+    let vendor = tagpath_member_handle(dir.path(), "helper", "a_vendor/main.rs");
+    assert_ne!(expected, vendor);
+
+    let output = tsift_bin()
+        .args([
+            "graph",
+            "src_caller",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "graph stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let helper_edge = json["callees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|edge| edge["callee_name"].as_str() == Some("helper"))
+        .unwrap_or_else(|| panic!("expected helper callee edge: {json}"));
+    let actual = helper_edge["tagpath_handle"]
+        .as_str()
+        .unwrap_or_else(|| panic!("helper callee edge missing tagpath_handle: {helper_edge}"));
+    assert_eq!(actual, expected);
+    assert_ne!(actual, vendor);
 }
 
 #[test]
