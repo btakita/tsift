@@ -23,7 +23,7 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift graph-db doctor` | Read-only graph DB diagnostics for local SQLite and Convex snapshots. Reports stale projection metadata, schema drift, orphan edges, duplicate ids, missing Convex index metadata, and repair commands with fail-closed exit codes. |
 | `tsift graph-db compact` | Guarded SQLite graph compaction policy and apply path. Dry-run reports tombstone scan/file-size proof; `--apply` checkpoints WAL and VACUUMs, while tombstone pruning requires `--confirmed-convex-reconciled`. |
 | `tsift audit` | Skill drift detection: scan installed skills, check health, compare against manifest, detect duplicates via Jaccard similarity. `--manifest <file>` / `--usage` / `--cleanup` / `--report <path>` / `--json` |
-| `tsift audit-tagpath` | Reconcile the tsift symbol index against the tagpath `.naming/index.json` source set. Reports `tsift_only_files` (paths tsift indexes but tagpath skipped via `SKIP_DIRS` / `[exclude]` / `extends`), `tagpath_only_files` (tagpath sources no longer in `index.db`), and per-file symbol counts for the recall-at-risk files. `--path <root>` / `--scope <name>` / `--json`. |
+| `tsift audit-tagpath` | Reconcile the tsift symbol index against the tagpath `.naming/index.json` source set. Reports `tsift_only_files` (paths tsift indexes but tagpath skipped via `SKIP_DIRS` / `[exclude]` / `extends`), `tagpath_only_files` (tagpath sources no longer in `index.db`), per-file symbol counts, and JSON `tsift_only_files_with_policy_hints` entries such as `skip_dir:__pycache__` / `extension_unsupported` for the recall-at-risk files. `--path <root>` / `--scope <name>` / `--json`. |
 | `tsift summarize` | Cached LLM analysis: pre-computed summaries, entities, relationships. `--extract <path>` / `--extract --diff` (relative extract paths resolve against `--path`; extraction stays scoped to the requested file/dir; `--diff` includes untracked files inside that scope; workspace extraction loads symbols from the matching scoped `index.db`; per-file cache rewrite is transactional; non-2xx Anthropic responses fail closed with status + API message) / `--file <path>` / `--stats` / `--json`. Read-only lookup paths fail closed when `summaries.db` is missing, never create the cache as a side effect, and retry through a snapshot copy when a rollback-journal lock wedges the live DB. |
 | `tsift diff-digest` | Code-aware digest for worktree, staged, and single-revision diffs. Supports the default working-tree view, `--cached` for staged-index review, and `--revision <rev>` for commit/history review while reporting changed files, touched symbols, current cached summary snippets when `summaries.db` matches the compared snapshot, and added/removed call edges without requiring a fresh `index.db`. |
 | `tsift context-pack` | Single resumable handoff pack for agent turns. Composes `session-review --next-context`, `diff-digest`, and optional `test-digest` / `log-digest` inputs into one bounded payload with follow-up commands instead of making callers stitch the surfaces together manually. |
@@ -124,7 +124,7 @@ If copied skill instructions lag behind the installed binary, treat this file, `
 
 Private: `github.com/btakita/tsift`. Submodule at `src/tsift` in agent-loop.
 
-<!-- tsift:code-navigation v=0.1.42 -->
+<!-- tsift:code-navigation v=0.1.61 -->
 ## Code Navigation
 
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead. Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`.
@@ -145,7 +145,7 @@ Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
 - If RTK is installed, digest-runner delegates supported generic command families through `rtk rewrite` and records the chosen compact filter in `report.filter` while preserving tsift artifact handles.
 - If your harness does not support Claude-style `PreToolUse` hooks, run `tsift rewrite --run '<command>'` to execute the same envelope-first, artifact-backed tsift equivalent manually.
 
-For local verification, run `make check` before committing. CI owns the wider ignored deterministic simulation corpus via `make ci-full`; after local changes, check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1` and fix any failing tests before calling the work complete.
+For local verification, run `make check` before committing. After local changes, check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1` and fix any failing tests before calling the work complete.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->

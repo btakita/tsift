@@ -1218,6 +1218,11 @@ fn audit_tagpath_reports_walker_diff() {
         "fn helper() {}\nfn caller() { helper(); }\n",
     )
     .unwrap();
+    fs::write(
+        dir.path().join("stubs.pyi"),
+        "def typed_helper() -> None: ...\n",
+    )
+    .unwrap();
 
     let output = tsift_bin()
         .args(["index", dir.path().to_str().unwrap()])
@@ -1259,6 +1264,10 @@ fn audit_tagpath_reports_walker_diff() {
         tsift_only.iter().any(|f| f.contains("__pycache__/lib.rs")),
         "expected __pycache__/lib.rs in tsift-only list: {json}"
     );
+    assert!(
+        tsift_only.iter().any(|f| f.contains("stubs.pyi")),
+        "expected stubs.pyi in tsift-only list: {json}"
+    );
 
     let unindexed_count = json["tsift_only_symbol_count"]
         .as_u64()
@@ -1280,6 +1289,32 @@ fn audit_tagpath_reports_walker_diff() {
                 && entry["symbols"].as_u64().unwrap_or(0) >= 1
         }),
         "expected __pycache__/lib.rs symbol entry: {json}"
+    );
+
+    let policy_hints = json["tsift_only_files_with_policy_hints"]
+        .as_array()
+        .expect("tsift_only_files_with_policy_hints");
+    assert!(
+        policy_hints.iter().any(|entry| {
+            entry["file"]
+                .as_str()
+                .is_some_and(|f| f.contains("__pycache__/lib.rs"))
+                && entry["hints"]
+                    .as_array()
+                    .is_some_and(|hints| hints.iter().any(|h| h == "skip_dir:__pycache__"))
+        }),
+        "expected __pycache__ policy hint: {json}"
+    );
+    assert!(
+        policy_hints.iter().any(|entry| {
+            entry["file"]
+                .as_str()
+                .is_some_and(|f| f.contains("stubs.pyi"))
+                && entry["hints"]
+                    .as_array()
+                    .is_some_and(|hints| hints.iter().any(|h| h == "extension_unsupported"))
+        }),
+        "expected unsupported extension policy hint: {json}"
     );
 }
 

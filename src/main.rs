@@ -16495,6 +16495,88 @@ fn print_explain_budget_human(report: &ExplainBudgetReport) {
 /// `tagpath_handle` even with a fresh tagpath index. This audit surfaces
 /// the diff so operators can decide whether to broaden the tagpath walk,
 /// add an `[exclude]` to tsift, or accept the gap.
+const TAGPATH_AUDIT_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".venv",
+    "vendor",
+];
+
+const TAGPATH_AUDIT_SOURCE_EXTENSIONS: &[&str] = &[
+    "rs", "py", "ts", "js", "go", "java", "rb", "c", "cpp", "h", "hpp", "cs", "swift", "kt",
+    "scala", "zig", "nim", "ex", "exs", "erl", "hs", "ml", "clj", "r", "lua", "php", "pl", "d",
+    "cr", "dart", "jl", "v", "odin", "gleam", "rkt", "scm", "lisp", "lsp", "f", "fs", "fsi",
+    "fsx", "sh", "bash", "zsh", "sql", "css", "tsx",
+];
+
+fn tagpath_audit_supported_extensions(root: &Path) -> BTreeSet<String> {
+    let mut extensions = TAGPATH_AUDIT_SOURCE_EXTENSIONS
+        .iter()
+        .map(|ext| (*ext).to_string())
+        .collect::<BTreeSet<_>>();
+
+    let config_path = root.join(".naming.toml");
+    if !config_path.exists() {
+        return extensions;
+    }
+
+    match tagpath::config::resolve(&config_path) {
+        Ok(config) => {
+            if let Some(grammars) = config.grammars {
+                for grammar in grammars.languages.values() {
+                    for ext in &grammar.extensions {
+                        if let Some(normalized) = normalize_extension(ext) {
+                            extensions.insert(normalized);
+                        }
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("tagpath_policy_hint_config_unreadable: {err}");
+        }
+    }
+    extensions
+}
+
+fn tagpath_audit_policy_hints(
+    rel_path: &str,
+    supported_extensions: &BTreeSet<String>,
+) -> Vec<String> {
+    let path = Path::new(rel_path);
+    let mut hints = BTreeSet::new();
+    if let Some(parent) = path.parent() {
+        for component in parent.components() {
+            if let std::path::Component::Normal(name) = component {
+                let name = name.to_string_lossy();
+                if TAGPATH_AUDIT_SKIP_DIRS.contains(&name.as_ref()) {
+                    hints.insert(format!("skip_dir:{name}"));
+                }
+            }
+        }
+    }
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(normalize_extension)
+        .is_some_and(|ext| !supported_extensions.contains(&ext))
+    {
+        hints.insert("extension_unsupported".to_string());
+    }
+    hints.into_iter().collect()
+}
+
+fn normalize_extension(ext: &str) -> Option<String> {
+    let normalized = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
 fn cmd_audit_tagpath(
     path: &std::path::Path,
     scope: Option<&str>,
@@ -16593,6 +16675,22 @@ fn cmd_audit_tagpath(
         .filter(|f| !tsift_files.contains(*f))
         .cloned()
         .collect();
+    let tagpath_supported_extensions = tagpath_audit_supported_extensions(&tagpath_root);
+    let tsift_only_policy_hints: Vec<(String, Vec<String>)> = tsift_only_files
+        .iter()
+        .filter_map(|file| {
+            let hints = tagpath_audit_policy_hints(file, &tagpath_supported_extensions);
+            if hints.is_empty() {
+                None
+            } else {
+                Some((file.clone(), hints))
+            }
+        })
+        .collect();
+    let tsift_only_policy_hints_by_file: BTreeMap<&str, &[String]> = tsift_only_policy_hints
+        .iter()
+        .map(|(file, hints)| (file.as_str(), hints.as_slice()))
+        .collect();
 
     // Aggregate tsift symbols whose definition file is in tsift_only_files
     // (these are the symbols that lose `tagpath_handle` recall today).
@@ -16624,6 +16722,10 @@ fn cmd_audit_tagpath(
                 .iter()
                 .map(|(file, count)| serde_json::json!({ "file": file, "symbols": count }))
                 .collect::<Vec<_>>(),
+            "tsift_only_files_with_policy_hints": tsift_only_policy_hints
+                .iter()
+                .map(|(file, hints)| serde_json::json!({ "file": file, "hints": hints }))
+                .collect::<Vec<_>>(),
         });
         if tagpath_state == "stale" {
             inject_tagpath_stale_into_json(&mut value, true, Some("stale_snapshot_loaded"));
@@ -16650,11 +16752,22 @@ fn cmd_audit_tagpath(
                     unindexed_symbol_count
                 );
                 for (file, count) in &unindexed_files_with_symbols {
-                    println!("  {file}  ({count} sym{})", if *count == 1 { "" } else { "s" });
+                    let hints = tsift_only_policy_hints_by_file
+                        .get(file.as_str())
+                        .map(|hints| format!("; hints: {}", hints.join(", ")))
+                        .unwrap_or_default();
+                    println!(
+                        "  {file}  ({count} sym{}{hints})",
+                        if *count == 1 { "" } else { "s" }
+                    );
                 }
                 for file in &tsift_only_files {
                     if !unindexed_files_with_symbols.iter().any(|(f, _)| f == file) {
-                        println!("  {file}  (0 syms)");
+                        let hints = tsift_only_policy_hints_by_file
+                            .get(file.as_str())
+                            .map(|hints| format!("; hints: {}", hints.join(", ")))
+                            .unwrap_or_default();
+                        println!("  {file}  (0 syms{hints})");
                     }
                 }
             }
