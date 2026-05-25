@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.46
+
+- `impact::compute` now exposes sub-phase timers under `conflict_matrix_preparation.impact.{context_resolution, diff_digest, test_path_scan, index_open, call_edge_impacts, route_handler_impacts, import_impacts, report_assembly}` and short-circuits the three iteration phases (`add_call_edge_impacts`, `add_route_handler_impacts`, `add_import_impacts`) when their inputs are empty. Three-sample medians on agent-loop show `conflict_matrix_preparation.impact` drops from 789 ms to 1.6 ms (-100%) on the typical backend-eval cold path (no staged changes), and the parent `conflict_matrix_preparation` drops from 2572 ms to 1935 ms (-25%). When staged changes are present the iteration phases run as before. The new sub-phases surface as `0us` on cache-hit reports with the existing source/document/staged-diff watermark detail, and the conformance suite asserts the sub-phases exist on cold runs.
+
 ## 0.1.45
 
 - `status_index_gate` is decomposed into three sub-phases reported as `conflict_matrix_preparation.status_index_gate.{prepare_agent_doc_index_gate, context_pack_status_reminders, load_tag_ontology_preview_context}`. Three-sample medians on agent-loop confirm `prepare_agent_doc_index_gate` (422 ms, 62%) and `context_pack_status_reminders` (266 ms, 39%) split the cost; ontology loading is effectively free. New `prepare_agent_doc_index_gate_cached` wraps the gate behind an in-process `(root, path_hint, scope, packet_label)` cache so repeated invocations within the same process — daemon use cases, tests, traversal+context-pack pipelines — reuse the inspection result. Single-shot CLI flows do not benefit yet because each helper currently fires only once per `backend-eval` pipeline; the cold-path inspection cost stays owned by future work. Cache-hit reports surface the new sub-phases as `0us` with the source/document/staged-diff watermark detail. Conformance suite asserts the sub-phases exist on cold runs.

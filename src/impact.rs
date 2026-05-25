@@ -9,6 +9,14 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImpactPhaseTiming {
+    pub name: String,
+    pub duration_micros: u128,
+    pub detail: String,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ImpactOptions<'a> {
@@ -59,8 +67,25 @@ impl ImpactTargetBuilder {
 }
 
 pub fn compute(path: &Path, options: ImpactOptions<'_>) -> Result<ImpactReport> {
+    compute_with_phases(path, options).map(|(report, _phases)| report)
+}
+
+pub fn compute_with_phases(
+    path: &Path,
+    options: ImpactOptions<'_>,
+) -> Result<(ImpactReport, Vec<ImpactPhaseTiming>)> {
+    let mut phases: Vec<ImpactPhaseTiming> = Vec::with_capacity(7);
+
+    let context_started = Instant::now();
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     let source_root = impact_source_root(&root, path, options.scope)?;
+    phases.push(ImpactPhaseTiming {
+        name: "context_resolution".to_string(),
+        duration_micros: context_started.elapsed().as_micros(),
+        detail: "project root and source root resolution".to_string(),
+    });
+
+    let diff_started = Instant::now();
     let diff = diff_digest::compute(
         &root,
         DiffDigestOptions {
@@ -68,6 +93,12 @@ pub fn compute(path: &Path, options: ImpactOptions<'_>) -> Result<ImpactReport> 
             revision: options.revision,
         },
     )?;
+    phases.push(ImpactPhaseTiming {
+        name: "diff_digest".to_string(),
+        duration_micros: diff_started.elapsed().as_micros(),
+        detail: "diff_digest::compute call for changed files/symbols".to_string(),
+    });
+
     let mut warnings = Vec::new();
     let changed_files = diff
         .files
@@ -87,6 +118,7 @@ pub fn compute(path: &Path, options: ImpactOptions<'_>) -> Result<ImpactReport> 
         .collect::<BTreeSet<_>>();
     let changed_tokens = changed_reference_tokens(&changed_files, &changed_symbols);
 
+    let test_scan_started = Instant::now();
     let mut targets = BTreeMap::<String, ImpactTargetBuilder>::new();
     for file in &diff.files {
         let abs = root.join(&file.path);
@@ -98,14 +130,26 @@ pub fn compute(path: &Path, options: ImpactOptions<'_>) -> Result<ImpactReport> 
             }
         }
     }
+    phases.push(ImpactPhaseTiming {
+        name: "test_path_scan".to_string(),
+        duration_micros: test_scan_started.elapsed().as_micros(),
+        detail: "per-changed-file test path / inline test classification".to_string(),
+    });
 
+    let index_started = Instant::now();
     let db_path = impact_db_path(&root, path, options.scope);
+    let mut call_edge_micros: u128 = 0;
+    let mut route_handler_micros: u128 = 0;
     match db_path {
         Ok(db_path) if db_path.exists() => {
             match index::IndexDb::open_read_only_resilient(&db_path) {
                 Ok(db) => {
+                    let call_started = Instant::now();
                     add_call_edge_impacts(&root, &db, &changed_symbol_set, &mut targets)?;
+                    call_edge_micros = call_started.elapsed().as_micros();
+                    let route_started = Instant::now();
                     add_route_handler_impacts(&root, &db, &changed_symbol_set, &mut targets)?;
+                    route_handler_micros = route_started.elapsed().as_micros();
                 }
                 Err(err) => warnings.push(format!(
                     "call-edge impact unavailable from {}: {err:#}",
@@ -119,9 +163,35 @@ pub fn compute(path: &Path, options: ImpactOptions<'_>) -> Result<ImpactReport> 
         )),
         Err(err) => warnings.push(format!("call-edge impact unavailable: {err:#}")),
     }
+    let index_total_micros = index_started.elapsed().as_micros();
+    let index_open_micros = index_total_micros
+        .saturating_sub(call_edge_micros)
+        .saturating_sub(route_handler_micros);
+    phases.push(ImpactPhaseTiming {
+        name: "index_open".to_string(),
+        duration_micros: index_open_micros,
+        detail: "index db path resolution and read-only open".to_string(),
+    });
+    phases.push(ImpactPhaseTiming {
+        name: "call_edge_impacts".to_string(),
+        duration_micros: call_edge_micros,
+        detail: "add_call_edge_impacts SQL/walk for symbol caller expansion".to_string(),
+    });
+    phases.push(ImpactPhaseTiming {
+        name: "route_handler_impacts".to_string(),
+        duration_micros: route_handler_micros,
+        detail: "add_route_handler_impacts route/handler annotation".to_string(),
+    });
 
+    let import_started = Instant::now();
     add_import_impacts(&root, &source_root, &changed_tokens, &mut targets)?;
+    phases.push(ImpactPhaseTiming {
+        name: "import_impacts".to_string(),
+        duration_micros: import_started.elapsed().as_micros(),
+        detail: "add_import_impacts source-root walk for token references".to_string(),
+    });
 
+    let assembly_started = Instant::now();
     let mut affected_tests = targets
         .into_iter()
         .map(|(path, builder)| ImpactTestTarget {
@@ -145,7 +215,7 @@ pub fn compute(path: &Path, options: ImpactOptions<'_>) -> Result<ImpactReport> 
         affected_tests.truncate(limit);
     }
 
-    Ok(ImpactReport {
+    let report = ImpactReport {
         root: root.display().to_string(),
         mode: diff.mode,
         revision: diff.revision,
@@ -155,7 +225,13 @@ pub fn compute(path: &Path, options: ImpactOptions<'_>) -> Result<ImpactReport> 
         affected_tests,
         truncated,
         warnings,
-    })
+    };
+    phases.push(ImpactPhaseTiming {
+        name: "report_assembly".to_string(),
+        duration_micros: assembly_started.elapsed().as_micros(),
+        detail: "sort, truncate, and report construction".to_string(),
+    });
+    Ok((report, phases))
 }
 
 fn impact_source_root(root: &Path, path: &Path, scope: Option<&str>) -> Result<PathBuf> {
@@ -237,6 +313,9 @@ fn add_call_edge_impacts(
     changed_symbols: &BTreeSet<String>,
     targets: &mut BTreeMap<String, ImpactTargetBuilder>,
 ) -> Result<()> {
+    if changed_symbols.is_empty() {
+        return Ok(());
+    }
     for edge in db.all_stored_edges()? {
         if !changed_symbols.contains(&edge.callee_name.to_ascii_lowercase()) {
             continue;
@@ -261,6 +340,9 @@ fn add_route_handler_impacts(
     changed_symbols: &BTreeSet<String>,
     targets: &mut BTreeMap<String, ImpactTargetBuilder>,
 ) -> Result<()> {
+    if changed_symbols.is_empty() {
+        return Ok(());
+    }
     for route in db.all_routes()? {
         if !changed_symbols.contains(&route.handler_name.to_ascii_lowercase()) {
             continue;
@@ -282,6 +364,9 @@ fn add_import_impacts(
     changed_tokens: &BTreeSet<String>,
     targets: &mut BTreeMap<String, ImpactTargetBuilder>,
 ) -> Result<()> {
+    if changed_tokens.is_empty() {
+        return Ok(());
+    }
     for entry in walk::walk_files(source_root)? {
         let path = rel_path(root, &entry.path);
         if !is_test_path(&path) && !file_contains_inline_tests(&entry.path) {

@@ -1469,6 +1469,14 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "conflict_matrix_preparation.status_index_gate.prepare_agent_doc_index_gate",
         "conflict_matrix_preparation.status_index_gate.context_pack_status_reminders",
         "conflict_matrix_preparation.status_index_gate.load_tag_ontology_preview_context",
+        "conflict_matrix_preparation.impact.context_resolution",
+        "conflict_matrix_preparation.impact.diff_digest",
+        "conflict_matrix_preparation.impact.test_path_scan",
+        "conflict_matrix_preparation.impact.index_open",
+        "conflict_matrix_preparation.impact.call_edge_impacts",
+        "conflict_matrix_preparation.impact.route_handler_impacts",
+        "conflict_matrix_preparation.impact.import_impacts",
+        "conflict_matrix_preparation.impact.report_assembly",
     ] {
         assert!(
             phases.iter().any(|entry| entry["name"] == phase),
@@ -2069,6 +2077,14 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "conflict_matrix_preparation.status_index_gate.load_tag_ontology_preview_context",
         "conflict_matrix_preparation.context_pack_diff",
         "conflict_matrix_preparation.impact",
+        "conflict_matrix_preparation.impact.context_resolution",
+        "conflict_matrix_preparation.impact.diff_digest",
+        "conflict_matrix_preparation.impact.test_path_scan",
+        "conflict_matrix_preparation.impact.index_open",
+        "conflict_matrix_preparation.impact.call_edge_impacts",
+        "conflict_matrix_preparation.impact.route_handler_impacts",
+        "conflict_matrix_preparation.impact.import_impacts",
+        "conflict_matrix_preparation.impact.report_assembly",
     ] {
         assert_eq!(
             phase_duration(&cached_report, phase),

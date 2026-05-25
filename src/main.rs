@@ -18257,6 +18257,14 @@ fn conflict_matrix_prepared_inputs_cache_hit(
         graph_db_backend_eval_phase_timing("graph_orchestration", 0, &cached_detail),
         graph_db_backend_eval_phase_timing("staged_diff", 0, &cached_detail),
         graph_db_backend_eval_phase_timing("impact", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing("impact.context_resolution", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing("impact.diff_digest", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing("impact.test_path_scan", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing("impact.index_open", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing("impact.call_edge_impacts", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing("impact.route_handler_impacts", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing("impact.import_impacts", 0, &cached_detail),
+        graph_db_backend_eval_phase_timing("impact.report_assembly", 0, &cached_detail),
     ];
     cached
 }
@@ -18330,23 +18338,30 @@ fn prepare_conflict_matrix_inputs(
             .with_context(|| format!("computing cached diff digest for {}", root.display()))
         },
     )?;
-    let impact_report = graph_db_backend_eval_timed_phase(
-        &mut preparation_timings,
-        "impact",
-        "cached impact analysis used for affected-test ownership checks",
-        || {
-            impact::compute(
-                root,
-                impact::ImpactOptions {
-                    cached: true,
-                    revision: None,
-                    scope,
-                    limit: impact_limit,
-                },
-            )
-            .with_context(|| format!("computing cached impact report for {}", root.display()))
+    let impact_started = Instant::now();
+    let (impact_report, impact_sub_phases) = impact::compute_with_phases(
+        root,
+        impact::ImpactOptions {
+            cached: true,
+            revision: None,
+            scope,
+            limit: impact_limit,
         },
-    )?;
+    )
+    .with_context(|| format!("computing cached impact report for {}", root.display()))?;
+    let impact_total_micros = impact_started.elapsed().as_micros();
+    preparation_timings.push(graph_db_backend_eval_phase_timing(
+        "impact",
+        impact_total_micros,
+        "cached impact analysis used for affected-test ownership checks",
+    ));
+    for sub in &impact_sub_phases {
+        preparation_timings.push(graph_db_backend_eval_phase_timing(
+            &format!("impact.{}", sub.name),
+            sub.duration_micros,
+            &sub.detail,
+        ));
+    }
     let prepared = ConflictMatrixPreparedInputs {
         context_pack,
         cached_diff,
