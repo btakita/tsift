@@ -741,22 +741,103 @@ fn communities_json_reports_disconnected_clusters() {
     );
 
     let communities = json["communities"].as_array().unwrap();
+    let community_member_names = |c: &serde_json::Value| -> Vec<String> {
+        c["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap().to_string())
+            .collect()
+    };
     assert!(
         communities.iter().any(|community| {
-            let members = community["members"].as_array().unwrap();
-            members.iter().any(|m| m == "alpha")
-                && members.iter().any(|m| m == "beta")
-                && members.iter().any(|m| m == "gamma")
+            let names = community_member_names(community);
+            names.contains(&"alpha".to_string())
+                && names.contains(&"beta".to_string())
+                && names.contains(&"gamma".to_string())
         }),
         "expected alpha/beta/gamma community: {json}"
     );
     assert!(
         communities.iter().any(|community| {
-            let members = community["members"].as_array().unwrap();
-            members.iter().any(|m| m == "delta") && members.iter().any(|m| m == "epsilon")
+            let names = community_member_names(community);
+            names.contains(&"delta".to_string())
+                && names.contains(&"epsilon".to_string())
         }),
         "expected delta/epsilon community: {json}"
     );
+    // Without a tagpath index in the fixture, no member should carry a handle.
+    for community in communities {
+        for member in community["members"].as_array().unwrap() {
+            assert!(
+                member.get("tagpath_handle").is_none(),
+                "unexpected handle: {member}"
+            );
+        }
+    }
+}
+
+#[test]
+fn communities_json_omits_handles_when_no_tagpath_flag_set() {
+    let dir = indexed_cli_fixture();
+    write_fresh_tagpath_index(dir.path(), &[("alpha", "main.rs"), ("beta", "main.rs")]);
+
+    let output = tsift_bin()
+        .args([
+            "communities",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--no-tagpath",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "communities should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for community in json["communities"].as_array().unwrap() {
+        for member in community["members"].as_array().unwrap() {
+            assert!(
+                member.get("tagpath_handle").is_none(),
+                "--no-tagpath should suppress handles: {member}"
+            );
+        }
+    }
+}
+
+#[test]
+fn communities_json_annotates_members_when_index_is_fresh() {
+    let dir = indexed_cli_fixture();
+    let members: Vec<(&str, &str)> = vec![
+        ("alpha", "main.rs"),
+        ("beta", "main.rs"),
+        ("gamma", "main.rs"),
+        ("delta", "main.rs"),
+        ("epsilon", "main.rs"),
+    ];
+    write_fresh_tagpath_index(dir.path(), &members);
+
+    let output = tsift_bin()
+        .args(["communities", dir.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "communities should succeed (stderr={})",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let communities = json["communities"].as_array().unwrap();
+    assert!(!communities.is_empty());
+    for community in communities {
+        for member in community["members"].as_array().unwrap() {
+            let name = member["name"].as_str().unwrap();
+            let handle = member["tagpath_handle"]
+                .as_str()
+                .unwrap_or_else(|| panic!("community member {name} missing tagpath_handle"));
+            assert!(handle.starts_with("mem:"), "{name}: {handle}");
+        }
+    }
 }
 
 #[test]

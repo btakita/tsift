@@ -578,9 +578,27 @@ pub fn project_routes(
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CommunityMember {
+    pub name: String,
+    /// Stable `mem:` handle from the tagpath index when a fresh adapter is
+    /// loaded for the project root. See `tagpath::SPEC.md` §15.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tagpath_handle: Option<String>,
+}
+
+impl CommunityMember {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            tagpath_handle: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Community {
     pub id: usize,
-    pub members: Vec<String>,
+    pub members: Vec<CommunityMember>,
     pub modularity_contribution: f64,
 }
 
@@ -641,7 +659,7 @@ pub fn detect_communities(edges: &[(String, String)]) -> CommunityResult {
             .enumerate()
             .map(|(i, name)| Community {
                 id: i,
-                members: vec![name.clone()],
+                members: vec![CommunityMember::new(name.clone())],
                 modularity_contribution: 0.0,
             })
             .collect();
@@ -730,7 +748,7 @@ pub fn detect_communities(edges: &[(String, String)]) -> CommunityResult {
             total_modularity += mod_contrib;
             Community {
                 id,
-                members,
+                members: members.into_iter().map(CommunityMember::new).collect(),
                 modularity_contribution: mod_contrib,
             }
         })

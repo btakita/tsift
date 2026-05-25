@@ -296,6 +296,13 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Skip tagpath index lookup (do not annotate members with `tagpath_handle`).
+        #[arg(long)]
+        no_tagpath: bool,
+        /// Fail closed when a tagpath index is present but stale, instead of
+        /// emitting a stale diagnostic and falling back silently.
+        #[arg(long)]
+        tagpath_strict: bool,
     },
     /// Find the shortest path between two symbols in the call graph
     Path {
@@ -1545,6 +1552,8 @@ fn main() -> Result<()> {
             min_size,
             limit,
             json,
+            no_tagpath,
+            tagpath_strict,
         }) => cmd_communities(
             &path,
             scope.as_deref(),
@@ -1556,6 +1565,10 @@ fn main() -> Result<()> {
             terse,
             tabular,
             schema,
+            TagpathSearchOpts {
+                no_tagpath,
+                strict: tagpath_strict,
+            },
         ),
         Some(Commands::Path {
             from,
@@ -3572,35 +3585,40 @@ pub enum EdgeSide {
     Callee,
 }
 
-/// Resolve `tagpath_handle` for each community member name. Members
-/// without a matching handle (or with no tagpath adapter loaded) are
-/// returned as `None`. Used by `cmd_explain` to enrich the community
-/// section of the JSON response without changing `graph::Community`'s
-/// stable shape used by the standalone `tsift communities` command.
-pub fn resolve_community_member_handles(
-    members: &[String],
+/// Annotate every `graph::CommunityMember` in `communities` in-place with
+/// the stable `mem:` handle from the tagpath index. Returns `None` when
+/// no tagpath adapter loaded for `root` (so the caller can suppress
+/// diagnostics for that case); returns `Some(diag)` for the
+/// loaded / stale paths. Same fallback matrix as
+/// [`annotate_hits_with_tagpath`].
+pub fn annotate_communities_with_tagpath(
+    communities: &mut [graph::Community],
     db: &index::IndexDb,
     root: &std::path::Path,
     opts: &TagpathSearchOpts,
-) -> Result<(Vec<Option<String>>, TagpathAnnotationDiagnostic)> {
+) -> Result<Option<TagpathAnnotationDiagnostic>> {
     if opts.no_tagpath {
-        return Ok((
-            vec![None; members.len()],
-            TagpathAnnotationDiagnostic::default(),
-        ));
+        return Ok(None);
     }
     match tagpath_adapter::try_load(root) {
         tagpath_adapter::LoadResult::Loaded(adapter) => {
-            let map = resolve_tagpath_handles_for_names(members, db, root, &adapter);
-            let handles = members.iter().map(|m| map.get(m).cloned()).collect();
-            Ok((
-                handles,
-                TagpathAnnotationDiagnostic {
-                    stale: false,
-                    reason: None,
-                    loaded: true,
-                },
-            ))
+            let mut names: Vec<String> = Vec::new();
+            for comm in communities.iter() {
+                names.extend(comm.members.iter().map(|m| m.name.clone()));
+            }
+            let map = resolve_tagpath_handles_for_names(&names, db, root, &adapter);
+            for comm in communities.iter_mut() {
+                for member in comm.members.iter_mut() {
+                    if let Some(handle) = map.get(&member.name) {
+                        member.tagpath_handle = Some(handle.clone());
+                    }
+                }
+            }
+            Ok(Some(TagpathAnnotationDiagnostic {
+                stale: false,
+                reason: None,
+                loaded: true,
+            }))
         }
         tagpath_adapter::LoadResult::Stale { reason, .. } => {
             if opts.strict {
@@ -3608,19 +3626,13 @@ pub fn resolve_community_member_handles(
                     "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
                 );
             }
-            Ok((
-                vec![None; members.len()],
-                TagpathAnnotationDiagnostic {
-                    stale: true,
-                    reason: Some(reason),
-                    loaded: false,
-                },
-            ))
+            Ok(Some(TagpathAnnotationDiagnostic {
+                stale: true,
+                reason: Some(reason),
+                loaded: false,
+            }))
         }
-        tagpath_adapter::LoadResult::Missing => Ok((
-            vec![None; members.len()],
-            TagpathAnnotationDiagnostic::default(),
-        )),
+        tagpath_adapter::LoadResult::Missing => Ok(None),
     }
 }
 
@@ -3734,14 +3746,15 @@ fn compact_snippet(snippet: &str) -> Option<String> {
         .map(|line| truncate_for_compact(line, 100))
 }
 
-fn compact_members(members: &[String], limit: usize) -> String {
-    if members.len() <= limit {
-        return members.join(", ");
+fn compact_members(members: &[graph::CommunityMember], limit: usize) -> String {
+    let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+    if names.len() <= limit {
+        return names.join(", ");
     }
     format!(
         "{} (+{} more)",
-        members[..limit].join(", "),
-        members.len() - limit
+        names[..limit].join(", "),
+        names.len() - limit
     )
 }
 
@@ -4957,10 +4970,26 @@ fn cmd_communities(
     terse: bool,
     tabular: bool,
     schema: bool,
+    tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     let db = open_index_db(path, scope)?;
     let edges = db.all_edges()?;
-    let result = graph::detect_communities(&edges);
+    let mut result = graph::detect_communities(&edges);
+    if let Some(diag) = annotate_communities_with_tagpath(
+        &mut result.communities,
+        &db,
+        &root,
+        &tagpath_opts,
+    )?
+        && diag.stale
+        && !tagpath_opts.no_tagpath
+    {
+        eprintln!(
+            "tagpath_index_stale: true (reason={}); falling back to live extraction",
+            diag.reason.as_deref().unwrap_or("unknown"),
+        );
+    }
 
     let filtered: Vec<&graph::Community> = result
         .communities
@@ -4990,11 +5019,12 @@ fn cmd_communities(
     } else if tabular {
         println!("id\tsize\tmembers");
         for (i, community) in display.iter().enumerate() {
+            let names: Vec<&str> = community.members.iter().map(|m| m.name.as_str()).collect();
             println!(
                 "{}\t{}\t{}",
                 i + 1,
                 community.members.len(),
-                community.members.join(",")
+                names.join(",")
             );
         }
         if truncated {
@@ -5037,7 +5067,10 @@ fn cmd_communities(
                     c.modularity_contribution
                 );
                 for m in &c.members {
-                    println!("    {}", m);
+                    match &m.tagpath_handle {
+                        Some(handle) => println!("    {}  [{}]", m.name, handle),
+                        None => println!("    {}", m.name),
+                    }
                 }
                 if i + 1 < display.len() {
                     println!();
@@ -15660,11 +15693,29 @@ fn cmd_explain_with_budget(
     }
 
     let edges = db.all_edges()?;
-    let comm_result = graph::detect_communities(&edges);
+    let mut comm_result = graph::detect_communities(&edges);
+    // Annotate community members across all communities so the focused
+    // explain response and any future per-community access see the same
+    // `tagpath_handle` data.
+    if let Some(comm_diag) = annotate_communities_with_tagpath(
+        &mut comm_result.communities,
+        &db,
+        &root,
+        &tagpath_opts,
+    )?
+        && comm_diag.stale
+        && !tagpath_opts.no_tagpath
+        && !tagpath_stale
+    {
+        eprintln!(
+            "tagpath_index_stale: true (reason={}); falling back to live extraction",
+            comm_diag.reason.as_deref().unwrap_or("unknown"),
+        );
+    }
     let community = comm_result
         .communities
         .iter()
-        .find(|c| c.members.iter().any(|m| m == symbol));
+        .find(|c| c.members.iter().any(|m| m.name == symbol));
 
     if budget.is_active() {
         let report = build_explain_budget_report(
@@ -15708,37 +15759,6 @@ fn cmd_explain_with_budget(
             print_explain_budget_human(&report);
         }
     } else if format.json_output {
-        let community_json = match community {
-            Some(comm) => {
-                let (handles, comm_diag) = resolve_community_member_handles(
-                    &comm.members,
-                    &db,
-                    &root,
-                    &tagpath_opts,
-                )?;
-                if comm_diag.stale && !tagpath_opts.no_tagpath && !tagpath_stale {
-                    eprintln!(
-                        "tagpath_index_stale: true (reason={}); falling back to live extraction",
-                        comm_diag.reason.as_deref().unwrap_or("unknown"),
-                    );
-                }
-                let members: Vec<serde_json::Value> = comm
-                    .members
-                    .iter()
-                    .zip(handles)
-                    .map(|(name, handle)| match handle {
-                        Some(h) => serde_json::json!({"name": name, "tagpath_handle": h}),
-                        None => serde_json::json!({"name": name}),
-                    })
-                    .collect();
-                serde_json::json!({
-                    "id": comm.id,
-                    "members": members,
-                    "modularity_contribution": comm.modularity_contribution,
-                })
-            }
-            None => serde_json::Value::Null,
-        };
         let out = serde_json::json!({
             "symbol": symbol,
             "definitions": symbols,
@@ -15748,7 +15768,7 @@ fn cmd_explain_with_budget(
             "callees": callees,
             "callees_total": callees_total,
             "callees_truncated": callees_truncated,
-            "community": community_json,
+            "community": community,
         });
         print_json_or_envelope(
             &out,
@@ -15811,10 +15831,11 @@ fn cmd_explain_with_budget(
         }
         if let Some(comm) = community {
             println!();
+            let names: Vec<&str> = comm.members.iter().map(|m| m.name.as_str()).collect();
             println!(
                 "community\t{}\t{}",
                 comm.members.len(),
-                comm.members.join(",")
+                names.join(",")
             );
         }
     } else if compact {
@@ -15937,8 +15958,11 @@ fn cmd_explain_with_budget(
             println!();
             println!("Community {} ({} members):", comm.id, comm.members.len());
             for m in &comm.members {
-                let marker = if m == symbol { "→ " } else { "  " };
-                println!("{}{}", marker, m);
+                let marker = if m.name == symbol { "→ " } else { "  " };
+                match &m.tagpath_handle {
+                    Some(handle) => println!("{}{}  [{}]", marker, m.name, handle),
+                    None => println!("{}{}", marker, m.name),
+                }
             }
         }
     }
@@ -16099,7 +16123,7 @@ fn build_explain_budget_report(
             .members
             .iter()
             .take(max_items)
-            .map(|member| truncate_for_budget(member, max_bytes))
+            .map(|member| truncate_for_budget(&member.name, max_bytes))
             .collect(),
     });
 
@@ -29420,14 +29444,10 @@ def list_items():
 
     #[test]
     fn compact_members_caps_list() {
-        let members = vec![
-            "a".to_string(),
-            "b".to_string(),
-            "c".to_string(),
-            "d".to_string(),
-            "e".to_string(),
-            "f".to_string(),
-        ];
+        let members: Vec<graph::CommunityMember> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|n| graph::CommunityMember::new(*n))
+            .collect();
         assert_eq!(compact_members(&members, 5), "a, b, c, d, e (+1 more)");
     }
 
@@ -30207,6 +30227,7 @@ tier = "private"
             false,
             false,
             false,
+            TagpathSearchOpts::default(),
         )
         .unwrap_err();
 
@@ -30237,7 +30258,17 @@ tier = "private"
         std::fs::create_dir_all(&nested).unwrap();
 
         let result = cmd_communities(
-            &nested, None, 1, 10, false, false, false, false, false, false,
+            &nested,
+            None,
+            1,
+            10,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            TagpathSearchOpts::default(),
         );
 
         assert!(result.is_ok());
@@ -30470,6 +30501,7 @@ tier = "private"
             false,
             false,
             false,
+            TagpathSearchOpts::default(),
         );
         assert!(result.is_err());
     }
@@ -31656,6 +31688,7 @@ tier = "private"
             false,
             false,
             false,
+            TagpathSearchOpts::default(),
         );
 
         assert!(result.is_ok());
@@ -31678,6 +31711,7 @@ tier = "private"
             false,
             false,
             false,
+            TagpathSearchOpts::default(),
         );
 
         assert!(result.is_ok());
@@ -32857,9 +32891,9 @@ tier = "private"
         let community = graph::Community {
             id: 1,
             members: vec![
-                "alpha_helper".to_string(),
-                "main".to_string(),
-                "worker".to_string(),
+                graph::CommunityMember::new("alpha_helper"),
+                graph::CommunityMember::new("main"),
+                graph::CommunityMember::new("worker"),
             ],
             modularity_contribution: 0.5,
         };
@@ -34381,6 +34415,7 @@ tier = "private"
             false,
             true,
             false,
+            TagpathSearchOpts::default(),
         );
         assert!(result.is_ok());
     }
