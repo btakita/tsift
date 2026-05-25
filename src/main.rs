@@ -3433,8 +3433,10 @@ pub fn annotate_hits_with_tagpath(
 /// Resolve a per-symbol-name `tagpath_handle` map for a batch of symbol
 /// names against a fresh tagpath index. Names whose definition file is not
 /// present in the index, or which have no matching handle, are simply
-/// absent from the returned map. `db.symbol_info` (first definition wins)
-/// supplies the file used for handle resolution when `file_hint` is `None`.
+/// absent from the returned map. When multiple `db.symbol_info` rows share
+/// the same name across files, every row is probed and the first one that
+/// produces a tagpath handle wins, so a name collision against an
+/// out-of-tagpath file no longer drops a valid handle from another file.
 fn resolve_tagpath_handles_for_names(
     names: &[String],
     db: &index::IndexDb,
@@ -3450,16 +3452,16 @@ fn resolve_tagpath_handles_for_names(
         let Ok(syms) = db.symbol_info(name) else {
             continue;
         };
-        let Some(sym) = syms.into_iter().next() else {
-            continue;
-        };
-        let abs = if std::path::Path::new(&sym.file).is_absolute() {
-            std::path::PathBuf::from(&sym.file)
-        } else {
-            root.join(&sym.file)
-        };
-        if let Some(handle) = adapter.handle_for_member(&abs, name) {
-            out.insert(name.clone(), handle);
+        for sym in syms {
+            let abs = if std::path::Path::new(&sym.file).is_absolute() {
+                std::path::PathBuf::from(&sym.file)
+            } else {
+                root.join(&sym.file)
+            };
+            if let Some(handle) = adapter.handle_for_member(&abs, name) {
+                out.insert(name.clone(), handle);
+                break;
+            }
         }
     }
     out
@@ -6242,6 +6244,10 @@ struct ConvexTransportRequest<'a> {
     node_rows: Vec<ConvexNodeRow>,
     edge_rows: Vec<ConvexEdgeRow>,
     keys: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -6250,6 +6256,38 @@ struct ConvexTransportResponse {
     status: Option<String>,
     message: Option<String>,
     rows: Option<ConvexProjectionRows>,
+    #[serde(default)]
+    meta: Option<ConvexSnapshotMeta>,
+    #[serde(default)]
+    page: Option<ConvexSnapshotPage>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ConvexSnapshotMeta {
+    // Captured for completeness/debugging; not currently consumed by the
+    // freshness diff (indexes are already validated against the required set
+    // via `convex_required_indexes`, and `page_size` is informational only).
+    #[serde(default)]
+    #[allow(dead_code)]
+    indexes: Vec<ConvexRequiredIndex>,
+    node_count: usize,
+    edge_count: usize,
+    #[serde(default)]
+    #[allow(dead_code)]
+    page_size: Option<usize>,
+}
+
+/// Paginated snapshot page response. `rows` is either node rows or edge rows
+/// depending on which operation was called; we deserialize as raw values to
+/// keep the transport struct shared between both shapes, then narrow per call
+/// site.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ConvexSnapshotPage {
+    rows: Vec<serde_json::Value>,
+    #[serde(default)]
+    next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -6442,7 +6480,37 @@ impl ConvexHttpTransport {
             .with_context(|| format!("parsing Convex graph transport response {}", self.endpoint))
     }
 
+    /// Fetch a full snapshot of the Convex graph backend.
+    ///
+    /// Uses the paginated `snapshot_meta` + `snapshot_nodes_page` +
+    /// `snapshot_edges_page` triplet so the call works on tables larger than
+    /// ~5k rows (the single-shot `snapshot` query hits Convex's 15s per-request
+    /// syscall budget at that scale; see `#convexsnapshotscale`).
+    ///
+    /// Falls back to the legacy single-shot `snapshot` operation if the
+    /// backend doesn't recognize `snapshot_meta` (older deployments that
+    /// haven't redeployed the new schema).
     fn fetch_snapshot(&self, projection_version: &str) -> Result<ConvexProjectionRows> {
+        match self.fetch_snapshot_paginated(projection_version) {
+            Ok(rows) => Ok(rows),
+            Err(err) => {
+                // Only fall through to the legacy path if the failure looks
+                // like "operation unknown" (older backend). Any other failure
+                // (HTTP timeout, deserialization mismatch) should surface so
+                // the operator sees the real cause.
+                let msg = format!("{err:#}");
+                let is_unknown_op = msg.contains("unknown operation")
+                    || msg.contains("snapshot_meta")
+                    || msg.contains("404");
+                if !is_unknown_op {
+                    return Err(err);
+                }
+                self.fetch_snapshot_legacy(projection_version)
+            }
+        }
+    }
+
+    fn fetch_snapshot_legacy(&self, projection_version: &str) -> Result<ConvexProjectionRows> {
         let response = self.post(&ConvexTransportRequest {
             operation: "snapshot",
             chunk: 0,
@@ -6451,10 +6519,96 @@ impl ConvexHttpTransport {
             node_rows: Vec::new(),
             edge_rows: Vec::new(),
             keys: Vec::new(),
+            cursor: None,
+            limit: None,
         })?;
         response
             .rows
             .context("Convex snapshot response did not include rows")
+    }
+
+    fn fetch_snapshot_paginated(
+        &self,
+        projection_version: &str,
+    ) -> Result<ConvexProjectionRows> {
+        let meta_response = self.post(&ConvexTransportRequest {
+            operation: "snapshot_meta",
+            chunk: 0,
+            projection_version,
+            projection_hash: None,
+            node_rows: Vec::new(),
+            edge_rows: Vec::new(),
+            keys: Vec::new(),
+            cursor: None,
+            limit: None,
+        })?;
+        if matches!(meta_response.status.as_deref(), Some("error")) {
+            anyhow::bail!(
+                "Convex snapshot_meta returned error: {}",
+                meta_response.message.unwrap_or_default()
+            );
+        }
+        let meta = meta_response
+            .meta
+            .context("Convex snapshot_meta response did not include meta")?;
+
+        let mut nodes: Vec<ConvexNodeRow> = Vec::with_capacity(meta.node_count);
+        let mut node_cursor: Option<String> = None;
+        loop {
+            let response = self.post(&ConvexTransportRequest {
+                operation: "snapshot_nodes_page",
+                chunk: 0,
+                projection_version,
+                projection_hash: None,
+                node_rows: Vec::new(),
+                edge_rows: Vec::new(),
+                keys: Vec::new(),
+                cursor: node_cursor.clone(),
+                limit: None,
+            })?;
+            let page = response
+                .page
+                .context("Convex snapshot_nodes_page response did not include page")?;
+            for raw in page.rows {
+                let row: ConvexNodeRow = serde_json::from_value(raw)
+                    .context("decoding Convex snapshot node row")?;
+                nodes.push(row);
+            }
+            match page.next_cursor {
+                Some(next) => node_cursor = Some(next),
+                None => break,
+            }
+        }
+
+        let mut edges: Vec<ConvexEdgeRow> = Vec::with_capacity(meta.edge_count);
+        let mut edge_cursor: Option<String> = None;
+        loop {
+            let response = self.post(&ConvexTransportRequest {
+                operation: "snapshot_edges_page",
+                chunk: 0,
+                projection_version,
+                projection_hash: None,
+                node_rows: Vec::new(),
+                edge_rows: Vec::new(),
+                keys: Vec::new(),
+                cursor: edge_cursor.clone(),
+                limit: None,
+            })?;
+            let page = response
+                .page
+                .context("Convex snapshot_edges_page response did not include page")?;
+            for raw in page.rows {
+                let row: ConvexEdgeRow = serde_json::from_value(raw)
+                    .context("decoding Convex snapshot edge row")?;
+                edges.push(row);
+            }
+            match page.next_cursor {
+                Some(next) => edge_cursor = Some(next),
+                None => break,
+            }
+        }
+
+        Ok(ConvexProjectionRows { nodes, edges })
     }
 
     fn apply_chunk(
@@ -6490,6 +6644,8 @@ impl ConvexHttpTransport {
             node_rows,
             edge_rows,
             keys: chunk.keys.clone(),
+            cursor: None,
+            limit: None,
         };
         let mut last_error = None;
         for attempt in 1..=chunk.max_attempts {

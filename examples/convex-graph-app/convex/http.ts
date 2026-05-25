@@ -18,8 +18,29 @@ http.route({
     const body = await request.json();
     switch (body.operation) {
       case "snapshot": {
+        // Legacy single-shot. Fails on tables >~5k rows (Convex syscall
+        // budget). New callers should use snapshot_meta + snapshot_nodes_page
+        // + snapshot_edges_page. See #convexsnapshotscale.
         const rows = await ctx.runQuery(api.graph.snapshot, {});
         return jsonResponse({ status: "ok", rows });
+      }
+      case "snapshot_meta": {
+        const meta = await ctx.runQuery(api.graph.snapshotMeta, {});
+        return jsonResponse({ status: "ok", meta });
+      }
+      case "snapshot_nodes_page": {
+        const page = await ctx.runQuery(api.graph.snapshotNodesPage, {
+          cursor: body.cursor ?? null,
+          limit: body.limit,
+        });
+        return jsonResponse({ status: "ok", page });
+      }
+      case "snapshot_edges_page": {
+        const page = await ctx.runQuery(api.graph.snapshotEdgesPage, {
+          cursor: body.cursor ?? null,
+          limit: body.limit,
+        });
+        return jsonResponse({ status: "ok", page });
       }
       case "delete_edges": {
         const result = await ctx.runMutation(api.graph.deleteEdges, {
@@ -55,4 +76,3 @@ http.route({
 });
 
 export default http;
-

@@ -840,6 +840,70 @@ fn communities_json_annotates_members_when_index_is_fresh() {
     }
 }
 
+// Regression: when two files define the same symbol and the first row by
+// `(file, line)` lives outside the tagpath index, the resolver must keep
+// iterating instead of dropping the handle. `__pycache__/` is in tagpath's
+// hard-coded SKIP_DIRS but tsift's `ignore`-based walker still indexes it,
+// and `_` (0x5F) sorts before `s` (0x73) so `__pycache__/main.rs` is the
+// first row tsift returns for `symbol_info("helper")`.
+#[test]
+fn communities_json_resolves_handle_through_name_collision() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("__pycache__")).unwrap();
+    fs::write(
+        dir.path().join("__pycache__/main.rs"),
+        "fn helper() {}\nfn vendor_caller() { helper(); }\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/main.rs"),
+        "fn helper() {}\nfn src_caller() { helper(); }\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    write_fresh_tagpath_index(dir.path(), &[("helper", "src/main.rs")]);
+
+    let output = tsift_bin()
+        .args(["communities", dir.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "communities stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let mut helper_handles: Vec<String> = Vec::new();
+    for community in json["communities"].as_array().unwrap() {
+        for member in community["members"].as_array().unwrap() {
+            if member["name"].as_str() == Some("helper")
+                && let Some(handle) = member.get("tagpath_handle").and_then(|h| h.as_str())
+            {
+                helper_handles.push(handle.to_string());
+            }
+        }
+    }
+    assert!(
+        !helper_handles.is_empty(),
+        "expected `helper` member to carry a tagpath_handle after the name-collision fix: {json}"
+    );
+    for handle in &helper_handles {
+        assert!(handle.starts_with("mem:"), "{handle}");
+    }
+}
+
 #[test]
 fn path_json_reports_shortest_symbol_chain() {
     let dir = indexed_cli_fixture();

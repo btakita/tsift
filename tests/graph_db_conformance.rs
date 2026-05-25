@@ -344,42 +344,80 @@ fn fetch_live_convex_snapshot(
     auth_token_env: &str,
     projection_version: &str,
 ) -> Value {
-    let request = json!({
-        "operation": "snapshot",
+    // Uses the paginated snapshot ops (#convexsnapshotscale). The single-shot
+    // `snapshot` operation hits Convex's 15s syscall budget once tables exceed
+    // ~5k rows.
+    let post = |body: Value| -> Value {
+        let mut builder = ureq::post(endpoint);
+        if let Ok(token) = env::var(auth_token_env)
+            && !token.trim().is_empty()
+        {
+            builder = builder.header("Authorization", &format!("Bearer {token}"));
+        }
+        let mut response = builder.send_json(&body).unwrap_or_else(|err| {
+            panic!("live Convex snapshot request failed for {endpoint} body={body}: {err}")
+        });
+        let response: Value = response.body_mut().read_json().unwrap_or_else(|err| {
+            panic!("live Convex snapshot response was not JSON for body={body}: {err}")
+        });
+        assert_eq!(
+            response["status"], "ok",
+            "unexpected snapshot response for body={body}: {response}"
+        );
+        response
+    };
+
+    let meta = post(json!({
+        "operation": "snapshot_meta",
         "chunk": 0,
         "projectionVersion": projection_version,
-        "projectionHash": null,
-        "nodeRows": [],
-        "edgeRows": [],
-        "keys": []
-    });
-    let mut builder = ureq::post(endpoint);
-    if let Ok(token) = env::var(auth_token_env)
-        && !token.trim().is_empty()
-    {
-        builder = builder.header("Authorization", &format!("Bearer {token}"));
+    }));
+    assert!(
+        meta["meta"]["nodeCount"].is_number(),
+        "meta missing nodeCount: {meta}"
+    );
+    assert!(
+        meta["meta"]["edgeCount"].is_number(),
+        "meta missing edgeCount: {meta}"
+    );
+
+    let mut nodes: Vec<Value> = Vec::new();
+    let mut cursor: Value = Value::Null;
+    loop {
+        let resp = post(json!({
+            "operation": "snapshot_nodes_page",
+            "chunk": 0,
+            "projectionVersion": projection_version,
+            "cursor": cursor,
+        }));
+        let rows = resp["page"]["rows"].as_array().cloned().unwrap_or_default();
+        nodes.extend(rows);
+        let next = resp["page"]["nextCursor"].clone();
+        if next.is_null() {
+            break;
+        }
+        cursor = next;
     }
-    let mut response = builder
-        .send_json(&request)
-        .unwrap_or_else(|err| panic!("live Convex snapshot request failed for {endpoint}: {err}"));
-    let response: Value = response
-        .body_mut()
-        .read_json()
-        .unwrap_or_else(|err| panic!("live Convex snapshot response was not JSON: {err}"));
-    assert_eq!(
-        response["status"], "ok",
-        "unexpected snapshot response: {response}"
-    );
-    let rows = response["rows"].clone();
-    assert!(
-        rows["nodes"].is_array(),
-        "snapshot rows missing nodes: {rows}"
-    );
-    assert!(
-        rows["edges"].is_array(),
-        "snapshot rows missing edges: {rows}"
-    );
-    rows
+
+    let mut edges: Vec<Value> = Vec::new();
+    let mut cursor: Value = Value::Null;
+    loop {
+        let resp = post(json!({
+            "operation": "snapshot_edges_page",
+            "chunk": 0,
+            "projectionVersion": projection_version,
+            "cursor": cursor,
+        }));
+        let rows = resp["page"]["rows"].as_array().cloned().unwrap_or_default();
+        edges.extend(rows);
+        let next = resp["page"]["nextCursor"].clone();
+        if next.is_null() {
+            break;
+        }
+        cursor = next;
+    }
+
+    json!({ "nodes": nodes, "edges": edges })
 }
 
 fn node_ids(report: &Value) -> Vec<String> {
@@ -4597,4 +4635,274 @@ fn graph_db_doctor_fails_closed_for_convex_index_duplicates_and_orphans() {
         "{report}"
     );
     assert!(stderr.contains("graph-db doctor failed closed"), "{stderr}");
+}
+
+// -- #convexsnapshotscale: paginated remote-snapshot transport coverage ---------
+//
+// The live acceptance test above (`live_convex_graph_backend_acceptance_...`)
+// only runs against a real Convex deployment behind an env gate. We also want
+// a fully hermetic integration test that exercises the paginated transport
+// (`snapshot_meta` + `snapshot_nodes_page` + `snapshot_edges_page`) without
+// requiring Docker or a live backend. The mock server below is the minimum
+// stdlib HTTP/1.1 implementation needed for ureq to talk to it.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+
+struct MockConvexSnapshotServer {
+    addr: String,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+    pub call_log: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl MockConvexSnapshotServer {
+    fn start(snapshot: Value, page_size: usize) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        listener
+            .set_nonblocking(true)
+            .expect("set nonblocking on listener");
+        let addr = listener.local_addr().unwrap().to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let call_log: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shutdown_clone = Arc::clone(&shutdown);
+        let call_log_clone = Arc::clone(&call_log);
+        let snapshot = Arc::new(snapshot);
+        let handle = thread::spawn(move || {
+            while !shutdown_clone.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("clear nonblocking on accepted stream");
+                        let mut reader = BufReader::new(
+                            stream.try_clone().expect("clone stream for read half"),
+                        );
+                        let mut request_line = String::new();
+                        if reader.read_line(&mut request_line).is_err() {
+                            continue;
+                        }
+                        let mut content_length = 0usize;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).is_err() {
+                                break;
+                            }
+                            if line == "\r\n" || line.is_empty() {
+                                break;
+                            }
+                            if let Some(rest) = line
+                                .strip_prefix("Content-Length:")
+                                .or_else(|| line.strip_prefix("content-length:"))
+                            {
+                                content_length = rest.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        let mut body_bytes = vec![0u8; content_length];
+                        if content_length > 0 {
+                            reader
+                                .read_exact(&mut body_bytes)
+                                .expect("read request body");
+                        }
+                        let body: Value =
+                            serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+                        let op = body["operation"].as_str().unwrap_or("").to_string();
+                        call_log_clone.lock().unwrap().push(op.clone());
+                        let response_body = handle_mock_request(&op, &body, &snapshot, page_size);
+                        let body_str = serde_json::to_string(&response_body).unwrap();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body_str.len(),
+                            body_str
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            addr,
+            shutdown,
+            handle: Some(handle),
+            call_log,
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("http://{}/tsift/graph", self.addr)
+    }
+
+    fn calls(&self) -> Vec<String> {
+        self.call_log.lock().unwrap().clone()
+    }
+}
+
+impl Drop for MockConvexSnapshotServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn handle_mock_request(
+    op: &str,
+    _body: &Value,
+    snapshot: &Value,
+    page_size: usize,
+) -> Value {
+    match op {
+        "snapshot_meta" => {
+            let node_count = snapshot["nodes"].as_array().map(|a| a.len()).unwrap_or(0);
+            let edge_count = snapshot["edges"].as_array().map(|a| a.len()).unwrap_or(0);
+            json!({
+                "status": "ok",
+                "meta": {
+                    "indexes": required_convex_indexes_json(),
+                    "nodeCount": node_count,
+                    "edgeCount": edge_count,
+                    "pageSize": page_size,
+                }
+            })
+        }
+        "snapshot_nodes_page" => {
+            page_response(snapshot, "nodes", "externalId", _body, page_size)
+        }
+        "snapshot_edges_page" => {
+            page_response(snapshot, "edges", "edgeKey", _body, page_size)
+        }
+        other => json!({
+            "status": "error",
+            "message": format!("mock server: unknown operation: {other}"),
+        }),
+    }
+}
+
+fn page_response(
+    snapshot: &Value,
+    table: &str,
+    cursor_field: &str,
+    body: &Value,
+    page_size: usize,
+) -> Value {
+    let mut rows: Vec<Value> = snapshot[table].as_array().cloned().unwrap_or_default();
+    // Mock backend sorts by the cursor field (matches the schema's
+    // by_external_id / by_edge_key index ordering).
+    rows.sort_by(|a, b| {
+        a[cursor_field]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b[cursor_field].as_str().unwrap_or(""))
+    });
+    let cursor = body["cursor"].as_str().map(|s| s.to_string());
+    let start = match &cursor {
+        Some(c) => rows
+            .iter()
+            .position(|row| row[cursor_field].as_str().unwrap_or("") > c.as_str())
+            .unwrap_or(rows.len()),
+        None => 0,
+    };
+    let end = (start + page_size).min(rows.len());
+    let page_rows: Vec<Value> = rows[start..end].to_vec();
+    let next_cursor: Value = if end < rows.len() && page_rows.len() == page_size {
+        Value::String(
+            page_rows
+                .last()
+                .and_then(|r| r[cursor_field].as_str())
+                .unwrap_or("")
+                .to_string(),
+        )
+    } else {
+        Value::Null
+    };
+    json!({
+        "status": "ok",
+        "page": {
+            "rows": page_rows,
+            "nextCursor": next_cursor,
+        }
+    })
+}
+
+#[test]
+fn convex_sync_remote_snapshot_uses_paginated_transport_against_mock_backend() {
+    // Build the local projection snapshot, then serve those rows from a mock
+    // server. With the projection identical on both sides, freshness must come
+    // back as `current` (not `unchecked` or `stale`).
+    let project = graph_db_project();
+    let snapshot = current_convex_snapshot(project.path());
+    let node_count = snapshot["nodes"].as_array().unwrap().len();
+    let edge_count = snapshot["edges"].as_array().unwrap().len();
+    assert!(
+        node_count > 0 && edge_count > 0,
+        "expected non-empty projection: {snapshot}"
+    );
+
+    // Small page size forces multiple pages even on the small synthetic graph
+    // — exercises the cursor loop, not just the first-page short-circuit.
+    let server = MockConvexSnapshotServer::start(snapshot.clone(), 3);
+
+    let endpoint = server.endpoint();
+    let output = run_tsift(vec![
+        "convex-sync".to_string(),
+        project.path().to_string_lossy().to_string(),
+        "--remote-snapshot".to_string(),
+        "--endpoint".to_string(),
+        endpoint.clone(),
+        "--json".to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "convex-sync --remote-snapshot failed against mock\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["freshness"]["status"], "current",
+        "expected current freshness against identical mock snapshot, got: {}",
+        report["freshness"]
+    );
+    assert!(
+        report["freshness"]["snapshot_hash"].is_string(),
+        "expected snapshot_hash populated: {}",
+        report["freshness"]
+    );
+    assert_eq!(
+        report["freshness"]["local_hash"], report["freshness"]["snapshot_hash"],
+        "expected local_hash == snapshot_hash: {}",
+        report["freshness"]
+    );
+
+    let calls = server.calls();
+    assert!(
+        calls.first().is_some_and(|op| op == "snapshot_meta"),
+        "expected first call to be snapshot_meta, got {calls:?}"
+    );
+    let nodes_pages = calls.iter().filter(|op| *op == "snapshot_nodes_page").count();
+    let edges_pages = calls.iter().filter(|op| *op == "snapshot_edges_page").count();
+    assert!(
+        nodes_pages >= node_count.div_ceil(3),
+        "expected at least {} node page calls, got {nodes_pages} (calls={calls:?})",
+        node_count.div_ceil(3)
+    );
+    assert!(
+        edges_pages >= edge_count.div_ceil(3),
+        "expected at least {} edge page calls, got {edges_pages} (calls={calls:?})",
+        edge_count.div_ceil(3)
+    );
+    assert!(
+        !calls.iter().any(|op| op == "snapshot"),
+        "must not fall back to legacy single-shot snapshot when paginated path works: {calls:?}"
+    );
 }

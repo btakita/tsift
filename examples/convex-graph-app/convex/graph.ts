@@ -41,6 +41,26 @@ const requiredIndexes = [
   { table: "edges", name: "by_to_kind", fields: ["toExternalId", "kind"] },
 ];
 
+// Default page size used by the paginated snapshot queries. Sized to stay well
+// under the Convex isolate's per-request syscall budget while keeping HTTP
+// round-trips low on multi-thousand-row tables. Override by passing `limit`.
+const DEFAULT_SNAPSHOT_PAGE_SIZE = 500;
+const MAX_SNAPSHOT_PAGE_SIZE = 2000;
+
+function clampLimit(limit: number | undefined): number {
+  if (limit === undefined || limit === null) {
+    return DEFAULT_SNAPSHOT_PAGE_SIZE;
+  }
+  if (!Number.isFinite(limit) || limit <= 0) {
+    return DEFAULT_SNAPSHOT_PAGE_SIZE;
+  }
+  return Math.min(Math.floor(limit), MAX_SNAPSHOT_PAGE_SIZE);
+}
+
+// Legacy single-shot snapshot — retained for back-compat with small tables and
+// existing operator commands. Fails (Convex syscall budget) on tables >~5k
+// rows; new callers MUST use snapshotMeta + snapshotNodesPage +
+// snapshotEdgesPage instead. See #convexsnapshotscale for the migration.
 export const snapshot = query({
   args: {},
   handler: async (ctx) => {
@@ -49,6 +69,73 @@ export const snapshot = query({
       edges: await ctx.db.query("edges").collect(),
       indexes: requiredIndexes,
     };
+  },
+});
+
+// Cheap metadata read: indexes + total row counts. Counts iterate the table
+// without materializing per-row payloads on the wire, which keeps the response
+// flat regardless of table size.
+export const snapshotMeta = query({
+  args: {},
+  handler: async (ctx) => {
+    let nodeCount = 0;
+    for await (const _ of ctx.db.query("nodes")) {
+      nodeCount += 1;
+    }
+    let edgeCount = 0;
+    for await (const _ of ctx.db.query("edges")) {
+      edgeCount += 1;
+    }
+    return {
+      indexes: requiredIndexes,
+      nodeCount,
+      edgeCount,
+      pageSize: DEFAULT_SNAPSHOT_PAGE_SIZE,
+    };
+  },
+});
+
+// Cursor-based page of nodes ordered by `externalId` (via the `by_external_id`
+// index). `cursor` is the exclusive lower bound (the last `externalId` from the
+// previous page); pass `null`/omit to start from the beginning. The returned
+// `nextCursor` is `null` when the page exhausts the table.
+export const snapshotNodesPage = query({
+  args: {
+    cursor: v.optional(v.union(v.string(), v.null())),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, { cursor, limit }) => {
+    const pageSize = clampLimit(limit);
+    const builder = ctx.db.query("nodes").withIndex("by_external_id", (q) =>
+      cursor === undefined || cursor === null
+        ? q
+        : q.gt("externalId", cursor),
+    );
+    const rows = await builder.take(pageSize);
+    const nextCursor =
+      rows.length === pageSize ? rows[rows.length - 1].externalId : null;
+    return { rows, nextCursor, pageSize };
+  },
+});
+
+// Cursor-based page of edges ordered by `edgeKey` (via the `by_edge_key`
+// index). Same cursor contract as snapshotNodesPage.
+export const snapshotEdgesPage = query({
+  args: {
+    cursor: v.optional(v.union(v.string(), v.null())),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, { cursor, limit }) => {
+    const pageSize = clampLimit(limit);
+    const builder = ctx.db.query("edges").withIndex("by_edge_key", (q) =>
+      cursor === undefined || cursor === null
+        ? q
+        : q.gt("edgeKey", cursor),
+    );
+    const rows = await builder.take(pageSize);
+    const nextCursor =
+      rows.length === pageSize ? rows[rows.length - 1].edgeKey : null;
+    return { rows, nextCursor, pageSize };
   },
 });
 

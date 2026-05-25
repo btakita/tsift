@@ -1496,6 +1496,7 @@ Since 0.1.47, `tsift search` auto-detects a [tagpath](https://github.com/btakita
 
 - The field is `Option<String>` and serializes only when present (`#[serde(skip_serializing_if = "Option::is_none")]`). Consumers that already know the field shape can rely on `tagpath_handle` being either `mem:...` or absent.
 - Handle derivation lives in tagpath; see [`src/tagpath/SPEC.md` §15](../tagpath/SPEC.md#15-consumer-contract-tsift--agent-doc--external) for the wire and freshness contract.
+- When more than one `symbol_info` row shares a name across files (e.g. two `main` definitions across `bin/foo/main.rs` and `bin/bar/main.rs`), the batch resolver iterates every row and keeps the first handle that resolves through the tagpath index. The earlier "first row wins" behavior silently dropped the handle when the first-by-`(file, line)` file lived outside the tagpath walk (vendored, generated, or skipped directory).
 
 ### Watch integration (deferred)
 
