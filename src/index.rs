@@ -147,7 +147,7 @@ pub struct IndexWarning {
     pub message: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IndexSummary {
     pub total_tracked: usize,
     pub new: usize,
@@ -174,7 +174,7 @@ pub enum ReadOnlyRecovery {
     SnapshotFallbackWal,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReadOnlyInspectResult {
     pub total_files: usize,
     pub summary: IndexSummary,
@@ -226,6 +226,11 @@ pub struct SymbolHit {
     pub tags: Option<String>,
     pub score: f64,
     pub match_type: String,
+    /// Optional `mem:` handle for the symbol when a fresh tagpath index is
+    /// available at the project root. See `tagpath::SPEC.md` §15 for the
+    /// handle derivation contract.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tagpath_handle: Option<String>,
 }
 
 fn system_time_to_pair(t: SystemTime) -> (i64, u32) {
@@ -1185,6 +1190,7 @@ impl IndexDb {
                     tags,
                     score: 1.0,
                     match_type: "exact_name".to_string(),
+                    tagpath_handle: None,
                 });
                 continue;
             }
@@ -1224,6 +1230,7 @@ impl IndexDb {
                     tags,
                     score: f1,
                     match_type: match_type.to_string(),
+                    tagpath_handle: None,
                 });
             }
         }

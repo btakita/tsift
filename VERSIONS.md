@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.47
+
+- Adopt tagpath's `.naming/index.json` as a stable symbol-graph adapter (`#p6tsi`). New module `src/tagpath_adapter.rs` (`try_load`, `TagpathAdapter`, `LoadResult`, `HandleResolution`) wraps `tagpath::index` and is used by `tsift search` to annotate each `SymbolHit` with a stable `mem:<sha256[0..16]>` `tagpath_handle` when a fresh tagpath index is present at the project root. New search flags `--no-tagpath` (skip lookup) and `--tagpath-strict` (fail closed on a stale index). Stale indexes fall back to live extraction with a `tagpath_index_stale: true` stderr diagnostic. Existing users without `.naming/index.json` see no behavior change. Bumps the local `tagpath` path dep to 0.17.1 (with a slim `lang-rust,lang-python,lang-javascript,lang-typescript` feature set) and the workspace `tree-sitter` requirement to `^0.26`.
+
 ## 0.1.46
 
 - `impact::compute` now exposes sub-phase timers under `conflict_matrix_preparation.impact.{context_resolution, diff_digest, test_path_scan, index_open, call_edge_impacts, route_handler_impacts, import_impacts, report_assembly}` and short-circuits the three iteration phases (`add_call_edge_impacts`, `add_route_handler_impacts`, `add_import_impacts`) when their inputs are empty. Three-sample medians on agent-loop show `conflict_matrix_preparation.impact` drops from 789 ms to 1.6 ms (-100%) on the typical backend-eval cold path (no staged changes), and the parent `conflict_matrix_preparation` drops from 2572 ms to 1935 ms (-25%). When staged changes are present the iteration phases run as before. The new sub-phases surface as `0us` on cache-hit reports with the existing source/document/staged-diff watermark detail, and the conformance suite asserts the sub-phases exist on cold runs.

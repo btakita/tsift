@@ -48,6 +48,7 @@ pub mod sift;
 pub mod status;
 pub mod substrate;
 pub mod summarize;
+pub mod tagpath_adapter;
 pub mod test_digest;
 pub mod walk;
 
@@ -138,6 +139,13 @@ enum Commands {
         /// Named preview budget preset (auto adapts from context-window env vars)
         #[arg(long, value_enum)]
         budget: Option<ResponseBudgetPreset>,
+        /// Skip tagpath index lookup (do not annotate hits with `tagpath_handle`).
+        #[arg(long)]
+        no_tagpath: bool,
+        /// Fail closed when a tagpath index is present but stale, instead of
+        /// emitting `tagpath_index_stale: true` and falling back silently.
+        #[arg(long)]
+        tagpath_strict: bool,
     },
     #[command(hide = true, name = "__search-worker")]
     SearchWorker {
@@ -1367,6 +1375,8 @@ fn main() -> Result<()> {
             max_items,
             max_bytes,
             budget,
+            no_tagpath,
+            tagpath_strict,
         }) => cmd_search_with_budget(
             query,
             path,
@@ -1389,6 +1399,10 @@ fn main() -> Result<()> {
             schema,
             envelope,
             ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
+            TagpathSearchOpts {
+                no_tagpath,
+                strict: tagpath_strict,
+            },
         ),
         Some(Commands::SearchWorker {
             path,
@@ -3298,6 +3312,69 @@ fn relativize_symbols(symbols: &mut [index::StoredSymbol], root: &std::path::Pat
 fn relativize_symbol_hits(hits: &mut [index::SymbolHit], root: &std::path::Path) {
     for hit in hits {
         hit.file = relativize(&hit.file, root);
+    }
+}
+
+/// Diagnostic produced by [`annotate_hits_with_tagpath`].
+#[derive(Debug, Default, Clone)]
+pub struct TagpathAnnotationDiagnostic {
+    pub stale: bool,
+    pub reason: Option<String>,
+    pub loaded: bool,
+}
+
+/// Annotate symbol hits in-place with `tagpath_handle` when a fresh tagpath
+/// index is present at `root`. Returns a diagnostic describing whether the
+/// adapter loaded, missed, or fell back due to staleness.
+///
+/// Behavior matrix:
+///
+/// | `no_tagpath` | index state | strict | action |
+/// |---|---|---|---|
+/// | true        | any         | any     | no-op |
+/// | false       | missing     | any     | no-op |
+/// | false       | fresh       | any     | annotate hits |
+/// | false       | stale       | false   | emit diagnostic, no annotation |
+/// | false       | stale       | true    | return error |
+pub fn annotate_hits_with_tagpath(
+    hits: &mut [index::SymbolHit],
+    root: &std::path::Path,
+    opts: &TagpathSearchOpts,
+) -> Result<TagpathAnnotationDiagnostic> {
+    if opts.no_tagpath {
+        return Ok(TagpathAnnotationDiagnostic::default());
+    }
+    match tagpath_adapter::try_load(root) {
+        tagpath_adapter::LoadResult::Loaded(adapter) => {
+            for hit in hits.iter_mut() {
+                let abs = if std::path::Path::new(&hit.file).is_absolute() {
+                    std::path::PathBuf::from(&hit.file)
+                } else {
+                    root.join(&hit.file)
+                };
+                if let Some(handle) = adapter.handle_for_member(&abs, &hit.name) {
+                    hit.tagpath_handle = Some(handle);
+                }
+            }
+            Ok(TagpathAnnotationDiagnostic {
+                stale: false,
+                reason: None,
+                loaded: true,
+            })
+        }
+        tagpath_adapter::LoadResult::Stale { reason, .. } => {
+            if opts.strict {
+                anyhow::bail!(
+                    "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
+                );
+            }
+            Ok(TagpathAnnotationDiagnostic {
+                stale: true,
+                reason: Some(reason),
+                loaded: false,
+            })
+        }
+        tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
     }
 }
 
@@ -11958,8 +12035,7 @@ fn cmd_graph_db_backend_eval(
             post_write_micros,
             "post-write freshness, target resolution, and convex row materialization reads",
         ));
-        let full_projection_micros =
-            sqlite_open_micros + sqlite_replace_micros + post_write_micros;
+        let full_projection_micros = sqlite_open_micros + sqlite_replace_micros + post_write_micros;
         let full_refresh = graph_db_backend_eval_refresh_operation(
             full_projection_micros,
             full_rows.nodes.len() + full_rows.edges.len(),
@@ -13261,8 +13337,7 @@ fn load_agent_doc_traversal_nodes(
     Ok(())
 }
 
-#[derive(Debug)]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct AgentDocIndexGate {
     db_path: Option<PathBuf>,
     source_root: PathBuf,
@@ -13277,9 +13352,9 @@ struct AgentDocIndexGateCacheKey {
     packet_label: String,
 }
 
-fn agent_doc_index_gate_cache()
--> &'static std::sync::Mutex<std::collections::HashMap<AgentDocIndexGateCacheKey, AgentDocIndexGate>>
-{
+fn agent_doc_index_gate_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<AgentDocIndexGateCacheKey, AgentDocIndexGate>,
+> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<AgentDocIndexGateCacheKey, AgentDocIndexGate>>,
     > = std::sync::OnceLock::new();
@@ -25017,6 +25092,16 @@ fn resolve_search_strategy(query: &str, strategy: Option<String>) -> String {
 
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
+/// Tagpath consumer-side options for the search command.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TagpathSearchOpts {
+    /// Skip tagpath lookup entirely (do not annotate hits).
+    pub no_tagpath: bool,
+    /// Treat a stale tagpath index as a hard error instead of falling back.
+    pub strict: bool,
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
 fn cmd_search(
     query: String,
     path: Option<PathBuf>,
@@ -25052,6 +25137,7 @@ fn cmd_search(
         schema,
         false,
         ResponseBudget::default(),
+        TagpathSearchOpts::default(),
     )
 }
 
@@ -25074,6 +25160,7 @@ fn cmd_search_with_budget(
     schema: bool,
     envelope: bool,
     budget: ResponseBudget,
+    tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
     let format = OutputFormat {
@@ -25165,8 +25252,15 @@ fn cmd_search_with_budget(
     };
 
     let mut symbol_hits = symbol_hits;
+    let tagpath_diag = annotate_hits_with_tagpath(&mut symbol_hits, &root, &tagpath_opts)?;
     if !absolute {
         relativize_symbol_hits(&mut symbol_hits, &root);
+    }
+    if tagpath_diag.stale && !tagpath_opts.no_tagpath {
+        eprintln!(
+            "tagpath_index_stale: true (reason={}); falling back to live extraction",
+            tagpath_diag.reason.as_deref().unwrap_or("unknown"),
+        );
     }
 
     let response = if exact_search {
@@ -32089,6 +32183,7 @@ tier = "private"
             tags: None,
             score: 0.98,
             match_type: "exact_name".to_string(),
+            tagpath_handle: None,
         }];
 
         let report = build_search_budget_report(
@@ -32123,6 +32218,7 @@ tier = "private"
                 tags: Some("alpha,helper".to_string()),
                 score: 0.98,
                 match_type: "exact_name".to_string(),
+                tagpath_handle: None,
             },
             index::SymbolHit {
                 name: "alphaHelper".to_string(),
@@ -32134,6 +32230,7 @@ tier = "private"
                 tags: Some("alpha,helper".to_string()),
                 score: 0.93,
                 match_type: "tag_overlap".to_string(),
+                tagpath_handle: None,
             },
             index::SymbolHit {
                 name: "alpha_helper".to_string(),
@@ -32145,6 +32242,7 @@ tier = "private"
                 tags: Some("alpha,helper".to_string()),
                 score: 0.91,
                 match_type: "tag_overlap".to_string(),
+                tagpath_handle: None,
             },
         ];
 
@@ -32190,6 +32288,7 @@ tier = "private"
                 tags: Some("alpha,helper".to_string()),
                 score: 0.98,
                 match_type: "exact_name".to_string(),
+                tagpath_handle: None,
             },
             index::SymbolHit {
                 name: "beta_helper".to_string(),
@@ -32201,6 +32300,7 @@ tier = "private"
                 tags: Some("beta,helper".to_string()),
                 score: 0.92,
                 match_type: "tag_overlap".to_string(),
+                tagpath_handle: None,
             },
         ];
 

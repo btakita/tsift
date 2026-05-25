@@ -1477,6 +1477,36 @@ All filters also strip ANSI codes and blank lines. The `--compact` and `--pretty
 
 Outside the Claude hook path, `tsift rewrite --run '<command>'` provides a built-in fallback for the same bounded-output policy. Structured `--json` / `--terse` / `--schema` / `--tabular` output stays untouched; remaining human-readable passthrough output is capped only for already-tsift verbose commands that do not have an envelope/structured rewrite form.
 
+## Tagpath integration
+
+Since 0.1.47, `tsift search` auto-detects a [tagpath](https://github.com/btakita/tagpath) index at the project root (`.naming/index.json`) and annotates each `SymbolHit` with a stable `tagpath_handle` field (`mem:<sha256[0..16]>`). Handles are content-addressable: ordinary edits that add a sibling member to a family do not change the family handle, so consumers can cite citations across edits.
+
+### Detection
+
+- The adapter walks up from the search path looking for `.naming.toml`. If none is found, the adapter returns `Missing` and tsift falls back to its native AST extraction with no annotation.
+- If an index is found, `tagpath::index::check` runs to decide freshness. Fresh indexes are loaded and used; stale indexes log a `tagpath_index_stale: true` diagnostic to stderr and fall back to live extraction (no `tagpath_handle` is emitted).
+- The strict-mode flag below converts the stale fallback into a hard error.
+
+### Flags
+
+- `--no-tagpath` — skip the lookup entirely (no annotation, no diagnostic). Useful for benchmarks and for debugging the native extraction path.
+- `--tagpath-strict` — fail closed when the index is present but stale. Use this in CI / hook contexts where silent fallback would be a regression.
+
+### `tagpath_handle` semantics
+
+- The field is `Option<String>` and serializes only when present (`#[serde(skip_serializing_if = "Option::is_none")]`). Consumers that already know the field shape can rely on `tagpath_handle` being either `mem:...` or absent.
+- Handle derivation lives in tagpath; see [`src/tagpath/SPEC.md` §15](../tagpath/SPEC.md#15-consumer-contract-tsift--agent-doc--external) for the wire and freshness contract.
+
+### Watch integration (deferred)
+
+The current adapter is a one-shot loader; it does not subscribe to `tagpath watch`. A follow-up will add an on-demand `tagpath watch --once` refresh and (eventually) a long-running NDJSON subscription for server-mode tsift.
+
+### Module layout
+
+- `src/tagpath_adapter.rs` — `try_load`, `TagpathAdapter`, `LoadResult`, `HandleResolution`. Public so other tsift commands can opt into the same lookup surface as they wire it through.
+- `src/main.rs::annotate_hits_with_tagpath` — annotation helper used by `cmd_search_with_budget`.
+- `src/index.rs::SymbolHit::tagpath_handle` — the citation field.
+
 ## What NOT to build
 
 - Visualization (Mermaid, HTML) — leave to graphify

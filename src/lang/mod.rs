@@ -280,7 +280,7 @@ impl Lang {
                 let cmd = name_node.utf8_text(source).unwrap_or("");
                 if cmd == "alias" {
                     for i in 0..node.named_child_count() {
-                        if let Some(arg) = node.named_child(i)
+                        if let Some(arg) = node.named_child(i as u32)
                             && (arg.kind() == "concatenation" || arg.kind() == "word")
                         {
                             let text = arg.utf8_text(source).unwrap_or("");

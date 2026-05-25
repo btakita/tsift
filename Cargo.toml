@@ -1,6 +1,6 @@
 [package]
 name = "tsift"
-version = "0.1.46"
+version = "0.1.47"
 edition = "2024"
 description = "Token-efficient CLI plugin for Claude Code — Sift-powered search + native tool routing"
 license = "MIT"
@@ -22,8 +22,8 @@ serde_json = "1"
 toml = "0.8"
 blake3 = "1"
 ureq = { version = "3", features = ["json"] }
-tagpath = { version = "0.6.2", default-features = false }
-tree-sitter = "0.25"
+tagpath = { path = "../tagpath", default-features = false, features = ["lang-rust", "lang-python", "lang-javascript", "lang-typescript"] }
+tree-sitter = "0.26"
 
 # Language grammars (optional, behind feature flags)
 tree-sitter-rust = { version = "0.24", optional = true }
