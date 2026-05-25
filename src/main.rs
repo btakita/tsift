@@ -6456,6 +6456,8 @@ struct ConvexTransportRequest<'a> {
     chunk: usize,
     projection_version: &'a str,
     projection_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projection_meta_id: Option<&'a str>,
     node_rows: Vec<ConvexNodeRow>,
     edge_rows: Vec<ConvexEdgeRow>,
     keys: Vec<String>,
@@ -6486,8 +6488,14 @@ struct ConvexSnapshotMeta {
     #[serde(default)]
     #[allow(dead_code)]
     indexes: Vec<ConvexRequiredIndex>,
-    node_count: usize,
-    edge_count: usize,
+    #[serde(default)]
+    #[allow(dead_code)]
+    node_count: Option<usize>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    edge_count: Option<usize>,
+    #[serde(default)]
+    projection_hash: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
     page_size: Option<usize>,
@@ -6705,8 +6713,14 @@ impl ConvexHttpTransport {
     /// Falls back to the legacy single-shot `snapshot` operation if the
     /// backend doesn't recognize `snapshot_meta` (older deployments that
     /// haven't redeployed the new schema).
-    fn fetch_snapshot(&self, projection_version: &str) -> Result<ConvexProjectionRows> {
-        match self.fetch_snapshot_paginated(projection_version) {
+    fn fetch_snapshot(
+        &self,
+        projection_version: &str,
+        scope: Option<&str>,
+        local_hash: Option<&str>,
+        local_rows: Option<&ConvexProjectionRows>,
+    ) -> Result<(ConvexProjectionRows, Vec<String>)> {
+        match self.fetch_snapshot_paginated(projection_version, scope, local_hash, local_rows) {
             Ok(rows) => Ok(rows),
             Err(err) => {
                 // Only fall through to the legacy path if the failure looks
@@ -6721,6 +6735,7 @@ impl ConvexHttpTransport {
                     return Err(err);
                 }
                 self.fetch_snapshot_legacy(projection_version)
+                    .map(|rows| (rows, Vec::new()))
             }
         }
     }
@@ -6731,6 +6746,7 @@ impl ConvexHttpTransport {
             chunk: 0,
             projection_version,
             projection_hash: None,
+            projection_meta_id: None,
             node_rows: Vec::new(),
             edge_rows: Vec::new(),
             keys: Vec::new(),
@@ -6745,12 +6761,17 @@ impl ConvexHttpTransport {
     fn fetch_snapshot_paginated(
         &self,
         projection_version: &str,
-    ) -> Result<ConvexProjectionRows> {
+        scope: Option<&str>,
+        local_hash: Option<&str>,
+        local_rows: Option<&ConvexProjectionRows>,
+    ) -> Result<(ConvexProjectionRows, Vec<String>)> {
+        let projection_meta_id = graph_projection_meta_id(scope);
         let meta_response = self.post(&ConvexTransportRequest {
             operation: "snapshot_meta",
             chunk: 0,
             projection_version,
             projection_hash: None,
+            projection_meta_id: Some(&projection_meta_id),
             node_rows: Vec::new(),
             edge_rows: Vec::new(),
             keys: Vec::new(),
@@ -6766,8 +6787,21 @@ impl ConvexHttpTransport {
         let meta = meta_response
             .meta
             .context("Convex snapshot_meta response did not include meta")?;
+        if let (Some(remote_hash), Some(local_hash), Some(local_rows)) =
+            (meta.projection_hash.as_deref(), local_hash, local_rows)
+            && remote_hash == local_hash
+        {
+            return Ok((
+                local_rows.clone(),
+                vec![
+                    "remote projection hash matched local graph; skipped full row-page snapshot diff"
+                        .to_string(),
+                ],
+            ));
+        }
 
-        let mut nodes: Vec<ConvexNodeRow> = Vec::with_capacity(meta.node_count);
+        let mut nodes: Vec<ConvexNodeRow> =
+            Vec::with_capacity(meta.node_count.unwrap_or_default());
         let mut node_cursor: Option<String> = None;
         loop {
             let response = self.post(&ConvexTransportRequest {
@@ -6775,6 +6809,7 @@ impl ConvexHttpTransport {
                 chunk: 0,
                 projection_version,
                 projection_hash: None,
+                projection_meta_id: None,
                 node_rows: Vec::new(),
                 edge_rows: Vec::new(),
                 keys: Vec::new(),
@@ -6795,7 +6830,8 @@ impl ConvexHttpTransport {
             }
         }
 
-        let mut edges: Vec<ConvexEdgeRow> = Vec::with_capacity(meta.edge_count);
+        let mut edges: Vec<ConvexEdgeRow> =
+            Vec::with_capacity(meta.edge_count.unwrap_or_default());
         let mut edge_cursor: Option<String> = None;
         loop {
             let response = self.post(&ConvexTransportRequest {
@@ -6803,6 +6839,7 @@ impl ConvexHttpTransport {
                 chunk: 0,
                 projection_version,
                 projection_hash: None,
+                projection_meta_id: None,
                 node_rows: Vec::new(),
                 edge_rows: Vec::new(),
                 keys: Vec::new(),
@@ -6823,7 +6860,7 @@ impl ConvexHttpTransport {
             }
         }
 
-        Ok(ConvexProjectionRows { nodes, edges })
+        Ok((ConvexProjectionRows { nodes, edges }, Vec::new()))
     }
 
     fn apply_chunk(
@@ -6856,6 +6893,7 @@ impl ConvexHttpTransport {
             chunk: chunk.chunk,
             projection_version: &report.projection_version,
             projection_hash: report.projection_hash.as_deref(),
+            projection_meta_id: None,
             node_rows,
             edge_rows,
             keys: chunk.keys.clone(),
@@ -7282,13 +7320,30 @@ fn cmd_convex_sync(options: ConvexSyncOptions<'_>, format: OutputFormat) -> Resu
     } else {
         None
     };
+    let mut snapshot_diagnostics = Vec::new();
     let snapshot_rows = if options.remote_snapshot {
-        Some(
-            transport
-                .as_ref()
-                .expect("transport is initialized when remote_snapshot is set")
-                .fetch_snapshot(GRAPH_PROJECTION_VERSION)?,
-        )
+        let local_report = build_convex_sync_report_with_snapshot(
+            options.path,
+            options.scope,
+            None,
+            options.chunk_size,
+            true,
+        )?;
+        let local_rows = ConvexProjectionRows {
+            nodes: local_report.node_upserts.clone(),
+            edges: local_report.edge_upserts.clone(),
+        };
+        let (rows, diagnostics) = transport
+            .as_ref()
+            .expect("transport is initialized when remote_snapshot is set")
+            .fetch_snapshot(
+                GRAPH_PROJECTION_VERSION,
+                options.scope,
+                local_report.projection_hash.as_deref(),
+                Some(&local_rows),
+            )?;
+        snapshot_diagnostics = diagnostics;
+        Some(rows)
     } else {
         options
             .snapshot
@@ -7302,6 +7357,7 @@ fn cmd_convex_sync(options: ConvexSyncOptions<'_>, format: OutputFormat) -> Resu
         options.chunk_size,
         !options.apply,
     )?;
+    report.diagnostics.extend(snapshot_diagnostics);
     if let Some(transport) = &transport {
         let mut receipts = Vec::new();
         if options.apply {
@@ -10021,7 +10077,7 @@ fn cmd_graph_db_compact(
     let mut pruned_tombstones = 0usize;
     if apply {
         let mut store = SqliteGraphStore::open(&graph_db)?;
-        pruned_tombstones = store.compact_storage(prune_tombstones)?;
+        pruned_tombstones = store.compact_storage(scope.unwrap_or("root"), prune_tombstones)?;
         if prune_tombstones {
             warnings.push(format!(
                 "pruned {pruned_tombstones} retained tombstone row(s) after explicit Convex reconciliation confirmation"

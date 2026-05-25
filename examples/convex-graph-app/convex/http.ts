@@ -25,7 +25,9 @@ http.route({
         return jsonResponse({ status: "ok", rows });
       }
       case "snapshot_meta": {
-        const meta = await ctx.runQuery(api.graph.snapshotMeta, {});
+        const meta = await ctx.runQuery(api.graph.snapshotMeta, {
+          projectionMetaId: body.projectionMetaId,
+        });
         return jsonResponse({ status: "ok", meta });
       }
       case "snapshot_nodes_page": {

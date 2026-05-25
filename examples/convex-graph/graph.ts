@@ -72,24 +72,26 @@ export const snapshot = query({
   },
 });
 
-// Cheap metadata read: indexes + total row counts. Counts iterate the table
-// without materializing per-row payloads on the wire, which keeps the response
-// flat regardless of table size.
+// Cheap metadata read: indexes + page sizing only. Row counts are intentionally
+// omitted because counting every row still spends Convex syscall budget at
+// million-row scale; callers discover completion through page nextCursor=null.
 export const snapshotMeta = query({
-  args: {},
-  handler: async (ctx) => {
-    let nodeCount = 0;
-    for await (const _ of ctx.db.query("nodes")) {
-      nodeCount += 1;
-    }
-    let edgeCount = 0;
-    for await (const _ of ctx.db.query("edges")) {
-      edgeCount += 1;
+  args: { projectionMetaId: v.optional(v.string()) },
+  handler: async (ctx, { projectionMetaId }) => {
+    let projectionHash: string | null = null;
+    if (projectionMetaId !== undefined) {
+      const meta = await ctx.db
+        .query("nodes")
+        .withIndex("by_external_id", (q) => q.eq("externalId", projectionMetaId))
+        .unique();
+      const hash = meta?.properties?.content_hash;
+      if (typeof hash === "string") {
+        projectionHash = hash;
+      }
     }
     return {
       indexes: requiredIndexes,
-      nodeCount,
-      edgeCount,
+      projectionHash,
       pageSize: DEFAULT_SNAPSHOT_PAGE_SIZE,
     };
   },

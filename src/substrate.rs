@@ -2265,7 +2265,7 @@ impl SqliteGraphStore {
         Ok(())
     }
 
-    pub fn compact_storage(&mut self, prune_tombstones: bool) -> Result<usize> {
+    pub fn compact_storage(&mut self, scope: &str, prune_tombstones: bool) -> Result<usize> {
         let pruned_tombstones = if prune_tombstones {
             self.conn.execute("DELETE FROM graph_tombstones", [])?
         } else {
@@ -2276,6 +2276,56 @@ impl SqliteGraphStore {
             PRAGMA wal_checkpoint(TRUNCATE);
             VACUUM;
             "#,
+        )?;
+        let nodes = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM graph_nodes", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        let edges = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM graph_edges", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        let tombstone_nodes = self.conn.query_row(
+            "SELECT COUNT(*) FROM graph_tombstones WHERE row_kind = 'node'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let tombstone_edges = self.conn.query_row(
+            "SELECT COUNT(*) FROM graph_tombstones WHERE row_kind = 'edge'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let file_size_bytes = sqlite_database_size_bytes(&self.conn)
+            .ok()
+            .map(|value| value as i64);
+        let freelist_bytes = sqlite_database_freelist_bytes(&self.conn)
+            .ok()
+            .map(|value| value as i64);
+        self.conn.execute(
+            r#"
+            INSERT INTO graph_operator_stats
+                (scope, nodes, edges, tombstone_nodes, tombstone_edges, file_size_bytes, freelist_bytes, observed_at_unix)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%s', 'now'))
+            ON CONFLICT(scope) DO UPDATE SET
+                nodes = excluded.nodes,
+                edges = excluded.edges,
+                tombstone_nodes = excluded.tombstone_nodes,
+                tombstone_edges = excluded.tombstone_edges,
+                file_size_bytes = excluded.file_size_bytes,
+                freelist_bytes = excluded.freelist_bytes,
+                observed_at_unix = excluded.observed_at_unix
+            "#,
+            (
+                scope,
+                nodes,
+                edges,
+                tombstone_nodes,
+                tombstone_edges,
+                file_size_bytes,
+                freelist_bytes,
+            ),
         )?;
         Ok(pruned_tombstones)
     }
@@ -4267,6 +4317,30 @@ mod tests {
             .unwrap();
         assert_eq!(refresh.pruned_tombstones, 1);
         assert_eq!(refresh.tombstoned_nodes, Vec::<String>::new());
+
+        projection.nodes.retain(|node| node.id != "topic:egress");
+        store
+            .replace_projection_with_version(
+                "root",
+                &projection,
+                Some("fixture-v4"),
+                Some("commit-d".to_string()),
+            )
+            .unwrap();
+        assert_eq!(store.compact_storage("root", true).unwrap(), 2);
+        let cached_counts: (usize, usize, usize, usize) = store
+            .conn
+            .query_row(
+                r#"
+                SELECT nodes, edges, tombstone_nodes, tombstone_edges
+                FROM graph_operator_stats
+                WHERE scope = 'root'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(cached_counts, (3, 1, 0, 0));
     }
 
     #[test]

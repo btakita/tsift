@@ -373,12 +373,12 @@ fn fetch_live_convex_snapshot(
         "projectionVersion": projection_version,
     }));
     assert!(
-        meta["meta"]["nodeCount"].is_number(),
-        "meta missing nodeCount: {meta}"
+        meta["meta"]["indexes"].is_array(),
+        "meta missing required indexes: {meta}"
     );
     assert!(
-        meta["meta"]["edgeCount"].is_number(),
-        "meta missing edgeCount: {meta}"
+        meta["meta"]["pageSize"].is_number(),
+        "meta missing pageSize: {meta}"
     );
 
     let mut nodes: Vec<Value> = Vec::new();
@@ -4661,6 +4661,14 @@ struct MockConvexSnapshotServer {
 
 impl MockConvexSnapshotServer {
     fn start(snapshot: Value, page_size: usize) -> Self {
+        Self::start_with_projection_hash(snapshot, page_size, false)
+    }
+
+    fn start_with_projection_hash(
+        snapshot: Value,
+        page_size: usize,
+        include_projection_hash: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         listener
             .set_nonblocking(true)
@@ -4712,7 +4720,13 @@ impl MockConvexSnapshotServer {
                             serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
                         let op = body["operation"].as_str().unwrap_or("").to_string();
                         call_log_clone.lock().unwrap().push(op.clone());
-                        let response_body = handle_mock_request(&op, &body, &snapshot, page_size);
+                        let response_body = handle_mock_request(
+                            &op,
+                            &body,
+                            &snapshot,
+                            page_size,
+                            include_projection_hash,
+                        );
                         let body_str = serde_json::to_string(&response_body).unwrap();
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -4757,35 +4771,44 @@ impl Drop for MockConvexSnapshotServer {
 
 fn handle_mock_request(
     op: &str,
-    _body: &Value,
+    body: &Value,
     snapshot: &Value,
     page_size: usize,
+    include_projection_hash: bool,
 ) -> Value {
     match op {
         "snapshot_meta" => {
-            let node_count = snapshot["nodes"].as_array().map(|a| a.len()).unwrap_or(0);
-            let edge_count = snapshot["edges"].as_array().map(|a| a.len()).unwrap_or(0);
-            json!({
+            let mut response = json!({
                 "status": "ok",
                 "meta": {
                     "indexes": required_convex_indexes_json(),
-                    "nodeCount": node_count,
-                    "edgeCount": edge_count,
                     "pageSize": page_size,
                 }
-            })
+            });
+            if include_projection_hash
+                && let Some(meta_id) = body["projectionMetaId"].as_str()
+                && let Some(hash) = projection_hash_from_snapshot(snapshot, meta_id)
+            {
+                response["meta"]["projectionHash"] = json!(hash);
+            }
+            response
         }
-        "snapshot_nodes_page" => {
-            page_response(snapshot, "nodes", "externalId", _body, page_size)
-        }
-        "snapshot_edges_page" => {
-            page_response(snapshot, "edges", "edgeKey", _body, page_size)
-        }
+        "snapshot_nodes_page" => page_response(snapshot, "nodes", "externalId", body, page_size),
+        "snapshot_edges_page" => page_response(snapshot, "edges", "edgeKey", body, page_size),
         other => json!({
             "status": "error",
             "message": format!("mock server: unknown operation: {other}"),
         }),
     }
+}
+
+fn projection_hash_from_snapshot(snapshot: &Value, meta_id: &str) -> Option<String> {
+    snapshot["nodes"]
+        .as_array()?
+        .iter()
+        .find(|node| node["externalId"].as_str() == Some(meta_id))
+        .and_then(|node| node["properties"]["content_hash"].as_str())
+        .map(str::to_string)
 }
 
 fn page_response(
@@ -4905,4 +4928,51 @@ fn convex_sync_remote_snapshot_uses_paginated_transport_against_mock_backend() {
         !calls.iter().any(|op| op == "snapshot"),
         "must not fall back to legacy single-shot snapshot when paginated path works: {calls:?}"
     );
+}
+
+#[test]
+fn convex_sync_remote_snapshot_uses_projection_hash_shortcut_when_current() {
+    let project = graph_db_project();
+    let snapshot = current_convex_snapshot(project.path());
+    let server = MockConvexSnapshotServer::start_with_projection_hash(snapshot, 3, true);
+
+    let output = run_tsift(vec![
+        "convex-sync".to_string(),
+        project.path().to_string_lossy().to_string(),
+        "--remote-snapshot".to_string(),
+        "--endpoint".to_string(),
+        server.endpoint(),
+        "--json".to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "convex-sync --remote-snapshot failed against hash shortcut mock\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["freshness"]["status"], "current", "{report}");
+    assert_eq!(
+        report["node_upserts"].as_array().unwrap().len(),
+        0,
+        "{report}"
+    );
+    assert_eq!(
+        report["edge_upserts"].as_array().unwrap().len(),
+        0,
+        "{report}"
+    );
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry
+                .as_str()
+                .is_some_and(|text| text.contains("projection hash matched"))),
+        "expected hash shortcut diagnostic: {report}"
+    );
+
+    let calls = server.calls();
+    assert_eq!(calls, vec!["snapshot_meta"], "unexpected calls: {calls:?}");
 }
