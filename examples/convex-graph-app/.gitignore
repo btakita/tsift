@@ -1,0 +1,6 @@
+node_modules/
+.env.local
+.env
+convex/_generated/
+*.log
+.DS_Store
