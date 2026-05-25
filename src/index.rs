@@ -46,6 +46,135 @@ impl Drop for SnapshotCopyGuard {
 
 const INDEX_DB_WAL_AUTOCHECKPOINT_PAGES: i64 = 256;
 
+// #gdbgatecold scope-bounded inspection sharing.
+//
+// Design choice (option 2): a thread-local cache guard that lets a trusted
+// pipeline (currently the conflict-matrix prep / context-pack handoff)
+// share one `IndexDb::inspect_read_only` result per `(db_path, root, prune)`
+// key. The cache is only populated while an `InspectScopeGuard` is held on
+// the current thread, so the search command and any other top-level path
+// runs outside the scope and gets the original fresh-per-call behavior.
+//
+// This avoids the regression hit by the prior process-wide cache attempt:
+// `tests/exit_code.rs::search_timeout_reports_reindex_when_index_turns_stale_during_worker_run`
+// — search's post-timeout freshness re-check must observe newly modified
+// files. Because search never enters the scope, it never sees a cached
+// inspection.
+type InspectScopeKey = (PathBuf, PathBuf, bool);
+
+thread_local! {
+    static INSPECT_SCOPE_CACHE: std::cell::RefCell<Option<HashMap<InspectScopeKey, ReadOnlyInspectResult>>> =
+        const { std::cell::RefCell::new(None) };
+    static INSPECT_SCOPE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INSPECT_SCOPE_MISSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INSPECT_SCOPE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard that activates the per-thread inspection-sharing scope. While
+/// any guard is alive the same `(db_path, root, prune)` triple will only
+/// inspect the underlying SQLite index once on this thread; subsequent
+/// callers reuse the cached `ReadOnlyInspectResult`. Guards nest safely
+/// (inner scopes reuse the outer cache); the cache clears when the
+/// outermost guard drops.
+pub struct InspectScopeGuard {
+    _private: (),
+}
+
+impl Default for InspectScopeGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InspectScopeGuard {
+    pub fn new() -> Self {
+        let depth = INSPECT_SCOPE_DEPTH.with(|cell| {
+            let next = cell.get() + 1;
+            cell.set(next);
+            next
+        });
+        if depth == 1 {
+            INSPECT_SCOPE_CACHE.with(|cache| {
+                *cache.borrow_mut() = Some(HashMap::new());
+            });
+            INSPECT_SCOPE_MISSES.with(|cell| cell.set(0));
+            INSPECT_SCOPE_HITS.with(|cell| cell.set(0));
+        }
+        InspectScopeGuard { _private: () }
+    }
+}
+
+impl Drop for InspectScopeGuard {
+    fn drop(&mut self) {
+        let depth = INSPECT_SCOPE_DEPTH.with(|cell| {
+            let prev = cell.get();
+            let next = prev.saturating_sub(1);
+            cell.set(next);
+            next
+        });
+        if depth == 0 {
+            INSPECT_SCOPE_CACHE.with(|cache| {
+                *cache.borrow_mut() = None;
+            });
+        }
+    }
+}
+
+fn inspect_scope_key(db_path: &Path, root: &Path, prune: bool) -> InspectScopeKey {
+    (db_path.to_path_buf(), root.to_path_buf(), prune)
+}
+
+fn inspect_scope_cache_lookup(
+    db_path: &Path,
+    root: &Path,
+    prune: bool,
+) -> Option<ReadOnlyInspectResult> {
+    INSPECT_SCOPE_CACHE.with(|cache| {
+        let borrow = cache.borrow();
+        let cache = borrow.as_ref()?;
+        let cached = cache.get(&inspect_scope_key(db_path, root, prune))?.clone();
+        INSPECT_SCOPE_HITS.with(|cell| cell.set(cell.get() + 1));
+        Some(cached)
+    })
+}
+
+fn inspect_scope_cache_store(
+    db_path: &Path,
+    root: &Path,
+    prune: bool,
+    result: &ReadOnlyInspectResult,
+) {
+    INSPECT_SCOPE_CACHE.with(|cache| {
+        let mut borrow = cache.borrow_mut();
+        if let Some(cache) = borrow.as_mut() {
+            cache.insert(inspect_scope_key(db_path, root, prune), result.clone());
+            INSPECT_SCOPE_MISSES.with(|cell| cell.set(cell.get() + 1));
+        }
+    });
+}
+
+/// Test/inspection helper: returns (hits, misses) recorded while a scope
+/// guard is currently active on this thread. Returns (0, 0) when no guard
+/// is held. Used by test assertions that verify the trusted pipeline only
+/// inspects the underlying DB once per scope.
+pub fn inspect_scope_stats() -> (usize, usize) {
+    let hits = INSPECT_SCOPE_HITS.with(|cell| cell.get());
+    let misses = INSPECT_SCOPE_MISSES.with(|cell| cell.get());
+    (hits, misses)
+}
+
+/// Drop all cached inspection entries for the active scope on this thread.
+/// Must be called whenever a writer mutates the index (refresh / rebuild)
+/// inside the scope, otherwise a subsequent inspect would replay the
+/// pre-write snapshot. No-op when no scope is active.
+pub fn inspect_scope_invalidate_all() {
+    INSPECT_SCOPE_CACHE.with(|cache| {
+        if let Some(cache) = cache.borrow_mut().as_mut() {
+            cache.clear();
+        }
+    });
+}
+
 #[cfg(test)]
 thread_local! {
     static FAIL_APPLY_CHANGES_AFTER_FILE_MUTATIONS: Cell<bool> = const { Cell::new(false) };
@@ -412,8 +541,11 @@ impl IndexDb {
         root: &Path,
         prune: bool,
     ) -> Result<ReadOnlyInspectResult> {
-        match Self::inspect_read_only_once(db_path, root, prune) {
-            Ok(result) => Ok(result),
+        if let Some(cached) = inspect_scope_cache_lookup(db_path, root, prune) {
+            return Ok(cached);
+        }
+        let result = match Self::inspect_read_only_once(db_path, root, prune) {
+            Ok(result) => result,
             Err(err) => {
                 let Some(recovery) = read_only_snapshot_recovery(db_path, &err) else {
                     return Err(err);
@@ -425,13 +557,15 @@ impl IndexDb {
                 } else {
                     db.compute_changes(root)?
                 };
-                Ok(ReadOnlyInspectResult {
+                ReadOnlyInspectResult {
                     total_files,
                     summary,
                     recovery: Some(recovery),
-                })
+                }
             }
-        }
+        };
+        inspect_scope_cache_store(db_path, root, prune, &result);
+        Ok(result)
     }
 
     fn inspect_read_only_once(

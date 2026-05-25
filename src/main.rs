@@ -13503,6 +13503,11 @@ fn prepare_agent_doc_index_gate(
 
     match apply_search_index_update(root, &target) {
         Ok(summary) => {
+            // #gdbgatecold: the index was just rewritten, so any cached
+            // pre-refresh inspection result for this scope (held by the
+            // active `InspectScopeGuard`) is stale. Drop it so the next
+            // `inspect_read_only` re-reads the fresh index.
+            index::inspect_scope_invalidate_all();
             let diagnostics = vec![index_refresh_diagnostic(
                 &target,
                 reason,
@@ -23318,6 +23323,14 @@ fn build_context_pack_report_with_profile(
     log_input: Option<&Path>,
     budget: ResponseBudget,
 ) -> Result<(ContextPackReport, Vec<GraphDbBackendEvalPhaseTiming>)> {
+    // #gdbgatecold: trusted scope share — `prepare_agent_doc_index_gate_cached`
+    // and `context_pack_status_reminders` both call `IndexDb::inspect_read_only`
+    // on the same `(root, .tsift/index.db)` cold path. While this guard is
+    // alive, the second call reuses the cached inspection on the same thread
+    // instead of paying the disk/SQLite walk a second time. Search runs
+    // entirely outside this scope, so freshness re-checks after a file
+    // mutation are unaffected.
+    let _inspect_scope = index::InspectScopeGuard::new();
     let budget = effective_context_budget(budget);
     let mut phases = Vec::new();
     let session_review_started = Instant::now();
@@ -32647,6 +32660,58 @@ tier = "private"
         assert_eq!(reminders.len(), 1);
         assert!(reminders[0].contains("index stale"));
         assert!(reminders[0].contains("tsift index ."));
+    }
+
+    // #gdbgatecold regression-lock: the trusted context-pack pipeline must
+    // share its index-inspection across `prepare_agent_doc_index_gate` and
+    // `context_pack_status_reminders` (both call `IndexDb::inspect_read_only`
+    // on the same `(root, .tsift/index.db)` key). With the scope guard
+    // active in `build_context_pack_report_with_profile`, the second call
+    // hits the cache, so we should record one miss and at least one hit.
+    #[test]
+    fn build_context_pack_reuses_inspect_within_scope() {
+        let dir = setup_graph_index();
+        init_git_repo(dir.path());
+        let _guard = index::InspectScopeGuard::new();
+        let _ = build_context_pack_report(
+            dir.path(),
+            None,
+            None,
+            None,
+            ResponseBudget::new(Some(2), Some(96)),
+        )
+        .unwrap();
+        let (hits, misses) = index::inspect_scope_stats();
+        assert!(
+            hits >= 1,
+            "expected at least one cached inspect within scope (hits={hits}, misses={misses})"
+        );
+        assert!(
+            misses >= 1,
+            "expected at least one initial inspect miss (hits={hits}, misses={misses})"
+        );
+    }
+
+    // #gdbgatecold scope-isolation: outside of any scope, every call to
+    // `IndexDb::inspect_read_only` must hit the disk fresh. This locks in
+    // the contract that the search/status fast-paths never reuse a cached
+    // inspection across consecutive top-level calls.
+    #[test]
+    fn inspect_read_only_outside_scope_does_not_cache() {
+        let dir = setup_graph_index();
+        let db_path = dir.path().join(".tsift/index.db");
+        let _first =
+            index::IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
+        let (hits, misses) = index::inspect_scope_stats();
+        assert_eq!(
+            (hits, misses),
+            (0, 0),
+            "no scope guard => no hits/misses recorded"
+        );
+        let _second =
+            index::IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
+        let (hits, _) = index::inspect_scope_stats();
+        assert_eq!(hits, 0, "must not reuse inspection outside of any scope");
     }
 
     #[test]

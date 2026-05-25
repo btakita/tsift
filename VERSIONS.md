@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.48
+
+- `IndexDb::inspect_read_only` consults a thread-local `InspectScopeGuard` cache so a single trusted pipeline (e.g., `build_context_pack_report_with_profile` → `context_pack_status_reminders` → `status::check_status`) inspects the same `(root, .tsift/index.db)` exactly once instead of twice. Search and every other top-level call site runs outside any guard and gets identical fresh-per-call behavior — the regression test `search_timeout_reports_reindex_when_index_turns_stale_during_worker_run` still passes. `prepare_agent_doc_index_gate` invalidates the scope cache after a successful refresh so post-refresh status reflects the new DB. Three-sample medians on agent-loop show `status_index_gate` cold-leg drops from ~324 ms to ~53 ms (~271 ms reduction, over the 200 ms target for `#gdbgatecold`) and warm `context_pack_status_reminders` drops ~400 µs per call. Two new tests (`build_context_pack_reuses_inspect_within_scope`, `inspect_read_only_outside_scope_does_not_cache`) lock the scoped-cache contract.
+
 ## 0.1.47
 
 - Adopt tagpath's `.naming/index.json` as a stable symbol-graph adapter (`#p6tsi`). New module `src/tagpath_adapter.rs` (`try_load`, `TagpathAdapter`, `LoadResult`, `HandleResolution`) wraps `tagpath::index` and is used by `tsift search` to annotate each `SymbolHit` with a stable `mem:<sha256[0..16]>` `tagpath_handle` when a fresh tagpath index is present at the project root. New search flags `--no-tagpath` (skip lookup) and `--tagpath-strict` (fail closed on a stale index). Stale indexes fall back to live extraction with a `tagpath_index_stale: true` stderr diagnostic. Existing users without `.naming/index.json` see no behavior change. Bumps the local `tagpath` path dep to 0.17.1 (with a slim `lang-rust,lang-python,lang-javascript,lang-typescript` feature set) and the workspace `tree-sitter` requirement to `^0.26`.
