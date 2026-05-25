@@ -22,7 +22,7 @@ serde_json = "1"
 toml = "0.8"
 blake3 = "1"
 ureq = { version = "3", features = ["json"] }
-tagpath = { version = "^0.11.0", path = "../tagpath", default-features = false, features = ["lang-rust", "lang-python", "lang-javascript", "lang-typescript"] }
+tagpath = { version = "0.11.1", default-features = false, features = ["lang-rust", "lang-python", "lang-javascript", "lang-typescript"] }
 tree-sitter = "0.26"
 
 # Language grammars (optional, behind feature flags)
