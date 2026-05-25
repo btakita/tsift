@@ -57,12 +57,12 @@ Dominant: `conflict_matrix_preparation.context_pack_diff`. No tie at the 10% thr
 
 | Phase | Default median | Default delta | Full-projection median | Full-projection delta |
 |---|---|---|---|---|
-| `conflict_matrix_preparation` (parent) | 1,727,371 | -1.8% | (see raw JSON `gdbprephot-after-full-*.json`) | — |
-| **`context_pack_diff`** | **288,577** | **-35.2%** | (see raw JSON) | — |
-| `session_review_compute` | 359,963 | -2.3% | — | — |
-| `status_index_gate` | 752,121 | +11.7% (noise — unchanged code path) | — | — |
-| `preparation_cache_lookup` | 256,064 | +0.3% | — | — |
-| `impact` | 1,701 | +17% (sub-ms noise) | — | — |
+| `conflict_matrix_preparation` (parent) | 1,727,371 | -1.8% | 1,769,675 | -4.7% |
+| **`context_pack_diff`** | **288,577** | **-35.2%** | **289,898** | **-39.7%** |
+| `session_review_compute` | 359,963 | -2.3% | 375,993 | +1.5% (noise) |
+| `status_index_gate` | 752,121 | +11.7% (noise — unchanged code path) | 732,809 | +2.9% (noise) |
+| `preparation_cache_lookup` | 256,064 | +0.3% | 277,537 | +6.4% (noise) |
+| `impact` | 1,701 | +17% (sub-ms noise) | 1,855 | -2.5% |
 
 After-fix raw timings per sample (default, μs):
 
@@ -72,7 +72,15 @@ After-fix raw timings per sample (default, μs):
 | 2 | 288,577 | 359,963 | 256,064 | 804,074 | 1,727,371 |
 | 3 | 282,587 | 346,146 | 235,643 | 630,223 | 1,512,531 |
 
-Full-projection after-fix is captured in the raw JSON at `target/perf/gdbprephot-after-full-{1,2,3}.json` (medians populate the per-sample table here once all three runs finish). The reduction direction matches the default leg — `context_pack_diff` parses 5 files instead of 41, regardless of projection mode, since both legs run through the same `build_context_pack_report_with_profile` path.
+After-fix raw timings per sample (full-projection, μs):
+
+| Sample | context_pack_diff | session_review_compute | preparation_cache_lookup | status_index_gate | parent |
+|---|---|---|---|---|---|
+| 1 | 294,791 | 444,499 | 277,537 | 732,809 | 1,769,675 |
+| 2 | 289,898 | 361,404 | 251,306 | 657,987 | 1,580,138 |
+| 3 | 286,068 | 375,993 | 284,898 | 949,608 | 1,912,841 |
+
+`context_pack_diff` median drops from 445 ms to 289 ms (-35%) on the default leg and from 481 ms to 290 ms (-40%) on the full-projection leg. The remaining ~290 ms comes from the five files that still get full parse: one `git show HEAD:path` invocation each, tree-sitter parsing of both snapshots, and the per-file summary-cache lookup. Further reduction would require batching those five `git show` calls into one `git show :files` or `git archive` invocation — recorded under the "Out of scope" follow-ups, not in this slice.
 
 ## Regression gate
 
