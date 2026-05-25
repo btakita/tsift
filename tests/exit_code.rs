@@ -613,6 +613,114 @@ fn graph_json_reports_callers_and_callees() {
     let callees = json["callees"].as_array().unwrap();
     assert!(callees.iter().any(|edge| edge["callee_name"] == "beta"));
     assert!(callees.iter().any(|edge| edge["callee_name"] == "gamma"));
+    // Without a tagpath index in the fixture, edges stay handle-free.
+    for caller in callers {
+        assert!(caller.get("tagpath_handle").is_none(), "{caller}");
+    }
+    for callee in callees {
+        assert!(callee.get("tagpath_handle").is_none(), "{callee}");
+    }
+}
+
+#[test]
+fn graph_json_omits_handles_when_no_tagpath_flag_set() {
+    let dir = indexed_cli_fixture();
+    write_fresh_tagpath_index(dir.path(), &[("alpha", "main.rs"), ("beta", "main.rs")]);
+
+    let output = tsift_bin()
+        .args([
+            "graph",
+            "alpha",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--no-tagpath",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "graph should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for caller in json["callers"].as_array().unwrap() {
+        assert!(
+            caller.get("tagpath_handle").is_none(),
+            "--no-tagpath should suppress caller handles: {caller}"
+        );
+    }
+    for callee in json["callees"].as_array().unwrap() {
+        assert!(
+            callee.get("tagpath_handle").is_none(),
+            "--no-tagpath should suppress callee handles: {callee}"
+        );
+    }
+}
+
+#[test]
+fn graph_json_annotates_caller_and_callee_edges_when_index_is_fresh() {
+    let dir = indexed_cli_fixture();
+    let members: Vec<(&str, &str)> = vec![
+        ("main", "main.rs"),
+        ("alpha", "main.rs"),
+        ("beta", "main.rs"),
+        ("gamma", "main.rs"),
+    ];
+    write_fresh_tagpath_index(dir.path(), &members);
+
+    let output = tsift_bin()
+        .args(["graph", "alpha", dir.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "graph should succeed (stderr={})",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let callers = json["callers"].as_array().unwrap();
+    assert!(!callers.is_empty());
+    for caller in callers {
+        let caller_name = caller["caller_name"].as_str().unwrap();
+        let handle = caller["tagpath_handle"]
+            .as_str()
+            .unwrap_or_else(|| panic!("caller {caller_name} missing tagpath_handle"));
+        assert!(handle.starts_with("mem:"), "{caller_name}: {handle}");
+    }
+    let callees = json["callees"].as_array().unwrap();
+    assert!(!callees.is_empty());
+    for callee in callees {
+        let callee_name = callee["callee_name"].as_str().unwrap();
+        let handle = callee["tagpath_handle"]
+            .as_str()
+            .unwrap_or_else(|| panic!("callee {callee_name} missing tagpath_handle"));
+        assert!(handle.starts_with("mem:"), "{callee_name}: {handle}");
+    }
+}
+
+#[test]
+fn graph_callers_only_json_annotates_handle() {
+    let dir = indexed_cli_fixture();
+    write_fresh_tagpath_index(dir.path(), &[("alpha", "main.rs"), ("main", "main.rs")]);
+
+    let output = tsift_bin()
+        .args([
+            "graph",
+            "alpha",
+            dir.path().to_str().unwrap(),
+            "--callers",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "graph --callers should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let callers = json["callers"].as_array().unwrap();
+    assert!(!callers.is_empty());
+    for caller in callers {
+        let handle = caller["tagpath_handle"].as_str().unwrap();
+        assert!(handle.starts_with("mem:"), "{caller}");
+    }
 }
 
 #[test]

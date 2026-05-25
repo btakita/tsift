@@ -257,6 +257,13 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Skip tagpath index lookup (do not annotate edges with `tagpath_handle`).
+        #[arg(long)]
+        no_tagpath: bool,
+        /// Fail closed when a tagpath index is present but stale, instead of
+        /// emitting a stale diagnostic and falling back silently.
+        #[arg(long)]
+        tagpath_strict: bool,
     },
     /// Query a SQLite database — show schema or run SQL
     Sql {
@@ -1496,6 +1503,8 @@ fn main() -> Result<()> {
             scope,
             limit,
             json,
+            no_tagpath,
+            tagpath_strict,
         }) => cmd_graph(
             &symbol,
             &path,
@@ -1510,6 +1519,10 @@ fn main() -> Result<()> {
             absolute,
             tabular,
             schema,
+            TagpathSearchOpts {
+                no_tagpath,
+                strict: tagpath_strict,
+            },
         ),
         Some(Commands::Sql {
             db,
@@ -4720,14 +4733,33 @@ fn cmd_graph(
     absolute: bool,
     tabular: bool,
     schema: bool,
+    tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     let db = open_index_db(path, scope)?;
 
     let show_both = !callers && !callees;
+    let mut tagpath_stale_emitted = false;
+    let mut maybe_emit_stale_diagnostic = |diag: &TagpathAnnotationDiagnostic| {
+        if !tagpath_stale_emitted && diag.stale && !tagpath_opts.no_tagpath {
+            eprintln!(
+                "tagpath_index_stale: true (reason={}); falling back to live extraction",
+                diag.reason.as_deref().unwrap_or("unknown"),
+            );
+            tagpath_stale_emitted = true;
+        }
+    };
 
     if callers || show_both {
         let mut edges = db.callers_of(symbol)?;
+        let diag = annotate_stored_edges_with_tagpath(
+            &mut edges,
+            &db,
+            &root,
+            EdgeSide::Caller,
+            &tagpath_opts,
+        )?;
+        maybe_emit_stale_diagnostic(&diag);
         if !absolute {
             relativize_edges(&mut edges, &root);
         }
@@ -4794,6 +4826,14 @@ fn cmd_graph(
 
     if callees || show_both {
         let mut edges = db.callees_of(symbol)?;
+        let diag = annotate_stored_edges_with_tagpath(
+            &mut edges,
+            &db,
+            &root,
+            EdgeSide::Callee,
+            &tagpath_opts,
+        )?;
+        maybe_emit_stale_diagnostic(&diag);
         if !absolute {
             relativize_edges(&mut edges, &root);
         }
@@ -4860,6 +4900,22 @@ fn cmd_graph(
     if show_both && json_output {
         let mut callers_edges = db.callers_of(symbol)?;
         let mut callees_edges = db.callees_of(symbol)?;
+        let caller_diag = annotate_stored_edges_with_tagpath(
+            &mut callers_edges,
+            &db,
+            &root,
+            EdgeSide::Caller,
+            &tagpath_opts,
+        )?;
+        let callee_diag = annotate_stored_edges_with_tagpath(
+            &mut callees_edges,
+            &db,
+            &root,
+            EdgeSide::Callee,
+            &tagpath_opts,
+        )?;
+        maybe_emit_stale_diagnostic(&caller_diag);
+        maybe_emit_stale_diagnostic(&callee_diag);
         if !absolute {
             relativize_edges(&mut callers_edges, &root);
             relativize_edges(&mut callees_edges, &root);
@@ -28379,6 +28435,7 @@ agent_doc_format: template
             false,
             false,
             false,
+            TagpathSearchOpts::default(),
         );
         assert!(result.is_err());
     }
@@ -30068,6 +30125,7 @@ tier = "private"
             false,
             false,
             false,
+            TagpathSearchOpts::default(),
         )
         .unwrap_err();
 
@@ -30111,6 +30169,7 @@ tier = "private"
             false,
             false,
             false,
+            TagpathSearchOpts::default(),
         );
 
         assert!(result.is_ok());
@@ -31523,6 +31582,7 @@ tier = "private"
             false,
             false,
             false,
+            TagpathSearchOpts::default(),
         );
 
         assert!(result.is_ok());
@@ -31548,6 +31608,7 @@ tier = "private"
             false,
             false,
             false,
+            TagpathSearchOpts::default(),
         );
 
         assert!(result.is_ok());
@@ -31560,8 +31621,20 @@ tier = "private"
         std::fs::create_dir_all(&nested).unwrap();
 
         let result = cmd_graph(
-            "helper", &nested, true, false, None, 20, false, false, false, false, false, false,
+            "helper",
+            &nested,
+            true,
             false,
+            None,
+            20,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            TagpathSearchOpts::default(),
         );
 
         assert!(result.is_ok());
@@ -34245,6 +34318,7 @@ tier = "private"
             false,
             false,
             false,
+            TagpathSearchOpts::default(),
         );
         assert!(result.is_ok());
     }
@@ -34266,6 +34340,7 @@ tier = "private"
             false,
             false,
             false,
+            TagpathSearchOpts::default(),
         );
         assert!(result.is_ok());
     }
@@ -34287,6 +34362,7 @@ tier = "private"
             false,
             true,
             false,
+            TagpathSearchOpts::default(),
         );
         assert!(result.is_ok());
     }
