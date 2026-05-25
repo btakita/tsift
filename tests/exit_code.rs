@@ -840,6 +840,113 @@ fn communities_json_annotates_members_when_index_is_fresh() {
     }
 }
 
+// Regression: federated search must annotate each hit against its own
+// scope's tagpath project rather than the workspace root, which usually has
+// no `.naming.toml`. Each submodule below installs its own tagpath index;
+// `tsift search --federated` should pick up handles from both.
+#[test]
+fn search_federated_json_annotates_handles_from_per_scope_tagpath_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+[submodule "src/beta"]
+	path = src/beta
+	url = https://example.com/beta
+"#,
+    )
+    .unwrap();
+
+    for scope in ["alpha", "beta"] {
+        let scope_root = dir.path().join(format!("src/{scope}"));
+        fs::create_dir_all(&scope_root).unwrap();
+        fs::write(
+            scope_root.join("lib.rs"),
+            "fn shared_helper() {}\nfn local_caller() { shared_helper(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            scope_root.join(".naming.toml"),
+            r#"version = 1
+name = "scope-test"
+convention = "snake_case"
+
+[contexts.function]
+convention = "snake_case"
+
+[contexts.type]
+convention = "PascalCase"
+"#,
+        )
+        .unwrap();
+        let index = tagpath::index::build(&tagpath::index::BuildOptions {
+            project_root: scope_root.clone(),
+        })
+        .expect("tagpath build");
+        let idx_path = tagpath::index::index_path(&scope_root);
+        fs::create_dir_all(idx_path.parent().unwrap()).unwrap();
+        tagpath::index::write(&index, &idx_path).expect("tagpath write");
+    }
+
+    let output = tsift_bin()
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "workspace index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = tsift_bin()
+        .args([
+            "search",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--federated",
+            "--json",
+            "shared_helper",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "search stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let symbols = json["symbols"].as_array().expect("symbols array");
+    let mut alpha_handle: Option<String> = None;
+    let mut beta_handle: Option<String> = None;
+    for sym in symbols {
+        if sym["name"].as_str() != Some("shared_helper") {
+            continue;
+        }
+        let file = sym["file"].as_str().unwrap_or("");
+        let handle = sym["tagpath_handle"]
+            .as_str()
+            .unwrap_or_else(|| panic!("federated hit `{file}` missing tagpath_handle: {sym}"));
+        assert!(handle.starts_with("mem:"), "{handle}");
+        if file.contains("alpha") {
+            alpha_handle = Some(handle.to_string());
+        }
+        if file.contains("beta") {
+            beta_handle = Some(handle.to_string());
+        }
+    }
+    assert!(
+        alpha_handle.is_some(),
+        "missing alpha-scope tagpath_handle: {json}"
+    );
+    assert!(
+        beta_handle.is_some(),
+        "missing beta-scope tagpath_handle: {json}"
+    );
+}
+
 // Regression: when two files define the same symbol and the first row by
 // `(file, line)` lives outside the tagpath index, the resolver must keep
 // iterating instead of dropping the handle. `__pycache__/` is in tagpath's

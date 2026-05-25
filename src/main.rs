@@ -397,8 +397,10 @@ enum Commands {
         /// Existing Convex rows snapshot to diff against
         #[arg(long)]
         snapshot: Option<PathBuf>,
-        /// Max rows per planned mutation chunk
-        #[arg(long, default_value = "100")]
+        /// Max rows per planned mutation chunk. Default 50 keeps `upsertEdges` under the
+        /// Convex isolate's 99 MiB carry-over limit on the demo schema; raise to 100+ only
+        /// when targeting a schema that has already optimized its upsert mutations.
+        #[arg(long, default_value = "50")]
         chunk_size: usize,
         /// Pull the current remote Convex rows through the configured transport before diffing
         #[arg(long, conflicts_with = "snapshot")]
@@ -25849,7 +25851,8 @@ fn cmd_search_with_budget(
         None
     };
 
-    let (symbol_hits, sift_path) = if let Some(scope) = inferred_scope.as_ref() {
+    let (symbol_hits, sift_path, federated_tagpath_diag) = if let Some(scope) = inferred_scope.as_ref()
+    {
         let cfg = config::Config::load(&root)?;
         let db_path = cfg.db_path_for(&root, &scope.id);
         let hits = if db_path.exists() {
@@ -25858,7 +25861,7 @@ fn cmd_search_with_budget(
         } else {
             Vec::new()
         };
-        (hits, scope.source_root.clone())
+        (hits, scope.source_root.clone(), None)
     } else if let Some(ref scope_name) = scope {
         let cfg = config::Config::load(&root)?;
         let scope = config::Config::resolve_submodule(&root, scope_name)?;
@@ -25869,9 +25872,10 @@ fn cmd_search_with_budget(
         } else {
             Vec::new()
         };
-        (hits, scope.source_root)
+        (hits, scope.source_root, None)
     } else if federated {
-        (federated_symbol_search(&root, &query, limit)?, root.clone())
+        let (hits, diag) = federated_symbol_search(&root, &query, limit, &tagpath_opts)?;
+        (hits, root.clone(), Some(diag))
     } else {
         let db_path = root.join(".tsift/index.db");
         let hits = if db_path.exists() {
@@ -25880,11 +25884,15 @@ fn cmd_search_with_budget(
         } else {
             Vec::new()
         };
-        (hits, root.clone())
+        (hits, root.clone(), None)
     };
 
     let mut symbol_hits = symbol_hits;
-    let tagpath_diag = annotate_hits_with_tagpath(&mut symbol_hits, &root, &tagpath_opts)?;
+    let tagpath_diag = if let Some(diag) = federated_tagpath_diag {
+        diag
+    } else {
+        annotate_hits_with_tagpath(&mut symbol_hits, &root, &tagpath_opts)?
+    };
     if !absolute {
         relativize_symbol_hits(&mut symbol_hits, &root);
     }
@@ -29957,7 +29965,16 @@ def list_items():
             false,
         )
         .unwrap();
-        let hits = federated_symbol_search(dir.path(), "alpha_helper", 10).unwrap();
+        let (hits, _diag) = federated_symbol_search(
+            dir.path(),
+            "alpha_helper",
+            10,
+            &TagpathSearchOpts {
+                no_tagpath: true,
+                strict: false,
+            },
+        )
+        .unwrap();
         assert!(
             !hits.is_empty(),
             "should find alpha_helper via federated search"
@@ -29994,7 +30011,16 @@ tier = "isolated"
             false,
         )
         .unwrap();
-        let hits = federated_symbol_search(dir.path(), "alpha_helper", 10).unwrap();
+        let (hits, _diag) = federated_symbol_search(
+            dir.path(),
+            "alpha_helper",
+            10,
+            &TagpathSearchOpts {
+                no_tagpath: true,
+                strict: false,
+            },
+        )
+        .unwrap();
         assert!(
             hits.is_empty(),
             "isolated submodule should not appear in federated search"
@@ -36322,14 +36348,23 @@ fn federated_sift_search(
     Ok(merge_search_responses(root, strategy, limit, responses))
 }
 
+/// Federated symbol search across every scoped `.tsift/indexes/<scope>/index.db`
+/// in the workspace. Per-scope tagpath annotation runs inside the per-scope
+/// loop so each scope's adapter resolves against its own `.naming.toml` /
+/// `.naming/index.json` (the workspace root usually has no tagpath of its
+/// own). The merged `TagpathAnnotationDiagnostic` reports `loaded=true` when
+/// at least one scope loaded, and `stale=true` with the first stale reason
+/// when any scope was stale.
 fn federated_symbol_search(
     root: &std::path::Path,
     query: &str,
     limit: usize,
-) -> Result<Vec<index::SymbolHit>> {
+    tagpath_opts: &TagpathSearchOpts,
+) -> Result<(Vec<index::SymbolHit>, TagpathAnnotationDiagnostic)> {
     let cfg = config::Config::load(root)?;
     let submodules = config::Config::submodule_dirs(root)?;
     let mut all_hits: Vec<index::SymbolHit> = Vec::new();
+    let mut combined = TagpathAnnotationDiagnostic::default();
     for scope in &submodules {
         if !cfg.federation_for_scope(scope) {
             continue;
@@ -36340,6 +36375,12 @@ fn federated_symbol_search(
         }
         let db = index::IndexDb::open_read_only(&db_path)?;
         let mut hits = db.symbol_search(query, limit)?;
+        let diag = annotate_hits_with_tagpath(&mut hits, &scope.source_root, tagpath_opts)?;
+        combined.loaded |= diag.loaded;
+        if diag.stale && !combined.stale {
+            combined.stale = true;
+            combined.reason = diag.reason;
+        }
         all_hits.append(&mut hits);
     }
     all_hits.sort_by(|a, b| {
@@ -36348,7 +36389,7 @@ fn federated_symbol_search(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     all_hits.truncate(limit);
-    Ok(all_hits)
+    Ok((all_hits, combined))
 }
 
 #[derive(Debug, Deserialize)]
