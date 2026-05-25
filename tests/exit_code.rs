@@ -1032,6 +1032,171 @@ convention = "PascalCase"
     assert!(handle.starts_with("mem:"), "{handle}");
 }
 
+// `tsift audit-tagpath --scope <name>` scopes the walker diff to a single
+// submodule. Implementation routes through `config::Config::resolve_submodule`
+// + scope.source_root; this test locks in that path so a regression cannot
+// silently fall back to the workspace root.
+#[test]
+fn audit_tagpath_scope_reports_per_submodule_walker_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+[submodule "src/beta"]
+	path = src/beta
+	url = https://example.com/beta
+"#,
+    )
+    .unwrap();
+
+    // alpha has a `__pycache__/` file tsift indexes but tagpath skips.
+    let alpha_root = dir.path().join("src/alpha");
+    fs::create_dir_all(alpha_root.join("__pycache__")).unwrap();
+    fs::write(
+        alpha_root.join("__pycache__/lib.rs"),
+        "fn cached_alpha() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        alpha_root.join("lib.rs"),
+        "fn alpha_helper() {}\nfn alpha_caller() { alpha_helper(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        alpha_root.join(".naming.toml"),
+        r#"version = 1
+name = "alpha-scope"
+convention = "snake_case"
+
+[contexts.function]
+convention = "snake_case"
+
+[contexts.type]
+convention = "PascalCase"
+"#,
+    )
+    .unwrap();
+    let alpha_index = tagpath::index::build(&tagpath::index::BuildOptions {
+        project_root: alpha_root.clone(),
+    })
+    .expect("tagpath build alpha");
+    let alpha_idx_path = tagpath::index::index_path(&alpha_root);
+    fs::create_dir_all(alpha_idx_path.parent().unwrap()).unwrap();
+    tagpath::index::write(&alpha_index, &alpha_idx_path).expect("tagpath write alpha");
+
+    // beta has a clean, fully-covered source set (no walker diff).
+    let beta_root = dir.path().join("src/beta");
+    fs::create_dir_all(&beta_root).unwrap();
+    fs::write(beta_root.join("lib.rs"), "fn beta_helper() {}\n").unwrap();
+    fs::write(
+        beta_root.join(".naming.toml"),
+        r#"version = 1
+name = "beta-scope"
+convention = "snake_case"
+
+[contexts.function]
+convention = "snake_case"
+
+[contexts.type]
+convention = "PascalCase"
+"#,
+    )
+    .unwrap();
+    let beta_index = tagpath::index::build(&tagpath::index::BuildOptions {
+        project_root: beta_root.clone(),
+    })
+    .expect("tagpath build beta");
+    let beta_idx_path = tagpath::index::index_path(&beta_root);
+    fs::create_dir_all(beta_idx_path.parent().unwrap()).unwrap();
+    tagpath::index::write(&beta_index, &beta_idx_path).expect("tagpath write beta");
+
+    let output = tsift_bin()
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "workspace index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Audit alpha: should report the __pycache__ diff inside alpha only.
+    let output = tsift_bin()
+        .args([
+            "audit-tagpath",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--scope",
+            "alpha",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "audit alpha stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["scope"].as_str(),
+        Some("alpha"),
+        "expected scope=alpha in JSON: {json}"
+    );
+    assert_eq!(json["tagpath_state"], "fresh", "{json}");
+
+    let tsift_only = json["tsift_only_files"]
+        .as_array()
+        .expect("tsift_only_files array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert!(
+        tsift_only
+            .iter()
+            .any(|f| f.contains("__pycache__/lib.rs")),
+        "expected alpha's __pycache__/lib.rs in tsift-only list: {json}"
+    );
+    // The scoped audit must NOT report files from other submodules.
+    assert!(
+        !tsift_only.iter().any(|f| f.contains("beta")),
+        "alpha-scoped audit leaked beta files: {json}"
+    );
+
+    // Audit beta: should be clean (no walker diff).
+    let output = tsift_bin()
+        .args([
+            "audit-tagpath",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--scope",
+            "beta",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "audit beta stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["scope"].as_str(), Some("beta"), "{json}");
+    assert_eq!(
+        json["tsift_only_files"].as_array().map(|a| a.len()),
+        Some(0),
+        "beta scope should have no tsift-only files: {json}"
+    );
+    assert_eq!(
+        json["tagpath_only_files"].as_array().map(|a| a.len()),
+        Some(0),
+        "beta scope should have no tagpath-only files: {json}"
+    );
+}
+
 // `tsift audit-tagpath` reports files covered by one walker but not the
 // other so operators can decide whether to broaden tagpath, narrow tsift,
 // or accept the gap. Tagpath skips `__pycache__/` via SKIP_DIRS but tsift

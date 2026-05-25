@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.61
+
+- **`#tpauditscope`**: lock in `tsift audit-tagpath --scope <name>` test coverage. The 0.1.59 implementation routes through `config::Config::resolve_submodule` + scope.source_root, but `audit_tagpath_reports_walker_diff` only exercised the workspace-root path. New `audit_tagpath_scope_reports_per_submodule_walker_diff` test in `tests/exit_code.rs` builds an `alpha` + `beta` workspace where `alpha/__pycache__/lib.rs` is tsift-indexed but tagpath-skipped (alpha has its own `.naming.toml` / `.naming/index.json`), and `beta` is fully covered. Asserts `--scope alpha` reports `__pycache__/lib.rs` in `tsift_only_files` and does NOT leak any beta files, then asserts `--scope beta` returns an empty diff in both directions. Locks in per-submodule scoping. Closes `#tpauditscope`. No source changes.
+
 ## 0.1.60
 
 - **`#p6tsifullscoped`**: `tsift search --scope <name>` and inferred-scope search paths now annotate against the scope's `source_root` instead of the workspace root. Mirror of the federated bug closed in 0.1.57 (`#p6tsifullfederated`): when a submodule owns its own `.naming.toml` / `.naming/index.json` but the workspace root does not, scoped searches previously returned zero `tagpath_handle` because the adapter walked up from the workspace root and reported `Missing`. Single-line fix in `cmd_search_with_budget`: pass `&sift_path` (already populated with `scope.source_root` for scoped paths and the workspace root otherwise) into `annotate_hits_with_tagpath`. The federated path is unaffected because it carries its own per-scope diagnostic and skips this branch. Test: `search_scoped_json_annotates_handles_from_submodule_tagpath` in `tests/exit_code.rs` builds a single-submodule workspace where only the submodule has a tagpath project and asserts `tsift search --scope alpha --json scoped_helper` returns a `mem:` handle. Verified the test fails before the fix and passes after. Closes `#p6tsifullscoped`.
