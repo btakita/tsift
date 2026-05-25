@@ -9,8 +9,9 @@
 mod perf_gate;
 
 use perf_gate::{
-    GateDecision, GateSample, GATE_WORKLOAD_PREFIXES, MIN_SAMPLES_PER_WORKLOAD,
-    WorkloadVerdict, evaluate_promotion, parse_history, workload_display_name,
+    CONTEXT_PACK_DIFF_BUDGET_MICROS, GateDecision, GateSample, GATE_WORKLOAD_PREFIXES,
+    MIN_HOTSPOT_SAMPLES, MIN_SAMPLES_PER_WORKLOAD, PreparationHotspotVerdict, WorkloadVerdict,
+    evaluate_preparation_hotspot, evaluate_promotion, parse_history, workload_display_name,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -163,6 +164,53 @@ fn gate_promotes_candidate_that_beats_sqlite_on_every_workload() {
         "diagnostics={:?}",
         report.diagnostics
     );
+}
+
+// ---------------------------------------------------------------------------
+// #gdbprephot: preparation hotspot regression gate (context_pack_diff)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn preparation_hotspot_gate_passes_when_post_fix_samples_under_budget() {
+    // Synthetic post-fix samples around 80ms median; budget is 250ms.
+    let report = evaluate_preparation_hotspot(
+        "conflict_matrix_preparation.context_pack_diff",
+        &[70_000, 80_000, 95_000],
+        CONTEXT_PACK_DIFF_BUDGET_MICROS,
+    );
+    assert_eq!(report.verdict, PreparationHotspotVerdict::Within);
+    assert_eq!(report.observed_median_micros, Some(80_000));
+    assert_eq!(report.min_samples, MIN_HOTSPOT_SAMPLES);
+}
+
+#[test]
+fn preparation_hotspot_gate_fails_closed_on_pre_fix_baseline() {
+    // The actual measured pre-fix medians from the gdbprephot baseline runs
+    // (default 3 samples). This locks the regression-detection direction:
+    // if the parse budget is ever removed, samples climb back to ~445ms and
+    // the gate must trip.
+    let report = evaluate_preparation_hotspot(
+        "conflict_matrix_preparation.context_pack_diff",
+        &[436_658, 445_507, 462_138],
+        CONTEXT_PACK_DIFF_BUDGET_MICROS,
+    );
+    assert_eq!(report.verdict, PreparationHotspotVerdict::Regressed);
+    assert_eq!(report.observed_median_micros, Some(445_507));
+    assert!(report.diagnostics[0].contains("REGRESSED"));
+}
+
+#[test]
+fn preparation_hotspot_gate_refuses_to_decide_below_three_samples() {
+    let report = evaluate_preparation_hotspot(
+        "conflict_matrix_preparation.context_pack_diff",
+        &[1_000, 2_000],
+        CONTEXT_PACK_DIFF_BUDGET_MICROS,
+    );
+    assert_eq!(
+        report.verdict,
+        PreparationHotspotVerdict::InsufficientSamples
+    );
+    assert_eq!(report.observed_median_micros, None);
 }
 
 // ---------------------------------------------------------------------------

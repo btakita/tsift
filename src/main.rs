@@ -16216,7 +16216,14 @@ fn cmd_diff_digest(
     revision: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
-    let report = diff_digest::compute(path, diff_digest::DiffDigestOptions { cached, revision })?;
+    let report = diff_digest::compute(
+        path,
+        diff_digest::DiffDigestOptions {
+            cached,
+            revision,
+            max_parsed_files: None,
+        },
+    )?;
     if format.json_output {
         println!(
             "{}",
@@ -18542,6 +18549,7 @@ fn prepare_conflict_matrix_inputs(
                 diff_digest::DiffDigestOptions {
                     cached: true,
                     revision: None,
+                    max_parsed_files: None,
                 },
             )
             .with_context(|| format!("computing cached diff digest for {}", root.display()))
@@ -23396,6 +23404,13 @@ fn build_context_pack_report_with_profile(
     let ontology_ref = ontology.as_ref();
     let mut next_context =
         build_session_review_next_context_budget_report(&review, budget, ontology_ref);
+    // #gdbprephot: cap working-tree diff_digest parsing to the preview budget.
+    // build_context_pack_diff_preview only emits files.take(preview_items),
+    // and enrich_next_context_with_diff_symbols / build_context_pack_exploration_packet
+    // only iterate diff_digest.files (the preview window). The full-fat parse
+    // of every working-tree changed file dominated context_pack_diff cost on
+    // repos with many unstaged edits.
+    let diff_parse_budget = budget.preview_items();
     let diff_digest = graph_db_backend_eval_timed_phase(
         &mut phases,
         "context_pack_diff",
@@ -23407,6 +23422,7 @@ fn build_context_pack_report_with_profile(
                     diff_digest::DiffDigestOptions {
                         cached: false,
                         revision: None,
+                        max_parsed_files: Some(diff_parse_budget),
                     },
                 )
                 .with_context(|| {
@@ -28301,6 +28317,7 @@ def list_items():
             diff_digest::DiffDigestOptions {
                 cached: true,
                 revision: None,
+                max_parsed_files: None,
             },
         )
         .unwrap();

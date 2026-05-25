@@ -20,6 +20,17 @@ pub enum DiffDigestMode {
 pub struct DiffDigestOptions<'a> {
     pub cached: bool,
     pub revision: Option<&'a str>,
+    /// Cap how many changed files get a full tree-sitter parse for symbols and
+    /// call-edges. `None` parses every changed file (the historical default).
+    /// `Some(N)` parses the first `N` files in sort order and emits cheap
+    /// path-only entries for the rest (`touched_symbols`, `current_summaries`,
+    /// `added_call_edges`, `removed_call_edges` all empty, marked with a
+    /// `parse_deferred_by_budget` warning). The aggregate `symbols_touched`,
+    /// `call_edges_added`, and `call_edges_removed` reflect only the parsed
+    /// subset; `files_changed` always counts every changed path. Used by
+    /// `context-pack` to avoid parsing every working-tree change when the
+    /// preview budget only takes the first N anyway (`#gdbprephot`).
+    pub max_parsed_files: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,43 +110,68 @@ pub fn compute(path: &Path, options: DiffDigestOptions<'_>) -> Result<DiffDigest
     let changed = collect_changed_files(&root, &mode)?;
     let summary_db = open_summary_db_if_present(&root)?;
 
-    let mut files = Vec::new();
-
+    // First pass: collect (path, status, existing) tuples after artifact filter.
+    // We need the deterministic sort order before deciding which files actually
+    // get an expensive tree-sitter parse so that `max_parsed_files` always
+    // selects the first N in canonical sort order.
+    let mut entries: Vec<(std::path::PathBuf, DiffDigestFileStatus, bool)> = Vec::new();
     for file_path in changed.existing {
         if is_internal_tsift_artifact(&root, &file_path) {
             continue;
         }
-        let previous = load_previous_bytes(&root, &mode, &file_path)?;
-        let status = if previous.is_some() {
-            DiffDigestFileStatus::Modified
-        } else {
-            DiffDigestFileStatus::Added
-        };
-        let (current, warnings) = load_current_bytes(&root, &mode, &file_path);
-        files.push(build_diff_file(
-            &root,
-            summary_db.as_ref(),
-            &file_path,
-            status,
-            previous.as_deref(),
-            current.as_deref(),
-            warnings,
-        )?);
+        entries.push((file_path, DiffDigestFileStatus::Modified, true));
     }
-
     for file_path in changed.deleted {
         if is_internal_tsift_artifact(&root, &file_path) {
             continue;
         }
-        files.push(build_deleted_diff_file(
-            &root,
-            &mode,
-            summary_db.as_ref(),
-            &file_path,
-        )?);
+        entries.push((file_path, DiffDigestFileStatus::Deleted, false));
     }
+    entries.sort_by(|left, right| {
+        relative_git_path(&root, &left.0).cmp(&relative_git_path(&root, &right.0))
+    });
 
-    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let parse_budget = options.max_parsed_files;
+    let mut parsed_count = 0usize;
+
+    let mut files = Vec::with_capacity(entries.len());
+    for (file_path, mut status, existing) in entries {
+        let parse_this = parse_budget.is_none_or(|n| parsed_count < n);
+        if !parse_this {
+            // #gdbprephot: skip the per-file `git show HEAD:path` /
+            // `git ls-files --stage` lookups required to determine
+            // Added vs Modified for deferred entries. The preview window
+            // never includes them, so the Modified-vs-Added distinction
+            // is irrelevant once we've decided not to parse.
+            files.push(build_parse_deferred_diff_file(&root, &file_path, status));
+            continue;
+        }
+        if existing {
+            let previous = load_previous_bytes(&root, &mode, &file_path)?;
+            if previous.is_none() {
+                status = DiffDigestFileStatus::Added;
+            }
+            let (current, warnings) = load_current_bytes(&root, &mode, &file_path);
+            files.push(build_diff_file(
+                &root,
+                summary_db.as_ref(),
+                &file_path,
+                status,
+                previous.as_deref(),
+                current.as_deref(),
+                warnings,
+            )?);
+            parsed_count += 1;
+        } else {
+            files.push(build_deleted_diff_file(
+                &root,
+                &mode,
+                summary_db.as_ref(),
+                &file_path,
+            )?);
+            parsed_count += 1;
+        }
+    }
 
     let files_with_current_summaries = files
         .iter()
@@ -209,6 +245,28 @@ fn build_diff_file(
         removed_call_edges,
         warnings,
     })
+}
+
+/// Cheap path-only `DiffDigestFile` for changed paths beyond the caller's
+/// `max_parsed_files` budget. Skips tree-sitter parsing, content-hash, and
+/// summary-cache lookups so a context-pack preview does not pay full
+/// per-file parse cost on changed files it would never include in the
+/// truncated preview window. Used by `#gdbprephot`.
+fn build_parse_deferred_diff_file(
+    root: &Path,
+    file_path: &Path,
+    status: DiffDigestFileStatus,
+) -> DiffDigestFile {
+    DiffDigestFile {
+        path: relative_git_path(root, file_path),
+        status,
+        touched_symbols: Vec::new(),
+        summary_state: DiffDigestSummaryState::Unavailable,
+        current_summaries: Vec::new(),
+        added_call_edges: Vec::new(),
+        removed_call_edges: Vec::new(),
+        warnings: vec!["parse_deferred_by_budget".to_string()],
+    }
 }
 
 fn build_deleted_diff_file(
@@ -800,6 +858,7 @@ mod tests {
             DiffDigestOptions {
                 cached: true,
                 revision: None,
+                max_parsed_files: None,
             },
         )
         .unwrap();
@@ -871,6 +930,7 @@ mod tests {
             DiffDigestOptions {
                 cached: false,
                 revision: Some("HEAD"),
+                max_parsed_files: None,
             },
         )
         .unwrap();
@@ -891,6 +951,84 @@ mod tests {
         assert_eq!(
             file.added_call_edges,
             vec!["main -> committed_helper".to_string()]
+        );
+    }
+
+    /// #gdbprephot: cap working-tree parsing to the caller's budget. Files
+    /// beyond `max_parsed_files` get cheap path-only entries so context-pack
+    /// preview cost scales with the preview window, not the working-tree
+    /// change count.
+    #[test]
+    fn diff_digest_max_parsed_files_skips_tree_sitter_beyond_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create 5 modifiable files committed at baseline, then mutate each so
+        // they all appear in the working-tree diff.
+        for name in ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"] {
+            std::fs::write(
+                dir.path().join(name),
+                format!("fn {}_helper() {{}}\nfn main() {{ {0}_helper(); }}\n", name.trim_end_matches(".rs")),
+            )
+            .unwrap();
+        }
+        init_git_repo(dir.path());
+        for name in ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"] {
+            std::fs::write(
+                dir.path().join(name),
+                format!(
+                    "fn {0}_helper_v2() {{}}\nfn main() {{ {0}_helper_v2(); }}\n",
+                    name.trim_end_matches(".rs")
+                ),
+            )
+            .unwrap();
+        }
+
+        // No budget: every file gets a full parse.
+        let full = compute(dir.path(), DiffDigestOptions::default()).unwrap();
+        assert_eq!(full.files_changed, 5);
+        assert!(full.symbols_touched >= 5, "full parse should touch every helper symbol: {full:?}");
+        let total_added: usize = full.files.iter().map(|f| f.added_call_edges.len()).sum();
+        let total_removed: usize = full.files.iter().map(|f| f.removed_call_edges.len()).sum();
+        assert!(total_added > 0 && total_removed > 0, "full parse should yield call-edge diffs: {full:?}");
+        assert!(full.files.iter().all(|f| !f.warnings.contains(&"parse_deferred_by_budget".to_string())));
+
+        // Budget=2: first two files parsed, remaining three deferred.
+        let bounded = compute(
+            dir.path(),
+            DiffDigestOptions {
+                cached: false,
+                revision: None,
+                max_parsed_files: Some(2),
+            },
+        )
+        .unwrap();
+        assert_eq!(bounded.files_changed, 5, "files_changed must count every path");
+        assert!(
+            bounded.symbols_touched <= full.symbols_touched,
+            "bounded symbol count must not exceed full parse"
+        );
+        let parsed: Vec<&DiffDigestFile> = bounded
+            .files
+            .iter()
+            .filter(|f| !f.warnings.contains(&"parse_deferred_by_budget".to_string()))
+            .collect();
+        let deferred: Vec<&DiffDigestFile> = bounded
+            .files
+            .iter()
+            .filter(|f| f.warnings.contains(&"parse_deferred_by_budget".to_string()))
+            .collect();
+        assert_eq!(parsed.len(), 2, "exactly two files should be parsed: {bounded:?}");
+        assert_eq!(deferred.len(), 3, "remaining three files should be deferred: {bounded:?}");
+        for f in &deferred {
+            assert!(f.touched_symbols.is_empty(), "deferred file leaked symbols: {f:?}");
+            assert!(f.added_call_edges.is_empty(), "deferred file leaked added edges: {f:?}");
+            assert!(f.removed_call_edges.is_empty(), "deferred file leaked removed edges: {f:?}");
+            assert_eq!(f.summary_state, DiffDigestSummaryState::Unavailable);
+        }
+        // Parsing must follow canonical sort: parsed files come first in `files`
+        // (sorted by path) and match the first two of the full parse.
+        assert_eq!(
+            bounded.files.iter().take(2).map(|f| f.path.clone()).collect::<Vec<_>>(),
+            full.files.iter().take(2).map(|f| f.path.clone()).collect::<Vec<_>>(),
         );
     }
 }

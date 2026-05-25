@@ -479,6 +479,112 @@ pub fn evaluate_promotion(
     }
 }
 
+/// Verdict for the conflict-matrix preparation hotspot regression gate.
+///
+/// `#gdbprephot`: each tsift release that reduces a preparation hotspot pins
+/// the new ceiling here so a later refactor cannot quietly grow the same
+/// phase back past its post-fix budget. The gate is fail-closed and refuses
+/// to "trust stale ownership" — callers must hand it freshly acquired
+/// samples; the gate never caches the previous comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparationHotspotVerdict {
+    /// Sample median is at or below the budget ceiling.
+    Within,
+    /// Sample median exceeded the budget ceiling.
+    Regressed,
+    /// Fewer than the required sample count was supplied; the gate refuses
+    /// to make a binding decision.
+    InsufficientSamples,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PreparationHotspotReport {
+    pub phase: String,
+    pub min_samples: usize,
+    pub sample_count: usize,
+    pub budget_micros: u128,
+    /// Median across the supplied freshly-acquired samples. `None` when too
+    /// few samples were supplied for the gate to compute a median.
+    pub observed_median_micros: Option<u128>,
+    pub verdict: PreparationHotspotVerdict,
+    pub diagnostics: Vec<String>,
+}
+
+/// Minimum sample count for the preparation-hotspot regression gate to emit
+/// a binding decision (matches the existing backend-eval gate's three-sample
+/// median contract).
+pub const MIN_HOTSPOT_SAMPLES: usize = 3;
+
+/// Evaluate whether a `conflict_matrix_preparation` phase's freshly observed
+/// median exceeds `budget_micros`.
+///
+/// Callers MUST pass freshly-acquired samples — the gate does not cache or
+/// persist prior measurements. This matches `#gdbprephot`'s constraint that
+/// the gate "compare freshly-acquired samples, not cached prior-run values".
+pub fn evaluate_preparation_hotspot(
+    phase: &str,
+    samples: &[u128],
+    budget_micros: u128,
+) -> PreparationHotspotReport {
+    let mut diagnostics = Vec::new();
+    if samples.len() < MIN_HOTSPOT_SAMPLES {
+        diagnostics.push(format!(
+            "preparation hotspot `{phase}` needs ≥{MIN_HOTSPOT_SAMPLES} fresh samples; got {}",
+            samples.len()
+        ));
+        return PreparationHotspotReport {
+            phase: phase.to_string(),
+            min_samples: MIN_HOTSPOT_SAMPLES,
+            sample_count: samples.len(),
+            budget_micros,
+            observed_median_micros: None,
+            verdict: PreparationHotspotVerdict::InsufficientSamples,
+            diagnostics,
+        };
+    }
+    let mut sorted: Vec<u128> = samples.to_vec();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    let observed = if sorted.len().is_multiple_of(2) {
+        (sorted[mid - 1] + sorted[mid]) / 2
+    } else {
+        sorted[mid]
+    };
+    let verdict = if observed <= budget_micros {
+        diagnostics.push(format!(
+            "`{phase}` median {observed}µs ≤ budget {budget_micros}µs across {} fresh samples",
+            samples.len()
+        ));
+        PreparationHotspotVerdict::Within
+    } else {
+        diagnostics.push(format!(
+            "`{phase}` REGRESSED: median {observed}µs > budget {budget_micros}µs across {} fresh samples",
+            samples.len()
+        ));
+        PreparationHotspotVerdict::Regressed
+    };
+    PreparationHotspotReport {
+        phase: phase.to_string(),
+        min_samples: MIN_HOTSPOT_SAMPLES,
+        sample_count: samples.len(),
+        budget_micros,
+        observed_median_micros: Some(observed),
+        verdict,
+        diagnostics,
+    }
+}
+
+/// Static budget for `conflict_matrix_preparation.context_pack_diff` after
+/// `#gdbprephot` capped working-tree parsing to the preview budget. The
+/// 0.1.48 pre-fix median on agent-loop was ~446 ms; the post-fix three-sample
+/// median is ~289 ms (~35 % reduction). We pin the ceiling at 350 ms so
+/// modest noise and small repo growth do not flap the gate, while a real
+/// regression (`max_parsed_files` removed, unbounded parse re-introduced,
+/// per-file `git show HEAD:path` revived for every working-tree change) trips
+/// it well before climbing back to the pre-fix ~445 ms band.
+pub const CONTEXT_PACK_DIFF_BUDGET_MICROS: u128 = 350_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,5 +789,96 @@ mod tests {
             .filter(|w| matches!(w.verdict, WorkloadVerdict::Regresses))
             .count();
         assert_eq!(regressing, GATE_WORKLOAD_PREFIXES.len());
+    }
+
+    // ---- #gdbprephot: preparation hotspot regression gate ----
+
+    #[test]
+    fn preparation_hotspot_within_budget_passes() {
+        let report = evaluate_preparation_hotspot(
+            "conflict_matrix_preparation.context_pack_diff",
+            // medians around ~80ms after #gdbprephot fix
+            &[60_000, 80_000, 90_000],
+            CONTEXT_PACK_DIFF_BUDGET_MICROS,
+        );
+        assert_eq!(report.verdict, PreparationHotspotVerdict::Within, "{report:?}");
+        assert_eq!(report.observed_median_micros, Some(80_000));
+        assert_eq!(report.sample_count, 3);
+        assert_eq!(report.budget_micros, CONTEXT_PACK_DIFF_BUDGET_MICROS);
+    }
+
+    #[test]
+    fn preparation_hotspot_over_budget_fails_closed() {
+        // Simulate the pre-fix 0.1.48 baseline (~446ms median).
+        let report = evaluate_preparation_hotspot(
+            "conflict_matrix_preparation.context_pack_diff",
+            &[436_658, 445_507, 462_138],
+            CONTEXT_PACK_DIFF_BUDGET_MICROS,
+        );
+        assert_eq!(report.verdict, PreparationHotspotVerdict::Regressed);
+        assert_eq!(report.observed_median_micros, Some(445_507));
+        assert!(report.diagnostics[0].contains("REGRESSED"));
+    }
+
+    #[test]
+    fn preparation_hotspot_with_fewer_than_three_samples_blocks() {
+        let report = evaluate_preparation_hotspot(
+            "conflict_matrix_preparation.context_pack_diff",
+            &[10, 20],
+            CONTEXT_PACK_DIFF_BUDGET_MICROS,
+        );
+        assert_eq!(
+            report.verdict,
+            PreparationHotspotVerdict::InsufficientSamples
+        );
+        assert_eq!(report.observed_median_micros, None);
+        assert!(report.diagnostics[0].contains("≥3 fresh samples"));
+    }
+
+    #[test]
+    fn preparation_hotspot_even_sample_count_averages_two_middle_values() {
+        // Four samples: median is average of middle two.
+        let report = evaluate_preparation_hotspot(
+            "conflict_matrix_preparation.context_pack_diff",
+            &[100_000, 150_000, 200_000, 250_000],
+            CONTEXT_PACK_DIFF_BUDGET_MICROS,
+        );
+        assert_eq!(report.observed_median_micros, Some(175_000));
+        assert_eq!(report.verdict, PreparationHotspotVerdict::Within);
+    }
+
+    #[test]
+    fn preparation_hotspot_at_exact_budget_passes() {
+        let report = evaluate_preparation_hotspot(
+            "conflict_matrix_preparation.context_pack_diff",
+            &[CONTEXT_PACK_DIFF_BUDGET_MICROS; 3],
+            CONTEXT_PACK_DIFF_BUDGET_MICROS,
+        );
+        assert_eq!(report.verdict, PreparationHotspotVerdict::Within);
+    }
+
+    /// Caller must hand over freshly-acquired samples each call: the gate
+    /// has no internal state to pollute. This test locks the contract by
+    /// running two evaluations in a row and verifying neither result carries
+    /// over from the other.
+    #[test]
+    fn preparation_hotspot_does_not_cache_prior_samples() {
+        let fast = evaluate_preparation_hotspot(
+            "context_pack_diff",
+            &[10_000, 20_000, 30_000],
+            CONTEXT_PACK_DIFF_BUDGET_MICROS,
+        );
+        assert_eq!(fast.verdict, PreparationHotspotVerdict::Within);
+        assert_eq!(fast.observed_median_micros, Some(20_000));
+
+        let slow = evaluate_preparation_hotspot(
+            "context_pack_diff",
+            &[400_000, 500_000, 600_000],
+            CONTEXT_PACK_DIFF_BUDGET_MICROS,
+        );
+        assert_eq!(slow.verdict, PreparationHotspotVerdict::Regressed);
+        assert_eq!(slow.observed_median_micros, Some(500_000));
+        // Crucially: `slow` did not inherit `fast`'s median; the gate refuses
+        // to "trust stale ownership" of prior measurements.
     }
 }

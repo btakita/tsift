@@ -91,6 +91,7 @@ pub fn compute_with_phases(
         DiffDigestOptions {
             cached: options.cached,
             revision: options.revision,
+            max_parsed_files: None,
         },
     )?;
     phases.push(ImpactPhaseTiming {
