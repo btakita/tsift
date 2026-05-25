@@ -214,6 +214,46 @@ fn epsilon() {
     .unwrap();
 }
 
+/// Build and persist a fresh tagpath index at `root` so the tsift tagpath
+/// adapter loads cleanly. Requires `.naming.toml` + sources already on disk.
+/// `expected_members` is a sanity hint for the caller; the actual index is
+/// built by tagpath's own walker.
+fn write_fresh_tagpath_index(root: &Path, expected_members: &[(&str, &str)]) {
+    fs::write(
+        root.join(".naming.toml"),
+        r#"version = 1
+name = "tsift-path-test"
+convention = "snake_case"
+
+[contexts.function]
+convention = "snake_case"
+
+[contexts.type]
+convention = "PascalCase"
+"#,
+    )
+    .unwrap();
+    let index = tagpath::index::build(&tagpath::index::BuildOptions {
+        project_root: root.to_path_buf(),
+    })
+    .expect("tagpath build");
+    let idx_path = tagpath::index::index_path(root);
+    fs::create_dir_all(idx_path.parent().unwrap()).unwrap();
+    tagpath::index::write(&index, &idx_path).expect("tagpath write");
+    for (name, file) in expected_members {
+        let found = index
+            .families
+            .iter()
+            .flat_map(|f| f.members.iter())
+            .any(|m| m.name == *name && m.path.ends_with(file));
+        assert!(
+            found,
+            "tagpath fixture missing member ({name}, {file}); families={:?}",
+            index.families
+        );
+    }
+}
+
 fn indexed_cli_fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     build_cli_fixture(dir.path());
@@ -632,10 +672,90 @@ fn path_json_reports_shortest_symbol_chain() {
     assert_eq!(json["from"], "main");
     assert_eq!(json["to"], "helper");
     assert_eq!(json["hops"].as_u64(), Some(3));
-    assert_eq!(
-        json["path"],
-        serde_json::json!(["main", "bridge", "shared", "helper"])
+    let names: Vec<&str> = json["path"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["main", "bridge", "shared", "helper"]);
+    // Without a tagpath index in the fixture, no node should carry a handle.
+    for node in json["path"].as_array().unwrap() {
+        assert!(
+            node.get("tagpath_handle").is_none(),
+            "unexpected handle in {node}"
+        );
+    }
+}
+
+#[test]
+fn path_json_omits_handles_when_no_tagpath_flag_set() {
+    let dir = indexed_cli_fixture();
+    write_fresh_tagpath_index(dir.path(), &[("main", "main.rs"), ("helper", "main.rs")]);
+
+    let output = tsift_bin()
+        .args([
+            "path",
+            "main",
+            "helper",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--no-tagpath",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "path should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for node in json["path"].as_array().unwrap() {
+        assert!(
+            node.get("tagpath_handle").is_none(),
+            "--no-tagpath should suppress handles: {node}"
+        );
+    }
+}
+
+#[test]
+fn path_json_annotates_nodes_with_tagpath_handles_when_index_is_fresh() {
+    let dir = indexed_cli_fixture();
+    let members: Vec<(&str, &str)> = vec![
+        ("main", "main.rs"),
+        ("bridge", "main.rs"),
+        ("shared", "main.rs"),
+        ("helper", "main.rs"),
+    ];
+    write_fresh_tagpath_index(dir.path(), &members);
+
+    let output = tsift_bin()
+        .args([
+            "path",
+            "main",
+            "helper",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "path should succeed (stderr={})",
+        String::from_utf8_lossy(&output.stderr)
     );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let nodes = json["path"].as_array().unwrap();
+    assert!(!nodes.is_empty());
+    for node in nodes {
+        let name = node["name"].as_str().unwrap();
+        let handle = node
+            .get("tagpath_handle")
+            .and_then(|h| h.as_str())
+            .unwrap_or_else(|| panic!("node {name} missing tagpath_handle"));
+        assert!(
+            handle.starts_with("mem:"),
+            "expected mem: handle for {name}, got {handle}"
+        );
+    }
 }
 
 #[test]

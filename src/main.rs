@@ -305,6 +305,13 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Skip tagpath index lookup (do not annotate path nodes with `tagpath_handle`).
+        #[arg(long)]
+        no_tagpath: bool,
+        /// Fail closed when a tagpath index is present but stale, instead of
+        /// emitting a stale diagnostic and falling back silently.
+        #[arg(long)]
+        tagpath_strict: bool,
     },
     /// Show full context for a symbol: callers, callees, and community membership
     Explain {
@@ -1536,6 +1543,8 @@ fn main() -> Result<()> {
             path,
             scope,
             json,
+            no_tagpath,
+            tagpath_strict,
         }) => cmd_path(
             &from,
             &to,
@@ -1546,6 +1555,10 @@ fn main() -> Result<()> {
             pretty,
             terse,
             schema,
+            TagpathSearchOpts {
+                no_tagpath,
+                strict: tagpath_strict,
+            },
         ),
         Some(Commands::Explain {
             symbol,
@@ -3378,6 +3391,61 @@ pub fn annotate_hits_with_tagpath(
     }
 }
 
+/// Annotate `graph::PathNode` entries in-place with `tagpath_handle` when a
+/// fresh tagpath index is present at `root`. Symbol→file resolution goes
+/// through `db.symbol_info(name)` (first definition wins), then the adapter
+/// resolves the per-member handle. Same fallback matrix as
+/// [`annotate_hits_with_tagpath`].
+pub fn annotate_path_nodes_with_tagpath(
+    nodes: &mut [graph::PathNode],
+    db: &index::IndexDb,
+    root: &std::path::Path,
+    opts: &TagpathSearchOpts,
+) -> Result<TagpathAnnotationDiagnostic> {
+    if opts.no_tagpath {
+        return Ok(TagpathAnnotationDiagnostic::default());
+    }
+    match tagpath_adapter::try_load(root) {
+        tagpath_adapter::LoadResult::Loaded(adapter) => {
+            for node in nodes.iter_mut() {
+                let syms = match db.symbol_info(&node.name) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(sym) = syms.into_iter().next() else {
+                    continue;
+                };
+                let abs = if std::path::Path::new(&sym.file).is_absolute() {
+                    std::path::PathBuf::from(&sym.file)
+                } else {
+                    root.join(&sym.file)
+                };
+                if let Some(handle) = adapter.handle_for_member(&abs, &node.name) {
+                    node.tagpath_handle = Some(handle);
+                }
+            }
+            Ok(TagpathAnnotationDiagnostic {
+                stale: false,
+                reason: None,
+                loaded: true,
+            })
+        }
+        tagpath_adapter::LoadResult::Stale { reason, .. } => {
+            if opts.strict {
+                anyhow::bail!(
+                    "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
+                );
+            }
+            Ok(TagpathAnnotationDiagnostic {
+                stale: true,
+                reason: Some(reason),
+                loaded: false,
+            })
+        }
+        tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
+    }
+}
+
 const JSON_PATH_KEYS: &[&str] = &["file", "path", "caller_file", "file_path"];
 
 fn relativize_json_paths(val: &mut serde_json::Value, root: &std::path::Path) {
@@ -3729,8 +3797,11 @@ fn abbreviate_match_type(mt: &str) -> &str {
     }
 }
 
-fn symbol_path_summary(path: &[String]) -> String {
-    path.join(" -> ")
+fn symbol_path_summary(path: &[graph::PathNode]) -> String {
+    path.iter()
+        .map(|n| n.name.as_str())
+        .collect::<Vec<_>>()
+        .join(" -> ")
 }
 
 const SEARCH_GROUP_SAMPLE_LIMIT: usize = 2;
@@ -13038,6 +13109,7 @@ fn traversal_source_watermark(
         &mut parts,
     );
 
+
     Ok(Some(content_hash(&parts)?))
 }
 
@@ -15131,11 +15203,21 @@ fn cmd_path(
     pretty: bool,
     terse: bool,
     schema: bool,
+    tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     let db = open_index_db(path, scope)?;
     let edges = db.all_edges()?;
     match graph::shortest_path(&edges, from, to) {
-        Some(result) => {
+        Some(mut result) => {
+            let tagpath_diag =
+                annotate_path_nodes_with_tagpath(&mut result.path, &db, &root, &tagpath_opts)?;
+            if tagpath_diag.stale && !tagpath_opts.no_tagpath {
+                eprintln!(
+                    "tagpath_index_stale: true (reason={}); falling back to live extraction",
+                    tagpath_diag.reason.as_deref().unwrap_or("unknown"),
+                );
+            }
             if json_output {
                 println!("{}", to_json_schema(&result, pretty, terse, schema)?);
             } else if compact {
@@ -15158,7 +15240,10 @@ fn cmd_path(
                     if i > 0 {
                         println!("  ↓");
                     }
-                    println!("  {}", node);
+                    match &node.tagpath_handle {
+                        Some(handle) => println!("  {}  [{}]", node.name, handle),
+                        None => println!("  {}", node.name),
+                    }
                 }
             }
         }
@@ -29843,6 +29928,7 @@ tier = "private"
             false,
             false,
             false,
+            TagpathSearchOpts::default(),
         )
         .unwrap_err();
 
@@ -29882,6 +29968,7 @@ tier = "private"
             false,
             false,
             false,
+            TagpathSearchOpts::default(),
         );
 
         assert!(result.is_ok());
@@ -29903,6 +29990,7 @@ tier = "private"
             false,
             false,
             false,
+            TagpathSearchOpts::default(),
         );
 
         assert!(result.is_ok());
@@ -30074,6 +30162,7 @@ tier = "private"
             false,
             false,
             false,
+            TagpathSearchOpts::default(),
         );
         assert!(result.is_err());
     }
@@ -33983,6 +34072,112 @@ tier = "private"
                 "expected `{path}` to be included in source watermark"
             );
         }
+    }
+
+    #[test]
+    fn traversal_excludes_tsift_and_target_runtime_paths_from_source_watermark() {
+        // #cachelookupshift: the conflict-matrix preparation cache key hashes
+        // file_state snapshot rows + every markdown file under the root. Any
+        // .tsift/, target/, or .agent-doc/ path slipping past the filter would
+        // shift the watermark every run because those directories mutate as a
+        // side effect of running tsift itself. This test locks the artifact
+        // filter against regressions for each prefix variant
+        // (bare, root-anchored, nested, and './' leading).
+        let cases = [
+            ".tsift",
+            ".tsift/index.db",
+            ".tsift/indexes/foo/index.db",
+            ".tsift/conflict-matrix-cache/inputs/abc.json",
+            ".tsift/summaries.db",
+            "src/foo/.tsift",
+            "src/foo/.tsift/graph.db",
+            "./.tsift/index.db",
+            "target",
+            "target/debug/build/x",
+            "target/release/tsift",
+            "src/foo/target/debug/x",
+            "./target/release/x",
+        ];
+        for path in cases {
+            assert!(
+                traversal_relative_path_is_generated_artifact(path),
+                "expected `{path}` to be excluded from source watermark"
+            );
+        }
+        // Look-alike paths must NOT be excluded — only true artifact dirs.
+        for path in [
+            "src/ctx-core-dev/lib/a__target/CHANGELOG.md",
+            "src/ctx-core-dev/lib/a__target/A__Target/index.d.ts",
+            "src/tsift-extras/lib.rs",
+            "tsift/README.md",
+            "src/targeting.rs",
+            "src/.tsiftrc",
+            "src/agent-doc-helper.rs",
+        ] {
+            assert!(
+                !traversal_relative_path_is_generated_artifact(path),
+                "expected `{path}` to be included in source watermark"
+            );
+        }
+    }
+
+    #[test]
+    fn traversal_source_watermark_is_stable_across_invocations_on_quiescent_root() {
+        // #cachelookupshift: the conflict-matrix preparation cache only hits
+        // when traversal_source_watermark returns the same hash for two
+        // consecutive calls on identical source state. Lock that invariant so
+        // a future change that folds wall-clock time, a directory mtime, or
+        // any other non-content input into the hash trips this test before
+        // regressing the preparation_cache_lookup hit rate. We exercise the
+        // session_only=true path with a hinted markdown file so the test does
+        // not need a full index DB to drive the index-snapshot branch.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let hint = root.join("README.md");
+        std::fs::write(&hint, "# stable\n").unwrap();
+        // Add a generated-artifact directory that must NOT affect the watermark.
+        std::fs::create_dir_all(root.join(".tsift")).unwrap();
+        std::fs::write(root.join(".tsift/index.db"), b"placeholder").unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::write(root.join("target/debug/marker"), b"placeholder").unwrap();
+
+        let first = traversal_source_watermark(root, &hint, None, true)
+            .expect("first watermark call must succeed")
+            .expect("first watermark must produce a hash for hinted markdown");
+        let second = traversal_source_watermark(root, &hint, None, true)
+            .expect("second watermark call must succeed")
+            .expect("second watermark must produce a hash for hinted markdown");
+        assert_eq!(
+            first, second,
+            "watermark must be identical across back-to-back invocations on a quiescent root"
+        );
+
+        // Mutating a generated-artifact file must NOT shift the hash.
+        std::fs::write(root.join(".tsift/index.db"), b"changed").unwrap();
+        std::fs::write(root.join("target/debug/marker"), b"changed").unwrap();
+        let third = traversal_source_watermark(root, &hint, None, true)
+            .expect("third watermark call must succeed")
+            .expect("third watermark must produce a hash for hinted markdown");
+        assert_eq!(
+            first, third,
+            "watermark must ignore mutations under .tsift/ and target/"
+        );
+
+        // Mutating the hinted markdown file MUST shift the hash so the
+        // preparation cache invalidates correctly when user state changes.
+        // Sleep briefly to push the file mtime past the original even on
+        // coarse-resolution filesystems.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&hint, "# stable edited with longer content\n").unwrap();
+        let fourth = traversal_source_watermark(root, &hint, None, true)
+            .expect("fourth watermark call must succeed")
+            .expect("fourth watermark must produce a hash for hinted markdown");
+        assert_ne!(
+            first, fourth,
+            "watermark must invalidate when the hinted markdown file changes"
+        );
     }
 }
 

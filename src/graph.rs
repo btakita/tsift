@@ -748,10 +748,28 @@ pub fn detect_communities(edges: &[(String, String)]) -> CommunityResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct PathNode {
+    pub name: String,
+    /// Stable `mem:` handle from the tagpath index, when a fresh adapter is
+    /// loaded for the project root. See `tagpath::SPEC.md` §15.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tagpath_handle: Option<String>,
+}
+
+impl PathNode {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            tagpath_handle: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct PathResult {
     pub from: String,
     pub to: String,
-    pub path: Vec<String>,
+    pub path: Vec<PathNode>,
     pub hops: usize,
 }
 
@@ -760,7 +778,7 @@ pub fn shortest_path(edges: &[(String, String)], from: &str, to: &str) -> Option
         return Some(PathResult {
             from: from.to_string(),
             to: to.to_string(),
-            path: vec![from.to_string()],
+            path: vec![PathNode::new(from)],
             hops: 0,
         });
     }
@@ -791,10 +809,10 @@ pub fn shortest_path(edges: &[(String, String)], from: &str, to: &str) -> Option
                 if visited.insert(neighbor) {
                     parent.insert(neighbor, current);
                     if neighbor == to {
-                        let mut path = vec![to.to_string()];
+                        let mut path = vec![PathNode::new(to)];
                         let mut curr = to;
                         while let Some(&p) = parent.get(curr) {
-                            path.push(p.to_string());
+                            path.push(PathNode::new(p));
                             curr = p;
                         }
                         path.reverse();
@@ -1259,12 +1277,17 @@ function createUser() {}
 
     // --- shortest_path ---
 
+    fn path_names(result: &PathResult) -> Vec<&str> {
+        result.path.iter().map(|n| n.name.as_str()).collect()
+    }
+
     #[test]
     fn path_direct_neighbors() {
         let edges = vec![s("a", "b")];
         let result = shortest_path(&edges, "a", "b").unwrap();
-        assert_eq!(result.path, vec!["a", "b"]);
+        assert_eq!(path_names(&result), vec!["a", "b"]);
         assert_eq!(result.hops, 1);
+        assert!(result.path.iter().all(|n| n.tagpath_handle.is_none()));
     }
 
     #[test]
@@ -1272,15 +1295,15 @@ function createUser() {}
         let edges = vec![s("a", "b"), s("b", "c")];
         let result = shortest_path(&edges, "a", "c").unwrap();
         assert_eq!(result.hops, 2);
-        assert_eq!(result.path.first().unwrap(), "a");
-        assert_eq!(result.path.last().unwrap(), "c");
+        assert_eq!(result.path.first().unwrap().name, "a");
+        assert_eq!(result.path.last().unwrap().name, "c");
     }
 
     #[test]
     fn path_same_node() {
         let edges = vec![s("a", "b")];
         let result = shortest_path(&edges, "a", "a").unwrap();
-        assert_eq!(result.path, vec!["a"]);
+        assert_eq!(path_names(&result), vec!["a"]);
         assert_eq!(result.hops, 0);
     }
 

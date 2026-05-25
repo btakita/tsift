@@ -8,6 +8,14 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- `#cachelookupshift` investigation (no behavioral change, no version bump): added regression-locking unit tests for `traversal_source_watermark` and `traversal_relative_path_is_generated_artifact` covering `.tsift/`, `target/`, and `.agent-doc/` prefix variants plus look-alike paths (`a__target/`, `tsift-extras/`), and a back-to-back stability test that asserts the watermark is identical on a quiescent root and only invalidates on real source mutation. Investigation verdict: no fix needed — the artifact filter is correct, no directory mtime enters the hash, and the agent-loop `preparation_cache_lookup` miss is caused by genuine concurrent edits to tracked markdown under `tasks/` and `src/session-share/tasks/`. On a quiet repo (e.g. `src/tsift` itself) the cache hits cleanly (~2 ms `disk_hit` vs ~250 ms recompute). Evidence: `plans/cachelookupshift-evidence.md`.
+
+## 0.1.51
+
+- `tsift path` now annotates each emitted node with the stable tagpath `mem:` handle when a fresh tagpath index is present at the project root. Adds `--no-tagpath` to skip the lookup and `--tagpath-strict` to fail closed on a stale index (parallels the `tsift search` consumer surface and the broader `p6tsifull` rollout).
+- **BREAKING CHANGE:** `tsift path --json` now emits `path` as an array of `{name, tagpath_handle?}` objects instead of a flat array of strings. Consumers should read `.name` per node and may optionally read `.tagpath_handle` for citation. Human output (compact / default) is unchanged except that nodes with a resolved handle now print as `name  [mem:…]`.
+- Internal: introduces `graph::PathNode` (the per-step entries of `PathResult.path`) and `annotate_path_nodes_with_tagpath`, mirroring the existing `annotate_hits_with_tagpath` helper. `tests/exit_code.rs` extends path coverage with explicit `--no-tagpath` and fresh-index annotation cases.
+
 ## 0.1.50
 
 - Pin the `tagpath` dep to `^0.11.0`. The `[dependencies]` entry now carries an explicit `version = "^0.11.0"` alongside the `path = "../tagpath"` override, codifying the supported range against the local tagpath 0.11.x line. Supersedes the v0.1.47 entry's reference to tagpath 0.17.1 (the local path dep is back at 0.11.0). Cargo.lock now resolves to the local 0.11.0 path build; downstream crates.io consumers (once tsift publishes) will fail closed on incompatible tagpath releases instead of silently pulling whatever the path override happens to resolve to.
