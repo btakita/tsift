@@ -1097,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "tagpath"
-version = "0.18.0"
+version = "0.11.0"
 dependencies = [
  "bincode",
  "clap",
