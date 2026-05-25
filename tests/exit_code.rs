@@ -947,6 +947,182 @@ convention = "PascalCase"
     );
 }
 
+// Regression: stale-index diagnostic surfaces as top-level JSON fields
+// (`tagpath_index_stale: true` + `tagpath_stale_reason`) on every command
+// that previously emitted the signal only on stderr, so structured
+// consumers can detect the condition without parsing logs.
+#[test]
+fn json_surfaces_tagpath_stale_diagnostic_when_index_is_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn alpha() {}\nfn caller() { alpha(); }\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "tsift index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    write_fresh_tagpath_index(dir.path(), &[("alpha", "main.rs"), ("caller", "main.rs")]);
+
+    // Mutate source so the tagpath index goes stale (source_modified) while
+    // tsift's index stays usable (we want the stale path, not the missing path).
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn alpha() {}\nfn caller() { alpha(); }\nfn extra() {}\n",
+    )
+    .unwrap();
+
+    // path command: expect both the stderr line AND the new JSON fields.
+    let output = tsift_bin()
+        .args([
+            "path",
+            "caller",
+            "alpha",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "path stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("tagpath_index_stale: true"),
+        "expected stderr stale line: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["tagpath_index_stale"].as_bool(),
+        Some(true),
+        "expected tagpath_index_stale=true on path JSON: {json}"
+    );
+    let reason = json["tagpath_stale_reason"]
+        .as_str()
+        .expect("expected tagpath_stale_reason on path JSON");
+    assert!(
+        reason.contains("source_modified") || reason.contains("source_added"),
+        "unexpected stale reason: {reason}"
+    );
+
+    // communities command: same expectation.
+    let output = tsift_bin()
+        .args(["communities", dir.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "communities stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["tagpath_index_stale"].as_bool(),
+        Some(true),
+        "expected tagpath_index_stale=true on communities JSON: {json}"
+    );
+    assert!(
+        json["tagpath_stale_reason"].as_str().is_some(),
+        "expected tagpath_stale_reason on communities JSON: {json}"
+    );
+
+    // graph command (combined output): same expectation.
+    let output = tsift_bin()
+        .args([
+            "graph",
+            "alpha",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "graph stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["tagpath_index_stale"].as_bool(),
+        Some(true),
+        "expected tagpath_index_stale=true on graph JSON: {json}"
+    );
+
+    // explain command: same expectation.
+    let output = tsift_bin()
+        .args([
+            "explain",
+            "alpha",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "explain stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["tagpath_index_stale"].as_bool(),
+        Some(true),
+        "expected tagpath_index_stale=true on explain JSON: {json}"
+    );
+
+    // search command (default JSON): same expectation.
+    let output = tsift_bin()
+        .args([
+            "search",
+            "alpha",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "search stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["tagpath_index_stale"].as_bool(),
+        Some(true),
+        "expected tagpath_index_stale=true on search JSON: {json}"
+    );
+
+    // --no-tagpath should suppress both the stderr line AND the JSON fields.
+    let output = tsift_bin()
+        .args([
+            "path",
+            "caller",
+            "alpha",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--no-tagpath",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        json.get("tagpath_index_stale").is_none(),
+        "--no-tagpath should suppress tagpath_index_stale field: {json}"
+    );
+}
+
 // Regression: when two files define the same symbol and the first row by
 // `(file, line)` lives outside the tagpath index, the resolver must keep
 // iterating instead of dropping the handle. `__pycache__/` is in tagpath's

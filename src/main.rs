@@ -2188,6 +2188,34 @@ fn to_json<T: serde::Serialize>(val: &T, pretty: bool, terse: bool) -> anyhow::R
     to_json_schema(val, pretty, terse, false)
 }
 
+/// Add top-level `tagpath_index_stale: true` + `tagpath_stale_reason: <reason>`
+/// fields to a JSON response when the tagpath adapter reported any helper
+/// going stale. JSON consumers (`tsift --envelope` / `--json` callers) can
+/// then act on the same condition the stderr `tagpath_index_stale: …` log
+/// already surfaces without parsing logs. No-op when `stale=false` or when
+/// `value` is not a JSON object.
+fn inject_tagpath_stale_into_json(
+    value: &mut serde_json::Value,
+    stale: bool,
+    reason: Option<&str>,
+) {
+    if !stale {
+        return;
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "tagpath_index_stale".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        if let Some(reason) = reason {
+            obj.insert(
+                "tagpath_stale_reason".to_string(),
+                serde_json::Value::String(reason.to_string()),
+            );
+        }
+    }
+}
+
 fn to_json_schema<T: serde::Serialize>(
     val: &T,
     pretty: bool,
@@ -4756,14 +4784,29 @@ fn cmd_graph(
     let db = open_index_db(path, scope)?;
 
     let show_both = !callers && !callees;
-    let mut tagpath_stale_emitted = false;
-    let mut maybe_emit_stale_diagnostic = |diag: &TagpathAnnotationDiagnostic| {
-        if !tagpath_stale_emitted && diag.stale && !tagpath_opts.no_tagpath {
+    // Shared mutable state for diagnostic aggregation across the per-side
+    // annotation passes. Cell-style indirection avoids a closure that
+    // mutably borrows these locals (the immutable borrow used by the JSON
+    // emit sites would otherwise conflict).
+    let tagpath_state = std::cell::RefCell::new((
+        false,            // emitted to stderr yet?
+        false,            // any diag.stale=true?
+        Option::<String>::None, // first stale reason
+    ));
+    let maybe_emit_stale_diagnostic = |diag: &TagpathAnnotationDiagnostic| {
+        let mut state = tagpath_state.borrow_mut();
+        if diag.stale {
+            state.1 = true;
+            if state.2.is_none() {
+                state.2 = diag.reason.clone();
+            }
+        }
+        if !state.0 && diag.stale && !tagpath_opts.no_tagpath {
             eprintln!(
                 "tagpath_index_stale: true (reason={}); falling back to live extraction",
                 diag.reason.as_deref().unwrap_or("unknown"),
             );
-            tagpath_stale_emitted = true;
+            state.0 = true;
         }
     };
 
@@ -4787,11 +4830,19 @@ fn cmd_graph(
         }
         if json_output {
             if !show_both {
-                let out = serde_json::json!({
+                let mut out = serde_json::json!({
                     "callers": edges,
                     "total": total,
                     "truncated": truncated,
                 });
+                {
+                    let state = tagpath_state.borrow();
+                    inject_tagpath_stale_into_json(
+                        &mut out,
+                        state.1 && !tagpath_opts.no_tagpath,
+                        state.2.as_deref(),
+                    );
+                }
                 println!("{}", to_json_schema(&out, pretty, terse, schema)?);
             }
         } else if tabular {
@@ -4861,11 +4912,19 @@ fn cmd_graph(
         }
         if json_output {
             if !show_both {
-                let out = serde_json::json!({
+                let mut out = serde_json::json!({
                     "callees": edges,
                     "total": total,
                     "truncated": truncated,
                 });
+                {
+                    let state = tagpath_state.borrow();
+                    inject_tagpath_stale_into_json(
+                        &mut out,
+                        state.1 && !tagpath_opts.no_tagpath,
+                        state.2.as_deref(),
+                    );
+                }
                 println!("{}", to_json_schema(&out, pretty, terse, schema)?);
             }
         } else if tabular {
@@ -4947,7 +5006,7 @@ fn cmd_graph(
         if callees_truncated {
             callees_edges.truncate(limit);
         }
-        let combined = serde_json::json!({
+        let mut combined = serde_json::json!({
             "symbol": symbol,
             "callers": callers_edges,
             "callers_total": callers_total,
@@ -4956,6 +5015,14 @@ fn cmd_graph(
             "callees_total": callees_total,
             "callees_truncated": callees_truncated,
         });
+        {
+            let state = tagpath_state.borrow();
+            inject_tagpath_stale_into_json(
+                &mut combined,
+                state.1 && !tagpath_opts.no_tagpath,
+                state.2.as_deref(),
+            );
+        }
         println!("{}", to_json_schema(&combined, pretty, terse, schema)?);
     }
 
@@ -4980,19 +5047,24 @@ fn cmd_communities(
     let db = open_index_db(path, scope)?;
     let edges = db.all_edges()?;
     let mut result = graph::detect_communities(&edges);
+    let mut tagpath_stale = false;
+    let mut tagpath_stale_reason: Option<String> = None;
     if let Some(diag) = annotate_communities_with_tagpath(
         &mut result.communities,
         &db,
         &root,
         &tagpath_opts,
-    )?
-        && diag.stale
-        && !tagpath_opts.no_tagpath
-    {
-        eprintln!(
-            "tagpath_index_stale: true (reason={}); falling back to live extraction",
-            diag.reason.as_deref().unwrap_or("unknown"),
-        );
+    )? {
+        if diag.stale && !tagpath_opts.no_tagpath {
+            eprintln!(
+                "tagpath_index_stale: true (reason={}); falling back to live extraction",
+                diag.reason.as_deref().unwrap_or("unknown"),
+            );
+        }
+        if diag.stale {
+            tagpath_stale = true;
+            tagpath_stale_reason = diag.reason;
+        }
     }
 
     let filtered: Vec<&graph::Community> = result
@@ -5010,7 +5082,7 @@ fn cmd_communities(
     };
 
     if json_output {
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "modularity": result.modularity,
             "iterations": result.iterations,
             "node_count": result.node_count,
@@ -5019,6 +5091,11 @@ fn cmd_communities(
             "communities": display,
             "truncated": truncated,
         });
+        inject_tagpath_stale_into_json(
+            &mut out,
+            tagpath_stale && !tagpath_opts.no_tagpath,
+            tagpath_stale_reason.as_deref(),
+        );
         println!("{}", to_json_schema(&out, pretty, terse, schema)?);
     } else if tabular {
         println!("id\tsize\tmembers");
@@ -15686,7 +15763,13 @@ fn cmd_path(
                 );
             }
             if json_output {
-                println!("{}", to_json_schema(&result, pretty, terse, schema)?);
+                let mut value = serde_json::to_value(&result)?;
+                inject_tagpath_stale_into_json(
+                    &mut value,
+                    tagpath_diag.stale && !tagpath_opts.no_tagpath,
+                    tagpath_diag.reason.as_deref(),
+                );
+                println!("{}", to_json_schema(&value, pretty, terse, schema)?);
             } else if compact {
                 println!(
                     "{} ({} hop{})",
@@ -15822,8 +15905,8 @@ fn cmd_explain_with_budget(
         EdgeSide::Callee,
         &tagpath_opts,
     )?;
-    let tagpath_stale = def_diag.stale || caller_diag.stale || callee_diag.stale;
-    let tagpath_stale_reason = def_diag
+    let mut tagpath_stale = def_diag.stale || caller_diag.stale || callee_diag.stale;
+    let mut tagpath_stale_reason = def_diag
         .reason
         .or(caller_diag.reason)
         .or(callee_diag.reason);
@@ -15860,21 +15943,27 @@ fn cmd_explain_with_budget(
         &db,
         &root,
         &tagpath_opts,
-    )?
-        && comm_diag.stale
-        && !tagpath_opts.no_tagpath
-        && !tagpath_stale
-    {
-        eprintln!(
-            "tagpath_index_stale: true (reason={}); falling back to live extraction",
-            comm_diag.reason.as_deref().unwrap_or("unknown"),
-        );
+    )? {
+        if comm_diag.stale && !tagpath_opts.no_tagpath && !tagpath_stale {
+            eprintln!(
+                "tagpath_index_stale: true (reason={}); falling back to live extraction",
+                comm_diag.reason.as_deref().unwrap_or("unknown"),
+            );
+        }
+        if comm_diag.stale {
+            tagpath_stale = true;
+            if tagpath_stale_reason.is_none() {
+                tagpath_stale_reason = comm_diag.reason;
+            }
+        }
     }
     let community = comm_result
         .communities
         .iter()
         .find(|c| c.members.iter().any(|m| m.name == symbol));
 
+    let combined_stale =
+        tagpath_stale && !tagpath_opts.no_tagpath;
     if budget.is_active() {
         let report = build_explain_budget_report(
             symbol,
@@ -15890,8 +15979,14 @@ fn cmd_explain_with_budget(
             budget,
         );
         if format.json_output {
+            let mut value = serde_json::to_value(&report)?;
+            inject_tagpath_stale_into_json(
+                &mut value,
+                combined_stale,
+                tagpath_stale_reason.as_deref(),
+            );
             print_json_or_envelope(
-                &report,
+                &value,
                 &format,
                 "explain",
                 "preview",
@@ -15917,7 +16012,7 @@ fn cmd_explain_with_budget(
             print_explain_budget_human(&report);
         }
     } else if format.json_output {
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "symbol": symbol,
             "definitions": symbols,
             "callers": callers,
@@ -15928,6 +16023,11 @@ fn cmd_explain_with_budget(
             "callees_truncated": callees_truncated,
             "community": community,
         });
+        inject_tagpath_stale_into_json(
+            &mut out,
+            combined_stale,
+            tagpath_stale_reason.as_deref(),
+        );
         print_json_or_envelope(
             &out,
             &format,
@@ -25962,8 +26062,15 @@ fn cmd_search_with_budget(
             if let Some(hit) = report.hits.first() {
                 follow_up.push(hit.expand.clone());
             }
+            let report_truncated = report.truncated;
+            let mut report_value = serde_json::to_value(&report)?;
+            inject_tagpath_stale_into_json(
+                &mut report_value,
+                tagpath_diag.stale && !tagpath_opts.no_tagpath,
+                tagpath_diag.reason.as_deref(),
+            );
             print_json_or_envelope(
-                &report,
+                &report_value,
                 &format,
                 "search",
                 "preview",
@@ -25977,7 +26084,7 @@ fn cmd_search_with_budget(
                         envelope_metric("skipped", report.skipped_artifacts),
                     ],
                 },
-                report.truncated,
+                report_truncated,
                 follow_up,
             )?;
         } else {
@@ -25998,8 +26105,14 @@ fn cmd_search_with_budget(
             symbols: &symbol_hits,
             sift: &sift_value,
         };
+        let mut combined_value = serde_json::to_value(&combined)?;
+        inject_tagpath_stale_into_json(
+            &mut combined_value,
+            tagpath_diag.stale && !tagpath_opts.no_tagpath,
+            tagpath_diag.reason.as_deref(),
+        );
         print_json_or_envelope(
-            &combined,
+            &combined_value,
             &format,
             "search",
             "report",
