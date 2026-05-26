@@ -230,17 +230,18 @@ tsift --compact search <query>  # terse human output across commands
 
 ## Search Stale Precheck + Timeout
 
-`tsift search` now performs a cheap freshness precheck before it calls the sift engine. If an existing local index is stale, search fails fast instead of spending up to 30 seconds in the lexical engine first.
+`tsift search` now performs a cheap freshness precheck before it calls the sift engine. If an existing local index is stale, search refreshes it before spending time in the lexical engine; callers that pass `--no-autoindex` fail fast instead.
 
 Default behavior:
 
 - fresh index: search proceeds normally
-- stale index: search exits non-zero immediately and tells the user to run `tsift index ...`
-- missing index: search still proceeds, but symbol ranking stays unavailable until the project is indexed
+- stale index: search incrementally refreshes the local or scoped index before running
+- missing index: search builds the local or scoped index before running when a concrete index target can be resolved
 
 Opt-in recovery:
 
-- `tsift search --autoindex ...` mirrors the hook behavior for unhooked sessions: if the local or scoped index is missing or stale, tsift incrementally builds it before searching
+- `tsift search --autoindex ...` is kept as an explicit compatibility flag for the default behavior: if the local or scoped index is missing or stale, tsift incrementally builds it before searching
+- `tsift search --no-autoindex ...` disables the default refresh and fails closed when an existing index is stale
 - if that autoindex pass only loses the coarse `index.lock` race to another live tsift writer, search now degrades instead of failing closed: stale indexes continue with the current read-only index snapshot, missing indexes fall back to exact live-file search, and stderr includes one concise retry hint for fresh symbol/index results after the writer finishes
 - `tsift search --scope <submod> --autoindex ...` rebuilds only that submodule's index
 - `tsift search --federated --autoindex ...` rebuilds stale/missing federated submodule indexes before aggregating symbol hits, and its lexical/vector/hybrid sift pass only searches the same federated scope roots instead of the whole workspace
@@ -255,7 +256,8 @@ Opt-in recovery:
 - writable index updates now claim an OS-backed exclusive lock on the sibling `index.lock` sidecar first, so concurrent `tsift index` / `tsift search --autoindex` writers fail fast with a tsift-owned error instead of surfacing raw SQLite lock contention or PID-recycling false positives
 - lock diagnostics intentionally distinguish the tsift-owned `index.lock` sidecar from SQLite WAL/SHM sidecar state: if `tsift locks` sees no live `index.lock` holder but does see live WAL/SHM sidecars, it recommends checking for a wedged SQLite writer and notes that read-only status/search consumers can keep using WAL-aware snapshot fallback
 - direct `tsift index`, `tsift search`, and `tsift status` regression coverage must include this WAL-without-`index.lock` mode so future changes do not regress back to raw `database is locked` failures or misleading rollback-journal-only recovery guidance
-- read-only graph queries (`graph`, `communities`, `path`, `explain`) open `index.db` without taking that writer-side `index.lock`, and when a live SQLite lock wedges the database they retry against a snapshot copy, including WAL sidecars when present, so diagnostic and graph traversal commands stay available
+- read-only graph queries (`graph`, `communities`, `path`, `explain`) now share the same development-machine freshness chain as search: they resolve the local/scoped index target, incrementally refresh missing or stale indexes before opening `index.db`, and then read through the resilient read-only helper; if a concurrent tsift writer already holds `index.lock` and a prior database exists, they skip the refresh with a concise stderr note and continue against the current read-only snapshot
+- agent-doc task paths named after workspace scopes, such as `tasks/software/tsift.md`, resolve to that scope's index for both search and read-only graph queries, so graph-backed agent workflows do not require an extra `--scope tsift` flag
 - writable `index.db` opens also set `PRAGMA wal_autocheckpoint=256`, so normal tsift write traffic checkpoints the WAL on an explicit budget instead of leaving it entirely to SQLite defaults
 - non-fatal source-read / symbol-extraction / call-extraction failures now emit warnings instead of being silently swallowed, and those warnings are carried in `IndexSummary` for JSON consumers
 

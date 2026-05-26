@@ -5820,25 +5820,63 @@ fn cmd_communities(
     Ok(())
 }
 
-fn resolve_query_db_path(root: &Path, path_hint: &Path, scope: Option<&str>) -> Result<PathBuf> {
+fn resolve_query_index_target(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+) -> Result<SearchIndexTarget> {
     let cfg = config::Config::load(root)?;
     if let Some(scope_name) = scope {
         let scope = config::Config::resolve_submodule(root, scope_name)?;
-        return Ok(cfg.db_path_for(root, &scope.id));
+        return Ok(SearchIndexTarget {
+            label: format!("submodule `{}` index", scope.id),
+            db_path: cfg.db_path_for(root, &scope.id),
+            source_root: scope.source_root.clone(),
+            scope_name: Some(scope.id.clone()),
+            reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
+        });
     }
 
     if let Some(scope) = config::Config::infer_submodule_from_path(root, path_hint)? {
-        return Ok(cfg.db_path_for(root, &scope.id));
+        return Ok(SearchIndexTarget {
+            label: format!("submodule `{}` index", scope.id),
+            db_path: cfg.db_path_for(root, &scope.id),
+            source_root: scope.source_root.clone(),
+            scope_name: Some(scope.id.clone()),
+            reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
+        });
+    }
+
+    if let Some(scope) = infer_agent_doc_task_submodule(root, path_hint)? {
+        return Ok(SearchIndexTarget {
+            label: format!("submodule `{}` index", scope.id),
+            db_path: cfg.db_path_for(root, &scope.id),
+            source_root: scope.source_root.clone(),
+            scope_name: Some(scope.id.clone()),
+            reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
+        });
     }
 
     let db_path = root.join(".tsift/index.db");
     if db_path.exists() {
-        return Ok(db_path);
+        return Ok(SearchIndexTarget {
+            label: "index".to_string(),
+            db_path,
+            source_root: root.to_path_buf(),
+            scope_name: None,
+            reindex_cmd: format!("tsift index {}", root.display()),
+        });
     }
 
     let scopes = config::Config::submodule_dirs(root)?;
     if scopes.is_empty() {
-        return Ok(db_path);
+        return Ok(SearchIndexTarget {
+            label: "index".to_string(),
+            db_path,
+            source_root: root.to_path_buf(),
+            scope_name: None,
+            reindex_cmd: format!("tsift index {}", root.display()),
+        });
     }
 
     let available_scopes = scopes
@@ -5866,9 +5904,40 @@ fn resolve_query_db_path(root: &Path, path_hint: &Path, scope: Option<&str>) -> 
     );
 }
 
+fn resolve_query_db_path(root: &Path, path_hint: &Path, scope: Option<&str>) -> Result<PathBuf> {
+    Ok(resolve_query_index_target(root, path_hint, scope)?.db_path)
+}
+
+fn ensure_query_index_current(root: &Path, target: &SearchIndexTarget) -> Result<()> {
+    let state = inspect_search_index(target)?;
+    let Some(reason) = index_reason_for_state(state) else {
+        return Ok(());
+    };
+
+    match apply_search_index_update(root, target) {
+        Ok(_) => {
+            index::inspect_scope_invalidate_all();
+            Ok(())
+        }
+        Err(err) if is_active_writer_lock_error(&err) && target.db_path.exists() => {
+            eprintln!(
+                "note: active tsift writer detected; skipping graph-query autoindex because {}. \
+                 Continuing with the current read-only index snapshot; graph results may lag. \
+                 Retry `{}` after the active writer finishes for fresh graph results.",
+                index_reason_detail(target, reason),
+                target.reindex_cmd
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::IndexDb> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    let db_path = resolve_query_db_path(&root, path, scope)?;
+    let target = resolve_query_index_target(&root, path, scope)?;
+    ensure_query_index_current(&root, &target)?;
+    let db_path = target.db_path;
     if !db_path.exists() {
         bail!(
             "no index found at {}. Run `tsift index` first.",
@@ -30004,17 +30073,22 @@ agent_doc_format: template
     }
 
     #[test]
-    fn graph_cmd_no_index_errors() {
+    fn graph_cmd_autoindexes_missing_index_by_default() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() {}\nfn main() { helper(); }\n",
+        )
+        .unwrap();
         let result = cmd_graph(
-            "main",
+            "helper",
             dir.path(),
-            false,
+            true,
             false,
             None,
             20,
             false,
-            false,
+            true,
             false,
             false,
             false,
@@ -30022,7 +30096,11 @@ agent_doc_format: template
             false,
             TagpathSearchOpts::default(),
         );
-        assert!(result.is_err());
+
+        assert!(result.is_ok());
+        let db = index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
+        let summary = db.compute_changes(dir.path()).unwrap();
+        assert_eq!(summary.new + summary.modified + summary.deleted, 0);
     }
 
     #[test]
@@ -30104,6 +30182,8 @@ agent_doc_format: template
         std::fs::write(&task, "# tsift\n").unwrap();
 
         let targets = resolve_search_index_targets(dir.path(), &task, None, false).unwrap();
+        let query_db_path = resolve_query_db_path(dir.path(), &task, None).unwrap();
+        let cfg = config::Config::load(dir.path()).unwrap();
 
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].scope_name.as_deref(), Some("tsift"));
@@ -30113,6 +30193,7 @@ agent_doc_format: template
                 .db_path
                 .ends_with(".tsift/indexes/tsift/index.db")
         );
+        assert_eq!(query_db_path, cfg.db_path_for(dir.path(), "tsift"));
     }
 
     #[test]
@@ -32067,7 +32148,7 @@ tier = "private"
     }
 
     #[test]
-    fn community_cmd_no_index_errors() {
+    fn community_cmd_autoindexes_missing_index_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let result = cmd_communities(
             dir.path(),
@@ -32082,7 +32163,9 @@ tier = "private"
             false,
             TagpathSearchOpts::default(),
         );
-        assert!(result.is_err());
+
+        assert!(result.is_ok());
+        assert!(dir.path().join(".tsift/index.db").exists());
     }
 
     // --- path ---
@@ -32107,7 +32190,7 @@ tier = "private"
     }
 
     #[test]
-    fn path_cmd_no_index_errors() {
+    fn path_cmd_autoindexes_missing_index_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let result = cmd_path(
             "a",
@@ -32121,7 +32204,9 @@ tier = "private"
             false,
             TagpathSearchOpts::default(),
         );
-        assert!(result.is_err());
+
+        assert!(result.is_ok());
+        assert!(dir.path().join(".tsift/index.db").exists());
     }
 
     // --- explain ---
@@ -32137,7 +32222,7 @@ tier = "private"
     }
 
     #[test]
-    fn explain_cmd_no_index_errors() {
+    fn explain_cmd_autoindexes_missing_index_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let result = cmd_explain(
             "main",
@@ -32152,7 +32237,9 @@ tier = "private"
             false,
             false,
         );
-        assert!(result.is_err());
+
+        assert!(result.is_ok());
+        assert!(dir.path().join(".tsift/index.db").exists());
     }
 
     fn hold_write_lock(db_path: &std::path::Path) -> Connection {
@@ -33197,6 +33284,39 @@ tier = "private"
         );
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn graph_cmd_autoindexes_stale_index_by_default() {
+        let dir = setup_graph_index();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn helper() { println!(\"updated\"); }\nfn main() { helper(); Vec::new(); }\n",
+        )
+        .unwrap();
+
+        let result = cmd_graph(
+            "helper",
+            dir.path(),
+            true,
+            false,
+            None,
+            20,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            TagpathSearchOpts::default(),
+        );
+
+        assert!(result.is_ok());
+        let db = index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
+        let summary = db.compute_changes(dir.path()).unwrap();
+        assert_eq!(summary.new + summary.modified + summary.deleted, 0);
     }
 
     #[test]
