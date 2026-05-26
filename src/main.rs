@@ -12596,6 +12596,9 @@ fn graph_db_backend_eval_performance_gate(
                 .to_string(),
             "full_projection.refresh_phase.projection_rows.duration_micros_per_1k_graph_rows"
                 .to_string(),
+            "full_projection.sqlite.sqlite_delta_write.duration_micros".to_string(),
+            "full_projection.sqlite.sqlite_edge_staging.duration_micros".to_string(),
+            "full_projection.sqlite.post_write_reads.duration_micros".to_string(),
             "full_projection.sqlite.evidence_target_resolution.duration_micros".to_string(),
             "full_projection.sqlite.evidence.duration_micros".to_string(),
             "full_projection.sqlite.path_max_hops.duration_micros".to_string(),
@@ -13055,6 +13058,22 @@ fn cmd_graph_db_backend_eval(
             graph_db_backend_eval_graph_rows(full_dataset),
             &normalized_full_projection_phases,
         );
+        for phase in &full_projection_phase_timings {
+            if let Some(sqlite_phase) = phase.name.strip_prefix("full_projection.sqlite.") {
+                metrics.insert(
+                    format!("full_projection.sqlite.{sqlite_phase}.duration_micros"),
+                    phase.duration_micros as f64,
+                );
+                append_graph_db_backend_eval_normalized_duration_metric(
+                    &mut metrics,
+                    &format!(
+                        "full_projection.sqlite.{sqlite_phase}.duration_micros_per_1k_graph_rows"
+                    ),
+                    phase.duration_micros,
+                    graph_db_backend_eval_graph_rows(full_dataset),
+                );
+            }
+        }
     }
     let report = GraphDbBackendEvalReport {
         root: root.to_string_lossy().to_string(),

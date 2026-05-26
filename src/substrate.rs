@@ -1620,10 +1620,18 @@ impl SqliteGraphStore {
                 value TEXT NOT NULL,
                 PRIMARY KEY (edge_key, key)
             );
+            CREATE TEMP TABLE IF NOT EXISTS next_graph_changed_nodes (
+                id TEXT PRIMARY KEY
+            );
+            CREATE TEMP TABLE IF NOT EXISTS next_graph_changed_edges (
+                edge_key TEXT PRIMARY KEY
+            );
             DELETE FROM next_graph_nodes;
             DELETE FROM next_graph_edges;
             DELETE FROM next_graph_node_properties;
             DELETE FROM next_graph_edge_properties;
+            DELETE FROM next_graph_changed_nodes;
+            DELETE FROM next_graph_changed_edges;
             "#,
         )?;
         phase_timings.push(sqlite_refresh_phase_timing(
@@ -1660,23 +1668,6 @@ impl SqliteGraphStore {
         }
         {
             let started = Instant::now();
-            tx.execute_batch(
-                r#"
-                INSERT INTO next_graph_node_properties (node_id, key, value)
-                SELECT n.id, json_each.key, CAST(json_each.value AS TEXT)
-                FROM next_graph_nodes n, json_each(n.properties_json)
-                WHERE json_each.key IS NOT NULL
-                  AND json_each.value IS NOT NULL
-                "#,
-            )?;
-            phase_timings.push(sqlite_refresh_phase_timing(
-                "sqlite_property_row_staging",
-                started,
-                "derive materialized node property rows from staged node JSON inside SQLite",
-            ));
-        }
-        {
-            let started = Instant::now();
             let mut insert_edge = tx.prepare(
                 r#"
                 INSERT INTO next_graph_edges
@@ -1706,11 +1697,64 @@ impl SqliteGraphStore {
         }
         {
             let started = Instant::now();
+            let changed_nodes_sql = if force_refresh_writes {
+                r#"
+                INSERT INTO next_graph_changed_nodes (id)
+                SELECT id
+                FROM next_graph_nodes
+                "#
+            } else {
+                r#"
+                INSERT INTO next_graph_changed_nodes (id)
+                SELECT n.id
+                FROM next_graph_nodes n
+                LEFT JOIN graph_nodes g ON g.id = n.id
+                WHERE g.id IS NULL OR g.row_hash IS NOT n.row_hash
+                "#
+            };
+            tx.execute(changed_nodes_sql, [])?;
+            tx.execute_batch(
+                r#"
+                INSERT INTO next_graph_node_properties (node_id, key, value)
+                SELECT n.id, json_each.key, CAST(json_each.value AS TEXT)
+                FROM next_graph_nodes n
+                JOIN next_graph_changed_nodes c ON c.id = n.id,
+                     json_each(n.properties_json)
+                WHERE json_each.key IS NOT NULL
+                  AND json_each.value IS NOT NULL
+                "#,
+            )?;
+            phase_timings.push(sqlite_refresh_phase_timing(
+                "sqlite_property_row_staging",
+                started,
+                "derive materialized node property rows only for new/changed node rows; unchanged row-hash owners reuse existing property rows",
+            ));
+        }
+        {
+            let started = Instant::now();
+            let changed_edges_sql = if force_refresh_writes {
+                r#"
+                INSERT INTO next_graph_changed_edges (edge_key)
+                SELECT edge_key
+                FROM next_graph_edges
+                "#
+            } else {
+                r#"
+                INSERT INTO next_graph_changed_edges (edge_key)
+                SELECT n.edge_key
+                FROM next_graph_edges n
+                LEFT JOIN graph_edges g ON g.edge_key = n.edge_key
+                WHERE g.edge_key IS NULL OR g.row_hash IS NOT n.row_hash
+                "#
+            };
+            tx.execute(changed_edges_sql, [])?;
             tx.execute_batch(
                 r#"
                 INSERT INTO next_graph_edge_properties (edge_key, key, value)
                 SELECT e.edge_key, json_each.key, CAST(json_each.value AS TEXT)
-                FROM next_graph_edges e, json_each(e.properties_json)
+                FROM next_graph_edges e
+                JOIN next_graph_changed_edges c ON c.edge_key = e.edge_key,
+                     json_each(e.properties_json)
                 WHERE json_each.key IS NOT NULL
                   AND json_each.value IS NOT NULL
                 "#,
@@ -1718,7 +1762,7 @@ impl SqliteGraphStore {
             phase_timings.push(sqlite_refresh_phase_timing(
                 "sqlite_edge_property_row_staging",
                 started,
-                "derive materialized edge property rows from staged edge JSON inside SQLite",
+                "derive materialized edge property rows only for new/changed edge rows; unchanged row-hash owners reuse existing property rows",
             ));
         }
 
@@ -1769,7 +1813,29 @@ impl SqliteGraphStore {
             [],
             |row| row.get(0),
         )?;
-        let unchanged_node_properties: usize = tx.query_row(
+        let reused_owner_node_properties: usize = tx.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM graph_node_properties g
+            JOIN next_graph_nodes n ON n.id = g.node_id
+            LEFT JOIN next_graph_changed_nodes c ON c.id = n.id
+            WHERE c.id IS NULL
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
+        let reused_owner_edge_properties: usize = tx.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM graph_edge_properties g
+            JOIN next_graph_edges n ON n.edge_key = g.edge_key
+            LEFT JOIN next_graph_changed_edges c ON c.edge_key = n.edge_key
+            WHERE c.edge_key IS NULL
+            "#,
+            [],
+            |row| row.get(0),
+        )?;
+        let unchanged_changed_node_properties: usize = tx.query_row(
             r#"
             SELECT COUNT(*)
             FROM next_graph_node_properties n
@@ -1780,7 +1846,7 @@ impl SqliteGraphStore {
             [],
             |row| row.get(0),
         )?;
-        let unchanged_edge_properties: usize = tx.query_row(
+        let unchanged_changed_edge_properties: usize = tx.query_row(
             r#"
             SELECT COUNT(*)
             FROM next_graph_edge_properties n
@@ -1791,7 +1857,10 @@ impl SqliteGraphStore {
             [],
             |row| row.get(0),
         )?;
-        let unchanged_properties = unchanged_node_properties + unchanged_edge_properties;
+        let unchanged_properties = reused_owner_node_properties
+            + reused_owner_edge_properties
+            + unchanged_changed_node_properties
+            + unchanged_changed_edge_properties;
 
         let deleted_edges = tx.execute(
             r#"
@@ -1816,25 +1885,7 @@ impl SqliteGraphStore {
             [],
         )?;
 
-        let upsert_nodes_sql = if force_refresh_writes {
-            r#"
-            INSERT INTO graph_nodes
-                (id, kind, label, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
-            SELECT id, kind, label, properties_json, provenance_json, freshness_json, row_hash, source_watermark
-            FROM next_graph_nodes
-            WHERE true
-            ON CONFLICT(id) DO UPDATE SET
-                kind = excluded.kind,
-                label = excluded.label,
-                properties_json = excluded.properties_json,
-                provenance_json = excluded.provenance_json,
-                freshness_json = excluded.freshness_json,
-                row_hash = excluded.row_hash,
-                source_watermark = excluded.source_watermark
-            WHERE graph_nodes.row_hash IS NOT excluded.row_hash
-            "#
-        } else {
-            r#"
+        let upsert_nodes_sql = r#"
             INSERT INTO graph_nodes
                 (id, kind, label, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
             SELECT
@@ -1847,8 +1898,8 @@ impl SqliteGraphStore {
                 n.row_hash,
                 n.source_watermark
             FROM next_graph_nodes n
-            LEFT JOIN graph_nodes g ON g.id = n.id
-            WHERE g.id IS NULL OR g.row_hash IS NOT n.row_hash
+            JOIN next_graph_changed_nodes c ON c.id = n.id
+            WHERE true
             ON CONFLICT(id) DO UPDATE SET
                 kind = excluded.kind,
                 label = excluded.label,
@@ -1858,27 +1909,9 @@ impl SqliteGraphStore {
                 row_hash = excluded.row_hash,
                 source_watermark = excluded.source_watermark
             WHERE graph_nodes.row_hash IS NOT excluded.row_hash
-            "#
-        };
+            "#;
         tx.execute(upsert_nodes_sql, [])?;
-        let upsert_edges_sql = if force_refresh_writes {
-            r#"
-            INSERT INTO graph_edges
-                (edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
-            SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark
-            FROM next_graph_edges
-            WHERE true
-            ON CONFLICT(from_id, to_id, kind) DO UPDATE SET
-                edge_key = excluded.edge_key,
-                properties_json = excluded.properties_json,
-                provenance_json = excluded.provenance_json,
-                freshness_json = excluded.freshness_json,
-                row_hash = excluded.row_hash,
-                source_watermark = excluded.source_watermark
-            WHERE graph_edges.row_hash IS NOT excluded.row_hash
-            "#
-        } else {
-            r#"
+        let upsert_edges_sql = r#"
             INSERT INTO graph_edges
                 (edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
             SELECT
@@ -1892,9 +1925,8 @@ impl SqliteGraphStore {
                 n.row_hash,
                 n.source_watermark
             FROM next_graph_edges n
-            LEFT JOIN graph_edges g
-                ON g.edge_key = n.edge_key
-            WHERE g.edge_key IS NULL OR g.row_hash IS NOT n.row_hash
+            JOIN next_graph_changed_edges c ON c.edge_key = n.edge_key
+            WHERE true
             ON CONFLICT(from_id, to_id, kind) DO UPDATE SET
                 edge_key = excluded.edge_key,
                 properties_json = excluded.properties_json,
@@ -1903,13 +1935,17 @@ impl SqliteGraphStore {
                 row_hash = excluded.row_hash,
                 source_watermark = excluded.source_watermark
             WHERE graph_edges.row_hash IS NOT excluded.row_hash
-            "#
-        };
+            "#;
         tx.execute(upsert_edges_sql, [])?;
         let deleted_node_properties = tx.execute(
             r#"
             DELETE FROM graph_node_properties
-            WHERE NOT EXISTS (
+            WHERE EXISTS (
+                SELECT 1
+                FROM next_graph_changed_nodes c
+                WHERE c.id = graph_node_properties.node_id
+            )
+              AND NOT EXISTS (
                 SELECT 1
                 FROM next_graph_node_properties n
                 WHERE n.node_id = graph_node_properties.node_id
@@ -1921,7 +1957,12 @@ impl SqliteGraphStore {
         let deleted_edge_properties = tx.execute(
             r#"
             DELETE FROM graph_edge_properties
-            WHERE NOT EXISTS (
+            WHERE EXISTS (
+                SELECT 1
+                FROM next_graph_changed_edges c
+                WHERE c.edge_key = graph_edge_properties.edge_key
+            )
+              AND NOT EXISTS (
                 SELECT 1
                 FROM next_graph_edge_properties n
                 WHERE n.edge_key = graph_edge_properties.edge_key
@@ -1931,18 +1972,7 @@ impl SqliteGraphStore {
             [],
         )?;
         let deleted_properties = deleted_node_properties + deleted_edge_properties;
-        let upsert_properties_sql = if force_refresh_writes {
-            r#"
-            INSERT INTO graph_node_properties (node_id, key, value)
-            SELECT node_id, key, value
-            FROM next_graph_node_properties
-            WHERE true
-            ON CONFLICT(node_id, key) DO UPDATE SET
-                value = excluded.value
-            WHERE graph_node_properties.value IS NOT excluded.value
-            "#
-        } else {
-            r#"
+        let upsert_properties_sql = r#"
             INSERT INTO graph_node_properties (node_id, key, value)
             SELECT n.node_id, n.key, n.value
             FROM next_graph_node_properties n
@@ -1952,21 +1982,9 @@ impl SqliteGraphStore {
             ON CONFLICT(node_id, key) DO UPDATE SET
                 value = excluded.value
             WHERE graph_node_properties.value IS NOT excluded.value
-            "#
-        };
+            "#;
         let upserted_node_properties = tx.execute(upsert_properties_sql, [])?;
-        let upsert_edge_properties_sql = if force_refresh_writes {
-            r#"
-            INSERT INTO graph_edge_properties (edge_key, key, value)
-            SELECT edge_key, key, value
-            FROM next_graph_edge_properties
-            WHERE true
-            ON CONFLICT(edge_key, key) DO UPDATE SET
-                value = excluded.value
-            WHERE graph_edge_properties.value IS NOT excluded.value
-            "#
-        } else {
-            r#"
+        let upsert_edge_properties_sql = r#"
             INSERT INTO graph_edge_properties (edge_key, key, value)
             SELECT n.edge_key, n.key, n.value
             FROM next_graph_edge_properties n
@@ -1976,8 +1994,7 @@ impl SqliteGraphStore {
             ON CONFLICT(edge_key, key) DO UPDATE SET
                 value = excluded.value
             WHERE graph_edge_properties.value IS NOT excluded.value
-            "#
-        };
+            "#;
         let upserted_edge_properties = tx.execute(upsert_edge_properties_sql, [])?;
         let upserted_properties = upserted_node_properties + upserted_edge_properties;
         tx.execute(
@@ -4637,6 +4654,42 @@ mod tests {
         assert_eq!(refresh.upserted_edges, 0);
         assert_eq!(refresh.unchanged_properties, 250);
         assert_eq!(refresh.upserted_properties, 0);
+        let staged_node_properties: usize = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM temp.next_graph_node_properties",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let staged_edge_properties: usize = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM temp.next_graph_edge_properties",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(staged_node_properties, 0);
+        assert_eq!(staged_edge_properties, 0);
+        assert!(
+            refresh
+                .phase_timings
+                .iter()
+                .any(|phase| phase.name == "sqlite_property_row_staging"
+                    && phase.detail.contains("new/changed node rows")),
+            "{:?}",
+            refresh.phase_timings
+        );
+        assert!(
+            refresh
+                .phase_timings
+                .iter()
+                .any(|phase| phase.name == "sqlite_edge_property_row_staging"
+                    && phase.detail.contains("new/changed edge rows")),
+            "{:?}",
+            refresh.phase_timings
+        );
         assert_eq!(
             store
                 .projection_version("root")
