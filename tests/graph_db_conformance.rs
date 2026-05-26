@@ -1998,6 +1998,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "freshness_and_full_parity_match_sqlite_on_every_graphstore_operation",
         "lock_semantics_match_or_beat_sqlite_for_writer_and_read_only_workflows",
         "install_portability_preserves_cargo_build_install_without_external_service_or_native_toolchain",
+        "full_projection_cache_hit_sample_before_backend_or_hop_cap_changes",
         "beats_sqlite_on_every_required_workload_and_metric_in_backend_eval",
     ] {
         assert!(
@@ -2073,6 +2074,13 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .iter()
             .any(|metric| metric
                 == "synthetic_deep_chain.sqlite.path_max_hops_512.duration_micros"),
+        "{report}"
+    );
+    assert!(
+        report["performance_gate"]["full_projection_cache_hit_gate"]
+            .as_str()
+            .unwrap()
+            .contains("not evaluated"),
         "{report}"
     );
     assert!(
@@ -2339,6 +2347,13 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .as_str()
             .unwrap()
             .contains("--full-projection"),
+        "{full_projection_report}"
+    );
+    assert!(
+        full_projection_report["performance_gate"]["full_projection_cache_hit_gate"]
+            .as_str()
+            .unwrap()
+            .contains("full_projection.cache.hit=1"),
         "{full_projection_report}"
     );
     assert!(

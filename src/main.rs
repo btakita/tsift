@@ -7932,6 +7932,7 @@ struct GraphDbBackendEvalPerformanceGate {
     baseline_fixture: String,
     ci_profile: String,
     opt_in_real_profile: String,
+    full_projection_cache_hit_gate: String,
     allowed_regression_percent: f64,
     minimum_sample_runs: usize,
     normalized_metric_unit: String,
@@ -12492,7 +12493,7 @@ fn graph_db_backend_eval_hop_cap_promotion_gate() -> GraphDbHopCapPromotionGate 
         allowed_regression_percent: GRAPH_DB_BACKEND_EVAL_ALLOWED_REGRESSION_PERCENT,
         minimum_sample_runs: GRAPH_DB_BACKEND_EVAL_MIN_SAMPLE_RUNS,
         decision_rule:
-            "keep 64 as the user-facing default until each candidate tier has repeated real, full_projection, and synthetic_deep_chain SQLite samples within the latency-regression budget and returning useful path rows"
+            "keep 64 as the user-facing default until each candidate tier has repeated real, full_projection, and synthetic_deep_chain SQLite samples within the latency-regression budget and returning useful path rows; full_projection samples are binding only after a cold populate leg proves a cache-hit leg"
                 .to_string(),
     }
 }
@@ -12526,6 +12527,7 @@ fn graph_db_backend_eval_backend_adapter_spike_gate() -> GraphDbBackendAdapterSp
             "lock_semantics_match_or_beat_sqlite_for_writer_and_read_only_workflows".to_string(),
             "install_portability_preserves_cargo_build_install_without_external_service_or_native_toolchain"
                 .to_string(),
+            "full_projection_cache_hit_sample_before_backend_or_hop_cap_changes".to_string(),
             "beats_sqlite_on_every_required_workload_and_metric_in_backend_eval".to_string(),
         ],
         decision_rule:
@@ -12611,6 +12613,12 @@ fn graph_db_backend_eval_performance_gate(
         opt_in_real_profile:
             "pass --full-projection to add the full-project dataset when checking for large projection regressions"
                 .to_string(),
+        full_projection_cache_hit_gate: if full_projection {
+            "binding full_projection performance evidence requires a cold populate leg followed by cache-leg samples with full_projection.cache.hit=1; cache-miss samples are diagnostics, not backend or hop-cap promotion proof"
+                .to_string()
+        } else {
+            "not evaluated until --full-projection is enabled".to_string()
+        },
         allowed_regression_percent: GRAPH_DB_BACKEND_EVAL_ALLOWED_REGRESSION_PERCENT,
         minimum_sample_runs: GRAPH_DB_BACKEND_EVAL_MIN_SAMPLE_RUNS,
         normalized_metric_unit: "duration_micros_per_1k_graph_rows".to_string(),
@@ -13858,6 +13866,54 @@ fn push_traversal_metadata_watermark_part(
     }
 }
 
+#[derive(Serialize)]
+struct TraversalSummaryWatermarkRow<'a> {
+    symbol_name: &'a str,
+    file_path: &'a str,
+    entities: &'a Option<Vec<summarize::Entity>>,
+    relationships: &'a Option<Vec<summarize::Relationship>>,
+    concept_labels: &'a Option<Vec<String>>,
+}
+
+fn push_traversal_summaries_watermark_part(root: &Path, parts: &mut Vec<String>) -> Result<()> {
+    let summaries_db = root.join(".tsift/summaries.db");
+    if !summaries_db.exists() {
+        parts.push("summaries_db:absent".to_string());
+        return Ok(());
+    }
+
+    match summarize::SummaryDb::open_read_only_resilient(&summaries_db)
+        .and_then(|summary_db| summary_db.all())
+    {
+        Ok(summaries) => {
+            let rows = summaries
+                .iter()
+                .map(|summary| TraversalSummaryWatermarkRow {
+                    symbol_name: &summary.symbol_name,
+                    file_path: &summary.file_path,
+                    entities: &summary.entities,
+                    relationships: &summary.relationships,
+                    concept_labels: &summary.concept_labels,
+                })
+                .collect::<Vec<_>>();
+            parts.push(format!(
+                "summaries_db:rows={}:semantic_hash={}",
+                rows.len(),
+                content_hash(&rows)?
+            ));
+        }
+        Err(_) => {
+            push_traversal_metadata_watermark_part(
+                root,
+                &summaries_db,
+                "summaries_db_unreadable",
+                parts,
+            );
+        }
+    }
+    Ok(())
+}
+
 fn traversal_relative_path_is_generated_artifact(relative: &str) -> bool {
     let relative = relative.trim_start_matches("./").replace('\\', "/");
     relative == ".tsift"
@@ -13948,13 +14004,7 @@ fn traversal_source_watermark(
         push_traversal_metadata_watermark_part(root, &markdown_path, "markdown", &mut parts);
     }
 
-    push_traversal_metadata_watermark_part(
-        root,
-        &root.join(".tsift/summaries.db"),
-        "summaries_db",
-        &mut parts,
-    );
-
+    push_traversal_summaries_watermark_part(root, &mut parts)?;
 
     Ok(Some(content_hash(&parts)?))
 }
@@ -35482,6 +35532,75 @@ tier = "private"
         assert_ne!(
             first, fourth,
             "watermark must invalidate when the hinted markdown file changes"
+        );
+    }
+
+    #[test]
+    fn traversal_source_watermark_uses_summary_rows_not_summaries_db_metadata() {
+        // #gcachemiss: full-projection cache keys must not miss just because the
+        // SQLite summary cache file header or mtime churned. Only the semantic rows
+        // that feed traversal projection should participate in the source watermark.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("README.md"), "# stable\n").unwrap();
+        let summaries_db_path = root.join(".tsift/summaries.db");
+        let summary_db = summarize::SummaryDb::open(&summaries_db_path).unwrap();
+        let mut summary = summarize::Summary {
+            id: 0,
+            symbol_name: "main".to_string(),
+            file_path: "src/main.rs".to_string(),
+            content_hash: "hash-main".to_string(),
+            summary: "main wires the CLI".to_string(),
+            entities: Some(vec![summarize::Entity {
+                name: "Cli".to_string(),
+                kind: "type".to_string(),
+                description: "Command-line interface".to_string(),
+            }]),
+            relationships: None,
+            concept_labels: Some(vec!["cli".to_string()]),
+            extracted_at: "1700000000".to_string(),
+            model: "test-model".to_string(),
+            tokens_input: Some(10),
+            tokens_output: Some(5),
+        };
+        summary_db.insert(&summary).unwrap();
+        drop(summary_db);
+
+        let hint = root.join("README.md");
+        let first = traversal_source_watermark(root, &hint, None, true)
+            .expect("first watermark call must succeed")
+            .expect("first watermark must produce a hash");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let conn = Connection::open(&summaries_db_path).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.pragma_update(None, "user_version", 0).unwrap();
+        drop(conn);
+
+        let second = traversal_source_watermark(root, &hint, None, true)
+            .expect("second watermark call must succeed")
+            .expect("second watermark must produce a hash");
+        assert_eq!(
+            first, second,
+            "metadata-only summaries.db churn must not invalidate the source watermark"
+        );
+
+        summary.entities = Some(vec![summarize::Entity {
+            name: "GraphCache".to_string(),
+            kind: "type".to_string(),
+            description: "Stable full-projection cache input".to_string(),
+        }]);
+        let summary_db = summarize::SummaryDb::open(&summaries_db_path).unwrap();
+        summary_db.delete_by_file("src/main.rs").unwrap();
+        summary_db.insert(&summary).unwrap();
+        drop(summary_db);
+
+        let third = traversal_source_watermark(root, &hint, None, true)
+            .expect("third watermark call must succeed")
+            .expect("third watermark must produce a hash");
+        assert_ne!(
+            first, third,
+            "semantic summary row changes must invalidate the source watermark"
         );
     }
 }
