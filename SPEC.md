@@ -70,6 +70,7 @@ A workload that is absent from history is treated as `missing` and blocks promot
 - `label` — human-readable description that includes the workload tag (for example `graph-db backend-eval full-projection agent-loop sample 1`).
 - `id` — stable identifier of the form `<scope>-<workload>-<date>-sample-<N>`; the trailing `sample-<N>` is the sample index parsed by `perf_gate::parse_history`.
 - `timestamp` — ISO-8601 recording time.
+- optional run metadata (`workload`, `sample_index`, `backend`, `projection_mode`, `cache_state`, `scope`) may be included to make human review and follow-up triage easier; parsers must continue to treat these fields as additive and derive binding workload/backend/sample facts from `id` plus `metrics`.
 - `metrics` — flat map of numeric metrics keyed `<workload_prefix>.<backend_id>.<operation>[.<sub>]`, including:
   - `refresh.duration_micros` for the projection write phase (required for the gate),
   - `total_duration_micros` for the aggregate workload cost (required for the gate),
