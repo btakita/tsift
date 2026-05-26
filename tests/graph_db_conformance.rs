@@ -2404,6 +2404,16 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         .contains("reused cached full-project source graph"),
         "{cached_full_projection_report}"
     );
+    for phase in [
+        "full_projection.source_graph_build",
+        "full_projection.projection_rows",
+    ] {
+        assert_eq!(
+            phase_duration(&cached_full_projection_report, phase),
+            0,
+            "full-projection cache hits must skip {phase}: {cached_full_projection_report}"
+        );
+    }
     assert!(
         !stale_legacy_cache.exists() && !stale_compressed_cache.exists(),
         "full-projection cache hit should prune stale pre-fix artifacts"
