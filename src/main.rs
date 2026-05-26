@@ -7939,6 +7939,7 @@ struct GraphDbBackendEvalPerformanceGate {
     digest_command: String,
     repeated_sample_command: String,
     hop_cap_promotion: GraphDbHopCapPromotionGate,
+    backend_adapter_spike: GraphDbBackendAdapterSpikeGate,
 }
 
 #[derive(Serialize)]
@@ -7952,6 +7953,25 @@ struct GraphDbHopCapPromotionGate {
     allowed_regression_percent: f64,
     minimum_sample_runs: usize,
     decision_rule: String,
+}
+
+#[derive(Serialize)]
+struct GraphDbBackendAdapterSpikeGate {
+    status: String,
+    candidate_backends: Vec<GraphDbBackendAdapterSpikeCandidate>,
+    required_workloads: Vec<String>,
+    required_checks: Vec<String>,
+    decision_rule: String,
+    evidence_plan: String,
+}
+
+#[derive(Serialize)]
+struct GraphDbBackendAdapterSpikeCandidate {
+    backend: String,
+    adapter_label: String,
+    projection_load: String,
+    lock_behavior: String,
+    install_portability: String,
 }
 
 #[derive(Serialize)]
@@ -12477,6 +12497,44 @@ fn graph_db_backend_eval_hop_cap_promotion_gate() -> GraphDbHopCapPromotionGate 
     }
 }
 
+fn graph_db_backend_eval_backend_adapter_spike_gate() -> GraphDbBackendAdapterSpikeGate {
+    let candidate_backends = [
+        GraphDbExperimentalBackend::Falkordb,
+        GraphDbExperimentalBackend::Kuzu,
+    ]
+    .into_iter()
+    .map(|backend| GraphDbBackendAdapterSpikeCandidate {
+        backend: backend.name().to_string(),
+        adapter_label: backend.adapter_label().to_string(),
+        projection_load: backend.projection_load().to_string(),
+        lock_behavior: backend.lock_behavior().to_string(),
+        install_portability: backend.install_portability().to_string(),
+    })
+    .collect();
+
+    GraphDbBackendAdapterSpikeGate {
+        status: "hold_real_optional_adapter_required".to_string(),
+        candidate_backends,
+        required_workloads: perf_gate::GATE_WORKLOAD_PREFIXES
+            .iter()
+            .map(|workload| (*workload).to_string())
+            .collect(),
+        required_checks: vec![
+            "real_optional_adapter_behind_graphstore_without_default_build_dependency".to_string(),
+            "projection_load_writes_provider_neutral_rows_without_sqlite_row_replay".to_string(),
+            "freshness_and_full_parity_match_sqlite_on_every_graphstore_operation".to_string(),
+            "lock_semantics_match_or_beat_sqlite_for_writer_and_read_only_workflows".to_string(),
+            "install_portability_preserves_cargo_build_install_without_external_service_or_native_toolchain"
+                .to_string(),
+            "beats_sqlite_on_every_required_workload_and_metric_in_backend_eval".to_string(),
+        ],
+        decision_rule:
+            "do not promote a read-only prototype; FalkorDB or Kuzu can only advance after a real optional adapter proves projection writes/load, lock semantics, install portability, full parity, and faster-than-SQLite results across every required workload"
+                .to_string(),
+        evidence_plan: "plans/gback-evidence.md".to_string(),
+    }
+}
+
 fn graph_db_backend_eval_performance_gate(
     root: &Path,
     scope: Option<&str>,
@@ -12564,6 +12622,7 @@ fn graph_db_backend_eval_performance_gate(
             full_projection,
         ),
         hop_cap_promotion: graph_db_backend_eval_hop_cap_promotion_gate(),
+        backend_adapter_spike: graph_db_backend_eval_backend_adapter_spike_gate(),
     }
 }
 

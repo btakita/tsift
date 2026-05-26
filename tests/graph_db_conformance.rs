@@ -1974,6 +1974,80 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .contains("returning useful path rows"),
         "{report}"
     );
+    let adapter_spike = &report["performance_gate"]["backend_adapter_spike"];
+    assert_eq!(
+        adapter_spike["status"], "hold_real_optional_adapter_required",
+        "{report}"
+    );
+    assert_eq!(
+        adapter_spike["evidence_plan"], "plans/gback-evidence.md",
+        "{report}"
+    );
+    assert_eq!(
+        adapter_spike["required_workloads"],
+        json!([
+            "real",
+            "full_projection",
+            "synthetic_high_degree",
+            "synthetic_deep_chain"
+        ]),
+        "{report}"
+    );
+    for required_check in [
+        "projection_load_writes_provider_neutral_rows_without_sqlite_row_replay",
+        "freshness_and_full_parity_match_sqlite_on_every_graphstore_operation",
+        "lock_semantics_match_or_beat_sqlite_for_writer_and_read_only_workflows",
+        "install_portability_preserves_cargo_build_install_without_external_service_or_native_toolchain",
+        "beats_sqlite_on_every_required_workload_and_metric_in_backend_eval",
+    ] {
+        assert!(
+            adapter_spike["required_checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check == required_check),
+            "adapter spike gate should require {required_check}: {report}"
+        );
+    }
+    assert!(
+        adapter_spike["decision_rule"]
+            .as_str()
+            .unwrap()
+            .contains("do not promote a read-only prototype"),
+        "{report}"
+    );
+    for backend in ["falkordb", "kuzu"] {
+        let candidate = adapter_spike["candidate_backends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["backend"] == backend)
+            .unwrap_or_else(|| {
+                panic!("missing backend adapter spike candidate for {backend}: {report}")
+            });
+        let projection_load = candidate["projection_load"]
+            .as_str()
+            .unwrap()
+            .to_lowercase();
+        assert!(
+            projection_load.contains(backend) || projection_load.contains("kuzu-compatible"),
+            "{report}"
+        );
+        assert!(
+            candidate["lock_behavior"]
+                .as_str()
+                .unwrap()
+                .contains("writer"),
+            "{report}"
+        );
+        assert!(
+            candidate["install_portability"]
+                .as_str()
+                .unwrap()
+                .contains("cargo build/install"),
+            "{report}"
+        );
+    }
     assert!(
         report["performance_gate"]["required_metrics"]
             .as_array()
