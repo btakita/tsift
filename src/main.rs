@@ -7938,6 +7938,20 @@ struct GraphDbBackendEvalPerformanceGate {
     required_metrics: Vec<String>,
     digest_command: String,
     repeated_sample_command: String,
+    hop_cap_promotion: GraphDbHopCapPromotionGate,
+}
+
+#[derive(Serialize)]
+struct GraphDbHopCapPromotionGate {
+    status: String,
+    current_default_hops: usize,
+    candidate_hop_tiers: Vec<usize>,
+    required_backend: String,
+    required_workloads: Vec<String>,
+    required_metrics: Vec<String>,
+    allowed_regression_percent: f64,
+    minimum_sample_runs: usize,
+    decision_rule: String,
 }
 
 #[derive(Serialize)]
@@ -12433,6 +12447,36 @@ fn graph_db_backend_eval_repeated_sample_command(
     )
 }
 
+fn graph_db_backend_eval_hop_cap_promotion_gate() -> GraphDbHopCapPromotionGate {
+    let mut required_metrics = Vec::new();
+    for workload in perf_gate::HOP_CAP_REQUIRED_WORKLOADS {
+        required_metrics.push(format!("{workload}.sqlite.path_max_hops.duration_micros"));
+        required_metrics.push(format!("{workload}.sqlite.path_max_hops.rows"));
+        for hops in perf_gate::HOP_CAP_CANDIDATE_TIERS {
+            required_metrics.push(format!(
+                "{workload}.sqlite.path_max_hops_{hops}.duration_micros"
+            ));
+            required_metrics.push(format!("{workload}.sqlite.path_max_hops_{hops}.rows"));
+        }
+    }
+    GraphDbHopCapPromotionGate {
+        status: "hold_64_default_until_gate_passes".to_string(),
+        current_default_hops: perf_gate::HOP_CAP_CURRENT_DEFAULT,
+        candidate_hop_tiers: perf_gate::HOP_CAP_CANDIDATE_TIERS.to_vec(),
+        required_backend: perf_gate::BASELINE_BACKEND.to_string(),
+        required_workloads: perf_gate::HOP_CAP_REQUIRED_WORKLOADS
+            .iter()
+            .map(|workload| (*workload).to_string())
+            .collect(),
+        required_metrics,
+        allowed_regression_percent: GRAPH_DB_BACKEND_EVAL_ALLOWED_REGRESSION_PERCENT,
+        minimum_sample_runs: GRAPH_DB_BACKEND_EVAL_MIN_SAMPLE_RUNS,
+        decision_rule:
+            "keep 64 as the user-facing default until each candidate tier has repeated real, full_projection, and synthetic_deep_chain SQLite samples within the latency-regression budget and returning useful path rows"
+                .to_string(),
+    }
+}
+
 fn graph_db_backend_eval_performance_gate(
     root: &Path,
     scope: Option<&str>,
@@ -12513,6 +12557,7 @@ fn graph_db_backend_eval_performance_gate(
             scope,
             full_projection,
         ),
+        hop_cap_promotion: graph_db_backend_eval_hop_cap_promotion_gate(),
     }
 }
 

@@ -1940,6 +1940,40 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .contains("for sample in 1 2 3"),
         "{report}"
     );
+    assert_eq!(
+        report["performance_gate"]["hop_cap_promotion"]["status"],
+        "hold_64_default_until_gate_passes",
+        "{report}"
+    );
+    assert_eq!(
+        report["performance_gate"]["hop_cap_promotion"]["current_default_hops"], 64,
+        "{report}"
+    );
+    assert_eq!(
+        report["performance_gate"]["hop_cap_promotion"]["candidate_hop_tiers"],
+        json!([128, 256, 512]),
+        "{report}"
+    );
+    assert_eq!(
+        report["performance_gate"]["hop_cap_promotion"]["required_workloads"],
+        json!(["real", "full_projection", "synthetic_deep_chain"]),
+        "{report}"
+    );
+    assert!(
+        report["performance_gate"]["hop_cap_promotion"]["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|metric| metric == "full_projection.sqlite.path_max_hops_512.rows"),
+        "{report}"
+    );
+    assert!(
+        report["performance_gate"]["hop_cap_promotion"]["decision_rule"]
+            .as_str()
+            .unwrap()
+            .contains("returning useful path rows"),
+        "{report}"
+    );
     assert!(
         report["performance_gate"]["required_metrics"]
             .as_array()

@@ -35,6 +35,17 @@ pub const BASELINE_BACKEND: &str = "sqlite";
 /// Minimum number of samples per workload before the gate's decision is binding.
 pub const MIN_SAMPLES_PER_WORKLOAD: usize = 3;
 
+/// User-facing graph path default. Higher hop tiers stay benchmark-only until
+/// `evaluate_hop_cap_promotion` returns `Promote`.
+pub const HOP_CAP_CURRENT_DEFAULT: usize = 64;
+
+/// Higher hop tiers that backend-eval records as promotion candidates.
+pub const HOP_CAP_CANDIDATE_TIERS: [usize; 3] = [128, 256, 512];
+
+/// Workloads that must prove higher hop caps before the default can move.
+pub const HOP_CAP_REQUIRED_WORKLOADS: [&str; 3] =
+    ["real", "full_projection", "synthetic_deep_chain"];
+
 /// Fixture metric prefixes for the four required gate workloads, in canonical
 /// fixture order.
 pub const GATE_WORKLOAD_PREFIXES: [&str; 4] = [
@@ -131,6 +142,44 @@ pub struct GateReport {
     pub baseline_backend: String,
     pub min_samples_per_workload: usize,
     pub workload_evaluations: Vec<WorkloadEvaluation>,
+    pub decision: GateDecision,
+    pub diagnostics: Vec<String>,
+}
+
+/// Diagnostic verdict for one workload in the hop-cap promotion gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HopCapWorkloadVerdict {
+    /// The candidate hop tier stayed within the allowed latency band and
+    /// returned useful path rows for this workload.
+    Promotable,
+    /// The candidate tier was present but did not satisfy latency or row
+    /// usefulness requirements.
+    Hold,
+    /// Fewer than `MIN_SAMPLES_PER_WORKLOAD` samples; insufficient evidence.
+    InsufficientSamples,
+    /// No samples carried this workload at all.
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HopCapWorkloadEvaluation {
+    pub workload: String,
+    pub display_name: String,
+    pub sample_count: usize,
+    pub verdict: HopCapWorkloadVerdict,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HopCapGateReport {
+    pub backend: String,
+    pub current_default_hops: usize,
+    pub candidate_hops: usize,
+    pub min_samples_per_workload: usize,
+    pub allowed_regression_percent: f64,
+    pub required_workloads: Vec<String>,
+    pub workload_evaluations: Vec<HopCapWorkloadEvaluation>,
     pub decision: GateDecision,
     pub diagnostics: Vec<String>,
 }
@@ -317,6 +366,240 @@ fn collect_workload_metrics(
         }
     }
     (sample_count, per_metric)
+}
+
+fn path_hop_metric_suffix(hops: usize, leaf: &str) -> String {
+    if hops == HOP_CAP_CURRENT_DEFAULT {
+        format!("path_max_hops.{leaf}")
+    } else {
+        format!("path_max_hops_{hops}.{leaf}")
+    }
+}
+
+fn metric_median_with_min_samples(values: &[f64]) -> Option<f64> {
+    if values.len() < MIN_SAMPLES_PER_WORKLOAD {
+        None
+    } else {
+        median(values)
+    }
+}
+
+/// Evaluate whether a measured higher hop tier can replace the user-facing
+/// `64`-hop default.
+///
+/// The gate is intentionally stricter than merely checking that the raw
+/// metrics exist. It requires repeated SQLite samples on the real,
+/// full-projection, and synthetic deep-chain workloads, keeps the higher tier
+/// within the configured latency-regression budget relative to the 64-hop
+/// baseline, and proves the higher tier returns useful rows. On the synthetic
+/// deep-chain workload, "useful" means the higher cap returns more path rows
+/// than the 64-hop cap.
+pub fn evaluate_hop_cap_promotion(
+    history: &[GateSample],
+    candidate_hops: usize,
+    allowed_regression_percent: f64,
+) -> HopCapGateReport {
+    let mut workload_evaluations = Vec::with_capacity(HOP_CAP_REQUIRED_WORKLOADS.len());
+    let mut diagnostics = Vec::new();
+    let mut any_block = false;
+
+    if candidate_hops <= HOP_CAP_CURRENT_DEFAULT {
+        any_block = true;
+        diagnostics.push(format!(
+            "candidate hop tier {candidate_hops} must be greater than current default {HOP_CAP_CURRENT_DEFAULT}"
+        ));
+    } else if !HOP_CAP_CANDIDATE_TIERS.contains(&candidate_hops) {
+        any_block = true;
+        diagnostics.push(format!(
+            "candidate hop tier {candidate_hops} is not one of the measured promotion tiers {:?}",
+            HOP_CAP_CANDIDATE_TIERS
+        ));
+    }
+
+    let allowed_multiplier = 1.0 + (allowed_regression_percent / 100.0);
+    let baseline_duration_suffix =
+        path_hop_metric_suffix(HOP_CAP_CURRENT_DEFAULT, "duration_micros");
+    let baseline_rows_suffix = path_hop_metric_suffix(HOP_CAP_CURRENT_DEFAULT, "rows");
+    let candidate_duration_suffix = path_hop_metric_suffix(candidate_hops, "duration_micros");
+    let candidate_rows_suffix = path_hop_metric_suffix(candidate_hops, "rows");
+
+    for prefix in HOP_CAP_REQUIRED_WORKLOADS {
+        let display = workload_display_name(prefix).to_string();
+        let (sample_count, per_metric) = collect_workload_metrics(history, prefix);
+        let mut workload_diagnostics = Vec::new();
+
+        if sample_count == 0 {
+            any_block = true;
+            workload_evaluations.push(HopCapWorkloadEvaluation {
+                workload: prefix.to_string(),
+                display_name: display.clone(),
+                sample_count,
+                verdict: HopCapWorkloadVerdict::Missing,
+                diagnostics: vec![format!(
+                    "workload `{display}` has no samples; hop-cap promotion requires {MIN_SAMPLES_PER_WORKLOAD}"
+                )],
+            });
+            diagnostics.push(format!("`{display}`: missing"));
+            continue;
+        }
+        if sample_count < MIN_SAMPLES_PER_WORKLOAD {
+            any_block = true;
+            workload_evaluations.push(HopCapWorkloadEvaluation {
+                workload: prefix.to_string(),
+                display_name: display.clone(),
+                sample_count,
+                verdict: HopCapWorkloadVerdict::InsufficientSamples,
+                diagnostics: vec![format!(
+                    "workload `{display}` has {sample_count} sample(s); hop-cap promotion requires {MIN_SAMPLES_PER_WORKLOAD}"
+                )],
+            });
+            diagnostics.push(format!(
+                "`{display}`: only {sample_count}/{MIN_SAMPLES_PER_WORKLOAD} samples"
+            ));
+            continue;
+        }
+
+        let baseline_duration_values = per_metric
+            .get(&(
+                BASELINE_BACKEND.to_string(),
+                baseline_duration_suffix.clone(),
+            ))
+            .cloned()
+            .unwrap_or_default();
+        let candidate_duration_values = per_metric
+            .get(&(
+                BASELINE_BACKEND.to_string(),
+                candidate_duration_suffix.clone(),
+            ))
+            .cloned()
+            .unwrap_or_default();
+        let baseline_rows_values = per_metric
+            .get(&(BASELINE_BACKEND.to_string(), baseline_rows_suffix.clone()))
+            .cloned()
+            .unwrap_or_default();
+        let candidate_rows_values = per_metric
+            .get(&(BASELINE_BACKEND.to_string(), candidate_rows_suffix.clone()))
+            .cloned()
+            .unwrap_or_default();
+
+        let mut verdict = HopCapWorkloadVerdict::Promotable;
+
+        match (
+            metric_median_with_min_samples(&baseline_duration_values),
+            metric_median_with_min_samples(&candidate_duration_values),
+        ) {
+            (Some(base), Some(candidate)) => {
+                let allowed = base * allowed_multiplier;
+                if candidate <= allowed {
+                    workload_diagnostics.push(format!(
+                        "`{candidate_duration_suffix}` median {candidate:.1}µs ≤ allowed {allowed:.1}µs (64-hop baseline {base:.1}µs)"
+                    ));
+                } else {
+                    verdict = HopCapWorkloadVerdict::Hold;
+                    workload_diagnostics.push(format!(
+                        "`{candidate_duration_suffix}` REGRESSES: median {candidate:.1}µs > allowed {allowed:.1}µs (64-hop baseline {base:.1}µs)"
+                    ));
+                }
+            }
+            (None, Some(_)) => {
+                verdict = HopCapWorkloadVerdict::Hold;
+                workload_diagnostics.push(format!(
+                    "`{baseline_duration_suffix}` has fewer than {MIN_SAMPLES_PER_WORKLOAD} samples"
+                ));
+            }
+            (Some(_), None) => {
+                verdict = HopCapWorkloadVerdict::Hold;
+                workload_diagnostics.push(format!(
+                    "`{candidate_duration_suffix}` has fewer than {MIN_SAMPLES_PER_WORKLOAD} samples"
+                ));
+            }
+            (None, None) => {
+                verdict = HopCapWorkloadVerdict::Hold;
+                workload_diagnostics.push(format!(
+                    "`{baseline_duration_suffix}` and `{candidate_duration_suffix}` have fewer than {MIN_SAMPLES_PER_WORKLOAD} samples"
+                ));
+            }
+        }
+
+        match (
+            metric_median_with_min_samples(&baseline_rows_values),
+            metric_median_with_min_samples(&candidate_rows_values),
+        ) {
+            (Some(base_rows), Some(candidate_rows)) if candidate_rows > 0.0 => {
+                let useful = if prefix == "synthetic_deep_chain" {
+                    candidate_rows > base_rows
+                } else {
+                    candidate_rows >= base_rows
+                };
+                if useful {
+                    workload_diagnostics.push(format!(
+                        "`{candidate_rows_suffix}` median {candidate_rows:.1} row(s) proves useful output against 64-hop baseline {base_rows:.1}"
+                    ));
+                } else {
+                    verdict = HopCapWorkloadVerdict::Hold;
+                    workload_diagnostics.push(format!(
+                        "`{candidate_rows_suffix}` is not useful: median {candidate_rows:.1} row(s) does not exceed required baseline {base_rows:.1}"
+                    ));
+                }
+            }
+            (Some(_), Some(candidate_rows)) => {
+                verdict = HopCapWorkloadVerdict::Hold;
+                workload_diagnostics.push(format!(
+                    "`{candidate_rows_suffix}` is not useful: median {candidate_rows:.1} row(s)"
+                ));
+            }
+            (None, Some(_)) => {
+                verdict = HopCapWorkloadVerdict::Hold;
+                workload_diagnostics.push(format!(
+                    "`{baseline_rows_suffix}` has fewer than {MIN_SAMPLES_PER_WORKLOAD} samples"
+                ));
+            }
+            (Some(_), None) => {
+                verdict = HopCapWorkloadVerdict::Hold;
+                workload_diagnostics.push(format!(
+                    "`{candidate_rows_suffix}` has fewer than {MIN_SAMPLES_PER_WORKLOAD} samples"
+                ));
+            }
+            (None, None) => {
+                verdict = HopCapWorkloadVerdict::Hold;
+                workload_diagnostics.push(format!(
+                    "`{baseline_rows_suffix}` and `{candidate_rows_suffix}` have fewer than {MIN_SAMPLES_PER_WORKLOAD} samples"
+                ));
+            }
+        }
+
+        if verdict != HopCapWorkloadVerdict::Promotable {
+            any_block = true;
+            diagnostics.push(format!("`{display}`: {candidate_hops}-hop tier held"));
+        }
+
+        workload_evaluations.push(HopCapWorkloadEvaluation {
+            workload: prefix.to_string(),
+            display_name: display,
+            sample_count,
+            verdict,
+            diagnostics: workload_diagnostics,
+        });
+    }
+
+    HopCapGateReport {
+        backend: BASELINE_BACKEND.to_string(),
+        current_default_hops: HOP_CAP_CURRENT_DEFAULT,
+        candidate_hops,
+        min_samples_per_workload: MIN_SAMPLES_PER_WORKLOAD,
+        allowed_regression_percent,
+        required_workloads: HOP_CAP_REQUIRED_WORKLOADS
+            .iter()
+            .map(|workload| (*workload).to_string())
+            .collect(),
+        workload_evaluations,
+        decision: if any_block {
+            GateDecision::Block
+        } else {
+            GateDecision::Promote
+        },
+        diagnostics,
+    }
 }
 
 /// Evaluate the promotion gate for a candidate backend against the baseline
@@ -589,7 +872,13 @@ pub const CONTEXT_PACK_DIFF_BUDGET_MICROS: u128 = 350_000;
 mod tests {
     use super::*;
 
-    fn synth_sample(id: &str, workload: &str, sample_idx: usize, sqlite_us: f64, cand_us: f64) -> Value {
+    fn synth_sample(
+        id: &str,
+        workload: &str,
+        sample_idx: usize,
+        sqlite_us: f64,
+        cand_us: f64,
+    ) -> Value {
         let mut metrics = serde_json::Map::new();
         metrics.insert(
             format!("{workload}.sqlite.refresh.duration_micros"),
@@ -608,7 +897,10 @@ mod tests {
             Value::from(cand_us * 2.0),
         );
         let mut run = serde_json::Map::new();
-        run.insert("label".into(), Value::from(format!("synth {workload} sample {sample_idx}")));
+        run.insert(
+            "label".into(),
+            Value::from(format!("synth {workload} sample {sample_idx}")),
+        );
         run.insert("id".into(), Value::from(id.to_string()));
         run.insert("timestamp".into(), Value::from("2026-05-24T00:00:00Z"));
         run.insert("metrics".into(), Value::Object(metrics));
@@ -635,16 +927,18 @@ mod tests {
         let s = &samples[0];
         assert_eq!(s.workload_prefixes, vec!["full_projection".to_string()]);
         assert_eq!(s.sample_index, Some(2));
-        assert!(s
-            .backends_by_workload
-            .get("full_projection")
-            .unwrap()
-            .contains(&"sqlite".to_string()));
-        assert!(s
-            .backends_by_workload
-            .get("full_projection")
-            .unwrap()
-            .contains(&"falkordb".to_string()));
+        assert!(
+            s.backends_by_workload
+                .get("full_projection")
+                .unwrap()
+                .contains(&"sqlite".to_string())
+        );
+        assert!(
+            s.backends_by_workload
+                .get("full_projection")
+                .unwrap()
+                .contains(&"falkordb".to_string())
+        );
     }
 
     fn full_history_three_samples_each(cand_us: f64) -> String {
@@ -658,16 +952,85 @@ mod tests {
         build_history(runs)
     }
 
+    fn hop_sample(
+        id: &str,
+        workload: &str,
+        sample_idx: usize,
+        base_us: f64,
+        candidate_us: f64,
+        base_rows: f64,
+        candidate_rows: f64,
+    ) -> Value {
+        let mut metrics = serde_json::Map::new();
+        metrics.insert(
+            format!("{workload}.sqlite.path_max_hops.duration_micros"),
+            Value::from(base_us),
+        );
+        metrics.insert(
+            format!("{workload}.sqlite.path_max_hops.rows"),
+            Value::from(base_rows),
+        );
+        metrics.insert(
+            format!("{workload}.sqlite.path_max_hops_512.duration_micros"),
+            Value::from(candidate_us),
+        );
+        metrics.insert(
+            format!("{workload}.sqlite.path_max_hops_512.rows"),
+            Value::from(candidate_rows),
+        );
+        let mut run = serde_json::Map::new();
+        run.insert(
+            "label".into(),
+            Value::from(format!("hop {workload} sample {sample_idx}")),
+        );
+        run.insert("id".into(), Value::from(id.to_string()));
+        run.insert("timestamp".into(), Value::from("2026-05-26T00:00:00Z"));
+        run.insert("metrics".into(), Value::Object(metrics));
+        Value::Object(run)
+    }
+
+    fn hop_history(
+        candidate_us: f64,
+        deep_candidate_rows: f64,
+        include_full_projection: bool,
+    ) -> String {
+        let mut runs = Vec::new();
+        for workload in HOP_CAP_REQUIRED_WORKLOADS {
+            if workload == "full_projection" && !include_full_projection {
+                continue;
+            }
+            for i in 1..=3 {
+                let (base_rows, candidate_rows) = if workload == "synthetic_deep_chain" {
+                    (65.0, deep_candidate_rows)
+                } else {
+                    (2.0, 2.0)
+                };
+                runs.push(hop_sample(
+                    &format!("agent-loop-{workload}-hop-2026-05-26-sample-{i}"),
+                    workload,
+                    i,
+                    1000.0,
+                    candidate_us,
+                    base_rows,
+                    candidate_rows,
+                ));
+            }
+        }
+        build_history(runs)
+    }
+
     #[test]
     fn evaluate_promotion_blocks_when_candidate_does_not_beat_baseline() {
         let raw = full_history_three_samples_each(2000.0); // candidate slower than sqlite
         let history = parse_history(&raw).unwrap();
         let report = evaluate_promotion(&history, "falkordb", 0.0);
         assert_eq!(report.decision, GateDecision::Block);
-        assert!(report
-            .workload_evaluations
-            .iter()
-            .all(|w| matches!(w.verdict, WorkloadVerdict::Regresses)));
+        assert!(
+            report
+                .workload_evaluations
+                .iter()
+                .all(|w| matches!(w.verdict, WorkloadVerdict::Regresses))
+        );
     }
 
     #[test]
@@ -681,10 +1044,12 @@ mod tests {
             "diagnostics: {:?}",
             report.diagnostics
         );
-        assert!(report
-            .workload_evaluations
-            .iter()
-            .all(|w| matches!(w.verdict, WorkloadVerdict::Beats)));
+        assert!(
+            report
+                .workload_evaluations
+                .iter()
+                .all(|w| matches!(w.verdict, WorkloadVerdict::Beats))
+        );
     }
 
     #[test]
@@ -699,13 +1064,7 @@ mod tests {
         }
         for i in 1..=2 {
             let id = format!("agent-loop-synthetic_deep_chain-2026-05-24-sample-{i}");
-            runs.push(synth_sample(
-                &id,
-                "synthetic_deep_chain",
-                i,
-                1000.0,
-                100.0,
-            ));
+            runs.push(synth_sample(&id, "synthetic_deep_chain", i, 1000.0, 100.0));
         }
         let raw = build_history(runs);
         let history = parse_history(&raw).unwrap();
@@ -791,6 +1150,92 @@ mod tests {
         assert_eq!(regressing, GATE_WORKLOAD_PREFIXES.len());
     }
 
+    #[test]
+    fn hop_cap_gate_promotes_when_all_required_workloads_fit_budget() {
+        let raw = hop_history(1050.0, 513.0, true);
+        let history = parse_history(&raw).unwrap();
+        let report = evaluate_hop_cap_promotion(&history, 512, 10.0);
+        assert_eq!(report.decision, GateDecision::Promote, "{report:?}");
+        assert_eq!(report.current_default_hops, 64);
+        assert_eq!(report.candidate_hops, 512);
+        assert_eq!(
+            report.required_workloads,
+            vec![
+                "real".to_string(),
+                "full_projection".to_string(),
+                "synthetic_deep_chain".to_string()
+            ]
+        );
+        assert!(
+            report
+                .workload_evaluations
+                .iter()
+                .all(|workload| workload.verdict == HopCapWorkloadVerdict::Promotable)
+        );
+    }
+
+    #[test]
+    fn hop_cap_gate_blocks_when_full_projection_is_missing() {
+        let raw = hop_history(900.0, 513.0, false);
+        let history = parse_history(&raw).unwrap();
+        let report = evaluate_hop_cap_promotion(&history, 512, 10.0);
+        assert_eq!(report.decision, GateDecision::Block);
+        let full_projection = report
+            .workload_evaluations
+            .iter()
+            .find(|workload| workload.workload == "full_projection")
+            .unwrap();
+        assert_eq!(full_projection.verdict, HopCapWorkloadVerdict::Missing);
+    }
+
+    #[test]
+    fn hop_cap_gate_holds_when_candidate_tier_regresses() {
+        let raw = hop_history(1500.0, 513.0, true);
+        let history = parse_history(&raw).unwrap();
+        let report = evaluate_hop_cap_promotion(&history, 512, 10.0);
+        assert_eq!(report.decision, GateDecision::Block);
+        assert!(report.workload_evaluations.iter().any(|workload| {
+            workload
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("REGRESSES"))
+        }));
+    }
+
+    #[test]
+    fn hop_cap_gate_blocks_unmeasured_candidate_tier() {
+        let raw = hop_history(900.0, 513.0, true);
+        let history = parse_history(&raw).unwrap();
+        let report = evaluate_hop_cap_promotion(&history, 96, 10.0);
+        assert_eq!(report.decision, GateDecision::Block);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("not one of the measured promotion tiers"))
+        );
+    }
+
+    #[test]
+    fn hop_cap_gate_requires_deep_chain_rows_to_expand() {
+        let raw = hop_history(900.0, 65.0, true);
+        let history = parse_history(&raw).unwrap();
+        let report = evaluate_hop_cap_promotion(&history, 512, 10.0);
+        assert_eq!(report.decision, GateDecision::Block);
+        let deep_chain = report
+            .workload_evaluations
+            .iter()
+            .find(|workload| workload.workload == "synthetic_deep_chain")
+            .unwrap();
+        assert_eq!(deep_chain.verdict, HopCapWorkloadVerdict::Hold);
+        assert!(
+            deep_chain
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("not useful"))
+        );
+    }
+
     // ---- #gdbprephot: preparation hotspot regression gate ----
 
     #[test]
@@ -801,7 +1246,11 @@ mod tests {
             &[60_000, 80_000, 90_000],
             CONTEXT_PACK_DIFF_BUDGET_MICROS,
         );
-        assert_eq!(report.verdict, PreparationHotspotVerdict::Within, "{report:?}");
+        assert_eq!(
+            report.verdict,
+            PreparationHotspotVerdict::Within,
+            "{report:?}"
+        );
         assert_eq!(report.observed_median_micros, Some(80_000));
         assert_eq!(report.sample_count, 3);
         assert_eq!(report.budget_micros, CONTEXT_PACK_DIFF_BUDGET_MICROS);

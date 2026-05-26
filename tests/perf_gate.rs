@@ -9,8 +9,9 @@
 mod perf_gate;
 
 use perf_gate::{
-    CONTEXT_PACK_DIFF_BUDGET_MICROS, GateDecision, GateSample, GATE_WORKLOAD_PREFIXES,
-    MIN_HOTSPOT_SAMPLES, MIN_SAMPLES_PER_WORKLOAD, PreparationHotspotVerdict, WorkloadVerdict,
+    CONTEXT_PACK_DIFF_BUDGET_MICROS, GATE_WORKLOAD_PREFIXES, GateDecision, GateSample,
+    HOP_CAP_CURRENT_DEFAULT, HopCapWorkloadVerdict, MIN_HOTSPOT_SAMPLES, MIN_SAMPLES_PER_WORKLOAD,
+    PreparationHotspotVerdict, WorkloadVerdict, evaluate_hop_cap_promotion,
     evaluate_preparation_hotspot, evaluate_promotion, parse_history, workload_display_name,
 };
 use std::collections::BTreeMap;
@@ -214,6 +215,62 @@ fn preparation_hotspot_gate_refuses_to_decide_below_three_samples() {
 }
 
 // ---------------------------------------------------------------------------
+// #ghop: hop-cap promotion gate
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hop_cap_gate_blocks_current_fixture_for_512_default_promotion() {
+    let samples = load_fixture();
+    let report = evaluate_hop_cap_promotion(&samples, 512, 10.0);
+    assert_eq!(report.current_default_hops, HOP_CAP_CURRENT_DEFAULT);
+    assert_eq!(report.candidate_hops, 512);
+    assert_eq!(
+        report.decision,
+        GateDecision::Block,
+        "current history should not promote 512-hop defaults without fresh full-projection/deep-chain proof: {report:?}"
+    );
+}
+
+#[test]
+fn hop_cap_gate_promotes_synthetic_history_when_all_workloads_fit() {
+    let samples = build_synthetic_hop_history(1050.0, 513.0, true);
+    let report = evaluate_hop_cap_promotion(&samples, 512, 10.0);
+    assert_eq!(report.decision, GateDecision::Promote, "{report:?}");
+    assert!(
+        report
+            .workload_evaluations
+            .iter()
+            .all(|workload| workload.verdict == HopCapWorkloadVerdict::Promotable)
+    );
+}
+
+#[test]
+fn hop_cap_gate_requires_full_projection_samples() {
+    let samples = build_synthetic_hop_history(900.0, 513.0, false);
+    let report = evaluate_hop_cap_promotion(&samples, 512, 10.0);
+    assert_eq!(report.decision, GateDecision::Block);
+    let full_projection = report
+        .workload_evaluations
+        .iter()
+        .find(|workload| workload.workload == "full_projection")
+        .expect("full-projection workload evaluation present");
+    assert_eq!(full_projection.verdict, HopCapWorkloadVerdict::Missing);
+}
+
+#[test]
+fn hop_cap_gate_requires_deep_chain_rows_to_expand() {
+    let samples = build_synthetic_hop_history(900.0, 65.0, true);
+    let report = evaluate_hop_cap_promotion(&samples, 512, 10.0);
+    assert_eq!(report.decision, GateDecision::Block);
+    let deep_chain = report
+        .workload_evaluations
+        .iter()
+        .find(|workload| workload.workload == "synthetic_deep_chain")
+        .expect("deep-chain workload evaluation present");
+    assert_eq!(deep_chain.verdict, HopCapWorkloadVerdict::Hold);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -257,4 +314,56 @@ fn build_synthetic_history(
     root.insert("runs".into(), serde_json::Value::Array(runs));
     let raw = serde_json::Value::Object(root).to_string();
     parse_history(&raw).expect("synthetic history parses")
+}
+
+fn build_synthetic_hop_history(
+    candidate_us: f64,
+    deep_candidate_rows: f64,
+    include_full_projection: bool,
+) -> Vec<GateSample> {
+    let mut runs = Vec::new();
+    for prefix in ["real", "full_projection", "synthetic_deep_chain"] {
+        if prefix == "full_projection" && !include_full_projection {
+            continue;
+        }
+        for i in 1..=3 {
+            let mut metrics = serde_json::Map::new();
+            let (base_rows, candidate_rows) = if prefix == "synthetic_deep_chain" {
+                (65.0, deep_candidate_rows)
+            } else {
+                (2.0, 2.0)
+            };
+            metrics.insert(
+                format!("{prefix}.sqlite.path_max_hops.duration_micros"),
+                1000.0.into(),
+            );
+            metrics.insert(
+                format!("{prefix}.sqlite.path_max_hops.rows"),
+                base_rows.into(),
+            );
+            metrics.insert(
+                format!("{prefix}.sqlite.path_max_hops_512.duration_micros"),
+                candidate_us.into(),
+            );
+            metrics.insert(
+                format!("{prefix}.sqlite.path_max_hops_512.rows"),
+                candidate_rows.into(),
+            );
+            let mut run = serde_json::Map::new();
+            run.insert(
+                "label".into(),
+                format!("graph-db backend-eval {prefix} hop sample {i}").into(),
+            );
+            run.insert(
+                "id".into(),
+                format!("synth-{prefix}-hop-2026-05-26-sample-{i}").into(),
+            );
+            run.insert("metrics".into(), serde_json::Value::Object(metrics));
+            runs.push(serde_json::Value::Object(run));
+        }
+    }
+    let mut root = serde_json::Map::new();
+    root.insert("runs".into(), serde_json::Value::Array(runs));
+    let raw = serde_json::Value::Object(root).to_string();
+    parse_history(&raw).expect("synthetic hop history parses")
 }

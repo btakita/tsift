@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **`#ghop`**: keep the user-facing graph path default at 64 hops until a dedicated hop-cap promotion gate passes. `perf_gate::evaluate_hop_cap_promotion` now requires repeated SQLite samples for `real`, `full_projection`, and `synthetic_deep_chain` workloads before any 128/256/512-hop tier can become the default; each candidate tier must stay within the latency regression budget against `path_max_hops.duration_micros` and return useful row counts, with deep-chain samples proving extra rows beyond the 64-hop median. `graph-db backend-eval` now emits the promotion contract in `performance_gate.hop_cap_promotion`. Tests cover fixture blocking, missing full-projection proof, latency regressions, and deep-chain row usefulness.
+
 ## 0.1.62
 
 - **`#convexsnapshotmetascale` / `#gdbvacproof`**: `snapshotMeta` no longer iterates the full `nodes` and `edges` tables to compute `nodeCount` / `edgeCount`. The Convex examples now return cheap metadata (`indexes`, `pageSize`) plus an indexed `projectionHash` lookup for `projectionMetaId`; the Rust HTTP transport sends that id and, when the remote projection hash matches the local projection hash, treats freshness as current without walking every row page. Missing or mismatched hashes still fall back to the paginated row diff. Tests: `convex_sync_remote_snapshot_uses_projection_hash_shortcut_when_current` and `convex_sync_remote_snapshot_uses_paginated_transport_against_mock_backend`.
