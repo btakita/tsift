@@ -1,7 +1,7 @@
 use crate::lang::{Lang, Symbol};
 use crate::substrate::{GraphEdge as SubstrateEdge, GraphNode, GraphProjection, GraphProvenance};
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
@@ -577,7 +577,7 @@ pub fn project_routes(
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommunityMember {
     pub name: String,
     /// Stable `mem:` handle from the tagpath index when a fresh adapter is
@@ -595,14 +595,14 @@ impl CommunityMember {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Community {
     pub id: usize,
     pub members: Vec<CommunityMember>,
     pub modularity_contribution: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommunityResult {
     pub communities: Vec<Community>,
     pub modularity: f64,

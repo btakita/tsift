@@ -1760,11 +1760,7 @@ fn main() -> Result<()> {
             terse,
             schema,
         ),
-        Some(Commands::AuditTagpath {
-            path,
-            scope,
-            json,
-        }) => cmd_audit_tagpath(
+        Some(Commands::AuditTagpath { path, scope, json }) => cmd_audit_tagpath(
             &path,
             scope.as_deref(),
             json || terse || schema || envelope,
@@ -3049,6 +3045,12 @@ fn terse_key(key: &str) -> &str {
         "community_count" => "cc",
         "communities" => "cms",
         "community" => "cm",
+        "community_diagnostics" => "cd",
+        "cache_hit" => "cah",
+        "tagpath_state" => "tps",
+        "tagpath_stale_reason" => "tsr",
+        "annotated_community_count" => "acc",
+        "annotated_member_count" => "amc",
         "symbol" => "s",
         "symbols" => "sy",
         "definitions" => "df",
@@ -3285,6 +3287,12 @@ const TERSE_PAIRS: &[(&str, &str)] = &[
     ("community_count", "cc"),
     ("communities", "cms"),
     ("community", "cm"),
+    ("community_diagnostics", "cd"),
+    ("cache_hit", "cah"),
+    ("tagpath_state", "tps"),
+    ("tagpath_stale_reason", "tsr"),
+    ("annotated_community_count", "acc"),
+    ("annotated_member_count", "amc"),
     ("symbol", "s"),
     ("symbols", "sy"),
     ("definitions", "df"),
@@ -3430,6 +3438,248 @@ pub struct TagpathAnnotationDiagnostic {
     pub loaded: bool,
 }
 
+const COMMUNITY_DETECTION_CACHE_VERSION: &str = "community-detection-cache-v1";
+
+static COMMUNITY_DETECTION_CACHE: OnceLock<Mutex<BTreeMap<String, graph::CommunityResult>>> =
+    OnceLock::new();
+
+#[derive(Debug, Clone, Serialize)]
+struct CommunityDetectionDiagnostics {
+    cache_hit: bool,
+    edge_count: usize,
+    iterations: usize,
+    tagpath_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tagpath_stale_reason: Option<String>,
+    annotated_community_count: usize,
+    annotated_member_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CommunityDetectionReport {
+    result: graph::CommunityResult,
+    diagnostics: CommunityDetectionDiagnostics,
+}
+
+#[derive(Debug, Clone)]
+struct CommunityTagpathCachePart {
+    state: String,
+    reason: Option<String>,
+    key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CommunityDetectionCacheEntry {
+    version: String,
+    key: String,
+    result: graph::CommunityResult,
+}
+
+fn community_detection_cache() -> &'static Mutex<BTreeMap<String, graph::CommunityResult>> {
+    COMMUNITY_DETECTION_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn community_tagpath_cache_part_for_loaded(
+    adapter: &tagpath_adapter::TagpathAdapter,
+) -> CommunityTagpathCachePart {
+    let index_path = tagpath::index::index_path(&adapter.project_root);
+    let index_hash = fs::read(&index_path)
+        .map(|bytes| hash_bytes_hex(&bytes))
+        .unwrap_or_else(|err| hash_bytes_hex(format!("fresh-index-unreadable:{err:#}").as_bytes()));
+    CommunityTagpathCachePart {
+        state: "fresh".to_string(),
+        reason: None,
+        key: format!("fresh:{index_hash}"),
+    }
+}
+
+fn community_tagpath_cache_part(
+    root: &std::path::Path,
+    opts: &TagpathSearchOpts,
+) -> Result<CommunityTagpathCachePart> {
+    if opts.no_tagpath {
+        return Ok(CommunityTagpathCachePart {
+            state: "disabled".to_string(),
+            reason: None,
+            key: "disabled".to_string(),
+        });
+    }
+    match tagpath_adapter::try_load(root) {
+        tagpath_adapter::LoadResult::Loaded(adapter) => {
+            Ok(community_tagpath_cache_part_for_loaded(&adapter))
+        }
+        tagpath_adapter::LoadResult::Stale { reason, .. } => {
+            if opts.strict {
+                anyhow::bail!(
+                    "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
+                );
+            }
+            Ok(CommunityTagpathCachePart {
+                state: "stale".to_string(),
+                key: format!("stale:{reason}"),
+                reason: Some(reason),
+            })
+        }
+        tagpath_adapter::LoadResult::Missing => Ok(CommunityTagpathCachePart {
+            state: "missing".to_string(),
+            reason: None,
+            key: "missing".to_string(),
+        }),
+    }
+}
+
+fn community_graph_watermark(db: &index::IndexDb) -> Result<String> {
+    let source_snapshot = db.source_snapshot_parts()?;
+    let edge_rows = db.edge_count()?;
+    let symbol_rows = db.symbol_count()?;
+    content_hash(&serde_json::json!({
+        "source_snapshot": source_snapshot,
+        "edge_rows": edge_rows,
+        "symbol_rows": symbol_rows,
+    }))
+}
+
+fn community_detection_cache_key(
+    root: &std::path::Path,
+    scope: Option<&str>,
+    graph_watermark: &str,
+    tagpath: &CommunityTagpathCachePart,
+) -> Result<String> {
+    content_hash(&serde_json::json!({
+        "version": COMMUNITY_DETECTION_CACHE_VERSION,
+        "root": root.display().to_string(),
+        "scope": scope.unwrap_or("root"),
+        "graph_watermark": graph_watermark,
+        "tagpath": tagpath.key,
+    }))
+}
+
+fn community_detection_cache_path(
+    root: &std::path::Path,
+    scope: Option<&str>,
+    key: &str,
+) -> PathBuf {
+    root.join(".tsift/community-cache")
+        .join(scope.unwrap_or("root"))
+        .join(format!("{key}.json"))
+}
+
+fn read_community_detection_cache(
+    root: &std::path::Path,
+    scope: Option<&str>,
+    key: &str,
+) -> Option<graph::CommunityResult> {
+    let path = community_detection_cache_path(root, scope, key);
+    let bytes = fs::read(path).ok()?;
+    let entry: CommunityDetectionCacheEntry = serde_json::from_slice(&bytes).ok()?;
+    if entry.version == COMMUNITY_DETECTION_CACHE_VERSION && entry.key == key {
+        Some(entry.result)
+    } else {
+        None
+    }
+}
+
+fn write_community_detection_cache(
+    root: &std::path::Path,
+    scope: Option<&str>,
+    key: &str,
+    result: &graph::CommunityResult,
+) {
+    let path = community_detection_cache_path(root, scope, key);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let entry = CommunityDetectionCacheEntry {
+        version: COMMUNITY_DETECTION_CACHE_VERSION.to_string(),
+        key: key.to_string(),
+        result: result.clone(),
+    };
+    if let Ok(bytes) = serde_json::to_vec(&entry) {
+        let _ = fs::write(path, bytes);
+    }
+}
+
+fn community_detection_diagnostics(
+    cache_hit: bool,
+    result: &graph::CommunityResult,
+    tagpath: &CommunityTagpathCachePart,
+) -> CommunityDetectionDiagnostics {
+    CommunityDetectionDiagnostics {
+        cache_hit,
+        edge_count: result.edge_count,
+        iterations: result.iterations,
+        tagpath_state: tagpath.state.clone(),
+        tagpath_stale_reason: tagpath.reason.clone(),
+        annotated_community_count: 0,
+        annotated_member_count: 0,
+    }
+}
+
+fn update_community_annotation_diagnostics(
+    diagnostics: &mut CommunityDetectionDiagnostics,
+    communities: &[graph::Community],
+) {
+    diagnostics.annotated_community_count = communities
+        .iter()
+        .filter(|community| {
+            community
+                .members
+                .iter()
+                .any(|member| member.tagpath_handle.is_some())
+        })
+        .count();
+    diagnostics.annotated_member_count = communities
+        .iter()
+        .flat_map(|community| community.members.iter())
+        .filter(|member| member.tagpath_handle.is_some())
+        .count();
+}
+
+fn detect_communities_cached(
+    db: &index::IndexDb,
+    root: &std::path::Path,
+    scope: Option<&str>,
+    tagpath: &CommunityTagpathCachePart,
+) -> Result<CommunityDetectionReport> {
+    let graph_watermark = community_graph_watermark(db)?;
+    let cache_key = community_detection_cache_key(root, scope, &graph_watermark, tagpath)?;
+
+    if let Some(result) = community_detection_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+    {
+        return Ok(CommunityDetectionReport {
+            diagnostics: community_detection_diagnostics(true, &result, tagpath),
+            result,
+        });
+    }
+
+    if let Some(result) = read_community_detection_cache(root, scope, &cache_key) {
+        if let Ok(mut cache) = community_detection_cache().lock() {
+            cache.insert(cache_key.clone(), result.clone());
+        }
+        return Ok(CommunityDetectionReport {
+            diagnostics: community_detection_diagnostics(true, &result, tagpath),
+            result,
+        });
+    }
+
+    let edges = db.all_edges()?;
+    let result = graph::detect_communities(&edges);
+    write_community_detection_cache(root, scope, &cache_key, &result);
+    if let Ok(mut cache) = community_detection_cache().lock() {
+        cache.insert(cache_key, result.clone());
+    }
+    Ok(CommunityDetectionReport {
+        diagnostics: community_detection_diagnostics(false, &result, tagpath),
+        result,
+    })
+}
+
 /// Annotate symbol hits in-place with `tagpath_handle` when a fresh tagpath
 /// index is present at `root`. Returns a diagnostic describing whether the
 /// adapter loaded, missed, or fell back due to staleness.
@@ -3529,14 +3779,15 @@ fn tagpath_handle_candidates_for_symbol_rows(
 fn file_communities_from_callers(
     db: &index::IndexDb,
     root: &std::path::Path,
+    scope: Option<&str>,
+    tagpath: &CommunityTagpathCachePart,
 ) -> Result<std::collections::HashMap<String, std::collections::HashSet<usize>>> {
-    let edges = db.all_edges()?;
-    if edges.is_empty() {
+    let community_report = detect_communities_cached(db, root, scope, tagpath)?;
+    if community_report.result.communities.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
-    let communities = graph::detect_communities(&edges);
     let mut community_by_symbol = std::collections::HashMap::new();
-    for community in communities.communities {
+    for community in community_report.result.communities {
         for member in community.members {
             community_by_symbol.insert(member.name, community.id);
         }
@@ -3684,6 +3935,7 @@ pub fn annotate_stored_edges_with_tagpath(
     edges: &mut [index::StoredEdge],
     db: &index::IndexDb,
     root: &std::path::Path,
+    scope: Option<&str>,
     side: EdgeSide,
     opts: &TagpathSearchOpts,
 ) -> Result<TagpathAnnotationDiagnostic> {
@@ -3700,16 +3952,16 @@ pub fn annotate_stored_edges_with_tagpath(
                         } else {
                             root.join(&edge.caller_file)
                         };
-                        if let Some(handle) =
-                            adapter.handle_for_member(&abs, &edge.caller_name)
-                        {
+                        if let Some(handle) = adapter.handle_for_member(&abs, &edge.caller_name) {
                             edge.tagpath_handle = Some(handle);
                         }
                     }
                 }
                 EdgeSide::Callee => {
+                    let tagpath = community_tagpath_cache_part_for_loaded(&adapter);
                     let communities_by_file =
-                        file_communities_from_callers(db, root).unwrap_or_default();
+                        file_communities_from_callers(db, root, scope, &tagpath)
+                            .unwrap_or_default();
                     for edge in edges.iter_mut() {
                         if let Some(handle) = resolve_tagpath_handle_for_callee_edge(
                             edge,
@@ -4925,8 +5177,8 @@ fn cmd_graph(
     // mutably borrows these locals (the immutable borrow used by the JSON
     // emit sites would otherwise conflict).
     let tagpath_state = std::cell::RefCell::new((
-        false,            // emitted to stderr yet?
-        false,            // any diag.stale=true?
+        false,                  // emitted to stderr yet?
+        false,                  // any diag.stale=true?
         Option::<String>::None, // first stale reason
     ));
     let maybe_emit_stale_diagnostic = |diag: &TagpathAnnotationDiagnostic| {
@@ -4952,6 +5204,7 @@ fn cmd_graph(
             &mut edges,
             &db,
             &root,
+            scope,
             EdgeSide::Caller,
             &tagpath_opts,
         )?;
@@ -5034,6 +5287,7 @@ fn cmd_graph(
             &mut edges,
             &db,
             &root,
+            scope,
             EdgeSide::Callee,
             &tagpath_opts,
         )?;
@@ -5116,6 +5370,7 @@ fn cmd_graph(
             &mut callers_edges,
             &db,
             &root,
+            scope,
             EdgeSide::Caller,
             &tagpath_opts,
         )?;
@@ -5123,6 +5378,7 @@ fn cmd_graph(
             &mut callees_edges,
             &db,
             &root,
+            scope,
             EdgeSide::Callee,
             &tagpath_opts,
         )?;
@@ -5181,16 +5437,31 @@ fn cmd_communities(
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     let db = open_index_db(path, scope)?;
-    let edges = db.all_edges()?;
-    let mut result = graph::detect_communities(&edges);
+    let tagpath_part = community_tagpath_cache_part(&root, &tagpath_opts)?;
+    let CommunityDetectionReport {
+        result,
+        mut diagnostics,
+    } = detect_communities_cached(&db, &root, scope, &tagpath_part)?;
     let mut tagpath_stale = false;
     let mut tagpath_stale_reason: Option<String> = None;
-    if let Some(diag) = annotate_communities_with_tagpath(
-        &mut result.communities,
-        &db,
-        &root,
-        &tagpath_opts,
-    )? {
+
+    let filtered: Vec<graph::Community> = result
+        .communities
+        .iter()
+        .filter(|c| c.members.len() >= min_size)
+        .cloned()
+        .collect();
+
+    let total = filtered.len();
+    let truncated = limit > 0 && total > limit;
+    let mut display: Vec<graph::Community> = if truncated {
+        filtered[..limit].to_vec()
+    } else {
+        filtered
+    };
+
+    if let Some(diag) = annotate_communities_with_tagpath(&mut display, &db, &root, &tagpath_opts)?
+    {
         if diag.stale && !tagpath_opts.no_tagpath {
             eprintln!(
                 "tagpath_index_stale: true (reason={}); falling back to live extraction",
@@ -5202,20 +5473,7 @@ fn cmd_communities(
             tagpath_stale_reason = diag.reason;
         }
     }
-
-    let filtered: Vec<&graph::Community> = result
-        .communities
-        .iter()
-        .filter(|c| c.members.len() >= min_size)
-        .collect();
-
-    let total = filtered.len();
-    let truncated = limit > 0 && total > limit;
-    let display: Vec<&graph::Community> = if truncated {
-        filtered[..limit].to_vec()
-    } else {
-        filtered
-    };
+    update_community_annotation_diagnostics(&mut diagnostics, &display);
 
     if json_output {
         let mut out = serde_json::json!({
@@ -5224,8 +5482,9 @@ fn cmd_communities(
             "node_count": result.node_count,
             "edge_count": result.edge_count,
             "community_count": total,
-            "communities": display,
+            "communities": &display,
             "truncated": truncated,
+            "community_diagnostics": diagnostics,
         });
         inject_tagpath_stale_into_json(
             &mut out,
@@ -6800,8 +7059,7 @@ impl ConvexHttpTransport {
             ));
         }
 
-        let mut nodes: Vec<ConvexNodeRow> =
-            Vec::with_capacity(meta.node_count.unwrap_or_default());
+        let mut nodes: Vec<ConvexNodeRow> = Vec::with_capacity(meta.node_count.unwrap_or_default());
         let mut node_cursor: Option<String> = None;
         loop {
             let response = self.post(&ConvexTransportRequest {
@@ -6820,8 +7078,8 @@ impl ConvexHttpTransport {
                 .page
                 .context("Convex snapshot_nodes_page response did not include page")?;
             for raw in page.rows {
-                let row: ConvexNodeRow = serde_json::from_value(raw)
-                    .context("decoding Convex snapshot node row")?;
+                let row: ConvexNodeRow =
+                    serde_json::from_value(raw).context("decoding Convex snapshot node row")?;
                 nodes.push(row);
             }
             match page.next_cursor {
@@ -6830,8 +7088,7 @@ impl ConvexHttpTransport {
             }
         }
 
-        let mut edges: Vec<ConvexEdgeRow> =
-            Vec::with_capacity(meta.edge_count.unwrap_or_default());
+        let mut edges: Vec<ConvexEdgeRow> = Vec::with_capacity(meta.edge_count.unwrap_or_default());
         let mut edge_cursor: Option<String> = None;
         loop {
             let response = self.post(&ConvexTransportRequest {
@@ -6850,8 +7107,8 @@ impl ConvexHttpTransport {
                 .page
                 .context("Convex snapshot_edges_page response did not include page")?;
             for raw in page.rows {
-                let row: ConvexEdgeRow = serde_json::from_value(raw)
-                    .context("decoding Convex snapshot edge row")?;
+                let row: ConvexEdgeRow =
+                    serde_json::from_value(raw).context("decoding Convex snapshot edge row")?;
                 edges.push(row);
             }
             match page.next_cursor {
@@ -16266,6 +16523,7 @@ fn cmd_explain_with_budget(
         &mut callers,
         &db,
         &root,
+        scope,
         EdgeSide::Caller,
         &tagpath_opts,
     )?;
@@ -16273,6 +16531,7 @@ fn cmd_explain_with_budget(
         &mut callees,
         &db,
         &root,
+        scope,
         EdgeSide::Callee,
         &tagpath_opts,
     )?;
@@ -16304,37 +16563,38 @@ fn cmd_explain_with_budget(
         callees.truncate(limit);
     }
 
-    let edges = db.all_edges()?;
-    let mut comm_result = graph::detect_communities(&edges);
-    // Annotate community members across all communities so the focused
-    // explain response and any future per-community access see the same
-    // `tagpath_handle` data.
-    if let Some(comm_diag) = annotate_communities_with_tagpath(
-        &mut comm_result.communities,
-        &db,
-        &root,
-        &tagpath_opts,
-    )? {
-        if comm_diag.stale && !tagpath_opts.no_tagpath && !tagpath_stale {
-            eprintln!(
-                "tagpath_index_stale: true (reason={}); falling back to live extraction",
-                comm_diag.reason.as_deref().unwrap_or("unknown"),
-            );
-        }
-        if comm_diag.stale {
-            tagpath_stale = true;
-            if tagpath_stale_reason.is_none() {
-                tagpath_stale_reason = comm_diag.reason;
-            }
-        }
-    }
-    let community = comm_result
+    let tagpath_part = community_tagpath_cache_part(&root, &tagpath_opts)?;
+    let CommunityDetectionReport {
+        result: comm_result,
+        diagnostics: mut community_diagnostics,
+    } = detect_communities_cached(&db, &root, scope, &tagpath_part)?;
+    let mut focused_community = comm_result
         .communities
         .iter()
-        .find(|c| c.members.iter().any(|m| m.name == symbol));
+        .find(|c| c.members.iter().any(|m| m.name == symbol))
+        .cloned();
+    if let Some(community) = focused_community.as_mut() {
+        let community_slice = std::slice::from_mut(community);
+        if let Some(comm_diag) =
+            annotate_communities_with_tagpath(community_slice, &db, &root, &tagpath_opts)?
+        {
+            if comm_diag.stale && !tagpath_opts.no_tagpath && !tagpath_stale {
+                eprintln!(
+                    "tagpath_index_stale: true (reason={}); falling back to live extraction",
+                    comm_diag.reason.as_deref().unwrap_or("unknown"),
+                );
+            }
+            if comm_diag.stale {
+                tagpath_stale = true;
+                if tagpath_stale_reason.is_none() {
+                    tagpath_stale_reason = comm_diag.reason;
+                }
+            }
+        }
+        update_community_annotation_diagnostics(&mut community_diagnostics, community_slice);
+    }
 
-    let combined_stale =
-        tagpath_stale && !tagpath_opts.no_tagpath;
+    let combined_stale = tagpath_stale && !tagpath_opts.no_tagpath;
     if budget.is_active() {
         let report = build_explain_budget_report(
             symbol,
@@ -16346,11 +16606,17 @@ fn cmd_explain_with_budget(
             &callees,
             callees_total,
             callees_truncated,
-            community,
+            focused_community.as_ref(),
             budget,
         );
         if format.json_output {
             let mut value = serde_json::to_value(&report)?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "community_diagnostics".to_string(),
+                    serde_json::to_value(&community_diagnostics)?,
+                );
+            }
             inject_tagpath_stale_into_json(
                 &mut value,
                 combined_stale,
@@ -16392,13 +16658,10 @@ fn cmd_explain_with_budget(
             "callees": callees,
             "callees_total": callees_total,
             "callees_truncated": callees_truncated,
-            "community": community,
+            "community": focused_community.as_ref(),
+            "community_diagnostics": community_diagnostics,
         });
-        inject_tagpath_stale_into_json(
-            &mut out,
-            combined_stale,
-            tagpath_stale_reason.as_deref(),
-        );
+        inject_tagpath_stale_into_json(&mut out, combined_stale, tagpath_stale_reason.as_deref());
         print_json_or_envelope(
             &out,
             &format,
@@ -16458,14 +16721,10 @@ fn cmd_explain_with_budget(
                 println!("# (+{} more callees)", callees_total - limit);
             }
         }
-        if let Some(comm) = community {
+        if let Some(comm) = focused_community.as_ref() {
             println!();
             let names: Vec<&str> = comm.members.iter().map(|m| m.name.as_str()).collect();
-            println!(
-                "community\t{}\t{}",
-                comm.members.len(),
-                names.join(",")
-            );
+            println!("community\t{}\t{}", comm.members.len(), names.join(","));
         }
     } else if compact {
         if symbols.is_empty() {
@@ -16506,7 +16765,7 @@ fn cmd_explain_with_budget(
             }
         }
 
-        if let Some(comm) = community {
+        if let Some(comm) = focused_community.as_ref() {
             println!(
                 "comm[{}]: {}",
                 comm.members.len(),
@@ -16583,7 +16842,7 @@ fn cmd_explain_with_budget(
             }
         }
 
-        if let Some(comm) = community {
+        if let Some(comm) = focused_community.as_ref() {
             println!();
             println!("Community {} ({} members):", comm.id, comm.members.len());
             for m in &comm.members {
@@ -16853,8 +17112,8 @@ const TAGPATH_AUDIT_SKIP_DIRS: &[&str] = &[
 const TAGPATH_AUDIT_SOURCE_EXTENSIONS: &[&str] = &[
     "rs", "py", "ts", "js", "go", "java", "rb", "c", "cpp", "h", "hpp", "cs", "swift", "kt",
     "scala", "zig", "nim", "ex", "exs", "erl", "hs", "ml", "clj", "r", "lua", "php", "pl", "d",
-    "cr", "dart", "jl", "v", "odin", "gleam", "rkt", "scm", "lisp", "lsp", "f", "fs", "fsi",
-    "fsx", "sh", "bash", "zsh", "sql", "css", "tsx",
+    "cr", "dart", "jl", "v", "odin", "gleam", "rkt", "scm", "lisp", "lsp", "f", "fs", "fsi", "fsx",
+    "sh", "bash", "zsh", "sql", "css", "tsx",
 ];
 
 fn tagpath_audit_supported_extensions(root: &Path) -> BTreeSet<String> {
@@ -16942,7 +17201,10 @@ fn cmd_audit_tagpath(
         let db = cfg.db_path_for(&workspace_root, &resolved.id);
         (resolved.source_root, db)
     } else {
-        (workspace_root.clone(), workspace_root.join(".tsift/index.db"))
+        (
+            workspace_root.clone(),
+            workspace_root.join(".tsift/index.db"),
+        )
     };
 
     if !db_path.exists() {
@@ -16958,8 +17220,7 @@ fn cmd_audit_tagpath(
     // tagpath stores relative-to-root.
     let mut tsift_abs_by_rel: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    let mut tsift_files: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut tsift_files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for raw in db.file_paths()? {
         let path = std::path::Path::new(&raw);
         let abs = if path.is_absolute() {
@@ -26621,41 +26882,41 @@ fn cmd_search_with_budget(
         None
     };
 
-    let (symbol_hits, sift_path, federated_tagpath_diag) = if let Some(scope) = inferred_scope.as_ref()
-    {
-        let cfg = config::Config::load(&root)?;
-        let db_path = cfg.db_path_for(&root, &scope.id);
-        let hits = if db_path.exists() {
-            let db = index::IndexDb::open_read_only_resilient(&db_path)?;
-            db.symbol_search(&query, limit)?
+    let (symbol_hits, sift_path, federated_tagpath_diag) =
+        if let Some(scope) = inferred_scope.as_ref() {
+            let cfg = config::Config::load(&root)?;
+            let db_path = cfg.db_path_for(&root, &scope.id);
+            let hits = if db_path.exists() {
+                let db = index::IndexDb::open_read_only_resilient(&db_path)?;
+                db.symbol_search(&query, limit)?
+            } else {
+                Vec::new()
+            };
+            (hits, scope.source_root.clone(), None)
+        } else if let Some(ref scope_name) = scope {
+            let cfg = config::Config::load(&root)?;
+            let scope = config::Config::resolve_submodule(&root, scope_name)?;
+            let db_path = cfg.db_path_for(&root, &scope.id);
+            let hits = if db_path.exists() {
+                let db = index::IndexDb::open_read_only_resilient(&db_path)?;
+                db.symbol_search(&query, limit)?
+            } else {
+                Vec::new()
+            };
+            (hits, scope.source_root, None)
+        } else if federated {
+            let (hits, diag) = federated_symbol_search(&root, &query, limit, &tagpath_opts)?;
+            (hits, root.clone(), Some(diag))
         } else {
-            Vec::new()
+            let db_path = root.join(".tsift/index.db");
+            let hits = if db_path.exists() {
+                let db = index::IndexDb::open_read_only_resilient(&db_path)?;
+                db.symbol_search(&query, limit)?
+            } else {
+                Vec::new()
+            };
+            (hits, root.clone(), None)
         };
-        (hits, scope.source_root.clone(), None)
-    } else if let Some(ref scope_name) = scope {
-        let cfg = config::Config::load(&root)?;
-        let scope = config::Config::resolve_submodule(&root, scope_name)?;
-        let db_path = cfg.db_path_for(&root, &scope.id);
-        let hits = if db_path.exists() {
-            let db = index::IndexDb::open_read_only_resilient(&db_path)?;
-            db.symbol_search(&query, limit)?
-        } else {
-            Vec::new()
-        };
-        (hits, scope.source_root, None)
-    } else if federated {
-        let (hits, diag) = federated_symbol_search(&root, &query, limit, &tagpath_opts)?;
-        (hits, root.clone(), Some(diag))
-    } else {
-        let db_path = root.join(".tsift/index.db");
-        let hits = if db_path.exists() {
-            let db = index::IndexDb::open_read_only_resilient(&db_path)?;
-            db.symbol_search(&query, limit)?
-        } else {
-            Vec::new()
-        };
-        (hits, root.clone(), None)
-    };
 
     let mut symbol_hits = symbol_hits;
     // Use `sift_path` (which equals `scope.source_root` for scoped /
@@ -34175,16 +34436,14 @@ tier = "private"
     fn inspect_read_only_outside_scope_does_not_cache() {
         let dir = setup_graph_index();
         let db_path = dir.path().join(".tsift/index.db");
-        let _first =
-            index::IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
+        let _first = index::IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
         let (hits, misses) = index::inspect_scope_stats();
         assert_eq!(
             (hits, misses),
             (0, 0),
             "no scope guard => no hits/misses recorded"
         );
-        let _second =
-            index::IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
+        let _second = index::IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
         let (hits, _) = index::inspect_scope_stats();
         assert_eq!(hits, 0, "must not reuse inspection outside of any scope");
     }

@@ -607,6 +607,8 @@ tsift communities [--path <path>] [--scope <submod>] [--min-size N] [--json]
 
 **`--min-size N` (default 2):** filter out singleton communities (external symbols with no definition in the indexed codebase).
 
+**Cache and diagnostics:** JSON community output includes `community_diagnostics` with `cache_hit`, `edge_count`, `iterations`, `tagpath_state`, and tagpath annotation counts. Louvain results are cached under `.tsift/community-cache/<scope>/` by cache version, scope, a cheap index graph watermark derived from indexed source state plus symbol/edge row counts, and tagpath freshness state. Cache hits reuse the stored `CommunityResult` without re-reading every call edge or rerunning Louvain. Tagpath annotation is bounded to the displayed communities (`tsift communities --limit N`) or the focused symbol's community (`tsift explain`) before handles are emitted, so default limited output does not pay to annotate hidden communities.
+
 **Locking:** `tsift communities` is a read-only graph query. It opens the existing `index.db` without acquiring the writer-side `index.lock`, and if a live SQLite lock temporarily blocks reads it retries against a snapshot copy, including WAL sidecars when present, so the command remains available.
 
 **Boundary rule:** `tsift communities` owns deterministic, AST-derived clustering. For LLM-derived semantic groupings (concept clusters, domain labels), use graphify's semantic layer over `tsift graph --json` output.
@@ -635,7 +637,7 @@ tsift explain main --json       # structured output
 tsift explain main --scope sub  # restrict to submodule
 ```
 
-Community membership is computed on-the-fly via Louvain to show which architectural subsystem the symbol belongs to.
+Community membership is computed via the same cached Louvain path as `tsift communities` to show which architectural subsystem the symbol belongs to. Structured explain output includes `community_diagnostics` alongside the focused `community`.
 
 ## Graph CLI End-to-End Coverage
 

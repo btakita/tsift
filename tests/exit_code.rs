@@ -774,8 +774,7 @@ fn communities_json_reports_disconnected_clusters() {
     assert!(
         communities.iter().any(|community| {
             let names = community_member_names(community);
-            names.contains(&"delta".to_string())
-                && names.contains(&"epsilon".to_string())
+            names.contains(&"delta".to_string()) && names.contains(&"epsilon".to_string())
         }),
         "expected delta/epsilon community: {json}"
     );
@@ -851,6 +850,91 @@ fn communities_json_annotates_members_when_index_is_fresh() {
             assert!(handle.starts_with("mem:"), "{name}: {handle}");
         }
     }
+}
+
+#[test]
+fn communities_json_reports_cache_diagnostics_and_reuses_disk_cache() {
+    let dir = indexed_cli_fixture();
+
+    let first = tsift_bin()
+        .args(["communities", dir.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "first communities run should succeed (stderr={})",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_json: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let first_diag = &first_json["community_diagnostics"];
+    assert_eq!(first_diag["cache_hit"], false, "{first_json}");
+    assert_eq!(first_diag["tagpath_state"], "missing", "{first_json}");
+    assert_eq!(
+        first_diag["edge_count"], first_json["edge_count"],
+        "{first_json}"
+    );
+    assert_eq!(
+        first_diag["iterations"], first_json["iterations"],
+        "{first_json}"
+    );
+    assert_eq!(first_diag["annotated_member_count"], 0, "{first_json}");
+
+    let second = tsift_bin()
+        .args(["communities", dir.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "second communities run should succeed (stderr={})",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_json: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(
+        second_json["community_diagnostics"]["cache_hit"], true,
+        "{second_json}"
+    );
+}
+
+#[test]
+fn communities_json_bounds_tagpath_annotation_to_displayed_results() {
+    let dir = indexed_cli_fixture();
+    let members: Vec<(&str, &str)> = vec![
+        ("main", "main.rs"),
+        ("alpha", "main.rs"),
+        ("beta", "main.rs"),
+        ("gamma", "main.rs"),
+        ("bridge", "main.rs"),
+        ("shared", "main.rs"),
+        ("helper", "main.rs"),
+        ("delta", "main.rs"),
+        ("epsilon", "main.rs"),
+    ];
+    write_fresh_tagpath_index(dir.path(), &members);
+
+    let output = tsift_bin()
+        .args([
+            "communities",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "communities should succeed (stderr={})",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let communities = json["communities"].as_array().unwrap();
+    assert_eq!(communities.len(), 1, "{json}");
+    let displayed_members = communities[0]["members"].as_array().unwrap().len() as u64;
+    let diag = &json["community_diagnostics"];
+    assert_eq!(diag["tagpath_state"], "fresh", "{json}");
+    assert_eq!(diag["annotated_community_count"], 1, "{json}");
+    assert_eq!(diag["annotated_member_count"], displayed_members, "{json}");
 }
 
 // Regression: federated search must annotate each hit against its own
@@ -1168,9 +1252,7 @@ convention = "PascalCase"
         .map(str::to_string)
         .collect::<Vec<_>>();
     assert!(
-        tsift_only
-            .iter()
-            .any(|f| f.contains("__pycache__/lib.rs")),
+        tsift_only.iter().any(|f| f.contains("__pycache__/lib.rs")),
         "expected alpha's __pycache__/lib.rs in tsift-only list: {json}"
     );
     // The scoped audit must NOT report files from other submodules.
@@ -1422,12 +1504,7 @@ fn json_surfaces_tagpath_stale_diagnostic_when_index_is_stale() {
 
     // graph command (combined output): same expectation.
     let output = tsift_bin()
-        .args([
-            "graph",
-            "alpha",
-            dir.path().to_str().unwrap(),
-            "--json",
-        ])
+        .args(["graph", "alpha", dir.path().to_str().unwrap(), "--json"])
         .output()
         .unwrap();
     assert!(
@@ -1444,12 +1521,7 @@ fn json_surfaces_tagpath_stale_diagnostic_when_index_is_stale() {
 
     // explain command: same expectation.
     let output = tsift_bin()
-        .args([
-            "explain",
-            "alpha",
-            dir.path().to_str().unwrap(),
-            "--json",
-        ])
+        .args(["explain", "alpha", dir.path().to_str().unwrap(), "--json"])
         .output()
         .unwrap();
     assert!(
