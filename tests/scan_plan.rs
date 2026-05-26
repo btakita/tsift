@@ -232,3 +232,14 @@ fn path_frontier_probe_uses_from_kind_index_on_hub_and_chain() {
         assert_plan_uses(&plan, &["idx_graph_edges_from_kind"], "path_frontier");
     }
 }
+
+#[test]
+fn path_frontier_chunk_uses_from_kind_index() {
+    let conn = build_synthetic_graph();
+    let sql = "SELECT from_id, to_id FROM graph_edges INDEXED BY idx_graph_edges_from_kind \
+               WHERE from_id IN ('hub-0', 'chain-00000', 'chain-00250') \
+                 AND kind = 'calls' \
+               ORDER BY from_id, to_id, kind";
+    let plan = query_plan(&conn, sql);
+    assert_plan_uses(&plan, &["idx_graph_edges_from_kind"], "path_frontier_chunk");
+}

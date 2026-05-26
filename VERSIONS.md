@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **`#gfront`**: refreshed full-projection backend-eval evidence shows SQLite path/evidence reads are not the current graph bottleneck, so the SQLite traversal path stays on the existing indexed frontier implementation instead of taking an unmeasured rewrite. The performance gate now requires full-projection SQLite evidence-target, evidence, and 64/128/256/512-hop path duration metrics, and `tests/scan_plan.rs` locks chunked frontier probes to `idx_graph_edges_from_kind` so future high-hop work cannot regress into broad edge scans. Evidence: `plans/gfront-evidence.md`.
 - **`#ghop`**: keep the user-facing graph path default at 64 hops until a dedicated hop-cap promotion gate passes. `perf_gate::evaluate_hop_cap_promotion` now requires repeated SQLite samples for `real`, `full_projection`, and `synthetic_deep_chain` workloads before any 128/256/512-hop tier can become the default; each candidate tier must stay within the latency regression budget against `path_max_hops.duration_micros` and return useful row counts, with deep-chain samples proving extra rows beyond the 64-hop median. `graph-db backend-eval` now emits the promotion contract in `performance_gate.hop_cap_promotion`. Tests cover fixture blocking, missing full-projection proof, latency regressions, and deep-chain row usefulness.
 
 ## 0.1.62

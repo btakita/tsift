@@ -12536,6 +12536,12 @@ fn graph_db_backend_eval_performance_gate(
                 .to_string(),
             "full_projection.refresh_phase.projection_rows.duration_micros_per_1k_graph_rows"
                 .to_string(),
+            "full_projection.sqlite.evidence_target_resolution.duration_micros".to_string(),
+            "full_projection.sqlite.evidence.duration_micros".to_string(),
+            "full_projection.sqlite.path_max_hops.duration_micros".to_string(),
+            "full_projection.sqlite.path_max_hops_128.duration_micros".to_string(),
+            "full_projection.sqlite.path_max_hops_256.duration_micros".to_string(),
+            "full_projection.sqlite.path_max_hops_512.duration_micros".to_string(),
             "full_projection.sqlite.conflict_matrix.duration_micros".to_string(),
             "full_projection.sqlite.dispatch_trace.duration_micros".to_string(),
         ]);
