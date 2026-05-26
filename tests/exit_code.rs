@@ -4889,6 +4889,62 @@ fn metric_digest_reads_run_history_from_stdin() {
 }
 
 #[test]
+fn metric_digest_reports_community_search_gate_fixture() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/community-search-gate-history.json");
+    assert!(
+        fixture.exists(),
+        "community search gate fixture should exist at {}",
+        fixture.display()
+    );
+
+    let output = tsift_bin()
+        .args([
+            "metric-digest",
+            "--input",
+            fixture.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "metric-digest should succeed for the community search gate fixture"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let gate = &json["community_search_gate"];
+    assert_eq!(gate["decision"], "pass");
+    assert_eq!(gate["workloads"].as_array().unwrap().len(), 2);
+    assert!(
+        gate["workloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|workload| { workload["workload"] == "real" && workload["status"] == "pass" })
+    );
+    assert!(
+        gate["workloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|workload| {
+                workload["workload"] == "synthetic_multi_module" && workload["status"] == "pass"
+            })
+    );
+    assert!(
+        json["metric_deltas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|delta| {
+                delta["metric"] == "communities.real.duration_micros"
+                    && delta["trend"] == "regressed"
+            })
+    );
+}
+
+#[test]
 fn dci_benchmark_summarizes_recorded_strategy_fixture() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/dci-search-benchmark.json");
     assert!(

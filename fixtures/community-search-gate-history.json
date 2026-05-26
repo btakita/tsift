@@ -1,0 +1,40 @@
+{
+  "runs": [
+    {
+      "label": "community-search-gate-baseline",
+      "id": "community-search-gate-2026-05-26-001",
+      "metrics": {
+        "communities.real.duration_micros": 125000,
+        "communities.real.handle_coverage_pct": 96.5,
+        "communities.real.stale_behavior_pass": 1,
+        "communities.real.no_tagpath_behavior_pass": 1,
+        "communities.real.duplicate_name_precision": 0.99,
+        "communities.real.top_community_stability": 0.96,
+        "communities.synthetic_multi_module.duration_micros": 190000,
+        "communities.synthetic_multi_module.handle_coverage_pct": 97.2,
+        "communities.synthetic_multi_module.stale_behavior_pass": 1,
+        "communities.synthetic_multi_module.no_tagpath_behavior_pass": 1,
+        "communities.synthetic_multi_module.duplicate_name_precision": 1,
+        "communities.synthetic_multi_module.top_community_stability": 0.98
+      }
+    },
+    {
+      "label": "community-search-gate-current",
+      "id": "community-search-gate-2026-05-26-002",
+      "metrics": {
+        "communities.real.duration_micros": 132000,
+        "communities.real.handle_coverage_pct": 98.1,
+        "communities.real.stale_behavior_pass": 1,
+        "communities.real.no_tagpath_behavior_pass": 1,
+        "communities.real.duplicate_name_precision": 1,
+        "communities.real.top_community_stability": 0.97,
+        "communities.synthetic_multi_module.duration_micros": 202000,
+        "communities.synthetic_multi_module.handle_coverage_pct": 99.0,
+        "communities.synthetic_multi_module.stale_behavior_pass": 1,
+        "communities.synthetic_multi_module.no_tagpath_behavior_pass": 1,
+        "communities.synthetic_multi_module.duplicate_name_precision": 1,
+        "communities.synthetic_multi_module.top_community_stability": 0.99
+      }
+    }
+  ]
+}

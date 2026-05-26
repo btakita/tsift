@@ -1277,6 +1277,8 @@ Behavior:
 
 `metric-digest` is intentionally schema-light. It does not execute the underlying benchmark/test/perf workflow, and it avoids hard-coding session-share-specific parsers so different run producers can feed the same digest surface.
 
+When a run includes `communities.<workload>.*` or `community_search.<workload>.*` metrics, `metric-digest` also emits a `community_search_gate` report. The gate requires both `real` and `synthetic_multi_module` workloads and checks `duration_micros` or `runtime_micros`, `handle_coverage_pct`, `stale_behavior_pass`, `no_tagpath_behavior_pass`, `duplicate_name_precision`, and `top_community_stability`. Runtime is tracked as lower-is-better and blocks when it regresses by more than 25% against the compared run; handle coverage must stay at or above 95%, duplicate-name precision at or above 0.99, top-community stability at or above 0.95, and stale/no-tagpath behavior metrics must report `1`. The checked-in fixture `fixtures/community-search-gate-history.json` records the canonical real plus synthetic multi-module sample shape and can be inspected with `tsift metric-digest --input fixtures/community-search-gate-history.json --json`.
+
 ## DCI Benchmark
 
 `tsift dci-benchmark --fixture <path>` summarizes recorded Direct Corpus Interaction search runs for multi-hop repo/code tasks. The benchmark fixture compares the three strategy lanes tsift cares about after the DCI paper review:

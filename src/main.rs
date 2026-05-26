@@ -22702,6 +22702,13 @@ fn metric_digest_trend_label(trend: metric_digest::MetricDigestTrend) -> &'stati
     }
 }
 
+fn metric_digest_gate_label(decision: metric_digest::CommunitySearchGateDecision) -> &'static str {
+    match decision {
+        metric_digest::CommunitySearchGateDecision::Pass => "pass",
+        metric_digest::CommunitySearchGateDecision::Block => "block",
+    }
+}
+
 fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: OutputFormat) -> Result<()> {
     let input = match options.input_path {
         Some(file_path) => fs::read_to_string(file_path)
@@ -22766,6 +22773,14 @@ fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: OutputFormat) -> 
                 metric_digest::format_number(delta.previous),
                 metric_digest::format_number(delta.delta),
                 metric_digest_trend_label(delta.trend)
+            );
+        }
+        if let Some(gate) = &report.community_search_gate {
+            println!(
+                "community-search-gate decision:{} workloads:{} diagnostics:{}",
+                metric_digest_gate_label(gate.decision),
+                gate.workloads.len(),
+                gate.diagnostics.len()
             );
         }
         for warning in &report.warnings {
@@ -22839,6 +22854,58 @@ fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: OutputFormat) -> 
         println!();
         println!("News-ready table:");
         println!("{}", report.news_table_markdown);
+    }
+
+    if let Some(gate) = &report.community_search_gate {
+        println!();
+        println!("Community search gate:");
+        println!("  decision: {}", metric_digest_gate_label(gate.decision));
+        println!(
+            "  thresholds: duration +{:.1}%, handle coverage {:.1}%, duplicate precision {:.2}, top stability {:.2}",
+            gate.max_duration_regression_percent,
+            gate.min_handle_coverage_pct,
+            gate.min_duplicate_name_precision,
+            gate.min_top_community_stability
+        );
+        for workload in &gate.workloads {
+            println!(
+                "  {}: {}",
+                workload.workload,
+                metric_digest_gate_label(workload.status)
+            );
+            if let Some(duration) = workload.duration_micros {
+                let regression = workload
+                    .duration_regression_percent
+                    .map(|value| format!(" ({value:+.2}%)"))
+                    .unwrap_or_default();
+                println!(
+                    "    duration_micros: {}{}",
+                    metric_digest::format_number(duration),
+                    regression
+                );
+            }
+            if let Some(coverage) = workload.handle_coverage_pct {
+                println!(
+                    "    handle_coverage_pct: {}",
+                    metric_digest::format_number(coverage)
+                );
+            }
+            if let Some(precision) = workload.duplicate_name_precision {
+                println!(
+                    "    duplicate_name_precision: {}",
+                    metric_digest::format_number(precision)
+                );
+            }
+            if let Some(stability) = workload.top_community_stability {
+                println!(
+                    "    top_community_stability: {}",
+                    metric_digest::format_number(stability)
+                );
+            }
+            for diagnostic in &workload.diagnostics {
+                println!("    warning: {diagnostic}");
+            }
+        }
     }
 
     for warning in &report.warnings {

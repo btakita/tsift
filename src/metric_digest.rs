@@ -4,6 +4,20 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 const EPSILON: f64 = 1e-9;
+const COMMUNITY_SEARCH_PREFIXES: &[&str] = &["communities", "community_search"];
+const COMMUNITY_SEARCH_WORKLOADS: &[&str] = &["real", "synthetic_multi_module"];
+const COMMUNITY_SEARCH_REQUIRED_METRICS: &[&str] = &[
+    "duration_micros",
+    "handle_coverage_pct",
+    "stale_behavior_pass",
+    "no_tagpath_behavior_pass",
+    "duplicate_name_precision",
+    "top_community_stability",
+];
+const COMMUNITY_MAX_DURATION_REGRESSION_PERCENT: f64 = 25.0;
+const COMMUNITY_MIN_HANDLE_COVERAGE_PCT: f64 = 95.0;
+const COMMUNITY_MIN_DUPLICATE_NAME_PRECISION: f64 = 0.99;
+const COMMUNITY_MIN_TOP_COMMUNITY_STABILITY: f64 = 0.95;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +49,51 @@ pub struct MetricDigestDelta {
     pub trend: MetricDigestTrend,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommunitySearchGateDecision {
+    Pass,
+    Block,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CommunitySearchWorkloadEvaluation {
+    pub workload: String,
+    pub status: CommunitySearchGateDecision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_micros: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_regression_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle_coverage_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_behavior_pass: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_tagpath_behavior_pass: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duplicate_name_precision: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_community_stability: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub missing_metrics: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CommunitySearchGateReport {
+    pub decision: CommunitySearchGateDecision,
+    pub required_workloads: Vec<String>,
+    pub required_metrics: Vec<String>,
+    pub max_duration_regression_percent: f64,
+    pub min_handle_coverage_pct: f64,
+    pub min_duplicate_name_precision: f64,
+    pub min_top_community_stability: f64,
+    pub workloads: Vec<CommunitySearchWorkloadEvaluation>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub diagnostics: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MetricDigestReport {
     pub runs_loaded: usize,
@@ -46,6 +105,8 @@ pub struct MetricDigestReport {
     pub metric_deltas: Vec<MetricDigestDelta>,
     pub top_improvements: Vec<MetricDigestDelta>,
     pub top_regressions: Vec<MetricDigestDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub community_search_gate: Option<CommunitySearchGateReport>,
     pub news_table_markdown: String,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
@@ -158,6 +219,14 @@ pub fn compute(
     regressions.sort_by(metric_delta_rank);
     regressions.truncate(top_limit.max(1));
 
+    let community_search_gate = build_community_search_gate(&current, previous.as_ref());
+    if matches!(
+        community_search_gate.as_ref().map(|gate| gate.decision),
+        Some(CommunitySearchGateDecision::Block)
+    ) {
+        warnings.push("community search gate blocked on missing or regressed metrics".to_string());
+    }
+
     Ok(MetricDigestReport {
         runs_loaded: all_runs.len(),
         history_runs: history_runs.iter().map(export_run).collect(),
@@ -167,6 +236,7 @@ pub fn compute(
         metric_deltas: deltas,
         top_improvements: improvements,
         top_regressions: regressions,
+        community_search_gate,
         news_table_markdown: build_news_table(&history_runs, &selected),
         warnings,
     })
@@ -406,6 +476,7 @@ fn metric_direction(
         "recall",
         "f1",
         "coverage",
+        "stability",
         "wins",
     ]
     .iter()
@@ -415,6 +486,227 @@ fn metric_direction(
     }
 
     MetricDirection::Unknown
+}
+
+fn build_community_search_gate(
+    current: &InputRun,
+    previous: Option<&InputRun>,
+) -> Option<CommunitySearchGateReport> {
+    if !has_community_search_metrics(current)
+        && previous.is_none_or(|run| !has_community_search_metrics(run))
+    {
+        return None;
+    }
+
+    let mut workloads = Vec::new();
+    let mut diagnostics = Vec::new();
+    for workload in COMMUNITY_SEARCH_WORKLOADS {
+        let evaluation = evaluate_community_search_workload(current, previous, workload);
+        diagnostics.extend(
+            evaluation
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!("{workload}: {diagnostic}")),
+        );
+        workloads.push(evaluation);
+    }
+
+    let decision = if workloads
+        .iter()
+        .all(|workload| workload.status == CommunitySearchGateDecision::Pass)
+    {
+        CommunitySearchGateDecision::Pass
+    } else {
+        CommunitySearchGateDecision::Block
+    };
+
+    Some(CommunitySearchGateReport {
+        decision,
+        required_workloads: COMMUNITY_SEARCH_WORKLOADS
+            .iter()
+            .map(|workload| (*workload).to_string())
+            .collect(),
+        required_metrics: COMMUNITY_SEARCH_REQUIRED_METRICS
+            .iter()
+            .map(|metric| (*metric).to_string())
+            .collect(),
+        max_duration_regression_percent: COMMUNITY_MAX_DURATION_REGRESSION_PERCENT,
+        min_handle_coverage_pct: COMMUNITY_MIN_HANDLE_COVERAGE_PCT,
+        min_duplicate_name_precision: COMMUNITY_MIN_DUPLICATE_NAME_PRECISION,
+        min_top_community_stability: COMMUNITY_MIN_TOP_COMMUNITY_STABILITY,
+        workloads,
+        diagnostics,
+    })
+}
+
+fn evaluate_community_search_workload(
+    current: &InputRun,
+    previous: Option<&InputRun>,
+    workload: &str,
+) -> CommunitySearchWorkloadEvaluation {
+    let duration_micros = community_metric_value(
+        &current.metrics,
+        workload,
+        &["duration_micros", "runtime_micros"],
+    );
+    let handle_coverage_pct = community_metric_value(
+        &current.metrics,
+        workload,
+        &["handle_coverage_pct", "tagpath_handle_coverage_pct"],
+    )
+    .map(normalize_percent);
+    let stale_behavior_pass = community_metric_value(
+        &current.metrics,
+        workload,
+        &["stale_behavior_pass", "stale_suppression_pass"],
+    );
+    let no_tagpath_behavior_pass = community_metric_value(
+        &current.metrics,
+        workload,
+        &["no_tagpath_behavior_pass", "no_tagpath_suppression_pass"],
+    );
+    let duplicate_name_precision = community_metric_value(
+        &current.metrics,
+        workload,
+        &["duplicate_name_precision", "duplicate_tagpath_precision"],
+    )
+    .map(normalize_ratio);
+    let top_community_stability = community_metric_value(
+        &current.metrics,
+        workload,
+        &["top_community_stability", "top_community_jaccard"],
+    )
+    .map(normalize_ratio);
+
+    let mut missing_metrics = Vec::new();
+    let mut diagnostics = Vec::new();
+    for metric in COMMUNITY_SEARCH_REQUIRED_METRICS {
+        if community_metric_value(&current.metrics, workload, community_metric_aliases(metric))
+            .is_none()
+        {
+            missing_metrics.push((*metric).to_string());
+            diagnostics.push(format!("missing metric `{metric}`"));
+        }
+    }
+
+    let duration_regression_percent = duration_micros.and_then(|current_duration| {
+        previous.and_then(|previous_run| {
+            community_metric_value(
+                &previous_run.metrics,
+                workload,
+                &["duration_micros", "runtime_micros"],
+            )
+            .and_then(|previous_duration| {
+                if previous_duration.abs() <= EPSILON {
+                    None
+                } else {
+                    Some(((current_duration - previous_duration) / previous_duration) * 100.0)
+                }
+            })
+        })
+    });
+
+    if duration_regression_percent
+        .is_some_and(|percent| percent > COMMUNITY_MAX_DURATION_REGRESSION_PERCENT)
+    {
+        diagnostics.push(format!(
+            "duration regression exceeds {:.1}% limit",
+            COMMUNITY_MAX_DURATION_REGRESSION_PERCENT
+        ));
+    }
+    if handle_coverage_pct.is_some_and(|value| value + EPSILON < COMMUNITY_MIN_HANDLE_COVERAGE_PCT)
+    {
+        diagnostics.push(format!(
+            "handle coverage below {:.1}%",
+            COMMUNITY_MIN_HANDLE_COVERAGE_PCT
+        ));
+    }
+    if stale_behavior_pass.is_some_and(|value| value + EPSILON < 1.0) {
+        diagnostics.push("stale behavior did not pass".to_string());
+    }
+    if no_tagpath_behavior_pass.is_some_and(|value| value + EPSILON < 1.0) {
+        diagnostics.push("no-tagpath behavior did not pass".to_string());
+    }
+    if duplicate_name_precision
+        .is_some_and(|value| value + EPSILON < COMMUNITY_MIN_DUPLICATE_NAME_PRECISION)
+    {
+        diagnostics.push(format!(
+            "duplicate-name precision below {:.2}",
+            COMMUNITY_MIN_DUPLICATE_NAME_PRECISION
+        ));
+    }
+    if top_community_stability
+        .is_some_and(|value| value + EPSILON < COMMUNITY_MIN_TOP_COMMUNITY_STABILITY)
+    {
+        diagnostics.push(format!(
+            "top-community stability below {:.2}",
+            COMMUNITY_MIN_TOP_COMMUNITY_STABILITY
+        ));
+    }
+
+    let status = if diagnostics.is_empty() {
+        CommunitySearchGateDecision::Pass
+    } else {
+        CommunitySearchGateDecision::Block
+    };
+
+    CommunitySearchWorkloadEvaluation {
+        workload: workload.to_string(),
+        status,
+        duration_micros,
+        duration_regression_percent,
+        handle_coverage_pct,
+        stale_behavior_pass,
+        no_tagpath_behavior_pass,
+        duplicate_name_precision,
+        top_community_stability,
+        missing_metrics,
+        diagnostics,
+    }
+}
+
+fn has_community_search_metrics(run: &InputRun) -> bool {
+    run.metrics.keys().any(|metric| {
+        COMMUNITY_SEARCH_PREFIXES
+            .iter()
+            .any(|prefix| metric.starts_with(&format!("{prefix}.")))
+    })
+}
+
+fn community_metric_value(
+    metrics: &BTreeMap<String, f64>,
+    workload: &str,
+    suffixes: &[&str],
+) -> Option<f64> {
+    for prefix in COMMUNITY_SEARCH_PREFIXES {
+        for suffix in suffixes {
+            let key = format!("{prefix}.{workload}.{suffix}");
+            if let Some(value) = metrics.get(&key) {
+                return Some(*value);
+            }
+        }
+    }
+    None
+}
+
+fn community_metric_aliases(metric: &str) -> &'static [&'static str] {
+    match metric {
+        "duration_micros" => &["duration_micros", "runtime_micros"],
+        "handle_coverage_pct" => &["handle_coverage_pct", "tagpath_handle_coverage_pct"],
+        "stale_behavior_pass" => &["stale_behavior_pass", "stale_suppression_pass"],
+        "no_tagpath_behavior_pass" => &["no_tagpath_behavior_pass", "no_tagpath_suppression_pass"],
+        "duplicate_name_precision" => &["duplicate_name_precision", "duplicate_tagpath_precision"],
+        "top_community_stability" => &["top_community_stability", "top_community_jaccard"],
+        _ => &[],
+    }
+}
+
+fn normalize_percent(value: f64) -> f64 {
+    if value <= 1.0 { value * 100.0 } else { value }
+}
+
+fn normalize_ratio(value: f64) -> f64 {
+    if value > 1.0 { value / 100.0 } else { value }
 }
 
 fn metric_delta_rank(left: &MetricDigestDelta, right: &MetricDigestDelta) -> std::cmp::Ordering {
@@ -577,6 +869,103 @@ mod tests {
         assert_eq!(
             classify_trend("mystery_metric", 1.0, &BTreeSet::new(), &BTreeSet::new()),
             MetricDigestTrend::Unknown
+        );
+    }
+
+    #[test]
+    fn community_search_gate_passes_real_and_synthetic_metrics() {
+        let baseline = r#"{
+          "label": "community-gate-baseline",
+          "metrics": {
+            "communities.real.duration_micros": 100000,
+            "communities.real.handle_coverage_pct": 96,
+            "communities.real.stale_behavior_pass": 1,
+            "communities.real.no_tagpath_behavior_pass": 1,
+            "communities.real.duplicate_name_precision": 0.99,
+            "communities.real.top_community_stability": 0.96,
+            "communities.synthetic_multi_module.duration_micros": 180000,
+            "communities.synthetic_multi_module.handle_coverage_pct": 97,
+            "communities.synthetic_multi_module.stale_behavior_pass": 1,
+            "communities.synthetic_multi_module.no_tagpath_behavior_pass": 1,
+            "communities.synthetic_multi_module.duplicate_name_precision": 1,
+            "communities.synthetic_multi_module.top_community_stability": 0.98
+          }
+        }"#;
+        let current = r#"{
+          "label": "community-gate-current",
+          "metrics": {
+            "communities.real.duration_micros": 108000,
+            "communities.real.handle_coverage_pct": 98,
+            "communities.real.stale_behavior_pass": 1,
+            "communities.real.no_tagpath_behavior_pass": 1,
+            "communities.real.duplicate_name_precision": 1,
+            "communities.real.top_community_stability": 0.97,
+            "communities.synthetic_multi_module.duration_micros": 190000,
+            "communities.synthetic_multi_module.handle_coverage_pct": 99,
+            "communities.synthetic_multi_module.stale_behavior_pass": 1,
+            "communities.synthetic_multi_module.no_tagpath_behavior_pass": 1,
+            "communities.synthetic_multi_module.duplicate_name_precision": 1,
+            "communities.synthetic_multi_module.top_community_stability": 0.99
+          }
+        }"#;
+
+        let report = compute(current, Some(baseline), &[], &[], &[], 3, 3).unwrap();
+        let gate = report.community_search_gate.unwrap();
+
+        assert_eq!(gate.decision, CommunitySearchGateDecision::Pass);
+        assert_eq!(gate.workloads.len(), 2);
+        assert!(gate.diagnostics.is_empty());
+        assert!(
+            report
+                .metric_deltas
+                .iter()
+                .any(|delta| delta.metric == "communities.real.duration_micros"
+                    && delta.trend == MetricDigestTrend::Regressed)
+        );
+    }
+
+    #[test]
+    fn community_search_gate_blocks_missing_quality_metrics() {
+        let input = r#"{
+          "label": "community-gate-current",
+          "metrics": {
+            "communities.real.duration_micros": 108000,
+            "communities.real.handle_coverage_pct": 94,
+            "communities.real.stale_behavior_pass": 1,
+            "communities.real.duplicate_name_precision": 0.95,
+            "communities.real.top_community_stability": 0.97,
+            "communities.synthetic_multi_module.duration_micros": 190000,
+            "communities.synthetic_multi_module.handle_coverage_pct": 99,
+            "communities.synthetic_multi_module.stale_behavior_pass": 1,
+            "communities.synthetic_multi_module.no_tagpath_behavior_pass": 1,
+            "communities.synthetic_multi_module.duplicate_name_precision": 1,
+            "communities.synthetic_multi_module.top_community_stability": 0.99
+          }
+        }"#;
+
+        let report = compute(input, None, &[], &[], &[], 3, 3).unwrap();
+        let gate = report.community_search_gate.unwrap();
+        let real = gate
+            .workloads
+            .iter()
+            .find(|workload| workload.workload == "real")
+            .unwrap();
+
+        assert_eq!(gate.decision, CommunitySearchGateDecision::Block);
+        assert!(
+            real.missing_metrics
+                .contains(&"no_tagpath_behavior_pass".to_string())
+        );
+        assert!(
+            real.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("handle coverage"))
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("community search gate blocked"))
         );
     }
 }
