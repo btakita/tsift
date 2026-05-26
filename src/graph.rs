@@ -578,8 +578,25 @@ pub fn project_routes(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommunityMemberRef {
+    pub file: String,
+    pub line: i64,
+    pub role: String,
+    pub peer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommunityMember {
     pub name: String,
+    /// Definition file selected from index rows using community-local evidence.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub file: Option<String>,
+    /// Definition line selected from index rows using community-local evidence.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub line: Option<i64>,
+    /// Bounded caller/callee evidence used to disambiguate duplicate names.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub refs: Vec<CommunityMemberRef>,
     /// Stable `mem:` handle from the tagpath index when a fresh adapter is
     /// loaded for the project root. See `tagpath::SPEC.md` §15.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -590,6 +607,9 @@ impl CommunityMember {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            file: None,
+            line: None,
+            refs: Vec::new(),
             tagpath_handle: None,
         }
     }

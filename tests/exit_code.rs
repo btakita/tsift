@@ -1612,6 +1612,7 @@ fn communities_json_resolves_handle_through_name_collision() {
     );
 
     write_fresh_tagpath_index(dir.path(), &[("helper", "src/main.rs")]);
+    let expected = tagpath_member_handle(dir.path(), "helper", "src/main.rs");
 
     let output = tsift_bin()
         .args(["communities", dir.path().to_str().unwrap(), "--json"])
@@ -1624,22 +1625,192 @@ fn communities_json_resolves_handle_through_name_collision() {
     );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    let mut helper_handles: Vec<String> = Vec::new();
+    let mut helper_members: Vec<&serde_json::Value> = Vec::new();
     for community in json["communities"].as_array().unwrap() {
         for member in community["members"].as_array().unwrap() {
-            if member["name"].as_str() == Some("helper")
-                && let Some(handle) = member.get("tagpath_handle").and_then(|h| h.as_str())
-            {
-                helper_handles.push(handle.to_string());
+            if member["name"].as_str() == Some("helper") {
+                helper_members.push(member);
             }
         }
     }
     assert!(
-        !helper_handles.is_empty(),
+        !helper_members.is_empty(),
         "expected `helper` member to carry a tagpath_handle after the name-collision fix: {json}"
     );
-    for handle in &helper_handles {
-        assert!(handle.starts_with("mem:"), "{handle}");
+    for helper in &helper_members {
+        assert_eq!(helper["tagpath_handle"].as_str(), Some(expected.as_str()));
+        assert_eq!(helper["file"].as_str(), Some("src/main.rs"));
+    }
+    let ambiguity = json["community_diagnostics"]["ambiguous_members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|diag| diag["name"].as_str() == Some("helper"))
+        .unwrap_or_else(|| panic!("expected helper ambiguity diagnostic: {json}"));
+    assert_eq!(ambiguity["candidate_count"].as_u64(), Some(2));
+    assert_eq!(ambiguity["tagpath_candidate_count"].as_u64(), Some(1));
+    assert_eq!(
+        ambiguity["evidence"].as_str(),
+        Some("unique_tagpath_handle")
+    );
+    assert_eq!(ambiguity["chosen_file"].as_str(), Some("src/main.rs"));
+}
+
+#[test]
+fn communities_json_resolves_duplicate_member_handle_with_edge_context() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("a_vendor")).unwrap();
+    fs::write(dir.path().join("a_vendor/main.rs"), "fn helper() {}\n").unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/main.rs"),
+        "fn helper() {}\nfn src_caller() { helper(); }\nfn src_peer() { src_caller(); }\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    write_fresh_tagpath_index(
+        dir.path(),
+        &[
+            ("helper", "a_vendor/main.rs"),
+            ("helper", "src/main.rs"),
+            ("src_caller", "src/main.rs"),
+        ],
+    );
+    let expected = tagpath_member_handle(dir.path(), "helper", "src/main.rs");
+    let vendor = tagpath_member_handle(dir.path(), "helper", "a_vendor/main.rs");
+    assert_ne!(expected, vendor);
+
+    let output = tsift_bin()
+        .args(["communities", dir.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "communities stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let helper = json["communities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|community| community["members"].as_array().unwrap().iter())
+        .find(|member| member["name"].as_str() == Some("helper"))
+        .unwrap_or_else(|| panic!("expected helper community member: {json}"));
+
+    assert_eq!(helper["tagpath_handle"].as_str(), Some(expected.as_str()));
+    assert_ne!(helper["tagpath_handle"].as_str(), Some(vendor.as_str()));
+    assert_eq!(helper["file"].as_str(), Some("src/main.rs"));
+    assert!(
+        helper["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |reference| reference["file"].as_str() == Some("src/main.rs")
+                    && reference["role"].as_str() == Some("callee")
+                    && reference["peer"].as_str() == Some("src_caller")
+            ),
+        "expected helper refs to include src caller evidence: {helper}"
+    );
+
+    let ambiguity = json["community_diagnostics"]["ambiguous_members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|diag| diag["name"].as_str() == Some("helper"))
+        .unwrap_or_else(|| panic!("expected helper ambiguity diagnostic: {json}"));
+    assert_eq!(ambiguity["candidate_count"].as_u64(), Some(2));
+    assert_eq!(ambiguity["tagpath_candidate_count"].as_u64(), Some(2));
+    assert_eq!(ambiguity["evidence"].as_str(), Some("edge_file"));
+    assert_eq!(ambiguity["chosen_file"].as_str(), Some("src/main.rs"));
+}
+
+#[test]
+fn communities_json_annotates_scoped_workspace_handles_from_per_scope_tagpath_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        r#"[submodule "src/alpha"]
+	path = src/alpha
+	url = https://example.com/alpha
+[submodule "src/beta"]
+	path = src/beta
+	url = https://example.com/beta
+"#,
+    )
+    .unwrap();
+
+    for scope in ["alpha", "beta"] {
+        let scope_root = dir.path().join(format!("src/{scope}"));
+        fs::create_dir_all(&scope_root).unwrap();
+        fs::write(
+            scope_root.join("lib.rs"),
+            format!("fn {scope}_helper() {{}}\nfn {scope}_caller() {{ {scope}_helper(); }}\n"),
+        )
+        .unwrap();
+        let helper_name = format!("{scope}_helper");
+        let caller_name = format!("{scope}_caller");
+        write_fresh_tagpath_index(
+            &scope_root,
+            &[(&helper_name, "lib.rs"), (&caller_name, "lib.rs")],
+        );
+    }
+
+    let output = tsift_bin()
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "workspace index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for scope in ["alpha", "beta"] {
+        let scope_root = dir.path().join(format!("src/{scope}"));
+        let helper_name = format!("{scope}_helper");
+        let expected = tagpath_member_handle(&scope_root, &helper_name, "lib.rs");
+        let output = tsift_bin()
+            .args([
+                "communities",
+                dir.path().to_str().unwrap(),
+                "--scope",
+                scope,
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{scope} communities stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            json["community_diagnostics"]["tagpath_state"].as_str(),
+            Some("fresh"),
+            "{json}"
+        );
+        let helper = json["communities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|community| community["members"].as_array().unwrap().iter())
+            .find(|member| member["name"].as_str() == Some(helper_name.as_str()))
+            .unwrap_or_else(|| panic!("expected {helper_name} community member: {json}"));
+        assert_eq!(helper["tagpath_handle"].as_str(), Some(expected.as_str()));
+        assert_eq!(helper["file"].as_str(), Some("lib.rs"));
     }
 }
 

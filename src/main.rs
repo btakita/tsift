@@ -3037,6 +3037,9 @@ fn terse_key(key: &str) -> &str {
         "callee_name" => "en",
         "call_site_line" => "csl",
         "members" => "m",
+        "refs" => "refs",
+        "role" => "rl",
+        "peer" => "pr",
         "modularity" => "q",
         "modularity_contribution" => "mc",
         "iterations" => "it",
@@ -3051,6 +3054,12 @@ fn terse_key(key: &str) -> &str {
         "tagpath_stale_reason" => "tsr",
         "annotated_community_count" => "acc",
         "annotated_member_count" => "amc",
+        "ambiguous_member_count" => "ambc",
+        "ambiguous_members" => "amb",
+        "candidate_count" => "cand",
+        "tagpath_candidate_count" => "tcand",
+        "evidence" => "ev",
+        "chosen_file" => "chf",
         "symbol" => "s",
         "symbols" => "sy",
         "definitions" => "df",
@@ -3279,6 +3288,9 @@ const TERSE_PAIRS: &[(&str, &str)] = &[
     ("callee_name", "en"),
     ("call_site_line", "csl"),
     ("members", "m"),
+    ("refs", "refs"),
+    ("role", "rl"),
+    ("peer", "pr"),
     ("modularity", "q"),
     ("modularity_contribution", "mc"),
     ("iterations", "it"),
@@ -3293,6 +3305,12 @@ const TERSE_PAIRS: &[(&str, &str)] = &[
     ("tagpath_stale_reason", "tsr"),
     ("annotated_community_count", "acc"),
     ("annotated_member_count", "amc"),
+    ("ambiguous_member_count", "ambc"),
+    ("ambiguous_members", "amb"),
+    ("candidate_count", "cand"),
+    ("tagpath_candidate_count", "tcand"),
+    ("evidence", "ev"),
+    ("chosen_file", "chf"),
     ("symbol", "s"),
     ("symbols", "sy"),
     ("definitions", "df"),
@@ -3436,6 +3454,18 @@ pub struct TagpathAnnotationDiagnostic {
     pub stale: bool,
     pub reason: Option<String>,
     pub loaded: bool,
+    pub ambiguous_members: Vec<CommunityMemberAmbiguityDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommunityMemberAmbiguityDiagnostic {
+    pub community_id: usize,
+    pub name: String,
+    pub candidate_count: usize,
+    pub tagpath_candidate_count: usize,
+    pub evidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_file: Option<String>,
 }
 
 const COMMUNITY_DETECTION_CACHE_VERSION: &str = "community-detection-cache-v1";
@@ -3453,6 +3483,9 @@ struct CommunityDetectionDiagnostics {
     tagpath_stale_reason: Option<String>,
     annotated_community_count: usize,
     annotated_member_count: usize,
+    ambiguous_member_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ambiguous_members: Vec<CommunityMemberAmbiguityDiagnostic>,
 }
 
 #[derive(Debug, Clone)]
@@ -3615,12 +3648,15 @@ fn community_detection_diagnostics(
         tagpath_stale_reason: tagpath.reason.clone(),
         annotated_community_count: 0,
         annotated_member_count: 0,
+        ambiguous_member_count: 0,
+        ambiguous_members: Vec::new(),
     }
 }
 
 fn update_community_annotation_diagnostics(
     diagnostics: &mut CommunityDetectionDiagnostics,
     communities: &[graph::Community],
+    annotation: Option<&TagpathAnnotationDiagnostic>,
 ) {
     diagnostics.annotated_community_count = communities
         .iter()
@@ -3636,6 +3672,13 @@ fn update_community_annotation_diagnostics(
         .flat_map(|community| community.members.iter())
         .filter(|member| member.tagpath_handle.is_some())
         .count();
+    if let Some(annotation) = annotation {
+        diagnostics.ambiguous_member_count = annotation.ambiguous_members.len();
+        diagnostics.ambiguous_members = annotation.ambiguous_members.clone();
+    } else {
+        diagnostics.ambiguous_member_count = 0;
+        diagnostics.ambiguous_members.clear();
+    }
 }
 
 fn detect_communities_cached(
@@ -3717,6 +3760,7 @@ pub fn annotate_hits_with_tagpath(
                 stale: false,
                 reason: None,
                 loaded: true,
+                ambiguous_members: Vec::new(),
             })
         }
         tagpath_adapter::LoadResult::Stale { reason, .. } => {
@@ -3729,6 +3773,7 @@ pub fn annotate_hits_with_tagpath(
                 stale: true,
                 reason: Some(reason),
                 loaded: false,
+                ambiguous_members: Vec::new(),
             })
         }
         tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
@@ -3762,16 +3807,27 @@ fn tagpath_handle_for_index_file(
     adapter.handle_for_member(&index_file_abs(file, root), name)
 }
 
+#[derive(Debug, Clone)]
+struct TagpathHandleCandidate {
+    file: String,
+    line: i64,
+    handle: String,
+}
+
 fn tagpath_handle_candidates_for_symbol_rows(
     name: &str,
-    syms: Vec<index::StoredSymbol>,
+    syms: &[index::StoredSymbol],
     root: &std::path::Path,
     adapter: &tagpath_adapter::TagpathAdapter,
-) -> Vec<(String, String)> {
-    syms.into_iter()
+) -> Vec<TagpathHandleCandidate> {
+    syms.iter()
         .filter_map(|sym| {
             let handle = tagpath_handle_for_index_file(&sym.file, name, root, adapter)?;
-            Some((index_file_key(&sym.file, root), handle))
+            Some(TagpathHandleCandidate {
+                file: index_file_key(&sym.file, root),
+                line: sym.line,
+                handle,
+            })
         })
         .collect()
 }
@@ -3825,59 +3881,251 @@ fn resolve_tagpath_handle_for_callee_edge(
 ) -> Option<String> {
     let syms = db.symbol_info(&edge.callee_name).ok()?;
     let candidates =
-        tagpath_handle_candidates_for_symbol_rows(&edge.callee_name, syms, root, adapter);
+        tagpath_handle_candidates_for_symbol_rows(&edge.callee_name, &syms, root, adapter);
     let caller_file = index_file_key(&edge.caller_file, root);
 
-    if let Some((_, handle)) = candidates
+    if let Some(candidate) = candidates
         .iter()
-        .find(|(candidate_file, _)| candidate_file == &caller_file)
+        .find(|candidate| candidate.file == caller_file)
     {
-        return Some(handle.clone());
+        return Some(candidate.handle.clone());
     }
 
     if let Some(caller_communities) = communities_by_file.get(&caller_file) {
-        for (candidate_file, handle) in &candidates {
-            if let Some(candidate_communities) = communities_by_file.get(candidate_file)
+        for candidate in &candidates {
+            if let Some(candidate_communities) = communities_by_file.get(&candidate.file)
                 && !caller_communities.is_disjoint(candidate_communities)
             {
-                return Some(handle.clone());
+                return Some(candidate.handle.clone());
             }
         }
     }
 
-    candidates.first().map(|(_, handle)| handle.clone())
+    candidates.first().map(|candidate| candidate.handle.clone())
 }
 
-/// Resolve a per-symbol-name `tagpath_handle` map for a batch of symbol
-/// names against a fresh tagpath index. Names whose definition file is not
-/// present in the index, or which have no matching handle, are simply
-/// absent from the returned map. This helper has no caller context, so when
-/// multiple `db.symbol_info` rows share the same name across files, every
-/// row is probed and the first one that produces a tagpath handle wins.
-fn resolve_tagpath_handles_for_names(
-    names: &[String],
+fn push_bounded_community_member_ref(
+    refs_by_member: &mut HashMap<(usize, String), Vec<graph::CommunityMemberRef>>,
+    community_id: usize,
+    name: &str,
+    reference: graph::CommunityMemberRef,
+) {
+    let refs = refs_by_member
+        .entry((community_id, name.to_string()))
+        .or_default();
+    if refs.iter().any(|existing| {
+        existing.file == reference.file
+            && existing.line == reference.line
+            && existing.role == reference.role
+            && existing.peer == reference.peer
+    }) {
+        return;
+    }
+    if refs.len() < 6 {
+        refs.push(reference);
+    }
+}
+
+fn choose_symbol_row_by_files<'a>(
+    syms: &'a [index::StoredSymbol],
+    files: &BTreeSet<String>,
+    root: &std::path::Path,
+) -> Option<(&'a index::StoredSymbol, &'static str)> {
+    let matches: Vec<&index::StoredSymbol> = syms
+        .iter()
+        .filter(|sym| files.contains(&index_file_key(&sym.file, root)))
+        .collect();
+    if matches.len() == 1 {
+        Some((matches[0], "edge_file"))
+    } else {
+        None
+    }
+}
+
+fn choose_tagpath_candidate_by_files<'a>(
+    candidates: &'a [TagpathHandleCandidate],
+    files: &BTreeSet<String>,
+    evidence: &'static str,
+) -> Option<(&'a TagpathHandleCandidate, &'static str)> {
+    let matches: Vec<&TagpathHandleCandidate> = candidates
+        .iter()
+        .filter(|candidate| files.contains(&candidate.file))
+        .collect();
+    if matches.len() == 1 {
+        Some((matches[0], evidence))
+    } else {
+        None
+    }
+}
+
+fn annotate_community_members_with_context(
+    communities: &mut [graph::Community],
     db: &index::IndexDb,
     root: &std::path::Path,
-    adapter: &tagpath_adapter::TagpathAdapter,
-) -> std::collections::HashMap<String, String> {
-    let mut out = std::collections::HashMap::new();
-    let mut seen = std::collections::HashSet::new();
-    for name in names {
-        if !seen.insert(name.clone()) {
-            continue;
-        }
-        let Ok(syms) = db.symbol_info(name) else {
-            continue;
-        };
-        if let Some((_, handle)) =
-            tagpath_handle_candidates_for_symbol_rows(name, syms, root, adapter)
-                .into_iter()
-                .next()
-        {
-            out.insert(name.clone(), handle);
+    adapter: Option<&tagpath_adapter::TagpathAdapter>,
+) -> Result<Vec<CommunityMemberAmbiguityDiagnostic>> {
+    let mut community_by_name = HashMap::<String, usize>::new();
+    for community in communities.iter() {
+        for member in &community.members {
+            community_by_name.insert(member.name.clone(), community.id);
         }
     }
-    out
+
+    let mut symbols_by_name = HashMap::<String, Vec<index::StoredSymbol>>::new();
+    for sym in db.all_symbols()? {
+        symbols_by_name
+            .entry(sym.name.clone())
+            .or_default()
+            .push(sym);
+    }
+
+    let mut refs_by_member = HashMap::<(usize, String), Vec<graph::CommunityMemberRef>>::new();
+    let mut evidence_files_by_member = HashMap::<(usize, String), BTreeSet<String>>::new();
+    let mut context_files_by_community = HashMap::<usize, BTreeSet<String>>::new();
+
+    for edge in db.all_stored_edges()? {
+        let Some(&caller_community) = community_by_name.get(&edge.caller_name) else {
+            continue;
+        };
+        let Some(&callee_community) = community_by_name.get(&edge.callee_name) else {
+            continue;
+        };
+        if caller_community != callee_community {
+            continue;
+        }
+
+        let file = index_file_key(&edge.caller_file, root);
+        context_files_by_community
+            .entry(caller_community)
+            .or_default()
+            .insert(file.clone());
+
+        evidence_files_by_member
+            .entry((caller_community, edge.caller_name.clone()))
+            .or_default()
+            .insert(file.clone());
+        push_bounded_community_member_ref(
+            &mut refs_by_member,
+            caller_community,
+            &edge.caller_name,
+            graph::CommunityMemberRef {
+                file: file.clone(),
+                line: edge.caller_line,
+                role: "caller".to_string(),
+                peer: edge.callee_name.clone(),
+            },
+        );
+
+        evidence_files_by_member
+            .entry((callee_community, edge.callee_name.clone()))
+            .or_default()
+            .insert(file.clone());
+        push_bounded_community_member_ref(
+            &mut refs_by_member,
+            callee_community,
+            &edge.callee_name,
+            graph::CommunityMemberRef {
+                file,
+                line: edge.call_site_line,
+                role: "callee".to_string(),
+                peer: edge.caller_name.clone(),
+            },
+        );
+    }
+
+    let mut diagnostics = Vec::new();
+    for community in communities.iter_mut() {
+        let community_files = context_files_by_community
+            .get(&community.id)
+            .cloned()
+            .unwrap_or_default();
+        for member in community.members.iter_mut() {
+            member.file = None;
+            member.line = None;
+            member.tagpath_handle = None;
+            let key = (community.id, member.name.clone());
+            member.refs = refs_by_member.remove(&key).unwrap_or_default();
+
+            let syms = symbols_by_name
+                .get(&member.name)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let evidence_files = evidence_files_by_member
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            let candidates = adapter
+                .map(|adapter| {
+                    tagpath_handle_candidates_for_symbol_rows(&member.name, syms, root, adapter)
+                })
+                .unwrap_or_default();
+
+            let mut selected_file: Option<String> = None;
+            let mut selected_line: Option<i64> = None;
+            let mut selected_handle: Option<String> = None;
+            let mut selected_evidence: Option<&'static str> = None;
+
+            if let Some(candidate) = candidates.first().filter(|_| candidates.len() == 1) {
+                selected_file = Some(candidate.file.clone());
+                selected_line = Some(candidate.line);
+                selected_handle = Some(candidate.handle.clone());
+                selected_evidence = Some("unique_tagpath_handle");
+            } else if let Some((candidate, evidence)) =
+                choose_tagpath_candidate_by_files(&candidates, &evidence_files, "edge_file")
+            {
+                selected_file = Some(candidate.file.clone());
+                selected_line = Some(candidate.line);
+                selected_handle = Some(candidate.handle.clone());
+                selected_evidence = Some(evidence);
+            } else if let Some((candidate, evidence)) =
+                choose_tagpath_candidate_by_files(&candidates, &community_files, "community_file")
+            {
+                selected_file = Some(candidate.file.clone());
+                selected_line = Some(candidate.line);
+                selected_handle = Some(candidate.handle.clone());
+                selected_evidence = Some(evidence);
+            }
+
+            if selected_file.is_none() {
+                if let Some(sym) = syms.first().filter(|_| syms.len() == 1) {
+                    selected_file = Some(index_file_key(&sym.file, root));
+                    selected_line = Some(sym.line);
+                    selected_evidence = Some("unique_symbol_row");
+                } else if let Some((sym, evidence)) =
+                    choose_symbol_row_by_files(syms, &evidence_files, root)
+                {
+                    selected_file = Some(index_file_key(&sym.file, root));
+                    selected_line = Some(sym.line);
+                    selected_evidence = Some(evidence);
+                } else if let Some((sym, _)) =
+                    choose_symbol_row_by_files(syms, &community_files, root)
+                {
+                    selected_file = Some(index_file_key(&sym.file, root));
+                    selected_line = Some(sym.line);
+                    selected_evidence = Some("community_file");
+                }
+            }
+
+            member.file = selected_file.clone();
+            member.line = selected_line;
+            member.tagpath_handle = selected_handle;
+
+            if syms.len() > 1 || candidates.len() > 1 {
+                diagnostics.push(CommunityMemberAmbiguityDiagnostic {
+                    community_id: community.id,
+                    name: member.name.clone(),
+                    candidate_count: syms.len(),
+                    tagpath_candidate_count: candidates.len(),
+                    evidence: selected_evidence
+                        .unwrap_or("ambiguous_no_evidence")
+                        .to_string(),
+                    chosen_file: selected_file,
+                });
+            }
+        }
+    }
+
+    Ok(diagnostics)
 }
 
 /// Annotate `StoredSymbol` definitions in-place with `tagpath_handle` when
@@ -3907,6 +4155,7 @@ pub fn annotate_stored_symbols_with_tagpath(
                 stale: false,
                 reason: None,
                 loaded: true,
+                ambiguous_members: Vec::new(),
             })
         }
         tagpath_adapter::LoadResult::Stale { reason, .. } => {
@@ -3919,6 +4168,7 @@ pub fn annotate_stored_symbols_with_tagpath(
                 stale: true,
                 reason: Some(reason),
                 loaded: false,
+                ambiguous_members: Vec::new(),
             })
         }
         tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
@@ -3979,6 +4229,7 @@ pub fn annotate_stored_edges_with_tagpath(
                 stale: false,
                 reason: None,
                 loaded: true,
+                ambiguous_members: Vec::new(),
             })
         }
         tagpath_adapter::LoadResult::Stale { reason, .. } => {
@@ -3991,6 +4242,7 @@ pub fn annotate_stored_edges_with_tagpath(
                 stale: true,
                 reason: Some(reason),
                 loaded: false,
+                ambiguous_members: Vec::new(),
             })
         }
         tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
@@ -4006,11 +4258,9 @@ pub enum EdgeSide {
 }
 
 /// Annotate every `graph::CommunityMember` in `communities` in-place with
-/// the stable `mem:` handle from the tagpath index. Returns `None` when
-/// no tagpath adapter loaded for `root` (so the caller can suppress
-/// diagnostics for that case); returns `Some(diag)` for the
-/// loaded / stale paths. Same fallback matrix as
-/// [`annotate_hits_with_tagpath`].
+/// file/ref context and, when available, the stable `mem:` handle from the
+/// tagpath index. Duplicate names are resolved through edge/community
+/// evidence rather than a name-only first-row fallback.
 pub fn annotate_communities_with_tagpath(
     communities: &mut [graph::Community],
     db: &index::IndexDb,
@@ -4018,26 +4268,18 @@ pub fn annotate_communities_with_tagpath(
     opts: &TagpathSearchOpts,
 ) -> Result<Option<TagpathAnnotationDiagnostic>> {
     if opts.no_tagpath {
+        annotate_community_members_with_context(communities, db, root, None)?;
         return Ok(None);
     }
     match tagpath_adapter::try_load(root) {
         tagpath_adapter::LoadResult::Loaded(adapter) => {
-            let mut names: Vec<String> = Vec::new();
-            for comm in communities.iter() {
-                names.extend(comm.members.iter().map(|m| m.name.clone()));
-            }
-            let map = resolve_tagpath_handles_for_names(&names, db, root, &adapter);
-            for comm in communities.iter_mut() {
-                for member in comm.members.iter_mut() {
-                    if let Some(handle) = map.get(&member.name) {
-                        member.tagpath_handle = Some(handle.clone());
-                    }
-                }
-            }
+            let ambiguous_members =
+                annotate_community_members_with_context(communities, db, root, Some(&adapter))?;
             Ok(Some(TagpathAnnotationDiagnostic {
                 stale: false,
                 reason: None,
                 loaded: true,
+                ambiguous_members,
             }))
         }
         tagpath_adapter::LoadResult::Stale { reason, .. } => {
@@ -4046,13 +4288,19 @@ pub fn annotate_communities_with_tagpath(
                     "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
                 );
             }
+            let ambiguous_members =
+                annotate_community_members_with_context(communities, db, root, None)?;
             Ok(Some(TagpathAnnotationDiagnostic {
                 stale: true,
                 reason: Some(reason),
                 loaded: false,
+                ambiguous_members,
             }))
         }
-        tagpath_adapter::LoadResult::Missing => Ok(None),
+        tagpath_adapter::LoadResult::Missing => {
+            annotate_community_members_with_context(communities, db, root, None)?;
+            Ok(None)
+        }
     }
 }
 
@@ -4093,6 +4341,7 @@ pub fn annotate_path_nodes_with_tagpath(
                 stale: false,
                 reason: None,
                 loaded: true,
+                ambiguous_members: Vec::new(),
             })
         }
         tagpath_adapter::LoadResult::Stale { reason, .. } => {
@@ -4105,6 +4354,7 @@ pub fn annotate_path_nodes_with_tagpath(
                 stale: true,
                 reason: Some(reason),
                 loaded: false,
+                ambiguous_members: Vec::new(),
             })
         }
         tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
@@ -5436,8 +5686,9 @@ fn cmd_communities(
     tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let tagpath_root = query_tagpath_root(&root, path, scope)?;
     let db = open_index_db(path, scope)?;
-    let tagpath_part = community_tagpath_cache_part(&root, &tagpath_opts)?;
+    let tagpath_part = community_tagpath_cache_part(&tagpath_root, &tagpath_opts)?;
     let CommunityDetectionReport {
         result,
         mut diagnostics,
@@ -5460,8 +5711,9 @@ fn cmd_communities(
         filtered
     };
 
-    if let Some(diag) = annotate_communities_with_tagpath(&mut display, &db, &root, &tagpath_opts)?
-    {
+    let community_annotation =
+        annotate_communities_with_tagpath(&mut display, &db, &tagpath_root, &tagpath_opts)?;
+    if let Some(diag) = community_annotation.as_ref() {
         if diag.stale && !tagpath_opts.no_tagpath {
             eprintln!(
                 "tagpath_index_stale: true (reason={}); falling back to live extraction",
@@ -5470,10 +5722,14 @@ fn cmd_communities(
         }
         if diag.stale {
             tagpath_stale = true;
-            tagpath_stale_reason = diag.reason;
+            tagpath_stale_reason = diag.reason.clone();
         }
     }
-    update_community_annotation_diagnostics(&mut diagnostics, &display);
+    update_community_annotation_diagnostics(
+        &mut diagnostics,
+        &display,
+        community_annotation.as_ref(),
+    );
 
     if json_output {
         let mut out = serde_json::json!({
@@ -5620,6 +5876,20 @@ fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::I
         );
     }
     index::IndexDb::open_read_only_resilient(&db_path)
+}
+
+fn query_tagpath_root(
+    root: &std::path::Path,
+    path_hint: &std::path::Path,
+    scope: Option<&str>,
+) -> Result<PathBuf> {
+    if let Some(scope_name) = scope {
+        return Ok(config::Config::resolve_submodule(root, scope_name)?.source_root);
+    }
+    if let Some(scope) = config::Config::infer_submodule_from_path(root, path_hint)? {
+        return Ok(scope.source_root);
+    }
+    Ok(root.to_path_buf())
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -16502,6 +16772,7 @@ fn cmd_explain_with_budget(
     tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let community_tagpath_root = query_tagpath_root(&root, path, scope)?;
     let format = OutputFormat {
         json_output,
         compact,
@@ -16563,7 +16834,7 @@ fn cmd_explain_with_budget(
         callees.truncate(limit);
     }
 
-    let tagpath_part = community_tagpath_cache_part(&root, &tagpath_opts)?;
+    let tagpath_part = community_tagpath_cache_part(&community_tagpath_root, &tagpath_opts)?;
     let CommunityDetectionReport {
         result: comm_result,
         diagnostics: mut community_diagnostics,
@@ -16575,9 +16846,13 @@ fn cmd_explain_with_budget(
         .cloned();
     if let Some(community) = focused_community.as_mut() {
         let community_slice = std::slice::from_mut(community);
-        if let Some(comm_diag) =
-            annotate_communities_with_tagpath(community_slice, &db, &root, &tagpath_opts)?
-        {
+        let community_annotation = annotate_communities_with_tagpath(
+            community_slice,
+            &db,
+            &community_tagpath_root,
+            &tagpath_opts,
+        )?;
+        if let Some(comm_diag) = community_annotation.as_ref() {
             if comm_diag.stale && !tagpath_opts.no_tagpath && !tagpath_stale {
                 eprintln!(
                     "tagpath_index_stale: true (reason={}); falling back to live extraction",
@@ -16587,11 +16862,15 @@ fn cmd_explain_with_budget(
             if comm_diag.stale {
                 tagpath_stale = true;
                 if tagpath_stale_reason.is_none() {
-                    tagpath_stale_reason = comm_diag.reason;
+                    tagpath_stale_reason = comm_diag.reason.clone();
                 }
             }
         }
-        update_community_annotation_diagnostics(&mut community_diagnostics, community_slice);
+        update_community_annotation_diagnostics(
+            &mut community_diagnostics,
+            community_slice,
+            community_annotation.as_ref(),
+        );
     }
 
     let combined_stale = tagpath_stale && !tagpath_opts.no_tagpath;
