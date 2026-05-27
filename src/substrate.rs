@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 pub const SQLITE_GRAPH_SCHEMA_VERSION: i64 = 5;
 const SQLITE_GRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 256;
+const SQLITE_GRAPH_STAGING_CHUNK_ROWS: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphProvenance {
@@ -1392,6 +1393,97 @@ fn sqlite_refresh_phase_timing(
     }
 }
 
+fn sqlite_graph_staging_placeholders(column_count: usize, row_count: usize) -> String {
+    let row = format!(
+        "({})",
+        (0..column_count)
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    (0..row_count)
+        .map(|_| row.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn sqlite_stage_projection_nodes(
+    tx: &rusqlite::Transaction<'_>,
+    nodes: &[GraphNode],
+    source_watermark: Option<&str>,
+) -> Result<()> {
+    for chunk in nodes.chunks(SQLITE_GRAPH_STAGING_CHUNK_ROWS) {
+        let sql = format!(
+            r#"
+            INSERT INTO next_graph_nodes
+                (id, kind, label, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+            VALUES {}
+            "#,
+            sqlite_graph_staging_placeholders(8, chunk.len())
+        );
+        let mut values = Vec::with_capacity(chunk.len() * 8);
+        for node in chunk {
+            values.push(Value::Text(node.id.clone()));
+            values.push(Value::Text(node.kind.clone()));
+            values.push(Value::Text(node.label.clone()));
+            values.push(Value::Text(to_json(&node.properties)?));
+            values.push(Value::Text(to_json(&node.provenance)?));
+            values.push(
+                optional_to_json(&node.freshness)?
+                    .map(Value::Text)
+                    .unwrap_or(Value::Null),
+            );
+            values.push(Value::Text(row_hash(node)?));
+            values.push(
+                source_watermark
+                    .map(|watermark| Value::Text(watermark.to_string()))
+                    .unwrap_or(Value::Null),
+            );
+        }
+        tx.execute(&sql, params_from_iter(values))?;
+    }
+    Ok(())
+}
+
+fn sqlite_stage_projection_edges(
+    tx: &rusqlite::Transaction<'_>,
+    edges: &[GraphEdge],
+    source_watermark: Option<&str>,
+) -> Result<()> {
+    for chunk in edges.chunks(SQLITE_GRAPH_STAGING_CHUNK_ROWS) {
+        let sql = format!(
+            r#"
+            INSERT INTO next_graph_edges
+                (edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+            VALUES {}
+            "#,
+            sqlite_graph_staging_placeholders(9, chunk.len())
+        );
+        let mut values = Vec::with_capacity(chunk.len() * 9);
+        for edge in chunk {
+            values.push(Value::Text(graph_edge_id(edge)));
+            values.push(Value::Text(edge.from_id.clone()));
+            values.push(Value::Text(edge.to_id.clone()));
+            values.push(Value::Text(edge.kind.clone()));
+            values.push(Value::Text(to_json(&edge.properties)?));
+            values.push(Value::Text(to_json(&edge.provenance)?));
+            values.push(
+                optional_to_json(&edge.freshness)?
+                    .map(Value::Text)
+                    .unwrap_or(Value::Null),
+            );
+            values.push(Value::Text(row_hash(edge)?));
+            values.push(
+                source_watermark
+                    .map(|watermark| Value::Text(watermark.to_string()))
+                    .unwrap_or(Value::Null),
+            );
+        }
+        tx.execute(&sql, params_from_iter(values))?;
+    }
+    Ok(())
+}
+
 impl SqliteGraphStore {
     pub fn open(db_path: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
@@ -1641,58 +1733,28 @@ impl SqliteGraphStore {
         ));
         {
             let started = Instant::now();
-            let mut insert_node = tx.prepare(
-                r#"
-                INSERT INTO next_graph_nodes
-                    (id, kind, label, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                "#,
-            )?;
-            for node in &projection.nodes {
-                insert_node.execute((
-                    &node.id,
-                    &node.kind,
-                    &node.label,
-                    to_json(&node.properties)?,
-                    to_json(&node.provenance)?,
-                    optional_to_json(&node.freshness)?,
-                    row_hash(node)?,
-                    source_watermark.as_deref(),
-                ))?;
-            }
+            sqlite_stage_projection_nodes(&tx, &projection.nodes, source_watermark.as_deref())?;
             phase_timings.push(sqlite_refresh_phase_timing(
                 "sqlite_node_staging",
                 started,
-                "stage graph_nodes rows with row hashes before delta comparison",
+                &format!(
+                    "bulk stage {} graph_nodes rows into temp table using multi-row chunks up to {} rows before delta comparison",
+                    projection.nodes.len(),
+                    SQLITE_GRAPH_STAGING_CHUNK_ROWS
+                ),
             ));
         }
         {
             let started = Instant::now();
-            let mut insert_edge = tx.prepare(
-                r#"
-                INSERT INTO next_graph_edges
-                    (edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                "#,
-            )?;
-            for edge in &projection.edges {
-                let edge_key = graph_edge_id(edge);
-                insert_edge.execute((
-                    &edge_key,
-                    &edge.from_id,
-                    &edge.to_id,
-                    &edge.kind,
-                    to_json(&edge.properties)?,
-                    to_json(&edge.provenance)?,
-                    optional_to_json(&edge.freshness)?,
-                    row_hash(edge)?,
-                    source_watermark.as_deref(),
-                ))?;
-            }
+            sqlite_stage_projection_edges(&tx, &projection.edges, source_watermark.as_deref())?;
             phase_timings.push(sqlite_refresh_phase_timing(
                 "sqlite_edge_staging",
                 started,
-                "stage graph_edges rows with row hashes before delta comparison",
+                &format!(
+                    "bulk stage {} graph_edges rows into temp table using multi-row chunks up to {} rows before delta comparison",
+                    projection.edges.len(),
+                    SQLITE_GRAPH_STAGING_CHUNK_ROWS
+                ),
             ));
         }
         {
@@ -4673,6 +4735,26 @@ mod tests {
         assert_eq!(refresh.upserted_edges, 0);
         assert_eq!(refresh.unchanged_properties, 250);
         assert_eq!(refresh.upserted_properties, 0);
+        assert!(
+            refresh
+                .phase_timings
+                .iter()
+                .any(|phase| phase.name == "sqlite_node_staging"
+                    && phase.detail.contains("bulk stage 126 graph_nodes rows")
+                    && phase.detail.contains("multi-row chunks up to 50 rows")),
+            "{:?}",
+            refresh.phase_timings
+        );
+        assert!(
+            refresh
+                .phase_timings
+                .iter()
+                .any(|phase| phase.name == "sqlite_edge_staging"
+                    && phase.detail.contains("bulk stage 124 graph_edges rows")
+                    && phase.detail.contains("multi-row chunks up to 50 rows")),
+            "{:?}",
+            refresh.phase_timings
+        );
         let staged_node_properties: usize = store
             .conn
             .query_row(
