@@ -48,6 +48,8 @@ pub mod sift;
 pub mod status;
 pub mod substrate;
 pub mod summarize;
+#[cfg(feature = "backend-libsql")]
+pub mod libsql_backend;
 pub mod tagpath_adapter;
 pub mod test_digest;
 pub mod walk;

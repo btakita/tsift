@@ -36,8 +36,12 @@ tree-sitter-bash = { version = "0.25", optional = true }
 tree-sitter-md = { version = "0.5", optional = true }
 tempfile = "3"
 
+libsql = { version = "0.9", optional = true }
+tokio = { version = "1", features = ["rt"], optional = true }
+
 [features]
 default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]
+backend-libsql = ["dep:libsql", "dep:tokio"]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-python = ["dep:tree-sitter-python"]
 lang-typescript = ["dep:tree-sitter-typescript"]
