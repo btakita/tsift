@@ -71,20 +71,14 @@ pub fn workload_display_name(prefix: &str) -> &'static str {
 /// `refresh.duration_micros` is the projection write cost; SQLite's bundled
 /// install and lock behavior cannot be sacrificed for a faster read path on
 /// any other operation.
-pub const REQUIRED_GATE_METRICS: [&str; 2] = [
-    "refresh.duration_micros",
-    "total_duration_micros",
-];
+pub const REQUIRED_GATE_METRICS: [&str; 2] = ["refresh.duration_micros", "total_duration_micros"];
 
 /// Lock-behavior metrics. If any candidate produces a lock-wait metric on a
 /// workload it must also be ≤ SQLite's median for that metric. Absent
 /// lock-wait metrics are not by themselves a block — sibling agents are still
 /// wiring projection-write lock instrumentation, and the gate refuses to
 /// invent evidence.
-pub const LOCK_BEHAVIOR_METRIC_SUFFIXES: [&str; 2] = [
-    "lock_wait_micros",
-    "lock_contention_micros",
-];
+pub const LOCK_BEHAVIOR_METRIC_SUFFIXES: [&str; 2] = ["lock_wait_micros", "lock_contention_micros"];
 
 /// A single fixture run entry, normalized for gate consumption.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -338,14 +332,15 @@ fn median(values: &[f64]) -> Option<f64> {
 fn collect_workload_metrics(
     history: &[GateSample],
     workload_prefix: &str,
-) -> (
-    usize,
-    BTreeMap<(String, String), Vec<f64>>,
-) {
+) -> (usize, BTreeMap<(String, String), Vec<f64>>) {
     let mut sample_count = 0usize;
     let mut per_metric: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
     for sample in history {
-        if !sample.workload_prefixes.iter().any(|w| w == workload_prefix) {
+        if !sample
+            .workload_prefixes
+            .iter()
+            .any(|w| w == workload_prefix)
+        {
             continue;
         }
         sample_count += 1;

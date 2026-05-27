@@ -966,7 +966,10 @@ mod tests {
         for name in ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"] {
             std::fs::write(
                 dir.path().join(name),
-                format!("fn {}_helper() {{}}\nfn main() {{ {0}_helper(); }}\n", name.trim_end_matches(".rs")),
+                format!(
+                    "fn {}_helper() {{}}\nfn main() {{ {0}_helper(); }}\n",
+                    name.trim_end_matches(".rs")
+                ),
             )
             .unwrap();
         }
@@ -985,11 +988,21 @@ mod tests {
         // No budget: every file gets a full parse.
         let full = compute(dir.path(), DiffDigestOptions::default()).unwrap();
         assert_eq!(full.files_changed, 5);
-        assert!(full.symbols_touched >= 5, "full parse should touch every helper symbol: {full:?}");
+        assert!(
+            full.symbols_touched >= 5,
+            "full parse should touch every helper symbol: {full:?}"
+        );
         let total_added: usize = full.files.iter().map(|f| f.added_call_edges.len()).sum();
         let total_removed: usize = full.files.iter().map(|f| f.removed_call_edges.len()).sum();
-        assert!(total_added > 0 && total_removed > 0, "full parse should yield call-edge diffs: {full:?}");
-        assert!(full.files.iter().all(|f| !f.warnings.contains(&"parse_deferred_by_budget".to_string())));
+        assert!(
+            total_added > 0 && total_removed > 0,
+            "full parse should yield call-edge diffs: {full:?}"
+        );
+        assert!(
+            full.files
+                .iter()
+                .all(|f| !f.warnings.contains(&"parse_deferred_by_budget".to_string()))
+        );
 
         // Budget=2: first two files parsed, remaining three deferred.
         let bounded = compute(
@@ -1001,7 +1014,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(bounded.files_changed, 5, "files_changed must count every path");
+        assert_eq!(
+            bounded.files_changed, 5,
+            "files_changed must count every path"
+        );
         assert!(
             bounded.symbols_touched <= full.symbols_touched,
             "bounded symbol count must not exceed full parse"
@@ -1016,19 +1032,45 @@ mod tests {
             .iter()
             .filter(|f| f.warnings.contains(&"parse_deferred_by_budget".to_string()))
             .collect();
-        assert_eq!(parsed.len(), 2, "exactly two files should be parsed: {bounded:?}");
-        assert_eq!(deferred.len(), 3, "remaining three files should be deferred: {bounded:?}");
+        assert_eq!(
+            parsed.len(),
+            2,
+            "exactly two files should be parsed: {bounded:?}"
+        );
+        assert_eq!(
+            deferred.len(),
+            3,
+            "remaining three files should be deferred: {bounded:?}"
+        );
         for f in &deferred {
-            assert!(f.touched_symbols.is_empty(), "deferred file leaked symbols: {f:?}");
-            assert!(f.added_call_edges.is_empty(), "deferred file leaked added edges: {f:?}");
-            assert!(f.removed_call_edges.is_empty(), "deferred file leaked removed edges: {f:?}");
+            assert!(
+                f.touched_symbols.is_empty(),
+                "deferred file leaked symbols: {f:?}"
+            );
+            assert!(
+                f.added_call_edges.is_empty(),
+                "deferred file leaked added edges: {f:?}"
+            );
+            assert!(
+                f.removed_call_edges.is_empty(),
+                "deferred file leaked removed edges: {f:?}"
+            );
             assert_eq!(f.summary_state, DiffDigestSummaryState::Unavailable);
         }
         // Parsing must follow canonical sort: parsed files come first in `files`
         // (sorted by path) and match the first two of the full parse.
         assert_eq!(
-            bounded.files.iter().take(2).map(|f| f.path.clone()).collect::<Vec<_>>(),
-            full.files.iter().take(2).map(|f| f.path.clone()).collect::<Vec<_>>(),
+            bounded
+                .files
+                .iter()
+                .take(2)
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>(),
+            full.files
+                .iter()
+                .take(2)
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>(),
         );
     }
 }

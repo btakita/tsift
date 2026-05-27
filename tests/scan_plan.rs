@@ -83,7 +83,9 @@ fn build_synthetic_graph() -> Connection {
             .prepare("INSERT INTO graph_edges(edge_key, from_id, to_id, kind) VALUES (?1, 'hub-0', ?2, 'defines')")
             .unwrap();
         let mut insert_node_prop = tx
-            .prepare("INSERT INTO graph_node_properties(node_id, key, value) VALUES (?1, 'path', ?2)")
+            .prepare(
+                "INSERT INTO graph_node_properties(node_id, key, value) VALUES (?1, 'path', ?2)",
+            )
             .unwrap();
         let mut insert_edge_prop = tx
             .prepare(
@@ -93,7 +95,11 @@ fn build_synthetic_graph() -> Connection {
         for idx in 0..HUB_LEAVES {
             let node_id = format!("leaf-{idx:05}");
             let edge_key = format!("edge-hub-{idx:05}");
-            let path = if idx % 3 == 0 { "src/lib.rs" } else { "src/main.rs" };
+            let path = if idx % 3 == 0 {
+                "src/lib.rs"
+            } else {
+                "src/main.rs"
+            };
             let label = if idx % 10 == 0 { "hot" } else { "cold" };
             insert_node.execute((&node_id, &node_id)).unwrap();
             insert_edge.execute((&edge_key, &node_id)).unwrap();
@@ -131,9 +137,7 @@ fn build_synthetic_graph() -> Connection {
 }
 
 fn query_plan(conn: &Connection, sql: &str) -> String {
-    let mut stmt = conn
-        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-        .unwrap();
+    let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
     let rows: Vec<String> = stmt
         .query_map([], |row| row.get::<_, String>(3))
         .unwrap()

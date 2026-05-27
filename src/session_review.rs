@@ -885,12 +885,15 @@ pub fn compute_with_options_and_phases(
     phases.push(SessionReviewPhaseTiming {
         name: "target_context_build".to_string(),
         duration_micros: target_context_micros,
-        detail: "build target context (root, canonical target, kind, aliases) before session discovery".to_string(),
+        detail:
+            "build target context (root, canonical target, kind, aliases) before session discovery"
+                .to_string(),
     });
     phases.push(SessionReviewPhaseTiming {
         name: "session_discovery".to_string(),
         duration_micros: session_discovery_micros,
-        detail: "agent-doc + Claude JSONL + Codex JSONL session candidate discovery and ranking".to_string(),
+        detail: "agent-doc + Claude JSONL + Codex JSONL session candidate discovery and ranking"
+            .to_string(),
     });
     phases.push(SessionReviewPhaseTiming {
         name: "session_digest_total".to_string(),
@@ -905,12 +908,14 @@ pub fn compute_with_options_and_phases(
     phases.push(SessionReviewPhaseTiming {
         name: "session_aggregation".to_string(),
         duration_micros: session_aggregation_micros,
-        detail: "per-session prompt/file/symbol/failure aggregation into bounded BTreeMaps".to_string(),
+        detail: "per-session prompt/file/symbol/failure aggregation into bounded BTreeMaps"
+            .to_string(),
     });
     phases.push(SessionReviewPhaseTiming {
         name: "report_assembly".to_string(),
         duration_micros: report_assembly_micros,
-        detail: "post-loop collect_strings + sort + next-context derivation + report construction".to_string(),
+        detail: "post-loop collect_strings + sort + next-context derivation + report construction"
+            .to_string(),
     });
 
     Ok((report, phases))
@@ -1688,12 +1693,7 @@ fn collect_recent_files_with_extension(
 ) -> Result<Vec<PathBuf>> {
     let mut entries: Vec<(Option<u64>, PathBuf)> = Vec::new();
     collect_recent_files_with_extension_inner(root, extension, &mut entries)?;
-    entries.sort_by(|left, right| {
-        right
-            .0
-            .cmp(&left.0)
-            .then_with(|| left.1.cmp(&right.1))
-    });
+    entries.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
     entries.truncate(limit);
     Ok(entries.into_iter().map(|(_, path)| path).collect())
 }
@@ -1929,16 +1929,24 @@ mod tests {
         )
         .unwrap();
 
-        let matched =
-            read_jsonl_session_text_if_cwd_matches(&matching, &context, "test", extract_claude_cwd_from_text)
-                .unwrap();
+        let matched = read_jsonl_session_text_if_cwd_matches(
+            &matching,
+            &context,
+            "test",
+            extract_claude_cwd_from_text,
+        )
+        .unwrap();
         assert!(
             matched.is_some(),
             "file with matching cwd should return Some(text)"
         );
-        let skipped =
-            read_jsonl_session_text_if_cwd_matches(&other, &context, "test", extract_claude_cwd_from_text)
-                .unwrap();
+        let skipped = read_jsonl_session_text_if_cwd_matches(
+            &other,
+            &context,
+            "test",
+            extract_claude_cwd_from_text,
+        )
+        .unwrap();
         assert!(
             skipped.is_none(),
             "file with non-matching cwd should return None"

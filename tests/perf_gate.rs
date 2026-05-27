@@ -31,7 +31,10 @@ fn load_fixture() -> Vec<GateSample> {
 #[test]
 fn fixture_entries_parse_with_label_id_and_metrics() {
     let samples = load_fixture();
-    assert!(!samples.is_empty(), "fixture should contain at least one run");
+    assert!(
+        !samples.is_empty(),
+        "fixture should contain at least one run"
+    );
     for sample in &samples {
         assert!(
             !sample.label.is_empty(),
@@ -274,9 +277,7 @@ fn hop_cap_gate_requires_deep_chain_rows_to_expand() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn build_synthetic_history(
-    workloads: &[(&str, usize, f64, f64)],
-) -> Vec<GateSample> {
+fn build_synthetic_history(workloads: &[(&str, usize, f64, f64)]) -> Vec<GateSample> {
     let mut runs = Vec::new();
     for (prefix, n, sqlite_us, cand_us) in workloads {
         for i in 1..=*n {
