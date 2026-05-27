@@ -526,6 +526,9 @@ enum Commands {
         /// Also inject auto-reindex hook into .codex/hooks.json
         #[arg(long)]
         codex: bool,
+        /// Also install project-local OpenCode tsift command shortcuts
+        #[arg(long)]
+        opencode: bool,
         /// Resolve to the workspace root and install a workspace-wide hook
         #[arg(long)]
         workspace: bool,
@@ -1788,8 +1791,9 @@ fn main() -> Result<()> {
         Some(Commands::Init {
             path,
             codex,
+            opencode,
             workspace,
-        }) => cmd_init(&path, codex, workspace),
+        }) => cmd_init(&path, codex, opencode, workspace),
         Some(Commands::Lint {
             file,
             index,
@@ -29157,7 +29161,7 @@ fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn cmd_init(path: &std::path::Path, codex: bool, workspace: bool) -> Result<()> {
+fn cmd_init(path: &std::path::Path, codex: bool, opencode: bool, workspace: bool) -> Result<()> {
     let resolved = if workspace {
         init::resolve_workspace_dir(path)?
     } else {
@@ -29167,7 +29171,7 @@ fn cmd_init(path: &std::path::Path, codex: bool, workspace: bool) -> Result<()> 
         println!("resolved: {} → {}", path.display(), resolved.display());
     }
     let codex_workspace = codex && (workspace || init::has_submodules(&resolved)?);
-    let result = init::init(&resolved, codex, codex_workspace)?;
+    let result = init::init_with_integrations(&resolved, codex, codex_workspace, opencode)?;
     for update in result.updates {
         println!(
             "{}: {} ({})",
@@ -29213,6 +29217,16 @@ fn cmd_init(path: &std::path::Path, codex: bool, workspace: bool) -> Result<()> 
                     scope_label
                 );
             }
+        }
+    }
+    if let Some(opencode_commands) = &result.opencode_commands {
+        for update in opencode_commands {
+            println!(
+                "{}: {} (OpenCode /{} tsift shortcut)",
+                update.file.display(),
+                update.action,
+                update.command_name
+            );
         }
     }
     Ok(())

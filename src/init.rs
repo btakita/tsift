@@ -13,7 +13,7 @@ fn versioned_section() -> String {
         r#"<!-- tsift:code-navigation v={version} -->
 ## Code Navigation
 
-Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead. Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`.
+Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead. Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`; OpenCode projects can install per-project tsift command shortcuts with `tsift init --opencode`.
 
 Use the commands listed in its `use:` output:
 - `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)
@@ -55,11 +55,13 @@ pub enum InstructionStatus {
 
 const GITIGNORE_ENTRY: &str = ".tsift/";
 const CODEX_HOOK_STATUS: &str = "tsift auto-reindex";
+const OPENCODE_COMMAND_MARKER_PREFIX: &str = "<!-- tsift:opencode-command";
 
 pub struct InitResult {
     pub updates: Vec<InstructionUpdate>,
     pub gitignore_added: bool,
     pub codex_hooks: Option<CodexHooksResult>,
+    pub opencode_commands: Option<Vec<OpenCodeCommandUpdate>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +82,13 @@ pub enum CodexHookAction {
 pub enum CodexHookScope {
     Project,
     Workspace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCodeCommandUpdate {
+    pub file: PathBuf,
+    pub command_name: &'static str,
+    pub action: InitAction,
 }
 
 pub struct InstructionUpdate {
@@ -170,6 +179,15 @@ pub fn has_submodules(dir: &Path) -> Result<bool> {
 }
 
 pub fn init(dir: &Path, codex: bool, codex_workspace: bool) -> Result<InitResult> {
+    init_with_integrations(dir, codex, codex_workspace, false)
+}
+
+pub fn init_with_integrations(
+    dir: &Path,
+    codex: bool,
+    codex_workspace: bool,
+    opencode: bool,
+) -> Result<InitResult> {
     let gitignore_added = ensure_gitignore(dir)?;
     let mut updates = Vec::new();
 
@@ -201,10 +219,17 @@ pub fn init(dir: &Path, codex: bool, codex_workspace: bool) -> Result<InitResult
         None
     };
 
+    let opencode_commands = if opencode {
+        Some(ensure_opencode_commands(dir)?)
+    } else {
+        None
+    };
+
     Ok(InitResult {
         updates,
         gitignore_added,
         codex_hooks,
+        opencode_commands,
     })
 }
 
@@ -377,6 +402,99 @@ fn codex_hook_command(dir: &Path, scope: CodexHookScope) -> String {
             quoted_dir, quoted_dir
         ),
     }
+}
+
+struct OpenCodeCommandSpec {
+    name: &'static str,
+    description: &'static str,
+    body: &'static str,
+}
+
+const OPENCODE_COMMANDS: &[OpenCodeCommandSpec] = &[
+    OpenCodeCommandSpec {
+        name: "tsift-status",
+        description: "Refresh and summarize tsift index status",
+        body: r#"Run `tsift status --fix` from the project root, then summarize index freshness, instruction freshness, summary-cache state, and any recommended `use:` or `run:` commands. Stop and report the exact failure if the command fails."#,
+    },
+    OpenCodeCommandSpec {
+        name: "tsift-session-review",
+        description: "Summarize bounded agent session context",
+        body: r#"Run `tsift --envelope session-review <target> --next-context --budget normal`, where `<target>` is `$ARGUMENTS` or `.` when no argument is provided. Summarize prompt targets, unresolved failures, touched files/symbols, and next digest commands. Do not replay raw transcripts."#,
+    },
+    OpenCodeCommandSpec {
+        name: "tsift-context-pack",
+        description: "Build a bounded tsift context pack",
+        body: r#"Run `tsift --envelope context-pack <target> --budget normal`, where `<target>` is `$ARGUMENTS` or `.` when no argument is provided. Use source handles and expansion commands from the packet before reading whole files."#,
+    },
+    OpenCodeCommandSpec {
+        name: "tsift-diff-digest",
+        description: "Digest current or requested git diff",
+        body: r#"Run `tsift diff-digest <target>`, where `<target>` is `$ARGUMENTS` or `.` when no argument is provided. Summarize changed paths, high-signal hunks, and any follow-up expansion commands instead of pasting the raw diff."#,
+    },
+    OpenCodeCommandSpec {
+        name: "tsift-test-digest",
+        description: "Run tests through the bounded digest runner",
+        body: r#"Run a bounded test digest. If `$ARGUMENTS` names a test command, run `tsift --envelope __digest-runner --kind test --path . --shell-command '<command>'`; otherwise choose the project test command from the local instructions and wrap it the same way. Summarize failing tests, failure lines, and artifact handles."#,
+    },
+    OpenCodeCommandSpec {
+        name: "tsift-log-digest",
+        description: "Run a verbose command through the bounded log digest",
+        body: r#"Run a bounded log digest. If `$ARGUMENTS` names a build, install, or verification command, run `tsift --envelope __digest-runner --kind log --path . --shell-command '<command>'`; otherwise ask for the command before running. Summarize compact output, failures, and artifact handles."#,
+    },
+];
+
+fn ensure_opencode_commands(dir: &Path) -> Result<Vec<OpenCodeCommandUpdate>> {
+    let commands_dir = dir.join(".opencode").join("commands");
+    std::fs::create_dir_all(&commands_dir)?;
+
+    let mut updates = Vec::new();
+    for spec in OPENCODE_COMMANDS {
+        let file = commands_dir.join(format!("{}.md", spec.name));
+        let action = ensure_opencode_command_file(&file, spec)?;
+        updates.push(OpenCodeCommandUpdate {
+            file,
+            command_name: spec.name,
+            action,
+        });
+    }
+    Ok(updates)
+}
+
+fn ensure_opencode_command_file(file: &Path, spec: &OpenCodeCommandSpec) -> Result<InitAction> {
+    let content = opencode_command_content(spec);
+    if file.exists() {
+        let existing = std::fs::read_to_string(file)?;
+        if existing == content {
+            return Ok(InitAction::AlreadyPresent);
+        }
+        if !existing.contains(OPENCODE_COMMAND_MARKER_PREFIX) {
+            bail!(
+                "{} already exists and is not managed by tsift; move it or add the tsift marker before rerunning --opencode",
+                file.display()
+            );
+        }
+        std::fs::write(file, content)?;
+        Ok(InitAction::Updated)
+    } else {
+        std::fs::write(file, content)?;
+        Ok(InitAction::Created)
+    }
+}
+
+fn opencode_command_content(spec: &OpenCodeCommandSpec) -> String {
+    format!(
+        r#"<!-- tsift:opencode-command v={version} name={name} -->
+---
+description: {description}
+---
+
+{body}
+"#,
+        version = TSIFT_VERSION,
+        name = spec.name,
+        description = spec.description,
+        body = spec.body
+    )
 }
 
 fn shell_quote(s: &str) -> String {
@@ -956,7 +1074,85 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let result = init(dir.path(), false, false).unwrap();
         assert!(result.codex_hooks.is_none());
+        assert!(result.opencode_commands.is_none());
         assert!(!dir.path().join(".codex/hooks.json").exists());
+        assert!(!dir.path().join(".opencode/commands").exists());
+    }
+
+    #[test]
+    fn init_opencode_creates_command_shortcuts() {
+        let dir = TempDir::new().unwrap();
+        let result = init_with_integrations(dir.path(), false, false, true).unwrap();
+        let commands = result
+            .opencode_commands
+            .expect("opencode command updates should be present");
+        assert_eq!(commands.len(), OPENCODE_COMMANDS.len());
+        assert!(
+            commands
+                .iter()
+                .all(|update| matches!(update.action, InitAction::Created))
+        );
+
+        let status =
+            std::fs::read_to_string(dir.path().join(".opencode/commands/tsift-status.md")).unwrap();
+        assert!(status.contains(OPENCODE_COMMAND_MARKER_PREFIX));
+        assert!(status.contains("description: Refresh and summarize tsift index status"));
+        assert!(status.contains("tsift status --fix"));
+
+        let session_review = std::fs::read_to_string(
+            dir.path()
+                .join(".opencode/commands/tsift-session-review.md"),
+        )
+        .unwrap();
+        assert!(session_review.contains("$ARGUMENTS"));
+        assert!(session_review.contains("tsift --envelope session-review"));
+        assert!(session_review.contains("--next-context --budget normal"));
+
+        let test_digest =
+            std::fs::read_to_string(dir.path().join(".opencode/commands/tsift-test-digest.md"))
+                .unwrap();
+        assert!(test_digest.contains("__digest-runner"));
+        assert!(test_digest.contains("--kind test"));
+    }
+
+    #[test]
+    fn init_opencode_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let first = init_with_integrations(dir.path(), false, false, true).unwrap();
+        assert!(
+            first
+                .opencode_commands
+                .unwrap()
+                .iter()
+                .all(|update| matches!(update.action, InitAction::Created))
+        );
+
+        let second = init_with_integrations(dir.path(), false, false, true).unwrap();
+        assert!(
+            second
+                .opencode_commands
+                .unwrap()
+                .iter()
+                .all(|update| matches!(update.action, InitAction::AlreadyPresent))
+        );
+    }
+
+    #[test]
+    fn init_opencode_refuses_unmanaged_command_conflict() {
+        let dir = TempDir::new().unwrap();
+        let commands_dir = dir.path().join(".opencode/commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("tsift-status.md"),
+            "---\ndescription: user command\n---\n\nDo something else.\n",
+        )
+        .unwrap();
+
+        let err = init_with_integrations(dir.path(), false, false, true)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("not managed by tsift"), "{err}");
     }
 
     #[test]
@@ -966,6 +1162,7 @@ mod tests {
         let content = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
         let expected_marker = format!("<!-- tsift:code-navigation v={} -->", TSIFT_VERSION);
         assert!(content.contains(&expected_marker));
+        assert!(content.contains("tsift init --opencode"));
         assert!(content.contains("tsift --envelope session-review <path> --next-context"));
         assert!(content.contains("tsift --envelope context-pack <path>"));
         assert!(content.contains("tsift diff-digest [path]"));

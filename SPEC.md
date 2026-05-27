@@ -955,6 +955,7 @@ tsift init <path>                       # inject at <path> (dir or file)
 tsift init src/sub/tasks/plan.md        # resolves to submodule root src/sub/
 tsift init --codex                      # also inject auto-reindex hook into .codex/hooks.json
 tsift init --codex --workspace          # resolve to workspace root + install one workspace hook
+tsift init --opencode                   # install .opencode/commands/tsift-*.md shortcuts
 ```
 
 ### Path Resolution
@@ -977,10 +978,13 @@ With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject
 4. If the section already exists (detected by `<!-- tsift:code-navigation -->` markers), updates it in place
 5. Idempotent — running twice produces no changes on the second run
 6. With `--codex`: merges a `UserPromptSubmit` auto-reindex hook into `.codex/hooks.json` (creates the file and directory if needed, updates stale tsift commands in place, removes duplicate tsift hook entries, idempotent)
-7. When the resolved target has `.gitmodules`, the Codex hook automatically uses `tsift index --check --exit-code --workspace <root>` / `tsift index --workspace <root>` so one root hook covers initialized submodules. `--workspace` makes that root resolution explicit from inside a submodule.
-8. The injected Code Navigation section explicitly tells harnesses to switch to the owning repo or submodule root before running tsift/build/test commands, so submodule work does not inherit the wider superproject instruction surface by accident.
-9. The injected section also steers harnesses toward envelope-backed `search`, `explain`, `session-review`, `context-pack`, and digest-runner artifacts instead of raw transcript replays, `git diff/show/log` patch dumps, or verbose build/test output reads.
-10. The injected section tells agents to run the local default suite with `make check`, then check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1`; deterministic simulation coverage runs in the default suite, and CI failures must be fixed before the work is complete.
+7. With `--opencode`: installs marker-owned `.opencode/commands/tsift-*.md` command templates for status, session review, context pack, diff digest, test digest, and log digest workflows. Existing marker-owned files are updated idempotently; unmanaged same-name command files fail closed instead of being overwritten.
+8. When the resolved target has `.gitmodules`, the Codex hook automatically uses `tsift index --check --exit-code --workspace <root>` / `tsift index --workspace <root>` so one root hook covers initialized submodules. `--workspace` makes that root resolution explicit from inside a submodule.
+9. The injected Code Navigation section explicitly tells harnesses to switch to the owning repo or submodule root before running tsift/build/test commands, so submodule work does not inherit the wider superproject instruction surface by accident.
+10. The injected section also steers harnesses toward envelope-backed `search`, `explain`, `session-review`, `context-pack`, and digest-runner artifacts instead of raw transcript replays, `git diff/show/log` patch dumps, or verbose build/test output reads.
+11. The injected section tells agents to run the local default suite with `make check`, then check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1`; deterministic simulation coverage runs in the default suite, and CI failures must be fixed before the work is complete.
+
+The OpenCode command shortcut set is intentionally prompt-template based rather than a background hook: OpenCode already reads project `AGENTS.md`, and the managed commands give operators explicit `/tsift-status`, `/tsift-session-review`, `/tsift-context-pack`, `/tsift-diff-digest`, `/tsift-test-digest`, and `/tsift-log-digest` entrypoints that route common workflows through bounded tsift evidence without depending on raw terminal replay.
 
 ### Injected Section
 
@@ -988,7 +992,7 @@ With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject
 <!-- tsift:code-navigation v=0.1.42 -->
 ## Code Navigation
 
-Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead. Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`.
+Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead. Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`; OpenCode projects can install per-project tsift command shortcuts with `tsift init --opencode`.
 
 Use the commands listed in its `use:` output:
 - `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)

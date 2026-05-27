@@ -29,6 +29,7 @@ crates.io with `cargo install tsift`.
 
 ```sh
 tsift status --fix
+tsift init --opencode
 tsift --envelope search "route dispatch" --budget normal
 tsift --envelope source-read src/main.rs --start 1 --lines 120 --budget normal
 tsift diff-digest .
@@ -51,7 +52,11 @@ tsift convex-sync . --chunk-size 100 --json
 
 For agent-doc projects, run `tsift status` from the repository root at session
 start. If `status` recommends a fix, run `tsift status --fix` before depending
-on search or digest output.
+on search or digest output. OpenCode users can run `tsift init --opencode` to
+install project-local `.opencode/commands/tsift-*.md` shortcuts for status,
+session-review, context-pack, diff-digest, test-digest, and log-digest
+workflows; existing same-name command files without tsift ownership markers are
+left untouched and reported as conflicts.
 
 Graph DB and Convex operator examples live under
 `fixtures/graph-db-operator-examples`; the reusable Convex app-side schema,
