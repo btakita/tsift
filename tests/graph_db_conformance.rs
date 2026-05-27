@@ -2256,6 +2256,21 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         json!(["real", "full_projection", "synthetic_deep_chain"]),
         "{report}"
     );
+    for workload in ["real", "full_projection", "synthetic_deep_chain"] {
+        for hops in ["128", "256", "512"] {
+            for leaf in ["duration_micros", "rows"] {
+                let metric = format!("{workload}.sqlite.path_max_hops_{hops}.{leaf}");
+                assert!(
+                    report["performance_gate"]["hop_cap_promotion"]["required_metrics"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|candidate| candidate == &metric),
+                    "missing hop-cap promotion metric {metric}: {report}"
+                );
+            }
+        }
+    }
     assert!(
         report["performance_gate"]["hop_cap_promotion"]["required_metrics"]
             .as_array()
