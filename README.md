@@ -56,7 +56,10 @@ on search or digest output. OpenCode users can run `tsift init --opencode` to
 install project-local `.opencode/commands/tsift-*.md` shortcuts for status,
 session-review, context-pack, diff-digest, test-digest, and log-digest
 workflows; existing same-name command files without tsift ownership markers are
-left untouched and reported as conflicts.
+left untouched and reported as conflicts. The same command pack is packaged as
+the `opencode-tsift` npm plugin; once it is published to npm, OpenCode users can
+run `opencode plugin opencode-tsift` and get the marker-owned shortcuts without
+cloning this repository.
 
 Graph DB and Convex operator examples live under
 `fixtures/graph-db-operator-examples`; the reusable Convex app-side schema,
@@ -129,3 +132,8 @@ The release workflow uses the `TSIFT_ENABLE_CRATES_PUBLISH=true` repository
 variable and `CARGO_REGISTRY_TOKEN` repository secret to turn on tagged
 crates.io publishes. The default lexical search adapter is maintained in-tree,
 so publishing no longer depends on an upstream git-only `sift` crate.
+
+The OpenCode command pack under `packages/opencode-tsift` is publishable to npm.
+The release workflow dry-runs `npm publish --access public`; tagged npm
+publishing is enabled with `TSIFT_ENABLE_NPM_PUBLISH=true` and an `NPM_TOKEN`
+repository secret.

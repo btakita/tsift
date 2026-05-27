@@ -1,0 +1,41 @@
+{
+  "name": "opencode-tsift",
+  "version": "0.1.62",
+  "description": "OpenCode command shortcuts for tsift bounded code navigation and session evidence",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./server": "./src/index.js"
+  },
+  "bin": {
+    "opencode-tsift": "bin/opencode-tsift.js"
+  },
+  "files": [
+    "bin/",
+    "commands/",
+    "src/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "pack:check": "npm pack --dry-run",
+    "publish:check": "npm publish --access public --dry-run"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tsift",
+    "agent",
+    "commands"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/btakita/tsift.git",
+    "directory": "packages/opencode-tsift"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1138,6 +1138,27 @@ mod tests {
     }
 
     #[test]
+    fn opencode_npm_package_matches_init_command_shortcuts() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let package_dir = manifest_dir.join("packages/opencode-tsift");
+        let package_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(package_dir.join("package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(package_json["version"], TSIFT_VERSION);
+
+        for spec in OPENCODE_COMMANDS {
+            let packaged = std::fs::read_to_string(
+                package_dir
+                    .join("commands")
+                    .join(format!("{}.md", spec.name)),
+            )
+            .unwrap_or_else(|_| panic!("missing packaged OpenCode command {}", spec.name));
+            assert_eq!(packaged, opencode_command_content(spec));
+        }
+    }
+
+    #[test]
     fn init_opencode_refuses_unmanaged_command_conflict() {
         let dir = TempDir::new().unwrap();
         let commands_dir = dir.path().join(".opencode/commands");
