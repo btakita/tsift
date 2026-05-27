@@ -1155,6 +1155,10 @@ fn assert_graph_db_snapshot_query_parity(project: &Path, snapshot: &Path) {
         &convex_neighborhood["page"],
     );
     assert_sqlite_page_uses_index(&sqlite_neighborhood["page"], "idx_graph_edges_from_kind");
+    assert_sqlite_page_diagnostic_contains(
+        &sqlite_neighborhood["page"],
+        "one recursive reachable-set CTE",
+    );
 
     let repeated_sqlite_neighborhood = graph_db_json(
         project,
@@ -1521,8 +1525,10 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             "missing phase {phase}: {report}"
         );
     }
-    let session_review_total =
-        phase_duration(&report, "conflict_matrix_preparation.session_review_compute");
+    let session_review_total = phase_duration(
+        &report,
+        "conflict_matrix_preparation.session_review_compute",
+    );
     let session_review_sub_sum: u64 = [
         "conflict_matrix_preparation.session_review_compute.target_context_build",
         "conflict_matrix_preparation.session_review_compute.session_discovery",
@@ -1625,6 +1631,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                     "edge_lookup".to_string(),
                     "edge_property_scan".to_string(),
                     "incident_edges".to_string(),
+                    "neighborhood".to_string(),
                     "path_max_hops".to_string(),
                     "path_max_hops_128".to_string(),
                     "path_max_hops_256".to_string(),
@@ -1831,6 +1838,13 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         report["metrics"]
             .as_object()
             .unwrap()
+            .contains_key("real.sqlite.neighborhood.duration_micros_per_1k_graph_rows"),
+        "{report}"
+    );
+    assert!(
+        report["metrics"]
+            .as_object()
+            .unwrap()
             .contains_key("real.sqlite.evidence_target_resolution.duration_micros"),
         "{report}"
     );
@@ -1876,7 +1890,19 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
     );
     assert!(
         report["metrics"].as_object().unwrap().contains_key(
+            "synthetic_high_degree.sqlite.neighborhood.duration_micros_per_1k_graph_rows"
+        ),
+        "{report}"
+    );
+    assert!(
+        report["metrics"].as_object().unwrap().contains_key(
             "synthetic_deep_chain.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows"
+        ),
+        "{report}"
+    );
+    assert!(
+        report["metrics"].as_object().unwrap().contains_key(
+            "synthetic_deep_chain.sqlite.neighborhood.duration_micros_per_1k_graph_rows"
         ),
         "{report}"
     );
@@ -2054,8 +2080,34 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .as_array()
             .unwrap()
             .iter()
+            .any(|metric| metric == "real.sqlite.neighborhood.duration_micros_per_1k_graph_rows"),
+        "{report}"
+    );
+    assert!(
+        report["performance_gate"]["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
             .any(|metric| metric
                 == "real.sqlite.path_max_hops_512.duration_micros_per_1k_graph_rows"),
+        "{report}"
+    );
+    assert!(
+        report["performance_gate"]["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|metric| metric
+                == "synthetic_high_degree.sqlite.neighborhood.duration_micros_per_1k_graph_rows"),
+        "{report}"
+    );
+    assert!(
+        report["performance_gate"]["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|metric| metric
+                == "synthetic_deep_chain.sqlite.neighborhood.duration_micros_per_1k_graph_rows"),
         "{report}"
     );
     assert!(
@@ -2312,6 +2364,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "full_projection.sqlite.sqlite_delta_write.duration_micros",
         "full_projection.sqlite.sqlite_edge_staging.duration_micros",
         "full_projection.sqlite.post_write_reads.duration_micros",
+        "full_projection.sqlite.neighborhood.duration_micros",
         "full_projection.sqlite.evidence_target_resolution.duration_micros",
         "full_projection.sqlite.evidence.duration_micros",
         "full_projection.sqlite.path_max_hops.duration_micros",
@@ -4469,6 +4522,11 @@ fn graph_db_scale_caps_pagination_paths_doctor_and_sqlite_plans() {
     assert_eq!(neighborhood["page"]["returned_nodes"], 13);
     assert!(neighborhood["page"]["truncated"].as_bool().unwrap());
     assert!(neighborhood["edges"].as_array().unwrap().len() <= 12);
+    assert_sqlite_page_uses_index(&neighborhood["page"], "idx_graph_edges_from_kind");
+    assert_sqlite_page_diagnostic_contains(
+        &neighborhood["page"],
+        "one recursive reachable-set CTE",
+    );
 
     let capped_path = graph_db_json(
         project.path(),
@@ -4829,9 +4887,8 @@ impl MockConvexSnapshotServer {
                         stream
                             .set_nonblocking(false)
                             .expect("clear nonblocking on accepted stream");
-                        let mut reader = BufReader::new(
-                            stream.try_clone().expect("clone stream for read half"),
-                        );
+                        let mut reader =
+                            BufReader::new(stream.try_clone().expect("clone stream for read half"));
                         let mut request_line = String::new();
                         if reader.read_line(&mut request_line).is_err() {
                             continue;
@@ -5054,8 +5111,14 @@ fn convex_sync_remote_snapshot_uses_paginated_transport_against_mock_backend() {
         calls.first().is_some_and(|op| op == "snapshot_meta"),
         "expected first call to be snapshot_meta, got {calls:?}"
     );
-    let nodes_pages = calls.iter().filter(|op| *op == "snapshot_nodes_page").count();
-    let edges_pages = calls.iter().filter(|op| *op == "snapshot_edges_page").count();
+    let nodes_pages = calls
+        .iter()
+        .filter(|op| *op == "snapshot_nodes_page")
+        .count();
+    let edges_pages = calls
+        .iter()
+        .filter(|op| *op == "snapshot_edges_page")
+        .count();
     assert!(
         nodes_pages >= node_count.div_ceil(3),
         "expected at least {} node page calls, got {nodes_pages} (calls={calls:?})",

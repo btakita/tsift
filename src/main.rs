@@ -12374,6 +12374,52 @@ fn graph_db_backend_eval_path_operation<S: GraphStore>(
     })
 }
 
+fn graph_db_backend_eval_neighborhood_operation<S: GraphStore>(
+    store: &S,
+    depth: usize,
+    limit: usize,
+) -> (
+    GraphDbBackendEvalOperation,
+    Option<GraphDbBackendEvalSignature>,
+) {
+    graph_db_backend_eval_timed("neighborhood", || {
+        let edge = match store.sample_edge(Some("calls"))? {
+            Some(edge) => edge,
+            None => store.sample_edge(None)?.context(
+                "backend-eval neighborhood probe requires at least one traversable edge",
+            )?,
+        };
+        let page = store
+            .paged_neighborhood(
+                &edge.from_id,
+                depth,
+                Some(&edge.kind),
+                GraphQueryOptions {
+                    limit: Some(limit.max(1)),
+                    ..GraphQueryOptions::default()
+                },
+            )?
+            .with_context(|| {
+                format!(
+                    "backend-eval neighborhood target not found: {}",
+                    edge.from_id
+                )
+            })?;
+        Ok((
+            Some(page.nodes.len() + page.edges.len()),
+            serde_json::json!({
+                "center": edge.from_id,
+                "kind": edge.kind,
+                "depth": depth,
+                "limit": limit.max(1),
+                "node_ids": page.nodes.iter().map(|node| &node.id).collect::<Vec<_>>(),
+                "edge_ids": page.edges.iter().map(graph_db_edge_key).collect::<Vec<_>>(),
+                "truncated": page.page.truncated,
+            }),
+        ))
+    })
+}
+
 fn graph_db_backend_eval_evidence_signature(report: &GraphDbEvidenceReport) -> serde_json::Value {
     serde_json::json!({
         "target": report.target,
@@ -12562,6 +12608,10 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
             }),
         ))
     });
+    operations.push(operation);
+    signatures.extend(signature);
+
+    let (operation, signature) = graph_db_backend_eval_neighborhood_operation(store, depth, limit);
     operations.push(operation);
     signatures.extend(signature);
 
@@ -13144,6 +13194,7 @@ fn graph_db_backend_eval_performance_gate(
         "real.sqlite.edge_lookup.duration_micros_per_1k_graph_rows".to_string(),
         "real.sqlite.edge_property_scan.duration_micros_per_1k_graph_rows".to_string(),
         "real.sqlite.incident_edges.duration_micros_per_1k_graph_rows".to_string(),
+        "real.sqlite.neighborhood.duration_micros_per_1k_graph_rows".to_string(),
         "real.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows".to_string(),
         "real.sqlite.evidence.duration_micros_per_1k_graph_rows".to_string(),
         "real.sqlite.total_duration_micros_per_1k_graph_rows".to_string(),
@@ -13162,11 +13213,13 @@ fn graph_db_backend_eval_performance_gate(
         "real.sqlite.path_max_hops_512.duration_micros_per_1k_graph_rows".to_string(),
         "synthetic_high_degree.sqlite.total_duration_micros".to_string(),
         "synthetic_high_degree.sqlite.total_duration_micros_per_1k_graph_rows".to_string(),
+        "synthetic_high_degree.sqlite.neighborhood.duration_micros_per_1k_graph_rows".to_string(),
         "synthetic_high_degree.sqlite.edge_property_scan.duration_micros_per_1k_graph_rows"
             .to_string(),
         "synthetic_high_degree.sqlite.evidence_target_resolution.duration_micros_per_1k_graph_rows"
             .to_string(),
         "synthetic_deep_chain.sqlite.incident_edges.duration_micros_per_1k_graph_rows".to_string(),
+        "synthetic_deep_chain.sqlite.neighborhood.duration_micros_per_1k_graph_rows".to_string(),
         "synthetic_deep_chain.sqlite.path_max_hops.duration_micros".to_string(),
         "synthetic_deep_chain.sqlite.path_max_hops_128.duration_micros".to_string(),
         "synthetic_deep_chain.sqlite.path_max_hops_256.duration_micros".to_string(),
@@ -13195,6 +13248,7 @@ fn graph_db_backend_eval_performance_gate(
             "full_projection.sqlite.sqlite_delta_write.duration_micros".to_string(),
             "full_projection.sqlite.sqlite_edge_staging.duration_micros".to_string(),
             "full_projection.sqlite.post_write_reads.duration_micros".to_string(),
+            "full_projection.sqlite.neighborhood.duration_micros".to_string(),
             "full_projection.sqlite.evidence_target_resolution.duration_micros".to_string(),
             "full_projection.sqlite.evidence.duration_micros".to_string(),
             "full_projection.sqlite.path_max_hops.duration_micros".to_string(),

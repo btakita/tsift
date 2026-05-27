@@ -2346,74 +2346,6 @@ impl SqliteGraphStore {
         )?;
         Ok(pruned_tombstones)
     }
-
-    fn neighborhood_edges_for_page(
-        &self,
-        center_id: &str,
-        depth: usize,
-        kind: Option<&str>,
-        node_ids: &[String],
-    ) -> Result<Vec<GraphEdge>> {
-        if node_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders = std::iter::repeat_n("?", node_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut sql = String::from(
-            r#"
-            WITH RECURSIVE walk(id, depth) AS (
-                SELECT ?, 0
-                UNION
-                SELECT e.to_id, walk.depth + 1
-                FROM walk
-                JOIN graph_edges e INDEXED BY idx_graph_edges_from_kind
-                    ON e.from_id = walk.id
-                WHERE walk.depth < ?
-            "#,
-        );
-        let mut values = vec![
-            Value::Text(center_id.to_string()),
-            Value::Integer(depth as i64),
-        ];
-        if let Some(kind) = kind {
-            sql.push_str(" AND e.kind = ?");
-            values.push(Value::Text(kind.to_string()));
-        }
-        sql.push_str(
-            r#"
-            ),
-            walk_edges AS (
-                SELECT e.from_id, e.to_id, e.kind
-                FROM walk
-                JOIN graph_edges e INDEXED BY idx_graph_edges_from_kind
-                    ON e.from_id = walk.id
-                WHERE walk.depth < ?
-            "#,
-        );
-        values.push(Value::Integer(depth as i64));
-        if let Some(kind) = kind {
-            sql.push_str(" AND e.kind = ?");
-            values.push(Value::Text(kind.to_string()));
-        }
-        sql.push_str(&format!(
-            r#"
-            )
-            SELECT DISTINCT
-                g.edge_key, g.from_id, g.to_id, g.kind, g.properties_json, g.provenance_json, g.freshness_json
-            FROM graph_edges g
-            JOIN walk_edges w
-                ON w.from_id = g.from_id AND w.to_id = g.to_id AND w.kind = g.kind
-            WHERE g.from_id IN ({placeholders})
-              AND g.to_id IN ({placeholders})
-            ORDER BY g.from_id, g.kind, g.to_id
-            "#
-        ));
-        values.extend(node_ids.iter().cloned().map(Value::Text));
-        values.extend(node_ids.iter().cloned().map(Value::Text));
-        let mut stmt = self.conn.prepare(&sql)?;
-        collect_rows(stmt.query_map(params_from_iter(values.iter()), edge_from_row)?)
-    }
 }
 
 fn sqlite_query_plan(conn: &Connection, sql: &str, values: &[Value]) -> Result<Vec<String>> {
@@ -3174,7 +3106,7 @@ impl GraphStore for SqliteGraphStore {
         if self.node(center_id)?.is_none() {
             return Ok(None);
         }
-        let mut node_sql = String::from(
+        let mut sql = String::from(
             r#"
             WITH RECURSIVE walk(id, depth) AS (
                 SELECT ?, 0
@@ -3191,37 +3123,96 @@ impl GraphStore for SqliteGraphStore {
             Value::Integer(depth as i64),
         ];
         if let Some(kind) = kind {
-            node_sql.push_str(" AND e.kind = ?");
+            sql.push_str(" AND e.kind = ?");
             values.push(Value::Text(kind.to_string()));
         }
-        node_sql.push_str(
+        sql.push_str(
             r#"
-            )
+            ),
+            filtered_nodes AS (
             SELECT DISTINCT n.id, n.kind, n.label, n.properties_json, n.provenance_json, n.freshness_json
             FROM walk
             JOIN graph_nodes n ON n.id = walk.id
             WHERE 1 = 1
             "#,
         );
-        push_sqlite_property_filter_exists(
-            &mut node_sql,
-            &mut values,
-            "n",
-            &options.property_filters,
-        );
+        push_sqlite_property_filter_exists(&mut sql, &mut values, "n", &options.property_filters);
         if let Some(cursor) = &options.cursor {
-            node_sql.push_str(" AND n.id > ?");
+            sql.push_str(" AND n.id > ?");
             values.push(Value::Text(cursor.clone()));
         }
-        node_sql.push_str(" ORDER BY n.id");
+        sql.push_str(
+            r#"
+            ),
+            page_nodes AS (
+                SELECT id, kind, label, properties_json, provenance_json, freshness_json
+                FROM filtered_nodes
+                ORDER BY id
+            "#,
+        );
         if let Some(limit) = options.limit {
-            node_sql.push_str(" LIMIT ?");
+            sql.push_str(" LIMIT ?");
             values.push(Value::Integer(limit.saturating_add(1) as i64));
         }
-        let plan = sqlite_query_plan(&self.conn, &node_sql, &values)?;
-        let mut stmt = self.conn.prepare(&node_sql)?;
-        let mut nodes =
-            collect_rows(stmt.query_map(params_from_iter(values.iter()), node_from_row)?)?;
+        sql.push_str(
+            r#"
+            ),
+            walk_edges AS (
+                SELECT e.edge_key, e.from_id, e.to_id, e.kind, e.properties_json, e.provenance_json, e.freshness_json
+                FROM walk
+                JOIN graph_edges e INDEXED BY idx_graph_edges_from_kind
+                    ON e.from_id = walk.id
+                WHERE walk.depth < ?
+            "#,
+        );
+        values.push(Value::Integer(depth as i64));
+        if let Some(kind) = kind {
+            sql.push_str(" AND e.kind = ?");
+            values.push(Value::Text(kind.to_string()));
+        }
+        sql.push_str(
+            r#"
+            )
+            SELECT
+                'node' AS row_type,
+                p.id, p.kind, p.label, p.properties_json, p.provenance_json, p.freshness_json,
+                NULL AS edge_key, NULL AS from_id, NULL AS to_id, NULL AS edge_kind,
+                NULL AS edge_properties_json, NULL AS edge_provenance_json, NULL AS edge_freshness_json
+            FROM page_nodes p
+            UNION ALL
+            SELECT DISTINCT
+                'edge' AS row_type,
+                NULL AS id, NULL AS kind, NULL AS label, NULL AS properties_json,
+                NULL AS provenance_json, NULL AS freshness_json,
+                e.edge_key, e.from_id, e.to_id, e.kind, e.properties_json, e.provenance_json, e.freshness_json
+            FROM walk_edges e
+            WHERE e.from_id IN (SELECT id FROM page_nodes)
+              AND e.to_id IN (SELECT id FROM page_nodes)
+            "#,
+        );
+
+        let plan = sqlite_query_plan(&self.conn, &sql, &values)?;
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
+            let row_type: String = row.get(0)?;
+            match row_type.as_str() {
+                "node" => Ok((Some(node_from_row_at(row, 1)?), None)),
+                "edge" => Ok((None, Some(edge_from_row_at(row, 7)?))),
+                _ => Err(rusqlite::Error::InvalidQuery),
+            }
+        })?;
+        for row in rows {
+            let (node, edge) = row?;
+            if let Some(node) = node {
+                nodes.push(node);
+            }
+            if let Some(edge) = edge {
+                edges.push(edge);
+            }
+        }
+        nodes.sort_by(|left, right| left.id.cmp(&right.id));
         let before_limit = nodes.len();
         let mut next_cursor = None;
         if let Some(limit) = options.limit
@@ -3232,8 +3223,19 @@ impl GraphStore for SqliteGraphStore {
                 .map(|node| node.id.clone());
             nodes.truncate(limit);
         }
-        let node_ids = nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>();
-        let edges = self.neighborhood_edges_for_page(center_id, depth, kind, &node_ids)?;
+        let node_ids = nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<BTreeSet<_>>();
+        edges.retain(|edge| {
+            node_ids.contains(edge.from_id.as_str()) && node_ids.contains(edge.to_id.as_str())
+        });
+        edges.sort_by(|left, right| {
+            left.from_id
+                .cmp(&right.from_id)
+                .then(left.kind.cmp(&right.kind))
+                .then(left.to_id.cmp(&right.to_id))
+        });
         let expected_indexes = if options.property_filters.is_empty() {
             vec!["idx_graph_edges_from_kind"]
         } else {
@@ -3243,6 +3245,9 @@ impl GraphStore for SqliteGraphStore {
             ]
         };
         let mut diagnostics = sqlite_query_plan_diagnostics(&plan, &expected_indexes);
+        diagnostics.push(
+            "neighborhood nodes and page edges share one recursive reachable-set CTE".to_string(),
+        );
         if !options.property_filters.is_empty() {
             diagnostics.push(
                 "property filters were evaluated by SQLite materialized property rows before paging"
@@ -3653,33 +3658,47 @@ fn collect_rows<T>(
         .map_err(Into::into)
 }
 
-fn node_from_row(row: &Row<'_>) -> rusqlite::Result<GraphNode> {
-    let properties_json: String = row.get(3)?;
-    let provenance_json: String = row.get(4)?;
-    let freshness_json: Option<String> = row.get(5)?;
+fn node_from_row_at(row: &Row<'_>, offset: usize) -> rusqlite::Result<GraphNode> {
+    let properties_col = offset + 3;
+    let provenance_col = offset + 4;
+    let freshness_col = offset + 5;
+    let properties_json: String = row.get(properties_col)?;
+    let provenance_json: String = row.get(provenance_col)?;
+    let freshness_json: Option<String> = row.get(freshness_col)?;
     Ok(GraphNode {
-        id: row.get(0)?,
-        kind: row.get(1)?,
-        label: row.get(2)?,
-        properties: from_json(3, &properties_json)?,
-        provenance: from_json(4, &provenance_json)?,
-        freshness: optional_from_json(5, freshness_json)?,
+        id: row.get(offset)?,
+        kind: row.get(offset + 1)?,
+        label: row.get(offset + 2)?,
+        properties: from_json(properties_col, &properties_json)?,
+        provenance: from_json(provenance_col, &provenance_json)?,
+        freshness: optional_from_json(freshness_col, freshness_json)?,
+    })
+}
+
+fn node_from_row(row: &Row<'_>) -> rusqlite::Result<GraphNode> {
+    node_from_row_at(row, 0)
+}
+
+fn edge_from_row_at(row: &Row<'_>, offset: usize) -> rusqlite::Result<GraphEdge> {
+    let properties_col = offset + 4;
+    let provenance_col = offset + 5;
+    let freshness_col = offset + 6;
+    let properties_json: String = row.get(properties_col)?;
+    let provenance_json: String = row.get(provenance_col)?;
+    let freshness_json: Option<String> = row.get(freshness_col)?;
+    Ok(GraphEdge {
+        id: row.get(offset)?,
+        from_id: row.get(offset + 1)?,
+        to_id: row.get(offset + 2)?,
+        kind: row.get(offset + 3)?,
+        properties: from_json(properties_col, &properties_json)?,
+        provenance: from_json(provenance_col, &provenance_json)?,
+        freshness: optional_from_json(freshness_col, freshness_json)?,
     })
 }
 
 fn edge_from_row(row: &Row<'_>) -> rusqlite::Result<GraphEdge> {
-    let properties_json: String = row.get(4)?;
-    let provenance_json: String = row.get(5)?;
-    let freshness_json: Option<String> = row.get(6)?;
-    Ok(GraphEdge {
-        id: row.get(0)?,
-        from_id: row.get(1)?,
-        to_id: row.get(2)?,
-        kind: row.get(3)?,
-        properties: from_json(4, &properties_json)?,
-        provenance: from_json(5, &provenance_json)?,
-        freshness: optional_from_json(6, freshness_json)?,
-    })
+    edge_from_row_at(row, 0)
 }
 
 fn from_json<T: DeserializeOwned>(column: usize, raw: &str) -> rusqlite::Result<T> {
