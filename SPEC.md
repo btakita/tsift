@@ -117,6 +117,8 @@ The recommended default workflow is **full-graph sync** (no `--scope`): the curs
 
 tsift owns the code adapter on top of this substrate. Code symbols become `code_symbol` nodes and call relationships become `calls` edges with line metadata and tsift index provenance. Future adapters can add code comments, routes, markdown sessions, backlog items, LiveKit docs, Orbit topics, questions, answers, visuals, and assets without changing the substrate schema. The boundary rule is: no AST, source-language, Orbit, LiveKit, Convex, or FalkorDB semantics are required to create or query generic substrate records.
 
+Backend-eval full-projection cache keys use a stable input watermark over indexed symbol/call-edge/route rows and semantic summary rows. That full-projection watermark ignores mtime-only `file_state`, path-only index churn, and unrelated agent-doc session markdown edits when those code/summary graph inputs are unchanged; the bounded real dataset remains responsible for current session evidence. Cache-hit samples must continue to report `full_projection.source_graph_build=0us` and `full_projection.projection_rows=0us`, proving the provider-neutral rows were reused instead of rebuilt.
+
 ## Per-Submodule Isolation
 
 Each git submodule gets its own index. Isolation tiers control federation (cross-submodule queries):

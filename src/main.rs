@@ -8545,7 +8545,7 @@ const GRAPH_DB_BACKEND_EVAL_NORMALIZATION_ROW_UNIT: f64 = 1000.0;
 const GRAPH_DB_BACKEND_EVAL_MIN_SAMPLE_RUNS: usize = 3;
 const CONFLICT_MATRIX_PREPARATION_CACHE_VERSION: &str = "conflict-matrix-prep-v1";
 const CONFLICT_MATRIX_GRAPH_PREPARATION_CACHE_VERSION: &str = "conflict-matrix-graph-prep-v1";
-const GRAPH_DB_BACKEND_EVAL_FULL_PROJECTION_CACHE_VERSION: &str = "backend-eval-full-projection-v2";
+const GRAPH_DB_BACKEND_EVAL_FULL_PROJECTION_CACHE_VERSION: &str = "backend-eval-full-projection-v5";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct GraphDbBackendEvalPhaseTiming {
@@ -8570,6 +8570,19 @@ struct GraphDbBackendEvalFullProjectionCacheStats {
     json_bytes: u64,
     pruned_files: usize,
     pruned_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct GraphDbBackendEvalRawSourceWatermarkRow {
+    path: String,
+    bytes: u64,
+    content_hash: String,
+}
+
+#[derive(Clone)]
+struct GraphDbBackendEvalFullProjectionSourceWatermark {
+    value: String,
+    detail: String,
 }
 
 #[derive(Serialize)]
@@ -12517,18 +12530,138 @@ fn graph_db_backend_eval_prune_disk_cache(root: &Path, kind: &str, keep_key: &st
     (pruned_files, pruned_bytes)
 }
 
+fn graph_db_backend_eval_full_projection_raw_watermark_rows(
+    root: &Path,
+    source_root: &Path,
+) -> Result<Vec<GraphDbBackendEvalRawSourceWatermarkRow>> {
+    let mut rows = Vec::new();
+    let mut entries = walk::walk_files(source_root)?;
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    for entry in entries {
+        if traversal_path_is_generated_artifact(root, source_root, &entry.path) {
+            continue;
+        }
+        let bytes = fs::read(&entry.path)
+            .with_context(|| format!("reading source input {}", entry.path.display()))?;
+        rows.push(GraphDbBackendEvalRawSourceWatermarkRow {
+            path: traversal_watermark_path(root, &entry.path),
+            bytes: bytes.len() as u64,
+            content_hash: content_hash(&bytes)?,
+        });
+    }
+    Ok(rows)
+}
+
+fn graph_db_backend_eval_full_projection_source_watermark(
+    root: &Path,
+    scope: Option<&str>,
+) -> Result<GraphDbBackendEvalFullProjectionSourceWatermark> {
+    let path_hint = root;
+    let mut detail_parts = Vec::new();
+    let mut parts = vec![
+        format!("projection_version:{GRAPH_PROJECTION_VERSION}"),
+        format!("cache_version:{GRAPH_DB_BACKEND_EVAL_FULL_PROJECTION_CACHE_VERSION}"),
+        "watermark_kind:stable_full_projection_inputs".to_string(),
+        format!("scope:{}", scope.unwrap_or("root")),
+        format!("path_hint:{}", traversal_watermark_path(root, path_hint)),
+    ];
+
+    let gate = prepare_agent_doc_index_gate(root, path_hint, scope, "full-projection cache key");
+    match gate.db_path.as_ref().filter(|db_path| db_path.exists()) {
+        Some(db_path) => {
+            let db = index::IndexDb::open_read_only_resilient(db_path)?;
+            parts.push("index_mode:indexed".to_string());
+            detail_parts.push("mode=indexed".to_string());
+            parts.push(format!(
+                "index_source_root:{}",
+                traversal_watermark_path(root, &gate.source_root)
+            ));
+
+            let symbols = db
+                .all_symbols()?
+                .into_iter()
+                .filter(|symbol| {
+                    !traversal_path_is_generated_artifact(
+                        root,
+                        &gate.source_root,
+                        Path::new(&symbol.file),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let symbols_hash = content_hash(&symbols)?;
+            detail_parts.push(format!("symbols={symbols_hash}"));
+            parts.push(format!("index_symbols:{symbols_hash}"));
+
+            let edges = db
+                .all_stored_edges()?
+                .into_iter()
+                .filter(|edge| {
+                    !traversal_path_is_generated_artifact(
+                        root,
+                        &gate.source_root,
+                        Path::new(&edge.caller_file),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let edges_hash = content_hash(&edges)?;
+            detail_parts.push(format!("call_edges={edges_hash}"));
+            parts.push(format!("index_call_edges:{edges_hash}"));
+
+            let routes = db
+                .all_routes()?
+                .into_iter()
+                .filter(|route| {
+                    !traversal_path_is_generated_artifact(
+                        root,
+                        &gate.source_root,
+                        Path::new(&route.file),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let routes_hash = content_hash(&routes)?;
+            detail_parts.push(format!("routes={routes_hash}"));
+            parts.push(format!("index_routes:{routes_hash}"));
+        }
+        None => {
+            parts.push("index_mode:raw_fallback".to_string());
+            detail_parts.push("mode=raw_fallback".to_string());
+            parts.push(format!(
+                "raw_source_root:{}",
+                traversal_watermark_path(root, &gate.source_root)
+            ));
+            let raw_rows =
+                graph_db_backend_eval_full_projection_raw_watermark_rows(root, &gate.source_root)?;
+            let raw_hash = content_hash(&raw_rows)?;
+            detail_parts.push(format!("raw_source_files={raw_hash}"));
+            parts.push(format!("raw_source_files:{raw_hash}"));
+        }
+    }
+
+    parts.push("agent_doc_session_markdown:bounded_real_dataset_only".to_string());
+    detail_parts.push("session_markdown=bounded_real_dataset_only".to_string());
+    let summaries_start = parts.len();
+    push_traversal_summaries_watermark_part(root, &mut parts)?;
+    let summaries_hash = content_hash(&parts[summaries_start..].to_vec())?;
+    detail_parts.push(format!("summaries={summaries_hash}"));
+    let value = content_hash(&parts)?;
+    detail_parts.push(format!("watermark={value}"));
+    Ok(GraphDbBackendEvalFullProjectionSourceWatermark {
+        value,
+        detail: detail_parts.join(" "),
+    })
+}
+
 fn graph_db_backend_eval_full_projection_cache_key(
     root: &Path,
     scope: Option<&str>,
-) -> Result<(String, String)> {
-    let source_watermark = traversal_source_watermark(root, root, scope, false)?
-        .unwrap_or_else(|| "unavailable".to_string());
+) -> Result<(String, String, String)> {
+    let source_watermark = graph_db_backend_eval_full_projection_source_watermark(root, scope)?;
     let key = graph_db_backend_eval_full_projection_cache_key_for_watermark(
         root,
         scope,
-        &source_watermark,
+        &source_watermark.value,
     )?;
-    Ok((source_watermark, key))
+    Ok((source_watermark.value, key, source_watermark.detail))
 }
 
 fn graph_db_backend_eval_full_projection_cache_key_for_watermark(
@@ -12553,7 +12686,8 @@ fn graph_db_backend_eval_full_projection_with_profile(
     Vec<GraphDbBackendEvalPhaseTiming>,
     GraphDbBackendEvalFullProjectionCacheStats,
 )> {
-    let (source_watermark, key) = graph_db_backend_eval_full_projection_cache_key(root, scope)?;
+    let (source_watermark, key, source_watermark_detail) =
+        graph_db_backend_eval_full_projection_cache_key(root, scope)?;
     let lookup_started = Instant::now();
     if let Some((cached, disk_bytes, json_bytes, read_profile)) =
         graph_db_backend_eval_read_disk_cache::<GraphDbBackendEvalFullProjectionCache>(
@@ -12594,7 +12728,9 @@ fn graph_db_backend_eval_full_projection_with_profile(
                 graph_db_backend_eval_phase_timing(
                     "full_projection.cache_lookup",
                     lookup_overhead_micros,
-                    "watermark/version check overhead around the cache load phases",
+                    &format!(
+                        "watermark/version check overhead around the cache load phases; {source_watermark_detail}"
+                    ),
                 ),
                 graph_db_backend_eval_phase_timing(
                     "full_projection.cache.file_read",
@@ -12637,7 +12773,9 @@ fn graph_db_backend_eval_full_projection_with_profile(
     let mut phases = vec![graph_db_backend_eval_phase_timing(
         "full_projection.cache_lookup",
         lookup_started.elapsed().as_micros(),
-        "no full-project projection cache entry matched the source watermark",
+        &format!(
+            "no full-project projection cache entry matched the source watermark; {source_watermark_detail}"
+        ),
     )];
     let full_source = graph_db_backend_eval_timed_phase(
         &mut phases,
@@ -12652,8 +12790,10 @@ fn graph_db_backend_eval_full_projection_with_profile(
         || traversal_projection_from_graph(root, scope, &full_source),
     )?;
     let warnings = full_source.warnings;
-    let refreshed_source_watermark = traversal_source_watermark(root, root, scope, false)?
-        .unwrap_or_else(|| source_watermark.clone());
+    let refreshed_source_watermark =
+        graph_db_backend_eval_full_projection_source_watermark(root, scope)
+            .map(|watermark| watermark.value)
+            .unwrap_or_else(|_| source_watermark.clone());
     let write_key = graph_db_backend_eval_full_projection_cache_key_for_watermark(
         root,
         scope,
@@ -14971,6 +15111,13 @@ fn hinted_markdown_file(root: &Path, path_hint: &Path) -> Option<PathBuf> {
     None
 }
 
+fn traversal_markdown_content_looks_like_session(content: &str) -> bool {
+    parse_agent_doc_session_id(content).is_some()
+        || content.contains("<!-- agent:exchange")
+        || content.contains("<!-- agent:backlog")
+        || content.contains("## Backlog")
+}
+
 fn markdown_files_for_traversal(root: &Path, path_hint: &Path) -> Result<Vec<PathBuf>> {
     if let Some(hinted_path) = hinted_markdown_file(root, path_hint) {
         return Ok(vec![hinted_path]);
@@ -15323,15 +15470,11 @@ fn load_agent_doc_traversal_nodes(
                 continue;
             }
         };
-        let session_id = parse_agent_doc_session_id(&content);
-        let looks_like_session = session_id.is_some()
-            || content.contains("<!-- agent:exchange")
-            || content.contains("<!-- agent:backlog")
-            || content.contains("## Backlog");
-        if !looks_like_session {
+        if !traversal_markdown_content_looks_like_session(&content) {
             continue;
         }
 
+        let session_id = parse_agent_doc_session_id(&content);
         let session = traversal_session_node(root, &markdown_path, session_id.as_deref());
         graph.add_node(session.clone());
         let lines = content.lines().collect::<Vec<_>>();
@@ -36921,6 +37064,123 @@ tier = "private"
             first, third,
             "semantic summary row changes must invalidate the source watermark"
         );
+    }
+
+    #[test]
+    fn full_projection_source_watermark_ignores_source_mtime_when_index_rows_unchanged() {
+        // #gfullhot: backend-eval full-projection cache keys should be based on
+        // the indexed graph inputs, not file_state mtimes. Touching a source file
+        // without changing extracted symbols/call edges must still hit the cache.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".tsift")).unwrap();
+        let source = root.join("src/lib.rs");
+        let source_body = "pub fn alpha() { beta(); }\npub fn beta() {}\n";
+        std::fs::write(&source, source_body).unwrap();
+        let db = index::IndexDb::open(&root.join(".tsift/index.db")).unwrap();
+        db.rebuild(root).unwrap();
+        drop(db);
+
+        let first = graph_db_backend_eval_full_projection_source_watermark(root, None)
+            .unwrap()
+            .value;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&source, source_body).unwrap();
+        let db = index::IndexDb::open(&root.join(".tsift/index.db")).unwrap();
+        db.apply_changes(root).unwrap();
+        drop(db);
+
+        let second = graph_db_backend_eval_full_projection_source_watermark(root, None)
+            .unwrap()
+            .value;
+        assert_eq!(
+            first, second,
+            "mtime-only source index churn must not invalidate the full-projection cache"
+        );
+    }
+
+    #[test]
+    fn full_projection_source_watermark_ignores_session_markdown_churn() {
+        // #gfullhot: the full-projection performance cache isolates code graph
+        // and semantic-summary inputs. Current session evidence is measured by
+        // the bounded real dataset, so unrelated task-doc edits must not force a
+        // million-row full-projection rebuild.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("tasks/software")).unwrap();
+        std::fs::create_dir_all(root.join(".tsift")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").unwrap();
+        let task_doc = root.join("tasks/software/tsift.md");
+        std::fs::write(
+            &task_doc,
+            "---\nagent_doc_session: tsift-v0.1\n---\n\n## Backlog\n\n- [ ] [#one] Initial item\n",
+        )
+        .unwrap();
+        let db = index::IndexDb::open(&root.join(".tsift/index.db")).unwrap();
+        db.rebuild(root).unwrap();
+        drop(db);
+
+        let first = graph_db_backend_eval_full_projection_source_watermark(root, None)
+            .unwrap()
+            .value;
+        std::fs::write(
+            &task_doc,
+            "---\nagent_doc_session: tsift-v0.1\n---\n\n## Backlog\n\n- [ ] [#one] Edited item\n",
+        )
+        .unwrap();
+        let second = graph_db_backend_eval_full_projection_source_watermark(root, None)
+            .unwrap()
+            .value;
+        assert_eq!(
+            first, second,
+            "session markdown churn must not invalidate the full-projection code/summary cache"
+        );
+    }
+
+    #[test]
+    fn full_projection_cache_hit_skips_provider_neutral_rebuild_after_mtime_churn() {
+        // #gfullhot: once a full-project projection is cached, repeated samples
+        // with unchanged graph inputs must report zero source_graph_build and
+        // projection_rows work even if indexed file mtimes changed.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".tsift")).unwrap();
+        let source = root.join("src/lib.rs");
+        let source_body = "pub fn alpha() { beta(); }\npub fn beta() {}\n";
+        std::fs::write(&source, source_body).unwrap();
+        let db = index::IndexDb::open(&root.join(".tsift/index.db")).unwrap();
+        db.rebuild(root).unwrap();
+        drop(db);
+
+        let (_projection, _warnings, _phases, first_stats) =
+            graph_db_backend_eval_full_projection_with_profile(root, None).unwrap();
+        assert!(
+            !first_stats.hit,
+            "the first full-projection run should populate the cache"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&source, source_body).unwrap();
+        let db = index::IndexDb::open(&root.join(".tsift/index.db")).unwrap();
+        db.apply_changes(root).unwrap();
+        drop(db);
+
+        let (_projection, _warnings, phases, second_stats) =
+            graph_db_backend_eval_full_projection_with_profile(root, None).unwrap();
+        assert!(second_stats.hit, "mtime-only churn should still cache-hit");
+        let source_graph_build = phases
+            .iter()
+            .find(|phase| phase.name == "full_projection.source_graph_build")
+            .expect("cache hit must report source_graph_build");
+        let projection_rows = phases
+            .iter()
+            .find(|phase| phase.name == "full_projection.projection_rows")
+            .expect("cache hit must report projection_rows");
+        assert_eq!(source_graph_build.duration_micros, 0);
+        assert_eq!(projection_rows.duration_micros, 0);
     }
 }
 
