@@ -282,3 +282,112 @@ The first prune run exposed a reporting bug: the SQLite tables were pruned and v
 `#gdbvacproof` is closed: the full-graph Convex apply path is proven at agent-loop scale, remote freshness is proven by the projection hash returned from the self-hosted Convex backend, and the guarded local prune removed all retained tombstones plus reclaimed 819.2 MiB from `.tsift/graph.db`.
 
 Final artifacts are under `/tmp/gdbvacproof-final/`, including `sync-apply-prune-gate.json`, `remote-meta-prune-gate.json`, `compact-prune-apply.json`, `status-post-prune-fixed.json`, `doctor-post-prune-fixed.json`, and direct SQLite/stat captures.
+
+## Agent-doc queue rerun -- #gtombops tombstone cleanup
+
+This pass re-ran the guarded cleanup workflow against the tsift submodule graph DB:
+`/home/brian/work/btakita/agent-loop/src/tsift/.tsift/graph.db`.
+
+The starting state matched the queue prompt: 27,375 live rows, 184,722 retained
+tombstones, `graph-db status` current, and `graph-db doctor` ok with
+`sqlite_tombstone_retention` warning/recommended compaction policy.
+
+### Workflow
+
+```bash
+tsift graph-db --path . --json status  > /tmp/gtombops/status-before.json
+tsift graph-db --path . --json doctor  > /tmp/gtombops/doctor-before.json
+tsift graph-db --path . --json compact > /tmp/gtombops/compact-dryrun-before.json
+
+TSIFT_CONVEX_GRAPH_URL=http://localhost:3211/tsift/graph \
+  tsift convex-sync . --remote-snapshot --apply --chunk-size 50 --json \
+  > /tmp/gtombops/sync-apply.json
+
+TSIFT_CONVEX_GRAPH_URL=http://localhost:3211/tsift/graph \
+  tsift convex-sync . --remote-snapshot --json \
+  > /tmp/gtombops/sync-verify-after-apply.json
+
+tsift graph-db --path . --json refresh > /tmp/gtombops/refresh-after-sync.json
+
+TSIFT_CONVEX_GRAPH_URL=http://localhost:3211/tsift/graph \
+  tsift convex-sync . --remote-snapshot --json \
+  > /tmp/gtombops/sync-verify-after-refresh.json
+
+tsift graph-db --path . --json compact \
+  --apply --prune-tombstones --confirmed-convex-reconciled \
+  > /tmp/gtombops/compact-prune-apply.json
+
+tsift graph-db --path . --json status > /tmp/gtombops/status-after.json
+tsift graph-db --path . --json doctor > /tmp/gtombops/doctor-after.json
+```
+
+The first Convex apply used a local self-hosted backend and applied 552 chunks:
+4,113 node upserts and 23,449 edge upserts. The follow-up remote snapshot
+verification returned `freshness.status: "current"` with matching hashes:
+`6616c265a6c3225fed6e35c4edf606047ad9933c378f0873c4d0c605b2bab790`.
+After `graph-db refresh`, the same remote snapshot verification remained
+current with zero missing or stale nodes/edges, so the guarded prune precondition
+was satisfied.
+
+### Status/doctor/file-size/tombstone deltas
+
+The refresh step moved the local graph from the queue-prompt baseline
+(4,090 nodes / 23,285 edges / 184,722 tombstones) to the reconciled projection
+(4,113 nodes / 23,449 edges / 198,840 tombstones). The compact report below
+therefore pruned 198,840 rows, while the net status delta is measured from the
+original 184,722-tombstone state.
+
+| Metric | Queue-prompt baseline | Reconciled pre-prune | Post-prune | Delta from baseline |
+| --- | ---: | ---: | ---: | ---: |
+| Live rows | 27,375 | 27,562 | 27,562 | +187 |
+| Nodes | 4,090 | 4,113 | 4,113 | +23 |
+| Edges | 23,285 | 23,449 | 23,449 | +164 |
+| Tombstone rows | 184,722 | 198,840 | 0 | -184,722 |
+| Node tombstones | 22,150 | 23,755 | 0 | -22,150 |
+| Edge tombstones | 162,572 | 175,085 | 0 | -162,572 |
+| Tombstone scan rows | 184,722 | 198,840 | 0 | -184,722 |
+| File size (bytes) | 73,248,768 | 76,115,968 | 37,093,376 | -36,155,392 |
+| `PRAGMA page_count` | 17,883 | 18,583 | 9,056 | -8,827 |
+| `PRAGMA freelist_count` | 0 | 0 | 0 | 0 |
+| `graph-db status` | current | current | current | unchanged |
+| `graph-db doctor` | ok, retention warning | ok, retention warning | ok, no retention warning | warning cleared |
+| Compaction policy | recommended | recommended | not_needed | cleared |
+
+`compact-prune-apply.json` reported:
+
+```json
+{
+  "applied": true,
+  "pruned_tombstones": 198840,
+  "reclaimed_bytes": 39022592,
+  "counts_before": {
+    "nodes": 4113,
+    "edges": 23449,
+    "tombstones": {"nodes": 23755, "edges": 175085, "total": 198840},
+    "file_size_bytes": 76115968,
+    "freelist_bytes": 0
+  },
+  "counts_after": {
+    "nodes": 4113,
+    "edges": 23449,
+    "tombstones": {"nodes": 0, "edges": 0, "total": 0},
+    "file_size_bytes": 37093376,
+    "freelist_bytes": 0
+  }
+}
+```
+
+Post-prune `graph-db status` reports `compaction.status: "not_needed"`,
+`tombstone_scan_rows: 0`, and `requires_convex_reconciliation: false`.
+Post-prune `graph-db doctor` reports `sqlite_tombstone_retention: ok` and
+`sqlite_compaction_policy: not_needed`.
+
+### Artifacts
+
+All command outputs for this pass are under `/tmp/gtombops/`:
+`status-before.json`, `doctor-before.json`, `compact-dryrun-before.json`,
+`sync-apply.json`, `sync-verify-after-apply.json`, `refresh-after-sync.json`,
+`sync-verify-after-refresh.json`, `compact-prune-apply.json`,
+`status-after.json`, `doctor-after.json`, `size-before.txt`,
+`size-after.txt`, `db-before.txt`, `db-after.txt`, `tombstones-before.txt`,
+and `tombstones-after.txt`.
