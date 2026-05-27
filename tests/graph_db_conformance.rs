@@ -1903,6 +1903,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                     "edge_property_scan".to_string(),
                     "incident_edges".to_string(),
                     "neighborhood".to_string(),
+                    "related".to_string(),
                     "path_max_hops".to_string(),
                     "path_max_hops_128".to_string(),
                     "path_max_hops_256".to_string(),

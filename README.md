@@ -38,6 +38,7 @@ tsift graph-db --path . status --json
 tsift graph-db --path . compact --json
 tsift graph-db --path . kind backlog --property ref_id=cvxa --limit 5 --json
 tsift graph-db --path . evidence cvxa --depth 3 --limit 8 --json
+tsift graph-db --path . related "realtime avatar memory" --kind all --json
 tsift conflict-matrix --path tasks/software/tsift.md cvxa --json
 tsift dependency-dag --path tasks/software/tsift.md cvxa --json
 tsift graph-db --path . doctor --json
@@ -63,7 +64,10 @@ WAL checkpoint/VACUUM policy before pruning tombstones. Refresh reports include
 node, edge, and materialized-property delta counts so unchanged property rows do
 not hide write amplification. Use
 `tsift graph-db evidence <backlog-id-or-job-handle>` for bounded
-worker-context/source-handle/semantic handoff packets. Use `tsift
+worker-context/source-handle/semantic handoff packets. Use `tsift graph-db
+related <phrase>` to turn natural-language concept phrases into semantic
+concept/entity seeds and expand incident/outgoing graph neighborhoods around
+them for knowledge retrieval. Use `tsift
 conflict-matrix` to rank candidate worker scopes, flag shared
 file/symbol/test/config ownership, and emit first-class worker prompt packets
 with worker-result feedback, closure ranking controls, expansion commands, token

@@ -1102,6 +1102,23 @@ enum GraphDbQuery {
         #[arg(long, default_value = "8")]
         limit: usize,
     },
+    /// Resolve a natural-language phrase to semantic seeds, then expand graph neighborhoods around them
+    Related {
+        /// Natural-language concept/entity phrase to retrieve context for
+        query: String,
+        /// Which semantic node family to seed from
+        #[arg(long, value_enum, default_value = "all")]
+        kind: SemanticRelatedKind,
+        /// Incident/outgoing graph hops to expand around each semantic seed
+        #[arg(long, default_value = "2")]
+        depth: usize,
+        /// Max semantic seed nodes to expand (0 = unlimited)
+        #[arg(long = "seed-limit", default_value = "5")]
+        seed_limit: usize,
+        /// Max graph nodes to return after seed expansion (0 = unlimited)
+        #[arg(short, long, default_value = "25")]
+        limit: usize,
+    },
     /// Show the stable JSON shape for graph database records and responses
     Schema,
     /// Look up one node by stable id
@@ -6146,7 +6163,7 @@ struct SemanticRelatedReport {
     warnings: Vec<String>,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 struct SemanticRelatedItem {
     handle: String,
     kind: String,
@@ -6299,17 +6316,20 @@ fn edge_with_content_freshness(mut edge: SubstrateGraphEdge) -> Result<Substrate
 const SEMANTIC_EMBEDDING_DIM: usize = 32;
 const SEMANTIC_EMBEDDING_MODEL: &str = "tsift-local-hash-v1";
 
-fn semantic_related_command(root: &Path, query: &str, kind: SemanticRelatedKind) -> String {
-    let kind_arg = match kind {
+fn semantic_related_kind_name(kind: SemanticRelatedKind) -> &'static str {
+    match kind {
         SemanticRelatedKind::Concept => "concept",
         SemanticRelatedKind::Entity => "entity",
         SemanticRelatedKind::All => "all",
-    };
+    }
+}
+
+fn semantic_related_command(root: &Path, query: &str, kind: SemanticRelatedKind) -> String {
     format!(
         "tsift semantic {} --path {} --kind {} --limit 10",
         shell_quote(query),
         shell_quote(root.to_string_lossy().as_ref()),
-        kind_arg
+        semantic_related_kind_name(kind)
     )
 }
 
@@ -8180,6 +8200,31 @@ struct GraphDbRankedNeighbor {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
+struct GraphDbKnowledgeRetrieval {
+    mode: String,
+    query: String,
+    seed_kind: String,
+    seed_limit: usize,
+    seed_count: usize,
+    depth: usize,
+    limit: usize,
+    node_count: usize,
+    edge_count: usize,
+    truncated: bool,
+    traversal: String,
+    freshness_boundary: String,
+    privacy_boundary: String,
+    diagnostics: Vec<String>,
+}
+
+struct GraphDbSemanticSeededSubgraph {
+    nodes: Vec<SubstrateGraphNode>,
+    edges: Vec<SubstrateGraphEdge>,
+    truncated: bool,
+    diagnostics: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
 struct GraphDbNeighborhoodRankingGate {
     status: String,
     ranked_output_default: bool,
@@ -8214,8 +8259,12 @@ struct GraphDbReport {
     edges: Vec<SubstrateGraphEdge>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     ranked_neighbors: Vec<GraphDbRankedNeighbor>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    semantic_related: Vec<SemanticRelatedItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     neighborhood_ranking_gate: Option<GraphDbNeighborhoodRankingGate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    knowledge_retrieval: Option<GraphDbKnowledgeRetrieval>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<substrate::GraphPath>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11473,6 +11522,10 @@ fn graph_db_schema() -> GraphDbSchema {
                 description: "Return a bounded versioned graph-db handoff packet for a backlog id or job packet handle, including packet_id, projection hash, worker_context rows, source_handle rows, worker_result rows, semantic_concept/entity rows, shortest paths, replay commands, repair commands, and next commands",
             },
             GraphDbSchemaOperation {
+                command: "related <phrase> [--kind concept|entity|all] [--depth N] [--seed-limit N] [--limit N]",
+                description: "Resolve a natural-language phrase to cached semantic concept/entity seed nodes, then return an incident/outgoing GraphStore neighborhood around those seeds for general knowledge retrieval without changing stable neighborhood pagination defaults",
+            },
+            GraphDbSchemaOperation {
                 command: "dispatch-trace [target...] --path <session> [--format json|html]",
                 description: "Export a compact graph-backed dispatch trace with evidence packet ids, worker-result feedback closure summaries, graph links, and conflict-matrix worker prompt packets",
             },
@@ -11980,7 +12033,9 @@ fn graph_db_report_from_store(
         nodes: Vec::new(),
         edges: Vec::new(),
         ranked_neighbors: Vec::new(),
+        semantic_related: Vec::new(),
         neighborhood_ranking_gate: None,
+        knowledge_retrieval: None,
         path: None,
         page: None,
         warnings,
@@ -12007,6 +12062,56 @@ fn graph_db_report_from_store(
         }
         GraphDbQuery::Evidence { .. } => {
             bail!("graph-db evidence must be handled by the evidence command path");
+        }
+        GraphDbQuery::Related {
+            query,
+            kind,
+            depth,
+            seed_limit,
+            limit,
+        } => {
+            let semantic =
+                semantic_related_report_from_store(root, scope, &query, seed_limit, kind, store)?;
+            let SemanticRelatedReport {
+                items,
+                warnings: semantic_warnings,
+                ..
+            } = semantic;
+            report.warnings.extend(semantic_warnings);
+            let seed_ids = items
+                .iter()
+                .map(|item| item.handle.clone())
+                .collect::<Vec<_>>();
+            let subgraph = graph_db_semantic_seeded_neighborhood(store, &seed_ids, depth, limit)?;
+            let seed_count = seed_ids.len();
+
+            report.semantic_related = items;
+            report.nodes = subgraph.nodes;
+            report.edges = subgraph.edges;
+            if let Some(seed_id) = seed_ids.first() {
+                report.ranked_neighbors =
+                    graph_db_ranked_neighbors(seed_id, &report.nodes, &report.edges);
+                report.neighborhood_ranking_gate = Some(graph_db_neighborhood_ranking_gate());
+            }
+            report.knowledge_retrieval = Some(GraphDbKnowledgeRetrieval {
+                mode: "semantic_seeded_neighborhood".to_string(),
+                query,
+                seed_kind: semantic_related_kind_name(kind).to_string(),
+                seed_limit,
+                seed_count,
+                depth,
+                limit,
+                node_count: report.nodes.len(),
+                edge_count: report.edges.len(),
+                truncated: subgraph.truncated,
+                traversal: "incident_plus_outgoing_edges".to_string(),
+                freshness_boundary:
+                    "semantic rows must come from refreshed summary graph records".to_string(),
+                privacy_boundary:
+                    "GraphStore stores substrate records only; user consent, deletion policy, persona policy, and LiveKit session state stay in the avatar/agent adapter"
+                        .to_string(),
+                diagnostics: subgraph.diagnostics,
+            });
         }
         GraphDbQuery::Schema => {
             report.schema = Some(graph_db_schema());
@@ -12148,6 +12253,18 @@ fn print_graph_db_human(report: &GraphDbReport, compact: bool) {
             edge.from_id,
             edge.kind,
             edge.to_id
+        );
+    }
+    if let Some(knowledge) = &report.knowledge_retrieval {
+        println!(
+            "knowledge_retrieval: {} seeds:{} depth:{} traversal:{}",
+            knowledge.mode, knowledge.seed_count, knowledge.depth, knowledge.traversal
+        );
+    }
+    for item in &report.semantic_related {
+        println!(
+            "semantic_seed: {:.3} [{}] {} ({})",
+            item.score, item.kind, item.label, item.handle
         );
     }
     for node in &report.nodes {
@@ -13055,6 +13172,48 @@ fn graph_db_backend_eval_neighborhood_operation<S: GraphStore>(
     })
 }
 
+fn graph_db_backend_eval_related_operation<S: GraphStore>(
+    root: &Path,
+    scope: Option<&str>,
+    store: &S,
+    depth: usize,
+    limit: usize,
+) -> (
+    GraphDbBackendEvalOperation,
+    Option<GraphDbBackendEvalSignature>,
+) {
+    graph_db_backend_eval_timed("related", || {
+        let query = "backend evaluation";
+        let semantic = semantic_related_report_from_store(
+            root,
+            scope,
+            query,
+            3,
+            SemanticRelatedKind::All,
+            store,
+        )?;
+        let seed_ids = semantic
+            .items
+            .iter()
+            .map(|item| item.handle.clone())
+            .collect::<Vec<_>>();
+        let subgraph =
+            graph_db_semantic_seeded_neighborhood(store, &seed_ids, depth, limit.max(1))?;
+        Ok((
+            Some(subgraph.nodes.len() + subgraph.edges.len()),
+            serde_json::json!({
+                "query": query,
+                "seed_ids": seed_ids,
+                "node_ids": subgraph.nodes.iter().map(|node| &node.id).collect::<Vec<_>>(),
+                "edge_ids": subgraph.edges.iter().map(graph_db_edge_key).collect::<Vec<_>>(),
+                "truncated": subgraph.truncated,
+                "warnings": semantic.warnings,
+                "diagnostics": subgraph.diagnostics,
+            }),
+        ))
+    })
+}
+
 fn graph_db_backend_eval_evidence_signature(report: &GraphDbEvidenceReport) -> serde_json::Value {
     serde_json::json!({
         "target": report.target,
@@ -13247,6 +13406,11 @@ fn graph_db_backend_eval_report_for_store<S: GraphStore>(
     signatures.extend(signature);
 
     let (operation, signature) = graph_db_backend_eval_neighborhood_operation(store, depth, limit);
+    operations.push(operation);
+    signatures.extend(signature);
+
+    let (operation, signature) =
+        graph_db_backend_eval_related_operation(root, scope, store, depth, limit);
     operations.push(operation);
     signatures.extend(signature);
 
@@ -13469,7 +13633,13 @@ fn graph_db_backend_eval_synthetic_projection(nodes: usize, fanout: usize) -> Gr
         SubstrateGraphNode::new("gfil-synthetic", "file", "synthetic.rs")
             .with_property("path", "synthetic.rs"),
         SubstrateGraphNode::new("gsem-synthetic", "semantic_concept", "backend evaluation")
-            .with_property("label", "backend evaluation"),
+            .with_property("handle", "gsem-synthetic")
+            .with_property("label", "backend evaluation")
+            .with_property("embedding_model", SEMANTIC_EMBEDDING_MODEL)
+            .with_property(
+                "embedding",
+                semantic_embedding_property("backend evaluation"),
+            ),
         SubstrateGraphNode::new("gwres-synthetic", "worker_result", "completed #synthetic")
             .with_property("ref_id", "synthetic")
             .with_property("status", "completed")
@@ -16869,6 +17039,110 @@ fn semantic_related_report_from_store(
         count: items.len(),
         items,
         warnings,
+    })
+}
+
+fn graph_db_semantic_seeded_neighborhood(
+    store: &impl GraphStore,
+    seed_ids: &[String],
+    depth: usize,
+    limit: usize,
+) -> Result<GraphDbSemanticSeededSubgraph> {
+    let seed_rank = seed_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, seed)| (seed.clone(), idx))
+        .collect::<BTreeMap<_, _>>();
+    let mut nodes = BTreeMap::<String, SubstrateGraphNode>::new();
+    let mut edges = BTreeMap::<String, SubstrateGraphEdge>::new();
+    let mut queue = VecDeque::<(String, usize)>::new();
+    let mut seen_at_depth = BTreeMap::<String, usize>::new();
+    let mut diagnostics = vec![
+        "semantic-seeded retrieval uses phrase similarity to pick graph seeds".to_string(),
+        "seed expansion traverses both outgoing and incident edges so code, markdown, conversation, and memory adapters can link into semantic rows without reversing their edge direction".to_string(),
+    ];
+
+    for seed_id in seed_ids {
+        if let Some(node) = store.node(seed_id)? {
+            nodes.entry(seed_id.clone()).or_insert(node);
+            queue.push_back((seed_id.clone(), 0));
+            seen_at_depth.entry(seed_id.clone()).or_insert(0);
+        } else {
+            diagnostics.push(format!(
+                "semantic seed {seed_id} was not present in the graph store"
+            ));
+        }
+    }
+
+    while let Some((current_id, current_depth)) = queue.pop_front() {
+        if current_depth >= depth {
+            continue;
+        }
+
+        let mut expansion_edges = store.outgoing_edges(&current_id, None)?;
+        expansion_edges.extend(store.incident_edges(&current_id, None)?);
+        for edge in expansion_edges {
+            let edge_key = graph_db_edge_key(&edge);
+            edges.entry(edge_key).or_insert_with(|| edge.clone());
+            let other_id = if edge.from_id == current_id {
+                edge.to_id.clone()
+            } else if edge.to_id == current_id {
+                edge.from_id.clone()
+            } else {
+                continue;
+            };
+            if let std::collections::btree_map::Entry::Vacant(entry) = nodes.entry(other_id.clone())
+                && let Some(node) = store.node(&other_id)?
+            {
+                entry.insert(node);
+            }
+            let next_depth = current_depth + 1;
+            let should_queue = seen_at_depth
+                .get(&other_id)
+                .is_none_or(|seen_depth| next_depth < *seen_depth);
+            if should_queue {
+                seen_at_depth.insert(other_id.clone(), next_depth);
+                queue.push_back((other_id, next_depth));
+            }
+        }
+    }
+
+    let mut nodes = nodes.into_values().collect::<Vec<_>>();
+    nodes.sort_by(|left, right| {
+        seed_rank
+            .get(&left.id)
+            .copied()
+            .unwrap_or(usize::MAX)
+            .cmp(&seed_rank.get(&right.id).copied().unwrap_or(usize::MAX))
+            .then(left.id.cmp(&right.id))
+    });
+
+    let before_limit = nodes.len();
+    let truncated = limit > 0 && nodes.len() > limit;
+    if truncated {
+        nodes.truncate(limit);
+        diagnostics.push(format!(
+            "semantic-seeded neighborhood truncated from {before_limit} to {limit} node(s)"
+        ));
+    }
+
+    let node_ids = nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut edges = edges
+        .into_values()
+        .filter(|edge| {
+            node_ids.contains(edge.from_id.as_str()) && node_ids.contains(edge.to_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    edges.sort_by_key(graph_db_edge_key);
+
+    Ok(GraphDbSemanticSeededSubgraph {
+        nodes,
+        edges,
+        truncated,
+        diagnostics,
     })
 }
 
@@ -31061,6 +31335,76 @@ def list_items():
     }
 
     #[test]
+    fn graph_db_related_query_uses_semantic_seeds_and_incident_neighborhoods() {
+        let dir = setup_traversal_project();
+        seed_traversal_semantic_summaries(dir.path());
+        refresh_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
+        let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
+
+        let report = graph_db_report_from_store(
+            dir.path(),
+            None,
+            "sqlite",
+            GraphDbQuery::Related {
+                query: "graph navigation".to_string(),
+                kind: SemanticRelatedKind::All,
+                depth: 1,
+                seed_limit: 2,
+                limit: 20,
+            },
+            &store,
+            sqlite_graph_freshness(&store, "root").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let knowledge = report.knowledge_retrieval.as_ref().unwrap();
+        assert_eq!(knowledge.mode, "semantic_seeded_neighborhood");
+        assert_eq!(knowledge.seed_kind, "all");
+        assert_eq!(knowledge.depth, 1);
+        assert!(
+            knowledge
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("incident"))
+        );
+        assert!(
+            report
+                .semantic_related
+                .iter()
+                .any(|item| item.label == "graph navigation"
+                    && item.kind == "semantic_concept"
+                    && item.score > 0.9),
+            "expected natural-language query to seed the graph navigation concept, got {:?}",
+            report.semantic_related
+        );
+        assert!(
+            report
+                .nodes
+                .iter()
+                .any(|node| node.kind == "semantic_concept" && node.label == "graph navigation")
+        );
+        assert!(
+            report
+                .nodes
+                .iter()
+                .any(|node| node.kind == "symbol" && node.label == "helper"),
+            "incident expansion from semantic seed should recover source symbols, got {:?}",
+            report
+                .nodes
+                .iter()
+                .map(|node| (&node.kind, &node.label))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            report
+                .edges
+                .iter()
+                .any(|edge| edge.kind == "mentions_concept")
+        );
+    }
+
+    #[test]
     fn conflict_matrix_uses_semantic_rows_as_dispatch_ranking_signal() {
         let dir = setup_traversal_project();
         seed_traversal_semantic_summaries(dir.path());
@@ -36467,6 +36811,47 @@ tier = "private"
                         );
                     }
                     _ => panic!("expected graph-db neighborhood query"),
+                }
+            }
+            _ => panic!("expected GraphDb command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_db_related_query() {
+        let cli = parse_cli([
+            "tsift",
+            "graph-db",
+            "--json",
+            "related",
+            "voice avatar memory retrieval",
+            "--kind",
+            "all",
+            "--depth",
+            "3",
+            "--seed-limit",
+            "4",
+            "--limit",
+            "12",
+        ]);
+        match cli.command {
+            Some(Commands::GraphDb { json, query, .. }) => {
+                assert!(json);
+                match query {
+                    GraphDbQuery::Related {
+                        query,
+                        kind,
+                        depth,
+                        seed_limit,
+                        limit,
+                    } => {
+                        assert_eq!(query, "voice avatar memory retrieval");
+                        assert_eq!(kind, SemanticRelatedKind::All);
+                        assert_eq!(depth, 3);
+                        assert_eq!(seed_limit, 4);
+                        assert_eq!(limit, 12);
+                    }
+                    _ => panic!("expected graph-db related query"),
                 }
             }
             _ => panic!("expected GraphDb command"),
