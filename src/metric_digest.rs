@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const EPSILON: f64 = 1e-9;
 const COMMUNITY_SEARCH_PREFIXES: &[&str] = &["communities", "community_search"];
-const COMMUNITY_SEARCH_WORKLOADS: &[&str] = &["real", "synthetic_multi_module"];
-const COMMUNITY_SEARCH_REQUIRED_METRICS: &[&str] = &[
+pub const COMMUNITY_SEARCH_WORKLOADS: &[&str] = &["real", "synthetic_multi_module"];
+pub const COMMUNITY_SEARCH_REQUIRED_METRICS: &[&str] = &[
     "duration_micros",
     "handle_coverage_pct",
     "stale_behavior_pass",
@@ -14,10 +14,10 @@ const COMMUNITY_SEARCH_REQUIRED_METRICS: &[&str] = &[
     "duplicate_name_precision",
     "top_community_stability",
 ];
-const COMMUNITY_MAX_DURATION_REGRESSION_PERCENT: f64 = 25.0;
-const COMMUNITY_MIN_HANDLE_COVERAGE_PCT: f64 = 95.0;
-const COMMUNITY_MIN_DUPLICATE_NAME_PRECISION: f64 = 0.99;
-const COMMUNITY_MIN_TOP_COMMUNITY_STABILITY: f64 = 0.95;
+pub const COMMUNITY_MAX_DURATION_REGRESSION_PERCENT: f64 = 25.0;
+pub const COMMUNITY_MIN_HANDLE_COVERAGE_PCT: f64 = 95.0;
+pub const COMMUNITY_MIN_DUPLICATE_NAME_PRECISION: f64 = 0.99;
+pub const COMMUNITY_MIN_TOP_COMMUNITY_STABILITY: f64 = 0.95;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

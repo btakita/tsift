@@ -8161,6 +8161,39 @@ struct GraphDbPageReport {
     diagnostics: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct GraphDbRankedNeighbor {
+    rank: usize,
+    node_id: String,
+    kind: String,
+    label: String,
+    score: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth: Option<usize>,
+    edge_kinds: Vec<String>,
+    community_co_membership: bool,
+    semantic_relation: bool,
+    source_handle_fresh: bool,
+    duplicate_name_precision: f64,
+    handle_coverage_pct: f64,
+    reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct GraphDbNeighborhoodRankingGate {
+    status: String,
+    ranked_output_default: bool,
+    default_order: String,
+    default_change_gate: String,
+    required_workloads: Vec<String>,
+    required_metrics: Vec<String>,
+    max_duration_regression_percent: f64,
+    min_handle_coverage_pct: f64,
+    min_duplicate_name_precision: f64,
+    min_top_community_stability: f64,
+    diagnostics: Vec<String>,
+}
+
 #[derive(Serialize)]
 struct GraphDbReport {
     root: String,
@@ -8179,6 +8212,10 @@ struct GraphDbReport {
     nodes: Vec<SubstrateGraphNode>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     edges: Vec<SubstrateGraphEdge>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    ranked_neighbors: Vec<GraphDbRankedNeighbor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neighborhood_ranking_gate: Option<GraphDbNeighborhoodRankingGate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<substrate::GraphPath>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11018,6 +11055,265 @@ fn graph_db_page_report_from_store(
     }
 }
 
+fn graph_db_neighborhood_ranking_gate() -> GraphDbNeighborhoodRankingGate {
+    GraphDbNeighborhoodRankingGate {
+        status: "held_default_order_unchanged".to_string(),
+        ranked_output_default: false,
+        default_order: "stable_node_id".to_string(),
+        default_change_gate: "community_search_quality_metrics".to_string(),
+        required_workloads: metric_digest::COMMUNITY_SEARCH_WORKLOADS
+            .iter()
+            .map(|workload| (*workload).to_string())
+            .collect(),
+        required_metrics: metric_digest::COMMUNITY_SEARCH_REQUIRED_METRICS
+            .iter()
+            .map(|metric| (*metric).to_string())
+            .collect(),
+        max_duration_regression_percent: metric_digest::COMMUNITY_MAX_DURATION_REGRESSION_PERCENT,
+        min_handle_coverage_pct: metric_digest::COMMUNITY_MIN_HANDLE_COVERAGE_PCT,
+        min_duplicate_name_precision: metric_digest::COMMUNITY_MIN_DUPLICATE_NAME_PRECISION,
+        min_top_community_stability: metric_digest::COMMUNITY_MIN_TOP_COMMUNITY_STABILITY,
+        diagnostics: vec![
+            "ranked_neighbors is additive; neighborhood nodes remain ordered by stable node id for cursor pagination".to_string(),
+            "changing the default neighborhood order requires the community-search gate to pass for every required workload".to_string(),
+        ],
+    }
+}
+
+fn graph_db_ranked_neighbors(
+    center_id: &str,
+    nodes: &[SubstrateGraphNode],
+    edges: &[SubstrateGraphEdge],
+) -> Vec<GraphDbRankedNeighbor> {
+    let node_by_id = nodes
+        .iter()
+        .map(|node| (node.id.clone(), node))
+        .collect::<BTreeMap<_, _>>();
+    let label_counts = nodes
+        .iter()
+        .fold(BTreeMap::<String, usize>::new(), |mut acc, node| {
+            *acc.entry(node.label.clone()).or_default() += 1;
+            acc
+        });
+    let mut outgoing = BTreeMap::<String, Vec<&SubstrateGraphEdge>>::new();
+    let mut edge_kinds_by_node = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut fresh_edge_by_node = BTreeSet::<String>::new();
+    for edge in edges {
+        outgoing.entry(edge.from_id.clone()).or_default().push(edge);
+        for endpoint in [&edge.from_id, &edge.to_id] {
+            if node_by_id.contains_key(endpoint) {
+                edge_kinds_by_node
+                    .entry(endpoint.clone())
+                    .or_default()
+                    .insert(edge.kind.clone());
+                if edge.freshness.as_ref().is_some_and(|freshness| {
+                    freshness.content_hash.is_some() || freshness.observed_at_unix.is_some()
+                }) {
+                    fresh_edge_by_node.insert(endpoint.clone());
+                }
+            }
+        }
+    }
+
+    let depths = graph_db_neighborhood_depths(center_id, &node_by_id, &outgoing);
+    let page_handle_coverage_pct = graph_db_page_handle_coverage_pct(nodes);
+    let mut ranked = Vec::new();
+
+    for node in nodes {
+        if node.id == center_id {
+            continue;
+        }
+        let edge_kinds = edge_kinds_by_node
+            .get(&node.id)
+            .map(|kinds| kinds.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let depth = depths.get(&node.id).copied();
+        let community_co_membership = graph_db_has_community_signal(node, &edge_kinds);
+        let semantic_relation = graph_db_has_semantic_signal(node, &edge_kinds);
+        let source_handle_fresh = graph_db_source_handle_is_fresh(node)
+            || (node.kind == "source_handle" && fresh_edge_by_node.contains(&node.id));
+        let duplicate_name_precision = graph_db_duplicate_name_precision(node, &label_counts);
+        let mut score = 0i64;
+        let mut reasons = Vec::new();
+
+        if let Some(depth) = depth {
+            let depth_score = 120i64
+                .saturating_sub((depth as i64).saturating_mul(18))
+                .max(0);
+            score += depth_score;
+            reasons.push(format!("depth:{depth}+{depth_score}"));
+        } else {
+            reasons.push("depth:unknown".to_string());
+        }
+
+        for edge_kind in &edge_kinds {
+            let edge_score = graph_db_edge_kind_rank_score(edge_kind);
+            score += edge_score;
+            reasons.push(format!("edge_kind:{edge_kind}+{edge_score}"));
+        }
+        if community_co_membership {
+            score += 18;
+            reasons.push("community_co_membership+18".to_string());
+        }
+        if semantic_relation {
+            score += 24;
+            reasons.push("semantic_relation+24".to_string());
+        }
+        if source_handle_fresh {
+            score += 18;
+            reasons.push("source_handle_fresh+18".to_string());
+        }
+        if duplicate_name_precision + f64::EPSILON
+            >= metric_digest::COMMUNITY_MIN_DUPLICATE_NAME_PRECISION
+        {
+            score += 10;
+            reasons.push("duplicate_name_precision+10".to_string());
+        } else {
+            score -= 10;
+            reasons.push("duplicate_name_precision-10".to_string());
+        }
+        if page_handle_coverage_pct + f64::EPSILON
+            >= metric_digest::COMMUNITY_MIN_HANDLE_COVERAGE_PCT
+        {
+            score += 10;
+            reasons.push("handle_coverage+10".to_string());
+        } else {
+            score -= 10;
+            reasons.push("handle_coverage-10".to_string());
+        }
+
+        ranked.push(GraphDbRankedNeighbor {
+            rank: 0,
+            node_id: node.id.clone(),
+            kind: node.kind.clone(),
+            label: node.label.clone(),
+            score,
+            depth,
+            edge_kinds,
+            community_co_membership,
+            semantic_relation,
+            source_handle_fresh,
+            duplicate_name_precision,
+            handle_coverage_pct: page_handle_coverage_pct,
+            reasons,
+        });
+    }
+
+    ranked.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| {
+                left.depth
+                    .unwrap_or(usize::MAX)
+                    .cmp(&right.depth.unwrap_or(usize::MAX))
+            })
+            .then(left.kind.cmp(&right.kind))
+            .then(left.label.cmp(&right.label))
+            .then(left.node_id.cmp(&right.node_id))
+    });
+    for (idx, neighbor) in ranked.iter_mut().enumerate() {
+        neighbor.rank = idx + 1;
+    }
+    ranked
+}
+
+fn graph_db_neighborhood_depths(
+    center_id: &str,
+    node_by_id: &BTreeMap<String, &SubstrateGraphNode>,
+    outgoing: &BTreeMap<String, Vec<&SubstrateGraphEdge>>,
+) -> BTreeMap<String, usize> {
+    if !node_by_id.contains_key(center_id) {
+        return BTreeMap::new();
+    }
+    let mut depths = BTreeMap::from([(center_id.to_string(), 0usize)]);
+    let mut queue = VecDeque::from([(center_id.to_string(), 0usize)]);
+    while let Some((current, depth)) = queue.pop_front() {
+        for edge in outgoing.get(&current).into_iter().flatten() {
+            if !node_by_id.contains_key(&edge.to_id) || depths.contains_key(&edge.to_id) {
+                continue;
+            }
+            let next_depth = depth + 1;
+            depths.insert(edge.to_id.clone(), next_depth);
+            queue.push_back((edge.to_id.clone(), next_depth));
+        }
+    }
+    depths
+}
+
+fn graph_db_page_handle_coverage_pct(nodes: &[SubstrateGraphNode]) -> f64 {
+    if nodes.is_empty() {
+        return 0.0;
+    }
+    let covered = nodes
+        .iter()
+        .filter(|node| graph_db_node_has_handle_coverage(node))
+        .count();
+    (covered as f64 / nodes.len() as f64) * 100.0
+}
+
+fn graph_db_node_has_handle_coverage(node: &SubstrateGraphNode) -> bool {
+    !node.id.is_empty()
+        || node.properties.contains_key("handle")
+        || node.properties.contains_key("ref_id")
+        || node.properties.contains_key("tagpath_handle")
+}
+
+fn graph_db_duplicate_name_precision(
+    node: &SubstrateGraphNode,
+    label_counts: &BTreeMap<String, usize>,
+) -> f64 {
+    let count = label_counts.get(&node.label).copied().unwrap_or(1);
+    if count <= 1 || graph_db_node_has_handle_coverage(node) {
+        1.0
+    } else {
+        1.0 / count as f64
+    }
+}
+
+fn graph_db_has_community_signal(node: &SubstrateGraphNode, edge_kinds: &[String]) -> bool {
+    node.kind.contains("community")
+        || edge_kinds.iter().any(|kind| kind.contains("community"))
+        || node
+            .properties
+            .iter()
+            .any(|(key, value)| key.contains("community") || value.contains("community"))
+}
+
+fn graph_db_has_semantic_signal(node: &SubstrateGraphNode, edge_kinds: &[String]) -> bool {
+    node.kind.starts_with("semantic_")
+        || edge_kinds.iter().any(|kind| {
+            kind.contains("semantic") || kind.contains("concept") || kind.contains("entity")
+        })
+}
+
+fn graph_db_source_handle_is_fresh(node: &SubstrateGraphNode) -> bool {
+    node.kind == "source_handle"
+        && node.freshness.as_ref().is_some_and(|freshness| {
+            freshness.content_hash.is_some() || freshness.observed_at_unix.is_some()
+        })
+}
+
+fn graph_db_edge_kind_rank_score(edge_kind: &str) -> i64 {
+    match edge_kind {
+        "semantic_relation" => 34,
+        "mentions_entity" | "mentions_concept" | "tagged_entity" | "tagged_concept"
+        | "related_concept" => 28,
+        "mentions" => 22,
+        "calls" => 20,
+        "requests_context" | "scopes_context" | "scopes_source" | "explains_result" => 18,
+        "defines" | "contains" | "belongs_to" => 12,
+        kind if kind.contains("community") => 20,
+        kind if kind.contains("semantic")
+            || kind.contains("concept")
+            || kind.contains("entity") =>
+        {
+            24
+        }
+        _ => 8,
+    }
+}
+
 fn graph_db_edge_key(edge: &SubstrateGraphEdge) -> String {
     if edge.id.is_empty() {
         substrate::ConvexEdgeRow::stable_key(&edge.from_id, &edge.to_id, &edge.kind)
@@ -11197,7 +11493,7 @@ fn graph_db_schema() -> GraphDbSchema {
             },
             GraphDbSchemaOperation {
                 command: "neighborhood <id> --depth <n> [--edge-kind <kind>] [--property KEY=VALUE] [--cursor ID] [--limit N]",
-                description: "Return a directed outgoing subgraph around a node using batched SQLite recursive traversal plus pushed filters/paging when available",
+                description: "Return a directed outgoing subgraph around a node using batched SQLite recursive traversal plus pushed filters/paging when available; JSON also includes additive ranked_neighbors while default nodes remain stable-id ordered",
             },
             GraphDbSchemaOperation {
                 command: "path <from> <to> [--edge-kind <kind>] [--max-hops N]",
@@ -11670,6 +11966,8 @@ fn graph_db_report_from_store(
         edge: None,
         nodes: Vec::new(),
         edges: Vec::new(),
+        ranked_neighbors: Vec::new(),
+        neighborhood_ranking_gate: None,
         path: None,
         page: None,
         warnings,
@@ -11775,6 +12073,9 @@ fn graph_db_report_from_store(
             )? {
                 report.nodes = paged.nodes;
                 report.edges = paged.edges;
+                report.ranked_neighbors =
+                    graph_db_ranked_neighbors(&id, &report.nodes, &report.edges);
+                report.neighborhood_ranking_gate = Some(graph_db_neighborhood_ranking_gate());
                 report.page = Some(graph_db_page_report_from_store(
                     paged.page,
                     options.property_filters,
@@ -11846,6 +12147,26 @@ fn print_graph_db_human(report: &GraphDbReport, compact: bool) {
             edge.from_id,
             edge.kind,
             edge.to_id
+        );
+    }
+    for neighbor in &report.ranked_neighbors {
+        println!(
+            "ranked_neighbor: #{} score:{} depth:{} {} [{}] {}",
+            neighbor.rank,
+            neighbor.score,
+            neighbor
+                .depth
+                .map(|depth| depth.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            neighbor.node_id,
+            neighbor.kind,
+            neighbor.label
+        );
+    }
+    if let Some(gate) = &report.neighborhood_ranking_gate {
+        println!(
+            "neighborhood_ranking_gate: {} default_order:{} ranked_output_default:{}",
+            gate.status, gate.default_order, gate.ranked_output_default
         );
     }
     if let Some(path) = &report.path {
@@ -30830,6 +31151,32 @@ def list_items():
                 .any(|edge| edge.from_id == backlog.handle && edge.kind == "mentions"),
             "expected backlog mention edge, got {:?}",
             report.edges
+        );
+        assert!(
+            report.ranked_neighbors.iter().any(|neighbor| {
+                neighbor.depth == Some(1)
+                    && neighbor.edge_kinds.iter().any(|kind| kind == "mentions")
+                    && neighbor.node_id != backlog.handle
+                    && neighbor.handle_coverage_pct >= 95.0
+                    && neighbor.duplicate_name_precision >= 0.99
+            }),
+            "expected ranked neighborhood neighbors with quality scores, got {:?}",
+            report.ranked_neighbors
+        );
+        let ranking_gate = report.neighborhood_ranking_gate.as_ref().unwrap();
+        assert!(!ranking_gate.ranked_output_default);
+        assert_eq!(ranking_gate.default_order, "stable_node_id");
+        assert!(
+            ranking_gate
+                .required_metrics
+                .iter()
+                .any(|metric| metric == "handle_coverage_pct")
+        );
+        assert!(
+            ranking_gate
+                .required_metrics
+                .iter()
+                .any(|metric| metric == "duplicate_name_precision")
         );
         assert!(
             report

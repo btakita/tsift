@@ -1207,9 +1207,10 @@ fn assert_graph_db_snapshot_query_parity(project: &Path, snapshot: &Path) {
     assert_eq!(sqlite_path["path"], convex_path["path"]);
     assert!(sqlite_path["path"]["hops"].as_u64().unwrap() >= 1);
 
+    let neighborhood_center_id = main_id.clone();
     let neighborhood_query = vec![
         "neighborhood".to_string(),
-        main_id,
+        neighborhood_center_id.clone(),
         "--depth".to_string(),
         "3".to_string(),
         "--edge-kind".to_string(),
@@ -1230,6 +1231,34 @@ fn assert_graph_db_snapshot_query_parity(project: &Path, snapshot: &Path) {
     let sqlite_edges = edge_keys(&sqlite_neighborhood);
     assert_eq!(sqlite_edges, edge_keys(&convex_neighborhood));
     assert!(!sqlite_edges.is_empty());
+    let ranked_neighbors = sqlite_neighborhood["ranked_neighbors"].as_array().unwrap();
+    assert!(!ranked_neighbors.is_empty(), "{sqlite_neighborhood}");
+    assert!(
+        ranked_neighbors.iter().all(|neighbor| {
+            neighbor["node_id"].as_str() != Some(neighborhood_center_id.as_str())
+                && neighbor["score"].as_i64().is_some()
+                && neighbor["edge_kinds"]
+                    .as_array()
+                    .is_some_and(|kinds| !kinds.is_empty())
+        }),
+        "{sqlite_neighborhood}"
+    );
+    assert!(
+        !sqlite_neighborhood["neighborhood_ranking_gate"]["ranked_output_default"]
+            .as_bool()
+            .unwrap()
+    );
+    assert_eq!(
+        sqlite_neighborhood["neighborhood_ranking_gate"]["default_change_gate"],
+        "community_search_quality_metrics"
+    );
+    assert!(
+        sqlite_neighborhood["neighborhood_ranking_gate"]["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|metric| metric == "duplicate_name_precision")
+    );
     assert_graph_db_page_semantics_match(
         &sqlite_neighborhood["page"],
         &convex_neighborhood["page"],

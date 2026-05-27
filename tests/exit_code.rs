@@ -4940,6 +4940,29 @@ fn metric_digest_reports_community_search_gate_fixture() {
     let gate = &json["community_search_gate"];
     assert_eq!(gate["decision"], "pass");
     assert_eq!(gate["workloads"].as_array().unwrap().len(), 2);
+    assert_eq!(gate["min_handle_coverage_pct"], 95.0);
+    assert_eq!(gate["min_duplicate_name_precision"], 0.99);
+    assert!(
+        gate["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|metric| metric == "handle_coverage_pct")
+    );
+    assert!(
+        gate["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|metric| metric == "duplicate_name_precision")
+    );
+    assert!(
+        gate["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|metric| metric == "top_community_stability")
+    );
     assert!(
         gate["workloads"]
             .as_array()
