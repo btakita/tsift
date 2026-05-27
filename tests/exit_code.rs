@@ -839,6 +839,10 @@ fn communities_json_annotates_members_when_index_is_fresh() {
         String::from_utf8_lossy(&output.stderr)
     );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let diag = &json["community_diagnostics"];
+    assert_eq!(diag["tagpath_state"], "fresh", "{json}");
+    assert_eq!(diag["tagpath_readiness"]["status"], "ready", "{json}");
+    assert_eq!(diag["tagpath_readiness"]["fail_closed"], false, "{json}");
     let communities = json["communities"].as_array().unwrap();
     assert!(!communities.is_empty());
     for community in communities {
@@ -869,6 +873,26 @@ fn communities_json_reports_cache_diagnostics_and_reuses_disk_cache() {
     let first_diag = &first_json["community_diagnostics"];
     assert_eq!(first_diag["cache_hit"], false, "{first_json}");
     assert_eq!(first_diag["tagpath_state"], "missing", "{first_json}");
+    assert_eq!(
+        first_diag["tagpath_readiness"]["status"], "blocked",
+        "{first_json}"
+    );
+    assert_eq!(
+        first_diag["tagpath_readiness"]["fail_closed"], true,
+        "{first_json}"
+    );
+    assert_eq!(
+        first_diag["tagpath_readiness"]["reason"], "tagpath_state_missing",
+        "{first_json}"
+    );
+    assert!(
+        first_diag["tagpath_readiness"]["next_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("tagpath index")),
+        "{first_json}"
+    );
     assert_eq!(
         first_diag["edge_count"], first_json["edge_count"],
         "{first_json}"

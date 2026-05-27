@@ -177,6 +177,86 @@ Completed `#wfok`; touched files `clean.rs`.
     dir
 }
 
+fn seed_current_semantic_summary(project: &Path, file_path: &str, symbol_name: &str) {
+    fs::create_dir_all(project.join(".tsift")).unwrap();
+    let content = fs::read(project.join(file_path)).unwrap();
+    let content_hash = blake3::hash(&content).to_hex().to_string();
+    let conn = Connection::open(project.join(".tsift/summaries.db")).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE IF NOT EXISTS summaries (
+             id INTEGER PRIMARY KEY,
+             symbol_name TEXT NOT NULL,
+             file_path TEXT NOT NULL,
+             content_hash TEXT NOT NULL,
+             summary TEXT NOT NULL,
+             entities TEXT,
+             relationships TEXT,
+             concept_labels TEXT,
+             extracted_at TEXT NOT NULL,
+             model TEXT NOT NULL,
+             tokens_input INTEGER,
+             tokens_output INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_summaries_symbol ON summaries(symbol_name);
+         CREATE INDEX IF NOT EXISTS idx_summaries_file ON summaries(file_path);
+         CREATE INDEX IF NOT EXISTS idx_summaries_hash ON summaries(content_hash);",
+    )
+    .unwrap();
+    let entities = serde_json::to_string(&json!([
+        {
+            "name": symbol_name,
+            "kind": "function",
+            "description": "Builds graph navigation evidence."
+        },
+        {
+            "name": "TraversalGraph",
+            "kind": "type",
+            "description": "Carries GraphStore-backed traversal rows."
+        }
+    ]))
+    .unwrap();
+    let relationships = serde_json::to_string(&json!([
+        {
+            "from": symbol_name,
+            "to": "TraversalGraph",
+            "kind": "uses"
+        }
+    ]))
+    .unwrap();
+    let concept_labels =
+        serde_json::to_string(&json!(["graph navigation", "semantic extraction"])).unwrap();
+    conn.execute(
+        "INSERT INTO summaries (
+            symbol_name,
+            file_path,
+            content_hash,
+            summary,
+            entities,
+            relationships,
+            concept_labels,
+            extracted_at,
+            model,
+            tokens_input,
+            tokens_output
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![
+            symbol_name,
+            file_path,
+            content_hash,
+            "cached summary links helper to graph navigation evidence",
+            entities,
+            relationships,
+            concept_labels,
+            "1700000000",
+            "test-model",
+            100_i64,
+            40_i64
+        ],
+    )
+    .unwrap();
+}
+
 fn init_git_repo(path: &Path) {
     let status = Command::new("git")
         .args(["init"])
@@ -1344,6 +1424,20 @@ fn graph_db_refresh_and_status_materialize_operator_report() {
             }),
         "{refresh}"
     );
+    assert_eq!(refresh["readiness"]["status"], "blocked", "{refresh}");
+    assert_eq!(refresh["readiness"]["fail_closed"], true, "{refresh}");
+    assert_eq!(
+        refresh["readiness"]["reason"], "summary_cache_empty",
+        "{refresh}"
+    );
+    assert!(
+        refresh["readiness"]["next_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str().unwrap().contains("summarize --extract")),
+        "{refresh}"
+    );
     let refresh_commands = refresh["next_commands"].as_array().unwrap();
     assert!(
         refresh_commands
@@ -1397,6 +1491,154 @@ fn graph_db_refresh_and_status_materialize_operator_report() {
     assert_eq!(
         status["compaction"]["live_rows"],
         refresh["compaction"]["live_rows"]
+    );
+}
+
+#[test]
+fn graph_db_semantic_readiness_clears_after_summarize_extract_and_refresh() {
+    let project = graph_db_project();
+    init_git_repo(project.path());
+
+    let refresh = graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
+    assert_eq!(refresh["readiness"]["status"], "blocked", "{refresh}");
+
+    let backlog = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "kind".to_string(),
+            "backlog".to_string(),
+            "--property".to_string(),
+            "ref_id=gval".to_string(),
+            "--limit".to_string(),
+            "1".to_string(),
+        ],
+    );
+    let backlog_id = node_ids(&backlog).remove(0);
+    let empty_neighborhood = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "neighborhood".to_string(),
+            backlog_id.clone(),
+            "--depth".to_string(),
+            "4".to_string(),
+            "--limit".to_string(),
+            "80".to_string(),
+        ],
+    );
+    assert!(
+        !empty_neighborhood["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["kind"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("semantic_"))),
+        "{empty_neighborhood}"
+    );
+    let empty_evidence = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "evidence".to_string(),
+            "gval".to_string(),
+            "--depth".to_string(),
+            "4".to_string(),
+            "--limit".to_string(),
+            "8".to_string(),
+        ],
+    );
+    assert_eq!(
+        empty_evidence["semantic_related"].as_array().unwrap().len(),
+        0,
+        "{empty_evidence}"
+    );
+
+    seed_current_semantic_summary(project.path(), "main.rs", "helper");
+    let summarize = assert_tsift_json(vec![
+        "summarize".to_string(),
+        "--path".to_string(),
+        project.path().to_string_lossy().to_string(),
+        "--extract".to_string(),
+        "main.rs".to_string(),
+        "--json".to_string(),
+    ]);
+    assert!(
+        summarize["errors"].as_array().unwrap().is_empty(),
+        "{summarize}"
+    );
+
+    let refreshed = graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
+    assert_eq!(refreshed["readiness"]["status"], "ready", "{refreshed}");
+    assert_eq!(
+        refreshed["readiness"]["reason"], "semantic_rows_available",
+        "{refreshed}"
+    );
+
+    let semantic_neighborhood = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "neighborhood".to_string(),
+            backlog_id,
+            "--depth".to_string(),
+            "4".to_string(),
+            "--limit".to_string(),
+            "80".to_string(),
+        ],
+    );
+    assert!(
+        semantic_neighborhood["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["kind"] == "semantic_concept" && node["label"] == "graph navigation"),
+        "{semantic_neighborhood}"
+    );
+
+    let semantic_evidence = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "evidence".to_string(),
+            "gval".to_string(),
+            "--depth".to_string(),
+            "4".to_string(),
+            "--limit".to_string(),
+            "8".to_string(),
+        ],
+    );
+    assert!(
+        semantic_evidence["semantic_related"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["kind"] == "semantic_concept" && node["label"] == "graph navigation"),
+        "{semantic_evidence}"
+    );
+
+    let session = project.path().join("tasks/software/tsift.md");
+    let conflict = assert_tsift_json(vec![
+        "conflict-matrix".to_string(),
+        "--path".to_string(),
+        session.to_string_lossy().to_string(),
+        "--json".to_string(),
+        "gval".to_string(),
+    ]);
+    let candidate = &conflict["candidates"].as_array().unwrap()[0];
+    assert_eq!(candidate["target"], "gval", "{conflict}");
+    assert!(
+        candidate["semantic_dispatch_score"].as_u64().unwrap() > 0,
+        "{conflict}"
+    );
+    assert!(
+        candidate["semantic_dispatch_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason.as_str().unwrap().contains("semantic_concept")),
+        "{conflict}"
     );
 }
 

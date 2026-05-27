@@ -3479,6 +3479,7 @@ struct CommunityDetectionDiagnostics {
     edge_count: usize,
     iterations: usize,
     tagpath_state: String,
+    tagpath_readiness: GraphEffectivenessReadiness,
     #[serde(skip_serializing_if = "Option::is_none")]
     tagpath_stale_reason: Option<String>,
     annotated_community_count: usize,
@@ -3561,6 +3562,80 @@ fn community_tagpath_cache_part(
     }
 }
 
+fn graph_effectiveness_ready(reason: impl Into<String>) -> GraphEffectivenessReadiness {
+    GraphEffectivenessReadiness {
+        status: "ready".to_string(),
+        fail_closed: false,
+        reason: reason.into(),
+        diagnostics: Vec::new(),
+        next_commands: Vec::new(),
+    }
+}
+
+fn graph_effectiveness_blocked(
+    reason: impl Into<String>,
+    diagnostics: Vec<String>,
+    next_commands: Vec<String>,
+) -> GraphEffectivenessReadiness {
+    GraphEffectivenessReadiness {
+        status: "blocked".to_string(),
+        fail_closed: true,
+        reason: reason.into(),
+        diagnostics,
+        next_commands,
+    }
+}
+
+fn tagpath_index_update_command(root: &std::path::Path) -> String {
+    format!(
+        "cd {} && tagpath index --update",
+        shell_quote(root.to_string_lossy().as_ref())
+    )
+}
+
+fn graph_tagpath_readiness(
+    root: &std::path::Path,
+    tagpath: &CommunityTagpathCachePart,
+) -> GraphEffectivenessReadiness {
+    match tagpath.state.as_str() {
+        "fresh" => graph_effectiveness_ready("tagpath_handles_available"),
+        "disabled" => GraphEffectivenessReadiness {
+            status: "disabled".to_string(),
+            fail_closed: false,
+            reason: "tagpath_lookup_disabled".to_string(),
+            diagnostics: Vec::new(),
+            next_commands: Vec::new(),
+        },
+        "stale" => graph_effectiveness_blocked(
+            "tagpath_state_stale",
+            vec![format!(
+                "tagpath_state=stale{}: community members may miss stable tagpath_handle citations; rebuild the tagpath index before relying on handle coverage",
+                tagpath
+                    .reason
+                    .as_ref()
+                    .map(|reason| format!(" (reason={reason})"))
+                    .unwrap_or_default()
+            )],
+            vec![tagpath_index_update_command(root)],
+        ),
+        "missing" => graph_effectiveness_blocked(
+            "tagpath_state_missing",
+            vec![format!(
+                "tagpath_state=missing: community members cannot emit stable tagpath_handle citations; create .naming.toml if needed, then run tagpath indexing from {}",
+                root.display()
+            )],
+            vec![tagpath_index_update_command(root)],
+        ),
+        state => graph_effectiveness_blocked(
+            format!("tagpath_state_{state}"),
+            vec![format!(
+                "tagpath_state={state}: community tagpath_handle readiness is unknown"
+            )],
+            vec![tagpath_index_update_command(root)],
+        ),
+    }
+}
+
 fn community_graph_watermark(db: &index::IndexDb) -> Result<String> {
     let source_snapshot = db.source_snapshot_parts()?;
     let edge_rows = db.edge_count()?;
@@ -3639,12 +3714,14 @@ fn community_detection_diagnostics(
     cache_hit: bool,
     result: &graph::CommunityResult,
     tagpath: &CommunityTagpathCachePart,
+    tagpath_root: &std::path::Path,
 ) -> CommunityDetectionDiagnostics {
     CommunityDetectionDiagnostics {
         cache_hit,
         edge_count: result.edge_count,
         iterations: result.iterations,
         tagpath_state: tagpath.state.clone(),
+        tagpath_readiness: graph_tagpath_readiness(tagpath_root, tagpath),
         tagpath_stale_reason: tagpath.reason.clone(),
         annotated_community_count: 0,
         annotated_member_count: 0,
@@ -3686,6 +3763,7 @@ fn detect_communities_cached(
     root: &std::path::Path,
     scope: Option<&str>,
     tagpath: &CommunityTagpathCachePart,
+    tagpath_root: &std::path::Path,
 ) -> Result<CommunityDetectionReport> {
     let graph_watermark = community_graph_watermark(db)?;
     let cache_key = community_detection_cache_key(root, scope, &graph_watermark, tagpath)?;
@@ -3696,7 +3774,7 @@ fn detect_communities_cached(
         .and_then(|cache| cache.get(&cache_key).cloned())
     {
         return Ok(CommunityDetectionReport {
-            diagnostics: community_detection_diagnostics(true, &result, tagpath),
+            diagnostics: community_detection_diagnostics(true, &result, tagpath, tagpath_root),
             result,
         });
     }
@@ -3706,7 +3784,7 @@ fn detect_communities_cached(
             cache.insert(cache_key.clone(), result.clone());
         }
         return Ok(CommunityDetectionReport {
-            diagnostics: community_detection_diagnostics(true, &result, tagpath),
+            diagnostics: community_detection_diagnostics(true, &result, tagpath, tagpath_root),
             result,
         });
     }
@@ -3718,7 +3796,7 @@ fn detect_communities_cached(
         cache.insert(cache_key, result.clone());
     }
     Ok(CommunityDetectionReport {
-        diagnostics: community_detection_diagnostics(false, &result, tagpath),
+        diagnostics: community_detection_diagnostics(false, &result, tagpath, tagpath_root),
         result,
     })
 }
@@ -3838,7 +3916,7 @@ fn file_communities_from_callers(
     scope: Option<&str>,
     tagpath: &CommunityTagpathCachePart,
 ) -> Result<std::collections::HashMap<String, std::collections::HashSet<usize>>> {
-    let community_report = detect_communities_cached(db, root, scope, tagpath)?;
+    let community_report = detect_communities_cached(db, root, scope, tagpath, root)?;
     if community_report.result.communities.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
@@ -5692,7 +5770,7 @@ fn cmd_communities(
     let CommunityDetectionReport {
         result,
         mut diagnostics,
-    } = detect_communities_cached(&db, &root, scope, &tagpath_part)?;
+    } = detect_communities_cached(&db, &root, scope, &tagpath_part, &tagpath_root)?;
     let mut tagpath_stale = false;
     let mut tagpath_stale_reason: Option<String> = None;
 
@@ -8045,6 +8123,15 @@ struct GraphDbFreshnessReport {
     diagnostics: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct GraphEffectivenessReadiness {
+    status: String,
+    fail_closed: bool,
+    reason: String,
+    diagnostics: Vec<String>,
+    next_commands: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 struct GraphDbPropertyFilter {
     key: String,
@@ -8724,6 +8811,7 @@ struct GraphDbOperatorReport {
     status: String,
     materialized: bool,
     freshness: GraphDbFreshnessReport,
+    readiness: GraphEffectivenessReadiness,
     counts: GraphDbOperatorCounts,
     #[serde(skip_serializing_if = "Option::is_none")]
     refresh: Option<GraphDbRefreshSummary>,
@@ -10211,6 +10299,7 @@ fn graph_db_operator_report_from_disk(
     warnings: Vec<String>,
 ) -> Result<GraphDbOperatorReport> {
     if !graph_db.exists() {
+        let next_commands = graph_db_operator_next_commands(root, scope, true);
         let counts = GraphDbOperatorCounts {
             nodes: 0,
             edges: 0,
@@ -10240,11 +10329,18 @@ fn graph_db_operator_report_from_disk(
                         .to_string(),
                 ],
             },
+            readiness: graph_effectiveness_blocked(
+                "graph_db_missing",
+                vec![
+                    "graph.db is missing; materialize the projection before relying on graph effectiveness".to_string(),
+                ],
+                next_commands.clone(),
+            ),
             counts: counts.clone(),
             refresh,
             compaction: graph_db_compaction_policy(root, scope, &counts, false),
             recovery: None,
-            next_commands: graph_db_operator_next_commands(root, scope, true),
+            next_commands,
             warnings,
         });
     }
@@ -10287,6 +10383,7 @@ fn graph_db_operator_report_from_disk(
         status,
         materialized: true,
         freshness,
+        readiness: graph_db_semantic_readiness(root, scope),
         compaction: graph_db_compaction_policy(root, scope, &counts, false),
         counts,
         refresh,
@@ -10323,6 +10420,10 @@ fn print_graph_db_operator_human(report: &GraphDbOperatorReport) {
     println!(
         "rows: {} node(s), {} edge(s), {} tombstone(s)",
         report.counts.nodes, report.counts.edges, report.counts.tombstones.total
+    );
+    println!(
+        "readiness: {} reason: {} fail_closed: {}",
+        report.readiness.status, report.readiness.reason, report.readiness.fail_closed
     );
     if let Some(file_size) = report.counts.file_size_bytes {
         println!(
@@ -10363,8 +10464,14 @@ fn print_graph_db_operator_human(report: &GraphDbOperatorReport) {
     for diagnostic in &report.freshness.diagnostics {
         println!("diagnostic: {diagnostic}");
     }
+    for diagnostic in &report.readiness.diagnostics {
+        println!("readiness diagnostic: {diagnostic}");
+    }
     for warning in &report.warnings {
         println!("warning: {warning}");
+    }
+    for command in &report.readiness.next_commands {
+        println!("readiness next: {command}");
     }
     for command in &report.next_commands {
         println!("next: {command}");
@@ -10397,6 +10504,7 @@ fn print_graph_db_operator_report(
                     envelope_metric("edges", report.counts.edges),
                     envelope_metric("tombstones", report.counts.tombstones.total),
                     envelope_metric("compaction", &report.compaction.status),
+                    envelope_metric("readiness", &report.readiness.status),
                 ],
             },
             false,
@@ -10414,6 +10522,73 @@ fn status_run_command_without_notes(run: &str) -> &str {
         .unwrap_or(run)
 }
 
+fn graph_db_status_summarize_command(report: &status::StatusReport) -> String {
+    report
+        .recommendations
+        .run
+        .as_deref()
+        .filter(|command| command.contains("summarize --extract"))
+        .map(status_run_command_without_notes)
+        .unwrap_or("tsift summarize --extract .")
+        .to_string()
+}
+
+fn graph_db_semantic_readiness(root: &Path, scope: Option<&str>) -> GraphEffectivenessReadiness {
+    let report = match status::check_status(root) {
+        Ok(report) => report,
+        Err(err) => {
+            return graph_effectiveness_blocked(
+                "status_check_unavailable",
+                vec![format!(
+                    "semantic readiness could not inspect summary cache after graph-db refresh: {err:#}"
+                )],
+                vec![graph_db_refresh_command(root, scope)],
+            );
+        }
+    };
+
+    match &report.summaries {
+        status::SummaryStatus::Available {
+            cached_files,
+            total_indexed_files,
+            coverage_pct,
+            ..
+        } => {
+            let mut readiness = graph_effectiveness_ready("semantic_rows_available");
+            readiness.diagnostics.push(format!(
+                "summary cache has {cached_files}/{total_indexed_files} indexed file(s) cached ({coverage_pct}% coverage); graph semantic rows are available"
+            ));
+            readiness
+        }
+        status::SummaryStatus::None { .. } => {
+            let summarize = graph_db_status_summarize_command(&report);
+            graph_effectiveness_blocked(
+                "summary_cache_empty",
+                vec![format!(
+                    "summary cache empty: graph-db materialized code/session rows but semantic rows are unavailable; run `{}` from {} and rerun `{}` before relying on semantic evidence",
+                    summarize,
+                    root.display(),
+                    graph_db_refresh_command(root, scope)
+                )],
+                vec![summarize, graph_db_refresh_command(root, scope)],
+            )
+        }
+        status::SummaryStatus::Unavailable => graph_effectiveness_blocked(
+            "summary_cache_unavailable",
+            vec![
+                "summary cache unavailable because the source index is missing; build the index before relying on semantic graph evidence".to_string(),
+            ],
+            report
+                .recommendations
+                .run
+                .clone()
+                .into_iter()
+                .chain(std::iter::once(graph_db_refresh_command(root, scope)))
+                .collect(),
+        ),
+    }
+}
+
 fn graph_db_operator_status_warnings(root: &Path, scope: Option<&str>) -> Vec<String> {
     let report = match status::check_status(root) {
         Ok(report) => report,
@@ -10424,15 +10599,14 @@ fn graph_db_operator_status_warnings(root: &Path, scope: Option<&str>) -> Vec<St
         }
     };
 
+    let summarize_run = if matches!(report.summaries, status::SummaryStatus::None { .. }) {
+        Some(graph_db_status_summarize_command(&report))
+    } else {
+        None
+    };
     let mut warnings = report.reminders;
     if matches!(report.summaries, status::SummaryStatus::None { .. }) {
-        let run = report
-            .recommendations
-            .run
-            .as_deref()
-            .filter(|command| command.contains("summarize --extract"))
-            .map(status_run_command_without_notes)
-            .unwrap_or("tsift summarize --extract .");
+        let run = summarize_run.unwrap_or_else(|| "tsift summarize --extract .".to_string());
         warnings.push(format!(
             "summary cache empty: graph-db refresh materialized code/session rows but semantic rows are unavailable; run `{}` from {} and rerun `{}` before relying on semantic evidence",
             run,
@@ -16961,7 +17135,7 @@ fn cmd_explain_with_budget(
     let CommunityDetectionReport {
         result: comm_result,
         diagnostics: mut community_diagnostics,
-    } = detect_communities_cached(&db, &root, scope, &tagpath_part)?;
+    } = detect_communities_cached(&db, &root, scope, &tagpath_part, &community_tagpath_root)?;
     let mut focused_community = comm_result
         .communities
         .iter()
