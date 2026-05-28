@@ -2747,6 +2747,7 @@ dependencies = [
  "tsift-algorithms",
  "tsift-core",
  "tsift-graph",
+ "tsift-index",
  "tsift-libsql",
  "tsift-quality",
  "tsift-resolution",
@@ -2784,6 +2785,7 @@ dependencies = [
  "tsift-algorithms",
  "tsift-core",
  "tsift-graph",
+ "tsift-index",
  "tsift-quality",
  "tsift-resolution",
  "tsift-sqlite",
@@ -2819,6 +2821,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tsift-index"
+version = "0.1.62"
+dependencies = [
+ "anyhow",
+ "fs4",
+ "ignore",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tagpath",
+ "tempfile",
+ "toml",
+ "tsift-graph",
+ "tsift-sqlite",
+]
+
+[[package]]
 name = "tsift-libsql"
 version = "0.1.0"
 dependencies = [
@@ -2839,6 +2858,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

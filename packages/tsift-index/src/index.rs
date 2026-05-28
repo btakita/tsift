@@ -1,6 +1,6 @@
-use crate::graph;
-use crate::lang::Lang;
 use crate::walk::{self, FileEntry, PruneStats};
+use tsift_graph as graph;
+use tsift_graph::lang::Lang;
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
 use rusqlite::{Connection, OpenFlags};
@@ -1444,14 +1444,14 @@ enum LockFileMarker {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WriterLockProbe {
+pub enum WriterLockProbe {
     Absent { path: PathBuf },
     Live { path: PathBuf, pid: Option<u32> },
     Stale { path: PathBuf, pid: Option<u32> },
     Unknown { path: PathBuf },
 }
 
-pub(crate) fn probe_writer_lock(lock_path: &Path) -> Result<WriterLockProbe> {
+pub fn probe_writer_lock(lock_path: &Path) -> Result<WriterLockProbe> {
     if !lock_path.exists() {
         return Ok(WriterLockProbe::Absent {
             path: lock_path.to_path_buf(),
@@ -1552,7 +1552,7 @@ fn compute_tags(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::substrate::{wal_sidecar_path, rollback_journal_path};
+    use tsift_sqlite::{wal_sidecar_path, rollback_journal_path};
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;

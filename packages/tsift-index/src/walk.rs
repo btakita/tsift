@@ -1,4 +1,4 @@
-use crate::lang::Lang;
+use tsift_graph::lang::Lang;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

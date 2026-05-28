@@ -53,6 +53,12 @@ tsift (CLI + MCP plugin)
 │   ├── dci_benchmark module — DCI (Driven Causal Index) benchmark harness types and result rollups
 │   ├── runtime_churn module — RestartChurnState / RestartChurnSummary derivation from transcript events
 │   └── re-exported via root `tsift` `pub use tsift_quality::{audit, dci_benchmark, perf_gate, runtime_churn};`
+├── tsift-index crate (packages/tsift-index — config + project walk + init + AST symbol index)
+│   ├── config module — Config + workspace/submodule resolution
+│   ├── walk module — file walking + mtime-based prune semantics + language tagging
+│   ├── init module — instruction injection, OpenCode/Codex hook setup, npm package parity
+│   ├── index module — AST symbol/index DB management, writer/reader, lock probes, snapshot fallback
+│   └── re-exported via root `tsift` `pub use tsift_index::{config, index, init, walk};`
 ├── tsift-cli crate (packages/tsift-cli — CLI dispatch, command handlers, output formatting)
 │   ├── clap CLI types — Cli, Commands, GraphDbQuery, output format enums
 │   ├── command handlers — cmd_search, cmd_index, cmd_graph, cmd_communities, cmd_explain, etc.

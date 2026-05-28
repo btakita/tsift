@@ -1,12 +1,11 @@
 //! Integration tests for the graph DB performance release gate.
 //!
-//! The decision function lives in `src/perf_gate.rs` and is included here
-//! through `#[path]` so the test exercises the same code the binary loads.
+//! The decision function lives in `tsift_quality::perf_gate` so the test
+//! exercises the same code the binary loads.
 //! Tests are read-only against `fixtures/graph-db-performance-history.json`;
 //! sibling agents are appending samples concurrently.
 
-#[path = "../../../src/perf_gate.rs"]
-mod perf_gate;
+use tsift_quality::perf_gate;
 
 use perf_gate::{
     CONTEXT_PACK_DIFF_BUDGET_MICROS, GATE_WORKLOAD_PREFIXES, GateDecision, GateSample,
