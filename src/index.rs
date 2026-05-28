@@ -1428,7 +1428,7 @@ fn acquire_write_lock(db_path: &Path) -> Result<WriteLockGuard> {
     }
 }
 
-pub(crate) fn writer_lock_path(db_path: &Path) -> PathBuf {
+pub fn writer_lock_path(db_path: &Path) -> PathBuf {
     let stem = db_path
         .file_stem()
         .and_then(|stem| stem.to_str())

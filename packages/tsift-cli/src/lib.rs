@@ -3,9 +3,6 @@ use clap::{Parser, Subcommand, ValueEnum};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use sift::{SearchInput, SearchOptions, Sift};
-#[cfg(test)]
-use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
@@ -15,48 +12,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use substrate::{
+use tagpath::{family as tagpath_family, ontology as tagpath_ontology};
+use tempfile::NamedTempFile;
+use tsift::sift::{SearchInput, SearchOptions, Sift};
+use tsift::substrate::{
     ConvexEdgeRow, ConvexNodeRow, ConvexProjectionRows, GraphEdge as SubstrateGraphEdge,
     GraphFreshness, GraphNode as SubstrateGraphNode, GraphProjection, GraphPropertyFilter,
     GraphProvenance, GraphQueryOptions, GraphQueryPage, GraphStore, SQLITE_GRAPH_SCHEMA_VERSION,
     SqliteGraphStore, SqliteProjectionRefresh,
 };
+use tsift::substrate::{ConvexGraphStore as SubstrateConvexGraphStore, ConvexRowsGraphClient};
 #[cfg(test)]
-use substrate::{ConvexGraphClient, ConvexGraphStore};
-use substrate::{ConvexGraphStore as SubstrateConvexGraphStore, ConvexRowsGraphClient};
-use tagpath::{family as tagpath_family, ontology as tagpath_ontology};
-use tempfile::NamedTempFile;
-
-pub mod audit;
-pub mod config;
-pub mod dci_benchmark;
-pub mod diff_digest;
-pub mod graph;
-pub mod impact;
-pub mod index;
-pub mod init;
-mod lang;
-pub mod lint;
-pub mod log_digest;
-pub mod metric_digest;
-pub mod perf_gate;
-pub mod runtime_churn;
-pub mod session_cost;
-pub mod session_digest;
-pub mod session_review;
-pub mod sift;
-pub mod status;
-pub mod resolution;
-pub mod substrate;
-pub mod summarize;
-#[cfg(feature = "backend-libsql")]
-pub mod libsql_backend;
-pub mod tagpath_adapter;
-pub mod test_digest;
-pub mod walk;
-
-#[cfg(test)]
-mod sim_world;
+use std::cell::RefCell;
 
 #[derive(Parser)]
 #[command(
@@ -1416,7 +1383,7 @@ struct AppliedEdit {
     backup_path: PathBuf,
 }
 
-fn main() -> Result<()> {
+pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let compact = cli.compact;
     let pretty = cli.pretty;
@@ -3454,19 +3421,19 @@ fn relativize_pathbuf(path: &std::path::Path, root: &std::path::Path) -> PathBuf
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn relativize_edges(edges: &mut [index::StoredEdge], root: &std::path::Path) {
+fn relativize_edges(edges: &mut [tsift::index::StoredEdge], root: &std::path::Path) {
     for edge in edges {
         edge.caller_file = relativize(&edge.caller_file, root);
     }
 }
 
-fn relativize_symbols(symbols: &mut [index::StoredSymbol], root: &std::path::Path) {
+fn relativize_symbols(symbols: &mut [tsift::index::StoredSymbol], root: &std::path::Path) {
     for sym in symbols {
         sym.file = relativize(&sym.file, root);
     }
 }
 
-fn relativize_symbol_hits(hits: &mut [index::SymbolHit], root: &std::path::Path) {
+fn relativize_symbol_hits(hits: &mut [tsift::index::SymbolHit], root: &std::path::Path) {
     for hit in hits {
         hit.file = relativize(&hit.file, root);
     }
@@ -3494,7 +3461,7 @@ pub struct CommunityMemberAmbiguityDiagnostic {
 
 const COMMUNITY_DETECTION_CACHE_VERSION: &str = "community-detection-cache-v1";
 
-static COMMUNITY_DETECTION_CACHE: OnceLock<Mutex<BTreeMap<String, graph::CommunityResult>>> =
+static COMMUNITY_DETECTION_CACHE: OnceLock<Mutex<BTreeMap<String, tsift::graph::CommunityResult>>> =
     OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
@@ -3515,7 +3482,7 @@ struct CommunityDetectionDiagnostics {
 
 #[derive(Debug, Clone)]
 struct CommunityDetectionReport {
-    result: graph::CommunityResult,
+    result: tsift::graph::CommunityResult,
     diagnostics: CommunityDetectionDiagnostics,
 }
 
@@ -3530,15 +3497,15 @@ struct CommunityTagpathCachePart {
 struct CommunityDetectionCacheEntry {
     version: String,
     key: String,
-    result: graph::CommunityResult,
+    result: tsift::graph::CommunityResult,
 }
 
-fn community_detection_cache() -> &'static Mutex<BTreeMap<String, graph::CommunityResult>> {
+fn community_detection_cache() -> &'static Mutex<BTreeMap<String, tsift::graph::CommunityResult>> {
     COMMUNITY_DETECTION_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 fn community_tagpath_cache_part_for_loaded(
-    adapter: &tagpath_adapter::TagpathAdapter,
+    adapter: &tsift::tagpath_adapter::TagpathAdapter,
 ) -> CommunityTagpathCachePart {
     let index_path = tagpath::index::index_path(&adapter.project_root);
     let index_hash = fs::read(&index_path)
@@ -3562,11 +3529,11 @@ fn community_tagpath_cache_part(
             key: "disabled".to_string(),
         });
     }
-    match tagpath_adapter::try_load(root) {
-        tagpath_adapter::LoadResult::Loaded(adapter) => {
+    match tsift::tagpath_adapter::try_load(root) {
+        tsift::tagpath_adapter::LoadResult::Loaded(adapter) => {
             Ok(community_tagpath_cache_part_for_loaded(&adapter))
         }
-        tagpath_adapter::LoadResult::Stale { reason, .. } => {
+        tsift::tagpath_adapter::LoadResult::Stale { reason, .. } => {
             if opts.strict {
                 anyhow::bail!(
                     "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
@@ -3578,7 +3545,7 @@ fn community_tagpath_cache_part(
                 reason: Some(reason),
             })
         }
-        tagpath_adapter::LoadResult::Missing => Ok(CommunityTagpathCachePart {
+        tsift::tagpath_adapter::LoadResult::Missing => Ok(CommunityTagpathCachePart {
             state: "missing".to_string(),
             reason: None,
             key: "missing".to_string(),
@@ -3660,7 +3627,7 @@ fn graph_tagpath_readiness(
     }
 }
 
-fn community_graph_watermark(db: &index::IndexDb) -> Result<String> {
+fn community_graph_watermark(db: &tsift::index::IndexDb) -> Result<String> {
     let source_snapshot = db.source_snapshot_parts()?;
     let edge_rows = db.edge_count()?;
     let symbol_rows = db.symbol_count()?;
@@ -3700,7 +3667,7 @@ fn read_community_detection_cache(
     root: &std::path::Path,
     scope: Option<&str>,
     key: &str,
-) -> Option<graph::CommunityResult> {
+) -> Option<tsift::graph::CommunityResult> {
     let path = community_detection_cache_path(root, scope, key);
     let bytes = fs::read(path).ok()?;
     let entry: CommunityDetectionCacheEntry = serde_json::from_slice(&bytes).ok()?;
@@ -3715,7 +3682,7 @@ fn write_community_detection_cache(
     root: &std::path::Path,
     scope: Option<&str>,
     key: &str,
-    result: &graph::CommunityResult,
+    result: &tsift::graph::CommunityResult,
 ) {
     let path = community_detection_cache_path(root, scope, key);
     let Some(parent) = path.parent() else {
@@ -3736,7 +3703,7 @@ fn write_community_detection_cache(
 
 fn community_detection_diagnostics(
     cache_hit: bool,
-    result: &graph::CommunityResult,
+    result: &tsift::graph::CommunityResult,
     tagpath: &CommunityTagpathCachePart,
     tagpath_root: &std::path::Path,
 ) -> CommunityDetectionDiagnostics {
@@ -3756,7 +3723,7 @@ fn community_detection_diagnostics(
 
 fn update_community_annotation_diagnostics(
     diagnostics: &mut CommunityDetectionDiagnostics,
-    communities: &[graph::Community],
+    communities: &[tsift::graph::Community],
     annotation: Option<&TagpathAnnotationDiagnostic>,
 ) {
     diagnostics.annotated_community_count = communities
@@ -3783,7 +3750,7 @@ fn update_community_annotation_diagnostics(
 }
 
 fn detect_communities_cached(
-    db: &index::IndexDb,
+    db: &tsift::index::IndexDb,
     root: &std::path::Path,
     scope: Option<&str>,
     tagpath: &CommunityTagpathCachePart,
@@ -3814,7 +3781,7 @@ fn detect_communities_cached(
     }
 
     let edges = db.all_edges()?;
-    let result = graph::detect_communities(&edges);
+    let result = tsift::graph::detect_communities(&edges);
     write_community_detection_cache(root, scope, &cache_key, &result);
     if let Ok(mut cache) = community_detection_cache().lock() {
         cache.insert(cache_key, result.clone());
@@ -3839,15 +3806,15 @@ fn detect_communities_cached(
 /// | false       | stale       | false   | emit diagnostic, no annotation |
 /// | false       | stale       | true    | return error |
 pub fn annotate_hits_with_tagpath(
-    hits: &mut [index::SymbolHit],
+    hits: &mut [tsift::index::SymbolHit],
     root: &std::path::Path,
     opts: &TagpathSearchOpts,
 ) -> Result<TagpathAnnotationDiagnostic> {
     if opts.no_tagpath {
         return Ok(TagpathAnnotationDiagnostic::default());
     }
-    match tagpath_adapter::try_load(root) {
-        tagpath_adapter::LoadResult::Loaded(adapter) => {
+    match tsift::tagpath_adapter::try_load(root) {
+        tsift::tagpath_adapter::LoadResult::Loaded(adapter) => {
             for hit in hits.iter_mut() {
                 let abs = if std::path::Path::new(&hit.file).is_absolute() {
                     std::path::PathBuf::from(&hit.file)
@@ -3865,7 +3832,7 @@ pub fn annotate_hits_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tagpath_adapter::LoadResult::Stale { reason, .. } => {
+        tsift::tagpath_adapter::LoadResult::Stale { reason, .. } => {
             if opts.strict {
                 anyhow::bail!(
                     "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
@@ -3878,7 +3845,7 @@ pub fn annotate_hits_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
+        tsift::tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
     }
 }
 
@@ -3904,7 +3871,7 @@ fn tagpath_handle_for_index_file(
     file: &str,
     name: &str,
     root: &std::path::Path,
-    adapter: &tagpath_adapter::TagpathAdapter,
+    adapter: &tsift::tagpath_adapter::TagpathAdapter,
 ) -> Option<String> {
     adapter.handle_for_member(&index_file_abs(file, root), name)
 }
@@ -3918,9 +3885,9 @@ struct TagpathHandleCandidate {
 
 fn tagpath_handle_candidates_for_symbol_rows(
     name: &str,
-    syms: &[index::StoredSymbol],
+    syms: &[tsift::index::StoredSymbol],
     root: &std::path::Path,
-    adapter: &tagpath_adapter::TagpathAdapter,
+    adapter: &tsift::tagpath_adapter::TagpathAdapter,
 ) -> Vec<TagpathHandleCandidate> {
     syms.iter()
         .filter_map(|sym| {
@@ -3935,7 +3902,7 @@ fn tagpath_handle_candidates_for_symbol_rows(
 }
 
 fn file_communities_from_callers(
-    db: &index::IndexDb,
+    db: &tsift::index::IndexDb,
     root: &std::path::Path,
     scope: Option<&str>,
     tagpath: &CommunityTagpathCachePart,
@@ -3975,10 +3942,10 @@ fn file_communities_from_callers(
 }
 
 fn resolve_tagpath_handle_for_callee_edge(
-    edge: &index::StoredEdge,
-    db: &index::IndexDb,
+    edge: &tsift::index::StoredEdge,
+    db: &tsift::index::IndexDb,
     root: &std::path::Path,
-    adapter: &tagpath_adapter::TagpathAdapter,
+    adapter: &tsift::tagpath_adapter::TagpathAdapter,
     communities_by_file: &std::collections::HashMap<String, std::collections::HashSet<usize>>,
 ) -> Option<String> {
     let syms = db.symbol_info(&edge.callee_name).ok()?;
@@ -4007,10 +3974,10 @@ fn resolve_tagpath_handle_for_callee_edge(
 }
 
 fn push_bounded_community_member_ref(
-    refs_by_member: &mut HashMap<(usize, String), Vec<graph::CommunityMemberRef>>,
+    refs_by_member: &mut HashMap<(usize, String), Vec<tsift::graph::CommunityMemberRef>>,
     community_id: usize,
     name: &str,
-    reference: graph::CommunityMemberRef,
+    reference: tsift::graph::CommunityMemberRef,
 ) {
     let refs = refs_by_member
         .entry((community_id, name.to_string()))
@@ -4029,11 +3996,11 @@ fn push_bounded_community_member_ref(
 }
 
 fn choose_symbol_row_by_files<'a>(
-    syms: &'a [index::StoredSymbol],
+    syms: &'a [tsift::index::StoredSymbol],
     files: &BTreeSet<String>,
     root: &std::path::Path,
-) -> Option<(&'a index::StoredSymbol, &'static str)> {
-    let matches: Vec<&index::StoredSymbol> = syms
+) -> Option<(&'a tsift::index::StoredSymbol, &'static str)> {
+    let matches: Vec<&tsift::index::StoredSymbol> = syms
         .iter()
         .filter(|sym| files.contains(&index_file_key(&sym.file, root)))
         .collect();
@@ -4061,10 +4028,10 @@ fn choose_tagpath_candidate_by_files<'a>(
 }
 
 fn annotate_community_members_with_context(
-    communities: &mut [graph::Community],
-    db: &index::IndexDb,
+    communities: &mut [tsift::graph::Community],
+    db: &tsift::index::IndexDb,
     root: &std::path::Path,
-    adapter: Option<&tagpath_adapter::TagpathAdapter>,
+    adapter: Option<&tsift::tagpath_adapter::TagpathAdapter>,
 ) -> Result<Vec<CommunityMemberAmbiguityDiagnostic>> {
     let mut community_by_name = HashMap::<String, usize>::new();
     for community in communities.iter() {
@@ -4073,7 +4040,7 @@ fn annotate_community_members_with_context(
         }
     }
 
-    let mut symbols_by_name = HashMap::<String, Vec<index::StoredSymbol>>::new();
+    let mut symbols_by_name = HashMap::<String, Vec<tsift::index::StoredSymbol>>::new();
     for sym in db.all_symbols()? {
         symbols_by_name
             .entry(sym.name.clone())
@@ -4081,7 +4048,7 @@ fn annotate_community_members_with_context(
             .push(sym);
     }
 
-    let mut refs_by_member = HashMap::<(usize, String), Vec<graph::CommunityMemberRef>>::new();
+    let mut refs_by_member = HashMap::<(usize, String), Vec<tsift::graph::CommunityMemberRef>>::new();
     let mut evidence_files_by_member = HashMap::<(usize, String), BTreeSet<String>>::new();
     let mut context_files_by_community = HashMap::<usize, BTreeSet<String>>::new();
 
@@ -4110,7 +4077,7 @@ fn annotate_community_members_with_context(
             &mut refs_by_member,
             caller_community,
             &edge.caller_name,
-            graph::CommunityMemberRef {
+            tsift::graph::CommunityMemberRef {
                 file: file.clone(),
                 line: edge.caller_line,
                 role: "caller".to_string(),
@@ -4126,7 +4093,7 @@ fn annotate_community_members_with_context(
             &mut refs_by_member,
             callee_community,
             &edge.callee_name,
-            graph::CommunityMemberRef {
+            tsift::graph::CommunityMemberRef {
                 file,
                 line: edge.call_site_line,
                 role: "callee".to_string(),
@@ -4234,15 +4201,15 @@ fn annotate_community_members_with_context(
 /// a fresh tagpath index is present at `root`. Same fallback matrix as
 /// [`annotate_hits_with_tagpath`].
 pub fn annotate_stored_symbols_with_tagpath(
-    symbols: &mut [index::StoredSymbol],
+    symbols: &mut [tsift::index::StoredSymbol],
     root: &std::path::Path,
     opts: &TagpathSearchOpts,
 ) -> Result<TagpathAnnotationDiagnostic> {
     if opts.no_tagpath {
         return Ok(TagpathAnnotationDiagnostic::default());
     }
-    match tagpath_adapter::try_load(root) {
-        tagpath_adapter::LoadResult::Loaded(adapter) => {
+    match tsift::tagpath_adapter::try_load(root) {
+        tsift::tagpath_adapter::LoadResult::Loaded(adapter) => {
             for sym in symbols.iter_mut() {
                 let abs = if std::path::Path::new(&sym.file).is_absolute() {
                     std::path::PathBuf::from(&sym.file)
@@ -4260,7 +4227,7 @@ pub fn annotate_stored_symbols_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tagpath_adapter::LoadResult::Stale { reason, .. } => {
+        tsift::tagpath_adapter::LoadResult::Stale { reason, .. } => {
             if opts.strict {
                 anyhow::bail!(
                     "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
@@ -4273,7 +4240,7 @@ pub fn annotate_stored_symbols_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
+        tsift::tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
     }
 }
 
@@ -4284,8 +4251,8 @@ pub fn annotate_stored_symbols_with_tagpath(
 /// (resolves each callee edge via `db.symbol_info`, preferring the
 /// caller's file or community before the no-context first-handle fallback).
 pub fn annotate_stored_edges_with_tagpath(
-    edges: &mut [index::StoredEdge],
-    db: &index::IndexDb,
+    edges: &mut [tsift::index::StoredEdge],
+    db: &tsift::index::IndexDb,
     root: &std::path::Path,
     scope: Option<&str>,
     side: EdgeSide,
@@ -4294,8 +4261,8 @@ pub fn annotate_stored_edges_with_tagpath(
     if opts.no_tagpath {
         return Ok(TagpathAnnotationDiagnostic::default());
     }
-    match tagpath_adapter::try_load(root) {
-        tagpath_adapter::LoadResult::Loaded(adapter) => {
+    match tsift::tagpath_adapter::try_load(root) {
+        tsift::tagpath_adapter::LoadResult::Loaded(adapter) => {
             match side {
                 EdgeSide::Caller => {
                     for edge in edges.iter_mut() {
@@ -4334,7 +4301,7 @@ pub fn annotate_stored_edges_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tagpath_adapter::LoadResult::Stale { reason, .. } => {
+        tsift::tagpath_adapter::LoadResult::Stale { reason, .. } => {
             if opts.strict {
                 anyhow::bail!(
                     "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
@@ -4347,7 +4314,7 @@ pub fn annotate_stored_edges_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
+        tsift::tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
     }
 }
 
@@ -4359,13 +4326,13 @@ pub enum EdgeSide {
     Callee,
 }
 
-/// Annotate every `graph::CommunityMember` in `communities` in-place with
+/// Annotate every `tsift::graph::CommunityMember` in `communities` in-place with
 /// file/ref context and, when available, the stable `mem:` handle from the
 /// tagpath index. Duplicate names are resolved through edge/community
 /// evidence rather than a name-only first-row fallback.
 pub fn annotate_communities_with_tagpath(
-    communities: &mut [graph::Community],
-    db: &index::IndexDb,
+    communities: &mut [tsift::graph::Community],
+    db: &tsift::index::IndexDb,
     root: &std::path::Path,
     opts: &TagpathSearchOpts,
 ) -> Result<Option<TagpathAnnotationDiagnostic>> {
@@ -4373,8 +4340,8 @@ pub fn annotate_communities_with_tagpath(
         annotate_community_members_with_context(communities, db, root, None)?;
         return Ok(None);
     }
-    match tagpath_adapter::try_load(root) {
-        tagpath_adapter::LoadResult::Loaded(adapter) => {
+    match tsift::tagpath_adapter::try_load(root) {
+        tsift::tagpath_adapter::LoadResult::Loaded(adapter) => {
             let ambiguous_members =
                 annotate_community_members_with_context(communities, db, root, Some(&adapter))?;
             Ok(Some(TagpathAnnotationDiagnostic {
@@ -4384,7 +4351,7 @@ pub fn annotate_communities_with_tagpath(
                 ambiguous_members,
             }))
         }
-        tagpath_adapter::LoadResult::Stale { reason, .. } => {
+        tsift::tagpath_adapter::LoadResult::Stale { reason, .. } => {
             if opts.strict {
                 anyhow::bail!(
                     "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
@@ -4399,29 +4366,29 @@ pub fn annotate_communities_with_tagpath(
                 ambiguous_members,
             }))
         }
-        tagpath_adapter::LoadResult::Missing => {
+        tsift::tagpath_adapter::LoadResult::Missing => {
             annotate_community_members_with_context(communities, db, root, None)?;
             Ok(None)
         }
     }
 }
 
-/// Annotate `graph::PathNode` entries in-place with `tagpath_handle` when a
+/// Annotate `tsift::graph::PathNode` entries in-place with `tagpath_handle` when a
 /// fresh tagpath index is present at `root`. Symbol→file resolution goes
 /// through `db.symbol_info(name)` (first definition wins), then the adapter
 /// resolves the per-member handle. Same fallback matrix as
 /// [`annotate_hits_with_tagpath`].
 pub fn annotate_path_nodes_with_tagpath(
-    nodes: &mut [graph::PathNode],
-    db: &index::IndexDb,
+    nodes: &mut [tsift::graph::PathNode],
+    db: &tsift::index::IndexDb,
     root: &std::path::Path,
     opts: &TagpathSearchOpts,
 ) -> Result<TagpathAnnotationDiagnostic> {
     if opts.no_tagpath {
         return Ok(TagpathAnnotationDiagnostic::default());
     }
-    match tagpath_adapter::try_load(root) {
-        tagpath_adapter::LoadResult::Loaded(adapter) => {
+    match tsift::tagpath_adapter::try_load(root) {
+        tsift::tagpath_adapter::LoadResult::Loaded(adapter) => {
             for node in nodes.iter_mut() {
                 let syms = match db.symbol_info(&node.name) {
                     Ok(v) => v,
@@ -4446,7 +4413,7 @@ pub fn annotate_path_nodes_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tagpath_adapter::LoadResult::Stale { reason, .. } => {
+        tsift::tagpath_adapter::LoadResult::Stale { reason, .. } => {
             if opts.strict {
                 anyhow::bail!(
                     "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
@@ -4459,7 +4426,7 @@ pub fn annotate_path_nodes_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
+        tsift::tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
     }
 }
 
@@ -4518,7 +4485,7 @@ fn compact_snippet(snippet: &str) -> Option<String> {
         .map(|line| truncate_for_compact(line, 100))
 }
 
-fn compact_members(members: &[graph::CommunityMember], limit: usize) -> String {
+fn compact_members(members: &[tsift::graph::CommunityMember], limit: usize) -> String {
     let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
     if names.len() <= limit {
         return names.join(", ");
@@ -4815,7 +4782,7 @@ fn abbreviate_match_type(mt: &str) -> &str {
     }
 }
 
-fn symbol_path_summary(path: &[graph::PathNode]) -> String {
+fn symbol_path_summary(path: &[tsift::graph::PathNode]) -> String {
     path.iter()
         .map(|n| n.name.as_str())
         .collect::<Vec<_>>()
@@ -4833,7 +4800,7 @@ struct SearchHitGroup {
     samples: Vec<String>,
 }
 
-fn format_search_sample(hit: &sift::SearchHit) -> Option<String> {
+fn format_search_sample(hit: &tsift::sift::SearchHit) -> Option<String> {
     let snippet = compact_snippet(&hit.snippet)?;
     Some(match hit.location.as_deref() {
         Some(location) => format!("{location}: {snippet}"),
@@ -4841,7 +4808,7 @@ fn format_search_sample(hit: &sift::SearchHit) -> Option<String> {
     })
 }
 
-fn group_search_hits(hits: &[sift::SearchHit], root: &Path, absolute: bool) -> Vec<SearchHitGroup> {
+fn group_search_hits(hits: &[tsift::sift::SearchHit], root: &Path, absolute: bool) -> Vec<SearchHitGroup> {
     let mut positions = BTreeMap::new();
     let mut groups = Vec::new();
     for hit in hits {
@@ -4880,13 +4847,13 @@ fn group_search_hits(hits: &[sift::SearchHit], root: &Path, absolute: bool) -> V
     groups
 }
 
-fn should_collapse_search_hits(hits: &[sift::SearchHit], root: &Path, absolute: bool) -> bool {
+fn should_collapse_search_hits(hits: &[tsift::sift::SearchHit], root: &Path, absolute: bool) -> bool {
     let groups = group_search_hits(hits, root, absolute);
     let max_hits_per_file = groups.iter().map(|group| group.hits).max().unwrap_or(0);
     max_hits_per_file >= 3 || (hits.len() >= 6 && groups.len() < hits.len())
 }
 
-fn format_edge_groups(edges: &[index::StoredEdge], use_callers: bool) -> Vec<String> {
+fn format_edge_groups(edges: &[tsift::index::StoredEdge], use_callers: bool) -> Vec<String> {
     let mut grouped: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for edge in edges {
         let key = edge.caller_file.as_str();
@@ -4907,7 +4874,7 @@ fn format_edge_groups(edges: &[index::StoredEdge], use_callers: bool) -> Vec<Str
         .collect()
 }
 
-fn should_collapse_edge_groups(edges: &[index::StoredEdge]) -> bool {
+fn should_collapse_edge_groups(edges: &[tsift::index::StoredEdge]) -> bool {
     let mut grouped: BTreeMap<&str, usize> = BTreeMap::new();
     for edge in edges {
         *grouped.entry(edge.caller_file.as_str()).or_default() += 1;
@@ -5223,16 +5190,16 @@ fn cmd_index(
     schema: bool,
 ) -> Result<()> {
     let quiet = quiet || exit_code;
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
 
     if workspace || submodule.is_some() {
-        let cfg = config::Config::load(&root)?;
-        let targets: Vec<(String, PathBuf, Option<config::WorkspaceScope>)> =
+        let cfg = tsift::config::Config::load(&root)?;
+        let targets: Vec<(String, PathBuf, Option<tsift::config::WorkspaceScope>)> =
             if let Some(name) = submodule {
-                let scope = config::Config::resolve_submodule(&root, name)?;
+                let scope = tsift::config::Config::resolve_submodule(&root, name)?;
                 vec![(scope.id.clone(), scope.source_root.clone(), Some(scope))]
             } else {
-                config::Config::submodule_dirs(&root)?
+                tsift::config::Config::submodule_dirs(&root)?
                     .into_iter()
                     .map(|scope| (scope.id.clone(), scope.source_root.clone(), Some(scope)))
                     .collect()
@@ -5260,7 +5227,7 @@ fn cmd_index(
                     false,
                 )?
             } else if check {
-                index::IndexDb::inspect_read_only(&db_path, sub_path, prune)?.summary
+                tsift::index::IndexDb::inspect_read_only(&db_path, sub_path, prune)?.summary
             } else if prune {
                 run_index_update(
                     &db_path,
@@ -5394,7 +5361,7 @@ fn cmd_index(
             false,
         )?
     } else if check {
-        index::IndexDb::inspect_read_only(&db_path, &root, prune)?.summary
+        tsift::index::IndexDb::inspect_read_only(&db_path, &root, prune)?.summary
     } else if prune {
         run_index_update(
             &db_path,
@@ -5488,9 +5455,9 @@ fn cmd_index(
             println!();
             for change in &summary.changes {
                 let marker = match change.kind {
-                    index::ChangeKind::New => "+",
-                    index::ChangeKind::Modified => "~",
-                    index::ChangeKind::Deleted => "-",
+                    tsift::index::ChangeKind::New => "+",
+                    tsift::index::ChangeKind::Modified => "~",
+                    tsift::index::ChangeKind::Deleted => "-",
                 };
                 let lang = change.language.as_deref().unwrap_or("");
                 println!("  {} {} [{}]", marker, change.path.display(), lang);
@@ -5520,7 +5487,7 @@ fn cmd_graph(
     schema: bool,
     tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
     let db = open_index_db(path, scope)?;
 
     let show_both = !callers && !callees;
@@ -5787,7 +5754,7 @@ fn cmd_communities(
     schema: bool,
     tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
     let tagpath_root = query_tagpath_root(&root, path, scope)?;
     let db = open_index_db(path, scope)?;
     let tagpath_part = community_tagpath_cache_part(&tagpath_root, &tagpath_opts)?;
@@ -5798,7 +5765,7 @@ fn cmd_communities(
     let mut tagpath_stale = false;
     let mut tagpath_stale_reason: Option<String> = None;
 
-    let filtered: Vec<graph::Community> = result
+    let filtered: Vec<tsift::graph::Community> = result
         .communities
         .iter()
         .filter(|c| c.members.len() >= min_size)
@@ -5807,7 +5774,7 @@ fn cmd_communities(
 
     let total = filtered.len();
     let truncated = limit > 0 && total > limit;
-    let mut display: Vec<graph::Community> = if truncated {
+    let mut display: Vec<tsift::graph::Community> = if truncated {
         filtered[..limit].to_vec()
     } else {
         filtered
@@ -5927,9 +5894,9 @@ fn resolve_query_index_target(
     path_hint: &Path,
     scope: Option<&str>,
 ) -> Result<SearchIndexTarget> {
-    let cfg = config::Config::load(root)?;
+    let cfg = tsift::config::Config::load(root)?;
     if let Some(scope_name) = scope {
-        let scope = config::Config::resolve_submodule(root, scope_name)?;
+        let scope = tsift::config::Config::resolve_submodule(root, scope_name)?;
         return Ok(SearchIndexTarget {
             label: format!("submodule `{}` index", scope.id),
             db_path: cfg.db_path_for(root, &scope.id),
@@ -5939,7 +5906,7 @@ fn resolve_query_index_target(
         });
     }
 
-    if let Some(scope) = config::Config::infer_submodule_from_path(root, path_hint)? {
+    if let Some(scope) = tsift::config::Config::infer_submodule_from_path(root, path_hint)? {
         return Ok(SearchIndexTarget {
             label: format!("submodule `{}` index", scope.id),
             db_path: cfg.db_path_for(root, &scope.id),
@@ -5970,7 +5937,7 @@ fn resolve_query_index_target(
         });
     }
 
-    let scopes = config::Config::submodule_dirs(root)?;
+    let scopes = tsift::config::Config::submodule_dirs(root)?;
     if scopes.is_empty() {
         return Ok(SearchIndexTarget {
             label: "index".to_string(),
@@ -6018,7 +5985,7 @@ fn ensure_query_index_current(root: &Path, target: &SearchIndexTarget) -> Result
 
     match apply_search_index_update(root, target) {
         Ok(_) => {
-            index::inspect_scope_invalidate_all();
+            tsift::index::inspect_scope_invalidate_all();
             Ok(())
         }
         Err(err) if is_active_writer_lock_error(&err) && target.db_path.exists() => {
@@ -6035,8 +6002,8 @@ fn ensure_query_index_current(root: &Path, target: &SearchIndexTarget) -> Result
     }
 }
 
-fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::IndexDb> {
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<tsift::index::IndexDb> {
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
     let target = resolve_query_index_target(&root, path, scope)?;
     ensure_query_index_current(&root, &target)?;
     let db_path = target.db_path;
@@ -6046,7 +6013,7 @@ fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Result<index::I
             db_path.display()
         );
     }
-    index::IndexDb::open_read_only_resilient(&db_path)
+    tsift::index::IndexDb::open_read_only_resilient(&db_path)
 }
 
 fn query_tagpath_root(
@@ -6055,9 +6022,9 @@ fn query_tagpath_root(
     scope: Option<&str>,
 ) -> Result<PathBuf> {
     if let Some(scope_name) = scope {
-        return Ok(config::Config::resolve_submodule(root, scope_name)?.source_root);
+        return Ok(tsift::config::Config::resolve_submodule(root, scope_name)?.source_root);
     }
-    if let Some(scope) = config::Config::infer_submodule_from_path(root, path_hint)? {
+    if let Some(scope) = tsift::config::Config::infer_submodule_from_path(root, path_hint)? {
         return Ok(scope.source_root);
     }
     Ok(root.to_path_buf())
@@ -6414,7 +6381,7 @@ fn semantic_concept_handle(label: &str) -> String {
 }
 
 fn summary_source_handles(
-    summary: &summarize::Summary,
+    summary: &tsift::summarize::Summary,
     file_node_by_path: &BTreeMap<String, String>,
     symbol_node_by_file_label: &BTreeMap<(String, String), String>,
 ) -> Vec<String> {
@@ -6433,7 +6400,7 @@ fn summary_source_handles(
 
 fn semantic_entity_node(
     root: &Path,
-    summary: &summarize::Summary,
+    summary: &tsift::summarize::Summary,
     name: &str,
     kind: &str,
     description: &str,
@@ -6467,7 +6434,7 @@ fn semantic_entity_node(
 
 fn semantic_concept_node(
     root: &Path,
-    summary: &summarize::Summary,
+    summary: &tsift::summarize::Summary,
     label: &str,
     provenance: &GraphProvenance,
 ) -> SubstrateGraphNode {
@@ -6508,7 +6475,7 @@ fn append_summary_semantic_projection_rows(
         return Ok(());
     }
 
-    let summary_db = summarize::SummaryDb::open_read_only_resilient(&summaries_db)?;
+    let summary_db = tsift::summarize::SummaryDb::open_read_only_resilient(&summaries_db)?;
     let summaries = summary_db.all()?;
     if summaries.is_empty() {
         return Ok(());
@@ -7861,7 +7828,7 @@ fn build_convex_sync_report_with_snapshot(
     if chunk_size == 0 {
         bail!("--chunk-size must be greater than zero");
     }
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
     let (graph, _refresh) = write_traversal_graph_store(&root, path, scope)?;
     let graph_db = graph_substrate_db_path(&root, scope);
     let store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
@@ -8188,7 +8155,7 @@ struct GraphDbPageReport {
     diagnostics: Vec<String>,
 }
 
-type GraphDbRankedNeighbor = resolution::RankedNeighbor;
+type GraphDbRankedNeighbor = tsift::resolution::RankedNeighbor;
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 struct GraphDbKnowledgeRetrieval {
@@ -8215,7 +8182,7 @@ struct GraphDbSemanticSeededSubgraph {
     diagnostics: Vec<String>,
 }
 
-type GraphDbNeighborhoodRankingGate = resolution::NeighborhoodRankingGate;
+type GraphDbNeighborhoodRankingGate = tsift::resolution::NeighborhoodRankingGate;
 
 #[derive(Serialize)]
 struct GraphDbReport {
@@ -8244,7 +8211,7 @@ struct GraphDbReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     knowledge_retrieval: Option<GraphDbKnowledgeRetrieval>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<substrate::GraphPath>,
+    path: Option<tsift::substrate::GraphPath>,
     #[serde(skip_serializing_if = "Option::is_none")]
     page: Option<GraphDbPageReport>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -8451,9 +8418,9 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
         from_id: &str,
         to_id: &str,
         kind: Option<&str>,
-    ) -> Result<Option<substrate::GraphPath>> {
+    ) -> Result<Option<tsift::substrate::GraphPath>> {
         if from_id == to_id {
-            return Ok(Some(substrate::GraphPath {
+            return Ok(Some(tsift::substrate::GraphPath {
                 nodes: vec![from_id.to_string()],
                 hops: 0,
             }));
@@ -8481,7 +8448,7 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
                         cursor = previous;
                     }
                     nodes.reverse();
-                    return Ok(Some(substrate::GraphPath {
+                    return Ok(Some(tsift::substrate::GraphPath {
                         hops: nodes.len().saturating_sub(1),
                         nodes,
                     }));
@@ -8499,14 +8466,14 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
         kinds: &[&str],
         depth: usize,
         limit: usize,
-    ) -> Result<BTreeMap<String, Vec<(SubstrateGraphNode, substrate::GraphPath)>>> {
+    ) -> Result<BTreeMap<String, Vec<(SubstrateGraphNode, tsift::substrate::GraphPath)>>> {
         let requested = kinds.iter().copied().collect::<BTreeSet<_>>();
         let mut rows = requested
             .iter()
             .map(|kind| {
                 (
                     (*kind).to_string(),
-                    BTreeMap::<String, (SubstrateGraphNode, substrate::GraphPath)>::new(),
+                    BTreeMap::<String, (SubstrateGraphNode, tsift::substrate::GraphPath)>::new(),
                 )
             })
             .collect::<BTreeMap<_, _>>();
@@ -8530,7 +8497,7 @@ impl GraphStore for ExperimentalReadOnlyGraphStore {
                 };
                 let mut next_path = path.clone();
                 next_path.push(edge.to_id.clone());
-                let graph_path = substrate::GraphPath {
+                let graph_path = tsift::substrate::GraphPath {
                     hops: next_path.len().saturating_sub(1),
                     nodes: next_path.clone(),
                 };
@@ -8894,7 +8861,7 @@ struct GraphDbOperatorReport {
     refresh: Option<GraphDbRefreshSummary>,
     compaction: GraphDbCompactionPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
-    recovery: Option<index::ReadOnlyRecovery>,
+    recovery: Option<tsift::index::ReadOnlyRecovery>,
     next_commands: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     warnings: Vec<String>,
@@ -8924,7 +8891,7 @@ struct GraphDbEvidencePath {
     kind: String,
     label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<substrate::GraphPath>,
+    path: Option<tsift::substrate::GraphPath>,
     #[serde(skip_serializing_if = "Option::is_none")]
     expand: Option<String>,
 }
@@ -9082,8 +9049,8 @@ fn convex_refresh_command(root: &Path, scope: Option<&str>) -> String {
     )
 }
 
-fn open_sqlite_graph_db_readonly(graph_db: &Path) -> Result<substrate::SqliteReadOnlyConnection> {
-    substrate::open_graph_read_only_connection_resilient(graph_db)
+fn open_sqlite_graph_db_readonly(graph_db: &Path) -> Result<tsift::substrate::SqliteReadOnlyConnection> {
+    tsift::substrate::open_graph_read_only_connection_resilient(graph_db)
 }
 
 fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool> {
@@ -9437,12 +9404,12 @@ fn graph_db_operator_next_commands(
     commands
 }
 
-fn graph_db_read_recovery_diagnostic(recovery: index::ReadOnlyRecovery) -> String {
+fn graph_db_read_recovery_diagnostic(recovery: tsift::index::ReadOnlyRecovery) -> String {
     match recovery {
-        index::ReadOnlyRecovery::SnapshotFallback => {
+        tsift::index::ReadOnlyRecovery::SnapshotFallback => {
             "graph.db read recovered through snapshot fallback after a rollback-journal lock on the live database".to_string()
         }
-        index::ReadOnlyRecovery::SnapshotFallbackWal => {
+        tsift::index::ReadOnlyRecovery::SnapshotFallbackWal => {
             "graph.db read recovered through WAL-aware snapshot fallback after copying live -wal/-shm sidecars".to_string()
         }
     }
@@ -9940,7 +9907,7 @@ fn append_sqlite_graph_doctor_checks(
     root: &Path,
     scope: Option<&str>,
     graph_db: &Path,
-) -> Option<substrate::SqliteReadOnlyConnection> {
+) -> Option<tsift::substrate::SqliteReadOnlyConnection> {
     let rebuild = graph_db_rebuild_command(root, scope);
     let backup_rebuild = graph_db_backup_rebuild_command(root, scope, graph_db);
     if !graph_db.exists() {
@@ -10599,7 +10566,7 @@ fn status_run_command_without_notes(run: &str) -> &str {
         .unwrap_or(run)
 }
 
-fn graph_db_status_summarize_command(report: &status::StatusReport) -> String {
+fn graph_db_status_summarize_command(report: &tsift::status::StatusReport) -> String {
     report
         .recommendations
         .run
@@ -10611,7 +10578,7 @@ fn graph_db_status_summarize_command(report: &status::StatusReport) -> String {
 }
 
 fn graph_db_semantic_readiness(root: &Path, scope: Option<&str>) -> GraphEffectivenessReadiness {
-    let report = match status::check_status(root) {
+    let report = match tsift::status::check_status(root) {
         Ok(report) => report,
         Err(err) => {
             return graph_effectiveness_blocked(
@@ -10625,7 +10592,7 @@ fn graph_db_semantic_readiness(root: &Path, scope: Option<&str>) -> GraphEffecti
     };
 
     match &report.summaries {
-        status::SummaryStatus::Available {
+        tsift::status::SummaryStatus::Available {
             cached_files,
             total_indexed_files,
             coverage_pct,
@@ -10637,7 +10604,7 @@ fn graph_db_semantic_readiness(root: &Path, scope: Option<&str>) -> GraphEffecti
             ));
             readiness
         }
-        status::SummaryStatus::None { .. } => {
+        tsift::status::SummaryStatus::None { .. } => {
             let summarize = graph_db_status_summarize_command(&report);
             graph_effectiveness_blocked(
                 "summary_cache_empty",
@@ -10650,7 +10617,7 @@ fn graph_db_semantic_readiness(root: &Path, scope: Option<&str>) -> GraphEffecti
                 vec![summarize, graph_db_refresh_command(root, scope)],
             )
         }
-        status::SummaryStatus::Unavailable => graph_effectiveness_blocked(
+        tsift::status::SummaryStatus::Unavailable => graph_effectiveness_blocked(
             "summary_cache_unavailable",
             vec![
                 "summary cache unavailable because the source index is missing; build the index before relying on semantic graph evidence".to_string(),
@@ -10667,7 +10634,7 @@ fn graph_db_semantic_readiness(root: &Path, scope: Option<&str>) -> GraphEffecti
 }
 
 fn graph_db_operator_status_warnings(root: &Path, scope: Option<&str>) -> Vec<String> {
-    let report = match status::check_status(root) {
+    let report = match tsift::status::check_status(root) {
         Ok(report) => report,
         Err(err) => {
             return vec![format!(
@@ -10676,13 +10643,13 @@ fn graph_db_operator_status_warnings(root: &Path, scope: Option<&str>) -> Vec<St
         }
     };
 
-    let summarize_run = if matches!(report.summaries, status::SummaryStatus::None { .. }) {
+    let summarize_run = if matches!(report.summaries, tsift::status::SummaryStatus::None { .. }) {
         Some(graph_db_status_summarize_command(&report))
     } else {
         None
     };
     let mut warnings = report.reminders;
-    if matches!(report.summaries, status::SummaryStatus::None { .. }) {
+    if matches!(report.summaries, tsift::status::SummaryStatus::None { .. }) {
         let run = summarize_run.unwrap_or_else(|| "tsift summarize --extract .".to_string());
         warnings.push(format!(
             "summary cache empty: graph-db refresh materialized code/session rows but semantic rows are unavailable; run `{}` from {} and rerun `{}` before relying on semantic evidence",
@@ -11101,18 +11068,18 @@ fn graph_db_neighborhood_ranking_gate() -> GraphDbNeighborhoodRankingGate {
         ranked_output_default: false,
         default_order: "stable_node_id".to_string(),
         default_change_gate: "community_search_quality_metrics".to_string(),
-        required_workloads: metric_digest::COMMUNITY_SEARCH_WORKLOADS
+        required_workloads: tsift::metric_digest::COMMUNITY_SEARCH_WORKLOADS
             .iter()
             .map(|workload| (*workload).to_string())
             .collect(),
-        required_metrics: metric_digest::COMMUNITY_SEARCH_REQUIRED_METRICS
+        required_metrics: tsift::metric_digest::COMMUNITY_SEARCH_REQUIRED_METRICS
             .iter()
             .map(|metric| (*metric).to_string())
             .collect(),
-        max_duration_regression_percent: metric_digest::COMMUNITY_MAX_DURATION_REGRESSION_PERCENT,
-        min_handle_coverage_pct: metric_digest::COMMUNITY_MIN_HANDLE_COVERAGE_PCT,
-        min_duplicate_name_precision: metric_digest::COMMUNITY_MIN_DUPLICATE_NAME_PRECISION,
-        min_top_community_stability: metric_digest::COMMUNITY_MIN_TOP_COMMUNITY_STABILITY,
+        max_duration_regression_percent: tsift::metric_digest::COMMUNITY_MAX_DURATION_REGRESSION_PERCENT,
+        min_handle_coverage_pct: tsift::metric_digest::COMMUNITY_MIN_HANDLE_COVERAGE_PCT,
+        min_duplicate_name_precision: tsift::metric_digest::COMMUNITY_MIN_DUPLICATE_NAME_PRECISION,
+        min_top_community_stability: tsift::metric_digest::COMMUNITY_MIN_TOP_COMMUNITY_STABILITY,
         diagnostics: vec![
             "ranked_neighbors is additive; neighborhood nodes remain ordered by stable node id for cursor pagination".to_string(),
             "changing the default neighborhood order requires the community-search gate to pass for every required workload".to_string(),
@@ -11125,7 +11092,7 @@ fn graph_db_ranked_neighbors(
     nodes: &[SubstrateGraphNode],
     edges: &[SubstrateGraphEdge],
 ) -> Vec<GraphDbRankedNeighbor> {
-    resolution::ranked_neighbors(center_id, nodes, edges)
+    tsift::resolution::ranked_neighbors(center_id, nodes, edges)
 }
 
 fn graph_db_neighborhood_depths(
@@ -11133,43 +11100,43 @@ fn graph_db_neighborhood_depths(
     node_by_id: &BTreeMap<String, &SubstrateGraphNode>,
     outgoing: &BTreeMap<String, Vec<&SubstrateGraphEdge>>,
 ) -> BTreeMap<String, usize> {
-    resolution::neighborhood_depths(center_id, node_by_id, outgoing)
+    tsift::resolution::neighborhood_depths(center_id, node_by_id, outgoing)
 }
 
 fn graph_db_page_handle_coverage_pct(nodes: &[SubstrateGraphNode]) -> f64 {
-    resolution::page_handle_coverage_pct(nodes)
+    tsift::resolution::page_handle_coverage_pct(nodes)
 }
 
 fn graph_db_node_has_handle_coverage(node: &SubstrateGraphNode) -> bool {
-    resolution::node_has_handle_coverage(node)
+    tsift::resolution::node_has_handle_coverage(node)
 }
 
 fn graph_db_duplicate_name_precision(
     node: &SubstrateGraphNode,
     label_counts: &BTreeMap<String, usize>,
 ) -> f64 {
-    resolution::duplicate_name_precision(node, label_counts)
+    tsift::resolution::duplicate_name_precision(node, label_counts)
 }
 
 fn graph_db_has_community_signal(node: &SubstrateGraphNode, edge_kinds: &[String]) -> bool {
-    resolution::has_community_signal(node, edge_kinds)
+    tsift::resolution::has_community_signal(node, edge_kinds)
 }
 
 fn graph_db_has_semantic_signal(node: &SubstrateGraphNode, edge_kinds: &[String]) -> bool {
-    resolution::has_semantic_signal(node, edge_kinds)
+    tsift::resolution::has_semantic_signal(node, edge_kinds)
 }
 
 fn graph_db_source_handle_is_fresh(node: &SubstrateGraphNode) -> bool {
-    resolution::source_handle_is_fresh(node)
+    tsift::resolution::source_handle_is_fresh(node)
 }
 
 fn graph_db_edge_kind_rank_score(edge_kind: &str) -> i64 {
-    resolution::edge_kind_rank_score(edge_kind)
+    tsift::resolution::edge_kind_rank_score(edge_kind)
 }
 
 fn graph_db_edge_key(edge: &SubstrateGraphEdge) -> String {
     if edge.id.is_empty() {
-        substrate::ConvexEdgeRow::stable_key(&edge.from_id, &edge.to_id, &edge.kind)
+        tsift::substrate::ConvexEdgeRow::stable_key(&edge.from_id, &edge.to_id, &edge.kind)
     } else {
         edge.id.clone()
     }
@@ -11435,7 +11402,7 @@ fn graph_db_reachable_nodes_by_kind(
     kind: &str,
     depth: usize,
     limit: usize,
-) -> Result<Vec<(SubstrateGraphNode, substrate::GraphPath)>> {
+) -> Result<Vec<(SubstrateGraphNode, tsift::substrate::GraphPath)>> {
     store.reachable_nodes_by_kind(from_id, kind, depth, limit)
 }
 
@@ -12443,7 +12410,7 @@ fn graph_db_backend_eval_full_projection_raw_watermark_rows(
     source_root: &Path,
 ) -> Result<Vec<GraphDbBackendEvalRawSourceWatermarkRow>> {
     let mut rows = Vec::new();
-    let mut entries = walk::walk_files(source_root)?;
+    let mut entries = tsift::walk::walk_files(source_root)?;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     for entry in entries {
         if traversal_path_is_generated_artifact(root, source_root, &entry.path) {
@@ -12477,7 +12444,7 @@ fn graph_db_backend_eval_full_projection_source_watermark(
     let gate = prepare_agent_doc_index_gate(root, path_hint, scope, "full-projection cache key");
     match gate.db_path.as_ref().filter(|db_path| db_path.exists()) {
         Some(db_path) => {
-            let db = index::IndexDb::open_read_only_resilient(db_path)?;
+            let db = tsift::index::IndexDb::open_read_only_resilient(db_path)?;
             parts.push("index_mode:indexed".to_string());
             detail_parts.push("mode=indexed".to_string());
             parts.push(format!(
@@ -13712,10 +13679,10 @@ fn graph_db_backend_eval_repeated_sample_command(
 
 fn graph_db_backend_eval_hop_cap_promotion_gate() -> GraphDbHopCapPromotionGate {
     let mut required_metrics = Vec::new();
-    for workload in perf_gate::HOP_CAP_REQUIRED_WORKLOADS {
+    for workload in tsift::perf_gate::HOP_CAP_REQUIRED_WORKLOADS {
         required_metrics.push(format!("{workload}.sqlite.path_max_hops.duration_micros"));
         required_metrics.push(format!("{workload}.sqlite.path_max_hops.rows"));
-        for hops in perf_gate::HOP_CAP_CANDIDATE_TIERS {
+        for hops in tsift::perf_gate::HOP_CAP_CANDIDATE_TIERS {
             required_metrics.push(format!(
                 "{workload}.sqlite.path_max_hops_{hops}.duration_micros"
             ));
@@ -13724,10 +13691,10 @@ fn graph_db_backend_eval_hop_cap_promotion_gate() -> GraphDbHopCapPromotionGate 
     }
     GraphDbHopCapPromotionGate {
         status: "hold_64_default_until_gate_passes".to_string(),
-        current_default_hops: perf_gate::HOP_CAP_CURRENT_DEFAULT,
-        candidate_hop_tiers: perf_gate::HOP_CAP_CANDIDATE_TIERS.to_vec(),
-        required_backend: perf_gate::BASELINE_BACKEND.to_string(),
-        required_workloads: perf_gate::HOP_CAP_REQUIRED_WORKLOADS
+        current_default_hops: tsift::perf_gate::HOP_CAP_CURRENT_DEFAULT,
+        candidate_hop_tiers: tsift::perf_gate::HOP_CAP_CANDIDATE_TIERS.to_vec(),
+        required_backend: tsift::perf_gate::BASELINE_BACKEND.to_string(),
+        required_workloads: tsift::perf_gate::HOP_CAP_REQUIRED_WORKLOADS
             .iter()
             .map(|workload| (*workload).to_string())
             .collect(),
@@ -13758,7 +13725,7 @@ fn graph_db_backend_eval_backend_adapter_spike_gate() -> GraphDbBackendAdapterSp
     GraphDbBackendAdapterSpikeGate {
         status: "hold_real_optional_adapter_required".to_string(),
         candidate_backends,
-        required_workloads: perf_gate::GATE_WORKLOAD_PREFIXES
+        required_workloads: tsift::perf_gate::GATE_WORKLOAD_PREFIXES
             .iter()
             .map(|workload| (*workload).to_string())
             .collect(),
@@ -13994,7 +13961,7 @@ fn cmd_graph_db_backend_eval(
         targets,
         full_projection,
     } = options;
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
     let candidates = if candidates.is_empty() {
         vec![
             GraphDbExperimentalBackend::DuckdbDuckpgq,
@@ -14470,7 +14437,7 @@ fn cmd_graph_db(
     query: GraphDbQuery,
     format: OutputFormat,
 ) -> Result<()> {
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
     match &query {
         GraphDbQuery::Refresh => {
             return cmd_graph_db_refresh(&root, path, scope, format);
@@ -14673,7 +14640,7 @@ fn traversal_raw_source_file_node(root: &Path, file: &str) -> TraversalNode {
     node
 }
 
-fn traversal_symbol_node(root: &Path, symbol: &index::StoredSymbol) -> TraversalNode {
+fn traversal_symbol_node(root: &Path, symbol: &tsift::index::StoredSymbol) -> TraversalNode {
     let file = relativize(&symbol.file, root);
     let key = format!("symbol:{file}:{}:{}", symbol.line, symbol.name);
     let handle = stable_handle("gsym", &key);
@@ -14705,7 +14672,7 @@ fn traversal_unresolved_symbol_node(root: &Path, name: &str) -> TraversalNode {
     }
 }
 
-fn traversal_route_node(root: &Path, route: &index::StoredRoute) -> TraversalNode {
+fn traversal_route_node(root: &Path, route: &tsift::index::StoredRoute) -> TraversalNode {
     let file = relativize(&route.file, root);
     let method = route.method.as_deref().unwrap_or("any");
     let key = format!(
@@ -15142,8 +15109,8 @@ fn push_traversal_metadata_watermark_part(
 struct TraversalSummaryWatermarkRow<'a> {
     symbol_name: &'a str,
     file_path: &'a str,
-    entities: &'a Option<Vec<summarize::Entity>>,
-    relationships: &'a Option<Vec<summarize::Relationship>>,
+    entities: &'a Option<Vec<tsift::summarize::Entity>>,
+    relationships: &'a Option<Vec<tsift::summarize::Relationship>>,
     concept_labels: &'a Option<Vec<String>>,
 }
 
@@ -15154,7 +15121,7 @@ fn push_traversal_summaries_watermark_part(root: &Path, parts: &mut Vec<String>)
         return Ok(());
     }
 
-    match summarize::SummaryDb::open_read_only_resilient(&summaries_db)
+    match tsift::summarize::SummaryDb::open_read_only_resilient(&summaries_db)
         .and_then(|summary_db| summary_db.all())
     {
         Ok(summaries) => {
@@ -15187,15 +15154,15 @@ fn push_traversal_summaries_watermark_part(root: &Path, parts: &mut Vec<String>)
 }
 
 fn traversal_relative_path_is_generated_artifact(relative: &str) -> bool {
-    resolution::relative_path_is_generated_artifact(relative)
+    tsift::resolution::relative_path_is_generated_artifact(relative)
 }
 
 fn traversal_path_is_generated_artifact(root: &Path, source_root: &Path, path: &Path) -> bool {
-    resolution::path_is_generated_artifact(root, source_root, path)
+    tsift::resolution::path_is_generated_artifact(root, source_root, path)
 }
 
 fn traversal_index_snapshot_part_is_generated(root: &Path, source_root: &Path, part: &str) -> bool {
-    resolution::index_snapshot_part_is_generated(root, source_root, part)
+    tsift::resolution::index_snapshot_part_is_generated(root, source_root, part)
 }
 
 fn traversal_source_watermark(
@@ -15219,7 +15186,7 @@ fn traversal_source_watermark(
         let Some(target) = targets.into_iter().next() else {
             return Ok(None);
         };
-        let db = match index::IndexDb::open_read_only_resilient(&target.db_path) {
+        let db = match tsift::index::IndexDb::open_read_only_resilient(&target.db_path) {
             Ok(db) => db,
             Err(_) => return Ok(None),
         };
@@ -15619,7 +15586,7 @@ fn index_reason_detail(target: &SearchIndexTarget, reason: RebuildSearchReason) 
 fn index_refresh_diagnostic(
     target: &SearchIndexTarget,
     reason: RebuildSearchReason,
-    summary: &index::IndexSummary,
+    summary: &tsift::index::IndexSummary,
     packet_label: &str,
 ) -> String {
     let changed = summary.new + summary.modified + summary.deleted;
@@ -15647,11 +15614,11 @@ fn index_refresh_fallback_diagnostic(
 
 fn graph_fallback_source_root(root: &Path, path_hint: &Path, scope: Option<&str>) -> PathBuf {
     if let Some(scope_name) = scope
-        && let Ok(scope) = config::Config::resolve_submodule(root, scope_name)
+        && let Ok(scope) = tsift::config::Config::resolve_submodule(root, scope_name)
     {
         return scope.source_root;
     }
-    if let Ok(Some(scope)) = config::Config::infer_submodule_from_path(root, path_hint) {
+    if let Ok(Some(scope)) = tsift::config::Config::infer_submodule_from_path(root, path_hint) {
         return scope.source_root;
     }
     if let Ok(Some(scope)) = infer_agent_doc_task_submodule(root, path_hint) {
@@ -15716,7 +15683,7 @@ fn prepare_agent_doc_index_gate(
             // pre-refresh inspection result for this scope (held by the
             // active `InspectScopeGuard`) is stale. Drop it so the next
             // `inspect_read_only` re-reads the fresh index.
-            index::inspect_scope_invalidate_all();
+            tsift::index::inspect_scope_invalidate_all();
             let diagnostics = vec![index_refresh_diagnostic(
                 &target,
                 reason,
@@ -15751,7 +15718,7 @@ fn add_raw_source_file_nodes(
     graph: &mut TraversalGraphBuild,
     file_entries: &mut Vec<TraversalFileIndexEntry>,
 ) -> Result<()> {
-    let mut entries = walk::walk_files(source_root)?;
+    let mut entries = tsift::walk::walk_files(source_root)?;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     for entry in entries {
         let file = entry.path.to_string_lossy();
@@ -15785,7 +15752,7 @@ fn build_traversal_graph_source_with_options(
 
         match gate.db_path {
             Some(db_path) if db_path.exists() => {
-                let db = index::IndexDb::open_read_only_resilient(&db_path)?;
+                let db = tsift::index::IndexDb::open_read_only_resilient(&db_path)?;
                 let file_paths = db.file_paths()?;
                 let mut file_handle_by_path = HashMap::<String, String>::new();
                 for file in file_paths {
@@ -16698,7 +16665,7 @@ fn cmd_traverse(
     schema: bool,
     convex_snapshot: Option<&Path>,
 ) -> Result<()> {
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
     let graph = build_traversal_graph(&root, path, scope)?;
     if let Some(snapshot) = convex_snapshot {
         verify_convex_projection_snapshot(&root, scope, snapshot)?;
@@ -16923,7 +16890,7 @@ fn cmd_semantic_related(
     terse: bool,
     schema: bool,
 ) -> Result<()> {
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
     write_traversal_graph_store(&root, path, scope)?;
     let graph_db = graph_substrate_db_path(&root, scope);
     let store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
@@ -17085,21 +17052,21 @@ fn source_summary_expand_command(root: &Path, symbol: &str) -> String {
     )
 }
 
-fn source_symbol_line(symbol: &index::StoredSymbol) -> usize {
+fn source_symbol_line(symbol: &tsift::index::StoredSymbol) -> usize {
     usize::try_from(symbol.line)
         .ok()
         .and_then(|line| line.checked_add(1))
         .unwrap_or(1)
 }
 
-fn source_symbol_end_line(symbol: &index::StoredSymbol) -> Option<usize> {
+fn source_symbol_end_line(symbol: &tsift::index::StoredSymbol) -> Option<usize> {
     symbol
         .end_line
         .and_then(|line| usize::try_from(line).ok())
         .and_then(|line| line.checked_add(1))
 }
 
-fn source_symbol_intersects(symbol: &index::StoredSymbol, start: usize, end: usize) -> bool {
+fn source_symbol_intersects(symbol: &tsift::index::StoredSymbol, start: usize, end: usize) -> bool {
     if end == 0 {
         return false;
     }
@@ -17135,7 +17102,7 @@ fn load_source_symbols(
         return Vec::new();
     }
 
-    let db = match index::IndexDb::open_read_only_resilient(&db_path) {
+    let db = match tsift::index::IndexDb::open_read_only_resilient(&db_path) {
         Ok(db) => db,
         Err(err) => {
             warnings.push(format!("index refs unavailable: {err:#}"));
@@ -17191,7 +17158,7 @@ fn load_source_summaries(
     if !db_path.exists() {
         return Vec::new();
     }
-    let db = match summarize::SummaryDb::open_read_only_resilient(&db_path) {
+    let db = match tsift::summarize::SummaryDb::open_read_only_resilient(&db_path) {
         Ok(db) => db,
         Err(err) => {
             warnings.push(format!("summary refs unavailable: {err:#}"));
@@ -17249,7 +17216,7 @@ fn cmd_source_read(
         bail!("--end must be greater than or equal to --start");
     }
 
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
     let file_abs = resolve_source_file(&root, file)?;
     let file_display = if absolute {
         file_abs.to_string_lossy().to_string()
@@ -17446,10 +17413,10 @@ fn cmd_path(
     schema: bool,
     tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
     let db = open_index_db(path, scope)?;
     let edges = db.all_edges()?;
-    match graph::shortest_path(&edges, from, to) {
+    match tsift::graph::shortest_path(&edges, from, to) {
         Some(mut result) => {
             let tagpath_diag =
                 annotate_path_nodes_with_tagpath(&mut result.path, &db, &root, &tagpath_opts)?;
@@ -17570,7 +17537,7 @@ fn cmd_explain_with_budget(
     budget: ResponseBudget,
     tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
     let community_tagpath_root = query_tagpath_root(&root, path, scope)?;
     let format = OutputFormat {
         json_output,
@@ -17986,14 +17953,14 @@ struct ExplainBudgetReport {
 fn build_explain_budget_report(
     symbol: &str,
     _root: &Path,
-    symbols: &[index::StoredSymbol],
-    callers: &[index::StoredEdge],
+    symbols: &[tsift::index::StoredSymbol],
+    callers: &[tsift::index::StoredEdge],
     callers_total: usize,
     callers_truncated_by_limit: bool,
-    callees: &[index::StoredEdge],
+    callees: &[tsift::index::StoredEdge],
     callees_total: usize,
     callees_truncated_by_limit: bool,
-    community: Option<&graph::Community>,
+    community: Option<&tsift::graph::Community>,
     budget: ResponseBudget,
 ) -> ExplainBudgetReport {
     let max_items = budget.preview_items();
@@ -18268,14 +18235,14 @@ fn cmd_audit_tagpath(
     terse: bool,
     schema: bool,
 ) -> Result<()> {
-    let workspace_root = lint::resolve_project_root_or_canonical_path(path)?;
+    let workspace_root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
 
     // Choose the project root for tagpath + the index.db path for tsift
     // based on whether the caller passed `--scope`. Scoped mode points
     // both indexes at the submodule.
     let (tagpath_root, db_path) = if let Some(scope_selector) = scope {
-        let cfg = config::Config::load(&workspace_root)?;
-        let resolved = config::Config::resolve_submodule(&workspace_root, scope_selector)?;
+        let cfg = tsift::config::Config::load(&workspace_root)?;
+        let resolved = tsift::config::Config::resolve_submodule(&workspace_root, scope_selector)?;
         let db = cfg.db_path_for(&workspace_root, &resolved.id);
         (resolved.source_root, db)
     } else {
@@ -18291,7 +18258,7 @@ fn cmd_audit_tagpath(
             db_path.display()
         );
     }
-    let db = index::IndexDb::open_read_only_resilient(&db_path)?;
+    let db = tsift::index::IndexDb::open_read_only_resilient(&db_path)?;
 
     // Collect tsift file paths and remember the absolute form so we can
     // re-query `symbols_for_file` later. Tsift stores absolute paths;
@@ -18315,10 +18282,10 @@ fn cmd_audit_tagpath(
         tsift_abs_by_rel.insert(rel, raw);
     }
 
-    let load = tagpath_adapter::try_load(&tagpath_root);
+    let load = tsift::tagpath_adapter::try_load(&tagpath_root);
     let (adapter, tagpath_state) = match load {
-        tagpath_adapter::LoadResult::Loaded(adapter) => (Some(adapter), "fresh"),
-        tagpath_adapter::LoadResult::Stale { reason, .. } => {
+        tsift::tagpath_adapter::LoadResult::Loaded(adapter) => (Some(adapter), "fresh"),
+        tsift::tagpath_adapter::LoadResult::Stale { reason, .. } => {
             eprintln!(
                 "tagpath_index_stale: true (reason={reason}); audit results reflect the last loaded snapshot",
             );
@@ -18327,7 +18294,7 @@ fn cmd_audit_tagpath(
             let idx_path = tagpath::index::index_path(&tagpath_root);
             match tagpath::index::read(&idx_path) {
                 Ok(index) => (
-                    Some(tagpath_adapter::TagpathAdapter {
+                    Some(tsift::tagpath_adapter::TagpathAdapter {
                         project_root: tagpath_root.clone(),
                         index,
                     }),
@@ -18336,7 +18303,7 @@ fn cmd_audit_tagpath(
                 Err(_) => (None, "stale_unreadable"),
             }
         }
-        tagpath_adapter::LoadResult::Missing => (None, "missing"),
+        tsift::tagpath_adapter::LoadResult::Missing => (None, "missing"),
     };
 
     let tagpath_files: std::collections::BTreeSet<String> = adapter
@@ -18490,22 +18457,22 @@ fn cmd_audit(
         std::path::PathBuf::from(skills_dir)
     };
 
-    let mut result = audit::scan_skills(&expanded)?;
+    let mut result = tsift::audit::scan_skills(&expanded)?;
 
     if let Some(manifest_path) = manifest {
-        audit::compare_manifest(&mut result, &manifest_path)?;
+        tsift::audit::compare_manifest(&mut result, &manifest_path)?;
     }
 
     if usage || cleanup || report.is_some() {
-        audit::track_usage(&mut result)?;
+        tsift::audit::track_usage(&mut result)?;
     }
 
     if cleanup || report.is_some() {
-        audit::generate_cleanup(&mut result);
+        tsift::audit::generate_cleanup(&mut result);
     }
 
     if let Some(report_path) = &report {
-        audit::write_report(&result, report_path)?;
+        tsift::audit::write_report(&result, report_path)?;
         println!("Report written to {}", report_path.display());
     }
 
@@ -18571,8 +18538,8 @@ fn cmd_audit(
             println!("Manifest diffs:");
             for diff in diffs {
                 let label = match diff.kind {
-                    audit::DiffKind::Missing => "missing (expected but not installed)",
-                    audit::DiffKind::Orphan => "orphan (installed but not in manifest)",
+                    tsift::audit::DiffKind::Missing => "missing (expected but not installed)",
+                    tsift::audit::DiffKind::Orphan => "orphan (installed but not in manifest)",
                 };
                 println!("  {} — {}", diff.name, label);
             }
@@ -18621,7 +18588,7 @@ fn cmd_summarize(
     terse: bool,
     schema: bool,
 ) -> Result<()> {
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
     let db_path = root.join(".tsift/summaries.db");
 
     // --extract mode: run LLM extraction
@@ -18631,7 +18598,7 @@ fn cmd_summarize(
         let cfg = load_summarize_config(&root);
 
         let (files_to_extract, mut deleted_summary_paths) = if diff {
-            let changed = summarize::git_changed_files(&root)?;
+            let changed = tsift::summarize::git_changed_files(&root)?;
             let existing = changed
                 .existing
                 .into_iter()
@@ -18657,8 +18624,8 @@ fn cmd_summarize(
             return Ok(());
         }
 
-        let _summary_write_lock = summarize::acquire_write_lock(&db_path)?;
-        let summary_db = summarize::SummaryDb::open(&db_path)?;
+        let _summary_write_lock = tsift::summarize::acquire_write_lock(&db_path)?;
+        let summary_db = tsift::summarize::SummaryDb::open(&db_path)?;
 
         if !diff {
             deleted_summary_paths.extend(summarize_full_extract_deleted_summary_paths(
@@ -18678,7 +18645,7 @@ fn cmd_summarize(
             summary_db.delete_by_file(rel_path)?;
         }
 
-        let mut report = summarize::ExtractionReport {
+        let mut report = tsift::summarize::ExtractionReport {
             files_processed: 0,
             symbols_extracted: 0,
             tokens_input: 0,
@@ -18696,7 +18663,7 @@ fn cmd_summarize(
                     continue;
                 }
             };
-            let hash = summarize::content_hash(&content);
+            let hash = tsift::summarize::content_hash(&content);
             let rel_path = summarize_relative_file_path(&root, file_path);
 
             if summary_db.is_current(&rel_path, &hash)? {
@@ -18704,7 +18671,7 @@ fn cmd_summarize(
             }
 
             let symbol_context = find_symbols_db_for_file(&root, file_path)?;
-            match summarize::extract_for_file(
+            match tsift::summarize::extract_for_file(
                 file_path,
                 symbol_context.as_ref().map(|ctx| ctx.db_path.as_path()),
                 symbol_context.as_ref().map(|ctx| ctx.source_root.as_path()),
@@ -18803,7 +18770,7 @@ fn cmd_summarize(
         let query_base = resolve_extract_base(path)?;
         let mut results = Vec::new();
         for candidate in
-            summarize::file_lookup_candidates(Path::new(&file_query), &query_base, &root)
+            tsift::summarize::file_lookup_candidates(Path::new(&file_query), &query_base, &root)
         {
             results = summary_db.get_by_file(&candidate)?;
             if !results.is_empty() {
@@ -18889,38 +18856,38 @@ fn cmd_summarize(
     bail!("specify a symbol, --file, --extract, or --stats");
 }
 
-fn diff_digest_status_label(status: diff_digest::DiffDigestFileStatus) -> &'static str {
+fn diff_digest_status_label(status: tsift::diff_digest::DiffDigestFileStatus) -> &'static str {
     match status {
-        diff_digest::DiffDigestFileStatus::Added => "added",
-        diff_digest::DiffDigestFileStatus::Modified => "modified",
-        diff_digest::DiffDigestFileStatus::Deleted => "deleted",
+        tsift::diff_digest::DiffDigestFileStatus::Added => "added",
+        tsift::diff_digest::DiffDigestFileStatus::Modified => "modified",
+        tsift::diff_digest::DiffDigestFileStatus::Deleted => "deleted",
     }
 }
 
-fn diff_digest_summary_label(state: diff_digest::DiffDigestSummaryState) -> &'static str {
+fn diff_digest_summary_label(state: tsift::diff_digest::DiffDigestSummaryState) -> &'static str {
     match state {
-        diff_digest::DiffDigestSummaryState::Current => "current",
-        diff_digest::DiffDigestSummaryState::Stale => "stale",
-        diff_digest::DiffDigestSummaryState::Missing => "missing",
-        diff_digest::DiffDigestSummaryState::Unavailable => "unavailable",
+        tsift::diff_digest::DiffDigestSummaryState::Current => "current",
+        tsift::diff_digest::DiffDigestSummaryState::Stale => "stale",
+        tsift::diff_digest::DiffDigestSummaryState::Missing => "missing",
+        tsift::diff_digest::DiffDigestSummaryState::Unavailable => "unavailable",
     }
 }
 
-fn test_digest_summary_label(state: test_digest::TestDigestSummaryState) -> &'static str {
+fn test_digest_summary_label(state: tsift::test_digest::TestDigestSummaryState) -> &'static str {
     match state {
-        test_digest::TestDigestSummaryState::Current => "current",
-        test_digest::TestDigestSummaryState::Stale => "stale",
-        test_digest::TestDigestSummaryState::Missing => "missing",
-        test_digest::TestDigestSummaryState::Unavailable => "unavailable",
+        tsift::test_digest::TestDigestSummaryState::Current => "current",
+        tsift::test_digest::TestDigestSummaryState::Stale => "stale",
+        tsift::test_digest::TestDigestSummaryState::Missing => "missing",
+        tsift::test_digest::TestDigestSummaryState::Unavailable => "unavailable",
     }
 }
 
-fn log_digest_summary_label(state: log_digest::LogDigestSummaryState) -> &'static str {
+fn log_digest_summary_label(state: tsift::log_digest::LogDigestSummaryState) -> &'static str {
     match state {
-        log_digest::LogDigestSummaryState::Current => "current",
-        log_digest::LogDigestSummaryState::Stale => "stale",
-        log_digest::LogDigestSummaryState::Missing => "missing",
-        log_digest::LogDigestSummaryState::Unavailable => "unavailable",
+        tsift::log_digest::LogDigestSummaryState::Current => "current",
+        tsift::log_digest::LogDigestSummaryState::Stale => "stale",
+        tsift::log_digest::LogDigestSummaryState::Missing => "missing",
+        tsift::log_digest::LogDigestSummaryState::Unavailable => "unavailable",
     }
 }
 
@@ -18930,9 +18897,9 @@ fn cmd_diff_digest(
     revision: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
-    let report = diff_digest::compute(
+    let report = tsift::diff_digest::compute(
         path,
-        diff_digest::DiffDigestOptions {
+        tsift::diff_digest::DiffDigestOptions {
             cached,
             revision,
             max_parsed_files: None,
@@ -19031,33 +18998,33 @@ fn cmd_diff_digest(
     Ok(())
 }
 
-fn diff_digest_mode_label(mode: diff_digest::DiffDigestMode) -> &'static str {
+fn diff_digest_mode_label(mode: tsift::diff_digest::DiffDigestMode) -> &'static str {
     match mode {
-        diff_digest::DiffDigestMode::WorkingTree => "worktree",
-        diff_digest::DiffDigestMode::Cached => "cached",
-        diff_digest::DiffDigestMode::Revision => "revision",
+        tsift::diff_digest::DiffDigestMode::WorkingTree => "worktree",
+        tsift::diff_digest::DiffDigestMode::Cached => "cached",
+        tsift::diff_digest::DiffDigestMode::Revision => "revision",
     }
 }
 
-fn diff_digest_mode_display(report: &diff_digest::DiffDigestReport) -> String {
+fn diff_digest_mode_display(report: &tsift::diff_digest::DiffDigestReport) -> String {
     match (&report.mode, &report.revision) {
-        (diff_digest::DiffDigestMode::WorkingTree, _) => "working tree".to_string(),
-        (diff_digest::DiffDigestMode::Cached, _) => "staged index".to_string(),
-        (diff_digest::DiffDigestMode::Revision, Some(revision)) => {
+        (tsift::diff_digest::DiffDigestMode::WorkingTree, _) => "working tree".to_string(),
+        (tsift::diff_digest::DiffDigestMode::Cached, _) => "staged index".to_string(),
+        (tsift::diff_digest::DiffDigestMode::Revision, Some(revision)) => {
             format!("revision {revision}")
         }
-        (diff_digest::DiffDigestMode::Revision, None) => "revision".to_string(),
+        (tsift::diff_digest::DiffDigestMode::Revision, None) => "revision".to_string(),
     }
 }
 
-fn diff_digest_empty_message(report: &diff_digest::DiffDigestReport) -> String {
+fn diff_digest_empty_message(report: &tsift::diff_digest::DiffDigestReport) -> String {
     match (&report.mode, &report.revision) {
-        (diff_digest::DiffDigestMode::WorkingTree, _) => "No git changes found.".to_string(),
-        (diff_digest::DiffDigestMode::Cached, _) => "No staged git changes found.".to_string(),
-        (diff_digest::DiffDigestMode::Revision, Some(revision)) => {
+        (tsift::diff_digest::DiffDigestMode::WorkingTree, _) => "No git changes found.".to_string(),
+        (tsift::diff_digest::DiffDigestMode::Cached, _) => "No staged git changes found.".to_string(),
+        (tsift::diff_digest::DiffDigestMode::Revision, Some(revision)) => {
             format!("No diff found for revision {revision}.")
         }
-        (diff_digest::DiffDigestMode::Revision, None) => "No revision diff found.".to_string(),
+        (tsift::diff_digest::DiffDigestMode::Revision, None) => "No revision diff found.".to_string(),
     }
 }
 
@@ -19069,9 +19036,9 @@ fn cmd_impact(
     limit: usize,
     format: OutputFormat,
 ) -> Result<()> {
-    let report = impact::compute(
+    let report = tsift::impact::compute(
         path,
-        impact::ImpactOptions {
+        tsift::impact::ImpactOptions {
             cached,
             revision,
             scope,
@@ -19166,7 +19133,7 @@ fn render_test_digest_from_input(
     runner: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
-    let report = test_digest::compute(path, input, runner)?;
+    let report = tsift::test_digest::compute(path, input, runner)?;
     if format.json_output {
         println!(
             "{}",
@@ -19286,7 +19253,7 @@ fn cmd_context_pack(
     convex_snapshot: Option<&Path>,
 ) -> Result<()> {
     if let Some(snapshot) = convex_snapshot {
-        let root = lint::resolve_project_root_or_canonical_path(path)?;
+        let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
         build_traversal_graph(&root, path, None)?;
         verify_convex_projection_snapshot(&root, None, snapshot)?;
     }
@@ -19649,8 +19616,8 @@ struct ConflictMatrixReport {
     per_target_fail_closed: Vec<ConflictMatrixPerTargetFailClosed>,
     inputs: ConflictMatrixInputSummary,
     context_pack: ConflictMatrixContextSummary,
-    cached_diff: diff_digest::DiffDigestReport,
-    impact: impact::ImpactReport,
+    cached_diff: tsift::diff_digest::DiffDigestReport,
+    impact: tsift::impact::ImpactReport,
     candidates: Vec<ConflictMatrixCandidate>,
     worker_prompt_packets: Vec<ConflictMatrixWorkerPromptPacket>,
     conflicts: Vec<ConflictMatrixPair>,
@@ -19758,7 +19725,7 @@ fn resolve_conflict_matrix_targets(
 }
 
 fn is_planner_config_path(path: &str) -> bool {
-    resolution::is_planner_config_path(path)
+    tsift::resolution::is_planner_config_path(path)
 }
 
 fn conflict_matrix_source_handle(node: &SubstrateGraphNode) -> Option<ConflictMatrixSourceHandle> {
@@ -19855,7 +19822,7 @@ fn conflict_matrix_symbols_for_files(
     symbols
 }
 
-fn conflict_matrix_test_commands(target: &impact::ImpactTestTarget) -> Vec<String> {
+fn conflict_matrix_test_commands(target: &tsift::impact::ImpactTestTarget) -> Vec<String> {
     if target.commands.is_empty() {
         vec![target.path.clone()]
     } else {
@@ -19864,7 +19831,7 @@ fn conflict_matrix_test_commands(target: &impact::ImpactTestTarget) -> Vec<Strin
 }
 
 fn conflict_matrix_affected_tests(
-    impact_report: &impact::ImpactReport,
+    impact_report: &tsift::impact::ImpactReport,
     files: &BTreeSet<String>,
     symbols: &BTreeSet<String>,
     staged_overlap: &ConflictMatrixOverlap,
@@ -19930,7 +19897,7 @@ fn conflict_matrix_semantic_dispatch_score(
 fn conflict_matrix_staged_overlap(
     files: &BTreeSet<String>,
     symbols: &BTreeSet<String>,
-    cached_diff: &diff_digest::DiffDigestReport,
+    cached_diff: &tsift::diff_digest::DiffDigestReport,
 ) -> ConflictMatrixOverlap {
     let staged_files = cached_diff
         .files
@@ -20149,8 +20116,8 @@ fn conflict_matrix_candidate_from_evidence(
     root: &Path,
     evidence: &GraphDbEvidenceReport,
     graph_index: &ConflictMatrixGraphIndex,
-    cached_diff: &diff_digest::DiffDigestReport,
-    impact_report: &impact::ImpactReport,
+    cached_diff: &tsift::diff_digest::DiffDigestReport,
+    impact_report: &tsift::impact::ImpactReport,
 ) -> ConflictMatrixCandidate {
     let mut files = BTreeSet::new();
     let source_handles = evidence
@@ -20956,8 +20923,8 @@ fn print_conflict_matrix_human(report: &ConflictMatrixReport, compact: bool) {
 #[derive(Clone, Serialize, Deserialize)]
 struct ConflictMatrixPreparedInputs {
     context_pack: ConflictMatrixPreparedContext,
-    cached_diff: diff_digest::DiffDigestReport,
-    impact_report: impact::ImpactReport,
+    cached_diff: tsift::diff_digest::DiffDigestReport,
+    impact_report: tsift::impact::ImpactReport,
     preparation_cache: ConflictMatrixPreparationCacheSummary,
     preparation_timings: Vec<GraphDbBackendEvalPhaseTiming>,
 }
@@ -21231,9 +21198,9 @@ fn prepare_conflict_matrix_inputs(
         "staged_diff",
         "cached/staged diff digest used for ownership overlap checks",
         || {
-            diff_digest::compute(
+            tsift::diff_digest::compute(
                 root,
-                diff_digest::DiffDigestOptions {
+                tsift::diff_digest::DiffDigestOptions {
                     cached: true,
                     revision: None,
                     max_parsed_files: None,
@@ -21243,9 +21210,9 @@ fn prepare_conflict_matrix_inputs(
         },
     )?;
     let impact_started = Instant::now();
-    let (impact_report, impact_sub_phases) = impact::compute_with_phases(
+    let (impact_report, impact_sub_phases) = tsift::impact::compute_with_phases(
         root,
-        impact::ImpactOptions {
+        tsift::impact::ImpactOptions {
             cached: true,
             revision: None,
             scope,
@@ -21890,7 +21857,7 @@ fn build_conflict_matrix_report(
     limit: usize,
     impact_limit: usize,
 ) -> Result<ConflictMatrixReport> {
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
     let source_watermark = traversal_source_watermark(&root, path, scope, false)?;
     if graph_db_backend_eval_cached_refresh(&root, scope, source_watermark.as_deref())?.is_none() {
         write_traversal_graph_store(&root, path, scope)
@@ -22264,7 +22231,7 @@ fn build_dispatch_trace_report(
     limit: usize,
     impact_limit: usize,
 ) -> Result<DispatchTraceReport> {
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
     let source_watermark = traversal_source_watermark(&root, path, scope, false)?;
     if graph_db_backend_eval_cached_refresh(&root, scope, source_watermark.as_deref())?.is_none() {
         write_traversal_graph_store(&root, path, scope)
@@ -23101,7 +23068,7 @@ fn build_dependency_dag_report(
     depth: usize,
     limit: usize,
 ) -> Result<DependencyDagReport> {
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
     write_traversal_graph_store(&root, path, scope)
         .with_context(|| format!("refreshing graph-db projection for {}", root.display()))?;
     let graph_db = graph_substrate_db_path(&root, scope);
@@ -23294,7 +23261,7 @@ fn cmd_dependency_dag(
 }
 
 fn render_log_digest_from_input(path: &Path, input: &str, format: OutputFormat) -> Result<()> {
-    let report = log_digest::compute(path, input)?;
+    let report = tsift::log_digest::compute(path, input)?;
     if format.json_output {
         println!(
             "{}",
@@ -23465,19 +23432,19 @@ fn render_log_digest_from_input(path: &Path, input: &str, format: OutputFormat) 
     Ok(())
 }
 
-fn metric_digest_trend_label(trend: metric_digest::MetricDigestTrend) -> &'static str {
+fn metric_digest_trend_label(trend: tsift::metric_digest::MetricDigestTrend) -> &'static str {
     match trend {
-        metric_digest::MetricDigestTrend::Improved => "improved",
-        metric_digest::MetricDigestTrend::Regressed => "regressed",
-        metric_digest::MetricDigestTrend::Flat => "flat",
-        metric_digest::MetricDigestTrend::Unknown => "changed",
+        tsift::metric_digest::MetricDigestTrend::Improved => "improved",
+        tsift::metric_digest::MetricDigestTrend::Regressed => "regressed",
+        tsift::metric_digest::MetricDigestTrend::Flat => "flat",
+        tsift::metric_digest::MetricDigestTrend::Unknown => "changed",
     }
 }
 
-fn metric_digest_gate_label(decision: metric_digest::CommunitySearchGateDecision) -> &'static str {
+fn metric_digest_gate_label(decision: tsift::metric_digest::CommunitySearchGateDecision) -> &'static str {
     match decision {
-        metric_digest::CommunitySearchGateDecision::Pass => "pass",
-        metric_digest::CommunitySearchGateDecision::Block => "block",
+        tsift::metric_digest::CommunitySearchGateDecision::Pass => "pass",
+        tsift::metric_digest::CommunitySearchGateDecision::Block => "block",
     }
 }
 
@@ -23505,7 +23472,7 @@ fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: OutputFormat) -> 
         None => None,
     };
 
-    let report = metric_digest::compute(
+    let report = tsift::metric_digest::compute(
         &input,
         baseline.as_deref(),
         options.metrics,
@@ -23541,9 +23508,9 @@ fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: OutputFormat) -> 
             println!(
                 "{} current:{} prev:{} delta:{} trend:{}",
                 delta.metric,
-                metric_digest::format_number(delta.current),
-                metric_digest::format_number(delta.previous),
-                metric_digest::format_number(delta.delta),
+                tsift::metric_digest::format_number(delta.current),
+                tsift::metric_digest::format_number(delta.previous),
+                tsift::metric_digest::format_number(delta.delta),
                 metric_digest_trend_label(delta.trend)
             );
         }
@@ -23574,7 +23541,7 @@ fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: OutputFormat) -> 
         println!();
         println!("Current metrics:");
         for (metric, value) in &report.current_run.metrics {
-            println!("  {}: {}", metric, metric_digest::format_number(*value));
+            println!("  {}: {}", metric, tsift::metric_digest::format_number(*value));
         }
     } else {
         println!();
@@ -23587,9 +23554,9 @@ fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: OutputFormat) -> 
             println!(
                 "  {}: {} (prev {}, delta {:+}{}; {})",
                 delta.metric,
-                metric_digest::format_number(delta.current),
-                metric_digest::format_number(delta.previous),
-                metric_digest::format_number(delta.delta),
+                tsift::metric_digest::format_number(delta.current),
+                tsift::metric_digest::format_number(delta.previous),
+                tsift::metric_digest::format_number(delta.delta),
                 percent,
                 metric_digest_trend_label(delta.trend)
             );
@@ -23603,8 +23570,8 @@ fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: OutputFormat) -> 
             println!(
                 "  {}: {} -> {}",
                 delta.metric,
-                metric_digest::format_number(delta.previous),
-                metric_digest::format_number(delta.current)
+                tsift::metric_digest::format_number(delta.previous),
+                tsift::metric_digest::format_number(delta.current)
             );
         }
     }
@@ -23616,8 +23583,8 @@ fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: OutputFormat) -> 
             println!(
                 "  {}: {} -> {}",
                 delta.metric,
-                metric_digest::format_number(delta.previous),
-                metric_digest::format_number(delta.current)
+                tsift::metric_digest::format_number(delta.previous),
+                tsift::metric_digest::format_number(delta.current)
             );
         }
     }
@@ -23652,26 +23619,26 @@ fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: OutputFormat) -> 
                     .unwrap_or_default();
                 println!(
                     "    duration_micros: {}{}",
-                    metric_digest::format_number(duration),
+                    tsift::metric_digest::format_number(duration),
                     regression
                 );
             }
             if let Some(coverage) = workload.handle_coverage_pct {
                 println!(
                     "    handle_coverage_pct: {}",
-                    metric_digest::format_number(coverage)
+                    tsift::metric_digest::format_number(coverage)
                 );
             }
             if let Some(precision) = workload.duplicate_name_precision {
                 println!(
                     "    duplicate_name_precision: {}",
-                    metric_digest::format_number(precision)
+                    tsift::metric_digest::format_number(precision)
                 );
             }
             if let Some(stability) = workload.top_community_stability {
                 println!(
                     "    top_community_stability: {}",
-                    metric_digest::format_number(stability)
+                    tsift::metric_digest::format_number(stability)
                 );
             }
             for diagnostic in &workload.diagnostics {
@@ -23689,7 +23656,7 @@ fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: OutputFormat) -> 
 fn cmd_dci_benchmark(fixture_path: &Path, format: OutputFormat) -> Result<()> {
     let input = fs::read_to_string(fixture_path)
         .with_context(|| format!("reading dci-benchmark fixture: {}", fixture_path.display()))?;
-    let report = dci_benchmark::compute(&input)?;
+    let report = tsift::dci_benchmark::compute(&input)?;
 
     if format.json_output {
         println!(
@@ -23713,10 +23680,10 @@ fn cmd_dci_benchmark(fixture_path: &Path, format: OutputFormat) -> Result<()> {
                 summary.rank,
                 summary.localized,
                 summary.task_runs,
-                dci_benchmark::format_number(summary.localization_rate * 100.0),
-                dci_benchmark::format_number(summary.avg_tool_calls),
-                dci_benchmark::format_number(summary.avg_latency_ms),
-                dci_benchmark::format_number(summary.avg_estimated_tokens)
+                tsift::dci_benchmark::format_number(summary.localization_rate * 100.0),
+                tsift::dci_benchmark::format_number(summary.avg_tool_calls),
+                tsift::dci_benchmark::format_number(summary.avg_latency_ms),
+                tsift::dci_benchmark::format_number(summary.avg_estimated_tokens)
             );
         }
         for warning in &report.warnings {
@@ -23742,9 +23709,9 @@ fn cmd_dci_benchmark(fixture_path: &Path, format: OutputFormat) -> Result<()> {
             summary.localized,
             summary.task_runs,
             summary.localization_rate * 100.0,
-            dci_benchmark::format_number(summary.avg_tool_calls),
-            dci_benchmark::format_number(summary.avg_latency_ms),
-            dci_benchmark::format_number(summary.avg_estimated_tokens)
+            tsift::dci_benchmark::format_number(summary.avg_tool_calls),
+            tsift::dci_benchmark::format_number(summary.avg_latency_ms),
+            tsift::dci_benchmark::format_number(summary.avg_estimated_tokens)
         );
     }
 
@@ -23793,7 +23760,7 @@ fn cmd_session_digest(
         bail!("no session input provided; pass --input <file> or pipe transcript on stdin");
     }
 
-    let report = session_digest::compute(path, &input, source)?;
+    let report = tsift::session_digest::compute(path, &input, source)?;
     if format.json_output {
         println!(
             "{}",
@@ -23985,7 +23952,7 @@ fn cmd_session_cost(
         );
     }
 
-    let report = session_cost::compute(&input, source)?;
+    let report = tsift::session_cost::compute(&input, source)?;
     if format.json_output {
         println!(
             "{}",
@@ -24208,7 +24175,7 @@ fn cmd_session_review_with_budget(
     format: OutputFormat,
     budget: ResponseBudget,
 ) -> Result<()> {
-    let report = session_review::compute(path)?;
+    let report = tsift::session_review::compute(path)?;
     if budget.is_active() {
         if next_context {
             let budget_report =
@@ -24977,7 +24944,7 @@ fn session_review_source_flag(source: &str) -> &'static str {
 }
 
 fn build_session_review_budget_report(
-    report: &session_review::SessionReviewReport,
+    report: &tsift::session_review::SessionReviewReport,
     budget: ResponseBudget,
 ) -> SessionReviewBudgetReport {
     let max_items = budget.preview_items();
@@ -25090,7 +25057,7 @@ fn build_session_review_budget_report(
 }
 
 fn build_session_review_next_context_budget_report(
-    report: &session_review::SessionReviewReport,
+    report: &tsift::session_review::SessionReviewReport,
     budget: ResponseBudget,
     ontology: Option<&TagOntologyPreviewContext>,
 ) -> SessionReviewNextContextBudgetReport {
@@ -25362,7 +25329,7 @@ fn build_context_summary_refs<'a>(
 }
 
 fn build_context_pack_diff_preview(
-    report: &diff_digest::DiffDigestReport,
+    report: &tsift::diff_digest::DiffDigestReport,
     budget: ResponseBudget,
     ontology: Option<&TagOntologyPreviewContext>,
 ) -> ContextPackDiffPreview {
@@ -25798,7 +25765,7 @@ fn materialize_context_pack_exploration_packet(
 }
 
 fn build_context_pack_test_preview(
-    report: &test_digest::TestDigestReport,
+    report: &tsift::test_digest::TestDigestReport,
     budget: ResponseBudget,
     ontology: Option<&TagOntologyPreviewContext>,
 ) -> ContextPackTestPreview {
@@ -25856,7 +25823,7 @@ fn build_context_pack_test_preview(
 }
 
 fn build_context_pack_log_preview(
-    report: &log_digest::LogDigestReport,
+    report: &tsift::log_digest::LogDigestReport,
     budget: ResponseBudget,
     ontology: Option<&TagOntologyPreviewContext>,
 ) -> ContextPackLogPreview {
@@ -26092,11 +26059,11 @@ fn build_context_pack_report_with_profile(
     // instead of paying the disk/SQLite walk a second time. Search runs
     // entirely outside this scope, so freshness re-checks after a file
     // mutation are unaffected.
-    let _inspect_scope = index::InspectScopeGuard::new();
+    let _inspect_scope = tsift::index::InspectScopeGuard::new();
     let budget = effective_context_budget(budget);
     let mut phases = Vec::new();
     let session_review_started = Instant::now();
-    let (review, session_review_sub_phases) = session_review::compute_with_phases(path)?;
+    let (review, session_review_sub_phases) = tsift::session_review::compute_with_phases(path)?;
     let session_review_total_micros = session_review_started.elapsed().as_micros();
     phases.push(graph_db_backend_eval_phase_timing(
         "session_review_compute",
@@ -26171,9 +26138,9 @@ fn build_context_pack_report_with_profile(
         "working-tree diff digest preview used to enrich next-context symbols",
         || {
             Ok(build_context_pack_diff_preview(
-                &diff_digest::compute(
+                &tsift::diff_digest::compute(
                     &root,
-                    diff_digest::DiffDigestOptions {
+                    tsift::diff_digest::DiffDigestOptions {
                         cached: false,
                         revision: None,
                         max_parsed_files: Some(diff_parse_budget),
@@ -26195,7 +26162,7 @@ fn build_context_pack_report_with_profile(
             if input.trim().is_empty() {
                 bail!("no test output provided in {}", file_path.display());
             }
-            let report = test_digest::compute(&root, &input, runner)?;
+            let report = tsift::test_digest::compute(&root, &input, runner)?;
             ContextPackOptionalSection {
                 status: "included".to_string(),
                 command: format!(
@@ -26227,7 +26194,7 @@ fn build_context_pack_report_with_profile(
             if input.trim().is_empty() {
                 bail!("no log output provided in {}", file_path.display());
             }
-            let report = log_digest::compute(&root, &input)?;
+            let report = tsift::log_digest::compute(&root, &input)?;
             let mut preview = build_context_pack_log_preview(&report, budget, ontology_ref);
             enrich_log_preview_with_diff_symbols(&mut preview, &diff_digest, ontology_ref);
             ContextPackOptionalSection {
@@ -26290,7 +26257,7 @@ fn build_context_pack_report_with_profile(
 }
 
 fn context_pack_status_reminders(root: &Path) -> Vec<String> {
-    status::check_status(root)
+    tsift::status::check_status(root)
         .map(|report| report.reminders)
         .unwrap_or_default()
 }
@@ -26796,7 +26763,7 @@ fn cmd_digest_runner(
 
         match digest_kind {
             DigestRunnerKind::Test => {
-                let digest_report = test_digest::compute(path, &captured, runner)?;
+                let digest_report = tsift::test_digest::compute(path, &captured, runner)?;
                 let report = serde_json::json!({
                     "kind": digest_kind.as_str(),
                     "command": shell_command,
@@ -26847,7 +26814,7 @@ fn cmd_digest_runner(
                 )?;
             }
             DigestRunnerKind::Log => {
-                let digest_report = log_digest::compute(path, &captured)?;
+                let digest_report = tsift::log_digest::compute(path, &captured)?;
                 let report = serde_json::json!({
                     "kind": digest_kind.as_str(),
                     "command": shell_command,
@@ -27012,11 +26979,11 @@ fn find_command_on_path(command: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn open_existing_summary_db_read_only(db_path: &Path) -> Result<summarize::SummaryDb> {
+fn open_existing_summary_db_read_only(db_path: &Path) -> Result<tsift::summarize::SummaryDb> {
     if !db_path.exists() {
         bail!("no summaries.db found — run `tsift summarize --extract <path>` first");
     }
-    summarize::SummaryDb::open_read_only_resilient(db_path)
+    tsift::summarize::SummaryDb::open_read_only_resilient(db_path)
 }
 
 fn cmd_status(
@@ -27028,47 +26995,47 @@ fn cmd_status(
     terse: bool,
     schema: bool,
 ) -> Result<()> {
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
-    let mut report = status::check_status(&root)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
+    let mut report = tsift::status::check_status(&root)?;
     if status_missing_workspace_scopes(&report) {
         autoindex_missing_workspace_scopes(&root, &report)?;
-        report = status::check_status(&root)?;
+        report = tsift::status::check_status(&root)?;
     }
     if fix {
         apply_status_fixes(&root, &report)?;
-        report = status::check_status(&root)?;
+        report = tsift::status::check_status(&root)?;
         if status_missing_workspace_scopes(&report) {
             autoindex_missing_workspace_scopes(&root, &report)?;
-            report = status::check_status(&root)?;
+            report = tsift::status::check_status(&root)?;
         }
     }
     if json_output {
         println!("{}", to_json_schema(&report, pretty, terse, schema)?);
     } else {
-        print!("{}", status::format_human(&report, compact));
+        print!("{}", tsift::status::format_human(&report, compact));
     }
     Ok(())
 }
 
-fn status_index_needs_fix(report: &status::StatusReport) -> bool {
-    !matches!(report.index, status::IndexStatus::Fresh { .. })
+fn status_index_needs_fix(report: &tsift::status::StatusReport) -> bool {
+    !matches!(report.index, tsift::status::IndexStatus::Fresh { .. })
 }
 
-fn status_instructions_need_fix(report: &status::StatusReport) -> bool {
-    !matches!(report.instructions, init::InstructionStatus::Current { .. })
+fn status_instructions_need_fix(report: &tsift::status::StatusReport) -> bool {
+    !matches!(report.instructions, tsift::init::InstructionStatus::Current { .. })
 }
 
-fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> Result<()> {
+fn apply_status_fixes(root: &Path, report: &tsift::status::StatusReport) -> Result<()> {
     if status_instructions_need_fix(report) {
         eprintln!("status fix: refreshing tsift instructions");
-        init::init(root, false, false)?;
+        tsift::init::init(root, false, false)?;
     }
 
     if !status_index_needs_fix(report) {
         return Ok(());
     }
 
-    let scopes = config::Config::submodule_dirs(root)?;
+    let scopes = tsift::config::Config::submodule_dirs(root)?;
     if scopes.is_empty() {
         eprintln!("status fix: refreshing index");
         run_index_update(
@@ -27083,7 +27050,7 @@ fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> Result<()> 
         return Ok(());
     }
 
-    let cfg = config::Config::load(root)?;
+    let cfg = tsift::config::Config::load(root)?;
     for scope in scopes {
         if !scope.source_root.exists() {
             eprintln!(
@@ -27108,19 +27075,19 @@ fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> Result<()> 
     Ok(())
 }
 
-fn status_missing_workspace_scopes(report: &status::StatusReport) -> bool {
+fn status_missing_workspace_scopes(report: &tsift::status::StatusReport) -> bool {
     match &report.index {
-        status::IndexStatus::Fresh { missing_scopes, .. }
-        | status::IndexStatus::Stale { missing_scopes, .. }
-        | status::IndexStatus::Missing { missing_scopes } => !missing_scopes.is_empty(),
+        tsift::status::IndexStatus::Fresh { missing_scopes, .. }
+        | tsift::status::IndexStatus::Stale { missing_scopes, .. }
+        | tsift::status::IndexStatus::Missing { missing_scopes } => !missing_scopes.is_empty(),
     }
 }
 
-fn autoindex_missing_workspace_scopes(root: &Path, report: &status::StatusReport) -> Result<()> {
+fn autoindex_missing_workspace_scopes(root: &Path, report: &tsift::status::StatusReport) -> Result<()> {
     let missing_scopes = match &report.index {
-        status::IndexStatus::Fresh { missing_scopes, .. }
-        | status::IndexStatus::Stale { missing_scopes, .. }
-        | status::IndexStatus::Missing { missing_scopes } => missing_scopes,
+        tsift::status::IndexStatus::Fresh { missing_scopes, .. }
+        | tsift::status::IndexStatus::Stale { missing_scopes, .. }
+        | tsift::status::IndexStatus::Missing { missing_scopes } => missing_scopes,
     };
     if missing_scopes.is_empty() {
         return Ok(());
@@ -27130,8 +27097,8 @@ fn autoindex_missing_workspace_scopes(root: &Path, report: &status::StatusReport
         .iter()
         .map(|scope| scope.scope.as_str())
         .collect::<std::collections::HashSet<_>>();
-    let cfg = config::Config::load(root)?;
-    for scope in config::Config::submodule_dirs(root)? {
+    let cfg = tsift::config::Config::load(root)?;
+    for scope in tsift::config::Config::submodule_dirs(root)? {
         if !missing_scope_ids.contains(scope.id.as_str()) || !scope.source_root.exists() {
             continue;
         }
@@ -27152,7 +27119,7 @@ fn autoindex_missing_workspace_scopes(root: &Path, report: &status::StatusReport
     Ok(())
 }
 
-fn emit_summary_stats_warnings(stats: &summarize::SummaryStats, root: &Path) {
+fn emit_summary_stats_warnings(stats: &tsift::summarize::SummaryStats, root: &Path) {
     for warning in &stats.warnings {
         let rel_path = relativize_pathbuf(&warning.path, root);
         eprintln!(
@@ -27172,12 +27139,12 @@ fn cmd_locks(
     terse: bool,
     schema: bool,
 ) -> Result<()> {
-    let root = lint::resolve_project_root_or_canonical_path(path)?;
-    let report = status::check_locks(&root, Some(path), scope)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
+    let report = tsift::status::check_locks(&root, Some(path), scope)?;
     if json_output {
         println!("{}", to_json_schema(&report, pretty, terse, schema)?);
     } else {
-        print!("{}", status::format_locks_human(&report, compact));
+        print!("{}", tsift::status::format_locks_human(&report, compact));
     }
     Ok(())
 }
@@ -27191,7 +27158,7 @@ fn contextualize_error(err: anyhow::Error, context: String) -> anyhow::Error {
 fn should_attach_lock_diagnostics(err: &anyhow::Error) -> bool {
     let message = err.to_string();
     message.contains("another tsift index writer is already active")
-        || substrate::error_mentions_locked_db(err)
+        || tsift::substrate::error_mentions_locked_db(err)
 }
 
 fn add_write_lock_context(
@@ -27204,7 +27171,7 @@ fn add_write_lock_context(
         return contextualize_error(err, action);
     }
 
-    let Ok(report) = status::check_locks(root, None, scope) else {
+    let Ok(report) = tsift::status::check_locks(root, None, scope) else {
         return contextualize_error(err, action);
     };
 
@@ -27213,7 +27180,7 @@ fn add_write_lock_context(
         format!(
             "{}\n\nlock diagnostics:\n{}",
             action,
-            status::format_locks_human(&report, false).trim_end()
+            tsift::status::format_locks_human(&report, false).trim_end()
         ),
     )
 }
@@ -27226,9 +27193,9 @@ fn run_index_update(
     scope: Option<&str>,
     rebuild: bool,
     prune: bool,
-) -> Result<index::IndexSummary> {
+) -> Result<tsift::index::IndexSummary> {
     let result = (|| {
-        let db = index::IndexDb::open(db_path)?;
+        let db = tsift::index::IndexDb::open(db_path)?;
         if rebuild {
             db.rebuild(source_root)
         } else if prune {
@@ -27243,7 +27210,7 @@ fn run_index_update(
     Ok(summary)
 }
 
-fn relativize_index_summary(summary: &mut index::IndexSummary, root: &Path) {
+fn relativize_index_summary(summary: &mut tsift::index::IndexSummary, root: &Path) {
     for change in &mut summary.changes {
         change.path = relativize_pathbuf(&change.path, root);
     }
@@ -27252,14 +27219,14 @@ fn relativize_index_summary(summary: &mut index::IndexSummary, root: &Path) {
     }
 }
 
-fn emit_index_warnings(summary: &index::IndexSummary, root: &Path, scope: Option<&str>) {
+fn emit_index_warnings(summary: &tsift::index::IndexSummary, root: &Path, scope: Option<&str>) {
     for warning in &summary.warnings {
         let rel_path = relativize_pathbuf(&warning.path, root);
         let stage = match warning.stage {
-            index::IndexWarningStage::ReadSource => "read failed",
-            index::IndexWarningStage::ExtractSymbols => "symbol extraction failed",
-            index::IndexWarningStage::ExtractCallSites => "call extraction failed",
-            index::IndexWarningStage::ExtractRoutes => "route extraction failed",
+            tsift::index::IndexWarningStage::ReadSource => "read failed",
+            tsift::index::IndexWarningStage::ExtractSymbols => "symbol extraction failed",
+            tsift::index::IndexWarningStage::ExtractCallSites => "call extraction failed",
+            tsift::index::IndexWarningStage::ExtractRoutes => "route extraction failed",
         };
         let scope_prefix = scope.map(|name| format!("[{}] ", name)).unwrap_or_default();
         let lang_suffix = warning
@@ -27278,10 +27245,10 @@ fn emit_index_warnings(summary: &index::IndexSummary, root: &Path, scope: Option
     }
 }
 
-fn load_summarize_config(root: &std::path::Path) -> summarize::SummarizeConfig {
+fn load_summarize_config(root: &std::path::Path) -> tsift::summarize::SummarizeConfig {
     let config_path = root.join(".tsift/config.toml");
     if !config_path.exists() {
-        return summarize::SummarizeConfig::default();
+        return tsift::summarize::SummarizeConfig::default();
     }
     #[derive(serde::Deserialize, Default)]
     struct RawConfig {
@@ -27296,9 +27263,9 @@ fn load_summarize_config(root: &std::path::Path) -> summarize::SummarizeConfig {
     }
     let content = std::fs::read_to_string(&config_path).unwrap_or_default();
     let raw: RawConfig = toml::from_str(&content).unwrap_or_default();
-    let defaults = summarize::SummarizeConfig::default();
+    let defaults = tsift::summarize::SummarizeConfig::default();
     match raw.summarize {
-        Some(s) => summarize::SummarizeConfig {
+        Some(s) => tsift::summarize::SummarizeConfig {
             model: s.model.unwrap_or(defaults.model),
             max_file_tokens: s.max_file_tokens.unwrap_or(defaults.max_file_tokens),
             api_key_env: s.api_key_env.unwrap_or(defaults.api_key_env),
@@ -27314,8 +27281,8 @@ struct ExtractSymbolContext {
 }
 
 fn find_symbols_db_for_file(root: &Path, file_path: &Path) -> Result<Option<ExtractSymbolContext>> {
-    let cfg = config::Config::load(root)?;
-    let mut submodules = config::Config::submodule_dirs(root)?;
+    let cfg = tsift::config::Config::load(root)?;
+    let mut submodules = tsift::config::Config::submodule_dirs(root)?;
     submodules.sort_by(|left, right| {
         right
             .source_root
@@ -27370,7 +27337,7 @@ fn normalize_extract_scope_path(path: &Path) -> Result<PathBuf> {
             .with_context(|| format!("canonicalizing extract scope {}", path.display()));
     }
 
-    Ok(summarize::normalize_lexical_path(path))
+    Ok(tsift::summarize::normalize_lexical_path(path))
 }
 
 fn resolve_extract_scope(root: &Path, extract_path: &Path) -> Result<PathBuf> {
@@ -27384,16 +27351,16 @@ fn resolve_extract_scope(root: &Path, extract_path: &Path) -> Result<PathBuf> {
 
 fn summarize_diff_matches_scope(changed_path: &Path, extract_scope: &Path) -> bool {
     normalize_extract_scope_path(changed_path)
-        .unwrap_or_else(|_| summarize::normalize_lexical_path(changed_path))
+        .unwrap_or_else(|_| tsift::summarize::normalize_lexical_path(changed_path))
         .starts_with(extract_scope)
 }
 
 fn summarize_relative_file_path(root: &Path, file_path: &Path) -> String {
-    summarize::normalize_summary_file_key(file_path.strip_prefix(root).unwrap_or(file_path))
+    tsift::summarize::normalize_summary_file_key(file_path.strip_prefix(root).unwrap_or(file_path))
 }
 
 fn summarize_full_extract_deleted_summary_paths(
-    summary_db: &summarize::SummaryDb,
+    summary_db: &tsift::summarize::SummaryDb,
     root: &Path,
     extract_scope: &Path,
     files_to_extract: &[PathBuf],
@@ -27439,8 +27406,8 @@ fn resolve_search_index_targets(
     federated: bool,
 ) -> Result<Vec<SearchIndexTarget>> {
     if let Some(scope_name) = scope {
-        let scope = config::Config::resolve_submodule(root, scope_name)?;
-        let cfg = config::Config::load(root)?;
+        let scope = tsift::config::Config::resolve_submodule(root, scope_name)?;
+        let cfg = tsift::config::Config::load(root)?;
         return Ok(vec![SearchIndexTarget {
             label: format!("submodule `{}` index", scope.id),
             db_path: cfg.db_path_for(root, &scope.id),
@@ -27451,9 +27418,9 @@ fn resolve_search_index_targets(
     }
 
     if federated {
-        let cfg = config::Config::load(root)?;
+        let cfg = tsift::config::Config::load(root)?;
         let mut targets = Vec::new();
-        for scope in config::Config::submodule_dirs(root)? {
+        for scope in tsift::config::Config::submodule_dirs(root)? {
             if !cfg.federation_for_scope(&scope) {
                 continue;
             }
@@ -27468,8 +27435,8 @@ fn resolve_search_index_targets(
         return Ok(targets);
     }
 
-    if let Some(scope) = config::Config::infer_submodule_from_path(root, path_hint)? {
-        let cfg = config::Config::load(root)?;
+    if let Some(scope) = tsift::config::Config::infer_submodule_from_path(root, path_hint)? {
+        let cfg = tsift::config::Config::load(root)?;
         return Ok(vec![SearchIndexTarget {
             label: format!("submodule `{}` index", scope.id),
             db_path: cfg.db_path_for(root, &scope.id),
@@ -27480,7 +27447,7 @@ fn resolve_search_index_targets(
     }
 
     if let Some(scope) = infer_agent_doc_task_submodule(root, path_hint)? {
-        let cfg = config::Config::load(root)?;
+        let cfg = tsift::config::Config::load(root)?;
         return Ok(vec![SearchIndexTarget {
             label: format!("submodule `{}` index", scope.id),
             db_path: cfg.db_path_for(root, &scope.id),
@@ -27490,7 +27457,7 @@ fn resolve_search_index_targets(
         }]);
     }
 
-    let scopes = config::Config::submodule_dirs(root)?;
+    let scopes = tsift::config::Config::submodule_dirs(root)?;
     if !scopes.is_empty() {
         let root_db = root.join(".tsift/index.db");
         if !root_db.exists() {
@@ -27499,7 +27466,7 @@ fn resolve_search_index_targets(
                 .map(|scope| scope.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let cfg = config::Config::load(root)?;
+            let cfg = tsift::config::Config::load(root)?;
             let indexed_scopes = scopes
                 .iter()
                 .filter(|scope| cfg.db_path_for(root, &scope.id).exists())
@@ -27535,7 +27502,7 @@ fn inspect_search_index(target: &SearchIndexTarget) -> Result<SearchIndexState> 
     }
 
     let inspection =
-        index::IndexDb::inspect_read_only(&target.db_path, &target.source_root, false)?;
+        tsift::index::IndexDb::inspect_read_only(&target.db_path, &target.source_root, false)?;
     let stale_files =
         inspection.summary.new + inspection.summary.modified + inspection.summary.deleted;
     if stale_files == 0 {
@@ -27588,7 +27555,7 @@ fn is_active_writer_lock_error(err: &anyhow::Error) -> bool {
 fn infer_agent_doc_task_submodule(
     root: &Path,
     path_hint: &Path,
-) -> Result<Option<config::WorkspaceScope>> {
+) -> Result<Option<tsift::config::WorkspaceScope>> {
     let hinted_path = if path_hint.is_absolute() {
         path_hint.to_path_buf()
     } else {
@@ -27607,7 +27574,7 @@ fn infer_agent_doc_task_submodule(
     let Some(file_stem) = relative.file_stem().and_then(|stem| stem.to_str()) else {
         return Ok(None);
     };
-    config::Config::find_submodule(root, file_stem)
+    tsift::config::Config::find_submodule(root, file_stem)
 }
 
 fn degraded_search_target(
@@ -27624,7 +27591,7 @@ fn degraded_search_target(
 fn apply_search_index_update(
     root: &Path,
     target: &SearchIndexTarget,
-) -> Result<index::IndexSummary> {
+) -> Result<tsift::index::IndexSummary> {
     run_index_update(
         &target.db_path,
         &target.source_root,
@@ -27954,7 +27921,7 @@ fn cmd_search_with_budget(
         schema,
         envelope,
     };
-    let root = lint::resolve_project_root_or_canonical_path(&base_path)?;
+    let root = tsift::lint::resolve_project_root_or_canonical_path(&base_path)?;
     let search_cache_dir = root.join(".tsift/search-cache");
     let requested_strategy = resolve_search_strategy(&query, strategy);
     let requested_exact_search = requested_strategy == "exact";
@@ -27995,28 +27962,28 @@ fn cmd_search_with_budget(
     };
 
     let inferred_scope = if scope.is_none() && !federated {
-        config::Config::infer_submodule_from_path(&root, &base_path)?
+        tsift::config::Config::infer_submodule_from_path(&root, &base_path)?
     } else {
         None
     };
 
     let (symbol_hits, sift_path, federated_tagpath_diag) =
         if let Some(scope) = inferred_scope.as_ref() {
-            let cfg = config::Config::load(&root)?;
+            let cfg = tsift::config::Config::load(&root)?;
             let db_path = cfg.db_path_for(&root, &scope.id);
             let hits = if db_path.exists() {
-                let db = index::IndexDb::open_read_only_resilient(&db_path)?;
+                let db = tsift::index::IndexDb::open_read_only_resilient(&db_path)?;
                 db.symbol_search(&query, limit)?
             } else {
                 Vec::new()
             };
             (hits, scope.source_root.clone(), None)
         } else if let Some(ref scope_name) = scope {
-            let cfg = config::Config::load(&root)?;
-            let scope = config::Config::resolve_submodule(&root, scope_name)?;
+            let cfg = tsift::config::Config::load(&root)?;
+            let scope = tsift::config::Config::resolve_submodule(&root, scope_name)?;
             let db_path = cfg.db_path_for(&root, &scope.id);
             let hits = if db_path.exists() {
-                let db = index::IndexDb::open_read_only_resilient(&db_path)?;
+                let db = tsift::index::IndexDb::open_read_only_resilient(&db_path)?;
                 db.symbol_search(&query, limit)?
             } else {
                 Vec::new()
@@ -28028,7 +27995,7 @@ fn cmd_search_with_budget(
         } else {
             let db_path = root.join(".tsift/index.db");
             let hits = if db_path.exists() {
-                let db = index::IndexDb::open_read_only_resilient(&db_path)?;
+                let db = tsift::index::IndexDb::open_read_only_resilient(&db_path)?;
                 db.symbol_search(&query, limit)?
             } else {
                 Vec::new()
@@ -28149,7 +28116,7 @@ fn cmd_search_with_budget(
     } else if format.json_output {
         #[derive(Serialize)]
         struct CombinedResponse<'a> {
-            symbols: &'a [index::SymbolHit],
+            symbols: &'a [tsift::index::SymbolHit],
             #[serde(flatten)]
             sift: &'a serde_json::Value,
         }
@@ -28539,7 +28506,7 @@ fn build_search_scale_guard(
     query: &str,
     strategy: &str,
     root: &Path,
-    response: &sift::SearchResponse,
+    response: &tsift::sift::SearchResponse,
     symbol_total: usize,
     raw_symbol_total: usize,
     hit_total: usize,
@@ -28604,8 +28571,8 @@ fn build_search_budget_report(
     query: &str,
     strategy: &str,
     root: &Path,
-    response: &sift::SearchResponse,
-    symbol_hits: &[index::SymbolHit],
+    response: &tsift::sift::SearchResponse,
+    symbol_hits: &[tsift::index::SymbolHit],
     absolute: bool,
     budget: ResponseBudget,
 ) -> SearchBudgetReport {
@@ -28896,24 +28863,24 @@ fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf>> {
 
 fn cmd_init(path: &std::path::Path, codex: bool, opencode: bool, workspace: bool) -> Result<()> {
     let resolved = if workspace {
-        init::resolve_workspace_dir(path)?
+        tsift::init::resolve_workspace_dir(path)?
     } else {
-        init::resolve_project_dir(path)?
+        tsift::init::resolve_project_dir(path)?
     };
     if resolved != path {
         println!("resolved: {} → {}", path.display(), resolved.display());
     }
-    let codex_workspace = codex && (workspace || init::has_submodules(&resolved)?);
-    let result = init::init_with_integrations(&resolved, codex, codex_workspace, opencode)?;
+    let codex_workspace = codex && (workspace || tsift::init::has_submodules(&resolved)?);
+    let result = tsift::init::init_with_integrations(&resolved, codex, codex_workspace, opencode)?;
     for update in result.updates {
         println!(
             "{}: {} ({})",
             update.file.display(),
             update.action,
             match update.action {
-                init::InitAction::Created => "tsift Code Navigation section added",
-                init::InitAction::Updated => "tsift Code Navigation section updated to latest",
-                init::InitAction::AlreadyPresent => "no changes needed",
+                tsift::init::InitAction::Created => "tsift Code Navigation section added",
+                tsift::init::InitAction::Updated => "tsift Code Navigation section updated to latest",
+                tsift::init::InitAction::AlreadyPresent => "no changes needed",
             }
         );
     }
@@ -28922,29 +28889,29 @@ fn cmd_init(path: &std::path::Path, codex: bool, opencode: bool, workspace: bool
     }
     if let Some(codex_result) = &result.codex_hooks {
         let scope_label = match codex_result.scope {
-            init::CodexHookScope::Project => "project",
-            init::CodexHookScope::Workspace => "workspace",
+            tsift::init::CodexHookScope::Project => "project",
+            tsift::init::CodexHookScope::Workspace => "workspace",
         };
         match codex_result.action {
-            init::CodexHookAction::Added => {
+            tsift::init::CodexHookAction::Added => {
                 println!(
                     ".codex/hooks.json: tsift {} auto-reindex hook added",
                     scope_label
                 );
             }
-            init::CodexHookAction::Updated => {
+            tsift::init::CodexHookAction::Updated => {
                 println!(
                     ".codex/hooks.json: tsift {} auto-reindex hook updated",
                     scope_label
                 );
             }
-            init::CodexHookAction::AlreadyPresent => {
+            tsift::init::CodexHookAction::AlreadyPresent => {
                 println!(
                     ".codex/hooks.json: tsift {} hook already present",
                     scope_label
                 );
             }
-            init::CodexHookAction::Created => {
+            tsift::init::CodexHookAction::Created => {
                 println!(
                     ".codex/hooks.json: created with tsift {} auto-reindex hook",
                     scope_label
@@ -28986,18 +28953,18 @@ fn cmd_lint(
     let mut entities = HashSet::new();
 
     if let Some(index_dir) = index {
-        entities.extend(lint::collect_entities_from_index_path(&index_dir)?);
-    } else if let Some(root) = lint::find_project_root_for_path(file_path)? {
-        entities.extend(lint::collect_entities_from_workspace_root(&root)?);
+        entities.extend(tsift::lint::collect_entities_from_index_path(&index_dir)?);
+    } else if let Some(root) = tsift::lint::find_project_root_for_path(file_path)? {
+        entities.extend(tsift::lint::collect_entities_from_workspace_root(&root)?);
     }
 
     for md_path in &entities_from {
-        entities.extend(lint::collect_entities_from_markdown(md_path)?);
+        entities.extend(tsift::lint::collect_entities_from_markdown(md_path)?);
     }
 
-    entities.extend(lint::collect_entities_from_markdown(file_path)?);
+    entities.extend(tsift::lint::collect_entities_from_markdown(file_path)?);
 
-    let result = lint::lint_markdown(file_path, &entities)?;
+    let result = tsift::lint::lint_markdown(file_path, &entities)?;
 
     if json_output {
         println!("{}", to_json_schema(&result, pretty, terse, schema)?);
@@ -29061,6 +29028,8 @@ fn cmd_search_worker(
 mod tests {
     use super::*;
 
+    use std::cell::RefCell;
+    use tsift::substrate::{ConvexGraphClient, ConvexGraphStore, ConvexNodeRow, ConvexEdgeRow};
     fn parse_cli<I, T>(itr: I) -> Cli
     where
         I: IntoIterator<Item = T> + Send + 'static,
@@ -29385,7 +29354,7 @@ mod tests {
         let new_file = source_dir.join("new.rs");
         std::fs::write(&new_file, "fn alpha_helper() {}\n").unwrap();
 
-        let files = summarize::git_changed_files(dir.path()).unwrap();
+        let files = tsift::summarize::git_changed_files(dir.path()).unwrap();
 
         assert_eq!(files.existing, vec![new_file]);
         assert!(files.deleted.is_empty());
@@ -29406,7 +29375,7 @@ mod tests {
         let new_file = source_dir.join("new.rs");
         std::fs::write(&new_file, "fn alpha_helper() {}\n").unwrap();
 
-        let files = summarize::git_changed_files(dir.path()).unwrap();
+        let files = tsift::summarize::git_changed_files(dir.path()).unwrap();
 
         assert_eq!(files.existing, vec![new_file]);
         assert!(files.deleted.is_empty());
@@ -29423,7 +29392,7 @@ mod tests {
 
         std::fs::remove_file(&deleted_file).unwrap();
 
-        let files = summarize::git_changed_files(dir.path()).unwrap();
+        let files = tsift::summarize::git_changed_files(dir.path()).unwrap();
 
         assert!(files.existing.is_empty());
         assert_eq!(files.deleted, vec![deleted_file]);
@@ -29446,7 +29415,7 @@ mod tests {
             .unwrap();
         assert!(status.success(), "git mv failed");
 
-        let files = summarize::git_changed_files(dir.path()).unwrap();
+        let files = tsift::summarize::git_changed_files(dir.path()).unwrap();
 
         assert_eq!(files.existing, vec![new_file]);
         assert_eq!(files.deleted, vec![old_file]);
@@ -29463,9 +29432,9 @@ mod tests {
         init_git_repo(dir.path());
 
         let summary_db =
-            summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+            tsift::summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
         summary_db
-            .insert(&summarize::Summary {
+            .insert(&tsift::summarize::Summary {
                 id: 0,
                 symbol_name: "stale".to_string(),
                 file_path: "src/gone.rs".to_string(),
@@ -29512,9 +29481,9 @@ mod tests {
         init_git_repo(dir.path());
 
         let summary_db =
-            summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+            tsift::summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
         summary_db
-            .insert(&summarize::Summary {
+            .insert(&tsift::summarize::Summary {
                 id: 0,
                 symbol_name: "stale".to_string(),
                 file_path: "src/old.rs".to_string(),
@@ -29564,9 +29533,9 @@ mod tests {
         std::fs::write(&deleted_file, "fn stale() {}\n").unwrap();
 
         let summary_db =
-            summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+            tsift::summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
         summary_db
-            .insert(&summarize::Summary {
+            .insert(&tsift::summarize::Summary {
                 id: 0,
                 symbol_name: "stale".to_string(),
                 file_path: "src/gone.rs".to_string(),
@@ -29612,13 +29581,13 @@ mod tests {
 
         let content = std::fs::read(&file).unwrap();
         let summary_db =
-            summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+            tsift::summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
         summary_db
-            .insert(&summarize::Summary {
+            .insert(&tsift::summarize::Summary {
                 id: 0,
                 symbol_name: "lib.rs".to_string(),
                 file_path: "src/lib.rs".to_string(),
-                content_hash: summarize::content_hash(&content),
+                content_hash: tsift::summarize::content_hash(&content),
                 summary: "cached summary".to_string(),
                 entities: None,
                 relationships: None,
@@ -29631,7 +29600,7 @@ mod tests {
             .unwrap();
         drop(summary_db);
 
-        let lock_path = summarize::writer_lock_path(&dir.path().join(".tsift/summaries.db"));
+        let lock_path = tsift::summarize::writer_lock_path(&dir.path().join(".tsift/summaries.db"));
         let _lock = hold_writer_lock(&lock_path);
 
         let err = cmd_summarize(
@@ -29683,9 +29652,9 @@ mod tests {
     fn summarize_stats_uses_snapshot_fallback_when_rollback_journal_is_locked() {
         let dir = tempfile::tempdir().unwrap();
         let summary_db =
-            summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+            tsift::summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
         summary_db
-            .insert(&summarize::Summary {
+            .insert(&tsift::summarize::Summary {
                 id: 0,
                 symbol_name: "alpha_helper".to_string(),
                 file_path: "src/lib.rs".to_string(),
@@ -29724,9 +29693,9 @@ mod tests {
     fn summarize_symbol_query_uses_snapshot_fallback_when_rollback_journal_is_locked() {
         let dir = tempfile::tempdir().unwrap();
         let summary_db =
-            summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+            tsift::summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
         summary_db
-            .insert(&summarize::Summary {
+            .insert(&tsift::summarize::Summary {
                 id: 0,
                 symbol_name: "alpha_helper".to_string(),
                 file_path: "src/lib.rs".to_string(),
@@ -29768,9 +29737,9 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
 
         let summary_db =
-            summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+            tsift::summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
         summary_db
-            .insert(&summarize::Summary {
+            .insert(&tsift::summarize::Summary {
                 id: 0,
                 symbol_name: "alpha_helper".to_string(),
                 file_path: "src/lib.rs".to_string(),
@@ -30614,7 +30583,7 @@ mod tests {
             "fn helper() { println!(\"hi\"); }\nfn main() { helper(); Vec::new(); }",
         )
         .unwrap();
-        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
         db.apply_changes(dir.path()).unwrap();
         dir
     }
@@ -30665,7 +30634,7 @@ dispatch #spec-test-build-install-commit-push
             "[package]\nname = \"dag-fixture\"\n",
         )
         .unwrap();
-        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
         db.apply_changes(dir.path()).unwrap();
 
         let task_dir = dir.path().join("tasks/software");
@@ -30721,27 +30690,27 @@ agent_doc_format: template
     }
 
     fn seed_traversal_semantic_summaries(dir: &Path) {
-        let summary_db = summarize::SummaryDb::open(&dir.join(".tsift/summaries.db")).unwrap();
+        let summary_db = tsift::summarize::SummaryDb::open(&dir.join(".tsift/summaries.db")).unwrap();
         summary_db
-            .insert(&summarize::Summary {
+            .insert(&tsift::summarize::Summary {
                 id: 0,
                 symbol_name: "helper".to_string(),
                 file_path: "main.rs".to_string(),
                 content_hash: "hash-main".to_string(),
                 summary: "helper builds graph navigation handles for traversal.".to_string(),
                 entities: Some(vec![
-                    summarize::Entity {
+                    tsift::summarize::Entity {
                         name: "helper".to_string(),
                         kind: "function".to_string(),
                         description: "Builds graph navigation handles.".to_string(),
                     },
-                    summarize::Entity {
+                    tsift::summarize::Entity {
                         name: "TraversalGraph".to_string(),
                         kind: "type".to_string(),
                         description: "Carries GraphStore-backed traversal rows.".to_string(),
                     },
                 ]),
-                relationships: Some(vec![summarize::Relationship {
+                relationships: Some(vec![tsift::summarize::Relationship {
                     from: "helper".to_string(),
                     to: "TraversalGraph".to_string(),
                     kind: "uses".to_string(),
@@ -30761,7 +30730,7 @@ agent_doc_format: template
     #[test]
     fn graph_callers_query() {
         let dir = setup_graph_index();
-        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
         let callers = db.callers_of("helper").unwrap();
         assert_eq!(callers.len(), 1);
         assert_eq!(callers[0].caller_name, "main");
@@ -30770,7 +30739,7 @@ agent_doc_format: template
     #[test]
     fn graph_callees_query() {
         let dir = setup_graph_index();
-        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
         let callees = db.callees_of("main").unwrap();
         let names: Vec<&str> = callees.iter().map(|e| e.callee_name.as_str()).collect();
         assert!(names.contains(&"helper"));
@@ -30780,7 +30749,7 @@ agent_doc_format: template
     #[test]
     fn graph_no_callers_returns_empty() {
         let dir = setup_graph_index();
-        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
         let callers = db.callers_of("nonexistent").unwrap();
         assert!(callers.is_empty());
     }
@@ -30811,7 +30780,7 @@ agent_doc_format: template
         );
 
         assert!(result.is_ok());
-        let db = index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
         let summary = db.compute_changes(dir.path()).unwrap();
         assert_eq!(summary.new + summary.modified + summary.deleted, 0);
     }
@@ -30896,7 +30865,7 @@ agent_doc_format: template
 
         let targets = resolve_search_index_targets(dir.path(), &task, None, false).unwrap();
         let query_db_path = resolve_query_db_path(dir.path(), &task, None).unwrap();
-        let cfg = config::Config::load(dir.path()).unwrap();
+        let cfg = tsift::config::Config::load(dir.path()).unwrap();
 
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].scope_name.as_deref(), Some("tsift"));
@@ -30942,7 +30911,7 @@ def list_items():
 "#,
         )
         .unwrap();
-        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
         db.apply_changes(dir.path()).unwrap();
 
         let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
@@ -31185,18 +31154,18 @@ def list_items():
                 .collect::<Vec<_>>()
         );
 
-        let cached_diff = diff_digest::compute(
+        let cached_diff = tsift::diff_digest::compute(
             dir.path(),
-            diff_digest::DiffDigestOptions {
+            tsift::diff_digest::DiffDigestOptions {
                 cached: true,
                 revision: None,
                 max_parsed_files: None,
             },
         )
         .unwrap();
-        let impact_report = impact::compute(
+        let impact_report = tsift::impact::compute(
             dir.path(),
-            impact::ImpactOptions {
+            tsift::impact::ImpactOptions {
                 cached: true,
                 revision: None,
                 scope: None,
@@ -31529,7 +31498,7 @@ def list_items():
         assert_eq!(report.status, "current");
         assert_eq!(
             report.recovery,
-            Some(index::ReadOnlyRecovery::SnapshotFallback)
+            Some(tsift::index::ReadOnlyRecovery::SnapshotFallback)
         );
         assert!(
             report
@@ -31555,7 +31524,7 @@ def list_items():
         assert_eq!(report.status, "current");
         assert_eq!(
             report.recovery,
-            Some(index::ReadOnlyRecovery::SnapshotFallbackWal)
+            Some(tsift::index::ReadOnlyRecovery::SnapshotFallbackWal)
         );
         assert!(
             report
@@ -31792,7 +31761,7 @@ def list_items():
         );
         assert!(resolve_traversal_node(&graph, "fresh_helper").is_some());
 
-        let db = index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
         let summary = db.compute_changes(dir.path()).unwrap();
         assert_eq!(summary.new + summary.modified + summary.deleted, 0);
     }
@@ -31801,7 +31770,7 @@ def list_items():
     fn traversal_graph_falls_back_to_raw_source_when_stale_refresh_is_blocked() {
         let dir = setup_traversal_project();
         let db_path = dir.path().join(".tsift/index.db");
-        let _writer = hold_writer_lock(&index::writer_lock_path(&db_path));
+        let _writer = hold_writer_lock(&tsift::index::writer_lock_path(&db_path));
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(
             dir.path().join("main.rs"),
@@ -31895,9 +31864,9 @@ def list_items():
 
     #[test]
     fn compact_members_caps_list() {
-        let members: Vec<graph::CommunityMember> = ["a", "b", "c", "d", "e", "f"]
+        let members: Vec<tsift::graph::CommunityMember> = ["a", "b", "c", "d", "e", "f"]
             .iter()
-            .map(|n| graph::CommunityMember::new(*n))
+            .map(|n| tsift::graph::CommunityMember::new(*n))
             .collect();
         assert_eq!(compact_members(&members, 5), "a, b, c, d, e (+1 more)");
     }
@@ -31935,7 +31904,7 @@ def list_items():
     #[test]
     fn explain_compact_groups_edges_by_file() {
         let edges = vec![
-            index::StoredEdge {
+            tsift::index::StoredEdge {
                 caller_file: "src/main.rs".to_string(),
                 caller_name: "main".to_string(),
                 caller_line: 1,
@@ -31943,7 +31912,7 @@ def list_items():
                 call_site_line: 2,
                 tagpath_handle: None,
             },
-            index::StoredEdge {
+            tsift::index::StoredEdge {
                 caller_file: "src/main.rs".to_string(),
                 caller_name: "main".to_string(),
                 caller_line: 1,
@@ -31965,56 +31934,56 @@ def list_items():
         fs::write(&main_rs, "claudescore-3 anchor\nclaudescore-3 follow-up\n").unwrap();
         let freshness = exact_search_file_timestamp(&main_rs);
         let hits = vec![
-            sift::SearchHit {
+            tsift::sift::SearchHit {
                 artifact_id: "a".to_string(),
-                artifact_kind: sift::ContextArtifactKind::File,
+                artifact_kind: tsift::sift::ContextArtifactKind::File,
                 path: main_rs.display().to_string(),
                 rank: 1,
                 score: 10.0,
-                confidence: sift::ScoreConfidence::High,
+                confidence: tsift::sift::ScoreConfidence::High,
                 location: Some("line 3".to_string()),
                 snippet: "claudescore-3 anchor".to_string(),
-                provenance: sift::ArtifactProvenance {
-                    adapter: sift::AcquisitionAdapterKind::FileSystem,
+                provenance: tsift::sift::ArtifactProvenance {
+                    adapter: tsift::sift::AcquisitionAdapterKind::FileSystem,
                     source: "ripgrep -F".to_string(),
                     synthetic: false,
                 },
                 freshness: freshness.clone(),
-                budget: sift::ArtifactBudget::from_text("claudescore-3 anchor", 1),
+                budget: tsift::sift::ArtifactBudget::from_text("claudescore-3 anchor", 1),
             },
-            sift::SearchHit {
+            tsift::sift::SearchHit {
                 artifact_id: "b".to_string(),
-                artifact_kind: sift::ContextArtifactKind::File,
+                artifact_kind: tsift::sift::ContextArtifactKind::File,
                 path: main_rs.display().to_string(),
                 rank: 2,
                 score: 9.0,
-                confidence: sift::ScoreConfidence::High,
+                confidence: tsift::sift::ScoreConfidence::High,
                 location: Some("line 7".to_string()),
                 snippet: "claudescore-3 follow-up".to_string(),
-                provenance: sift::ArtifactProvenance {
-                    adapter: sift::AcquisitionAdapterKind::FileSystem,
+                provenance: tsift::sift::ArtifactProvenance {
+                    adapter: tsift::sift::AcquisitionAdapterKind::FileSystem,
                     source: "ripgrep -F".to_string(),
                     synthetic: false,
                 },
                 freshness: freshness.clone(),
-                budget: sift::ArtifactBudget::from_text("claudescore-3 follow-up", 1),
+                budget: tsift::sift::ArtifactBudget::from_text("claudescore-3 follow-up", 1),
             },
-            sift::SearchHit {
+            tsift::sift::SearchHit {
                 artifact_id: "c".to_string(),
-                artifact_kind: sift::ContextArtifactKind::File,
+                artifact_kind: tsift::sift::ContextArtifactKind::File,
                 path: main_rs.display().to_string(),
                 rank: 3,
                 score: 8.0,
-                confidence: sift::ScoreConfidence::High,
+                confidence: tsift::sift::ScoreConfidence::High,
                 location: Some("line 9".to_string()),
                 snippet: "claudescore-3 tail".to_string(),
-                provenance: sift::ArtifactProvenance {
-                    adapter: sift::AcquisitionAdapterKind::FileSystem,
+                provenance: tsift::sift::ArtifactProvenance {
+                    adapter: tsift::sift::AcquisitionAdapterKind::FileSystem,
                     source: "ripgrep -F".to_string(),
                     synthetic: false,
                 },
                 freshness,
-                budget: sift::ArtifactBudget::from_text("claudescore-3 tail", 1),
+                budget: tsift::sift::ArtifactBudget::from_text("claudescore-3 tail", 1),
             },
         ];
 
@@ -32035,7 +32004,7 @@ def list_items():
     #[test]
     fn dense_edge_groups_trigger_collapse() {
         let edges = vec![
-            index::StoredEdge {
+            tsift::index::StoredEdge {
                 caller_file: "src/main.rs".to_string(),
                 caller_name: "main".to_string(),
                 caller_line: 1,
@@ -32043,7 +32012,7 @@ def list_items():
                 call_site_line: 2,
                 tagpath_handle: None,
             },
-            index::StoredEdge {
+            tsift::index::StoredEdge {
                 caller_file: "src/main.rs".to_string(),
                 caller_name: "beta".to_string(),
                 caller_line: 5,
@@ -32051,7 +32020,7 @@ def list_items():
                 call_site_line: 6,
                 tagpath_handle: None,
             },
-            index::StoredEdge {
+            tsift::index::StoredEdge {
                 caller_file: "src/main.rs".to_string(),
                 caller_name: "gamma".to_string(),
                 caller_line: 9,
@@ -32444,9 +32413,9 @@ tier = "private"
             false,
         )
         .unwrap();
-        let cfg = config::Config::load(dir.path()).unwrap();
+        let cfg = tsift::config::Config::load(dir.path()).unwrap();
         let db_path = cfg.db_path_for(dir.path(), "alpha");
-        let db = index::IndexDb::open(&db_path).unwrap();
+        let db = tsift::index::IndexDb::open(&db_path).unwrap();
         let hits = db.symbol_search("alpha_main", 10).unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].name, "alpha_main");
@@ -32546,9 +32515,9 @@ tier = "private"
             false,
         )
         .unwrap();
-        let cfg = config::Config::load(dir.path()).unwrap();
+        let cfg = tsift::config::Config::load(dir.path()).unwrap();
         let db_path = cfg.db_path_for(dir.path(), "alpha");
-        let db = index::IndexDb::open(&db_path).unwrap();
+        let db = tsift::index::IndexDb::open(&db_path).unwrap();
         let callees = db.callees_of("alpha_main").unwrap();
         let names: Vec<&str> = callees.iter().map(|e| e.callee_name.as_str()).collect();
         assert!(names.contains(&"alpha_helper"));
@@ -32949,9 +32918,9 @@ tier = "private"
     #[test]
     fn community_detection_groups_related() {
         let dir = setup_graph_index();
-        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
         let edges = db.all_edges().unwrap();
-        let result = graph::detect_communities(&edges);
+        let result = tsift::graph::detect_communities(&edges);
         assert!(result.node_count > 0);
         assert!(!result.communities.is_empty());
     }
@@ -32982,9 +32951,9 @@ tier = "private"
     #[test]
     fn path_finds_connected_symbols() {
         let dir = setup_graph_index();
-        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
         let edges = db.all_edges().unwrap();
-        let result = graph::shortest_path(&edges, "main", "helper");
+        let result = tsift::graph::shortest_path(&edges, "main", "helper");
         assert!(result.is_some());
         let path = result.unwrap();
         assert_eq!(path.hops, 1);
@@ -32993,9 +32962,9 @@ tier = "private"
     #[test]
     fn path_returns_none_for_unknown() {
         let dir = setup_graph_index();
-        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
         let edges = db.all_edges().unwrap();
-        assert!(graph::shortest_path(&edges, "main", "nonexistent").is_none());
+        assert!(tsift::graph::shortest_path(&edges, "main", "nonexistent").is_none());
     }
 
     #[test]
@@ -33023,7 +32992,7 @@ tier = "private"
     #[test]
     fn explain_shows_symbol_info() {
         let dir = setup_graph_index();
-        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
         let symbols = db.symbol_info("main").unwrap();
         assert!(!symbols.is_empty());
         assert_eq!(symbols[0].name, "main");
@@ -33077,7 +33046,7 @@ tier = "private"
         let conn = Connection::open(db_path).unwrap();
         conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
             .unwrap();
-        std::fs::write(substrate::rollback_journal_path(db_path), "locked").unwrap();
+        std::fs::write(tsift::substrate::rollback_journal_path(db_path), "locked").unwrap();
         conn
     }
 
@@ -33092,7 +33061,7 @@ tier = "private"
              BEGIN EXCLUSIVE;",
         )
         .unwrap();
-        assert!(substrate::wal_sidecar_path(db_path).exists());
+        assert!(tsift::substrate::wal_sidecar_path(db_path).exists());
         conn
     }
 
@@ -33307,7 +33276,7 @@ tier = "private"
 
         assert!(result.is_ok());
 
-        let db = index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
         let summary = db.compute_changes(dir.path()).unwrap();
         assert_eq!(summary.new + summary.modified + summary.deleted, 0);
     }
@@ -33343,7 +33312,7 @@ tier = "private"
 
         assert!(result.is_ok());
 
-        let db = index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
         let summary = db.compute_changes(dir.path()).unwrap();
         assert_eq!(summary.modified, 1);
     }
@@ -33593,7 +33562,7 @@ tier = "private"
             false, false,
         );
 
-        let cfg = config::Config::load(dir.path()).unwrap();
+        let cfg = tsift::config::Config::load(dir.path()).unwrap();
 
         assert!(result.is_ok());
         assert!(cfg.db_path_for(dir.path(), "alpha").exists());
@@ -33603,10 +33572,10 @@ tier = "private"
     #[test]
     fn status_cmd_autoindexes_missing_workspace_scopes() {
         let dir = setup_workspace();
-        let cfg = config::Config::load(dir.path()).unwrap();
-        let alpha = config::Config::resolve_submodule(dir.path(), "alpha").unwrap();
+        let cfg = tsift::config::Config::load(dir.path()).unwrap();
+        let alpha = tsift::config::Config::resolve_submodule(dir.path(), "alpha").unwrap();
         let alpha_db_path = cfg.db_path_for(dir.path(), &alpha.id);
-        let alpha_db = index::IndexDb::open(&alpha_db_path).unwrap();
+        let alpha_db = tsift::index::IndexDb::open(&alpha_db_path).unwrap();
         alpha_db.apply_changes(&alpha.source_root).unwrap();
 
         let beta_db_path = cfg.db_path_for(dir.path(), "beta");
@@ -33615,21 +33584,21 @@ tier = "private"
         cmd_status(dir.path(), false, true, false, false, false, false).unwrap();
 
         assert!(beta_db_path.exists());
-        let report = status::check_status(dir.path()).unwrap();
-        assert!(matches!(report.index, status::IndexStatus::Fresh { .. }));
+        let report = tsift::status::check_status(dir.path()).unwrap();
+        assert!(matches!(report.index, tsift::status::IndexStatus::Fresh { .. }));
     }
 
     #[test]
     fn status_cmd_autoindexes_workspace_when_all_scopes_are_missing() {
         let dir = setup_workspace();
-        let cfg = config::Config::load(dir.path()).unwrap();
+        let cfg = tsift::config::Config::load(dir.path()).unwrap();
 
         cmd_status(dir.path(), false, true, false, false, false, false).unwrap();
 
         assert!(cfg.db_path_for(dir.path(), "alpha").exists());
         assert!(cfg.db_path_for(dir.path(), "beta").exists());
-        let report = status::check_status(dir.path()).unwrap();
-        assert!(matches!(report.index, status::IndexStatus::Fresh { .. }));
+        let report = tsift::status::check_status(dir.path()).unwrap();
+        assert!(matches!(report.index, tsift::status::IndexStatus::Fresh { .. }));
     }
 
     #[test]
@@ -33642,13 +33611,13 @@ tier = "private"
         )
         .unwrap();
 
-        let report = status::check_status(dir.path()).unwrap();
-        assert!(matches!(report.index, status::IndexStatus::Stale { .. }));
+        let report = tsift::status::check_status(dir.path()).unwrap();
+        assert!(matches!(report.index, tsift::status::IndexStatus::Stale { .. }));
 
         cmd_status(dir.path(), true, true, false, false, false, false).unwrap();
 
-        let report = status::check_status(dir.path()).unwrap();
-        assert!(matches!(report.index, status::IndexStatus::Fresh { .. }));
+        let report = tsift::status::check_status(dir.path()).unwrap();
+        assert!(matches!(report.index, tsift::status::IndexStatus::Fresh { .. }));
     }
 
     #[test]
@@ -33659,18 +33628,18 @@ tier = "private"
 
         cmd_status(dir.path(), false, true, false, false, false, false).unwrap();
 
-        let report = status::check_status(dir.path()).unwrap();
+        let report = tsift::status::check_status(dir.path()).unwrap();
         assert!(matches!(
             report.index,
-            status::IndexStatus::Fresh {
-                recovery: Some(index::ReadOnlyRecovery::SnapshotFallbackWal),
+            tsift::status::IndexStatus::Fresh {
+                recovery: Some(tsift::index::ReadOnlyRecovery::SnapshotFallbackWal),
                 ..
             }
         ));
-        let locks = status::check_locks(dir.path(), None, None).unwrap();
+        let locks = tsift::status::check_locks(dir.path(), None, None).unwrap();
         assert!(matches!(
             locks.writer_lock,
-            status::WriterLockStatus::Absent { .. }
+            tsift::status::WriterLockStatus::Absent { .. }
         ));
         assert!(locks.wal_sidecar.present || locks.shared_memory_sidecar.present);
         assert!(
@@ -33686,8 +33655,8 @@ tier = "private"
         let nested = dir.path().join("src/nested");
         std::fs::create_dir_all(&nested).unwrap();
 
-        let root = lint::resolve_project_root_or_canonical_path(&nested).unwrap();
-        let report = status::check_locks(&root, Some(&nested), None).unwrap();
+        let root = tsift::lint::resolve_project_root_or_canonical_path(&nested).unwrap();
+        let report = tsift::status::check_locks(&root, Some(&nested), None).unwrap();
 
         assert_eq!(report.source_root, dir.path());
         assert_eq!(report.db_path, dir.path().join(".tsift/index.db"));
@@ -33716,9 +33685,9 @@ tier = "private"
         let nested = dir.path().join("src/alpha/nested");
         std::fs::create_dir_all(&nested).unwrap();
 
-        let root = lint::resolve_project_root_or_canonical_path(&nested).unwrap();
-        let report = status::check_locks(&root, Some(&nested), None).unwrap();
-        let cfg = config::Config::load(dir.path()).unwrap();
+        let root = tsift::lint::resolve_project_root_or_canonical_path(&nested).unwrap();
+        let report = tsift::status::check_locks(&root, Some(&nested), None).unwrap();
+        let cfg = tsift::config::Config::load(dir.path()).unwrap();
 
         assert_eq!(report.label, "submodule `alpha` index");
         assert_eq!(report.source_root, dir.path().join("src/alpha"));
@@ -33778,8 +33747,8 @@ tier = "private"
 
         assert!(result.is_ok());
 
-        let cfg = config::Config::load(dir.path()).unwrap();
-        let db = index::IndexDb::open_read_only(&cfg.db_path_for(dir.path(), "alpha")).unwrap();
+        let cfg = tsift::config::Config::load(dir.path()).unwrap();
+        let db = tsift::index::IndexDb::open_read_only(&cfg.db_path_for(dir.path(), "alpha")).unwrap();
         let summary = db.compute_changes(&dir.path().join("src/alpha")).unwrap();
         assert_eq!(summary.new + summary.modified + summary.deleted, 0);
     }
@@ -33813,7 +33782,7 @@ tier = "private"
         )
         .unwrap();
 
-        let cfg = config::Config::load(dir.path()).unwrap();
+        let cfg = tsift::config::Config::load(dir.path()).unwrap();
         let _lock = hold_rollback_journal_lock(&cfg.db_path_for(dir.path(), "alpha"));
 
         let err = cmd_search(
@@ -33889,8 +33858,8 @@ tier = "private"
 
         assert!(result.is_ok());
 
-        let cfg = config::Config::load(dir.path()).unwrap();
-        let db = index::IndexDb::open_read_only(&cfg.db_path_for(dir.path(), "alpha")).unwrap();
+        let cfg = tsift::config::Config::load(dir.path()).unwrap();
+        let db = tsift::index::IndexDb::open_read_only(&cfg.db_path_for(dir.path(), "alpha")).unwrap();
         let summary = db.compute_changes(&dir.path().join("src/alpha")).unwrap();
         assert_eq!(summary.new + summary.modified + summary.deleted, 0);
     }
@@ -33924,7 +33893,7 @@ tier = "private"
         )
         .unwrap();
 
-        let cfg = config::Config::load(dir.path()).unwrap();
+        let cfg = tsift::config::Config::load(dir.path()).unwrap();
         let _lock = hold_rollback_journal_lock(&cfg.db_path_for(dir.path(), "alpha"));
 
         let err = cmd_search(
@@ -34062,9 +34031,9 @@ tier = "private"
         let nested = dir.path().join("vendor/foo/nested");
         std::fs::create_dir_all(&nested).unwrap();
 
-        let root = lint::resolve_project_root_or_canonical_path(&nested).unwrap();
+        let root = tsift::lint::resolve_project_root_or_canonical_path(&nested).unwrap();
         let db_path = resolve_query_db_path(&root, &nested, None).unwrap();
-        let cfg = config::Config::load(dir.path()).unwrap();
+        let cfg = tsift::config::Config::load(dir.path()).unwrap();
 
         assert_eq!(db_path, cfg.db_path_for(dir.path(), "vendor/foo"));
     }
@@ -34123,7 +34092,7 @@ tier = "private"
         );
 
         assert!(result.is_ok());
-        let db = index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
         let summary = db.compute_changes(dir.path()).unwrap();
         assert_eq!(summary.new + summary.modified + summary.deleted, 0);
     }
@@ -34252,11 +34221,11 @@ tier = "private"
         )
         .unwrap();
 
-        let root = lint::find_project_root_for_path(&dir.path().join("README.md"))
+        let root = tsift::lint::find_project_root_for_path(&dir.path().join("README.md"))
             .unwrap()
             .unwrap();
-        let entities = lint::collect_entities_from_index_path(&root).unwrap();
-        let result = lint::lint_markdown(&dir.path().join("README.md"), &entities).unwrap();
+        let entities = tsift::lint::collect_entities_from_index_path(&root).unwrap();
+        let result = tsift::lint::lint_markdown(&dir.path().join("README.md"), &entities).unwrap();
 
         assert!(
             result
@@ -35194,7 +35163,7 @@ tier = "private"
     #[test]
     fn search_budget_report_truncates_symbol_preview_and_emits_stable_handle() {
         let response = empty_search_response(Path::new("/repo"), "lexical");
-        let symbol_hits = vec![index::SymbolHit {
+        let symbol_hits = vec![tsift::index::SymbolHit {
             name: "alpha_helper_with_a_long_name".to_string(),
             kind: "function".to_string(),
             language: "rust".to_string(),
@@ -35229,7 +35198,7 @@ tier = "private"
     fn search_budget_report_groups_repeated_symbols_by_canonical_tag_family() {
         let response = empty_search_response(Path::new("/repo"), "lexical");
         let symbol_hits = vec![
-            index::SymbolHit {
+            tsift::index::SymbolHit {
                 name: "alpha_helper".to_string(),
                 kind: "function".to_string(),
                 language: "rust".to_string(),
@@ -35241,7 +35210,7 @@ tier = "private"
                 match_type: "exact_name".to_string(),
                 tagpath_handle: None,
             },
-            index::SymbolHit {
+            tsift::index::SymbolHit {
                 name: "alphaHelper".to_string(),
                 kind: "method".to_string(),
                 language: "rust".to_string(),
@@ -35253,7 +35222,7 @@ tier = "private"
                 match_type: "tag_overlap".to_string(),
                 tagpath_handle: None,
             },
-            index::SymbolHit {
+            tsift::index::SymbolHit {
                 name: "alpha_helper".to_string(),
                 kind: "function".to_string(),
                 language: "rust".to_string(),
@@ -35299,7 +35268,7 @@ tier = "private"
         let mut response = empty_search_response(Path::new("/repo"), "lexical");
         response.indexed_artifacts = 450;
         let symbol_hits = vec![
-            index::SymbolHit {
+            tsift::index::SymbolHit {
                 name: "alpha_helper".to_string(),
                 kind: "function".to_string(),
                 language: "rust".to_string(),
@@ -35311,7 +35280,7 @@ tier = "private"
                 match_type: "exact_name".to_string(),
                 tagpath_handle: None,
             },
-            index::SymbolHit {
+            tsift::index::SymbolHit {
                 name: "beta_helper".to_string(),
                 kind: "function".to_string(),
                 language: "rust".to_string(),
@@ -35365,7 +35334,7 @@ tier = "private"
 
     #[test]
     fn explain_budget_report_limits_edges_and_members() {
-        let symbols = vec![index::StoredSymbol {
+        let symbols = vec![tsift::index::StoredSymbol {
             name: "alpha_helper".to_string(),
             kind: "function".to_string(),
             language: "rust".to_string(),
@@ -35379,7 +35348,7 @@ tier = "private"
             tagpath_handle: None,
         }];
         let callers = vec![
-            index::StoredEdge {
+            tsift::index::StoredEdge {
                 caller_file: "src/main.rs".to_string(),
                 caller_name: "main".to_string(),
                 caller_line: 1,
@@ -35387,7 +35356,7 @@ tier = "private"
                 call_site_line: 3,
                 tagpath_handle: None,
             },
-            index::StoredEdge {
+            tsift::index::StoredEdge {
                 caller_file: "src/worker.rs".to_string(),
                 caller_name: "worker".to_string(),
                 caller_line: 5,
@@ -35396,12 +35365,12 @@ tier = "private"
                 tagpath_handle: None,
             },
         ];
-        let community = graph::Community {
+        let community = tsift::graph::Community {
             id: 1,
             members: vec![
-                graph::CommunityMember::new("alpha_helper"),
-                graph::CommunityMember::new("main"),
-                graph::CommunityMember::new("worker"),
+                tsift::graph::CommunityMember::new("alpha_helper"),
+                tsift::graph::CommunityMember::new("main"),
+                tsift::graph::CommunityMember::new("worker"),
             ],
             modularity_contribution: 0.5,
         };
@@ -35434,7 +35403,7 @@ tier = "private"
 
     #[test]
     fn session_review_next_context_budget_limits_lists() {
-        let report = session_review::SessionReviewReport {
+        let report = tsift::session_review::SessionReviewReport {
             root: "/repo".to_string(),
             target: "tasks/software/tsift.md".to_string(),
             target_kind: "file".to_string(),
@@ -35460,7 +35429,7 @@ tier = "private"
             total_tokens: 240,
             cached_input_ratio: Some(40.0),
             largest_turn_total_tokens: 240,
-            aggregate_cost: session_review::SessionReviewCostSummary {
+            aggregate_cost: tsift::session_review::SessionReviewCostSummary {
                 scope: "bounded_matched_sessions".to_string(),
                 sessions: 1,
                 usage_samples: 1,
@@ -35473,7 +35442,7 @@ tier = "private"
                 cached_input_ratio: Some(40.0),
                 largest_turn_total_tokens: 240,
             },
-            latest_session_cost: Some(session_review::SessionReviewCostSummary {
+            latest_session_cost: Some(tsift::session_review::SessionReviewCostSummary {
                 scope: "latest_matched_session".to_string(),
                 sessions: 1,
                 usage_samples: 1,
@@ -35490,11 +35459,11 @@ tier = "private"
             loop_clusters: vec![],
             file_read_diagnostics: vec![],
             prompt_targets: vec![
-                session_review::SessionReviewPromptTarget {
+                tsift::session_review::SessionReviewPromptTarget {
                     text: "do one".to_string(),
                     occurrences: 1,
                 },
-                session_review::SessionReviewPromptTarget {
+                tsift::session_review::SessionReviewPromptTarget {
                     text: "do two".to_string(),
                     occurrences: 1,
                 },
@@ -35507,7 +35476,7 @@ tier = "private"
             restart_churn: vec![],
             closeout: vec![],
             largest_turns: vec![],
-            sessions: vec![session_review::SessionReviewSession {
+            sessions: vec![tsift::session_review::SessionReviewSession {
                 source: "claude_jsonl".to_string(),
                 path: "/tmp/session.jsonl".to_string(),
                 matched_by: vec!["path".to_string()],
@@ -35529,16 +35498,16 @@ tier = "private"
                 total_tokens: 240,
                 largest_turn_total_tokens: 240,
             }],
-            next_context: session_review::SessionReviewNextContext {
+            next_context: tsift::session_review::SessionReviewNextContext {
                 target: "tasks/software/tsift.md".to_string(),
                 active_prompt_targets: vec!["do one".to_string(), "do two".to_string()],
-                last_verification: session_review::SessionReviewVerificationState {
+                last_verification: tsift::session_review::SessionReviewVerificationState {
                     status: "green".to_string(),
                     detail: "cargo test".to_string(),
                 },
                 touched_files: vec!["src/lib.rs".to_string(), "src/main.rs".to_string()],
                 touched_symbols: vec!["alpha_helper".to_string(), "main".to_string()],
-                unresolved_failures: vec![session_review::SessionReviewFailure {
+                unresolved_failures: vec![tsift::session_review::SessionReviewFailure {
                     kind: "timeout".to_string(),
                     message: "search timed out".to_string(),
                     occurrences: 1,
@@ -35587,9 +35556,9 @@ tier = "private"
 
     #[test]
     fn context_pack_diff_preview_limits_files_and_symbols() {
-        let report = diff_digest::DiffDigestReport {
+        let report = tsift::diff_digest::DiffDigestReport {
             root: "/repo".to_string(),
-            mode: diff_digest::DiffDigestMode::WorkingTree,
+            mode: tsift::diff_digest::DiffDigestMode::WorkingTree,
             revision: None,
             files_changed: 2,
             files_with_current_summaries: 1,
@@ -35597,12 +35566,12 @@ tier = "private"
             call_edges_added: 1,
             call_edges_removed: 0,
             files: vec![
-                diff_digest::DiffDigestFile {
+                tsift::diff_digest::DiffDigestFile {
                     path: "src/lib.rs".to_string(),
-                    status: diff_digest::DiffDigestFileStatus::Modified,
+                    status: tsift::diff_digest::DiffDigestFileStatus::Modified,
                     touched_symbols: vec!["alpha_helper".to_string(), "beta_helper".to_string()],
-                    summary_state: diff_digest::DiffDigestSummaryState::Current,
-                    current_summaries: vec![diff_digest::DiffDigestSummarySnippet {
+                    summary_state: tsift::diff_digest::DiffDigestSummaryState::Current,
+                    current_summaries: vec![tsift::diff_digest::DiffDigestSummarySnippet {
                         symbol: "alpha_helper".to_string(),
                         summary: "alpha helper handles the main alpha workflow".to_string(),
                     }],
@@ -35610,11 +35579,11 @@ tier = "private"
                     removed_call_edges: vec![],
                     warnings: vec!["stale parse".to_string()],
                 },
-                diff_digest::DiffDigestFile {
+                tsift::diff_digest::DiffDigestFile {
                     path: "src/main.rs".to_string(),
-                    status: diff_digest::DiffDigestFileStatus::Added,
+                    status: tsift::diff_digest::DiffDigestFileStatus::Added,
                     touched_symbols: vec!["main".to_string()],
-                    summary_state: diff_digest::DiffDigestSummaryState::Missing,
+                    summary_state: tsift::diff_digest::DiffDigestSummaryState::Missing,
                     current_summaries: vec![],
                     added_call_edges: vec![],
                     removed_call_edges: vec![],
@@ -35683,7 +35652,7 @@ tier = "private"
     fn build_context_pack_reuses_inspect_within_scope() {
         let dir = setup_graph_index();
         init_git_repo(dir.path());
-        let _guard = index::InspectScopeGuard::new();
+        let _guard = tsift::index::InspectScopeGuard::new();
         let _ = build_context_pack_report(
             dir.path(),
             None,
@@ -35692,7 +35661,7 @@ tier = "private"
             ResponseBudget::new(Some(2), Some(96)),
         )
         .unwrap();
-        let (hits, misses) = index::inspect_scope_stats();
+        let (hits, misses) = tsift::index::inspect_scope_stats();
         assert!(
             hits >= 1,
             "expected at least one cached inspect within scope (hits={hits}, misses={misses})"
@@ -35711,15 +35680,15 @@ tier = "private"
     fn inspect_read_only_outside_scope_does_not_cache() {
         let dir = setup_graph_index();
         let db_path = dir.path().join(".tsift/index.db");
-        let _first = index::IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
-        let (hits, misses) = index::inspect_scope_stats();
+        let _first = tsift::index::IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
+        let (hits, misses) = tsift::index::inspect_scope_stats();
         assert_eq!(
             (hits, misses),
             (0, 0),
             "no scope guard => no hits/misses recorded"
         );
-        let _second = index::IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
-        let (hits, _) = index::inspect_scope_stats();
+        let _second = tsift::index::IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
+        let (hits, _) = tsift::index::inspect_scope_stats();
         assert_eq!(hits, 0, "must not reuse inspection outside of any scope");
     }
 
@@ -35761,7 +35730,7 @@ tier = "private"
             report.status_reminders
         );
 
-        let db = index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
         let summary = db.compute_changes(dir.path()).unwrap();
         assert_eq!(summary.new + summary.modified + summary.deleted, 0);
     }
@@ -36070,21 +36039,21 @@ tier = "private"
         )
         .unwrap();
         let ontology = load_tag_ontology_preview_context(root.path()).unwrap();
-        let report = diff_digest::DiffDigestReport {
+        let report = tsift::diff_digest::DiffDigestReport {
             root: root.path().display().to_string(),
-            mode: diff_digest::DiffDigestMode::WorkingTree,
+            mode: tsift::diff_digest::DiffDigestMode::WorkingTree,
             revision: None,
             files_changed: 1,
             files_with_current_summaries: 1,
             symbols_touched: 1,
             call_edges_added: 0,
             call_edges_removed: 0,
-            files: vec![diff_digest::DiffDigestFile {
+            files: vec![tsift::diff_digest::DiffDigestFile {
                 path: "src/lib.rs".to_string(),
-                status: diff_digest::DiffDigestFileStatus::Modified,
+                status: tsift::diff_digest::DiffDigestFileStatus::Modified,
                 touched_symbols: vec!["alpha_helper".to_string()],
-                summary_state: diff_digest::DiffDigestSummaryState::Current,
-                current_summaries: vec![diff_digest::DiffDigestSummarySnippet {
+                summary_state: tsift::diff_digest::DiffDigestSummaryState::Current,
+                current_summaries: vec![tsift::diff_digest::DiffDigestSummarySnippet {
                     symbol: "alpha_helper".to_string(),
                     summary: "alpha helper summary".to_string(),
                 }],
@@ -36114,38 +36083,38 @@ tier = "private"
 
     #[test]
     fn context_pack_test_preview_limits_failure_groups() {
-        let report = test_digest::TestDigestReport {
+        let report = tsift::test_digest::TestDigestReport {
             root: "/repo".to_string(),
             runner: "cargo".to_string(),
             failures: 2,
             grouped_failures: 2,
-            counts: test_digest::TestDigestCounts {
+            counts: tsift::test_digest::TestDigestCounts {
                 passed: Some(8),
                 failed: Some(2),
                 skipped: Some(1),
             },
             failure_groups: vec![
-                test_digest::TestDigestFailure {
+                tsift::test_digest::TestDigestFailure {
                     tests: vec!["suite::alpha_failure".to_string()],
                     message: "assertion failed".to_string(),
                     path: Some("src/lib.rs".to_string()),
                     line: Some(42),
                     column: None,
                     occurrences: 1,
-                    summary_state: test_digest::TestDigestSummaryState::Current,
-                    current_summaries: vec![test_digest::TestDigestSummarySnippet {
+                    summary_state: tsift::test_digest::TestDigestSummaryState::Current,
+                    current_summaries: vec![tsift::test_digest::TestDigestSummarySnippet {
                         symbol: "alpha_failure".to_string(),
                         summary: "failure summary for alpha test".to_string(),
                     }],
                 },
-                test_digest::TestDigestFailure {
+                tsift::test_digest::TestDigestFailure {
                     tests: vec!["suite::beta_failure".to_string()],
                     message: "panic".to_string(),
                     path: Some("src/main.rs".to_string()),
                     line: Some(7),
                     column: None,
                     occurrences: 1,
-                    summary_state: test_digest::TestDigestSummaryState::Missing,
+                    summary_state: tsift::test_digest::TestDigestSummaryState::Missing,
                     current_summaries: vec![],
                 },
             ],
@@ -36173,7 +36142,7 @@ tier = "private"
 
     #[test]
     fn context_pack_log_preview_limits_signals_and_refs() {
-        let report = log_digest::LogDigestReport {
+        let report = tsift::log_digest::LogDigestReport {
             root: "/repo".to_string(),
             total_lines: 12,
             non_empty_lines: 10,
@@ -36184,79 +36153,79 @@ tier = "private"
             symbol_ref_groups: 2,
             stack_groups: 1,
             signals: vec![
-                log_digest::LogDigestSignal {
+                tsift::log_digest::LogDigestSignal {
                     severity: "error".to_string(),
                     message: "src/lib.rs:42 boom".to_string(),
                     path: Some("src/lib.rs".to_string()),
                     line: Some(42),
                     column: None,
                     occurrences: 2,
-                    summary_state: log_digest::LogDigestSummaryState::Current,
-                    current_summaries: vec![log_digest::LogDigestSummarySnippet {
+                    summary_state: tsift::log_digest::LogDigestSummaryState::Current,
+                    current_summaries: vec![tsift::log_digest::LogDigestSummarySnippet {
                         symbol: "alpha_helper".to_string(),
                         summary: "alpha helper cached log summary".to_string(),
                     }],
                 },
-                log_digest::LogDigestSignal {
+                tsift::log_digest::LogDigestSignal {
                     severity: "warn".to_string(),
                     message: "slow path".to_string(),
                     path: None,
                     line: None,
                     column: None,
                     occurrences: 1,
-                    summary_state: log_digest::LogDigestSummaryState::Unavailable,
+                    summary_state: tsift::log_digest::LogDigestSummaryState::Unavailable,
                     current_summaries: vec![],
                 },
             ],
             repeated_lines: vec![
-                log_digest::LogDigestRepeatedLine {
+                tsift::log_digest::LogDigestRepeatedLine {
                     line: "retrying work item alpha".to_string(),
                     occurrences: 3,
                 },
-                log_digest::LogDigestRepeatedLine {
+                tsift::log_digest::LogDigestRepeatedLine {
                     line: "retrying work item beta".to_string(),
                     occurrences: 2,
                 },
             ],
             file_refs: vec![
-                log_digest::LogDigestFileRef {
+                tsift::log_digest::LogDigestFileRef {
                     path: "src/lib.rs".to_string(),
                     line: Some(42),
                     column: None,
                     occurrences: 2,
-                    summary_state: log_digest::LogDigestSummaryState::Current,
-                    current_summaries: vec![log_digest::LogDigestSummarySnippet {
+                    summary_state: tsift::log_digest::LogDigestSummaryState::Current,
+                    current_summaries: vec![tsift::log_digest::LogDigestSummarySnippet {
                         symbol: "alpha_helper".to_string(),
                         summary: "alpha helper cached file summary".to_string(),
                     }],
                 },
-                log_digest::LogDigestFileRef {
+                tsift::log_digest::LogDigestFileRef {
                     path: "src/main.rs".to_string(),
                     line: Some(7),
                     column: None,
                     occurrences: 1,
-                    summary_state: log_digest::LogDigestSummaryState::Missing,
+                    summary_state: tsift::log_digest::LogDigestSummaryState::Missing,
                     current_summaries: vec![],
                 },
             ],
             symbol_refs: vec![
-                log_digest::LogDigestSymbolRef {
+                tsift::log_digest::LogDigestSymbolRef {
                     symbol: "alpha_helper".to_string(),
                     occurrences: 2,
-                    summary_state: log_digest::LogDigestSummaryState::Current,
-                    current_summaries: vec![log_digest::LogDigestSummarySnippet {
+                    summary_state: tsift::log_digest::LogDigestSummaryState::Current,
+                    current_summaries: vec![tsift::log_digest::LogDigestSummarySnippet {
                         symbol: "alpha_helper".to_string(),
                         summary: "alpha helper cached symbol summary".to_string(),
                     }],
                 },
-                log_digest::LogDigestSymbolRef {
+                tsift::log_digest::LogDigestSymbolRef {
                     symbol: "beta_helper".to_string(),
                     occurrences: 1,
-                    summary_state: log_digest::LogDigestSummaryState::Missing,
+                    summary_state: tsift::log_digest::LogDigestSummaryState::Missing,
                     current_summaries: vec![],
                 },
             ],
-            stack_traces: vec![log_digest::LogDigestStackGroup {
+            stack_traces: vec![tsift::log_digest::LogDigestStackGroup {
                 frames: vec!["frame one".to_string()],
                 occurrences: 1,
             }],
@@ -36789,7 +36758,7 @@ tier = "private"
     #[test]
     fn relativize_edges_strips_caller_file() {
         let root = std::path::Path::new("/tmp/proj");
-        let mut edges = vec![index::StoredEdge {
+        let mut edges = vec![tsift::index::StoredEdge {
             caller_file: "/tmp/proj/src/main.rs".to_string(),
             caller_name: "main".to_string(),
             caller_line: 1,
@@ -37138,14 +37107,14 @@ tier = "private"
         let root = dir.path();
         std::fs::write(root.join("README.md"), "# stable\n").unwrap();
         let summaries_db_path = root.join(".tsift/summaries.db");
-        let summary_db = summarize::SummaryDb::open(&summaries_db_path).unwrap();
-        let mut summary = summarize::Summary {
+        let summary_db = tsift::summarize::SummaryDb::open(&summaries_db_path).unwrap();
+        let mut summary = tsift::summarize::Summary {
             id: 0,
             symbol_name: "main".to_string(),
             file_path: "src/main.rs".to_string(),
             content_hash: "hash-main".to_string(),
             summary: "main wires the CLI".to_string(),
-            entities: Some(vec![summarize::Entity {
+            entities: Some(vec![tsift::summarize::Entity {
                 name: "Cli".to_string(),
                 kind: "type".to_string(),
                 description: "Command-line interface".to_string(),
@@ -37179,12 +37148,12 @@ tier = "private"
             "metadata-only summaries.db churn must not invalidate the source watermark"
         );
 
-        summary.entities = Some(vec![summarize::Entity {
+        summary.entities = Some(vec![tsift::summarize::Entity {
             name: "GraphCache".to_string(),
             kind: "type".to_string(),
             description: "Stable full-projection cache input".to_string(),
         }]);
-        let summary_db = summarize::SummaryDb::open(&summaries_db_path).unwrap();
+        let summary_db = tsift::summarize::SummaryDb::open(&summaries_db_path).unwrap();
         summary_db.delete_by_file("src/main.rs").unwrap();
         summary_db.insert(&summary).unwrap();
         drop(summary_db);
@@ -37210,7 +37179,7 @@ tier = "private"
         let source = root.join("src/lib.rs");
         let source_body = "pub fn alpha() { beta(); }\npub fn beta() {}\n";
         std::fs::write(&source, source_body).unwrap();
-        let db = index::IndexDb::open(&root.join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open(&root.join(".tsift/index.db")).unwrap();
         db.rebuild(root).unwrap();
         drop(db);
 
@@ -37219,7 +37188,7 @@ tier = "private"
             .value;
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&source, source_body).unwrap();
-        let db = index::IndexDb::open(&root.join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open(&root.join(".tsift/index.db")).unwrap();
         db.apply_changes(root).unwrap();
         drop(db);
 
@@ -37250,7 +37219,7 @@ tier = "private"
             "---\nagent_doc_session: tsift-v0.1\n---\n\n## Backlog\n\n- [ ] [#one] Initial item\n",
         )
         .unwrap();
-        let db = index::IndexDb::open(&root.join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open(&root.join(".tsift/index.db")).unwrap();
         db.rebuild(root).unwrap();
         drop(db);
 
@@ -37283,7 +37252,7 @@ tier = "private"
         let source = root.join("src/lib.rs");
         let source_body = "pub fn alpha() { beta(); }\npub fn beta() {}\n";
         std::fs::write(&source, source_body).unwrap();
-        let db = index::IndexDb::open(&root.join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open(&root.join(".tsift/index.db")).unwrap();
         db.rebuild(root).unwrap();
         drop(db);
 
@@ -37296,7 +37265,7 @@ tier = "private"
 
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&source, source_body).unwrap();
-        let db = index::IndexDb::open(&root.join(".tsift/index.db")).unwrap();
+        let db = tsift::index::IndexDb::open(&root.join(".tsift/index.db")).unwrap();
         db.apply_changes(root).unwrap();
         drop(db);
 
@@ -38224,7 +38193,7 @@ fn rewrite_source_read_command(cmd: &str) -> Option<String> {
         return None;
     }
 
-    let root = lint::find_project_root_for_path(input_path).ok()??;
+    let root = tsift::lint::find_project_root_for_path(input_path).ok()??;
     if !project_has_index(&root) {
         return None;
     }
@@ -38357,7 +38326,7 @@ fn parse_sed_print_window(raw: &str) -> Option<(usize, usize)> {
 fn file_is_supported_source(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .and_then(lang::Lang::from_extension)
+        .and_then(tsift::lang::Lang::from_extension)
         .is_some()
 }
 
@@ -38427,19 +38396,19 @@ fn directory_contains_index_db(path: &Path) -> bool {
     false
 }
 
-fn detect_session_digest_source(path: &Path) -> Option<session_digest::SessionDigestSource> {
+fn detect_session_digest_source(path: &Path) -> Option<tsift::session_digest::SessionDigestSource> {
     match path.extension().and_then(|ext| ext.to_str()) {
         Some("md") if file_looks_like_agent_doc_session(path) => {
-            Some(session_digest::SessionDigestSource::Markdown)
+            Some(tsift::session_digest::SessionDigestSource::Markdown)
         }
         Some("jsonl") if file_looks_like_claude_jsonl(path) => {
-            Some(session_digest::SessionDigestSource::ClaudeJsonl)
+            Some(tsift::session_digest::SessionDigestSource::ClaudeJsonl)
         }
         Some("jsonl") if file_looks_like_codex_jsonl(path) => {
-            Some(session_digest::SessionDigestSource::CodexJsonl)
+            Some(tsift::session_digest::SessionDigestSource::CodexJsonl)
         }
         Some("log") if file_looks_like_agent_doc_log(path) => {
-            Some(session_digest::SessionDigestSource::AgentDocLog)
+            Some(tsift::session_digest::SessionDigestSource::AgentDocLog)
         }
         _ => None,
     }
@@ -38542,7 +38511,7 @@ fn file_has_at_least_lines(path: &Path, min_lines: usize) -> bool {
 fn build_session_digest_command(
     path: &str,
     input: &str,
-    source: session_digest::SessionDigestSource,
+    source: tsift::session_digest::SessionDigestSource,
 ) -> String {
     format!(
         "tsift session-digest --path {} --input {} --source {}",
@@ -38553,7 +38522,7 @@ fn build_session_digest_command(
 }
 
 fn resolve_digest_context_path(path: &Path) -> String {
-    crate::lint::resolve_harness_root_or_canonical_path(path)
+    tsift::lint::resolve_harness_root_or_canonical_path(path)
         .map(|root| root.display().to_string())
         .unwrap_or_else(|_| ".".to_string())
 }
@@ -38720,9 +38689,9 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
-fn empty_search_coverage() -> sift::SearchCoverageSnapshot {
-    sift::SearchCoverageSnapshot {
-        mode: sift::SearchCoverageMode::Sealed,
+fn empty_search_coverage() -> tsift::sift::SearchCoverageSnapshot {
+    tsift::sift::SearchCoverageSnapshot {
+        mode: tsift::sift::SearchCoverageMode::Sealed,
         total_sector_count: 0,
         mounted_sector_count: 0,
         reused_sector_count: 0,
@@ -38734,7 +38703,7 @@ fn empty_search_coverage() -> sift::SearchCoverageSnapshot {
     }
 }
 
-fn aggregate_search_coverage(responses: &[sift::SearchResponse]) -> sift::SearchCoverageSnapshot {
+fn aggregate_search_coverage(responses: &[tsift::sift::SearchResponse]) -> tsift::sift::SearchCoverageSnapshot {
     let total_sector_count = responses
         .iter()
         .map(|response| response.coverage.total_sector_count)
@@ -38765,17 +38734,17 @@ fn aggregate_search_coverage(responses: &[sift::SearchResponse]) -> sift::Search
         .sum();
 
     let mode = if dirty_sector_count == 0 && rebuilding_sector_count == 0 {
-        sift::SearchCoverageMode::Sealed
+        tsift::sift::SearchCoverageMode::Sealed
     } else if completed_dirty_sector_count > 0
         || rebuilding_sector_count > 0
         || resumed_sector_count > 0
     {
-        sift::SearchCoverageMode::Converging
+        tsift::sift::SearchCoverageMode::Converging
     } else {
-        sift::SearchCoverageMode::Frontier
+        tsift::sift::SearchCoverageMode::Frontier
     };
 
-    sift::SearchCoverageSnapshot {
+    tsift::sift::SearchCoverageSnapshot {
         mode,
         total_sector_count,
         mounted_sector_count,
@@ -38790,8 +38759,8 @@ fn aggregate_search_coverage(responses: &[sift::SearchResponse]) -> sift::Search
     }
 }
 
-fn empty_search_response(root: &Path, strategy: &str) -> sift::SearchResponse {
-    sift::SearchResponse {
+fn empty_search_response(root: &Path, strategy: &str) -> tsift::sift::SearchResponse {
+    tsift::sift::SearchResponse {
         strategy: strategy.to_string(),
         root: root.display().to_string(),
         indexed_artifacts: 0,
@@ -38801,7 +38770,7 @@ fn empty_search_response(root: &Path, strategy: &str) -> sift::SearchResponse {
     }
 }
 
-fn absolutize_search_hit_paths(response: &mut sift::SearchResponse, search_root: &Path) {
+fn absolutize_search_hit_paths(response: &mut tsift::sift::SearchResponse, search_root: &Path) {
     for hit in &mut response.hits {
         let path = Path::new(&hit.path);
         if path.is_relative() {
@@ -38814,8 +38783,8 @@ fn merge_search_responses(
     root: &Path,
     strategy: &str,
     limit: usize,
-    responses: Vec<sift::SearchResponse>,
-) -> sift::SearchResponse {
+    responses: Vec<tsift::sift::SearchResponse>,
+) -> tsift::sift::SearchResponse {
     let indexed_artifacts = responses
         .iter()
         .map(|response| response.indexed_artifacts)
@@ -38829,7 +38798,7 @@ fn merge_search_responses(
     } else {
         aggregate_search_coverage(&responses)
     };
-    let mut hits: Vec<sift::SearchHit> = responses
+    let mut hits: Vec<tsift::sift::SearchHit> = responses
         .into_iter()
         .flat_map(|response| response.hits)
         .collect();
@@ -38846,7 +38815,7 @@ fn merge_search_responses(
         hit.rank = rank + 1;
     }
 
-    sift::SearchResponse {
+    tsift::sift::SearchResponse {
         strategy: strategy.to_string(),
         root: root.display().to_string(),
         indexed_artifacts,
@@ -38863,10 +38832,10 @@ fn federated_sift_search(
     limit: usize,
     timeout_secs: u64,
     strategy: &str,
-) -> Result<sift::SearchResponse> {
+) -> Result<tsift::sift::SearchResponse> {
     let targets = resolve_search_index_targets(root, root, None, true)?;
     if targets.is_empty() {
-        if config::Config::submodule_dirs(root)?.is_empty() {
+        if tsift::config::Config::submodule_dirs(root)?.is_empty() {
             return run_search_with_timeout(
                 root,
                 cache_dir,
@@ -38911,10 +38880,10 @@ fn federated_symbol_search(
     query: &str,
     limit: usize,
     tagpath_opts: &TagpathSearchOpts,
-) -> Result<(Vec<index::SymbolHit>, TagpathAnnotationDiagnostic)> {
-    let cfg = config::Config::load(root)?;
-    let submodules = config::Config::submodule_dirs(root)?;
-    let mut all_hits: Vec<index::SymbolHit> = Vec::new();
+) -> Result<(Vec<tsift::index::SymbolHit>, TagpathAnnotationDiagnostic)> {
+    let cfg = tsift::config::Config::load(root)?;
+    let submodules = tsift::config::Config::submodule_dirs(root)?;
+    let mut all_hits: Vec<tsift::index::SymbolHit> = Vec::new();
     let mut combined = TagpathAnnotationDiagnostic::default();
     for scope in &submodules {
         if !cfg.federation_for_scope(scope) {
@@ -38924,7 +38893,7 @@ fn federated_symbol_search(
         if !db_path.exists() {
             continue;
         }
-        let db = index::IndexDb::open_read_only(&db_path)?;
+        let db = tsift::index::IndexDb::open_read_only(&db_path)?;
         let mut hits = db.symbol_search(query, limit)?;
         let diag = annotate_hits_with_tagpath(&mut hits, &scope.source_root, tagpath_opts)?;
         combined.loaded |= diag.loaded;
@@ -38970,10 +38939,10 @@ fn federated_exact_search(
     query: &str,
     limit: usize,
     timeout_secs: u64,
-) -> Result<sift::SearchResponse> {
-    let cfg = config::Config::load(root)?;
+) -> Result<tsift::sift::SearchResponse> {
+    let cfg = tsift::config::Config::load(root)?;
     let mut responses = Vec::new();
-    for scope in config::Config::submodule_dirs(root)? {
+    for scope in tsift::config::Config::submodule_dirs(root)? {
         if !cfg.federation_for_scope(&scope) {
             continue;
         }
@@ -38993,7 +38962,7 @@ fn run_sift_search(
     query: &str,
     limit: usize,
     strategy: &str,
-) -> Result<sift::SearchResponse> {
+) -> Result<tsift::sift::SearchResponse> {
     let engine = Sift::builder().with_cache_dir(cache_dir).build();
     let options = SearchOptions::default()
         .with_limit(limit)
@@ -39023,7 +38992,7 @@ fn exact_search_command(search_path: &Path, query: &str) -> Command {
     command
 }
 
-fn exact_search_file_timestamp(path: &Path) -> sift::ArtifactFreshness {
+fn exact_search_file_timestamp(path: &Path) -> tsift::sift::ArtifactFreshness {
     let observed_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -39033,7 +39002,7 @@ fn exact_search_file_timestamp(path: &Path) -> sift::ArtifactFreshness {
         .and_then(|metadata| metadata.modified().ok())
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs() as i64);
-    sift::ArtifactFreshness {
+    tsift::sift::ArtifactFreshness {
         observed_unix_secs,
         modified_unix_secs,
     }
@@ -39043,9 +39012,9 @@ fn parse_exact_search_output(
     search_path: &Path,
     limit: usize,
     raw: &str,
-) -> Result<sift::SearchResponse> {
+) -> Result<tsift::sift::SearchResponse> {
     if limit == 0 {
-        return Ok(sift::SearchResponse {
+        return Ok(tsift::sift::SearchResponse {
             strategy: "exact".to_string(),
             root: search_path.display().to_string(),
             indexed_artifacts: 0,
@@ -39071,34 +39040,34 @@ fn parse_exact_search_output(
         let path = PathBuf::from(path_text);
         let snippet = lines_text.trim_end_matches(['\r', '\n']).to_string();
         let rank = hits.len() + 1;
-        hits.push(sift::SearchHit {
+        hits.push(tsift::sift::SearchHit {
             artifact_id: format!(
                 "exact:{}:{}:{}",
                 path.display(),
                 data.line_number.unwrap_or(0),
                 rank
             ),
-            artifact_kind: sift::ContextArtifactKind::File,
+            artifact_kind: tsift::sift::ContextArtifactKind::File,
             path: path.display().to_string(),
             rank,
             score: (limit.saturating_sub(rank).saturating_add(1)) as f64,
-            confidence: sift::ScoreConfidence::High,
+            confidence: tsift::sift::ScoreConfidence::High,
             location: data.line_number.map(|line| format!("line {}", line)),
             snippet: snippet.clone(),
-            provenance: sift::ArtifactProvenance {
-                adapter: sift::AcquisitionAdapterKind::FileSystem,
+            provenance: tsift::sift::ArtifactProvenance {
+                adapter: tsift::sift::AcquisitionAdapterKind::FileSystem,
                 source: "ripgrep -F".to_string(),
                 synthetic: false,
             },
             freshness: exact_search_file_timestamp(&path),
-            budget: sift::ArtifactBudget::from_text(&snippet, 1),
+            budget: tsift::sift::ArtifactBudget::from_text(&snippet, 1),
         });
         if hits.len() >= limit {
             break;
         }
     }
 
-    Ok(sift::SearchResponse {
+    Ok(tsift::sift::SearchResponse {
         strategy: "exact".to_string(),
         root: search_path.display().to_string(),
         indexed_artifacts: hits.len(),
@@ -39114,7 +39083,7 @@ fn exact_search_response_from_process(
     status: std::process::ExitStatus,
     stdout: &[u8],
     stderr: &[u8],
-) -> Result<sift::SearchResponse> {
+) -> Result<tsift::sift::SearchResponse> {
     if !status.success() && status.code() != Some(1) {
         let message = String::from_utf8_lossy(stderr);
         let trimmed = message.trim();
@@ -39128,7 +39097,7 @@ fn exact_search_response_from_process(
     parse_exact_search_output(search_path, limit, &raw)
 }
 
-fn run_exact_search(search_path: &Path, query: &str, limit: usize) -> Result<sift::SearchResponse> {
+fn run_exact_search(search_path: &Path, query: &str, limit: usize) -> Result<tsift::sift::SearchResponse> {
     let output = exact_search_command(search_path, query)
         .output()
         .context("running exact search with ripgrep")?;
@@ -39146,7 +39115,7 @@ fn run_exact_search_with_timeout(
     query: &str,
     limit: usize,
     timeout_secs: u64,
-) -> Result<sift::SearchResponse> {
+) -> Result<tsift::sift::SearchResponse> {
     if timeout_secs == 0 {
         return run_exact_search(search_path, query, limit);
     }
@@ -39187,7 +39156,7 @@ fn run_search_with_timeout(
     timeout_secs: u64,
     strategy: &str,
     search_targets: &[SearchIndexTarget],
-) -> Result<sift::SearchResponse> {
+) -> Result<tsift::sift::SearchResponse> {
     if timeout_secs == 0 {
         return run_sift_search(search_path, cache_dir, query, limit, strategy);
     }
@@ -39372,7 +39341,7 @@ fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
             SearchPostPrecheckLockMode::RollbackJournal => {
                 conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
                     .expect("acquiring rollback-journal hook lock");
-                fs::write(substrate::rollback_journal_path(&hook.db_path), "locked")
+                fs::write(tsift::substrate::rollback_journal_path(&hook.db_path), "locked")
                     .expect("writing rollback journal marker");
             }
             SearchPostPrecheckLockMode::Wal => {
@@ -39385,13 +39354,13 @@ fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
                      BEGIN EXCLUSIVE;",
                 )
                 .expect("acquiring WAL hook lock");
-                assert!(substrate::wal_sidecar_path(&hook.db_path).exists());
+                assert!(tsift::substrate::wal_sidecar_path(&hook.db_path).exists());
             }
         }
         ready_tx.send(()).expect("signaling search lock hook");
         std::thread::sleep(Duration::from_millis(200));
         drop(conn);
-        let _ = fs::remove_file(substrate::rollback_journal_path(&hook.db_path));
+        let _ = fs::remove_file(tsift::substrate::rollback_journal_path(&hook.db_path));
     });
     ready_rx
         .recv_timeout(Duration::from_secs(1))

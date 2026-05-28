@@ -109,7 +109,7 @@ pub struct SummarizeConfig {
 const REPLACE_FILE_SAVEPOINT: &str = "tsift_summary_replace";
 
 #[derive(Debug)]
-pub(crate) struct SummaryWriteLockGuard {
+pub struct SummaryWriteLockGuard {
     file: File,
 }
 
@@ -150,7 +150,7 @@ impl Default for SummarizeConfig {
     }
 }
 
-pub(crate) fn acquire_write_lock(db_path: &Path) -> Result<SummaryWriteLockGuard> {
+pub fn acquire_write_lock(db_path: &Path) -> Result<SummaryWriteLockGuard> {
     let lock_path = writer_lock_path(db_path);
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)
@@ -190,7 +190,7 @@ pub(crate) fn acquire_write_lock(db_path: &Path) -> Result<SummaryWriteLockGuard
     }
 }
 
-pub(crate) fn writer_lock_path(db_path: &Path) -> PathBuf {
+pub fn writer_lock_path(db_path: &Path) -> PathBuf {
     let stem = db_path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -600,11 +600,11 @@ fn row_to_summary(row: &rusqlite::Row) -> Summary {
     }
 }
 
-pub(crate) fn normalize_summary_file_key(path: &Path) -> String {
+pub fn normalize_summary_file_key(path: &Path) -> String {
     normalize_summary_file_key_str(path.to_string_lossy().as_ref())
 }
 
-pub(crate) fn normalize_summary_file_key_str(path: &str) -> String {
+pub fn normalize_summary_file_key_str(path: &str) -> String {
     path.replace('\\', "/")
 }
 
@@ -707,7 +707,7 @@ fn normalize_lookup_path(path: &Path) -> String {
     normalize_summary_file_key(path)
 }
 
-pub(crate) fn normalize_lexical_path(path: &Path) -> PathBuf {
+pub fn normalize_lexical_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
 
     for component in path.components() {

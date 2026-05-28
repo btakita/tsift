@@ -2763,6 +2763,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "tsift-cli"
+version = "0.1.62"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "flate2",
+ "fs4",
+ "ignore",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tagpath",
+ "tempfile",
+ "toml",
+ "tree-sitter",
+ "tsift",
+ "tsift-algorithms",
+ "tsift-core",
+ "tsift-graph",
+ "tsift-resolution",
+ "tsift-sqlite",
+ "ureq",
+]
+
+[[package]]
 name = "tsift-core"
 version = "0.1.0"
 dependencies = [

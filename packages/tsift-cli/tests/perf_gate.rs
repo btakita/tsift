@@ -5,7 +5,7 @@
 //! Tests are read-only against `fixtures/graph-db-performance-history.json`;
 //! sibling agents are appending samples concurrently.
 
-#[path = "../src/perf_gate.rs"]
+#[path = "../../../src/perf_gate.rs"]
 mod perf_gate;
 
 use perf_gate::{

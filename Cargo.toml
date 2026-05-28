@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-resolution"]
+members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-resolution", "packages/tsift-cli"]
 resolver = "3"
 
 [package]

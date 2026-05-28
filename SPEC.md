@@ -47,6 +47,14 @@ tsift (CLI + MCP plugin)
 │   ├── scoring module — RankedNeighbor, neighborhood ranking, edge kind scoring, heuristic helpers
 │   ├── blocklist module — generated artifact detection, planner config path filtering
 │   └── resolve module — F1 scoring, token-overlap ranking, NodeMatchKind, kind priority
+├── tsift-cli crate (packages/tsift-cli — CLI dispatch, command handlers, output formatting)
+│   ├── clap CLI types — Cli, Commands, GraphDbQuery, output format enums
+│   ├── command handlers — cmd_search, cmd_index, cmd_graph, cmd_communities, cmd_explain, etc.
+│   ├── output formatting — ToolEnvelope, ResponseBudget, terse/schema transforms
+│   ├── tagpath annotation — annotate_hits/stored_symbols/edges/communities/path_nodes_with_tagpath
+│   ├── traversal graph — TraversalGraphBuild, exploration budget, worker packets
+│   ├── convex sync — chunk planning, transport, snapshot diffing
+│   └── binary entry point — src/main.rs delegates to tsift_cli::run()
 
 └── rusqlite (storage — existing)
 ```
