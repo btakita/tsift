@@ -28,6 +28,11 @@ tsift (CLI + MCP plugin)
 ├── tsift-libsql crate (packages/tsift-libsql — libSQL graph store backend, optional)
 │   ├── LibsqlGraphStore (local and remote libsql/Turso)
 │   └── implements GraphStore trait from tsift-core
+├── tsift-tokensave crate (packages/tsift-tokensave — tokensave DB reader adapter)
+│   ├── TokensaveDb — read-only adapter for .tokensave/tokensave.db
+│   ├── schema mapping: tokensave nodes/edges → tsift GraphNode/GraphEdge
+│   ├── FTS5 search via nodes_fts virtual table
+│   └── implements GraphStore trait (read-only, write ops bail)
 ├── graph module (internal — src/graph.rs)
 │   ├── call-site extraction via tree-sitter queries
 │   ├── caller→callee edge resolution against symbol table
