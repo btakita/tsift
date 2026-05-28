@@ -47,6 +47,12 @@ tsift (CLI + MCP plugin)
 │   ├── scoring module — RankedNeighbor, neighborhood ranking, edge kind scoring, heuristic helpers
 │   ├── blocklist module — generated artifact detection, planner config path filtering
 │   └── resolve module — F1 scoring, token-overlap ranking, NodeMatchKind, kind priority
+├── tsift-quality crate (packages/tsift-quality — quality-gate surfaces)
+│   ├── audit module — skill drift detection, manifest reconciliation, usage scanning, cleanup, report writing
+│   ├── perf_gate module — perf-gate workload definitions, hop-cap tiers, baseline backend selection
+│   ├── dci_benchmark module — DCI (Driven Causal Index) benchmark harness types and result rollups
+│   ├── runtime_churn module — RestartChurnState / RestartChurnSummary derivation from transcript events
+│   └── re-exported via root `tsift` `pub use tsift_quality::{audit, dci_benchmark, perf_gate, runtime_churn};`
 ├── tsift-cli crate (packages/tsift-cli — CLI dispatch, command handlers, output formatting)
 │   ├── clap CLI types — Cli, Commands, GraphDbQuery, output format enums
 │   ├── command handlers — cmd_search, cmd_index, cmd_graph, cmd_communities, cmd_explain, etc.

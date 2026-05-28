@@ -32,6 +32,7 @@ tsift-graph = { path = "../tsift-graph" }
 tsift-resolution = { path = "../tsift-resolution" }
 tsift-sqlite = { path = "../tsift-sqlite" }
 tsift-algorithms = { path = "../tsift-algorithms" }
+tsift-quality = { path = "../tsift-quality" }
 
 [dev-dependencies]
 fs4 = "0.13"

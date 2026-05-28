@@ -1,6 +1,4 @@
-pub mod audit;
 pub mod config;
-pub mod dci_benchmark;
 pub mod diff_digest;
 pub mod graph;
 pub mod impact;
@@ -10,8 +8,6 @@ pub mod lang;
 pub mod lint;
 pub mod log_digest;
 pub mod metric_digest;
-pub mod perf_gate;
-pub mod runtime_churn;
 pub mod session_cost;
 pub mod session_digest;
 pub mod session_review;
@@ -25,3 +21,5 @@ pub mod libsql_backend;
 pub mod tagpath_adapter;
 pub mod test_digest;
 pub mod walk;
+
+pub use tsift_quality::{audit, dci_benchmark, perf_gate, runtime_churn};
