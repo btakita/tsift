@@ -52,13 +52,19 @@ tsift (CLI + MCP plugin)
 │   ├── perf_gate module — perf-gate workload definitions, hop-cap tiers, baseline backend selection
 │   ├── dci_benchmark module — DCI (Driven Causal Index) benchmark harness types and result rollups
 │   ├── runtime_churn module — RestartChurnState / RestartChurnSummary derivation from transcript events
-│   └── re-exported via root `tsift` `pub use tsift_quality::{audit, dci_benchmark, perf_gate, runtime_churn};`
+│   ├── lint module — markdown lint, project root resolution (depends on tsift-index for config + IndexDb)
+│   └── re-exported via root `tsift` `pub use tsift_quality::{audit, dci_benchmark, lint, perf_gate, runtime_churn};`
 ├── tsift-index crate (packages/tsift-index — config + project walk + init + AST symbol index)
 │   ├── config module — Config + workspace/submodule resolution
 │   ├── walk module — file walking + mtime-based prune semantics + language tagging
 │   ├── init module — instruction injection, OpenCode/Codex hook setup, npm package parity
 │   ├── index module — AST symbol/index DB management, writer/reader, lock probes, snapshot fallback
 │   └── re-exported via root `tsift` `pub use tsift_index::{config, index, init, walk};`
+├── tsift-session crate (packages/tsift-session — session observability across harnesses)
+│   ├── session_cost module — token/runtime-cost digest for Claude JSONL, Codex JSONL, agent-doc logs
+│   ├── session_digest module — bounded session transcript/log digest with restart-churn families
+│   ├── session_review module — cross-harness aggregate review combining digest + cost + log discovery
+│   └── re-exported via root `tsift` `pub use tsift_session::{session_cost, session_digest, session_review};`
 ├── tsift-cli crate (packages/tsift-cli — CLI dispatch, command handlers, output formatting)
 │   ├── clap CLI types — Cli, Commands, GraphDbQuery, output format enums
 │   ├── command handlers — cmd_search, cmd_index, cmd_graph, cmd_communities, cmd_explain, etc.

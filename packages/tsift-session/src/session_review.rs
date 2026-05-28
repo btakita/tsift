@@ -8,7 +8,7 @@ use std::time::{Instant, UNIX_EPOCH};
 
 const SESSION_HEADER_PROBE_BUDGET_BYTES: usize = 256 * 1024;
 
-use crate::runtime_churn::RestartChurnSummary;
+use tsift_quality::runtime_churn::RestartChurnSummary;
 use crate::{
     session_cost::{
         self, SessionCostFileReadDiagnostic, SessionCostGuardrail, SessionCostGuardrailInput,
@@ -925,7 +925,7 @@ fn build_target_context(target: &Path) -> Result<TargetContext> {
     let canonical_target = target
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", target.display()))?;
-    let root = crate::lint::resolve_harness_root_or_canonical_path(target)?;
+    let root = tsift_quality::lint::resolve_harness_root_or_canonical_path(target)?;
     let kind = if canonical_target.is_dir() {
         TargetKind::Directory
     } else if canonical_target.is_file() {

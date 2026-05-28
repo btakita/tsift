@@ -34,6 +34,7 @@ tsift-sqlite = { path = "../tsift-sqlite" }
 tsift-algorithms = { path = "../tsift-algorithms" }
 tsift-quality = { path = "../tsift-quality" }
 tsift-index = { path = "../tsift-index" }
+tsift-session = { path = "../tsift-session" }
 
 [dev-dependencies]
 fs4 = "0.13"

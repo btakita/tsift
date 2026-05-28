@@ -3,7 +3,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::runtime_churn::{RestartChurnState, RestartChurnSummary};
+use tsift_quality::runtime_churn::{RestartChurnState, RestartChurnSummary};
 
 const MAX_LARGEST_TURNS: usize = 5;
 const MAX_RUNTIME_EVENTS: usize = 8;

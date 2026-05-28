@@ -2751,6 +2751,7 @@ dependencies = [
  "tsift-libsql",
  "tsift-quality",
  "tsift-resolution",
+ "tsift-session",
  "tsift-sqlite",
  "ureq",
 ]
@@ -2788,6 +2789,7 @@ dependencies = [
  "tsift-index",
  "tsift-quality",
  "tsift-resolution",
+ "tsift-session",
  "tsift-sqlite",
  "ureq",
 ]
@@ -2856,9 +2858,11 @@ name = "tsift-quality"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
+ "tsift-index",
 ]
 
 [[package]]
@@ -2868,6 +2872,17 @@ dependencies = [
  "anyhow",
  "serde",
  "tsift-core",
+]
+
+[[package]]
+name = "tsift-session"
+version = "0.1.62"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tsift-quality",
 ]
 
 [[package]]

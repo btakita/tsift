@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::runtime_churn::{RestartChurnState, RestartChurnSummary};
+use tsift_quality::runtime_churn::{RestartChurnState, RestartChurnSummary};
 
 const MAX_PROMPT_TARGETS: usize = 8;
 const MAX_COMMANDS: usize = 12;
@@ -150,7 +150,7 @@ pub fn compute(path: &Path, input: &str, source_hint: Option<&str>) -> Result<Se
         bail!("no session input provided; pass --input <file> or pipe transcript on stdin");
     }
 
-    let root = crate::lint::resolve_harness_root_or_canonical_path(path)?;
+    let root = tsift_quality::lint::resolve_harness_root_or_canonical_path(path)?;
     let source = resolve_source(input, source_hint)?;
     let total_lines = input.lines().count();
     let mut state = DigestState::default();

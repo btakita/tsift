@@ -1,4 +1,4 @@
-use crate::{config, index::IndexDb};
+use tsift_index::{config, index::IndexDb};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
