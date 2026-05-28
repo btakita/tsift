@@ -2744,11 +2744,21 @@ dependencies = [
  "tokio",
  "toml",
  "tree-sitter",
+ "tsift-algorithms",
  "tsift-core",
  "tsift-graph",
  "tsift-libsql",
  "tsift-sqlite",
  "ureq",
+]
+
+[[package]]
+name = "tsift-algorithms"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "tsift-core",
 ]
 
 [[package]]

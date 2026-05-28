@@ -33,6 +33,11 @@ tsift (CLI + MCP plugin)
 │   ├── graph extraction — call sites, routes, edge resolution, community detection, shortest path
 │   ├── complexity module — ComplexityMetrics, LanguageExtractor trait, LanguageRegistry
 │   └── re-exported via src/graph.rs and src/lang/mod.rs as thin shims
+├── tsift-algorithms crate (packages/tsift-algorithms — graph algorithms)
+│   ├── scc module — iterative Tarjan SCC (strongly connected components)
+│   ├── health module — composite health score (connectivity, reachability, centrality, cycle risk)
+│   ├── dead_code module — dead code detection (unreachable, isolated, orphaned nodes)
+│   └── coupling module — coupling analysis (fan-in, fan-out, instability metrics per module)
 ├── tsift-tokensave crate (packages/tsift-tokensave — tokensave DB reader adapter)
 │   ├── TokensaveDb — read-only adapter for .tokensave/tokensave.db
 │   ├── schema mapping: tokensave nodes/edges → tsift GraphNode/GraphEdge
