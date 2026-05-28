@@ -2744,15 +2744,8 @@ dependencies = [
  "tokio",
  "toml",
  "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-javascript",
- "tree-sitter-kotlin-ng",
- "tree-sitter-md",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
- "tree-sitter-zig",
  "tsift-core",
+ "tsift-graph",
  "tsift-libsql",
  "tsift-sqlite",
  "ureq",
@@ -2766,6 +2759,24 @@ dependencies = [
  "blake3",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "tsift-graph"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-javascript",
+ "tree-sitter-kotlin-ng",
+ "tree-sitter-md",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "tree-sitter-zig",
+ "tsift-core",
 ]
 
 [[package]]

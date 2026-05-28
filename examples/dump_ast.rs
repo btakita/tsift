@@ -1,9 +1,9 @@
-// Quick AST dump for Zig, Bash, Markdown
+use tsift_graph::lang::Lang;
 use tree_sitter::Parser;
 
-fn dump(lang_name: &str, ts_lang: tree_sitter::Language, source: &str, _depth: usize) {
+fn dump(lang_name: &str, lang: Lang, source: &str, _depth: usize) {
     let mut parser = Parser::new();
-    parser.set_language(&ts_lang).unwrap();
+    parser.set_language(&lang.tree_sitter_language()).unwrap();
     let tree = parser.parse(source.as_bytes(), None).unwrap();
     println!("=== {} ===", lang_name);
     println!("Source:\n{}\n", source);
@@ -34,10 +34,10 @@ fn dump(lang_name: &str, ts_lang: tree_sitter::Language, source: &str, _depth: u
 }
 
 fn main() {
-    // Zig: need struct, enum, union, const, fn
+    #[cfg(feature = "lang-zig")]
     dump(
         "Zig",
-        tree_sitter_zig::LANGUAGE.into(),
+        Lang::Zig,
         r#"
 const std = @import("std");
 pub fn main() !void {}
@@ -49,10 +49,10 @@ const Result = union(enum) { ok: i32, err: []const u8 };
         4,
     );
 
-    // Bash: function + alias
+    #[cfg(feature = "lang-bash")]
     dump(
         "Bash",
-        tree_sitter_bash::LANGUAGE.into(),
+        Lang::Bash,
         r#"
 #!/bin/bash
 hello() { echo hi; }
@@ -64,10 +64,10 @@ alias grep='grep --color=auto'
         4,
     );
 
-    // Markdown: headings + fenced code blocks
+    #[cfg(feature = "lang-markdown")]
     dump(
         "Markdown",
-        tree_sitter_md::LANGUAGE.into(),
+        Lang::Markdown,
         r#"
 # Title
 

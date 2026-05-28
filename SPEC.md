@@ -28,20 +28,17 @@ tsift (CLI + MCP plugin)
 ├── tsift-libsql crate (packages/tsift-libsql — libSQL graph store backend, optional)
 │   ├── LibsqlGraphStore (local and remote libsql/Turso)
 │   └── implements GraphStore trait from tsift-core
+├── tsift-graph crate (packages/tsift-graph — language-aware graph extraction)
+│   ├── lang module — Lang enum, Symbol, tree-sitter symbol/call queries, extract_symbols
+│   ├── graph extraction — call sites, routes, edge resolution, community detection, shortest path
+│   ├── complexity module — ComplexityMetrics, LanguageExtractor trait, LanguageRegistry
+│   └── re-exported via src/graph.rs and src/lang/mod.rs as thin shims
 ├── tsift-tokensave crate (packages/tsift-tokensave — tokensave DB reader adapter)
 │   ├── TokensaveDb — read-only adapter for .tokensave/tokensave.db
 │   ├── schema mapping: tokensave nodes/edges → tsift GraphNode/GraphEdge
 │   ├── FTS5 search via nodes_fts virtual table
 │   └── implements GraphStore trait (read-only, write ops bail)
-├── graph module (internal — src/graph.rs)
-│   ├── call-site extraction via tree-sitter queries
-│   ├── caller→callee edge resolution against symbol table
-│   ├── narrow Rust/TypeScript/Python route extraction for common web handlers
-│   ├── tsift code-symbol/call-edge adapter into substrate records
-│   └── SQLite storage (call_edges and route_nodes tables)
-├── lang module (tree-sitter parsing — existing)
-│   ├── symbol extraction (function/type/trait definitions)
-│   └── call queries (function calls, method calls, macro invocations)
+
 └── rusqlite (storage — existing)
 ```
 
@@ -976,7 +973,7 @@ Dynamic grammars use `tree_sitter::Language::from_path()`. The `Language` enum a
 4. Implement `tsift index --ast` — multi-language symbol extraction to SQLite
 5. Wire AST index into `tsift search` — symbol-match ranking first, BM25 fallback
 6. Add remaining language queries (TypeScript, JavaScript, Kotlin, Zig, Bash, Markdown)
-7. ~~Add `tsift-graph` crate~~ → Internal `graph` module — call graph extraction + edge storage (done)
+7. `tsift-graph` crate — language-aware graph extraction (`Lang`, `Symbol`, call sites, routes, community detection, path finding, `LanguageExtractor` trait, `LanguageRegistry`, `ComplexityMetrics`)
 8. Per-submodule config + isolation tiers
 
 ## Init (Project Setup)
