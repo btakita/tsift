@@ -46,6 +46,7 @@ pub mod session_digest;
 pub mod session_review;
 pub mod sift;
 pub mod status;
+pub mod resolution;
 pub mod substrate;
 pub mod summarize;
 #[cfg(feature = "backend-libsql")]
@@ -8187,23 +8188,7 @@ struct GraphDbPageReport {
     diagnostics: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
-struct GraphDbRankedNeighbor {
-    rank: usize,
-    node_id: String,
-    kind: String,
-    label: String,
-    score: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    depth: Option<usize>,
-    edge_kinds: Vec<String>,
-    community_co_membership: bool,
-    semantic_relation: bool,
-    source_handle_fresh: bool,
-    duplicate_name_precision: f64,
-    handle_coverage_pct: f64,
-    reasons: Vec<String>,
-}
+type GraphDbRankedNeighbor = resolution::RankedNeighbor;
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 struct GraphDbKnowledgeRetrieval {
@@ -8230,20 +8215,7 @@ struct GraphDbSemanticSeededSubgraph {
     diagnostics: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
-struct GraphDbNeighborhoodRankingGate {
-    status: String,
-    ranked_output_default: bool,
-    default_order: String,
-    default_change_gate: String,
-    required_workloads: Vec<String>,
-    required_metrics: Vec<String>,
-    max_duration_regression_percent: f64,
-    min_handle_coverage_pct: f64,
-    min_duplicate_name_precision: f64,
-    min_top_community_stability: f64,
-    diagnostics: Vec<String>,
-}
+type GraphDbNeighborhoodRankingGate = resolution::NeighborhoodRankingGate;
 
 #[derive(Serialize)]
 struct GraphDbReport {
@@ -11153,137 +11125,7 @@ fn graph_db_ranked_neighbors(
     nodes: &[SubstrateGraphNode],
     edges: &[SubstrateGraphEdge],
 ) -> Vec<GraphDbRankedNeighbor> {
-    let node_by_id = nodes
-        .iter()
-        .map(|node| (node.id.clone(), node))
-        .collect::<BTreeMap<_, _>>();
-    let label_counts = nodes
-        .iter()
-        .fold(BTreeMap::<String, usize>::new(), |mut acc, node| {
-            *acc.entry(node.label.clone()).or_default() += 1;
-            acc
-        });
-    let mut outgoing = BTreeMap::<String, Vec<&SubstrateGraphEdge>>::new();
-    let mut edge_kinds_by_node = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut fresh_edge_by_node = BTreeSet::<String>::new();
-    for edge in edges {
-        outgoing.entry(edge.from_id.clone()).or_default().push(edge);
-        for endpoint in [&edge.from_id, &edge.to_id] {
-            if node_by_id.contains_key(endpoint) {
-                edge_kinds_by_node
-                    .entry(endpoint.clone())
-                    .or_default()
-                    .insert(edge.kind.clone());
-                if edge.freshness.as_ref().is_some_and(|freshness| {
-                    freshness.content_hash.is_some() || freshness.observed_at_unix.is_some()
-                }) {
-                    fresh_edge_by_node.insert(endpoint.clone());
-                }
-            }
-        }
-    }
-
-    let depths = graph_db_neighborhood_depths(center_id, &node_by_id, &outgoing);
-    let page_handle_coverage_pct = graph_db_page_handle_coverage_pct(nodes);
-    let mut ranked = Vec::new();
-
-    for node in nodes {
-        if node.id == center_id {
-            continue;
-        }
-        let edge_kinds = edge_kinds_by_node
-            .get(&node.id)
-            .map(|kinds| kinds.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let depth = depths.get(&node.id).copied();
-        let community_co_membership = graph_db_has_community_signal(node, &edge_kinds);
-        let semantic_relation = graph_db_has_semantic_signal(node, &edge_kinds);
-        let source_handle_fresh = graph_db_source_handle_is_fresh(node)
-            || (node.kind == "source_handle" && fresh_edge_by_node.contains(&node.id));
-        let duplicate_name_precision = graph_db_duplicate_name_precision(node, &label_counts);
-        let mut score = 0i64;
-        let mut reasons = Vec::new();
-
-        if let Some(depth) = depth {
-            let depth_score = 120i64
-                .saturating_sub((depth as i64).saturating_mul(18))
-                .max(0);
-            score += depth_score;
-            reasons.push(format!("depth:{depth}+{depth_score}"));
-        } else {
-            reasons.push("depth:unknown".to_string());
-        }
-
-        for edge_kind in &edge_kinds {
-            let edge_score = graph_db_edge_kind_rank_score(edge_kind);
-            score += edge_score;
-            reasons.push(format!("edge_kind:{edge_kind}+{edge_score}"));
-        }
-        if community_co_membership {
-            score += 18;
-            reasons.push("community_co_membership+18".to_string());
-        }
-        if semantic_relation {
-            score += 24;
-            reasons.push("semantic_relation+24".to_string());
-        }
-        if source_handle_fresh {
-            score += 18;
-            reasons.push("source_handle_fresh+18".to_string());
-        }
-        if duplicate_name_precision + f64::EPSILON
-            >= metric_digest::COMMUNITY_MIN_DUPLICATE_NAME_PRECISION
-        {
-            score += 10;
-            reasons.push("duplicate_name_precision+10".to_string());
-        } else {
-            score -= 10;
-            reasons.push("duplicate_name_precision-10".to_string());
-        }
-        if page_handle_coverage_pct + f64::EPSILON
-            >= metric_digest::COMMUNITY_MIN_HANDLE_COVERAGE_PCT
-        {
-            score += 10;
-            reasons.push("handle_coverage+10".to_string());
-        } else {
-            score -= 10;
-            reasons.push("handle_coverage-10".to_string());
-        }
-
-        ranked.push(GraphDbRankedNeighbor {
-            rank: 0,
-            node_id: node.id.clone(),
-            kind: node.kind.clone(),
-            label: node.label.clone(),
-            score,
-            depth,
-            edge_kinds,
-            community_co_membership,
-            semantic_relation,
-            source_handle_fresh,
-            duplicate_name_precision,
-            handle_coverage_pct: page_handle_coverage_pct,
-            reasons,
-        });
-    }
-
-    ranked.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| {
-                left.depth
-                    .unwrap_or(usize::MAX)
-                    .cmp(&right.depth.unwrap_or(usize::MAX))
-            })
-            .then(left.kind.cmp(&right.kind))
-            .then(left.label.cmp(&right.label))
-            .then(left.node_id.cmp(&right.node_id))
-    });
-    for (idx, neighbor) in ranked.iter_mut().enumerate() {
-        neighbor.rank = idx + 1;
-    }
-    ranked
+    resolution::ranked_neighbors(center_id, nodes, edges)
 }
 
 fn graph_db_neighborhood_depths(
@@ -11291,95 +11133,38 @@ fn graph_db_neighborhood_depths(
     node_by_id: &BTreeMap<String, &SubstrateGraphNode>,
     outgoing: &BTreeMap<String, Vec<&SubstrateGraphEdge>>,
 ) -> BTreeMap<String, usize> {
-    if !node_by_id.contains_key(center_id) {
-        return BTreeMap::new();
-    }
-    let mut depths = BTreeMap::from([(center_id.to_string(), 0usize)]);
-    let mut queue = VecDeque::from([(center_id.to_string(), 0usize)]);
-    while let Some((current, depth)) = queue.pop_front() {
-        for edge in outgoing.get(&current).into_iter().flatten() {
-            if !node_by_id.contains_key(&edge.to_id) || depths.contains_key(&edge.to_id) {
-                continue;
-            }
-            let next_depth = depth + 1;
-            depths.insert(edge.to_id.clone(), next_depth);
-            queue.push_back((edge.to_id.clone(), next_depth));
-        }
-    }
-    depths
+    resolution::neighborhood_depths(center_id, node_by_id, outgoing)
 }
 
 fn graph_db_page_handle_coverage_pct(nodes: &[SubstrateGraphNode]) -> f64 {
-    if nodes.is_empty() {
-        return 0.0;
-    }
-    let covered = nodes
-        .iter()
-        .filter(|node| graph_db_node_has_handle_coverage(node))
-        .count();
-    (covered as f64 / nodes.len() as f64) * 100.0
+    resolution::page_handle_coverage_pct(nodes)
 }
 
 fn graph_db_node_has_handle_coverage(node: &SubstrateGraphNode) -> bool {
-    !node.id.is_empty()
-        || node.properties.contains_key("handle")
-        || node.properties.contains_key("ref_id")
-        || node.properties.contains_key("tagpath_handle")
+    resolution::node_has_handle_coverage(node)
 }
 
 fn graph_db_duplicate_name_precision(
     node: &SubstrateGraphNode,
     label_counts: &BTreeMap<String, usize>,
 ) -> f64 {
-    let count = label_counts.get(&node.label).copied().unwrap_or(1);
-    if count <= 1 || graph_db_node_has_handle_coverage(node) {
-        1.0
-    } else {
-        1.0 / count as f64
-    }
+    resolution::duplicate_name_precision(node, label_counts)
 }
 
 fn graph_db_has_community_signal(node: &SubstrateGraphNode, edge_kinds: &[String]) -> bool {
-    node.kind.contains("community")
-        || edge_kinds.iter().any(|kind| kind.contains("community"))
-        || node
-            .properties
-            .iter()
-            .any(|(key, value)| key.contains("community") || value.contains("community"))
+    resolution::has_community_signal(node, edge_kinds)
 }
 
 fn graph_db_has_semantic_signal(node: &SubstrateGraphNode, edge_kinds: &[String]) -> bool {
-    node.kind.starts_with("semantic_")
-        || edge_kinds.iter().any(|kind| {
-            kind.contains("semantic") || kind.contains("concept") || kind.contains("entity")
-        })
+    resolution::has_semantic_signal(node, edge_kinds)
 }
 
 fn graph_db_source_handle_is_fresh(node: &SubstrateGraphNode) -> bool {
-    node.kind == "source_handle"
-        && node.freshness.as_ref().is_some_and(|freshness| {
-            freshness.content_hash.is_some() || freshness.observed_at_unix.is_some()
-        })
+    resolution::source_handle_is_fresh(node)
 }
 
 fn graph_db_edge_kind_rank_score(edge_kind: &str) -> i64 {
-    match edge_kind {
-        "semantic_relation" => 34,
-        "mentions_entity" | "mentions_concept" | "tagged_entity" | "tagged_concept"
-        | "related_concept" => 28,
-        "mentions" => 22,
-        "calls" => 20,
-        "requests_context" | "scopes_context" | "scopes_source" | "explains_result" => 18,
-        "defines" | "contains" | "belongs_to" => 12,
-        kind if kind.contains("community") => 20,
-        kind if kind.contains("semantic")
-            || kind.contains("concept")
-            || kind.contains("entity") =>
-        {
-            24
-        }
-        _ => 8,
-    }
+    resolution::edge_kind_rank_score(edge_kind)
 }
 
 fn graph_db_edge_key(edge: &SubstrateGraphEdge) -> String {
@@ -15402,42 +15187,15 @@ fn push_traversal_summaries_watermark_part(root: &Path, parts: &mut Vec<String>)
 }
 
 fn traversal_relative_path_is_generated_artifact(relative: &str) -> bool {
-    let relative = relative.trim_start_matches("./").replace('\\', "/");
-    relative == ".tsift"
-        || relative.starts_with(".tsift/")
-        || relative.ends_with("/.tsift")
-        || relative.contains("/.tsift/")
-        || relative == ".agent-doc"
-        || relative.starts_with(".agent-doc/")
-        || relative.ends_with("/.agent-doc")
-        || relative.contains("/.agent-doc/")
-        || relative == "target"
-        || relative.starts_with("target/")
-        || relative.contains("/target/")
+    resolution::relative_path_is_generated_artifact(relative)
 }
 
 fn traversal_path_is_generated_artifact(root: &Path, source_root: &Path, path: &Path) -> bool {
-    let mut relatives = Vec::new();
-    if let Ok(relative) = path.strip_prefix(source_root) {
-        relatives.push(relative.to_string_lossy().replace('\\', "/"));
-    }
-    if let Ok(relative) = path.strip_prefix(root) {
-        relatives.push(relative.to_string_lossy().replace('\\', "/"));
-    }
-    if !path.is_absolute() {
-        relatives.push(path.to_string_lossy().replace('\\', "/"));
-    }
-    relatives
-        .iter()
-        .any(|relative| traversal_relative_path_is_generated_artifact(relative))
+    resolution::path_is_generated_artifact(root, source_root, path)
 }
 
 fn traversal_index_snapshot_part_is_generated(root: &Path, source_root: &Path, part: &str) -> bool {
-    let Some(rest) = part.strip_prefix("file:") else {
-        return false;
-    };
-    let path = rest.split(':').next().unwrap_or(rest);
-    traversal_path_is_generated_artifact(root, source_root, Path::new(path))
+    resolution::index_snapshot_part_is_generated(root, source_root, part)
 }
 
 fn traversal_source_watermark(
@@ -20000,34 +19758,7 @@ fn resolve_conflict_matrix_targets(
 }
 
 fn is_planner_config_path(path: &str) -> bool {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-    normalized.starts_with(".github/")
-        || normalized.starts_with(".codex/")
-        || normalized.starts_with(".agent-doc/")
-        || normalized.contains("/.github/")
-        || matches!(
-            file_name,
-            "agents.md"
-                | "claude.md"
-                | "cargo.toml"
-                | "cargo.lock"
-                | "package.json"
-                | "package-lock.json"
-                | "pnpm-lock.yaml"
-                | "yarn.lock"
-                | "makefile"
-                | "justfile"
-                | "dockerfile"
-                | "docker-compose.yml"
-                | "docker-compose.yaml"
-                | "config.toml"
-                | "tsconfig.json"
-        )
-        || file_name.ends_with(".config.js")
-        || file_name.ends_with(".config.ts")
-        || file_name.ends_with(".yml")
-        || file_name.ends_with(".yaml")
+    resolution::is_planner_config_path(path)
 }
 
 fn conflict_matrix_source_handle(node: &SubstrateGraphNode) -> Option<ConflictMatrixSourceHandle> {

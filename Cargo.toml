@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-graph", "packages/tsift-algorithms"]
+members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-resolution"]
 resolver = "3"
 
 [package]
@@ -32,6 +32,7 @@ tsift-core = { path = "packages/tsift-core" }
 tsift-sqlite = { path = "packages/tsift-sqlite" }
 tsift-graph = { path = "packages/tsift-graph" }
 tsift-algorithms = { path = "packages/tsift-algorithms" }
+tsift-resolution = { path = "packages/tsift-resolution" }
 tempfile = "3"
 
 libsql = { version = "0.9", optional = true }

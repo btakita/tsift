@@ -2748,6 +2748,7 @@ dependencies = [
  "tsift-core",
  "tsift-graph",
  "tsift-libsql",
+ "tsift-resolution",
  "tsift-sqlite",
  "ureq",
 ]
@@ -2800,6 +2801,15 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tsift-core",
+]
+
+[[package]]
+name = "tsift-resolution"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
  "tsift-core",
 ]
 

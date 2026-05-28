@@ -43,6 +43,10 @@ tsift (CLI + MCP plugin)
 │   ├── schema mapping: tokensave nodes/edges → tsift GraphNode/GraphEdge
 │   ├── FTS5 search via nodes_fts virtual table
 │   └── implements GraphStore trait (read-only, write ops bail)
+├── tsift-resolution crate (packages/tsift-resolution — multi-strategy resolution, scoring, blocklist)
+│   ├── scoring module — RankedNeighbor, neighborhood ranking, edge kind scoring, heuristic helpers
+│   ├── blocklist module — generated artifact detection, planner config path filtering
+│   └── resolve module — F1 scoring, token-overlap ranking, NodeMatchKind, kind priority
 
 └── rusqlite (storage — existing)
 ```
