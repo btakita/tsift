@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+pub const SQLITE_GRAPH_SCHEMA_VERSION: i64 = 5;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphProvenance {
     pub source: String,

@@ -8,12 +8,12 @@ use serde::Serialize;
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tagpath::{family as tagpath_family, query as tagpath_query};
+pub use tsift_sqlite::{ReadOnlyRecovery, copy_read_only_snapshot, read_only_snapshot_recovery};
 
 pub struct IndexDb {
     conn: Connection,
@@ -294,13 +294,6 @@ impl IndexSummary {
     pub fn has_changes(&self) -> bool {
         self.new > 0 || self.modified > 0 || self.deleted > 0
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReadOnlyRecovery {
-    SnapshotFallback,
-    SnapshotFallbackWal,
 }
 
 #[derive(Debug, Clone)]
@@ -1509,106 +1502,6 @@ pub(crate) fn probe_writer_lock(lock_path: &Path) -> Result<WriterLockProbe> {
     }
 }
 
-pub(crate) fn read_only_snapshot_recovery(
-    db_path: &Path,
-    err: &anyhow::Error,
-) -> Option<ReadOnlyRecovery> {
-    if !error_mentions_locked_db(err) {
-        return None;
-    }
-    if wal_sidecar_path(db_path).exists() || shared_memory_sidecar_path(db_path).exists() {
-        Some(ReadOnlyRecovery::SnapshotFallbackWal)
-    } else if rollback_journal_path(db_path).exists() {
-        Some(ReadOnlyRecovery::SnapshotFallback)
-    } else {
-        None
-    }
-}
-
-pub(crate) fn rollback_journal_path(db_path: &Path) -> PathBuf {
-    let mut journal = db_path.as_os_str().to_os_string();
-    journal.push("-journal");
-    PathBuf::from(journal)
-}
-
-pub(crate) fn wal_sidecar_path(db_path: &Path) -> PathBuf {
-    let mut wal = db_path.as_os_str().to_os_string();
-    wal.push("-wal");
-    PathBuf::from(wal)
-}
-
-pub(crate) fn shared_memory_sidecar_path(db_path: &Path) -> PathBuf {
-    let mut shm = db_path.as_os_str().to_os_string();
-    shm.push("-shm");
-    PathBuf::from(shm)
-}
-
-pub(crate) fn copy_read_only_snapshot(
-    db_path: &Path,
-    default_stem: &str,
-) -> Result<(PathBuf, Vec<PathBuf>)> {
-    let snapshot_path = snapshot_copy_path(db_path, default_stem);
-    std::fs::copy(db_path, &snapshot_path).with_context(|| {
-        format!(
-            "copying locked db {} to snapshot {}",
-            db_path.display(),
-            snapshot_path.display()
-        )
-    })?;
-    let mut cleanup_paths = vec![snapshot_path.clone()];
-    copy_optional_snapshot_sidecar(
-        &wal_sidecar_path(db_path),
-        &wal_sidecar_path(&snapshot_path),
-        &mut cleanup_paths,
-    )?;
-    copy_optional_snapshot_sidecar(
-        &shared_memory_sidecar_path(db_path),
-        &shared_memory_sidecar_path(&snapshot_path),
-        &mut cleanup_paths,
-    )?;
-    Ok((snapshot_path, cleanup_paths))
-}
-
-fn copy_optional_snapshot_sidecar(
-    source_path: &Path,
-    snapshot_path: &Path,
-    cleanup_paths: &mut Vec<PathBuf>,
-) -> Result<()> {
-    match std::fs::copy(source_path, snapshot_path) {
-        Ok(_) => {
-            cleanup_paths.push(snapshot_path.to_path_buf());
-            Ok(())
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| {
-            format!(
-                "copying SQLite sidecar {} to snapshot {}",
-                source_path.display(),
-                snapshot_path.display()
-            )
-        }),
-    }
-}
-
-fn snapshot_copy_path(db_path: &Path, default_stem: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_nanos();
-    let stem = db_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or(default_stem);
-    let mut file_name = OsString::from(format!("tsift-{stem}-{}-{nanos}", std::process::id()));
-    file_name.push(".db");
-    std::env::temp_dir().join(file_name)
-}
-
-pub(crate) fn error_mentions_locked_db(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|cause| cause.to_string().contains("database is locked"))
-}
-
 fn read_lock_marker(file: &mut File) -> std::io::Result<LockFileMarker> {
     file.seek(SeekFrom::Start(0))?;
     let mut content = String::new();
@@ -1659,6 +1552,7 @@ fn compute_tags(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::substrate::{wal_sidecar_path, rollback_journal_path};
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;

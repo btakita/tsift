@@ -1,6 +1,5 @@
-use crate::index::{
-    IndexDb, ReadOnlyRecovery, copy_read_only_snapshot, read_only_snapshot_recovery,
-};
+use crate::index::IndexDb;
+use crate::substrate::{ReadOnlyRecovery, copy_read_only_snapshot, read_only_snapshot_recovery};
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
 use rusqlite::{Connection, OpenFlags};
@@ -1048,7 +1047,7 @@ fn chrono_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{rollback_journal_path, wal_sidecar_path};
+    use crate::substrate::{rollback_journal_path, wal_sidecar_path};
     use rusqlite::Connection;
     use serde_json::json;
     use tempfile::NamedTempFile;
@@ -1716,7 +1715,7 @@ mod tests {
 
         assert_eq!(
             opened.recovery,
-            Some(crate::index::ReadOnlyRecovery::SnapshotFallback)
+            Some(crate::substrate::ReadOnlyRecovery::SnapshotFallback)
         );
         let results = opened.db.get_by_symbol("main").unwrap();
         assert_eq!(results.len(), 1);
@@ -1737,7 +1736,7 @@ mod tests {
         let opened = SummaryDb::open_read_only_with_recovery(&db_path).unwrap();
         assert_eq!(
             opened.recovery,
-            Some(crate::index::ReadOnlyRecovery::SnapshotFallbackWal)
+            Some(crate::substrate::ReadOnlyRecovery::SnapshotFallbackWal)
         );
         let results = opened.db.get_by_symbol("main").unwrap();
         assert_eq!(results.len(), 1);

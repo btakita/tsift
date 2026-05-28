@@ -2753,6 +2753,8 @@ dependencies = [
  "tree-sitter-typescript",
  "tree-sitter-zig",
  "tsift-core",
+ "tsift-libsql",
+ "tsift-sqlite",
  "ureq",
 ]
 
@@ -2764,6 +2766,33 @@ dependencies = [
  "blake3",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "tsift-libsql"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "libsql",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tsift-core",
+]
+
+[[package]]
+name = "tsift-sqlite"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tsift-core",
 ]
 
 [[package]]

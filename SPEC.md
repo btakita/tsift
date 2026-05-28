@@ -16,14 +16,18 @@ tsift (CLI + MCP plugin)
 │   ├── GraphStore trait (CRUD/query contract — lookup, kind scans, neighborhoods, shortest paths)
 │   ├── ConvexGraphClient trait, ConvexRowsGraphClient, ConvexGraphStore
 │   ├── ConvexProjectionRows, ConvexNodeRow, ConvexEdgeRow
+│   ├── SQLITE_GRAPH_SCHEMA_VERSION (shared schema version constant)
 │   └── shortest_path_using_outgoing, apply_graph_query_page helpers
-├── substrate module (SQLite-specific graph DB API — src/substrate.rs)
+├── tsift-sqlite crate (packages/tsift-sqlite — SQLite graph store backend)
 │   ├── re-exports all tsift-core types for backward compatibility
 │   ├── SqliteGraphStore (graph_nodes, graph_edges, graph_node_properties, projection versions, tombstones)
 │   ├── SqliteProjectionRefresh, SqliteProjectionVersion, SqliteProjectionRefreshPhase
 │   ├── open_graph_read_only_connection, open_graph_read_only_connection_resilient
-│   ├── libsql backend (src/libsql_backend.rs, feature backend-libsql) — local and remote libsql/Turso
+│   ├── ReadOnlyRecovery, snapshot copy utilities (shared with index module)
 │   └── projection boundary for FalkorDB/other read models
+├── tsift-libsql crate (packages/tsift-libsql — libSQL graph store backend, optional)
+│   ├── LibsqlGraphStore (local and remote libsql/Turso)
+│   └── implements GraphStore trait from tsift-core
 ├── graph module (internal — src/graph.rs)
 │   ├── call-site extraction via tree-sitter queries
 │   ├── caller→callee edge resolution against symbol table

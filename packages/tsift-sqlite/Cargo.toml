@@ -1,0 +1,17 @@
+[package]
+name = "tsift-sqlite"
+version = "0.1.0"
+edition = "2024"
+description = "SQLite graph store backend for tsift"
+license = "MIT"
+repository = "https://github.com/btakita/tsift"
+authors = ["Brian Takita <brian.takita@gmail.com>"]
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+rusqlite = { version = "0.34", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tsift-core = { path = "../tsift-core" }
+tempfile = "3"

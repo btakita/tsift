@@ -1,9 +1,9 @@
 use crate::config;
-use crate::index::{
-    IndexDb, ReadOnlyRecovery, WriterLockProbe, probe_writer_lock, rollback_journal_path,
-    shared_memory_sidecar_path, wal_sidecar_path, writer_lock_path,
-};
+use crate::index::{IndexDb, WriterLockProbe, probe_writer_lock, writer_lock_path};
 use crate::init::{self, InstructionStatus};
+use crate::substrate::{
+    ReadOnlyRecovery, rollback_journal_path, shared_memory_sidecar_path, wal_sidecar_path,
+};
 use crate::summarize::SummaryDb;
 use anyhow::Result;
 use serde::Serialize;
@@ -1174,7 +1174,7 @@ pub fn format_locks_human(report: &LockReport, compact: bool) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::index::wal_sidecar_path;
+    use crate::substrate::wal_sidecar_path;
     use fs4::fs_std::FileExt;
     use rusqlite::Connection;
     use std::fs::OpenOptions;

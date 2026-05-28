@@ -27460,7 +27460,7 @@ fn contextualize_error(err: anyhow::Error, context: String) -> anyhow::Error {
 fn should_attach_lock_diagnostics(err: &anyhow::Error) -> bool {
     let message = err.to_string();
     message.contains("another tsift index writer is already active")
-        || index::error_mentions_locked_db(err)
+        || substrate::error_mentions_locked_db(err)
 }
 
 fn add_write_lock_context(
@@ -33346,7 +33346,7 @@ tier = "private"
         let conn = Connection::open(db_path).unwrap();
         conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
             .unwrap();
-        std::fs::write(index::rollback_journal_path(db_path), "locked").unwrap();
+        std::fs::write(substrate::rollback_journal_path(db_path), "locked").unwrap();
         conn
     }
 
@@ -33361,7 +33361,7 @@ tier = "private"
              BEGIN EXCLUSIVE;",
         )
         .unwrap();
-        assert!(index::wal_sidecar_path(db_path).exists());
+        assert!(substrate::wal_sidecar_path(db_path).exists());
         conn
     }
 
@@ -39641,7 +39641,7 @@ fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
             SearchPostPrecheckLockMode::RollbackJournal => {
                 conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
                     .expect("acquiring rollback-journal hook lock");
-                fs::write(index::rollback_journal_path(&hook.db_path), "locked")
+                fs::write(substrate::rollback_journal_path(&hook.db_path), "locked")
                     .expect("writing rollback journal marker");
             }
             SearchPostPrecheckLockMode::Wal => {
@@ -39654,13 +39654,13 @@ fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
                      BEGIN EXCLUSIVE;",
                 )
                 .expect("acquiring WAL hook lock");
-                assert!(index::wal_sidecar_path(&hook.db_path).exists());
+                assert!(substrate::wal_sidecar_path(&hook.db_path).exists());
             }
         }
         ready_tx.send(()).expect("signaling search lock hook");
         std::thread::sleep(Duration::from_millis(200));
         drop(conn);
-        let _ = fs::remove_file(index::rollback_journal_path(&hook.db_path));
+        let _ = fs::remove_file(substrate::rollback_journal_path(&hook.db_path));
     });
     ready_rx
         .recv_timeout(Duration::from_secs(1))
