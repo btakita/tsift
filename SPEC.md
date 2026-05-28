@@ -9,12 +9,20 @@ Extend tsift with tree-sitter AST parsing, dependency graph tracking, and per-su
 ```
 tsift (CLI + MCP plugin)
 ├── local lexical search adapter
-├── substrate module (provider-neutral graph DB API — src/substrate.rs)
-│   ├── generic nodes/edges/provenance/freshness records
-│   ├── GraphStore CRUD/query contract (lookup, kind scans, neighborhoods, shortest paths)
-│   ├── SQLite graph store (`graph_nodes`, `graph_edges`, `graph_node_properties`, projection versions, tombstones)
-│   ├── Convex projection adapter for `nodes` + `edges` read models and snapshots
-│   ├── libsql backend (`src/libsql_backend.rs`, feature `backend-libsql`) — local and remote libsql/Turso
+├── tsift-core crate (packages/tsift-core — provider-neutral graph types)
+│   ├── GraphNode, GraphEdge, GraphProjection, GraphPath, GraphSubgraph
+│   ├── GraphProvenance, GraphFreshness, GraphPropertyFilter
+│   ├── GraphQueryOptions, GraphQueryPage, GraphPagedSubgraph
+│   ├── GraphStore trait (CRUD/query contract — lookup, kind scans, neighborhoods, shortest paths)
+│   ├── ConvexGraphClient trait, ConvexRowsGraphClient, ConvexGraphStore
+│   ├── ConvexProjectionRows, ConvexNodeRow, ConvexEdgeRow
+│   └── shortest_path_using_outgoing, apply_graph_query_page helpers
+├── substrate module (SQLite-specific graph DB API — src/substrate.rs)
+│   ├── re-exports all tsift-core types for backward compatibility
+│   ├── SqliteGraphStore (graph_nodes, graph_edges, graph_node_properties, projection versions, tombstones)
+│   ├── SqliteProjectionRefresh, SqliteProjectionVersion, SqliteProjectionRefreshPhase
+│   ├── open_graph_read_only_connection, open_graph_read_only_connection_resilient
+│   ├── libsql backend (src/libsql_backend.rs, feature backend-libsql) — local and remote libsql/Turso
 │   └── projection boundary for FalkorDB/other read models
 ├── graph module (internal — src/graph.rs)
 │   ├── call-site extraction via tree-sitter queries

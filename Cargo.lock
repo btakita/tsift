@@ -2752,7 +2752,18 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "tree-sitter-zig",
+ "tsift-core",
  "ureq",
+]
+
+[[package]]
+name = "tsift-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

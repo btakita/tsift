@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "packages/tsift-core"]
+resolver = "3"
+
 [package]
 name = "tsift"
 version = "0.1.62"
@@ -24,6 +28,7 @@ blake3 = "1"
 ureq = { version = "3", features = ["json"] }
 tagpath = { version = "0.11.1", default-features = false, features = ["lang-rust", "lang-python", "lang-javascript", "lang-typescript"] }
 tree-sitter = "0.26"
+tsift-core = { path = "packages/tsift-core" }
 
 # Language grammars (optional, behind feature flags)
 tree-sitter-rust = { version = "0.24", optional = true }
