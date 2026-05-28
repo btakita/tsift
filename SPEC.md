@@ -65,6 +65,10 @@ tsift (CLI + MCP plugin)
 │   ├── session_digest module — bounded session transcript/log digest with restart-churn families
 │   ├── session_review module — cross-harness aggregate review combining digest + cost + log discovery
 │   └── re-exported via root `tsift` `pub use tsift_session::{session_cost, session_digest, session_review};`
+├── tsift-summarize crate (packages/tsift-summarize — cached LLM analysis foundation)
+│   ├── summarize module — SummaryDb (read-only / read-write opens), entities/relationships/concepts JSON, snapshot fallback for rollback-journal contention, Anthropic API extract pipeline
+│   ├── shared by tsift-digest (diff/log/test consume cached summaries) and the future tsift-search crate
+│   └── re-exported via root `tsift` `pub use tsift_summarize::summarize;`
 ├── tsift-cli crate (packages/tsift-cli — CLI dispatch, command handlers, output formatting)
 │   ├── clap CLI types — Cli, Commands, GraphDbQuery, output format enums
 │   ├── command handlers — cmd_search, cmd_index, cmd_graph, cmd_communities, cmd_explain, etc.

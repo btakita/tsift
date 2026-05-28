@@ -2753,6 +2753,7 @@ dependencies = [
  "tsift-resolution",
  "tsift-session",
  "tsift-sqlite",
+ "tsift-summarize",
  "ureq",
 ]
 
@@ -2791,6 +2792,7 @@ dependencies = [
  "tsift-resolution",
  "tsift-session",
  "tsift-sqlite",
+ "tsift-summarize",
  "ureq",
 ]
 
@@ -2896,6 +2898,22 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tsift-core",
+]
+
+[[package]]
+name = "tsift-summarize"
+version = "0.1.62"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "fs4",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tsift-index",
+ "tsift-sqlite",
+ "ureq",
 ]
 
 [[package]]
