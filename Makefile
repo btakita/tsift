@@ -10,7 +10,7 @@ test:
 ci-full: check
 
 clippy:
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 opencode-plugin-test:
 	cd packages/opencode-tsift && npm test

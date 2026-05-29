@@ -555,6 +555,7 @@ pub(crate) fn cmd_path(
 }
 
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_explain(
     symbol: &str,
     path: &std::path::Path,

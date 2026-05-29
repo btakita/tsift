@@ -8504,45 +8504,6 @@ fn graph_db_ranked_neighbors(
     tsift::resolution::ranked_neighbors(center_id, nodes, edges)
 }
 
-fn graph_db_neighborhood_depths(
-    center_id: &str,
-    node_by_id: &BTreeMap<String, &SubstrateGraphNode>,
-    outgoing: &BTreeMap<String, Vec<&SubstrateGraphEdge>>,
-) -> BTreeMap<String, usize> {
-    tsift::resolution::neighborhood_depths(center_id, node_by_id, outgoing)
-}
-
-fn graph_db_page_handle_coverage_pct(nodes: &[SubstrateGraphNode]) -> f64 {
-    tsift::resolution::page_handle_coverage_pct(nodes)
-}
-
-fn graph_db_node_has_handle_coverage(node: &SubstrateGraphNode) -> bool {
-    tsift::resolution::node_has_handle_coverage(node)
-}
-
-fn graph_db_duplicate_name_precision(
-    node: &SubstrateGraphNode,
-    label_counts: &BTreeMap<String, usize>,
-) -> f64 {
-    tsift::resolution::duplicate_name_precision(node, label_counts)
-}
-
-fn graph_db_has_community_signal(node: &SubstrateGraphNode, edge_kinds: &[String]) -> bool {
-    tsift::resolution::has_community_signal(node, edge_kinds)
-}
-
-fn graph_db_has_semantic_signal(node: &SubstrateGraphNode, edge_kinds: &[String]) -> bool {
-    tsift::resolution::has_semantic_signal(node, edge_kinds)
-}
-
-fn graph_db_source_handle_is_fresh(node: &SubstrateGraphNode) -> bool {
-    tsift::resolution::source_handle_is_fresh(node)
-}
-
-fn graph_db_edge_kind_rank_score(edge_kind: &str) -> i64 {
-    tsift::resolution::edge_kind_rank_score(edge_kind)
-}
-
 fn graph_db_edge_key(edge: &SubstrateGraphEdge) -> String {
     if edge.id.is_empty() {
         tsift::substrate::ConvexEdgeRow::stable_key(&edge.from_id, &edge.to_id, &edge.kind)
@@ -11962,6 +11923,7 @@ fn push_traversal_summaries_watermark_part(root: &Path, parts: &mut Vec<String>)
     Ok(())
 }
 
+#[cfg(test)]
 fn traversal_relative_path_is_generated_artifact(relative: &str) -> bool {
     tsift::resolution::relative_path_is_generated_artifact(relative)
 }
