@@ -67,7 +67,7 @@ tsift (CLI + MCP plugin)
 │   └── re-exported via root `tsift` `pub use tsift_session::{session_cost, session_digest, session_review};`
 ├── tsift-summarize crate (packages/tsift-summarize — cached LLM analysis foundation)
 │   ├── summarize module — SummaryDb (read-only / read-write opens), entities/relationships/concepts JSON, snapshot fallback for rollback-journal contention, Anthropic API extract pipeline
-│   ├── shared by tsift-digest (diff/log/test consume cached summaries) and the future tsift-search crate
+│   ├── shared by tsift-digest (diff/log/test consume cached summaries) and the tsift-search crate
 │   └── re-exported via root `tsift` `pub use tsift_summarize::summarize;`
 ├── tsift-digest crate (packages/tsift-digest — code-aware digest emitters)
 │   ├── diff_digest module — worktree/staged/revision diff digest, touched symbols, call-edge deltas (uses tsift-graph)
@@ -76,6 +76,13 @@ tsift (CLI + MCP plugin)
 │   ├── test_digest module — grouped test-failure digest (cargo/pytest)
 │   ├── depends on tsift-graph (diff edges + Lang), tsift-quality (lint/runtime_churn), tsift-summarize (SummaryDb enrichment)
 │   └── re-exported via root `tsift` `pub use tsift_digest::{diff_digest, log_digest, metric_digest, test_digest};`
+├── tsift-search crate (packages/tsift-search — search ranking, impact analysis, tagpath annotation)
+│   ├── sift module — local lexical search adapter (ranked BM25-ish lexical hits, cache serialization)
+│   ├── impact module — change-impact analysis (call-edge/route/import impacts; per-language import detection gated by lang-* features)
+│   ├── tagpath_adapter module — tagpath `.naming/index.json` family/member lookup + handle round-trip
+│   ├── depends on tsift-index (config/index/walk), tsift-digest (diff_digest), tsift-graph (Lang), tsift-quality (lint), tsift-summarize
+│   ├── forwards lang-* features to tsift-graph (mirrors root tsift) so impact's per-Lang arms compile
+│   └── re-exported via root `tsift` `pub use tsift_search::{impact, sift, tagpath_adapter};`
 ├── tsift-cli crate (packages/tsift-cli — CLI dispatch, command handlers, output formatting)
 │   ├── clap CLI types — Cli, Commands, GraphDbQuery, output format enums
 │   ├── command handlers — cmd_search, cmd_index, cmd_graph, cmd_communities, cmd_explain, etc.

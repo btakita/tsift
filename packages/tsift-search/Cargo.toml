@@ -1,0 +1,38 @@
+[package]
+name = "tsift-search"
+version = "0.1.62"
+edition = "2024"
+description = "Search + impact surfaces for tsift — lexical search adapter, impact analysis, and tagpath annotation"
+license = "MIT"
+repository = "https://github.com/btakita/tsift"
+authors = ["Brian Takita <brian.takita@gmail.com>"]
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ignore = "0.4"
+tagpath = { version = "0.11.1", default-features = false, features = ["lang-rust", "lang-python", "lang-javascript", "lang-typescript"] }
+tsift-graph = { path = "../tsift-graph" }
+tsift-index = { path = "../tsift-index" }
+tsift-quality = { path = "../tsift-quality" }
+tsift-summarize = { path = "../tsift-summarize" }
+tsift-digest = { path = "../tsift-digest" }
+
+[features]
+# Language features gate the per-Lang match arms in `impact::is_import_line`
+# and forward to tsift-graph so the matching tree-sitter grammars + Lang
+# variants are available. Mirrors root tsift's language feature set.
+default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]
+lang-rust = ["tsift-graph/lang-rust"]
+lang-python = ["tsift-graph/lang-python"]
+lang-typescript = ["tsift-graph/lang-typescript"]
+lang-javascript = ["tsift-graph/lang-javascript"]
+lang-kotlin = ["tsift-graph/lang-kotlin"]
+lang-zig = ["tsift-graph/lang-zig"]
+lang-bash = ["tsift-graph/lang-bash"]
+lang-markdown = ["tsift-graph/lang-markdown"]
+all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]
+
+[dev-dependencies]
+tempfile = "3"

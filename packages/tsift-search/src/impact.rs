@@ -1,11 +1,9 @@
-use crate::config;
-use crate::diff_digest::{self, DiffDigestOptions};
-use crate::index;
-use crate::lang::Lang;
-use crate::lint;
-use crate::summarize;
-use crate::walk;
 use anyhow::{Context, Result};
+use tsift_digest::diff_digest::{self, DiffDigestOptions};
+use tsift_graph::lang::Lang;
+use tsift_index::{config, index, walk};
+use tsift_quality::lint;
+use tsift_summarize::summarize;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-resolution", "packages/tsift-quality", "packages/tsift-index", "packages/tsift-session", "packages/tsift-summarize", "packages/tsift-digest", "packages/tsift-cli", "packages/tsift-sim-world"]
+members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-resolution", "packages/tsift-quality", "packages/tsift-index", "packages/tsift-session", "packages/tsift-summarize", "packages/tsift-digest", "packages/tsift-search", "packages/tsift-cli", "packages/tsift-sim-world"]
 resolver = "3"
 
 [package]
@@ -38,6 +38,7 @@ tsift-index = { path = "packages/tsift-index" }
 tsift-session = { path = "packages/tsift-session" }
 tsift-summarize = { path = "packages/tsift-summarize" }
 tsift-digest = { path = "packages/tsift-digest" }
+tsift-search = { path = "packages/tsift-search" }
 tempfile = "3"
 
 libsql = { version = "0.9", optional = true }
@@ -47,14 +48,14 @@ tsift-libsql = { path = "packages/tsift-libsql", optional = true }
 [features]
 default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]
 backend-libsql = ["dep:tsift-libsql"]
-lang-rust = ["tsift-graph/lang-rust"]
-lang-python = ["tsift-graph/lang-python"]
-lang-typescript = ["tsift-graph/lang-typescript"]
-lang-javascript = ["tsift-graph/lang-javascript"]
-lang-kotlin = ["tsift-graph/lang-kotlin"]
-lang-zig = ["tsift-graph/lang-zig"]
-lang-bash = ["tsift-graph/lang-bash"]
-lang-markdown = ["tsift-graph/lang-markdown"]
+lang-rust = ["tsift-graph/lang-rust", "tsift-search/lang-rust"]
+lang-python = ["tsift-graph/lang-python", "tsift-search/lang-python"]
+lang-typescript = ["tsift-graph/lang-typescript", "tsift-search/lang-typescript"]
+lang-javascript = ["tsift-graph/lang-javascript", "tsift-search/lang-javascript"]
+lang-kotlin = ["tsift-graph/lang-kotlin", "tsift-search/lang-kotlin"]
+lang-zig = ["tsift-graph/lang-zig", "tsift-search/lang-zig"]
+lang-bash = ["tsift-graph/lang-bash", "tsift-search/lang-bash"]
+lang-markdown = ["tsift-graph/lang-markdown", "tsift-search/lang-markdown"]
 all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]
 
 [dev-dependencies]

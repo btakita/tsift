@@ -2752,6 +2752,7 @@ dependencies = [
  "tsift-libsql",
  "tsift-quality",
  "tsift-resolution",
+ "tsift-search",
  "tsift-session",
  "tsift-sqlite",
  "tsift-summarize",
@@ -2888,6 +2889,23 @@ dependencies = [
  "anyhow",
  "serde",
  "tsift-core",
+]
+
+[[package]]
+name = "tsift-search"
+version = "0.1.62"
+dependencies = [
+ "anyhow",
+ "ignore",
+ "serde",
+ "serde_json",
+ "tagpath",
+ "tempfile",
+ "tsift-digest",
+ "tsift-graph",
+ "tsift-index",
+ "tsift-quality",
+ "tsift-summarize",
 ]
 
 [[package]]
