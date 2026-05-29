@@ -13,5 +13,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tsift-quality = { path = "../tsift-quality" }
 
+[features]
+# Re-exports otherwise test-only digest helpers (e.g.
+# `session_digest::extract_prompt_targets_from_text_block`) as `pub` so the
+# `tsift-sim-world` harness crate can drive them as a dev-dependency.
+test-support = []
+
 [dev-dependencies]
 tempfile = "3"

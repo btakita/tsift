@@ -31220,7 +31220,10 @@ fn strip_ansi_codes(input: &str) -> String {
 
 /// Attempt to rewrite a shell command to use tsift.
 /// Returns Some(rewritten) if applicable, None if no match.
-pub(crate) fn rewrite_command(command: &str) -> Option<String> {
+///
+/// `pub` (not `pub(crate)`) so the `tsift-sim-world` test-harness crate can
+/// exercise the rewrite surface as a dev-dependency.
+pub fn rewrite_command(command: &str) -> Option<String> {
     let trimmed = command.trim();
 
     // Already a tsift command — pass through (exit 0, identical)

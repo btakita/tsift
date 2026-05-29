@@ -5,7 +5,7 @@ check: clippy test opencode-plugin-test
 precommit: check
 
 test:
-	cargo test
+	cargo test --workspace
 
 ci-full: check
 

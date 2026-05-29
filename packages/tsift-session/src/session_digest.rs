@@ -896,8 +896,11 @@ fn push_prompt_target(prompt: &str, targets: &mut Vec<String>) {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn extract_prompt_targets_from_text_block(input: &str, user_bias: bool) -> Vec<String> {
+/// Exposed under the `test-support` feature (and in-crate `test` builds) so the
+/// `tsift-sim-world` harness crate can exercise prompt-target extraction without
+/// reaching into crate-private internals.
+#[cfg(any(test, feature = "test-support"))]
+pub fn extract_prompt_targets_from_text_block(input: &str, user_bias: bool) -> Vec<String> {
     let mut targets = Vec::new();
     for raw_line in input.lines() {
         let trimmed = raw_line.trim();

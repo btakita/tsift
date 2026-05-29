@@ -2888,6 +2888,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tsift-sim-world"
+version = "0.1.62"
+dependencies = [
+ "tempfile",
+ "tsift",
+ "tsift-cli",
+ "tsift-session",
+]
+
+[[package]]
 name = "tsift-sqlite"
 version = "0.1.0"
 dependencies = [

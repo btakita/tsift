@@ -291,7 +291,7 @@ pub fn default_neighborhood_ranking_gate() -> NeighborhoodRankingGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-use tsift_core::{GraphEdge, GraphNode};
+    use tsift_core::{GraphEdge, GraphFreshness, GraphNode};
 
     #[test]
     fn edge_kind_rank_score_semantic_relation() {

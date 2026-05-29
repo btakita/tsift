@@ -1,8 +1,9 @@
-use crate::{init, rewrite_command, session_digest, status};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+use tsift::{init, session_digest, status};
+use tsift_cli::rewrite_command;
 
 const FAST_CORPUS_SEEDS: u64 = 12;
 const FAST_CORPUS_STEPS: usize = 40;
