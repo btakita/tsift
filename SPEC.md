@@ -7,8 +7,8 @@ Extend tsift with tree-sitter AST parsing, dependency graph tracking, and per-su
 ## Architecture
 
 ```
-tsift (CLI + MCP plugin)
-├── local lexical search adapter
+tsift (root crate — thin re-export shim: lib.rs + graph/lang/resolution/substrate/libsql_backend
+│        modules only `pub use` the sibling crates below; carries no external deps of its own)
 ├── tsift-core crate (packages/tsift-core — provider-neutral graph types)
 │   ├── GraphNode, GraphEdge, GraphProjection, GraphPath, GraphSubgraph
 │   ├── GraphProvenance, GraphFreshness, GraphPropertyFilter
@@ -83,6 +83,11 @@ tsift (CLI + MCP plugin)
 │   ├── depends on tsift-index (config/index/walk), tsift-digest (diff_digest), tsift-graph (Lang), tsift-quality (lint), tsift-summarize
 │   ├── forwards lang-* features to tsift-graph (mirrors root tsift) so impact's per-Lang arms compile
 │   └── re-exported via root `tsift` `pub use tsift_search::{impact, sift, tagpath_adapter};`
+├── tsift-status crate (packages/tsift-status — session health + lock diagnostics)
+│   ├── status module — index freshness, instruction-version check, summary-cache recovery, lock-sidecar/journal state
+│   ├── backs `tsift status` and `tsift locks`
+│   ├── depends on tsift-index (config/index/init), tsift-sqlite (sidecar/recovery helpers), tsift-summarize (SummaryDb)
+│   └── re-exported via root `tsift` `pub use tsift_status::status;`
 ├── tsift-cli crate (packages/tsift-cli — CLI dispatch, command handlers, output formatting)
 │   ├── clap CLI types — Cli, Commands, GraphDbQuery, output format enums
 │   ├── command handlers — cmd_search, cmd_index, cmd_graph, cmd_communities, cmd_explain, etc.

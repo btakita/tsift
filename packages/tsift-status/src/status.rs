@@ -1,11 +1,11 @@
-use crate::config;
-use crate::index::{IndexDb, WriterLockProbe, probe_writer_lock, writer_lock_path};
-use crate::init::{self, InstructionStatus};
-use crate::substrate::{
+use anyhow::Result;
+use tsift_index::config;
+use tsift_index::index::{IndexDb, WriterLockProbe, probe_writer_lock, writer_lock_path};
+use tsift_index::init::{self, InstructionStatus};
+use tsift_sqlite::{
     ReadOnlyRecovery, rollback_journal_path, shared_memory_sidecar_path, wal_sidecar_path,
 };
-use crate::summarize::SummaryDb;
-use anyhow::Result;
+use tsift_summarize::summarize::SummaryDb;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -1173,9 +1173,9 @@ pub fn format_locks_human(report: &LockReport, compact: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use crate::substrate::wal_sidecar_path;
     use fs4::fs_std::FileExt;
+    use tsift_index::config::Config;
+    use tsift_sqlite::wal_sidecar_path;
     use rusqlite::Connection;
     use std::fs::OpenOptions;
     use tempfile::TempDir;
@@ -1502,7 +1502,7 @@ mod tests {
         db.apply_changes(dir.path()).unwrap();
 
         let sdb = SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
-        sdb.insert(&crate::summarize::Summary {
+        sdb.insert(&tsift_summarize::summarize::Summary {
             id: 0,
             symbol_name: "main".to_string(),
             file_path: "main.rs".to_string(),
@@ -1600,7 +1600,7 @@ mod tests {
 
         let db_path = dir.path().join(".tsift/summaries.db");
         let sdb = SummaryDb::open(&db_path).unwrap();
-        sdb.insert(&crate::summarize::Summary {
+        sdb.insert(&tsift_summarize::summarize::Summary {
             id: 0,
             symbol_name: "main".to_string(),
             file_path: "main.rs".to_string(),
@@ -1636,7 +1636,7 @@ mod tests {
         db.apply_changes(dir.path()).unwrap();
 
         let sdb = SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
-        sdb.insert(&crate::summarize::Summary {
+        sdb.insert(&tsift_summarize::summarize::Summary {
             id: 0,
             symbol_name: "main".to_string(),
             file_path: "main.rs".to_string(),
@@ -1651,7 +1651,7 @@ mod tests {
             tokens_output: Some(50),
         })
         .unwrap();
-        sdb.insert(&crate::summarize::Summary {
+        sdb.insert(&tsift_summarize::summarize::Summary {
             id: 0,
             symbol_name: "ghost".to_string(),
             file_path: "removed.rs".to_string(),

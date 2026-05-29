@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-resolution", "packages/tsift-quality", "packages/tsift-index", "packages/tsift-session", "packages/tsift-summarize", "packages/tsift-digest", "packages/tsift-search", "packages/tsift-cli", "packages/tsift-sim-world"]
+members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-resolution", "packages/tsift-quality", "packages/tsift-index", "packages/tsift-session", "packages/tsift-summarize", "packages/tsift-digest", "packages/tsift-search", "packages/tsift-status", "packages/tsift-cli", "packages/tsift-sim-world"]
 resolver = "3"
 
 [package]
@@ -15,23 +15,12 @@ keywords = ["agent", "search", "rag", "cli", "context"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-flate2 = "1"
-fs4 = "0.13"
-ignore = "0.4"
-rusqlite = { version = "0.34", features = ["bundled"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
-blake3 = "1"
-ureq = { version = "3", features = ["json"] }
-tagpath = { version = "0.11.1", default-features = false, features = ["lang-rust", "lang-python", "lang-javascript", "lang-typescript"] }
-tree-sitter = "0.26"
-tsift-core = { path = "packages/tsift-core" }
+# Root `tsift` is now a thin re-export shim: its lib.rs and the `graph` / `lang`
+# / `resolution` / `substrate` / `libsql_backend` modules only `pub use` sibling
+# crates. It therefore carries no external crate dependencies of its own — every
+# real implementation lives in a `tsift-*` workspace crate.
 tsift-sqlite = { path = "packages/tsift-sqlite" }
 tsift-graph = { path = "packages/tsift-graph" }
-tsift-algorithms = { path = "packages/tsift-algorithms" }
 tsift-resolution = { path = "packages/tsift-resolution" }
 tsift-quality = { path = "packages/tsift-quality" }
 tsift-index = { path = "packages/tsift-index" }
@@ -39,10 +28,8 @@ tsift-session = { path = "packages/tsift-session" }
 tsift-summarize = { path = "packages/tsift-summarize" }
 tsift-digest = { path = "packages/tsift-digest" }
 tsift-search = { path = "packages/tsift-search" }
-tempfile = "3"
+tsift-status = { path = "packages/tsift-status" }
 
-libsql = { version = "0.9", optional = true }
-tokio = { version = "1", features = ["rt"], optional = true }
 tsift-libsql = { path = "packages/tsift-libsql", optional = true }
 
 [features]

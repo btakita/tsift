@@ -2729,23 +2729,6 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 name = "tsift"
 version = "0.1.62"
 dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "flate2",
- "fs4",
- "ignore",
- "libsql",
- "rusqlite",
- "serde",
- "serde_json",
- "tagpath",
- "tempfile",
- "tokio",
- "toml",
- "tree-sitter",
- "tsift-algorithms",
- "tsift-core",
  "tsift-digest",
  "tsift-graph",
  "tsift-index",
@@ -2755,8 +2738,8 @@ dependencies = [
  "tsift-search",
  "tsift-session",
  "tsift-sqlite",
+ "tsift-status",
  "tsift-summarize",
- "ureq",
 ]
 
 [[package]]
@@ -2940,6 +2923,21 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tsift-core",
+]
+
+[[package]]
+name = "tsift-status"
+version = "0.1.62"
+dependencies = [
+ "anyhow",
+ "fs4",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tsift-index",
+ "tsift-sqlite",
+ "tsift-summarize",
 ]
 
 [[package]]
