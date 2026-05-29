@@ -1,4 +1,5 @@
 mod cli;
+mod commands;
 mod output;
 
 use anyhow::{Context, Result, bail};
@@ -7,6 +8,9 @@ use cli::{
     Cli, Commands, DispatchTraceFormat, GraphDbBackend, GraphDbQuery, SemanticRelatedKind,
     TraverseFormat,
 };
+use commands::index_search::{cmd_index, cmd_search_with_budget, cmd_search_worker};
+#[cfg(test)]
+use commands::index_search::cmd_search;
 use output::{
     OutputFormat, ResponseBudget, ResponseBudgetPreset, ToolEnvelope, ToolEnvelopeMetric,
     ToolEnvelopeSummary, TranscriptArtifactRef,
@@ -1094,7 +1098,7 @@ fn to_json<T: serde::Serialize>(val: &T, pretty: bool, terse: bool) -> anyhow::R
 /// then act on the same condition the stderr `tagpath_index_stale: …` log
 /// already surfaces without parsing logs. No-op when `stale=false` or when
 /// `value` is not a JSON object.
-fn inject_tagpath_stale_into_json(
+pub(crate) fn inject_tagpath_stale_into_json(
     value: &mut serde_json::Value,
     stale: bool,
     reason: Option<&str>,
@@ -1116,7 +1120,7 @@ fn inject_tagpath_stale_into_json(
     }
 }
 
-fn to_json_schema<T: serde::Serialize>(
+pub(crate) fn to_json_schema<T: serde::Serialize>(
     val: &T,
     pretty: bool,
     terse: bool,
@@ -1148,7 +1152,7 @@ fn to_json_schema<T: serde::Serialize>(
     }
 }
 
-fn envelope_metric(label: &str, value: impl ToString) -> ToolEnvelopeMetric {
+pub(crate) fn envelope_metric(label: &str, value: impl ToString) -> ToolEnvelopeMetric {
     ToolEnvelopeMetric {
         label: label.to_string(),
         value: value.to_string(),
@@ -1166,7 +1170,7 @@ fn dedupe_preserve_order(values: Vec<String>) -> Vec<String> {
     deduped
 }
 
-fn print_json_or_envelope<T: Serialize>(
+pub(crate) fn print_json_or_envelope<T: Serialize>(
     report: &T,
     format: &OutputFormat,
     tool: &str,
@@ -2275,7 +2279,7 @@ const TERSE_PAIRS: &[(&str, &str)] = &[
     ("replace_all", "ra"),
 ];
 
-fn relativize(path: &str, root: &std::path::Path) -> String {
+pub(crate) fn relativize(path: &str, root: &std::path::Path) -> String {
     let root_str = root.to_string_lossy();
     let prefix = format!("{}/", root_str.trim_end_matches('/'));
     path.strip_prefix(&prefix).unwrap_or(path).to_string()
@@ -2321,7 +2325,7 @@ fn relativize_symbols(symbols: &mut [tsift::index::StoredSymbol], root: &std::pa
     }
 }
 
-fn relativize_symbol_hits(hits: &mut [tsift::index::SymbolHit], root: &std::path::Path) {
+pub(crate) fn relativize_symbol_hits(hits: &mut [tsift::index::SymbolHit], root: &std::path::Path) {
     for hit in hits {
         hit.file = relativize(&hit.file, root);
     }
@@ -3320,7 +3324,7 @@ pub fn annotate_path_nodes_with_tagpath(
 
 const JSON_PATH_KEYS: &[&str] = &["file", "path", "caller_file", "file_path"];
 
-fn relativize_json_paths(val: &mut serde_json::Value, root: &std::path::Path) {
+pub(crate) fn relativize_json_paths(val: &mut serde_json::Value, root: &std::path::Path) {
     let root_str = root.to_string_lossy();
     let prefix = format!("{}/", root_str.trim_end_matches('/'));
     relativize_json_inner(val, &prefix);
@@ -3348,7 +3352,7 @@ fn relativize_json_inner(val: &mut serde_json::Value, prefix: &str) {
     }
 }
 
-fn format_score(score: f64, compact: bool) -> String {
+pub(crate) fn format_score(score: f64, compact: bool) -> String {
     if compact {
         format!("{score:.2}")
     } else {
@@ -3366,7 +3370,7 @@ fn truncate_for_compact(input: &str, max_chars: usize) -> String {
     format!("{prefix}...")
 }
 
-fn compact_snippet(snippet: &str) -> Option<String> {
+pub(crate) fn compact_snippet(snippet: &str) -> Option<String> {
     snippet
         .lines()
         .find(|line| !line.trim().is_empty())
@@ -3635,7 +3639,7 @@ fn truncate_for_budget(input: &str, max_bytes: usize) -> String {
     }
 }
 
-fn abbreviate_kind(kind: &str) -> &str {
+pub(crate) fn abbreviate_kind(kind: &str) -> &str {
     match kind {
         "function" => "fn",
         "method" => "meth",
@@ -3658,7 +3662,7 @@ fn abbreviate_kind(kind: &str) -> &str {
     }
 }
 
-fn abbreviate_match_type(mt: &str) -> &str {
+pub(crate) fn abbreviate_match_type(mt: &str) -> &str {
     match mt {
         "exact_name" => "exact",
         "all_tags" => "all_tags",
@@ -3693,7 +3697,7 @@ fn format_search_sample(hit: &tsift::sift::SearchHit) -> Option<String> {
     })
 }
 
-fn group_search_hits(hits: &[tsift::sift::SearchHit], root: &Path, absolute: bool) -> Vec<SearchHitGroup> {
+pub(crate) fn group_search_hits(hits: &[tsift::sift::SearchHit], root: &Path, absolute: bool) -> Vec<SearchHitGroup> {
     let mut positions = BTreeMap::new();
     let mut groups = Vec::new();
     for hit in hits {
@@ -3732,7 +3736,7 @@ fn group_search_hits(hits: &[tsift::sift::SearchHit], root: &Path, absolute: boo
     groups
 }
 
-fn should_collapse_search_hits(hits: &[tsift::sift::SearchHit], root: &Path, absolute: bool) -> bool {
+pub(crate) fn should_collapse_search_hits(hits: &[tsift::sift::SearchHit], root: &Path, absolute: bool) -> bool {
     let groups = group_search_hits(hits, root, absolute);
     let max_hits_per_file = groups.iter().map(|group| group.hits).max().unwrap_or(0);
     max_hits_per_file >= 3 || (hits.len() >= 6 && groups.len() < hits.len())
@@ -4057,303 +4061,6 @@ fn cmd_edit(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cmd_index(
-    path: &std::path::Path,
-    rebuild: bool,
-    check: bool,
-    exit_code: bool,
-    prune: bool,
-    quiet: bool,
-    workspace: bool,
-    submodule: Option<&str>,
-    json_output: bool,
-    compact: bool,
-    pretty: bool,
-    terse: bool,
-    absolute: bool,
-    schema: bool,
-) -> Result<()> {
-    let quiet = quiet || exit_code;
-    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
-
-    if workspace || submodule.is_some() {
-        let cfg = tsift::config::Config::load(&root)?;
-        let targets: Vec<(String, PathBuf, Option<tsift::config::WorkspaceScope>)> =
-            if let Some(name) = submodule {
-                let scope = tsift::config::Config::resolve_submodule(&root, name)?;
-                vec![(scope.id.clone(), scope.source_root.clone(), Some(scope))]
-            } else {
-                tsift::config::Config::submodule_dirs(&root)?
-                    .into_iter()
-                    .map(|scope| (scope.id.clone(), scope.source_root.clone(), Some(scope)))
-                    .collect()
-            };
-
-        if targets.is_empty() {
-            bail!("no submodules found in {}", root.display());
-        }
-
-        let mut any_stale = false;
-        for (name, sub_path, scope) in &targets {
-            if !sub_path.exists() {
-                eprintln!("  skip {} (not found: {})", name, sub_path.display());
-                continue;
-            }
-            let db_path = cfg.db_path_for(&root, name);
-            let mut summary = if rebuild {
-                run_index_update(
-                    &db_path,
-                    sub_path,
-                    format!("rebuilding submodule `{}` index", name),
-                    &root,
-                    Some(name.as_str()),
-                    true,
-                    false,
-                )?
-            } else if check {
-                tsift::index::IndexDb::inspect_read_only(&db_path, sub_path, prune)?.summary
-            } else if prune {
-                run_index_update(
-                    &db_path,
-                    sub_path,
-                    format!("pruning submodule `{}` index", name),
-                    &root,
-                    Some(name.as_str()),
-                    false,
-                    true,
-                )?
-            } else {
-                run_index_update(
-                    &db_path,
-                    sub_path,
-                    format!("indexing submodule `{}`", name),
-                    &root,
-                    Some(name.as_str()),
-                    false,
-                    false,
-                )?
-            };
-            if !absolute {
-                relativize_index_summary(&mut summary, sub_path);
-            }
-            if summary.has_changes() {
-                any_stale = true;
-            }
-            let tier = scope
-                .as_ref()
-                .map(|scope| cfg.tier_for_scope(scope))
-                .unwrap_or_else(|| cfg.tier_for(name));
-            if json_output {
-                let entry = if quiet {
-                    serde_json::json!({
-                        "submodule": name,
-                        "tier": format!("{:?}", tier).to_lowercase(),
-                        "total_tracked": summary.total_tracked,
-                        "new": summary.new,
-                        "modified": summary.modified,
-                        "deleted": summary.deleted,
-                        "unchanged": summary.unchanged,
-                    })
-                } else {
-                    serde_json::json!({
-                        "submodule": name,
-                        "tier": format!("{:?}", tier).to_lowercase(),
-                        "summary": summary,
-                    })
-                };
-                println!(
-                    "{}",
-                    if quiet {
-                        serde_json::to_string(&entry)?
-                    } else {
-                        to_json_schema(&entry, pretty, terse, schema)?
-                    }
-                );
-            } else if compact {
-                let mode = if rebuild {
-                    "rebuild"
-                } else if check {
-                    "check"
-                } else if prune {
-                    "prune-safe"
-                } else {
-                    "incremental"
-                };
-                print!(
-                    "[{}] {} {:?} tracked:{} new:{} mod:{} del:{} unch:{}",
-                    name,
-                    mode,
-                    tier,
-                    summary.total_tracked,
-                    summary.new,
-                    summary.modified,
-                    summary.deleted,
-                    summary.unchanged
-                );
-                if let Some(ref ps) = summary.prune_stats {
-                    print!(
-                        " pruned:{} walked:{} skipped:{}",
-                        ps.dirs_pruned, ps.dirs_walked, ps.files_pruned
-                    );
-                }
-                println!();
-            } else {
-                let mode = if rebuild {
-                    "rebuild"
-                } else if check {
-                    "check"
-                } else if prune {
-                    "prune-safe"
-                } else {
-                    "incremental"
-                };
-                print!(
-                    "[{}] ({}, {:?}) {} files tracked — new:{} mod:{} del:{} unch:{}",
-                    name,
-                    mode,
-                    tier,
-                    summary.total_tracked,
-                    summary.new,
-                    summary.modified,
-                    summary.deleted,
-                    summary.unchanged
-                );
-                if let Some(ref ps) = summary.prune_stats {
-                    print!(
-                        " | pruned:{} dirs ({}d walked, {} files skipped)",
-                        ps.dirs_pruned, ps.dirs_walked, ps.files_pruned
-                    );
-                }
-                println!();
-            }
-        }
-        if exit_code && check && any_stale {
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-
-    let db_path = root.join(".tsift/index.db");
-    let summary = if rebuild {
-        run_index_update(
-            &db_path,
-            &root,
-            "rebuilding index".to_string(),
-            &root,
-            None,
-            true,
-            false,
-        )?
-    } else if check {
-        tsift::index::IndexDb::inspect_read_only(&db_path, &root, prune)?.summary
-    } else if prune {
-        run_index_update(
-            &db_path,
-            &root,
-            "scanning index (--prune safety mode)".to_string(),
-            &root,
-            None,
-            false,
-            true,
-        )?
-    } else {
-        run_index_update(
-            &db_path,
-            &root,
-            "indexing index".to_string(),
-            &root,
-            None,
-            false,
-            false,
-        )?
-    };
-
-    let mut summary = summary;
-    if !absolute {
-        relativize_index_summary(&mut summary, &root);
-    }
-
-    if json_output {
-        if quiet {
-            let compact = serde_json::json!({
-                "total_tracked": summary.total_tracked,
-                "new": summary.new,
-                "modified": summary.modified,
-                "deleted": summary.deleted,
-                "unchanged": summary.unchanged,
-                "prune_stats": summary.prune_stats,
-            });
-            println!("{}", serde_json::to_string(&compact)?);
-        } else {
-            println!("{}", to_json_schema(&summary, pretty, terse, schema)?);
-        }
-    } else if compact {
-        let mode = if rebuild {
-            "rebuild"
-        } else if check {
-            "check"
-        } else if prune {
-            "prune-safe"
-        } else {
-            "incremental"
-        };
-        print!(
-            "index {} tracked:{} new:{} mod:{} del:{} unch:{}",
-            mode,
-            summary.total_tracked,
-            summary.new,
-            summary.modified,
-            summary.deleted,
-            summary.unchanged
-        );
-        if let Some(ref ps) = summary.prune_stats {
-            print!(
-                " pruned:{} walked:{} skipped:{}",
-                ps.dirs_pruned, ps.dirs_walked, ps.files_pruned
-            );
-        }
-        println!();
-    } else {
-        let mode = if rebuild {
-            "rebuild"
-        } else if check {
-            "check"
-        } else if prune {
-            "prune-safe"
-        } else {
-            "incremental"
-        };
-        println!("Index ({}): {} files tracked", mode, summary.total_tracked);
-        print!(
-            "  new: {}  modified: {}  deleted: {}  unchanged: {}",
-            summary.new, summary.modified, summary.deleted, summary.unchanged
-        );
-        if let Some(ref ps) = summary.prune_stats {
-            print!(
-                " | pruned: {} dirs ({} walked, {} files skipped)",
-                ps.dirs_pruned, ps.dirs_walked, ps.files_pruned
-            );
-        }
-        println!();
-        if !quiet && !summary.changes.is_empty() {
-            println!();
-            for change in &summary.changes {
-                let marker = match change.kind {
-                    tsift::index::ChangeKind::New => "+",
-                    tsift::index::ChangeKind::Modified => "~",
-                    tsift::index::ChangeKind::Deleted => "-",
-                };
-                let lang = change.language.as_deref().unwrap_or("");
-                println!("  {} {} [{}]", marker, change.path.display(), lang);
-            }
-        }
-    }
-    if exit_code && check && summary.has_changes() {
-        std::process::exit(1);
-    }
-    Ok(())
-}
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_graph(
@@ -26070,7 +25777,7 @@ fn add_write_lock_context(
     )
 }
 
-fn run_index_update(
+pub(crate) fn run_index_update(
     db_path: &std::path::Path,
     source_root: &std::path::Path,
     action: String,
@@ -26095,7 +25802,7 @@ fn run_index_update(
     Ok(summary)
 }
 
-fn relativize_index_summary(summary: &mut tsift::index::IndexSummary, root: &Path) {
+pub(crate) fn relativize_index_summary(summary: &mut tsift::index::IndexSummary, root: &Path) {
     for change in &mut summary.changes {
         change.path = relativize_pathbuf(&change.path, root);
     }
@@ -26418,7 +26125,7 @@ struct DegradedSearchTarget {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DegradedSearchMode {
+pub(crate) enum DegradedSearchMode {
     ReadOnly,
     Exact,
 }
@@ -26549,7 +26256,7 @@ fn rebuild_search_targets_message(rebuild_targets: &[RebuildSearchTarget]) -> St
     )
 }
 
-fn precheck_search_indexes(
+pub(crate) fn precheck_search_indexes(
     root: &Path,
     path_hint: &Path,
     scope: Option<&str>,
@@ -26610,7 +26317,7 @@ fn precheck_search_indexes(
     );
 }
 
-fn degraded_search_mode(targets: &[DegradedSearchTarget]) -> Option<DegradedSearchMode> {
+pub(crate) fn degraded_search_mode(targets: &[DegradedSearchTarget]) -> Option<DegradedSearchMode> {
     if targets.is_empty() {
         return None;
     }
@@ -26657,7 +26364,7 @@ fn degraded_search_targets_summary(targets: &[DegradedSearchTarget]) -> String {
     parts.join(", ")
 }
 
-fn emit_degraded_search_note(targets: &[DegradedSearchTarget], mode: DegradedSearchMode) {
+pub(crate) fn emit_degraded_search_note(targets: &[DegradedSearchTarget], mode: DegradedSearchMode) {
     let summary = degraded_search_targets_summary(targets);
     let reindex_cmd = &targets[0].reindex_cmd;
     match mode {
@@ -26715,7 +26422,7 @@ fn query_prefers_exact_search(query: &str) -> bool {
             .all(|ch| ch.is_alphanumeric() || is_exact_preferring_query_char(ch))
 }
 
-fn resolve_search_strategy(query: &str, strategy: Option<String>) -> String {
+pub(crate) fn resolve_search_strategy(query: &str, strategy: Option<String>) -> String {
     strategy.unwrap_or_else(|| {
         if query_prefers_exact_search(query) {
             "exact".to_string()
@@ -26736,486 +26443,7 @@ pub struct TagpathSearchOpts {
     pub strict: bool,
 }
 
-#[allow(dead_code, clippy::too_many_arguments)]
-fn cmd_search(
-    query: String,
-    path: Option<PathBuf>,
-    limit: usize,
-    strategy: Option<String>,
-    scope: Option<String>,
-    federated: bool,
-    json_output: bool,
-    autoindex: bool,
-    timeout_secs: u64,
-    compact: bool,
-    pretty: bool,
-    terse: bool,
-    absolute: bool,
-    tabular: bool,
-    schema: bool,
-) -> Result<()> {
-    cmd_search_with_budget(
-        query,
-        path,
-        limit,
-        strategy,
-        scope,
-        federated,
-        json_output,
-        autoindex,
-        timeout_secs,
-        compact,
-        pretty,
-        terse,
-        absolute,
-        tabular,
-        schema,
-        false,
-        ResponseBudget::default(),
-        TagpathSearchOpts::default(),
-    )
-}
 
-#[allow(clippy::too_many_arguments)]
-fn cmd_search_with_budget(
-    query: String,
-    path: Option<PathBuf>,
-    limit: usize,
-    strategy: Option<String>,
-    scope: Option<String>,
-    federated: bool,
-    json_output: bool,
-    autoindex: bool,
-    timeout_secs: u64,
-    compact: bool,
-    pretty: bool,
-    terse: bool,
-    absolute: bool,
-    tabular: bool,
-    schema: bool,
-    envelope: bool,
-    budget: ResponseBudget,
-    tagpath_opts: TagpathSearchOpts,
-) -> Result<()> {
-    let base_path = path.unwrap_or_else(|| PathBuf::from("."));
-    let format = OutputFormat {
-        json_output,
-        compact,
-        pretty,
-        terse,
-        schema,
-        envelope,
-    };
-    let root = tsift::lint::resolve_project_root_or_canonical_path(&base_path)?;
-    let search_cache_dir = root.join(".tsift/search-cache");
-    let requested_strategy = resolve_search_strategy(&query, strategy);
-    let requested_exact_search = requested_strategy == "exact";
-    let precheck = if requested_exact_search {
-        None
-    } else {
-        Some(precheck_search_indexes(
-            &root,
-            &base_path,
-            scope.as_deref(),
-            federated,
-            autoindex,
-        )?)
-    };
-    let degraded_mode = precheck
-        .as_ref()
-        .and_then(|precheck| degraded_search_mode(&precheck.degraded_targets));
-    let exact_search = requested_exact_search || degraded_mode == Some(DegradedSearchMode::Exact);
-    let effective_strategy = if exact_search {
-        "exact".to_string()
-    } else {
-        requested_strategy
-    };
-    let search_targets = if requested_exact_search {
-        Vec::new()
-    } else if let Some(precheck) = precheck.as_ref() {
-        if let Some(mode) = degraded_mode {
-            emit_degraded_search_note(&precheck.degraded_targets, mode);
-        }
-        if exact_search {
-            Vec::new()
-        } else {
-            maybe_apply_search_post_precheck_test_hooks()?;
-            precheck.targets.clone()
-        }
-    } else {
-        Vec::new()
-    };
-
-    let inferred_scope = if scope.is_none() && !federated {
-        tsift::config::Config::infer_submodule_from_path(&root, &base_path)?
-    } else {
-        None
-    };
-
-    let (symbol_hits, sift_path, federated_tagpath_diag) =
-        if let Some(scope) = inferred_scope.as_ref() {
-            let cfg = tsift::config::Config::load(&root)?;
-            let db_path = cfg.db_path_for(&root, &scope.id);
-            let hits = if db_path.exists() {
-                let db = tsift::index::IndexDb::open_read_only_resilient(&db_path)?;
-                db.symbol_search(&query, limit)?
-            } else {
-                Vec::new()
-            };
-            (hits, scope.source_root.clone(), None)
-        } else if let Some(ref scope_name) = scope {
-            let cfg = tsift::config::Config::load(&root)?;
-            let scope = tsift::config::Config::resolve_submodule(&root, scope_name)?;
-            let db_path = cfg.db_path_for(&root, &scope.id);
-            let hits = if db_path.exists() {
-                let db = tsift::index::IndexDb::open_read_only_resilient(&db_path)?;
-                db.symbol_search(&query, limit)?
-            } else {
-                Vec::new()
-            };
-            (hits, scope.source_root, None)
-        } else if federated {
-            let (hits, diag) = federated_symbol_search(&root, &query, limit, &tagpath_opts)?;
-            (hits, root.clone(), Some(diag))
-        } else {
-            let db_path = root.join(".tsift/index.db");
-            let hits = if db_path.exists() {
-                let db = tsift::index::IndexDb::open_read_only_resilient(&db_path)?;
-                db.symbol_search(&query, limit)?
-            } else {
-                Vec::new()
-            };
-            (hits, root.clone(), None)
-        };
-
-    let mut symbol_hits = symbol_hits;
-    // Use `sift_path` (which equals `scope.source_root` for scoped /
-    // inferred-scope paths and the workspace root otherwise) so the
-    // tagpath adapter walks for `.naming.toml` from the right project
-    // root. The previous behavior walked from the workspace root,
-    // which silently dropped handles when the submodule owned the
-    // tagpath project but the workspace did not — the same shape as
-    // the federated bug closed in #p6tsifullfederated (0.1.57).
-    let tagpath_diag = if let Some(diag) = federated_tagpath_diag {
-        diag
-    } else {
-        annotate_hits_with_tagpath(&mut symbol_hits, &sift_path, &tagpath_opts)?
-    };
-    if !absolute {
-        relativize_symbol_hits(&mut symbol_hits, &root);
-    }
-    if tagpath_diag.stale && !tagpath_opts.no_tagpath {
-        eprintln!(
-            "tagpath_index_stale: true (reason={}); falling back to live extraction",
-            tagpath_diag.reason.as_deref().unwrap_or("unknown"),
-        );
-    }
-
-    let response = if exact_search {
-        if federated && scope.is_none() {
-            federated_exact_search(&root, &query, limit, timeout_secs)?
-        } else {
-            let exact_path = if requested_exact_search && scope.is_none() {
-                &base_path
-            } else {
-                &sift_path
-            };
-            run_exact_search_with_timeout(exact_path, &query, limit, timeout_secs)?
-        }
-    } else if federated && scope.is_none() {
-        federated_sift_search(
-            &root,
-            &search_cache_dir,
-            &query,
-            limit,
-            timeout_secs,
-            &effective_strategy,
-        )?
-    } else {
-        run_search_with_timeout(
-            &sift_path,
-            &search_cache_dir,
-            &query,
-            limit,
-            timeout_secs,
-            &effective_strategy,
-            &search_targets,
-        )?
-    };
-
-    if budget.is_active() {
-        let report = build_search_budget_report(
-            &query,
-            &effective_strategy,
-            &root,
-            &response,
-            &symbol_hits,
-            absolute,
-            budget,
-        );
-        if format.json_output {
-            let mut follow_up = report
-                .scale_guard
-                .as_ref()
-                .map(|guard| guard.narrow_commands.clone())
-                .unwrap_or_default();
-            follow_up.push(build_search_budget_follow_up(
-                &query,
-                &effective_strategy,
-                base_path.to_string_lossy().as_ref(),
-            ));
-            if let Some(symbol) = report.symbols.first() {
-                follow_up.push(symbol.expand.clone());
-            }
-            if let Some(hit) = report.hits.first() {
-                follow_up.push(hit.expand.clone());
-            }
-            let report_truncated = report.truncated;
-            let mut report_value = serde_json::to_value(&report)?;
-            inject_tagpath_stale_into_json(
-                &mut report_value,
-                tagpath_diag.stale && !tagpath_opts.no_tagpath,
-                tagpath_diag.reason.as_deref(),
-            );
-            print_json_or_envelope(
-                &report_value,
-                &format,
-                "search",
-                "preview",
-                ToolEnvelopeSummary {
-                    text: format!("search preview for {}", query),
-                    metrics: vec![
-                        envelope_metric("strategy", &report.strategy),
-                        envelope_metric("symbols", report.symbol_total),
-                        envelope_metric("hits", report.hit_total),
-                        envelope_metric("indexed", report.indexed_artifacts),
-                        envelope_metric("skipped", report.skipped_artifacts),
-                    ],
-                },
-                report_truncated,
-                follow_up,
-            )?;
-        } else {
-            print_search_budget_human(&report);
-        }
-    } else if format.json_output {
-        #[derive(Serialize)]
-        struct CombinedResponse<'a> {
-            symbols: &'a [tsift::index::SymbolHit],
-            #[serde(flatten)]
-            sift: &'a serde_json::Value,
-        }
-        let mut sift_value = serde_json::to_value(&response)?;
-        if !absolute {
-            relativize_json_paths(&mut sift_value, &root);
-        }
-        let combined = CombinedResponse {
-            symbols: &symbol_hits,
-            sift: &sift_value,
-        };
-        let mut combined_value = serde_json::to_value(&combined)?;
-        inject_tagpath_stale_into_json(
-            &mut combined_value,
-            tagpath_diag.stale && !tagpath_opts.no_tagpath,
-            tagpath_diag.reason.as_deref(),
-        );
-        print_json_or_envelope(
-            &combined_value,
-            &format,
-            "search",
-            "report",
-            ToolEnvelopeSummary {
-                text: format!("search results for {}", query),
-                metrics: vec![
-                    envelope_metric("strategy", &effective_strategy),
-                    envelope_metric("symbols", symbol_hits.len()),
-                    envelope_metric("hits", response.hits.len()),
-                    envelope_metric("indexed", response.indexed_artifacts),
-                    envelope_metric("skipped", response.skipped_artifacts),
-                ],
-            },
-            false,
-            vec![build_search_budget_follow_up(
-                &query,
-                &effective_strategy,
-                base_path.to_string_lossy().as_ref(),
-            )],
-        )?;
-    } else if tabular {
-        if !symbol_hits.is_empty() {
-            println!("match_type\tkind\tname\tfile\tline\tscore");
-            for hit in &symbol_hits {
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}",
-                    hit.match_type,
-                    hit.kind,
-                    hit.name,
-                    hit.file,
-                    hit.line,
-                    format_score(hit.score, true)
-                );
-            }
-        }
-        if !response.hits.is_empty() {
-            if !symbol_hits.is_empty() {
-                println!();
-            }
-            println!("rank\tpath\tconfidence\tscore");
-            for hit in &response.hits {
-                let hp = if absolute {
-                    hit.path.clone()
-                } else {
-                    relativize(&hit.path, &root)
-                };
-                println!(
-                    "{}\t{}\t{:?}\t{}",
-                    hit.rank,
-                    hp,
-                    hit.confidence,
-                    format_score(hit.score, true)
-                );
-            }
-        }
-        if symbol_hits.is_empty() && response.hits.is_empty() {
-            println!("(none)");
-        }
-    } else if compact {
-        if !symbol_hits.is_empty() {
-            println!("syms[{}]:", symbol_hits.len());
-            for (i, hit) in symbol_hits.iter().enumerate() {
-                println!(
-                    "  {}. [{}] {} {} {}:{} {}",
-                    i + 1,
-                    abbreviate_match_type(&hit.match_type),
-                    abbreviate_kind(&hit.kind),
-                    hit.name,
-                    hit.file,
-                    hit.line,
-                    format_score(hit.score, true)
-                );
-            }
-        }
-
-        println!("hits[{}]:", response.hits.len());
-        if should_collapse_search_hits(&response.hits, &root, absolute) {
-            for group in group_search_hits(&response.hits, &root, absolute) {
-                let sample_suffix = if group.samples.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {}", group.samples.join(" | "))
-                };
-                println!(
-                    "  {}. {} [{} {} hits:{}]{}",
-                    group.first_rank,
-                    group.path,
-                    group.confidence,
-                    format_score(group.top_score, true),
-                    group.hits,
-                    sample_suffix
-                );
-            }
-        } else {
-            for hit in &response.hits {
-                let hp = if absolute {
-                    hit.path.clone()
-                } else {
-                    relativize(&hit.path, &root)
-                };
-                let snippet = compact_snippet(&hit.snippet).unwrap_or_default();
-                if snippet.is_empty() {
-                    println!(
-                        "  {}. {} [{:?} {}]",
-                        hit.rank,
-                        hp,
-                        hit.confidence,
-                        format_score(hit.score, true)
-                    );
-                } else {
-                    println!(
-                        "  {}. {} [{:?} {}] {}",
-                        hit.rank,
-                        hp,
-                        hit.confidence,
-                        format_score(hit.score, true),
-                        snippet
-                    );
-                }
-            }
-        }
-        if symbol_hits.is_empty() && response.hits.is_empty() {
-            println!("  (none)");
-        }
-    } else {
-        if !symbol_hits.is_empty() {
-            println!("Symbol matches ({}):", symbol_hits.len());
-            println!();
-            for (i, hit) in symbol_hits.iter().enumerate() {
-                println!(
-                    "  #{} [{}] {} {} ({}:{}) score: {:.4}",
-                    i + 1,
-                    hit.match_type,
-                    hit.kind,
-                    hit.name,
-                    hit.file,
-                    hit.line,
-                    hit.score
-                );
-            }
-            println!();
-        }
-
-        println!(
-            "Strategy: {} | Indexed: {} | Skipped: {}",
-            response.strategy, response.indexed_artifacts, response.skipped_artifacts
-        );
-        println!();
-        if should_collapse_search_hits(&response.hits, &root, absolute) {
-            let groups = group_search_hits(&response.hits, &root, absolute);
-            println!(
-                "File matches ({} files / {} hits):",
-                groups.len(),
-                response.hits.len()
-            );
-            println!();
-            for group in groups {
-                println!(
-                    "  #{} [{}] {} (hits: {}, top score: {:.4})",
-                    group.first_rank, group.confidence, group.path, group.hits, group.top_score
-                );
-                for sample in &group.samples {
-                    println!("    {}", sample);
-                }
-                let hidden_hits = group.hits.saturating_sub(group.samples.len());
-                if hidden_hits > 0 {
-                    println!("    (+{} more hits in file)", hidden_hits);
-                }
-                println!();
-            }
-        } else {
-            for hit in &response.hits {
-                let hp = if absolute {
-                    hit.path.clone()
-                } else {
-                    relativize(&hit.path, &root)
-                };
-                println!(
-                    "  #{} [{:?}] {} (score: {:.4})",
-                    hit.rank, hit.confidence, hp, hit.score
-                );
-                if !hit.snippet.is_empty() {
-                    for line in hit.snippet.lines().take(3) {
-                        println!("    {}", line);
-                    }
-                }
-                println!();
-            }
-        }
-        if symbol_hits.is_empty() && response.hits.is_empty() {
-            println!("  No results.");
-        }
-    }
-    Ok(())
-}
 
 #[derive(Serialize)]
 struct SearchBudgetSymbolPreview {
@@ -27349,7 +26577,7 @@ fn format_search_budget_symbol_file(file: &str, file_count: usize, max_bytes: us
     truncate_for_budget(&preview, max_bytes)
 }
 
-fn build_search_budget_follow_up(query: &str, strategy: &str, path: &str) -> String {
+pub(crate) fn build_search_budget_follow_up(query: &str, strategy: &str, path: &str) -> String {
     let mut command = format!(
         "tsift search {} --path {} --limit 20",
         shell_quote(query),
@@ -27452,7 +26680,7 @@ fn build_search_scale_guard(
     })
 }
 
-fn build_search_budget_report(
+pub(crate) fn build_search_budget_report(
     query: &str,
     strategy: &str,
     root: &Path,
@@ -27625,7 +26853,7 @@ fn build_search_budget_report(
     }
 }
 
-fn print_search_budget_human(report: &SearchBudgetReport) {
+pub(crate) fn print_search_budget_human(report: &SearchBudgetReport) {
     println!(
         "search-budget q:{} strategy:{} symbols:{}/{} raw-symbols:{} hits:{}/{} indexed:{} skipped:{}",
         shell_quote(&report.query),
@@ -27884,30 +27112,6 @@ fn cmd_lint(
     Ok(())
 }
 
-fn cmd_search_worker(
-    path: &Path,
-    cache_dir: &Path,
-    query: &str,
-    limit: usize,
-    strategy: &str,
-    output: &Path,
-) -> Result<()> {
-    maybe_apply_search_worker_test_hooks()?;
-    let response = run_sift_search(path, cache_dir, query, limit, strategy)?;
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output)
-        .with_context(|| format!("creating search worker output: {}", output.display()))?;
-    serde_json::to_writer(&mut file, &response)
-        .with_context(|| format!("writing search worker output: {}", output.display()))?;
-    file.flush()
-        .with_context(|| format!("flushing search worker output: {}", output.display()))?;
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -37710,7 +36914,7 @@ fn merge_search_responses(
     }
 }
 
-fn federated_sift_search(
+pub(crate) fn federated_sift_search(
     root: &Path,
     cache_dir: &Path,
     query: &str,
@@ -37760,7 +36964,7 @@ fn federated_sift_search(
 /// own). The merged `TagpathAnnotationDiagnostic` reports `loaded=true` when
 /// at least one scope loaded, and `stale=true` with the first stale reason
 /// when any scope was stale.
-fn federated_symbol_search(
+pub(crate) fn federated_symbol_search(
     root: &std::path::Path,
     query: &str,
     limit: usize,
@@ -37819,7 +37023,7 @@ struct RipgrepTextField {
     text: Option<String>,
 }
 
-fn federated_exact_search(
+pub(crate) fn federated_exact_search(
     root: &Path,
     query: &str,
     limit: usize,
@@ -37841,7 +37045,7 @@ fn federated_exact_search(
     Ok(merge_search_responses(root, "exact", limit, responses))
 }
 
-fn run_sift_search(
+pub(crate) fn run_sift_search(
     search_path: &Path,
     cache_dir: &Path,
     query: &str,
@@ -37995,7 +37199,7 @@ fn run_exact_search(search_path: &Path, query: &str, limit: usize) -> Result<tsi
     )
 }
 
-fn run_exact_search_with_timeout(
+pub(crate) fn run_exact_search_with_timeout(
     search_path: &Path,
     query: &str,
     limit: usize,
@@ -38033,7 +37237,7 @@ fn run_exact_search_with_timeout(
     )
 }
 
-fn run_search_with_timeout(
+pub(crate) fn run_search_with_timeout(
     search_path: &Path,
     cache_dir: &Path,
     query: &str,
@@ -38146,7 +37350,7 @@ fn read_child_stdout(child: &mut std::process::Child) -> Result<String> {
     Ok(stdout)
 }
 
-fn maybe_apply_search_worker_test_hooks() -> Result<()> {
+pub(crate) fn maybe_apply_search_worker_test_hooks() -> Result<()> {
     if let Ok(path) = std::env::var("TSIFT_TEST_SEARCH_WORKER_PID_FILE") {
         fs::write(&path, std::process::id().to_string())
             .with_context(|| format!("writing search worker pid file: {path}"))?;
@@ -38215,7 +37419,7 @@ fn install_search_post_precheck_lock_hook(
 }
 
 #[cfg(test)]
-fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
+pub(crate) fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
     let Some(hook) = SEARCH_POST_PRECHECK_LOCK_HOOK.with(|hook| hook.borrow_mut().take()) else {
         return Ok(());
     };
@@ -38254,6 +37458,6 @@ fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
 }
 
 #[cfg(not(test))]
-fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
+pub(crate) fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
     Ok(())
 }
