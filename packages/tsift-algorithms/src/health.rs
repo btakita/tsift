@@ -23,6 +23,7 @@ pub struct HealthReport {
     pub edge_count: usize,
 }
 
+#[allow(clippy::type_complexity)]
 fn build_graph(edges: &[(String, String)]) -> (Vec<String>, HashMap<String, usize>, Vec<HashSet<usize>>, Vec<HashSet<usize>>) {
     let mut node_vec: Vec<String> = Vec::new();
     let mut node_idx: HashMap<String, usize> = HashMap::new();
@@ -76,6 +77,7 @@ fn find_cycles(n: usize, adj: &[HashSet<usize>]) -> HashSet<usize> {
     let mut indices = vec![None::<usize>; n];
     let mut lowlinks = vec![0usize; n];
 
+    #[allow(clippy::too_many_arguments)]
     fn strongconnect(
         v: usize,
         adj: &[HashSet<usize>],

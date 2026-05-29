@@ -86,11 +86,11 @@ pub fn detect_dead_code(
     let mut reachable = vec![false; n];
     let mut queue: VecDeque<usize> = VecDeque::new();
     for name in entry_points {
-        if let Some(&idx) = node_idx.get(name) {
-            if !reachable[idx] {
-                reachable[idx] = true;
-                queue.push_back(idx);
-            }
+        if let Some(&idx) = node_idx.get(name)
+            && !reachable[idx]
+        {
+            reachable[idx] = true;
+            queue.push_back(idx);
         }
     }
 

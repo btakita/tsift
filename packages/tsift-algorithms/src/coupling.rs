@@ -51,8 +51,8 @@ pub fn coupling_analysis(
 
     for name in &module_list {
         let m = name.to_string();
-        efferent.entry(m.clone()).or_insert_with(HashSet::new);
-        afferent.entry(m).or_insert_with(HashSet::new);
+        efferent.entry(m.clone()).or_default();
+        afferent.entry(m).or_default();
     }
 
     for (from, to) in edges {

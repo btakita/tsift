@@ -8,9 +8,8 @@ use cli::{
     TraverseFormat,
 };
 use output::{
-    DEFAULT_BUDGET_BYTES, DEFAULT_BUDGET_ITEMS, DEFAULT_FOLLOW_UP_ITEMS, OutputFormat,
-    ResponseBudget, ResponseBudgetPreset, ToolEnvelope, ToolEnvelopeMetric, ToolEnvelopeSummary,
-    TranscriptArtifactRef,
+    OutputFormat, ResponseBudget, ResponseBudgetPreset, ToolEnvelope, ToolEnvelopeMetric,
+    ToolEnvelopeSummary, TranscriptArtifactRef,
 };
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use rusqlite::{Connection, OptionalExtension};

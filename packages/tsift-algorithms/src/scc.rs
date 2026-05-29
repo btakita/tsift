@@ -56,6 +56,7 @@ pub fn tarjan_scc(edges: &[(String, String)]) -> SccResult {
     let mut stack: Vec<usize> = Vec::new();
     let mut components: Vec<Vec<usize>> = Vec::new();
 
+    #[allow(clippy::too_many_arguments)]
     fn strongconnect(
         v: usize,
         adj: &[Vec<usize>],

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::Serialize;
-use tsift_core::{GraphEdge, GraphFreshness, GraphNode};
+use tsift_core::{GraphEdge, GraphNode};
 
 pub const COMMUNITY_MIN_HANDLE_COVERAGE_PCT: f64 = 95.0;
 pub const COMMUNITY_MIN_DUPLICATE_NAME_PRECISION: f64 = 0.99;
