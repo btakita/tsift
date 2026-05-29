@@ -69,6 +69,13 @@ tsift (CLI + MCP plugin)
 │   ├── summarize module — SummaryDb (read-only / read-write opens), entities/relationships/concepts JSON, snapshot fallback for rollback-journal contention, Anthropic API extract pipeline
 │   ├── shared by tsift-digest (diff/log/test consume cached summaries) and the future tsift-search crate
 │   └── re-exported via root `tsift` `pub use tsift_summarize::summarize;`
+├── tsift-digest crate (packages/tsift-digest — code-aware digest emitters)
+│   ├── diff_digest module — worktree/staged/revision diff digest, touched symbols, call-edge deltas (uses tsift-graph)
+│   ├── log_digest module — bounded verbose-log digest, repeat collapse, signal grouping
+│   ├── metric_digest module — repeated metric-run deltas + news tables (self-contained)
+│   ├── test_digest module — grouped test-failure digest (cargo/pytest)
+│   ├── depends on tsift-graph (diff edges + Lang), tsift-quality (lint/runtime_churn), tsift-summarize (SummaryDb enrichment)
+│   └── re-exported via root `tsift` `pub use tsift_digest::{diff_digest, log_digest, metric_digest, test_digest};`
 ├── tsift-cli crate (packages/tsift-cli — CLI dispatch, command handlers, output formatting)
 │   ├── clap CLI types — Cli, Commands, GraphDbQuery, output format enums
 │   ├── command handlers — cmd_search, cmd_index, cmd_graph, cmd_communities, cmd_explain, etc.

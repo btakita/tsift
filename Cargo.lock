@@ -2746,6 +2746,7 @@ dependencies = [
  "tree-sitter",
  "tsift-algorithms",
  "tsift-core",
+ "tsift-digest",
  "tsift-graph",
  "tsift-index",
  "tsift-libsql",
@@ -2804,6 +2805,19 @@ dependencies = [
  "blake3",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "tsift-digest"
+version = "0.1.62"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tsift-graph",
+ "tsift-quality",
+ "tsift-summarize",
 ]
 
 [[package]]

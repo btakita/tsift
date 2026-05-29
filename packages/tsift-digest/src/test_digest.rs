@@ -1,4 +1,4 @@
-use crate::summarize::{self, SummaryDb};
+use tsift_summarize::summarize::{self, SummaryDb};
 use anyhow::{Result, bail};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -140,7 +140,7 @@ struct FailureGroupBuilder {
 }
 
 pub fn compute(path: &Path, input: &str, runner: Option<&str>) -> Result<TestDigestReport> {
-    let root = crate::lint::resolve_harness_root_or_canonical_path(path)?;
+    let root = tsift_quality::lint::resolve_harness_root_or_canonical_path(path)?;
     let selected_runner = match runner {
         Some(raw) => {
             let parsed = TestRunner::parse(raw)?;
@@ -662,7 +662,7 @@ fn parse_anchor_token(token: &str) -> Option<Anchor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::summarize::Summary;
+    use tsift_summarize::summarize::Summary;
 
     #[test]
     fn cargo_digest_groups_duplicate_failures_and_reads_counts() {

@@ -1,7 +1,7 @@
-use crate::graph;
-use crate::lang::Lang;
-use crate::lint;
-use crate::summarize::{self, SummaryDb};
+use tsift_graph as graph;
+use tsift_graph::lang::Lang;
+use tsift_quality::lint;
+use tsift_summarize::summarize::{self, SummaryDb};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -712,7 +712,7 @@ fn git_has_head_commit(root: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::summarize::Summary;
+    use tsift_summarize::summarize::Summary;
 
     fn init_git_repo(path: &Path) {
         let status = Command::new("git")

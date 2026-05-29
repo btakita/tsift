@@ -1,5 +1,5 @@
-use crate::runtime_churn;
-use crate::summarize::{self, SummaryDb};
+use tsift_quality::runtime_churn;
+use tsift_summarize::summarize::{self, SummaryDb};
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -129,7 +129,7 @@ struct FileRefBuilder {
 }
 
 pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
-    let root = crate::lint::resolve_harness_root_or_canonical_path(path)?;
+    let root = tsift_quality::lint::resolve_harness_root_or_canonical_path(path)?;
     let summary_db = open_summary_db_if_present(&root)?;
 
     let mut repeated_lines = BTreeMap::<String, usize>::new();
@@ -917,7 +917,7 @@ fn is_symbol_char(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::summarize::Summary;
+    use tsift_summarize::summarize::Summary;
 
     #[test]
     fn log_digest_collapses_repeats_and_enriches_paths_and_symbols() {
