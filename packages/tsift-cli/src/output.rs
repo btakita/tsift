@@ -5,12 +5,16 @@
 //! - `ResponseBudget` + `ResponseBudgetPreset` — adaptive item/byte budgets for envelope-wrapped previews
 //! - `DEFAULT_BUDGET_*` constants
 //!
-//! `ToolEnvelope`, `TranscriptArtifactRef`, `TagpathSearchOpts`, `TagpathAnnotationDiagnostic`,
-//! and the `annotate_*_with_tagpath` family stay in `lib.rs` for now; they pull in
-//! cross-cutting types (`CommunityResult`, `CommunityMemberAmbiguityDiagnostic`) that are
-//! cleaner to move alongside the graph/community command cluster in a later sub-phase.
+//! Phase 1a-ii:
+//! - `ToolEnvelope` + `ToolEnvelopeMetric` + `ToolEnvelopeSummary` — summary-wrapping JSON envelope
+//! - `TranscriptArtifactRef` — session-transcript artifact reference
+//!
+//! `TagpathSearchOpts`, `TagpathAnnotationDiagnostic`, and the `annotate_*_with_tagpath`
+//! family still live in `lib.rs`; they pull in cross-cutting types
+//! (`CommunityResult`, `CommunityMemberAmbiguityDiagnostic`) and land in Phase 1a-iii.
 
 use clap::ValueEnum;
+use serde::Serialize;
 
 pub(crate) const DEFAULT_BUDGET_ITEMS: usize = 5;
 pub(crate) const DEFAULT_BUDGET_BYTES: usize = 160;
@@ -94,6 +98,38 @@ impl ResponseBudgetPreset {
             ResponseBudgetPreset::Auto => adaptive_response_budget(),
         }
     }
+}
+
+#[derive(Serialize)]
+pub(crate) struct ToolEnvelopeMetric {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ToolEnvelopeSummary {
+    pub text: String,
+    pub metrics: Vec<ToolEnvelopeMetric>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ToolEnvelope<'a, T: Serialize> {
+    pub tool: &'a str,
+    pub view: &'a str,
+    pub summary: ToolEnvelopeSummary,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub follow_up: Vec<String>,
+    pub report: &'a T,
+}
+
+#[derive(Serialize)]
+pub(crate) struct TranscriptArtifactRef {
+    pub handle: String,
+    pub path: String,
+    pub bytes: usize,
+    pub lines: usize,
+    pub expand: String,
 }
 
 fn adaptive_response_budget() -> ResponseBudget {

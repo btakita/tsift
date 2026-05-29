@@ -4,7 +4,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use output::{
     DEFAULT_BUDGET_BYTES, DEFAULT_BUDGET_ITEMS, DEFAULT_FOLLOW_UP_ITEMS, OutputFormat,
-    ResponseBudget, ResponseBudgetPreset,
+    ResponseBudget, ResponseBudgetPreset, ToolEnvelope, ToolEnvelopeMetric, ToolEnvelopeSummary,
+    TranscriptArtifactRef,
 };
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use rusqlite::{Connection, OptionalExtension};
@@ -1207,38 +1208,6 @@ struct EditOp {
     /// Replace all occurrences (default: false — fails if not unique)
     #[serde(default)]
     replace_all: bool,
-}
-
-#[derive(Serialize)]
-struct ToolEnvelopeMetric {
-    label: String,
-    value: String,
-}
-
-#[derive(Serialize)]
-struct ToolEnvelopeSummary {
-    text: String,
-    metrics: Vec<ToolEnvelopeMetric>,
-}
-
-#[derive(Serialize)]
-struct ToolEnvelope<'a, T: Serialize> {
-    tool: &'a str,
-    view: &'a str,
-    summary: ToolEnvelopeSummary,
-    truncated: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    follow_up: Vec<String>,
-    report: &'a T,
-}
-
-#[derive(Serialize)]
-struct TranscriptArtifactRef {
-    handle: String,
-    path: String,
-    bytes: usize,
-    lines: usize,
-    expand: String,
 }
 
 struct MetricDigestOptions<'a> {
