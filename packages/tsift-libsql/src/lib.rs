@@ -1,11 +1,8 @@
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::Duration;
 use tsift_core::{
-    SQLITE_GRAPH_SCHEMA_VERSION,
-    GraphEdge, GraphNode, GraphPath, GraphPropertyFilter, GraphPagedSubgraph, GraphQueryOptions,
-    GraphStore, GraphSubgraph, GraphFreshness, GraphProvenance, GraphProjection,
+    GraphEdge, GraphNode, GraphPath, GraphStore, SQLITE_GRAPH_SCHEMA_VERSION,
 };
 
 fn block_on<F: std::future::Future>(rt: &tokio::runtime::Runtime, f: F) -> F::Output {
@@ -24,7 +21,7 @@ impl LibsqlGraphStore {
                 .with_context(|| format!("creating libsql graph substrate dir: {}", parent.display()))?;
         }
         let rt = tokio::runtime::Runtime::new().context("creating tokio runtime for libsql")?;
-        let db = libsql::Database::open(db_path.to_string_lossy().to_string())
+        let db = block_on(&rt, libsql::Builder::new_local(db_path).build())
             .with_context(|| format!("opening libsql graph substrate db: {}", db_path.display()))?;
         let conn = db.connect()
             .with_context(|| format!("connecting to libsql graph substrate db: {}", db_path.display()))?;
@@ -45,7 +42,8 @@ impl LibsqlGraphStore {
 
     pub fn in_memory() -> Result<Self> {
         let rt = tokio::runtime::Runtime::new().context("creating tokio runtime for libsql")?;
-        let db = libsql::Database::open(":memory:").context("opening in-memory libsql database")?;
+        let db = block_on(&rt, libsql::Builder::new_local(":memory:").build())
+            .context("opening in-memory libsql database")?;
         let conn = db.connect().context("connecting to in-memory libsql database")?;
         let store = Self { conn, rt };
         store.init_schema()?;
@@ -197,7 +195,7 @@ fn row_hash<T: serde::Serialize>(value: &T) -> Result<String> {
 fn replace_node_properties(conn: &libsql::Connection, rt: &tokio::runtime::Runtime, node_id: &str, properties: &BTreeMap<String, String>) -> Result<()> {
     block_on(rt, async {
         conn.execute("DELETE FROM graph_node_properties WHERE node_id = ?1", [node_id]).await?;
-        let mut stmt = conn.prepare(
+        let stmt = conn.prepare(
             "INSERT INTO graph_node_properties (node_id, key, value) VALUES (?1, ?2, ?3)"
         ).await?;
         for (key, value) in properties {
@@ -211,7 +209,7 @@ fn replace_node_properties(conn: &libsql::Connection, rt: &tokio::runtime::Runti
 fn replace_edge_properties(conn: &libsql::Connection, rt: &tokio::runtime::Runtime, edge_key: &str, properties: &BTreeMap<String, String>) -> Result<()> {
     block_on(rt, async {
         conn.execute("DELETE FROM graph_edge_properties WHERE edge_key = ?1", [edge_key.to_string()]).await?;
-        let mut stmt = conn.prepare(
+        let stmt = conn.prepare(
             "INSERT INTO graph_edge_properties (edge_key, key, value) VALUES (?1, ?2, ?3)"
         ).await?;
         for (key, value) in properties {
@@ -487,6 +485,7 @@ impl GraphStore for LibsqlGraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tsift_core::{GraphFreshness, GraphProjection, GraphProvenance};
 
     fn sample_provenance() -> GraphProvenance {
         GraphProvenance::new("fixture", "src/lib.rs:1").with_content_hash("hash-1")

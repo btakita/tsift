@@ -1,12 +1,9 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tsift_core::{
-    GraphEdge, GraphNode, GraphPath, GraphPagedSubgraph, GraphPropertyFilter, GraphQueryOptions,
-    GraphStore, GraphSubgraph,
-};
+use tsift_core::{GraphEdge, GraphNode, GraphPath, GraphStore};
 
 pub struct TokensaveDb {
     conn: Connection,

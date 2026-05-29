@@ -320,12 +320,12 @@ mod tests {
 
     #[test]
     fn neighborhood_depths_basic() {
-        let nodes = vec![
+        let nodes = [
             GraphNode::new("a", "file", "a"),
             GraphNode::new("b", "file", "b"),
             GraphNode::new("c", "file", "c"),
         ];
-        let edges = vec![
+        let edges = [
             GraphEdge::new("a", "b", "calls"),
             GraphEdge::new("b", "c", "calls"),
         ];
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn neighborhood_depths_missing_center() {
-        let nodes = vec![GraphNode::new("a", "file", "a")];
+        let nodes = [GraphNode::new("a", "file", "a")];
         let node_by_id = nodes.iter().map(|n| (n.id.clone(), n)).collect();
         let outgoing = BTreeMap::new();
         let depths = neighborhood_depths("missing", &node_by_id, &outgoing);
