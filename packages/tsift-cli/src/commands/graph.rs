@@ -1,7 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use anyhow::{Context, Result};
-use serde::Serialize;
+use anyhow::Result;
 
 use crate::cli::TraverseFormat;
 use crate::output::{OutputFormat, ResponseBudget, ToolEnvelopeSummary};

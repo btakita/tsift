@@ -9,9 +9,11 @@
 //! - `ToolEnvelope` + `ToolEnvelopeMetric` + `ToolEnvelopeSummary` — summary-wrapping JSON envelope
 //! - `TranscriptArtifactRef` — session-transcript artifact reference
 //!
-//! `TagpathSearchOpts`, `TagpathAnnotationDiagnostic`, and the `annotate_*_with_tagpath`
-//! family still live in `lib.rs`; they pull in cross-cutting types
-//! (`CommunityResult`, `CommunityMemberAmbiguityDiagnostic`) and land in Phase 1a-iii.
+//! Phase 1a-iii:
+//! - `tagpath` submodule — `TagpathSearchOpts`, `TagpathAnnotationDiagnostic`,
+//!   `CommunityMemberAmbiguityDiagnostic`, and the `annotate_*_with_tagpath` family.
+
+pub(crate) mod tagpath;
 
 use clap::ValueEnum;
 use serde::Serialize;
