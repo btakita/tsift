@@ -75,7 +75,11 @@ not hide write amplification. Use
 worker-context/source-handle/semantic handoff packets. Use `tsift graph-db
 related <phrase>` to turn natural-language concept phrases into semantic
 concept/entity seeds and expand incident/outgoing graph neighborhoods around
-them for knowledge retrieval. Use `tsift
+them for knowledge retrieval. Refresh also projects matching read-only
+`claude-mem` rows from a project-local `.claude-mem/claude-mem.db` or the
+default `~/.claude-mem/claude-mem.db`, including Chroma vector handles, so
+existing memory can seed those semantic graph queries without importing capture.
+Use `tsift
 conflict-matrix` to rank candidate worker scopes, flag shared
 file/symbol/test/config ownership, and emit first-class worker prompt packets
 with worker-result feedback, closure ranking controls, expansion commands, token

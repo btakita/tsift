@@ -65,6 +65,7 @@ use tsift_agent_doc::{session_digest, session_review};
 use tsift_digest::{diff_digest, log_digest, metric_digest, test_digest};
 use tsift_graph as graph;
 use tsift_index::{config, index, init, multiplicity, walk};
+use tsift_memory::{MemoryEvent, default_claude_mem_db_path, read_claude_mem_events};
 use tsift_quality::{dci_benchmark, lint, perf_gate};
 use tsift_resolution as resolution;
 use tsift_search::{impact, sift, tagpath_adapter};
@@ -4169,6 +4170,7 @@ fn edge_with_content_freshness(mut edge: SubstrateGraphEdge) -> Result<Substrate
 
 const SEMANTIC_EMBEDDING_DIM: usize = 32;
 const SEMANTIC_EMBEDDING_MODEL: &str = "tsift-local-hash-v1";
+const CLAUDE_MEM_GRAPH_LIMIT_PER_TABLE: usize = 200;
 
 fn semantic_related_kind_name(kind: SemanticRelatedKind) -> &'static str {
     match kind {
@@ -4341,6 +4343,255 @@ fn insert_semantic_edge(
     edge_map
         .entry((edge.from_id.clone(), edge.to_id.clone(), edge.kind.clone()))
         .or_insert(edge);
+}
+
+fn claude_mem_graph_db_path(root: &Path) -> Option<PathBuf> {
+    let project_local = root.join(".claude-mem").join("claude-mem.db");
+    if project_local.exists() {
+        return Some(project_local);
+    }
+    default_claude_mem_db_path().filter(|path| path.exists())
+}
+
+fn claude_mem_project_keys(root: &Path) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    keys.insert(root.to_string_lossy().to_string());
+    if let Ok(canonical) = root.canonicalize() {
+        keys.insert(canonical.to_string_lossy().to_string());
+    }
+    keys
+}
+
+fn claude_mem_event_matches_project(event: &MemoryEvent, project_keys: &BTreeSet<String>) -> bool {
+    event
+        .metadata
+        .get("project")
+        .is_some_and(|project| project_keys.contains(project))
+}
+
+fn claude_mem_event_key(event: &MemoryEvent) -> String {
+    event
+        .imported_id
+        .as_deref()
+        .unwrap_or(event.source_ref.as_str())
+        .to_string()
+}
+
+fn claude_mem_event_label(event: &MemoryEvent) -> String {
+    let first_line = event
+        .text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(event.kind.as_str());
+    match event.kind.as_str() {
+        "imported_observation" => {
+            let observation_type = event
+                .metadata
+                .get("observation_type")
+                .map(String::as_str)
+                .unwrap_or("observation");
+            truncate_for_compact(&format!("{observation_type}: {first_line}"), 80)
+        }
+        "imported_session_summary" => truncate_for_compact(&format!("summary: {first_line}"), 80),
+        "imported_user_prompt" => truncate_for_compact(&format!("prompt: {first_line}"), 80),
+        _ => truncate_for_compact(first_line, 80),
+    }
+}
+
+fn append_claude_mem_graph_projection_rows(
+    root: &Path,
+    nodes: &mut Vec<SubstrateGraphNode>,
+    edges: &mut Vec<SubstrateGraphEdge>,
+) -> Result<()> {
+    let Some(db_path) = claude_mem_graph_db_path(root) else {
+        return Ok(());
+    };
+    let read_report = match read_claude_mem_events(&db_path, CLAUDE_MEM_GRAPH_LIMIT_PER_TABLE) {
+        Ok(report) => report,
+        Err(_) => return Ok(()),
+    };
+    if read_report.events.is_empty() {
+        return Ok(());
+    }
+
+    let project_local = db_path.starts_with(root.join(".claude-mem"));
+    let project_keys = claude_mem_project_keys(root);
+    let mut project_sessions = BTreeSet::new();
+    for event in &read_report.events {
+        if (project_local || claude_mem_event_matches_project(event, &project_keys))
+            && let Some(session_id) = &event.session_id
+        {
+            project_sessions.insert(session_id.clone());
+        }
+    }
+
+    let selected_events = read_report
+        .events
+        .iter()
+        .filter(|event| {
+            project_local
+                || claude_mem_event_matches_project(event, &project_keys)
+                || event
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|session_id| project_sessions.contains(session_id))
+        })
+        .collect::<Vec<_>>();
+    if selected_events.is_empty() {
+        return Ok(());
+    }
+
+    let chroma_path = read_report
+        .plan
+        .chroma_present
+        .then_some(read_report.plan.chroma_path.as_deref())
+        .flatten();
+    let mut seen_sessions = BTreeSet::new();
+    let mut edge_map = BTreeMap::<(String, String, String), SubstrateGraphEdge>::new();
+
+    for event in selected_events {
+        let event_key = claude_mem_event_key(event);
+        let source_handle = stable_handle("cmemsrc", &event_key);
+        let semantic_handle = stable_handle("cmemsem", &event_key);
+        let provenance = GraphProvenance::new("claude-mem", &event.source_ref);
+
+        if let Some(session_id) = &event.session_id {
+            let session_handle = stable_handle("cmemsess", session_id);
+            if seen_sessions.insert(session_id.clone()) {
+                let session_node = SubstrateGraphNode::new(
+                    session_handle.clone(),
+                    "session",
+                    truncate_for_compact(session_id, 80),
+                )
+                .with_property("handle", session_handle.clone())
+                .with_property("ref_id", session_id.clone())
+                .with_property("session_id", session_id.clone())
+                .with_property("provider", "claude-mem")
+                .with_property(
+                    "expand",
+                    format!(
+                        "tsift memory status {} --json",
+                        shell_quote(root.to_string_lossy().as_ref())
+                    ),
+                )
+                .with_provenance(provenance.clone());
+                nodes.push(node_with_content_freshness(session_node)?);
+            }
+
+            insert_semantic_edge(
+                &mut edge_map,
+                SubstrateGraphEdge::new(
+                    session_handle,
+                    source_handle.clone(),
+                    "records_memory_source",
+                )
+                .with_property("label", "claude-mem session source")
+                .with_provenance(provenance.clone()),
+            );
+        }
+
+        let label = claude_mem_event_label(event);
+        let mut source_node =
+            SubstrateGraphNode::new(source_handle.clone(), "source_handle", label.clone())
+                .with_property("handle", source_handle.clone())
+                .with_property("ref_id", event.source_ref.clone())
+                .with_property("source_ref", event.source_ref.clone())
+                .with_property("provider", "claude-mem")
+                .with_property("memory_kind", event.kind.as_str())
+                .with_property("text_preview", truncate_for_compact(&event.text, 240))
+                .with_property("token_estimate", event.token_estimate.to_string())
+                .with_property(
+                    "expand",
+                    format!(
+                        "tsift memory status {} --json",
+                        shell_quote(root.to_string_lossy().as_ref())
+                    ),
+                )
+                .with_provenance(provenance.clone());
+        if let Some(session_id) = &event.session_id {
+            source_node = source_node.with_property("session_id", session_id.clone());
+        }
+        if let Some(observed_at_unix) = event.observed_at_unix {
+            source_node =
+                source_node.with_property("observed_at_unix", observed_at_unix.to_string());
+        }
+        if let Some(imported_id) = &event.imported_id {
+            source_node = source_node.with_property("imported_id", imported_id.clone());
+        }
+        nodes.push(node_with_content_freshness(source_node)?);
+
+        let semantic_text = format!("{} {}", label, event.text);
+        let semantic_node =
+            SubstrateGraphNode::new(semantic_handle.clone(), "semantic_concept", label.clone())
+                .with_property("handle", semantic_handle.clone())
+                .with_property("ref_id", event.source_ref.clone())
+                .with_property("detail", "read-only semantic row from claude-mem")
+                .with_property("source_ref", event.source_ref.clone())
+                .with_property("provider", "claude-mem")
+                .with_property("memory_kind", event.kind.as_str())
+                .with_property("embedding_model", SEMANTIC_EMBEDDING_MODEL)
+                .with_property("embedding", semantic_embedding_property(&semantic_text))
+                .with_property(
+                    "expand",
+                    semantic_related_command(root, &label, SemanticRelatedKind::Concept),
+                )
+                .with_provenance(provenance.clone());
+        nodes.push(node_with_content_freshness(semantic_node)?);
+
+        insert_semantic_edge(
+            &mut edge_map,
+            SubstrateGraphEdge::new(
+                source_handle.clone(),
+                semantic_handle.clone(),
+                "mentions_concept",
+            )
+            .with_property("label", "claude-mem semantic source")
+            .with_provenance(provenance.clone()),
+        );
+
+        if let Some(chroma_path) = chroma_path {
+            let vector_ref = format!("chroma://{}#{}", chroma_path, event_key);
+            let vector_handle = stable_handle("cmemvec", &vector_ref);
+            let vector_node = SubstrateGraphNode::new(
+                vector_handle.clone(),
+                "semantic_vector_handle",
+                format!("claude-mem vector {}", truncate_for_compact(&event_key, 48)),
+            )
+            .with_property("handle", vector_handle.clone())
+            .with_property("ref_id", vector_ref.clone())
+            .with_property("source_ref", event.source_ref.clone())
+            .with_property("provider", "chroma")
+            .with_property("vector_ref", vector_ref)
+            .with_property("owner_source_handle", source_handle.clone())
+            .with_property("embedding_model", "claude-mem-chroma")
+            .with_provenance(provenance.clone());
+            nodes.push(node_with_content_freshness(vector_node)?);
+
+            insert_semantic_edge(
+                &mut edge_map,
+                SubstrateGraphEdge::new(
+                    source_handle.clone(),
+                    vector_handle.clone(),
+                    "has_vector_handle",
+                )
+                .with_property("label", "claude-mem Chroma handle")
+                .with_provenance(provenance.clone()),
+            );
+            insert_semantic_edge(
+                &mut edge_map,
+                SubstrateGraphEdge::new(semantic_handle, vector_handle, "has_vector_handle")
+                    .with_property("label", "claude-mem semantic vector")
+                    .with_provenance(provenance),
+            );
+        }
+    }
+
+    for edge in edge_map.into_values() {
+        edges.push(edge_with_content_freshness(edge)?);
+    }
+
+    Ok(())
 }
 
 fn append_summary_semantic_projection_rows(
@@ -4612,6 +4863,7 @@ fn traversal_projection_from_graph(
 
     append_traversal_context_projection_rows(root, graph, &provenance, &mut nodes, &mut edges)?;
     append_summary_semantic_projection_rows(root, graph, &provenance, &mut nodes, &mut edges)?;
+    append_claude_mem_graph_projection_rows(root, &mut nodes, &mut edges)?;
 
     let projection_hash = projection_content_hash(&nodes, &edges)?;
     let meta = SubstrateGraphNode::new(
@@ -25146,6 +25398,120 @@ agent_doc_format: template
             .unwrap();
     }
 
+    fn seed_claude_mem_graph_db(dir: &Path) {
+        let claude_mem_dir = dir.join(".claude-mem");
+        std::fs::create_dir_all(claude_mem_dir.join("chroma")).unwrap();
+        let conn = Connection::open(claude_mem_dir.join("claude-mem.db")).unwrap();
+        conn.execute_batch(
+            r#"
+CREATE TABLE observations (
+  id INTEGER PRIMARY KEY,
+  memory_session_id TEXT NOT NULL,
+  project TEXT NOT NULL,
+  type TEXT NOT NULL,
+  title TEXT,
+  subtitle TEXT,
+  text TEXT,
+  facts TEXT,
+  narrative TEXT,
+  concepts TEXT,
+  prompt_number INTEGER,
+  discovery_tokens INTEGER NOT NULL,
+  created_at_epoch INTEGER NOT NULL,
+  content_hash TEXT
+);
+CREATE TABLE session_summaries (
+  id INTEGER PRIMARY KEY,
+  memory_session_id TEXT NOT NULL,
+  project TEXT NOT NULL,
+  request TEXT,
+  investigated TEXT,
+  learned TEXT,
+  completed TEXT,
+  next_steps TEXT,
+  notes TEXT,
+  prompt_number INTEGER,
+  discovery_tokens INTEGER NOT NULL,
+  created_at_epoch INTEGER NOT NULL
+);
+CREATE TABLE user_prompts (
+  id INTEGER PRIMARY KEY,
+  content_session_id TEXT NOT NULL,
+  prompt_number INTEGER NOT NULL,
+  prompt_text TEXT NOT NULL,
+  created_at_epoch INTEGER NOT NULL
+);
+"#,
+        )
+        .unwrap();
+        let project = dir.to_string_lossy().to_string();
+        conn.execute(
+            r#"
+INSERT INTO observations(
+  id, memory_session_id, project, type, title, subtitle, text, facts,
+  narrative, concepts, prompt_number, discovery_tokens, created_at_epoch,
+  content_hash
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+"#,
+            rusqlite::params![
+                1i64,
+                "claude-session-a",
+                &project,
+                "fact",
+                "Graph memory adapter",
+                "read-only projection",
+                "graph-db should retrieve claude mem observations",
+                "vector handles stay in Chroma",
+                "Project memory is queried without importing capture",
+                "graph memory, claude mem, semantic query",
+                7i64,
+                42i64,
+                1_700_000_000i64,
+                "hash-observation-1",
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            r#"
+INSERT INTO session_summaries(
+  id, memory_session_id, project, request, investigated, learned,
+  completed, next_steps, notes, prompt_number, discovery_tokens,
+  created_at_epoch
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+"#,
+            rusqlite::params![
+                2i64,
+                "claude-session-a",
+                &project,
+                "Query old memory from graph-db",
+                "Read-only claude mem SQLite projection",
+                "Semantic graph rows can point at existing memory",
+                "Projected source and session nodes",
+                "Keep capture ownership outside tsift",
+                "summary note",
+                8i64,
+                36i64,
+                1_700_000_010i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            r#"
+INSERT INTO user_prompts(
+  id, content_session_id, prompt_number, prompt_text, created_at_epoch
+) VALUES (?1, ?2, ?3, ?4, ?5)
+"#,
+            rusqlite::params![
+                3i64,
+                "claude-session-a",
+                9i64,
+                "How can graph-db query claude mem semantic history?",
+                1_700_000_020i64,
+            ],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn graph_callers_query() {
         let dir = setup_graph_index();
@@ -25562,6 +25928,94 @@ def list_items():
                 .any(|edge| edge.to_id == entity.handle
                     && edge.properties.get("relationship_kind") == Some(&"uses".to_string())),
             "expected LLM relationship rows projected into GraphStore"
+        );
+    }
+
+    #[test]
+    fn traversal_projection_materializes_read_only_claude_mem_rows() {
+        let dir = setup_traversal_project();
+        seed_claude_mem_graph_db(dir.path());
+        refresh_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
+        let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
+
+        let source = store
+            .nodes_by_kind("source_handle")
+            .unwrap()
+            .into_iter()
+            .find(|node| {
+                node.properties.get("source_ref") == Some(&"claude-mem:observations:1".to_string())
+            })
+            .expect("expected claude-mem source handle");
+        let session = store
+            .nodes_by_kind("session")
+            .unwrap()
+            .into_iter()
+            .find(|node| {
+                node.properties.get("provider") == Some(&"claude-mem".to_string())
+                    && node.properties.get("session_id") == Some(&"claude-session-a".to_string())
+            })
+            .expect("expected claude-mem session node");
+        let concept = store
+            .nodes_by_kind("semantic_concept")
+            .unwrap()
+            .into_iter()
+            .find(|node| {
+                node.properties.get("provider") == Some(&"claude-mem".to_string())
+                    && node.label.contains("Graph memory adapter")
+                    && node.properties.contains_key("embedding")
+            })
+            .expect("expected claude-mem semantic concept");
+        let vector = store
+            .nodes_by_kind("semantic_vector_handle")
+            .unwrap()
+            .into_iter()
+            .find(|node| {
+                node.properties.get("source_ref") == Some(&"claude-mem:observations:1".to_string())
+                    && node.properties.get("provider") == Some(&"chroma".to_string())
+            })
+            .expect("expected claude-mem Chroma vector handle");
+
+        assert!(
+            store
+                .outgoing_edges(&session.id, Some("records_memory_source"))
+                .unwrap()
+                .iter()
+                .any(|edge| edge.to_id == source.id),
+            "expected session to link to source handle"
+        );
+        assert!(
+            store
+                .outgoing_edges(&source.id, Some("mentions_concept"))
+                .unwrap()
+                .iter()
+                .any(|edge| edge.to_id == concept.id),
+            "expected source handle to seed semantic concept"
+        );
+        assert!(
+            store
+                .outgoing_edges(&source.id, Some("has_vector_handle"))
+                .unwrap()
+                .iter()
+                .any(|edge| edge.to_id == vector.id),
+            "expected source handle to link to Chroma vector ref"
+        );
+
+        let related = semantic_related_report_from_store(
+            dir.path(),
+            None,
+            "claude mem graph adapter",
+            5,
+            SemanticRelatedKind::Concept,
+            &store,
+        )
+        .unwrap();
+        assert!(
+            related
+                .items
+                .iter()
+                .any(|item| item.handle == concept.id && item.score > 0.0),
+            "expected semantic query to retrieve claude-mem concept, got {:?}",
+            related.items
         );
     }
 

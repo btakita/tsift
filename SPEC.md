@@ -74,8 +74,8 @@ tsift (root crate — public package shim: lib.rs + graph/lang/resolution/substr
 │   ├── exposes token-budgeted handoff planning so observer/plugin prompts split before model calls instead of overflowing
 │   ├── exposes a budget guard that rejects oversized raw tool/log/transcript payloads, replaces them with digest/context/session-review commands, and emits retryable chunk plans
 │   ├── defines agent-doc hook event contracts for prompt targets, tool artifacts, response summaries, closeout proof, and session-check results
-│   ├── projects memory events into provider-neutral graph nodes/edges (`memory_session`, `memory_event`) with source handles for later graph-db integration
-│   ├── imports the observed `claude-mem` SQLite tables (`observations`, `session_summaries`, `user_prompts`) as migration events while recording adjacent Chroma availability as external vector handles
+│   ├── projects memory events into provider-neutral graph nodes/edges (`memory_session`, `memory_event`) and read-only `claude-mem` rows into graph-db semantic/session/source/vector-handle nodes
+│   ├── reads the observed `claude-mem` SQLite tables (`observations`, `session_summaries`, `user_prompts`) without mutating them, can optionally migrate them as memory events, and records adjacent Chroma availability as external vector handles
 │   ├── exposes a query packet contract for future ranked, token-capped memory retrieval
 │   └── re-exported via root `tsift` as `tsift::memory`
 ├── tsift-session crate (packages/tsift-session — compatibility shim)
@@ -446,7 +446,7 @@ Traversal and `context-pack` JSON include an `exploration` packet for agent hand
 
 ## Semantic Graph Similarity
 
-`tsift semantic "<query>" --path .` refreshes the local traversal projection, reads semantic nodes through the `GraphStore` contract, and returns the nearest cached concepts/entities by cosine similarity over persisted local embeddings. The query path never calls a model or remote API: model/API usage remains behind explicit `tsift summarize --extract <path>` runs that populate `.tsift/summaries.db`. Semantic graph projection stores a deterministic `embedding_model=tsift-local-hash-v1` and `embedding` property on each `semantic_concept` / `semantic_entity` node so local SQLite, Convex snapshots, and HTML traversal all see the same semantic rows. Use `--kind concept`, `--kind entity`, or `--kind all`, `--limit N`, and `--json` for structured nearest-related-concepts output.
+`tsift semantic "<query>" --path .` refreshes the local traversal projection, reads semantic nodes through the `GraphStore` contract, and returns the nearest cached concepts/entities by cosine similarity over persisted local embeddings. The query path never calls a model or remote API: model/API usage remains behind explicit `tsift summarize --extract <path>` runs that populate `.tsift/summaries.db`. Semantic graph projection stores a deterministic `embedding_model=tsift-local-hash-v1` and `embedding` property on each `semantic_concept` / `semantic_entity` node so local SQLite, Convex snapshots, and HTML traversal all see the same semantic rows. When a project-local `.claude-mem/claude-mem.db` exists, or the default `~/.claude-mem/claude-mem.db` has rows whose `project` matches the current root, graph-db refresh also projects `claude-mem` observations, session summaries, user prompts, and adjacent Chroma handles as read-only semantic/session/source/vector-handle rows so existing memory can be queried without importing or owning capture. Use `--kind concept`, `--kind entity`, or `--kind all`, `--limit N`, and `--json` for structured nearest-related-concepts output.
 
 ### `impact`
 

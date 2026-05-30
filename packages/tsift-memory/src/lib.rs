@@ -842,23 +842,26 @@ pub struct ClaudeMemImportReport {
     pub plan: ClaudeMemImportPlan,
 }
 
-pub fn import_claude_mem(
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeMemReadReport {
+    pub contract_version: String,
+    pub source: String,
+    pub limit_per_table: usize,
+    pub events: Vec<MemoryEvent>,
+    pub plan: ClaudeMemImportPlan,
+}
+
+pub fn read_claude_mem_events(
     source_db_path: &Path,
-    target_memory_db_path: &Path,
     limit_per_table: usize,
-    dry_run: bool,
-) -> Result<ClaudeMemImportReport> {
+) -> Result<ClaudeMemReadReport> {
     let plan = inspect_claude_mem(source_db_path)?;
     if !plan.exists || !plan.readable {
-        return Ok(ClaudeMemImportReport {
+        return Ok(ClaudeMemReadReport {
             contract_version: MEMORY_CONTRACT_VERSION.to_string(),
             source: source_db_path.display().to_string(),
-            target: target_memory_db_path.display().to_string(),
-            dry_run,
             limit_per_table,
-            imported_events: 0,
-            planned_events: 0,
-            event_ids: Vec::new(),
+            events: Vec::new(),
             plan,
         });
     }
@@ -878,6 +881,38 @@ pub fn import_claude_mem(
         events.extend(read_claude_mem_user_prompts(&conn, limit_per_table)?);
     }
 
+    Ok(ClaudeMemReadReport {
+        contract_version: MEMORY_CONTRACT_VERSION.to_string(),
+        source: source_db_path.display().to_string(),
+        limit_per_table,
+        events,
+        plan,
+    })
+}
+
+pub fn import_claude_mem(
+    source_db_path: &Path,
+    target_memory_db_path: &Path,
+    limit_per_table: usize,
+    dry_run: bool,
+) -> Result<ClaudeMemImportReport> {
+    let read_report = read_claude_mem_events(source_db_path, limit_per_table)?;
+    let plan = read_report.plan;
+    if !plan.exists || !plan.readable {
+        return Ok(ClaudeMemImportReport {
+            contract_version: MEMORY_CONTRACT_VERSION.to_string(),
+            source: source_db_path.display().to_string(),
+            target: target_memory_db_path.display().to_string(),
+            dry_run,
+            limit_per_table,
+            imported_events: 0,
+            planned_events: 0,
+            event_ids: Vec::new(),
+            plan,
+        });
+    }
+
+    let events = read_report.events;
     let planned_events = events.len();
     let mut event_ids = Vec::new();
     if !dry_run {
@@ -1039,7 +1074,14 @@ fn join_non_empty(values: impl IntoIterator<Item = Option<String>>) -> String {
 }
 
 pub fn memory_graph_node_kinds() -> Vec<&'static str> {
-    vec!["memory_session", "memory_event"]
+    vec![
+        "memory_session",
+        "memory_event",
+        "session",
+        "source_handle",
+        "semantic_concept",
+        "semantic_vector_handle",
+    ]
 }
 
 pub fn project_memory_events(events: &[MemoryEvent]) -> GraphProjection {

@@ -10,4 +10,6 @@ Current surfaces:
 - `plan_capture_handoff` estimates tokens before model calls and reports split/defer decisions.
 - `guard_memory_handoff` fails closed on oversized raw payloads and emits digest/context replacements plus retryable chunk commands.
 - `project_memory_events` maps memory events into provider-neutral graph nodes/edges.
-- `inspect_claude_mem` and `import_claude_mem` read the observed `claude-mem` SQLite schema and optionally import events into the tsift memory DB.
+- `inspect_claude_mem` and `read_claude_mem_events` inspect the observed `claude-mem` SQLite schema without writing to it.
+- `import_claude_mem` optionally migrates those events into the tsift memory DB.
+- Graph-db refresh can project matching `claude-mem` observations, session summaries, user prompts, and adjacent Chroma handles as read-only semantic/session/source rows without taking over capture ownership.
