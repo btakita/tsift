@@ -3,32 +3,20 @@ use std::io::Read as _;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use tsift_agent_doc::{session_cost, session_digest, session_review};
+use tsift_digest::{diff_digest, metric_digest};
+use tsift_quality::lint;
 
 use crate::output::{OutputFormat, ResponseBudget, ToolEnvelopeSummary};
 use crate::{
-    build_context_pack_report,
-    build_session_review_budget_report,
-    build_session_review_next_context_budget_report,
-    build_traversal_graph,
-    diff_digest_empty_message,
-    diff_digest_mode_display,
-    diff_digest_mode_label,
-    diff_digest_status_label,
-    diff_digest_summary_label,
-    envelope_metric,
-    format_compact_count,
-    metric_digest_gate_label,
-    MetricDigestOptions,
-    metric_digest_trend_label,
-    print_context_pack_human,
-    print_json_or_envelope,
-    print_session_review_budget_human,
-    print_session_review_next_context_budget_human,
-    render_log_digest_from_input,
-    render_test_digest_from_input,
-    shell_quote,
-    to_json_schema,
-    truncate_for_compact,
+    MetricDigestOptions, build_context_pack_report, build_session_review_budget_report,
+    build_session_review_next_context_budget_report, build_traversal_graph,
+    diff_digest_empty_message, diff_digest_mode_display, diff_digest_mode_label,
+    diff_digest_status_label, diff_digest_summary_label, envelope_metric, format_compact_count,
+    metric_digest_gate_label, metric_digest_trend_label, print_context_pack_human,
+    print_json_or_envelope, print_session_review_budget_human,
+    print_session_review_next_context_budget_human, render_log_digest_from_input,
+    render_test_digest_from_input, shell_quote, to_json_schema, truncate_for_compact,
     verify_convex_projection_snapshot,
 };
 
@@ -38,9 +26,9 @@ pub(crate) fn cmd_diff_digest(
     revision: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
-    let report = tsift::diff_digest::compute(
+    let report = diff_digest::compute(
         path,
-        tsift::diff_digest::DiffDigestOptions {
+        diff_digest::DiffDigestOptions {
             cached,
             revision,
             max_parsed_files: None,
@@ -163,7 +151,11 @@ pub(crate) fn cmd_test_digest(
     render_test_digest_from_input(path, &input, runner, format)
 }
 
-pub(crate) fn cmd_log_digest(path: &Path, input_path: Option<&Path>, format: OutputFormat) -> Result<()> {
+pub(crate) fn cmd_log_digest(
+    path: &Path,
+    input_path: Option<&Path>,
+    format: OutputFormat,
+) -> Result<()> {
     let input = match input_path {
         Some(file_path) => fs::read_to_string(file_path)
             .with_context(|| format!("reading log output: {}", file_path.display()))?,
@@ -192,7 +184,7 @@ pub(crate) fn cmd_context_pack(
     convex_snapshot: Option<&Path>,
 ) -> Result<()> {
     if let Some(snapshot) = convex_snapshot {
-        let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
+        let root = lint::resolve_project_root_or_canonical_path(path)?;
         build_traversal_graph(&root, path, None)?;
         verify_convex_projection_snapshot(&root, None, snapshot)?;
     }
@@ -235,7 +227,10 @@ pub(crate) fn cmd_context_pack(
     Ok(())
 }
 
-pub(crate) fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: OutputFormat) -> Result<()> {
+pub(crate) fn cmd_metric_digest(
+    options: MetricDigestOptions<'_>,
+    format: OutputFormat,
+) -> Result<()> {
     let input = match options.input_path {
         Some(file_path) => fs::read_to_string(file_path)
             .with_context(|| format!("reading metric input: {}", file_path.display()))?,
@@ -259,7 +254,7 @@ pub(crate) fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: Output
         None => None,
     };
 
-    let report = tsift::metric_digest::compute(
+    let report = metric_digest::compute(
         &input,
         baseline.as_deref(),
         options.metrics,
@@ -295,9 +290,9 @@ pub(crate) fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: Output
             println!(
                 "{} current:{} prev:{} delta:{} trend:{}",
                 delta.metric,
-                tsift::metric_digest::format_number(delta.current),
-                tsift::metric_digest::format_number(delta.previous),
-                tsift::metric_digest::format_number(delta.delta),
+                metric_digest::format_number(delta.current),
+                metric_digest::format_number(delta.previous),
+                metric_digest::format_number(delta.delta),
                 metric_digest_trend_label(delta.trend)
             );
         }
@@ -328,7 +323,7 @@ pub(crate) fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: Output
         println!();
         println!("Current metrics:");
         for (metric, value) in &report.current_run.metrics {
-            println!("  {}: {}", metric, tsift::metric_digest::format_number(*value));
+            println!("  {}: {}", metric, metric_digest::format_number(*value));
         }
     } else {
         println!();
@@ -341,9 +336,9 @@ pub(crate) fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: Output
             println!(
                 "  {}: {} (prev {}, delta {:+}{}; {})",
                 delta.metric,
-                tsift::metric_digest::format_number(delta.current),
-                tsift::metric_digest::format_number(delta.previous),
-                tsift::metric_digest::format_number(delta.delta),
+                metric_digest::format_number(delta.current),
+                metric_digest::format_number(delta.previous),
+                metric_digest::format_number(delta.delta),
                 percent,
                 metric_digest_trend_label(delta.trend)
             );
@@ -357,8 +352,8 @@ pub(crate) fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: Output
             println!(
                 "  {}: {} -> {}",
                 delta.metric,
-                tsift::metric_digest::format_number(delta.previous),
-                tsift::metric_digest::format_number(delta.current)
+                metric_digest::format_number(delta.previous),
+                metric_digest::format_number(delta.current)
             );
         }
     }
@@ -370,8 +365,8 @@ pub(crate) fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: Output
             println!(
                 "  {}: {} -> {}",
                 delta.metric,
-                tsift::metric_digest::format_number(delta.previous),
-                tsift::metric_digest::format_number(delta.current)
+                metric_digest::format_number(delta.previous),
+                metric_digest::format_number(delta.current)
             );
         }
     }
@@ -406,26 +401,26 @@ pub(crate) fn cmd_metric_digest(options: MetricDigestOptions<'_>, format: Output
                     .unwrap_or_default();
                 println!(
                     "    duration_micros: {}{}",
-                    tsift::metric_digest::format_number(duration),
+                    metric_digest::format_number(duration),
                     regression
                 );
             }
             if let Some(coverage) = workload.handle_coverage_pct {
                 println!(
                     "    handle_coverage_pct: {}",
-                    tsift::metric_digest::format_number(coverage)
+                    metric_digest::format_number(coverage)
                 );
             }
             if let Some(precision) = workload.duplicate_name_precision {
                 println!(
                     "    duplicate_name_precision: {}",
-                    tsift::metric_digest::format_number(precision)
+                    metric_digest::format_number(precision)
                 );
             }
             if let Some(stability) = workload.top_community_stability {
                 println!(
                     "    top_community_stability: {}",
-                    tsift::metric_digest::format_number(stability)
+                    metric_digest::format_number(stability)
                 );
             }
             for diagnostic in &workload.diagnostics {
@@ -461,7 +456,7 @@ pub(crate) fn cmd_session_digest(
         bail!("no session input provided; pass --input <file> or pipe transcript on stdin");
     }
 
-    let report = tsift::session_digest::compute(path, &input, source)?;
+    let report = session_digest::compute(path, &input, source)?;
     if format.json_output {
         println!(
             "{}",
@@ -653,7 +648,7 @@ pub(crate) fn cmd_session_cost(
         );
     }
 
-    let report = tsift::session_cost::compute(&input, source)?;
+    let report = session_cost::compute(&input, source)?;
     if format.json_output {
         println!(
             "{}",
@@ -866,7 +861,11 @@ pub(crate) fn cmd_session_cost(
 }
 
 #[allow(dead_code)]
-pub(crate) fn cmd_session_review(path: &Path, next_context: bool, format: OutputFormat) -> Result<()> {
+pub(crate) fn cmd_session_review(
+    path: &Path,
+    next_context: bool,
+    format: OutputFormat,
+) -> Result<()> {
     cmd_session_review_with_budget(path, next_context, format, ResponseBudget::default())
 }
 
@@ -876,7 +875,7 @@ pub(crate) fn cmd_session_review_with_budget(
     format: OutputFormat,
     budget: ResponseBudget,
 ) -> Result<()> {
-    let report = tsift::session_review::compute(path)?;
+    let report = session_review::compute(path)?;
     if budget.is_active() {
         if next_context {
             let budget_report =
@@ -1378,4 +1377,3 @@ pub(crate) fn cmd_session_review_with_budget(
     }
     Ok(())
 }
-

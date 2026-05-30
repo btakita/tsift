@@ -91,6 +91,7 @@ tsift (root crate — thin re-export shim: lib.rs + graph/lang/resolution/substr
 │   ├── depends on tsift-index (config/index/init), tsift-sqlite (sidecar/recovery helpers), tsift-summarize (SummaryDb)
 │   └── re-exported via root `tsift` `pub use tsift_status::status;`
 ├── tsift-cli crate (packages/tsift-cli — CLI dispatch, command handlers, output formatting)
+│   ├── depends directly on sibling `tsift-*` crates; must not depend on the root `tsift` re-export shim
 │   ├── clap CLI types — Cli, Commands, GraphDbQuery, output format enums
 │   ├── command handlers — cmd_search, cmd_index, cmd_graph, cmd_communities, cmd_explain, etc.
 │   ├── output formatting — ToolEnvelope, ResponseBudget, terse/schema transforms

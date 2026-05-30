@@ -2,12 +2,14 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use tsift_index::{config, index};
+use tsift_quality::{audit, lint};
+use tsift_search::tagpath_adapter;
 
 use crate::{
-    inject_tagpath_stale_into_json, tagpath_audit_policy_hints,
-    tagpath_audit_supported_extensions, to_json_schema,
+    inject_tagpath_stale_into_json, tagpath_audit_policy_hints, tagpath_audit_supported_extensions,
+    to_json_schema,
 };
-
 
 pub(crate) fn cmd_audit_tagpath(
     path: &std::path::Path,
@@ -17,14 +19,14 @@ pub(crate) fn cmd_audit_tagpath(
     terse: bool,
     schema: bool,
 ) -> Result<()> {
-    let workspace_root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
+    let workspace_root = lint::resolve_project_root_or_canonical_path(path)?;
 
     // Choose the project root for tagpath + the index.db path for tsift
     // based on whether the caller passed `--scope`. Scoped mode points
     // both indexes at the submodule.
     let (tagpath_root, db_path) = if let Some(scope_selector) = scope {
-        let cfg = tsift::config::Config::load(&workspace_root)?;
-        let resolved = tsift::config::Config::resolve_submodule(&workspace_root, scope_selector)?;
+        let cfg = config::Config::load(&workspace_root)?;
+        let resolved = config::Config::resolve_submodule(&workspace_root, scope_selector)?;
         let db = cfg.db_path_for(&workspace_root, &resolved.id);
         (resolved.source_root, db)
     } else {
@@ -40,7 +42,7 @@ pub(crate) fn cmd_audit_tagpath(
             db_path.display()
         );
     }
-    let db = tsift::index::IndexDb::open_read_only_resilient(&db_path)?;
+    let db = index::IndexDb::open_read_only_resilient(&db_path)?;
 
     // Collect tsift file paths and remember the absolute form so we can
     // re-query `symbols_for_file` later. Tsift stores absolute paths;
@@ -64,10 +66,10 @@ pub(crate) fn cmd_audit_tagpath(
         tsift_abs_by_rel.insert(rel, raw);
     }
 
-    let load = tsift::tagpath_adapter::try_load(&tagpath_root);
+    let load = tagpath_adapter::try_load(&tagpath_root);
     let (adapter, tagpath_state) = match load {
-        tsift::tagpath_adapter::LoadResult::Loaded(adapter) => (Some(adapter), "fresh"),
-        tsift::tagpath_adapter::LoadResult::Stale { reason, .. } => {
+        tagpath_adapter::LoadResult::Loaded(adapter) => (Some(adapter), "fresh"),
+        tagpath_adapter::LoadResult::Stale { reason, .. } => {
             eprintln!(
                 "tagpath_index_stale: true (reason={reason}); audit results reflect the last loaded snapshot",
             );
@@ -76,7 +78,7 @@ pub(crate) fn cmd_audit_tagpath(
             let idx_path = tagpath::index::index_path(&tagpath_root);
             match tagpath::index::read(&idx_path) {
                 Ok(index) => (
-                    Some(tsift::tagpath_adapter::TagpathAdapter {
+                    Some(tagpath_adapter::TagpathAdapter {
                         project_root: tagpath_root.clone(),
                         index,
                     }),
@@ -85,7 +87,7 @@ pub(crate) fn cmd_audit_tagpath(
                 Err(_) => (None, "stale_unreadable"),
             }
         }
-        tsift::tagpath_adapter::LoadResult::Missing => (None, "missing"),
+        tagpath_adapter::LoadResult::Missing => (None, "missing"),
     };
 
     let tagpath_files: std::collections::BTreeSet<String> = adapter
@@ -239,22 +241,22 @@ pub(crate) fn cmd_audit(
         std::path::PathBuf::from(skills_dir)
     };
 
-    let mut result = tsift::audit::scan_skills(&expanded)?;
+    let mut result = audit::scan_skills(&expanded)?;
 
     if let Some(manifest_path) = manifest {
-        tsift::audit::compare_manifest(&mut result, &manifest_path)?;
+        audit::compare_manifest(&mut result, &manifest_path)?;
     }
 
     if usage || cleanup || report.is_some() {
-        tsift::audit::track_usage(&mut result)?;
+        audit::track_usage(&mut result)?;
     }
 
     if cleanup || report.is_some() {
-        tsift::audit::generate_cleanup(&mut result);
+        audit::generate_cleanup(&mut result);
     }
 
     if let Some(report_path) = &report {
-        tsift::audit::write_report(&result, report_path)?;
+        audit::write_report(&result, report_path)?;
         println!("Report written to {}", report_path.display());
     }
 
@@ -320,8 +322,8 @@ pub(crate) fn cmd_audit(
             println!("Manifest diffs:");
             for diff in diffs {
                 let label = match diff.kind {
-                    tsift::audit::DiffKind::Missing => "missing (expected but not installed)",
-                    tsift::audit::DiffKind::Orphan => "orphan (installed but not in manifest)",
+                    audit::DiffKind::Missing => "missing (expected but not installed)",
+                    audit::DiffKind::Orphan => "orphan (installed but not in manifest)",
                 };
                 println!("  {} — {}", diff.name, label);
             }
@@ -377,18 +379,18 @@ pub(crate) fn cmd_lint(
     let mut entities = HashSet::new();
 
     if let Some(index_dir) = index {
-        entities.extend(tsift::lint::collect_entities_from_index_path(&index_dir)?);
-    } else if let Some(root) = tsift::lint::find_project_root_for_path(file_path)? {
-        entities.extend(tsift::lint::collect_entities_from_workspace_root(&root)?);
+        entities.extend(lint::collect_entities_from_index_path(&index_dir)?);
+    } else if let Some(root) = lint::find_project_root_for_path(file_path)? {
+        entities.extend(lint::collect_entities_from_workspace_root(&root)?);
     }
 
     for md_path in &entities_from {
-        entities.extend(tsift::lint::collect_entities_from_markdown(md_path)?);
+        entities.extend(lint::collect_entities_from_markdown(md_path)?);
     }
 
-    entities.extend(tsift::lint::collect_entities_from_markdown(file_path)?);
+    entities.extend(lint::collect_entities_from_markdown(file_path)?);
 
-    let result = tsift::lint::lint_markdown(file_path, &entities)?;
+    let result = lint::lint_markdown(file_path, &entities)?;
 
     if json_output {
         println!("{}", to_json_schema(&result, pretty, terse, schema)?);

@@ -103,6 +103,40 @@ fn release_publish_gate_requires_secret_variable_and_dry_run() {
     );
 }
 
+#[test]
+fn cli_manifest_uses_split_crates_without_root_shim() {
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = fs::read_to_string(manifest_path).unwrap();
+    let value: toml::Value = manifest.parse().unwrap();
+    let deps = value
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .unwrap();
+
+    assert!(
+        !deps.contains_key("tsift"),
+        "tsift-cli should import sibling crates directly instead of the root re-export shim"
+    );
+    for name in [
+        "tsift-agent-doc",
+        "tsift-core",
+        "tsift-digest",
+        "tsift-graph",
+        "tsift-index",
+        "tsift-quality",
+        "tsift-resolution",
+        "tsift-search",
+        "tsift-sqlite",
+        "tsift-status",
+        "tsift-summarize",
+    ] {
+        assert!(
+            deps.contains_key(name),
+            "missing direct dependency on {name}"
+        );
+    }
+}
+
 fn init_git_repo(path: &Path) {
     let status = Command::new("git")
         .args(["init"])

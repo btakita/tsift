@@ -1,11 +1,13 @@
 use anyhow::Result;
 use serde::Serialize;
+use tsift_graph as graph;
+use tsift_index::index;
+use tsift_search::tagpath_adapter;
 
 use crate::{
     EdgeSide, annotate_community_members_with_context, community_tagpath_cache_part_for_loaded,
     file_communities_from_callers, resolve_tagpath_handle_for_callee_edge,
 };
-
 
 /// Diagnostic produced by [`annotate_hits_with_tagpath`].
 #[derive(Debug, Default, Clone)]
@@ -52,15 +54,15 @@ pub struct TagpathSearchOpts {
 /// | false       | stale       | false   | emit diagnostic, no annotation |
 /// | false       | stale       | true    | return error |
 pub fn annotate_hits_with_tagpath(
-    hits: &mut [tsift::index::SymbolHit],
+    hits: &mut [index::SymbolHit],
     root: &std::path::Path,
     opts: &TagpathSearchOpts,
 ) -> Result<TagpathAnnotationDiagnostic> {
     if opts.no_tagpath {
         return Ok(TagpathAnnotationDiagnostic::default());
     }
-    match tsift::tagpath_adapter::try_load(root) {
-        tsift::tagpath_adapter::LoadResult::Loaded(adapter) => {
+    match tagpath_adapter::try_load(root) {
+        tagpath_adapter::LoadResult::Loaded(adapter) => {
             for hit in hits.iter_mut() {
                 let abs = if std::path::Path::new(&hit.file).is_absolute() {
                     std::path::PathBuf::from(&hit.file)
@@ -78,7 +80,7 @@ pub fn annotate_hits_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tsift::tagpath_adapter::LoadResult::Stale { reason, .. } => {
+        tagpath_adapter::LoadResult::Stale { reason, .. } => {
             if opts.strict {
                 anyhow::bail!(
                     "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
@@ -91,7 +93,7 @@ pub fn annotate_hits_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tsift::tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
+        tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
     }
 }
 
@@ -99,15 +101,15 @@ pub fn annotate_hits_with_tagpath(
 /// a fresh tagpath index is present at `root`. Same fallback matrix as
 /// [`annotate_hits_with_tagpath`].
 pub fn annotate_stored_symbols_with_tagpath(
-    symbols: &mut [tsift::index::StoredSymbol],
+    symbols: &mut [index::StoredSymbol],
     root: &std::path::Path,
     opts: &TagpathSearchOpts,
 ) -> Result<TagpathAnnotationDiagnostic> {
     if opts.no_tagpath {
         return Ok(TagpathAnnotationDiagnostic::default());
     }
-    match tsift::tagpath_adapter::try_load(root) {
-        tsift::tagpath_adapter::LoadResult::Loaded(adapter) => {
+    match tagpath_adapter::try_load(root) {
+        tagpath_adapter::LoadResult::Loaded(adapter) => {
             for sym in symbols.iter_mut() {
                 let abs = if std::path::Path::new(&sym.file).is_absolute() {
                     std::path::PathBuf::from(&sym.file)
@@ -125,7 +127,7 @@ pub fn annotate_stored_symbols_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tsift::tagpath_adapter::LoadResult::Stale { reason, .. } => {
+        tagpath_adapter::LoadResult::Stale { reason, .. } => {
             if opts.strict {
                 anyhow::bail!(
                     "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
@@ -138,7 +140,7 @@ pub fn annotate_stored_symbols_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tsift::tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
+        tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
     }
 }
 
@@ -149,8 +151,8 @@ pub fn annotate_stored_symbols_with_tagpath(
 /// (resolves each callee edge via `db.symbol_info`, preferring the
 /// caller's file or community before the no-context first-handle fallback).
 pub fn annotate_stored_edges_with_tagpath(
-    edges: &mut [tsift::index::StoredEdge],
-    db: &tsift::index::IndexDb,
+    edges: &mut [index::StoredEdge],
+    db: &index::IndexDb,
     root: &std::path::Path,
     scope: Option<&str>,
     side: EdgeSide,
@@ -159,8 +161,8 @@ pub fn annotate_stored_edges_with_tagpath(
     if opts.no_tagpath {
         return Ok(TagpathAnnotationDiagnostic::default());
     }
-    match tsift::tagpath_adapter::try_load(root) {
-        tsift::tagpath_adapter::LoadResult::Loaded(adapter) => {
+    match tagpath_adapter::try_load(root) {
+        tagpath_adapter::LoadResult::Loaded(adapter) => {
             match side {
                 EdgeSide::Caller => {
                     for edge in edges.iter_mut() {
@@ -199,7 +201,7 @@ pub fn annotate_stored_edges_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tsift::tagpath_adapter::LoadResult::Stale { reason, .. } => {
+        tagpath_adapter::LoadResult::Stale { reason, .. } => {
             if opts.strict {
                 anyhow::bail!(
                     "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
@@ -212,17 +214,17 @@ pub fn annotate_stored_edges_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tsift::tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
+        tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
     }
 }
 
-/// Annotate every `tsift::graph::CommunityMember` in `communities` in-place with
+/// Annotate every `graph::CommunityMember` in `communities` in-place with
 /// file/ref context and, when available, the stable `mem:` handle from the
 /// tagpath index. Duplicate names are resolved through edge/community
 /// evidence rather than a name-only first-row fallback.
 pub fn annotate_communities_with_tagpath(
-    communities: &mut [tsift::graph::Community],
-    db: &tsift::index::IndexDb,
+    communities: &mut [graph::Community],
+    db: &index::IndexDb,
     root: &std::path::Path,
     opts: &TagpathSearchOpts,
 ) -> Result<Option<TagpathAnnotationDiagnostic>> {
@@ -230,8 +232,8 @@ pub fn annotate_communities_with_tagpath(
         annotate_community_members_with_context(communities, db, root, None)?;
         return Ok(None);
     }
-    match tsift::tagpath_adapter::try_load(root) {
-        tsift::tagpath_adapter::LoadResult::Loaded(adapter) => {
+    match tagpath_adapter::try_load(root) {
+        tagpath_adapter::LoadResult::Loaded(adapter) => {
             let ambiguous_members =
                 annotate_community_members_with_context(communities, db, root, Some(&adapter))?;
             Ok(Some(TagpathAnnotationDiagnostic {
@@ -241,7 +243,7 @@ pub fn annotate_communities_with_tagpath(
                 ambiguous_members,
             }))
         }
-        tsift::tagpath_adapter::LoadResult::Stale { reason, .. } => {
+        tagpath_adapter::LoadResult::Stale { reason, .. } => {
             if opts.strict {
                 anyhow::bail!(
                     "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
@@ -256,29 +258,29 @@ pub fn annotate_communities_with_tagpath(
                 ambiguous_members,
             }))
         }
-        tsift::tagpath_adapter::LoadResult::Missing => {
+        tagpath_adapter::LoadResult::Missing => {
             annotate_community_members_with_context(communities, db, root, None)?;
             Ok(None)
         }
     }
 }
 
-/// Annotate `tsift::graph::PathNode` entries in-place with `tagpath_handle` when a
+/// Annotate `graph::PathNode` entries in-place with `tagpath_handle` when a
 /// fresh tagpath index is present at `root`. Symbol→file resolution goes
 /// through `db.symbol_info(name)` (first definition wins), then the adapter
 /// resolves the per-member handle. Same fallback matrix as
 /// [`annotate_hits_with_tagpath`].
 pub fn annotate_path_nodes_with_tagpath(
-    nodes: &mut [tsift::graph::PathNode],
-    db: &tsift::index::IndexDb,
+    nodes: &mut [graph::PathNode],
+    db: &index::IndexDb,
     root: &std::path::Path,
     opts: &TagpathSearchOpts,
 ) -> Result<TagpathAnnotationDiagnostic> {
     if opts.no_tagpath {
         return Ok(TagpathAnnotationDiagnostic::default());
     }
-    match tsift::tagpath_adapter::try_load(root) {
-        tsift::tagpath_adapter::LoadResult::Loaded(adapter) => {
+    match tagpath_adapter::try_load(root) {
+        tagpath_adapter::LoadResult::Loaded(adapter) => {
             for node in nodes.iter_mut() {
                 let syms = match db.symbol_info(&node.name) {
                     Ok(v) => v,
@@ -303,7 +305,7 @@ pub fn annotate_path_nodes_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tsift::tagpath_adapter::LoadResult::Stale { reason, .. } => {
+        tagpath_adapter::LoadResult::Stale { reason, .. } => {
             if opts.strict {
                 anyhow::bail!(
                     "tagpath index is stale (reason={reason}); rerun `tagpath index --update` or drop --tagpath-strict"
@@ -316,6 +318,6 @@ pub fn annotate_path_nodes_with_tagpath(
                 ambiguous_members: Vec::new(),
             })
         }
-        tsift::tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
+        tagpath_adapter::LoadResult::Missing => Ok(TagpathAnnotationDiagnostic::default()),
     }
 }

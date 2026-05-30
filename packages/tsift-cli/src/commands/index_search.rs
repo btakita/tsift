@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use tsift_index::{config, index};
+use tsift_quality::lint;
 
 use crate::output::{OutputFormat, ResponseBudget, ToolEnvelopeSummary};
 use crate::{
@@ -11,12 +13,12 @@ use crate::{
     annotate_hits_with_tagpath, build_search_budget_follow_up, build_search_budget_report,
     compact_snippet, degraded_search_mode, emit_degraded_search_note, envelope_metric,
     federated_exact_search, federated_sift_search, federated_symbol_search, format_score,
-    group_search_hits, inject_tagpath_stale_into_json,
-    maybe_apply_search_post_precheck_test_hooks, maybe_apply_search_worker_test_hooks,
-    precheck_search_indexes, print_json_or_envelope, print_search_budget_human, relativize,
-    relativize_index_summary, relativize_json_paths, relativize_symbol_hits,
-    resolve_search_strategy, run_exact_search_with_timeout, run_index_update, run_search_with_timeout,
-    run_sift_search, should_collapse_search_hits, to_json_schema,
+    group_search_hits, inject_tagpath_stale_into_json, maybe_apply_search_post_precheck_test_hooks,
+    maybe_apply_search_worker_test_hooks, precheck_search_indexes, print_json_or_envelope,
+    print_search_budget_human, relativize, relativize_index_summary, relativize_json_paths,
+    relativize_symbol_hits, resolve_search_strategy, run_exact_search_with_timeout,
+    run_index_update, run_search_with_timeout, run_sift_search, should_collapse_search_hits,
+    to_json_schema,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -37,16 +39,16 @@ pub(crate) fn cmd_index(
     schema: bool,
 ) -> Result<()> {
     let quiet = quiet || exit_code;
-    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
 
     if workspace || submodule.is_some() {
-        let cfg = tsift::config::Config::load(&root)?;
-        let targets: Vec<(String, PathBuf, Option<tsift::config::WorkspaceScope>)> =
+        let cfg = config::Config::load(&root)?;
+        let targets: Vec<(String, PathBuf, Option<config::WorkspaceScope>)> =
             if let Some(name) = submodule {
-                let scope = tsift::config::Config::resolve_submodule(&root, name)?;
+                let scope = config::Config::resolve_submodule(&root, name)?;
                 vec![(scope.id.clone(), scope.source_root.clone(), Some(scope))]
             } else {
-                tsift::config::Config::submodule_dirs(&root)?
+                config::Config::submodule_dirs(&root)?
                     .into_iter()
                     .map(|scope| (scope.id.clone(), scope.source_root.clone(), Some(scope)))
                     .collect()
@@ -74,7 +76,7 @@ pub(crate) fn cmd_index(
                     false,
                 )?
             } else if check {
-                tsift::index::IndexDb::inspect_read_only(&db_path, sub_path, prune)?.summary
+                index::IndexDb::inspect_read_only(&db_path, sub_path, prune)?.summary
             } else if prune {
                 run_index_update(
                     &db_path,
@@ -208,7 +210,7 @@ pub(crate) fn cmd_index(
             false,
         )?
     } else if check {
-        tsift::index::IndexDb::inspect_read_only(&db_path, &root, prune)?.summary
+        index::IndexDb::inspect_read_only(&db_path, &root, prune)?.summary
     } else if prune {
         run_index_update(
             &db_path,
@@ -302,9 +304,9 @@ pub(crate) fn cmd_index(
             println!();
             for change in &summary.changes {
                 let marker = match change.kind {
-                    tsift::index::ChangeKind::New => "+",
-                    tsift::index::ChangeKind::Modified => "~",
-                    tsift::index::ChangeKind::Deleted => "-",
+                    index::ChangeKind::New => "+",
+                    index::ChangeKind::Modified => "~",
+                    index::ChangeKind::Deleted => "-",
                 };
                 let lang = change.language.as_deref().unwrap_or("");
                 println!("  {} {} [{}]", marker, change.path.display(), lang);
@@ -387,7 +389,7 @@ pub(crate) fn cmd_search_with_budget(
         schema,
         envelope,
     };
-    let root = tsift::lint::resolve_project_root_or_canonical_path(&base_path)?;
+    let root = lint::resolve_project_root_or_canonical_path(&base_path)?;
     let search_cache_dir = root.join(".tsift/search-cache");
     let requested_strategy = resolve_search_strategy(&query, strategy);
     let requested_exact_search = requested_strategy == "exact";
@@ -428,28 +430,28 @@ pub(crate) fn cmd_search_with_budget(
     };
 
     let inferred_scope = if scope.is_none() && !federated {
-        tsift::config::Config::infer_submodule_from_path(&root, &base_path)?
+        config::Config::infer_submodule_from_path(&root, &base_path)?
     } else {
         None
     };
 
     let (symbol_hits, sift_path, federated_tagpath_diag) =
         if let Some(scope) = inferred_scope.as_ref() {
-            let cfg = tsift::config::Config::load(&root)?;
+            let cfg = config::Config::load(&root)?;
             let db_path = cfg.db_path_for(&root, &scope.id);
             let hits = if db_path.exists() {
-                let db = tsift::index::IndexDb::open_read_only_resilient(&db_path)?;
+                let db = index::IndexDb::open_read_only_resilient(&db_path)?;
                 db.symbol_search(&query, limit)?
             } else {
                 Vec::new()
             };
             (hits, scope.source_root.clone(), None)
         } else if let Some(ref scope_name) = scope {
-            let cfg = tsift::config::Config::load(&root)?;
-            let scope = tsift::config::Config::resolve_submodule(&root, scope_name)?;
+            let cfg = config::Config::load(&root)?;
+            let scope = config::Config::resolve_submodule(&root, scope_name)?;
             let db_path = cfg.db_path_for(&root, &scope.id);
             let hits = if db_path.exists() {
-                let db = tsift::index::IndexDb::open_read_only_resilient(&db_path)?;
+                let db = index::IndexDb::open_read_only_resilient(&db_path)?;
                 db.symbol_search(&query, limit)?
             } else {
                 Vec::new()
@@ -461,7 +463,7 @@ pub(crate) fn cmd_search_with_budget(
         } else {
             let db_path = root.join(".tsift/index.db");
             let hits = if db_path.exists() {
-                let db = tsift::index::IndexDb::open_read_only_resilient(&db_path)?;
+                let db = index::IndexDb::open_read_only_resilient(&db_path)?;
                 db.symbol_search(&query, limit)?
             } else {
                 Vec::new()
@@ -582,7 +584,7 @@ pub(crate) fn cmd_search_with_budget(
     } else if format.json_output {
         #[derive(Serialize)]
         struct CombinedResponse<'a> {
-            symbols: &'a [tsift::index::SymbolHit],
+            symbols: &'a [index::SymbolHit],
             #[serde(flatten)]
             sift: &'a serde_json::Value,
         }

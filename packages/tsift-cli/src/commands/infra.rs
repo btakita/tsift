@@ -5,101 +5,52 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use tsift::substrate::{
+use substrate::{
     ConvexGraphStore as SubstrateConvexGraphStore, ConvexProjectionRows, ConvexRowsGraphClient,
     SqliteGraphStore,
 };
+use tsift_index::init;
+use tsift_quality::lint;
+use tsift_sqlite as substrate;
+use tsift_status::status;
 
 use crate::cli::{GraphDbBackend, GraphDbQuery};
 use crate::output::{OutputFormat, ToolEnvelopeSummary};
 use crate::{
+    ConvexHttpTransport, ConvexSyncOptions, EditBatch, EditResult, EditStatus,
     GRAPH_DB_BACKEND_EVAL_DIRECT_PATH_HOPS, GRAPH_DB_BACKEND_EVAL_EXTENDED_PATH_HOPS,
     GRAPH_DB_BACKEND_EVAL_NORMALIZATION_ROW_UNIT, GRAPH_DB_BACKEND_EVAL_PATH_MAX_HOPS,
-    GRAPH_PROJECTION_VERSION, append_convex_snapshot_doctor_checks,
-    graph_db_backend_eval_timed_phase, graph_db_evidence_report_from_store,
+    GRAPH_PROJECTION_VERSION, GraphDbBackendEvalConfig, GraphDbBackendEvalOptions,
+    GraphDbBackendEvalPhaseTiming, GraphDbBackendEvalReport, GraphDbCompactionReport,
+    GraphDbDoctorReport, GraphDbDriftInput, GraphDbEvidenceInput, GraphDbExperimentalBackend,
+    GraphDbRefreshSummary, append_convex_snapshot_doctor_checks,
     append_graph_db_backend_eval_normalized_duration_metric,
-    append_graph_db_backend_eval_phase_metrics,
-    append_sqlite_graph_doctor_checks,
-    apply_edit_plan_atomically,
-    apply_rewrite_output_format,
-    apply_status_fixes,
-    autoindex_missing_workspace_scopes,
-    build_convex_sync_report_with_snapshot,
-    build_edit_plan,
-    classify_task,
-    convex_graph_freshness,
-    ConvexHttpTransport,
-    convex_rows_from_graph_store,
-    ConvexSyncOptions,
-    dedupe_preserve_order,
-    EditBatch,
-    EditResult,
-    EditStatus,
-    envelope_metric,
-    execute_query,
-    execute_rewritten_command,
-    graph_db_backend_eval_cached_refresh,
-    GraphDbBackendEvalConfig,
-    graph_db_backend_eval_dataset,
-    graph_db_backend_eval_full_projection_with_profile,
-    graph_db_backend_eval_graph_rows,
-    graph_db_backend_eval_metric_digest_command,
-    graph_db_backend_eval_metrics,
-    GraphDbBackendEvalOptions,
-    graph_db_backend_eval_performance_gate,
-    graph_db_backend_eval_phase_timing,
-    GraphDbBackendEvalPhaseTiming,
-    graph_db_backend_eval_promotion,
-    graph_db_backend_eval_refresh_operation,
-    graph_db_backend_eval_refresh_total_micros,
-    graph_db_backend_eval_refresh_with_profile,
-    GraphDbBackendEvalReport,
-    graph_db_backend_eval_reused_cached_projection,
-    graph_db_backend_eval_synthetic_projection,
-    graph_db_backend_eval_targets,
-    graph_db_backend_eval_update_source_watermark,
-    graph_db_compaction_policy,
-    GraphDbCompactionReport,
-    GraphDbDoctorReport,
-    GraphDbDriftInput,
-    graph_db_drift_report,
-    GraphDbEvidenceInput,
-    GraphDbExperimentalBackend,
-    graph_db_operator_report_from_disk,
-    graph_db_operator_status_warnings,
-    graph_db_read_recovery_diagnostic,
-    GraphDbRefreshSummary,
-    graph_db_report_from_store,
-    graph_db_resolve_evidence_target,
-    graph_db_scope_arg,
-    graph_projection_content_hash,
-    graph_substrate_db_path,
-    load_convex_projection_rows,
-    load_convex_projection_snapshot_value,
-    no_rewrite_message,
-    open_db,
-    prepare_conflict_matrix_inputs,
-    print_convex_sync_human,
-    print_graph_db_backend_eval_human,
-    print_graph_db_compaction_human,
-    print_graph_db_doctor_human,
-    print_graph_db_drift_human,
-    print_graph_db_evidence_report,
-    print_graph_db_human,
-    print_graph_db_operator_report,
-    print_json_or_envelope,
-    rewrite_command,
-    schema_overview,
-    shell_quote,
-    sqlite_convex_rows_from_conn,
-    sqlite_graph_freshness,
-    status_missing_workspace_scopes,
-    table_columns,
-    to_json_schema,
-    traversal_source_watermark,
-    truncate_for_compact,
-    validate_convex_projection_rows,
-    write_traversal_graph_store,
+    append_graph_db_backend_eval_phase_metrics, append_sqlite_graph_doctor_checks,
+    apply_edit_plan_atomically, apply_rewrite_output_format, apply_status_fixes,
+    autoindex_missing_workspace_scopes, build_convex_sync_report_with_snapshot, build_edit_plan,
+    classify_task, convex_graph_freshness, convex_rows_from_graph_store, dedupe_preserve_order,
+    envelope_metric, execute_query, execute_rewritten_command,
+    graph_db_backend_eval_cached_refresh, graph_db_backend_eval_dataset,
+    graph_db_backend_eval_full_projection_with_profile, graph_db_backend_eval_graph_rows,
+    graph_db_backend_eval_metric_digest_command, graph_db_backend_eval_metrics,
+    graph_db_backend_eval_performance_gate, graph_db_backend_eval_phase_timing,
+    graph_db_backend_eval_promotion, graph_db_backend_eval_refresh_operation,
+    graph_db_backend_eval_refresh_total_micros, graph_db_backend_eval_refresh_with_profile,
+    graph_db_backend_eval_reused_cached_projection, graph_db_backend_eval_synthetic_projection,
+    graph_db_backend_eval_targets, graph_db_backend_eval_timed_phase,
+    graph_db_backend_eval_update_source_watermark, graph_db_compaction_policy,
+    graph_db_drift_report, graph_db_evidence_report_from_store, graph_db_operator_report_from_disk,
+    graph_db_operator_status_warnings, graph_db_read_recovery_diagnostic,
+    graph_db_report_from_store, graph_db_resolve_evidence_target, graph_db_scope_arg,
+    graph_projection_content_hash, graph_substrate_db_path, load_convex_projection_rows,
+    load_convex_projection_snapshot_value, no_rewrite_message, open_db,
+    prepare_conflict_matrix_inputs, print_convex_sync_human, print_graph_db_backend_eval_human,
+    print_graph_db_compaction_human, print_graph_db_doctor_human, print_graph_db_drift_human,
+    print_graph_db_evidence_report, print_graph_db_human, print_graph_db_operator_report,
+    print_json_or_envelope, rewrite_command, schema_overview, shell_quote,
+    sqlite_convex_rows_from_conn, sqlite_graph_freshness, status_missing_workspace_scopes,
+    table_columns, to_json_schema, traversal_source_watermark, truncate_for_compact,
+    validate_convex_projection_rows, write_traversal_graph_store,
     write_traversal_graph_store_with_options,
 };
 
@@ -294,7 +245,11 @@ pub(crate) fn cmd_convex_sync(options: ConvexSyncOptions<'_>, format: OutputForm
     }
 }
 
-pub(crate) fn cmd_graph_db_status(root: &Path, scope: Option<&str>, format: OutputFormat) -> Result<()> {
+pub(crate) fn cmd_graph_db_status(
+    root: &Path,
+    scope: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
     let graph_db = graph_substrate_db_path(root, scope);
     let report =
         graph_db_operator_report_from_disk(root, scope, &graph_db, "status", None, Vec::new())?;
@@ -611,7 +566,7 @@ pub(crate) fn cmd_graph_db_backend_eval(
         targets,
         full_projection,
     } = options;
-    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     let candidates = if candidates.is_empty() {
         vec![
             GraphDbExperimentalBackend::DuckdbDuckpgq,
@@ -1032,7 +987,7 @@ pub(crate) fn cmd_graph_db(
     query: GraphDbQuery,
     format: OutputFormat,
 ) -> Result<()> {
-    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     match &query {
         GraphDbQuery::Refresh => {
             return cmd_graph_db_refresh(&root, path, scope, format);
@@ -1211,24 +1166,24 @@ pub(crate) fn cmd_status(
     terse: bool,
     schema: bool,
 ) -> Result<()> {
-    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
-    let mut report = tsift::status::check_status(&root)?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let mut report = status::check_status(&root)?;
     if status_missing_workspace_scopes(&report) {
         autoindex_missing_workspace_scopes(&root, &report)?;
-        report = tsift::status::check_status(&root)?;
+        report = status::check_status(&root)?;
     }
     if fix {
         apply_status_fixes(&root, &report)?;
-        report = tsift::status::check_status(&root)?;
+        report = status::check_status(&root)?;
         if status_missing_workspace_scopes(&report) {
             autoindex_missing_workspace_scopes(&root, &report)?;
-            report = tsift::status::check_status(&root)?;
+            report = status::check_status(&root)?;
         }
     }
     if json_output {
         println!("{}", to_json_schema(&report, pretty, terse, schema)?);
     } else {
-        print!("{}", tsift::status::format_human(&report, compact));
+        print!("{}", status::format_human(&report, compact));
     }
     Ok(())
 }
@@ -1242,36 +1197,41 @@ pub(crate) fn cmd_locks(
     terse: bool,
     schema: bool,
 ) -> Result<()> {
-    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
-    let report = tsift::status::check_locks(&root, Some(path), scope)?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let report = status::check_locks(&root, Some(path), scope)?;
     if json_output {
         println!("{}", to_json_schema(&report, pretty, terse, schema)?);
     } else {
-        print!("{}", tsift::status::format_locks_human(&report, compact));
+        print!("{}", status::format_locks_human(&report, compact));
     }
     Ok(())
 }
 
-pub(crate) fn cmd_init(path: &std::path::Path, codex: bool, opencode: bool, workspace: bool) -> Result<()> {
+pub(crate) fn cmd_init(
+    path: &std::path::Path,
+    codex: bool,
+    opencode: bool,
+    workspace: bool,
+) -> Result<()> {
     let resolved = if workspace {
-        tsift::init::resolve_workspace_dir(path)?
+        init::resolve_workspace_dir(path)?
     } else {
-        tsift::init::resolve_project_dir(path)?
+        init::resolve_project_dir(path)?
     };
     if resolved != path {
         println!("resolved: {} → {}", path.display(), resolved.display());
     }
-    let codex_workspace = codex && (workspace || tsift::init::has_submodules(&resolved)?);
-    let result = tsift::init::init_with_integrations(&resolved, codex, codex_workspace, opencode)?;
+    let codex_workspace = codex && (workspace || init::has_submodules(&resolved)?);
+    let result = init::init_with_integrations(&resolved, codex, codex_workspace, opencode)?;
     for update in result.updates {
         println!(
             "{}: {} ({})",
             update.file.display(),
             update.action,
             match update.action {
-                tsift::init::InitAction::Created => "tsift Code Navigation section added",
-                tsift::init::InitAction::Updated => "tsift Code Navigation section updated to latest",
-                tsift::init::InitAction::AlreadyPresent => "no changes needed",
+                init::InitAction::Created => "tsift Code Navigation section added",
+                init::InitAction::Updated => "tsift Code Navigation section updated to latest",
+                init::InitAction::AlreadyPresent => "no changes needed",
             }
         );
     }
@@ -1280,29 +1240,29 @@ pub(crate) fn cmd_init(path: &std::path::Path, codex: bool, opencode: bool, work
     }
     if let Some(codex_result) = &result.codex_hooks {
         let scope_label = match codex_result.scope {
-            tsift::init::CodexHookScope::Project => "project",
-            tsift::init::CodexHookScope::Workspace => "workspace",
+            init::CodexHookScope::Project => "project",
+            init::CodexHookScope::Workspace => "workspace",
         };
         match codex_result.action {
-            tsift::init::CodexHookAction::Added => {
+            init::CodexHookAction::Added => {
                 println!(
                     ".codex/hooks.json: tsift {} auto-reindex hook added",
                     scope_label
                 );
             }
-            tsift::init::CodexHookAction::Updated => {
+            init::CodexHookAction::Updated => {
                 println!(
                     ".codex/hooks.json: tsift {} auto-reindex hook updated",
                     scope_label
                 );
             }
-            tsift::init::CodexHookAction::AlreadyPresent => {
+            init::CodexHookAction::AlreadyPresent => {
                 println!(
                     ".codex/hooks.json: tsift {} hook already present",
                     scope_label
                 );
             }
-            tsift::init::CodexHookAction::Created => {
+            init::CodexHookAction::Created => {
                 println!(
                     ".codex/hooks.json: created with tsift {} auto-reindex hook",
                     scope_label
@@ -1466,7 +1426,6 @@ pub(crate) fn cmd_sql(
     Ok(())
 }
 
-
 /// Exit codes for `tsift rewrite` (matches rtk protocol):
 ///   0 + stdout → rewrite found, auto-allow
 ///   1 + stderr → no tsift equivalent, pass through
@@ -1488,4 +1447,3 @@ pub(crate) fn cmd_rewrite(command: &str, run: bool, format: OutputFormat) -> Res
     let status_code = execute_rewritten_command(&rewritten)?;
     std::process::exit(status_code);
 }
-

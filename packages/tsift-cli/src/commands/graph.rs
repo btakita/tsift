@@ -1,6 +1,8 @@
 use std::path::Path;
 
 use anyhow::Result;
+use tsift_graph as graph;
+use tsift_quality::lint;
 
 use crate::cli::TraverseFormat;
 use crate::output::{OutputFormat, ResponseBudget, ToolEnvelopeSummary};
@@ -11,9 +13,9 @@ use crate::{
     build_explain_budget_report, build_traversal_graph, community_tagpath_cache_part,
     compact_members, detect_communities_cached, envelope_metric, format_edge_groups,
     inject_tagpath_stale_into_json, open_index_db, print_explain_budget_human,
-    print_json_or_envelope, query_tagpath_root, relativize_edges, relativize_symbols,
-    shell_quote, should_collapse_edge_groups, symbol_path_summary, to_json_schema,
-    traversal_report, traversal_report_html, update_community_annotation_diagnostics,
+    print_json_or_envelope, query_tagpath_root, relativize_edges, relativize_symbols, shell_quote,
+    should_collapse_edge_groups, symbol_path_summary, to_json_schema, traversal_report,
+    traversal_report_html, update_community_annotation_diagnostics,
     verify_convex_projection_snapshot,
 };
 
@@ -34,7 +36,7 @@ pub(crate) fn cmd_graph(
     schema: bool,
     tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
-    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     let db = open_index_db(path, scope)?;
 
     let show_both = !callers && !callees;
@@ -301,7 +303,7 @@ pub(crate) fn cmd_communities(
     schema: bool,
     tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
-    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     let tagpath_root = query_tagpath_root(&root, path, scope)?;
     let db = open_index_db(path, scope)?;
     let tagpath_part = community_tagpath_cache_part(&tagpath_root, &tagpath_opts)?;
@@ -312,7 +314,7 @@ pub(crate) fn cmd_communities(
     let mut tagpath_stale = false;
     let mut tagpath_stale_reason: Option<String> = None;
 
-    let filtered: Vec<tsift::graph::Community> = result
+    let filtered: Vec<graph::Community> = result
         .communities
         .iter()
         .filter(|c| c.members.len() >= min_size)
@@ -321,7 +323,7 @@ pub(crate) fn cmd_communities(
 
     let total = filtered.len();
     let truncated = limit > 0 && total > limit;
-    let mut display: Vec<tsift::graph::Community> = if truncated {
+    let mut display: Vec<graph::Community> = if truncated {
         filtered[..limit].to_vec()
     } else {
         filtered
@@ -450,7 +452,7 @@ pub(crate) fn cmd_traverse(
     schema: bool,
     convex_snapshot: Option<&Path>,
 ) -> Result<()> {
-    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     let graph = build_traversal_graph(&root, path, scope)?;
     if let Some(snapshot) = convex_snapshot {
         verify_convex_projection_snapshot(&root, scope, snapshot)?;
@@ -480,10 +482,10 @@ pub(crate) fn cmd_path(
     schema: bool,
     tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
-    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     let db = open_index_db(path, scope)?;
     let edges = db.all_edges()?;
-    match tsift::graph::shortest_path(&edges, from, to) {
+    match graph::shortest_path(&edges, from, to) {
         Some(mut result) => {
             let tagpath_diag =
                 annotate_path_nodes_with_tagpath(&mut result.path, &db, &root, &tagpath_opts)?;
@@ -604,7 +606,7 @@ pub(crate) fn cmd_explain_with_budget(
     budget: ResponseBudget,
     tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
-    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     let community_tagpath_root = query_tagpath_root(&root, path, scope)?;
     let format = OutputFormat {
         json_output,

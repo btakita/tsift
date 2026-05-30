@@ -2,12 +2,15 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use tsift_quality::lint;
+use tsift_summarize::summarize;
+
 use crate::{
     collect_source_files, emit_summary_stats_warnings, find_symbols_db_for_file,
     load_summarize_config, open_existing_summary_db_read_only, resolve_extract_base,
     resolve_extract_scope, summarize_diff_matches_scope,
-    summarize_full_extract_deleted_summary_paths, summarize_relative_file_path,
-    to_json_schema, truncate_for_compact,
+    summarize_full_extract_deleted_summary_paths, summarize_relative_file_path, to_json_schema,
+    truncate_for_compact,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -24,7 +27,7 @@ pub(crate) fn cmd_summarize(
     terse: bool,
     schema: bool,
 ) -> Result<()> {
-    let root = tsift::lint::resolve_project_root_or_canonical_path(path)?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
     let db_path = root.join(".tsift/summaries.db");
 
     // --extract mode: run LLM extraction
@@ -34,7 +37,7 @@ pub(crate) fn cmd_summarize(
         let cfg = load_summarize_config(&root);
 
         let (files_to_extract, mut deleted_summary_paths) = if diff {
-            let changed = tsift::summarize::git_changed_files(&root)?;
+            let changed = summarize::git_changed_files(&root)?;
             let existing = changed
                 .existing
                 .into_iter()
@@ -60,8 +63,8 @@ pub(crate) fn cmd_summarize(
             return Ok(());
         }
 
-        let _summary_write_lock = tsift::summarize::acquire_write_lock(&db_path)?;
-        let summary_db = tsift::summarize::SummaryDb::open(&db_path)?;
+        let _summary_write_lock = summarize::acquire_write_lock(&db_path)?;
+        let summary_db = summarize::SummaryDb::open(&db_path)?;
 
         if !diff {
             deleted_summary_paths.extend(summarize_full_extract_deleted_summary_paths(
@@ -81,7 +84,7 @@ pub(crate) fn cmd_summarize(
             summary_db.delete_by_file(rel_path)?;
         }
 
-        let mut report = tsift::summarize::ExtractionReport {
+        let mut report = summarize::ExtractionReport {
             files_processed: 0,
             symbols_extracted: 0,
             tokens_input: 0,
@@ -99,7 +102,7 @@ pub(crate) fn cmd_summarize(
                     continue;
                 }
             };
-            let hash = tsift::summarize::content_hash(&content);
+            let hash = summarize::content_hash(&content);
             let rel_path = summarize_relative_file_path(&root, file_path);
 
             if summary_db.is_current(&rel_path, &hash)? {
@@ -107,7 +110,7 @@ pub(crate) fn cmd_summarize(
             }
 
             let symbol_context = find_symbols_db_for_file(&root, file_path)?;
-            match tsift::summarize::extract_for_file(
+            match summarize::extract_for_file(
                 file_path,
                 symbol_context.as_ref().map(|ctx| ctx.db_path.as_path()),
                 symbol_context.as_ref().map(|ctx| ctx.source_root.as_path()),
@@ -206,7 +209,7 @@ pub(crate) fn cmd_summarize(
         let query_base = resolve_extract_base(path)?;
         let mut results = Vec::new();
         for candidate in
-            tsift::summarize::file_lookup_candidates(Path::new(&file_query), &query_base, &root)
+            summarize::file_lookup_candidates(Path::new(&file_query), &query_base, &root)
         {
             results = summary_db.get_by_file(&candidate)?;
             if !results.is_empty() {
