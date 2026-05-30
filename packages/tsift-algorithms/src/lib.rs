@@ -1,9 +1,9 @@
-pub mod scc;
-pub mod health;
-pub mod dead_code;
 pub mod coupling;
+pub mod dead_code;
+pub mod health;
+pub mod scc;
 
-pub use scc::{tarjan_scc, SccResult, SccComponent};
-pub use health::{composite_health_score, HealthScore, HealthReport};
-pub use dead_code::{detect_dead_code, DeadCodeResult, DeadCodeNode};
-pub use coupling::{coupling_analysis, CouplingReport, ModuleCoupling};
+pub use coupling::{CouplingReport, ModuleCoupling, coupling_analysis};
+pub use dead_code::{DeadCodeNode, DeadCodeResult, detect_dead_code};
+pub use health::{HealthReport, HealthScore, composite_health_score};
+pub use scc::{SccComponent, SccResult, tarjan_scc};

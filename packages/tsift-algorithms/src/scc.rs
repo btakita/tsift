@@ -76,7 +76,16 @@ pub fn tarjan_scc(edges: &[(String, String)]) -> SccResult {
         for &w in &adj[v] {
             match indices[w] {
                 None => {
-                    strongconnect(w, adj, index_counter, indices, lowlinks, on_stack, stack, components);
+                    strongconnect(
+                        w,
+                        adj,
+                        index_counter,
+                        indices,
+                        lowlinks,
+                        on_stack,
+                        stack,
+                        components,
+                    );
                     lowlinks[v] = lowlinks[v].min(lowlinks[w]);
                 }
                 Some(_) if on_stack[w] => {
@@ -103,8 +112,14 @@ pub fn tarjan_scc(edges: &[(String, String)]) -> SccResult {
     for v in 0..n {
         if indices[v].is_none() {
             strongconnect(
-                v, &adj, &mut index_counter, &mut indices, &mut lowlinks,
-                &mut on_stack, &mut stack, &mut components,
+                v,
+                &adj,
+                &mut index_counter,
+                &mut indices,
+                &mut lowlinks,
+                &mut on_stack,
+                &mut stack,
+                &mut components,
             );
         }
     }

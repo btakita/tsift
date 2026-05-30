@@ -1,6 +1,4 @@
 use crate::walk::{self, FileEntry, PruneStats};
-use tsift_graph as graph;
-use tsift_graph::lang::Lang;
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
 use rusqlite::{Connection, OpenFlags};
@@ -13,6 +11,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tagpath::{family as tagpath_family, query as tagpath_query};
+use tsift_graph as graph;
+use tsift_graph::lang::Lang;
 pub use tsift_sqlite::{ReadOnlyRecovery, copy_read_only_snapshot, read_only_snapshot_recovery};
 
 pub struct IndexDb {
@@ -1552,10 +1552,10 @@ fn compute_tags(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tsift_sqlite::{wal_sidecar_path, rollback_journal_path};
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use tsift_sqlite::{rollback_journal_path, wal_sidecar_path};
 
     fn setup_tree() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();

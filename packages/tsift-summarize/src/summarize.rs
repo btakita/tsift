@@ -1,5 +1,3 @@
-use tsift_index::index::IndexDb;
-use tsift_sqlite::{ReadOnlyRecovery, copy_read_only_snapshot, read_only_snapshot_recovery};
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
 use rusqlite::{Connection, OpenFlags};
@@ -9,6 +7,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
+use tsift_index::index::IndexDb;
+use tsift_sqlite::{ReadOnlyRecovery, copy_read_only_snapshot, read_only_snapshot_recovery};
 
 pub struct SummaryDb {
     conn: Connection,
@@ -1047,10 +1047,10 @@ fn chrono_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tsift_sqlite::{rollback_journal_path, wal_sidecar_path};
     use rusqlite::Connection;
     use serde_json::json;
     use tempfile::NamedTempFile;
+    use tsift_sqlite::{rollback_journal_path, wal_sidecar_path};
 
     fn test_db() -> (NamedTempFile, SummaryDb) {
         let tmp = NamedTempFile::new().unwrap();

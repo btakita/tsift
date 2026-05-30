@@ -12,7 +12,7 @@ const LIVE_CONVEX_GRAPH_URL_ENV: &str = "TSIFT_LIVE_CONVEX_GRAPH_URL";
 const LIVE_CONVEX_AUTH_TOKEN_ENV: &str = "TSIFT_LIVE_CONVEX_AUTH_TOKEN";
 
 fn tsift_bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_tsift"))
+    Command::new(env!("CARGO_BIN_EXE_tsift-cli"))
 }
 
 fn run_tsift(args: Vec<String>) -> Output {

@@ -2733,6 +2733,7 @@ version = "0.1.62"
 dependencies = [
  "tsift-agent-doc",
  "tsift-algorithms",
+ "tsift-cli",
  "tsift-digest",
  "tsift-graph",
  "tsift-index",
@@ -2759,7 +2760,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-algorithms"
-version = "0.1.0"
+version = "0.1.62"
 dependencies = [
  "anyhow",
  "serde",
@@ -2801,7 +2802,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-core"
-version = "0.1.0"
+version = "0.1.62"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2824,7 +2825,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-graph"
-version = "0.1.0"
+version = "0.1.62"
 dependencies = [
  "anyhow",
  "serde",
@@ -2859,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-libsql"
-version = "0.1.0"
+version = "0.1.62"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2873,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-quality"
-version = "0.1.0"
+version = "0.1.62"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -2885,7 +2886,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-resolution"
-version = "0.1.0"
+version = "0.1.62"
 dependencies = [
  "anyhow",
  "serde",
@@ -2928,7 +2929,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-sqlite"
-version = "0.1.0"
+version = "0.1.62"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2972,7 +2973,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-tokensave"
-version = "0.1.0"
+version = "0.1.62"
 dependencies = [
  "anyhow",
  "rusqlite",

@@ -43,21 +43,47 @@ jobs:
         shell: bash
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
-          crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          if [ -z "$crate_version" ]; then
-            echo "failed to read Cargo.toml package.version" >&2
-            exit 1
-          fi
-          if [ "$tag_version" != "$crate_version" ]; then
-            echo "tag version v$tag_version does not match Cargo.toml version $crate_version" >&2
-            exit 1
-          fi
+          while IFS= read -r manifest; do
+            crate_name="$(sed -n 's/^name = "\(.*\)"/\1/p' "$manifest" | head -n 1)"
+            crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$manifest" | head -n 1)"
+            if [ -z "$crate_name" ] || [ -z "$crate_version" ]; then
+              echo "failed to read package name/version from $manifest" >&2
+              exit 1
+            fi
+            if [ "$tag_version" != "$crate_version" ]; then
+              echo "tag version v$tag_version does not match $crate_name version $crate_version in $manifest" >&2
+              exit 1
+            fi
+          done < <(find . -name Cargo.toml -not -path './target/*' | sort)
 
       - name: Full CI suite
         run: make ci-full
 
-      - name: Crate publish dry run
-        run: cargo publish --locked --dry-run
+      - name: Crate package file check
+        shell: bash
+        run: |
+          for package in \
+            tsift-core \
+            tsift-graph \
+            tsift-sqlite \
+            tsift-algorithms \
+            tsift-resolution \
+            tsift-tokensave \
+            tsift-libsql \
+            tsift-index \
+            tsift-summarize \
+            tsift-quality \
+            tsift-agent-doc \
+            tsift-digest \
+            tsift-search \
+            tsift-status \
+            tsift-session \
+            tsift-cli \
+            tsift-sim-world \
+            tsift
+          do
+            cargo package -p "$package" --locked --list > "/tmp/${package}.package-files"
+          done
 
       - name: OpenCode plugin publish dry run
         run: npm run publish:check
@@ -95,7 +121,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build -p tsift --release --locked --target ${{ matrix.target }}
 
       - name: Package Unix archive
         if: runner.os != 'Windows'
@@ -168,7 +194,32 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Publish crate
-        run: cargo publish --locked
+        shell: bash
+        run: |
+          for package in \
+            tsift-core \
+            tsift-graph \
+            tsift-sqlite \
+            tsift-algorithms \
+            tsift-resolution \
+            tsift-tokensave \
+            tsift-libsql \
+            tsift-index \
+            tsift-summarize \
+            tsift-quality \
+            tsift-agent-doc \
+            tsift-digest \
+            tsift-search \
+            tsift-status \
+            tsift-session \
+            tsift-cli \
+            tsift-sim-world \
+            tsift
+          do
+            cargo publish -p "$package" --locked --dry-run
+            cargo publish -p "$package" --locked
+            sleep 20
+          done
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

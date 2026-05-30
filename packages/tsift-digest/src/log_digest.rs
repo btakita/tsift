@@ -1,9 +1,9 @@
-use tsift_quality::runtime_churn;
-use tsift_summarize::summarize::{self, SummaryDb};
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use tsift_quality::runtime_churn;
+use tsift_summarize::summarize::{self, SummaryDb};
 
 const MAX_REPEATED_LINES: usize = 8;
 const MAX_SIGNALS: usize = 12;

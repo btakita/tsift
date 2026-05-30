@@ -1,5 +1,5 @@
-use tsift_graph::lang::Lang;
 use tree_sitter::Parser;
+use tsift_graph::lang::Lang;
 
 fn dump(lang_name: &str, lang: Lang, source: &str, _depth: usize) {
     let mut parser = Parser::new();

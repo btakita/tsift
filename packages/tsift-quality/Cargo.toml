@@ -1,17 +1,21 @@
 [package]
 name = "tsift-quality"
-version = "0.1.0"
+version = "0.1.62"
 edition = "2024"
 description = "Quality-gate surfaces for tsift — audit, perf gates, DCI benchmarks, runtime churn detection"
 license = "MIT"
 repository = "https://github.com/btakita/tsift"
 authors = ["Brian Takita <brian.takita@gmail.com>"]
+readme = "README.md"
+keywords = ["agent", "search", "rag", "cli", "context"]
+categories = ["command-line-utilities", "development-tools"]
+publish = true
 
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tsift-index = { path = "../tsift-index" }
+tsift-index = { path = "../tsift-index", version = "0.1.62" }
 
 [dev-dependencies]
 rusqlite = { version = "0.34", features = ["bundled"] }

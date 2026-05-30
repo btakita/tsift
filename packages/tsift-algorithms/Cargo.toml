@@ -1,13 +1,17 @@
 [package]
 name = "tsift-algorithms"
-version = "0.1.0"
+version = "0.1.62"
 edition = "2024"
 description = "Graph algorithms for tsift — Tarjan SCC, health scoring, dead code detection, coupling analysis"
 license = "MIT"
 repository = "https://github.com/btakita/tsift"
 authors = ["Brian Takita <brian.takita@gmail.com>"]
+readme = "README.md"
+keywords = ["agent", "search", "rag", "cli", "context"]
+categories = ["command-line-utilities", "development-tools"]
+publish = true
 
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-tsift-core = { path = "../tsift-core" }
+tsift-core = { path = "../tsift-core", version = "0.1.62" }

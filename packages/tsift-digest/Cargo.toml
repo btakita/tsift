@@ -6,14 +6,18 @@ description = "Code-aware digest emitters for tsift — diff / log / metric / te
 license = "MIT"
 repository = "https://github.com/btakita/tsift"
 authors = ["Brian Takita <brian.takita@gmail.com>"]
+readme = "README.md"
+keywords = ["agent", "search", "rag", "cli", "context"]
+categories = ["command-line-utilities", "development-tools"]
+publish = true
 
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tsift-graph = { path = "../tsift-graph" }
-tsift-quality = { path = "../tsift-quality" }
-tsift-summarize = { path = "../tsift-summarize" }
+tsift-graph = { path = "../tsift-graph", version = "0.1.62" }
+tsift-quality = { path = "../tsift-quality", version = "0.1.62" }
+tsift-summarize = { path = "../tsift-summarize", version = "0.1.62" }
 
 [dev-dependencies]
 tempfile = "3"

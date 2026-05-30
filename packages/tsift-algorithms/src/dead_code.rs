@@ -38,10 +38,7 @@ pub struct DeadCodeResult {
     pub entry_points: Vec<String>,
 }
 
-pub fn detect_dead_code(
-    edges: &[(String, String)],
-    entry_points: &[String],
-) -> DeadCodeResult {
+pub fn detect_dead_code(edges: &[(String, String)], entry_points: &[String]) -> DeadCodeResult {
     if edges.is_empty() {
         return DeadCodeResult {
             dead_nodes: Vec::new(),
@@ -136,7 +133,10 @@ pub fn detect_dead_code(
     };
 
     dead_nodes.sort_by(|a, b| {
-        a.reason.to_string().cmp(&b.reason.to_string()).then(a.name.cmp(&b.name))
+        a.reason
+            .to_string()
+            .cmp(&b.reason.to_string())
+            .then(a.name.cmp(&b.name))
     });
 
     DeadCodeResult {
@@ -198,10 +198,7 @@ mod tests {
     #[test]
     fn multiple_entry_points() {
         let edges = vec![e("main", "a"), e("init", "b"), e("a", "c"), e("dead", "d")];
-        let result = detect_dead_code(
-            &edges,
-            &["main".to_string(), "init".to_string()],
-        );
+        let result = detect_dead_code(&edges, &["main".to_string(), "init".to_string()]);
         assert_eq!(result.dead_count, 2);
     }
 

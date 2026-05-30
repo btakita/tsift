@@ -1,9 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use tsift_core::{
-    GraphEdge, GraphNode, GraphPath, GraphStore, SQLITE_GRAPH_SCHEMA_VERSION,
-};
+use tsift_core::{GraphEdge, GraphNode, GraphPath, GraphStore, SQLITE_GRAPH_SCHEMA_VERSION};
 
 fn block_on<F: std::future::Future>(rt: &tokio::runtime::Runtime, f: F) -> F::Output {
     rt.block_on(f)
@@ -17,24 +15,35 @@ pub struct LibsqlGraphStore {
 impl LibsqlGraphStore {
     pub fn open(db_path: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating libsql graph substrate dir: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("creating libsql graph substrate dir: {}", parent.display())
+            })?;
         }
         let rt = tokio::runtime::Runtime::new().context("creating tokio runtime for libsql")?;
         let db = block_on(&rt, libsql::Builder::new_local(db_path).build())
             .with_context(|| format!("opening libsql graph substrate db: {}", db_path.display()))?;
-        let conn = db.connect()
-            .with_context(|| format!("connecting to libsql graph substrate db: {}", db_path.display()))?;
+        let conn = db.connect().with_context(|| {
+            format!(
+                "connecting to libsql graph substrate db: {}",
+                db_path.display()
+            )
+        })?;
         let store = Self { conn, rt };
         store.init_schema()?;
         Ok(store)
     }
 
     pub fn open_remote(url: &str, auth_token: &str) -> Result<Self> {
-        let rt = tokio::runtime::Runtime::new().context("creating tokio runtime for libsql remote")?;
-        let db = block_on(&rt, libsql::Builder::new_remote(url.to_string(), auth_token.to_string()).build())
-            .context("building libsql remote database")?;
-        let conn = db.connect().context("connecting to libsql remote database")?;
+        let rt =
+            tokio::runtime::Runtime::new().context("creating tokio runtime for libsql remote")?;
+        let db = block_on(
+            &rt,
+            libsql::Builder::new_remote(url.to_string(), auth_token.to_string()).build(),
+        )
+        .context("building libsql remote database")?;
+        let conn = db
+            .connect()
+            .context("connecting to libsql remote database")?;
         let store = Self { conn, rt };
         store.init_schema()?;
         Ok(store)
@@ -44,7 +53,9 @@ impl LibsqlGraphStore {
         let rt = tokio::runtime::Runtime::new().context("creating tokio runtime for libsql")?;
         let db = block_on(&rt, libsql::Builder::new_local(":memory:").build())
             .context("opening in-memory libsql database")?;
-        let conn = db.connect().context("connecting to in-memory libsql database")?;
+        let conn = db
+            .connect()
+            .context("connecting to in-memory libsql database")?;
         let store = Self { conn, rt };
         store.init_schema()?;
         Ok(store)
@@ -52,8 +63,9 @@ impl LibsqlGraphStore {
 
     fn init_schema(&self) -> Result<()> {
         block_on(&self.rt, async {
-            self.conn.execute_batch(&format!(
-                r#"
+            self.conn
+                .execute_batch(&format!(
+                    r#"
                 PRAGMA foreign_keys = ON;
                 PRAGMA busy_timeout = 5000;
 
@@ -127,7 +139,9 @@ impl LibsqlGraphStore {
 
                 PRAGMA user_version = {SQLITE_GRAPH_SCHEMA_VERSION};
                 "#,
-            )).await.context("initializing libsql graph schema")?;
+                ))
+                .await
+                .context("initializing libsql graph schema")?;
             Ok::<(), anyhow::Error>(())
         })?;
         Ok(())
@@ -192,28 +206,56 @@ fn row_hash<T: serde::Serialize>(value: &T) -> Result<String> {
     Ok(blake3::hash(&payload).to_hex().to_string())
 }
 
-fn replace_node_properties(conn: &libsql::Connection, rt: &tokio::runtime::Runtime, node_id: &str, properties: &BTreeMap<String, String>) -> Result<()> {
+fn replace_node_properties(
+    conn: &libsql::Connection,
+    rt: &tokio::runtime::Runtime,
+    node_id: &str,
+    properties: &BTreeMap<String, String>,
+) -> Result<()> {
     block_on(rt, async {
-        conn.execute("DELETE FROM graph_node_properties WHERE node_id = ?1", [node_id]).await?;
-        let stmt = conn.prepare(
-            "INSERT INTO graph_node_properties (node_id, key, value) VALUES (?1, ?2, ?3)"
-        ).await?;
+        conn.execute(
+            "DELETE FROM graph_node_properties WHERE node_id = ?1",
+            [node_id],
+        )
+        .await?;
+        let stmt = conn
+            .prepare("INSERT INTO graph_node_properties (node_id, key, value) VALUES (?1, ?2, ?3)")
+            .await?;
         for (key, value) in properties {
-            stmt.execute(libsql::params![node_id.to_string(), key.clone(), value.clone()]).await?;
+            stmt.execute(libsql::params![
+                node_id.to_string(),
+                key.clone(),
+                value.clone()
+            ])
+            .await?;
         }
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
 }
 
-fn replace_edge_properties(conn: &libsql::Connection, rt: &tokio::runtime::Runtime, edge_key: &str, properties: &BTreeMap<String, String>) -> Result<()> {
+fn replace_edge_properties(
+    conn: &libsql::Connection,
+    rt: &tokio::runtime::Runtime,
+    edge_key: &str,
+    properties: &BTreeMap<String, String>,
+) -> Result<()> {
     block_on(rt, async {
-        conn.execute("DELETE FROM graph_edge_properties WHERE edge_key = ?1", [edge_key.to_string()]).await?;
-        let stmt = conn.prepare(
-            "INSERT INTO graph_edge_properties (edge_key, key, value) VALUES (?1, ?2, ?3)"
-        ).await?;
+        conn.execute(
+            "DELETE FROM graph_edge_properties WHERE edge_key = ?1",
+            [edge_key.to_string()],
+        )
+        .await?;
+        let stmt = conn
+            .prepare("INSERT INTO graph_edge_properties (edge_key, key, value) VALUES (?1, ?2, ?3)")
+            .await?;
         for (key, value) in properties {
-            stmt.execute(libsql::params![edge_key.to_string(), key.clone(), value.clone()]).await?;
+            stmt.execute(libsql::params![
+                edge_key.to_string(),
+                key.clone(),
+                value.clone()
+            ])
+            .await?;
         }
         Ok::<(), anyhow::Error>(())
     })?;
@@ -285,10 +327,10 @@ impl GraphStore for LibsqlGraphStore {
 
     fn delete_node(&self, id: &str) -> Result<usize> {
         let count = block_on(&self.rt, async {
-            let result = self.conn.execute(
-                "DELETE FROM graph_nodes WHERE id = ?1",
-                [id],
-            ).await?;
+            let result = self
+                .conn
+                .execute("DELETE FROM graph_nodes WHERE id = ?1", [id])
+                .await?;
             Ok::<u64, anyhow::Error>(result)
         })?;
         Ok(count as usize)
@@ -296,10 +338,13 @@ impl GraphStore for LibsqlGraphStore {
 
     fn delete_edge(&self, from_id: &str, to_id: &str, kind: &str) -> Result<usize> {
         let count = block_on(&self.rt, async {
-            let result = self.conn.execute(
-                "DELETE FROM graph_edges WHERE from_id = ?1 AND to_id = ?2 AND kind = ?3",
-                libsql::params![from_id, to_id, kind],
-            ).await?;
+            let result = self
+                .conn
+                .execute(
+                    "DELETE FROM graph_edges WHERE from_id = ?1 AND to_id = ?2 AND kind = ?3",
+                    libsql::params![from_id, to_id, kind],
+                )
+                .await?;
             Ok::<u64, anyhow::Error>(result)
         })?;
         Ok(count as usize)
@@ -307,14 +352,17 @@ impl GraphStore for LibsqlGraphStore {
 
     fn node(&self, id: &str) -> Result<Option<GraphNode>> {
         block_on(&self.rt, async {
-            let mut rows = self.conn.query(
-                r#"
+            let mut rows = self
+                .conn
+                .query(
+                    r#"
                 SELECT id, kind, label, properties_json, provenance_json, freshness_json
                 FROM graph_nodes
                 WHERE id = ?1
                 "#,
-                [id],
-            ).await?;
+                    [id],
+                )
+                .await?;
             match rows.next().await? {
                 Some(row) => Ok(Some(node_from_row(&row)?)),
                 None => Ok(None),
@@ -324,14 +372,17 @@ impl GraphStore for LibsqlGraphStore {
 
     fn all_nodes(&self) -> Result<Vec<GraphNode>> {
         block_on(&self.rt, async {
-            let mut rows = self.conn.query(
-                r#"
+            let mut rows = self
+                .conn
+                .query(
+                    r#"
                 SELECT id, kind, label, properties_json, provenance_json, freshness_json
                 FROM graph_nodes
                 ORDER BY id
                 "#,
-                (),
-            ).await?;
+                    (),
+                )
+                .await?;
             let mut nodes = Vec::new();
             while let Some(row) = rows.next().await? {
                 nodes.push(node_from_row(&row)?);
@@ -360,15 +411,18 @@ impl GraphStore for LibsqlGraphStore {
 
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>> {
         block_on(&self.rt, async {
-            let mut rows = self.conn.query(
-                r#"
+            let mut rows = self
+                .conn
+                .query(
+                    r#"
                 SELECT id, kind, label, properties_json, provenance_json, freshness_json
                 FROM graph_nodes
                 WHERE kind = ?1
                 ORDER BY id
                 "#,
-                [kind],
-            ).await?;
+                    [kind],
+                )
+                .await?;
             let mut nodes = Vec::new();
             while let Some(row) = rows.next().await? {
                 nodes.push(node_from_row(&row)?);
@@ -507,8 +561,7 @@ mod tests {
                     .with_property("confidence", "0.91")
                     .with_provenance(source.clone())
                     .with_freshness(GraphFreshness::content_hash("edge-hash")),
-                GraphEdge::new("topic:rooms", "topic:egress", "related_to")
-                    .with_provenance(source),
+                GraphEdge::new("topic:rooms", "topic:egress", "related_to").with_provenance(source),
             ],
         }
     }
@@ -532,14 +585,13 @@ mod tests {
         store.upsert_edge(&edge).unwrap();
 
         assert_eq!(store.node("doc:livekit").unwrap(), Some(node));
-        assert_eq!(
-            store.nodes_by_kind("topic").unwrap(),
-            vec![topic]
-        );
+        assert_eq!(store.nodes_by_kind("topic").unwrap(), vec![topic]);
         assert_eq!(store.all_nodes().unwrap().len(), 2);
         assert_eq!(store.all_edges().unwrap().len(), 1);
         assert_eq!(
-            store.outgoing_edges("doc:livekit", Some("mentions")).unwrap(),
+            store
+                .outgoing_edges("doc:livekit", Some("mentions"))
+                .unwrap(),
             vec![edge]
         );
     }
@@ -566,35 +618,48 @@ mod tests {
         projection.upsert_into(&store).unwrap();
 
         let neighborhood = store.neighborhood("doc:livekit", 2, None).unwrap().unwrap();
-        let node_ids: Vec<&str> = neighborhood
-            .nodes
-            .iter()
-            .map(|n| n.id.as_str())
-            .collect();
+        let node_ids: Vec<&str> = neighborhood.nodes.iter().map(|n| n.id.as_str()).collect();
         assert_eq!(node_ids, vec!["doc:livekit", "topic:egress", "topic:rooms"]);
 
         assert_eq!(
-            store.delete_edge("topic:rooms", "topic:egress", "related_to").unwrap(),
+            store
+                .delete_edge("topic:rooms", "topic:egress", "related_to")
+                .unwrap(),
             1
         );
-        assert!(store
-            .shortest_path("doc:livekit", "topic:egress", None)
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .shortest_path("doc:livekit", "topic:egress", None)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(store.delete_node("topic:rooms").unwrap(), 1);
         assert!(store.node("topic:rooms").unwrap().is_none());
-        assert!(store.outgoing_edges("doc:livekit", None).unwrap().is_empty());
+        assert!(
+            store
+                .outgoing_edges("doc:livekit", None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn libsql_store_shortest_path() {
         let store = LibsqlGraphStore::in_memory().unwrap();
         for id in ["a", "b", "c"] {
-            store.upsert_node(&GraphNode::new(id, "symbol", id)).unwrap();
+            store
+                .upsert_node(&GraphNode::new(id, "symbol", id))
+                .unwrap();
         }
-        store.upsert_edge(&GraphEdge::new("a", "b", "calls")).unwrap();
-        store.upsert_edge(&GraphEdge::new("a", "c", "documents")).unwrap();
-        store.upsert_edge(&GraphEdge::new("b", "c", "calls")).unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("a", "b", "calls"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("a", "c", "documents"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("b", "c", "calls"))
+            .unwrap();
 
         let calls = store.outgoing_edges("a", Some("calls")).unwrap();
         assert_eq!(calls.len(), 1);
@@ -607,7 +672,12 @@ mod tests {
         assert_eq!(path.nodes, vec!["a", "b", "c"]);
         assert_eq!(path.hops, 2);
 
-        assert!(store.shortest_path("c", "a", Some("calls")).unwrap().is_none());
+        assert!(
+            store
+                .shortest_path("c", "a", Some("calls"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -625,10 +695,16 @@ mod tests {
     fn libsql_graph_counts() {
         let store = LibsqlGraphStore::in_memory().unwrap();
         for id in ["a", "b", "c"] {
-            store.upsert_node(&GraphNode::new(id, "symbol", id)).unwrap();
+            store
+                .upsert_node(&GraphNode::new(id, "symbol", id))
+                .unwrap();
         }
-        store.upsert_edge(&GraphEdge::new("a", "b", "calls")).unwrap();
-        store.upsert_edge(&GraphEdge::new("b", "c", "calls")).unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("a", "b", "calls"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("b", "c", "calls"))
+            .unwrap();
         let (nodes, edges) = store.graph_counts().unwrap();
         assert_eq!(nodes, 3);
         assert_eq!(edges, 2);

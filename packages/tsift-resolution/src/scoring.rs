@@ -213,7 +213,10 @@ pub fn page_handle_coverage_pct(nodes: &[GraphNode]) -> f64 {
     if nodes.is_empty() {
         return 0.0;
     }
-    let covered = nodes.iter().filter(|node| node_has_handle_coverage(node)).count();
+    let covered = nodes
+        .iter()
+        .filter(|node| node_has_handle_coverage(node))
+        .count();
     (covered as f64 / nodes.len() as f64) * 100.0
 }
 
@@ -244,9 +247,9 @@ pub fn has_community_signal(node: &GraphNode, edge_kinds: &[String]) -> bool {
 
 pub fn has_semantic_signal(node: &GraphNode, edge_kinds: &[String]) -> bool {
     node.kind.starts_with("semantic_")
-        || edge_kinds
-            .iter()
-            .any(|kind| kind.contains("semantic") || kind.contains("concept") || kind.contains("entity"))
+        || edge_kinds.iter().any(|kind| {
+            kind.contains("semantic") || kind.contains("concept") || kind.contains("entity")
+        })
 }
 
 pub fn source_handle_is_fresh(node: &GraphNode) -> bool {
@@ -343,9 +346,8 @@ mod tests {
             GraphEdge::new("b", "c", "calls"),
         ];
         let node_by_id = nodes.iter().map(|n| (n.id.clone(), n)).collect();
-        let outgoing: BTreeMap<String, Vec<&GraphEdge>> = edges
-            .iter()
-            .fold(BTreeMap::new(), |mut acc, e| {
+        let outgoing: BTreeMap<String, Vec<&GraphEdge>> =
+            edges.iter().fold(BTreeMap::new(), |mut acc, e| {
                 acc.entry(e.from_id.clone()).or_default().push(e);
                 acc
             });
@@ -443,8 +445,7 @@ mod tests {
 
     #[test]
     fn duplicate_name_precision_duplicate_with_handle() {
-        let node =
-            GraphNode::new("a", "symbol", "dup").with_property("handle", "h:1");
+        let node = GraphNode::new("a", "symbol", "dup").with_property("handle", "h:1");
         let counts = BTreeMap::from([("dup".to_string(), 5)]);
         assert_eq!(duplicate_name_precision(&node, &counts), 1.0);
     }
@@ -470,8 +471,7 @@ mod tests {
 
     #[test]
     fn has_community_signal_property() {
-        let node =
-            GraphNode::new("a", "file", "a").with_property("community_id", "c1");
+        let node = GraphNode::new("a", "file", "a").with_property("community_id", "c1");
         assert!(has_community_signal(&node, &[]));
     }
 
@@ -496,8 +496,8 @@ mod tests {
 
     #[test]
     fn source_handle_is_fresh_wrong_kind() {
-        let node = GraphNode::new("a", "file", "a")
-            .with_freshness(GraphFreshness::content_hash("abc"));
+        let node =
+            GraphNode::new("a", "file", "a").with_freshness(GraphFreshness::content_hash("abc"));
         assert!(!source_handle_is_fresh(&node));
     }
 
@@ -530,7 +530,13 @@ mod tests {
         let gate = default_neighborhood_ranking_gate();
         assert_eq!(gate.status, "active");
         assert!(gate.ranked_output_default);
-        assert_eq!(gate.min_handle_coverage_pct, COMMUNITY_MIN_HANDLE_COVERAGE_PCT);
-        assert_eq!(gate.min_duplicate_name_precision, COMMUNITY_MIN_DUPLICATE_NAME_PRECISION);
+        assert_eq!(
+            gate.min_handle_coverage_pct,
+            COMMUNITY_MIN_HANDLE_COVERAGE_PCT
+        );
+        assert_eq!(
+            gate.min_duplicate_name_precision,
+            COMMUNITY_MIN_DUPLICATE_NAME_PRECISION
+        );
     }
 }

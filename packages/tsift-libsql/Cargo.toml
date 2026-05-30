@@ -1,11 +1,15 @@
 [package]
 name = "tsift-libsql"
-version = "0.1.0"
+version = "0.1.62"
 edition = "2024"
 description = "libSQL graph store backend for tsift"
 license = "MIT"
 repository = "https://github.com/btakita/tsift"
 authors = ["Brian Takita <brian.takita@gmail.com>"]
+readme = "README.md"
+keywords = ["agent", "search", "rag", "cli", "context"]
+categories = ["command-line-utilities", "development-tools"]
+publish = true
 
 [dependencies]
 anyhow = "1"
@@ -14,5 +18,5 @@ libsql = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt"] }
-tsift-core = { path = "../tsift-core" }
+tsift-core = { path = "../tsift-core", version = "0.1.62" }
 tempfile = "3"

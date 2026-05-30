@@ -13,30 +13,37 @@ authors = ["Brian Takita <brian.takita@gmail.com>"]
 readme = "README.md"
 keywords = ["agent", "search", "rag", "cli", "context"]
 categories = ["command-line-utilities", "development-tools"]
+publish = true
+
+[[bin]]
+name = "tsift"
+path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
-# Root `tsift` is now a thin re-export shim: its lib.rs and the `graph` / `lang`
-# / `resolution` / `substrate` / `libsql_backend` modules only `pub use` sibling
-# crates. It therefore carries no external crate dependencies of its own — every
-# real implementation lives in a `tsift-*` workspace crate.
-tsift-algorithms = { path = "packages/tsift-algorithms" }
-tsift-tokensave = { path = "packages/tsift-tokensave" }
-tsift-sqlite = { path = "packages/tsift-sqlite" }
-tsift-graph = { path = "packages/tsift-graph" }
-tsift-resolution = { path = "packages/tsift-resolution" }
-tsift-quality = { path = "packages/tsift-quality" }
-tsift-index = { path = "packages/tsift-index" }
-tsift-agent-doc = { path = "packages/tsift-agent-doc" }
-tsift-summarize = { path = "packages/tsift-summarize" }
-tsift-digest = { path = "packages/tsift-digest" }
-tsift-search = { path = "packages/tsift-search" }
-tsift-status = { path = "packages/tsift-status" }
+# Root `tsift` keeps the public package name. Its library remains a thin
+# re-export shim while the package binary delegates to `tsift-cli` so
+# `cargo install tsift` continues to install the CLI.
+tsift-agent-doc = { path = "packages/tsift-agent-doc", version = "0.1.62" }
+tsift-algorithms = { path = "packages/tsift-algorithms", version = "0.1.62" }
+tsift-cli = { path = "packages/tsift-cli", version = "0.1.62", optional = true }
+tsift-digest = { path = "packages/tsift-digest", version = "0.1.62" }
+tsift-graph = { path = "packages/tsift-graph", version = "0.1.62" }
+tsift-index = { path = "packages/tsift-index", version = "0.1.62" }
+tsift-quality = { path = "packages/tsift-quality", version = "0.1.62" }
+tsift-resolution = { path = "packages/tsift-resolution", version = "0.1.62" }
+tsift-search = { path = "packages/tsift-search", version = "0.1.62" }
+tsift-sqlite = { path = "packages/tsift-sqlite", version = "0.1.62" }
+tsift-status = { path = "packages/tsift-status", version = "0.1.62" }
+tsift-summarize = { path = "packages/tsift-summarize", version = "0.1.62" }
+tsift-tokensave = { path = "packages/tsift-tokensave", version = "0.1.62" }
 
-tsift-libsql = { path = "packages/tsift-libsql", optional = true }
+tsift-libsql = { path = "packages/tsift-libsql", version = "0.1.62", optional = true }
 
 [features]
-default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]
+default = ["cli", "lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]
 backend-libsql = ["dep:tsift-libsql"]
+cli = ["dep:tsift-cli"]
 lang-rust = ["tsift-graph/lang-rust", "tsift-search/lang-rust"]
 lang-python = ["tsift-graph/lang-python", "tsift-search/lang-python"]
 lang-typescript = ["tsift-graph/lang-typescript", "tsift-search/lang-typescript"]

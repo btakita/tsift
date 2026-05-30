@@ -1,8 +1,8 @@
-use tsift_summarize::summarize::{self, SummaryDb};
 use anyhow::{Result, bail};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use tsift_summarize::summarize::{self, SummaryDb};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

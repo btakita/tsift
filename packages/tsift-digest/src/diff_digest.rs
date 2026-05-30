@@ -1,12 +1,12 @@
-use tsift_graph as graph;
-use tsift_graph::lang::Lang;
-use tsift_quality::lint;
-use tsift_summarize::summarize::{self, SummaryDb};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
+use tsift_graph as graph;
+use tsift_graph::lang::Lang;
+use tsift_quality::lint;
+use tsift_summarize::summarize::{self, SummaryDb};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

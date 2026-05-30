@@ -65,7 +65,10 @@ pub fn coupling_analysis(
             None => continue,
         };
         if from_mod != to_mod {
-            efferent.entry(from_mod.clone()).or_default().insert(to_mod.clone());
+            efferent
+                .entry(from_mod.clone())
+                .or_default()
+                .insert(to_mod.clone());
             afferent.entry(to_mod).or_default().insert(from_mod);
         }
     }
@@ -111,8 +114,16 @@ pub fn coupling_analysis(
     }
 
     let num_modules = modules_out.len();
-    let avg_fan_out = if num_modules > 0 { total_fan_out as f64 / num_modules as f64 } else { 0.0 };
-    let avg_fan_in = if num_modules > 0 { total_fan_in as f64 / num_modules as f64 } else { 0.0 };
+    let avg_fan_out = if num_modules > 0 {
+        total_fan_out as f64 / num_modules as f64
+    } else {
+        0.0
+    };
+    let avg_fan_in = if num_modules > 0 {
+        total_fan_in as f64 / num_modules as f64
+    } else {
+        0.0
+    };
 
     let avg_plus_std = avg_fan_out + (avg_fan_out * 0.5).max(1.0);
     let highly_coupled: Vec<String> = modules_out
@@ -144,7 +155,10 @@ mod tests {
     }
 
     fn make_module_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -180,12 +194,7 @@ mod tests {
     #[test]
     fn instability_computed() {
         let edges = vec![e("a", "b"), e("a", "c"), e("d", "a")];
-        let map = make_module_map(&[
-            ("a", "core"),
-            ("b", "util"),
-            ("c", "util"),
-            ("d", "cli"),
-        ]);
+        let map = make_module_map(&[("a", "core"), ("b", "util"), ("c", "util"), ("d", "cli")]);
         let report = coupling_analysis(&edges, &map);
         let core = report.modules.iter().find(|m| m.module == "core").unwrap();
         assert_eq!(core.fan_out, 1); // core -> util

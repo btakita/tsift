@@ -9,7 +9,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 fn tsift_bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_tsift"))
+    Command::new(env!("CARGO_BIN_EXE_tsift-cli"))
 }
 
 fn hold_rollback_journal_lock(db_path: &std::path::Path) -> Connection {
@@ -79,8 +79,18 @@ fn release_publish_gate_requires_secret_variable_and_dry_run() {
     let readme = fs::read_to_string(root.join("README.md")).unwrap();
 
     assert!(
-        workflow.contains("cargo publish --locked --dry-run"),
-        "release verification should prove the crate package is publishable"
+        workflow.contains("cargo package -p \"$package\" --locked --list"),
+        "release verification should list each split crate package payload"
+    );
+    assert!(
+        workflow.contains(
+            "cargo publish -p \"$package\" --locked --dry-run\n            cargo publish -p \"$package\" --locked"
+        ),
+        "publish job should dry-run each split crate immediately before upload"
+    );
+    assert!(
+        workflow.contains("cargo build -p tsift --release --locked"),
+        "release asset builds should target the public root package"
     );
     assert!(
         workflow.contains("vars.TSIFT_ENABLE_CRATES_PUBLISH == 'true'"),
@@ -93,7 +103,8 @@ fn release_publish_gate_requires_secret_variable_and_dry_run() {
     assert!(
         spec.contains("TSIFT_ENABLE_CRATES_PUBLISH=true")
             && spec.contains("CARGO_REGISTRY_TOKEN")
-            && spec.contains("cargo publish --locked --dry-run"),
+            && spec.contains("cargo package -p <crate> --locked --list")
+            && spec.contains("cargo publish -p <crate> --locked --dry-run"),
         "release spec should document the publish gate"
     );
     assert!(
@@ -101,6 +112,142 @@ fn release_publish_gate_requires_secret_variable_and_dry_run() {
             && readme.contains("CARGO_REGISTRY_TOKEN"),
         "README should document the repo variable and secret"
     );
+
+    let publish_job = workflow
+        .split("      - name: Publish crate")
+        .nth(1)
+        .expect("release workflow should include the crate publish step");
+    let mut previous = 0;
+    for package in release_crate_order() {
+        let line_with_continuation = format!("            {package} \\");
+        let line_last = format!("            {package}\n");
+        let next = publish_job[previous..]
+            .find(&line_with_continuation)
+            .or_else(|| publish_job[previous..].find(&line_last));
+        let Some(index) = next.map(|idx| previous + idx) else {
+            panic!("release workflow missing dependency-ordered package {package}");
+        };
+        previous = index;
+    }
+}
+
+fn release_crate_order() -> &'static [&'static str] {
+    &[
+        "tsift-core",
+        "tsift-graph",
+        "tsift-sqlite",
+        "tsift-algorithms",
+        "tsift-resolution",
+        "tsift-tokensave",
+        "tsift-libsql",
+        "tsift-index",
+        "tsift-summarize",
+        "tsift-quality",
+        "tsift-agent-doc",
+        "tsift-digest",
+        "tsift-search",
+        "tsift-status",
+        "tsift-session",
+        "tsift-cli",
+        "tsift-sim-world",
+        "tsift",
+    ]
+}
+
+#[test]
+fn split_crate_manifests_are_publish_ready() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("tsift-cli lives under packages/");
+
+    for (name, rel_manifest) in [
+        ("tsift", "Cargo.toml"),
+        ("tsift-agent-doc", "packages/tsift-agent-doc/Cargo.toml"),
+        ("tsift-algorithms", "packages/tsift-algorithms/Cargo.toml"),
+        ("tsift-cli", "packages/tsift-cli/Cargo.toml"),
+        ("tsift-core", "packages/tsift-core/Cargo.toml"),
+        ("tsift-digest", "packages/tsift-digest/Cargo.toml"),
+        ("tsift-graph", "packages/tsift-graph/Cargo.toml"),
+        ("tsift-index", "packages/tsift-index/Cargo.toml"),
+        ("tsift-libsql", "packages/tsift-libsql/Cargo.toml"),
+        ("tsift-quality", "packages/tsift-quality/Cargo.toml"),
+        ("tsift-resolution", "packages/tsift-resolution/Cargo.toml"),
+        ("tsift-search", "packages/tsift-search/Cargo.toml"),
+        ("tsift-session", "packages/tsift-session/Cargo.toml"),
+        ("tsift-sim-world", "packages/tsift-sim-world/Cargo.toml"),
+        ("tsift-sqlite", "packages/tsift-sqlite/Cargo.toml"),
+        ("tsift-status", "packages/tsift-status/Cargo.toml"),
+        ("tsift-summarize", "packages/tsift-summarize/Cargo.toml"),
+        ("tsift-tokensave", "packages/tsift-tokensave/Cargo.toml"),
+    ] {
+        let manifest_path = workspace_root.join(rel_manifest);
+        let manifest = fs::read_to_string(&manifest_path).unwrap();
+        let value: toml::Value = manifest.parse().unwrap();
+        let package = value
+            .get("package")
+            .and_then(toml::Value::as_table)
+            .unwrap();
+
+        assert_eq!(
+            package.get("name").and_then(toml::Value::as_str),
+            Some(name),
+            "manifest name mismatch for {rel_manifest}"
+        );
+        assert_eq!(
+            package.get("version").and_then(toml::Value::as_str),
+            Some("0.1.62"),
+            "manifest version drift for {name}"
+        );
+        assert_eq!(
+            package.get("publish").and_then(toml::Value::as_bool),
+            Some(true),
+            "publish should be explicit for {name}"
+        );
+        let readme = package
+            .get("readme")
+            .and_then(toml::Value::as_str)
+            .expect("readme metadata required");
+        assert!(
+            manifest_path.parent().unwrap().join(readme).exists(),
+            "readme path should exist for {name}: {readme}"
+        );
+        assert!(
+            package
+                .get("keywords")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|items| !items.is_empty()),
+            "keywords should be explicit for {name}"
+        );
+        assert!(
+            package
+                .get("categories")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|items| !items.is_empty()),
+            "categories should be explicit for {name}"
+        );
+
+        for table_name in ["dependencies", "dev-dependencies"] {
+            if let Some(table) = value.get(table_name).and_then(toml::Value::as_table) {
+                for (dep_name, dep_value) in table {
+                    let is_local_tsift = dep_name == "tsift" || dep_name.starts_with("tsift-");
+                    if is_local_tsift
+                        && dep_value
+                            .get("path")
+                            .and_then(toml::Value::as_str)
+                            .is_some()
+                    {
+                        assert_eq!(
+                            dep_value.get("version").and_then(toml::Value::as_str),
+                            Some("0.1.62"),
+                            "{name} {table_name}.{dep_name} path dependency needs matching version"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]

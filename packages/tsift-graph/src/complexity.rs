@@ -238,9 +238,9 @@ impl LanguageRegistry {
     }
 
     pub fn complexity_for_source(&self, lang: Lang, source: &[u8]) -> Result<ComplexityMetrics> {
-        let extractor = self
-            .get(lang.name())
-            .ok_or_else(|| anyhow::anyhow!("no extractor registered for language: {}", lang.name()))?;
+        let extractor = self.get(lang.name()).ok_or_else(|| {
+            anyhow::anyhow!("no extractor registered for language: {}", lang.name())
+        })?;
         extractor.extract_complexity(source)
     }
 
@@ -291,9 +291,21 @@ mod tests {
 }
 "#;
         let metrics = registry.complexity_for_source(Lang::Rust, source).unwrap();
-        assert!(metrics.branches >= 2, "expected >=2 branches, got {}", metrics.branches);
-        assert!(metrics.loops >= 1, "expected >=1 loop, got {}", metrics.loops);
-        assert!(metrics.returns >= 1, "expected >=1 return, got {}", metrics.returns);
+        assert!(
+            metrics.branches >= 2,
+            "expected >=2 branches, got {}",
+            metrics.branches
+        );
+        assert!(
+            metrics.loops >= 1,
+            "expected >=1 loop, got {}",
+            metrics.loops
+        );
+        assert!(
+            metrics.returns >= 1,
+            "expected >=1 return, got {}",
+            metrics.returns
+        );
     }
 
     #[cfg(feature = "lang-python")]
@@ -308,10 +320,24 @@ mod tests {
             continue
     return 0
 "#;
-        let metrics = registry.complexity_for_source(Lang::Python, source).unwrap();
-        assert!(metrics.branches >= 2, "expected >=2 branches, got {}", metrics.branches);
-        assert!(metrics.loops >= 1, "expected >=1 loop, got {}", metrics.loops);
-        assert!(metrics.returns >= 2, "expected >=2 returns, got {}", metrics.returns);
+        let metrics = registry
+            .complexity_for_source(Lang::Python, source)
+            .unwrap();
+        assert!(
+            metrics.branches >= 2,
+            "expected >=2 branches, got {}",
+            metrics.branches
+        );
+        assert!(
+            metrics.loops >= 1,
+            "expected >=1 loop, got {}",
+            metrics.loops
+        );
+        assert!(
+            metrics.returns >= 2,
+            "expected >=2 returns, got {}",
+            metrics.returns
+        );
     }
 
     #[cfg(feature = "lang-typescript")]
@@ -331,9 +357,21 @@ mod tests {
         let metrics = registry
             .complexity_for_source(Lang::TypeScript, source)
             .unwrap();
-        assert!(metrics.branches >= 2, "expected >=2 branches, got {}", metrics.branches);
-        assert!(metrics.loops >= 1, "expected >=1 loop, got {}", metrics.loops);
-        assert!(metrics.returns >= 2, "expected >=2 returns, got {}", metrics.returns);
+        assert!(
+            metrics.branches >= 2,
+            "expected >=2 branches, got {}",
+            metrics.branches
+        );
+        assert!(
+            metrics.loops >= 1,
+            "expected >=1 loop, got {}",
+            metrics.loops
+        );
+        assert!(
+            metrics.returns >= 2,
+            "expected >=2 returns, got {}",
+            metrics.returns
+        );
     }
 
     #[test]

@@ -1,4 +1,8 @@
 use anyhow::Result;
+use serde::Serialize;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use tsift_index::config;
 use tsift_index::index::{IndexDb, WriterLockProbe, probe_writer_lock, writer_lock_path};
 use tsift_index::init::{self, InstructionStatus};
@@ -6,10 +10,6 @@ use tsift_sqlite::{
     ReadOnlyRecovery, rollback_journal_path, shared_memory_sidecar_path, wal_sidecar_path,
 };
 use tsift_summarize::summarize::SummaryDb;
-use serde::Serialize;
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 #[derive(Debug, Serialize)]
 pub struct StatusReport {
@@ -1174,11 +1174,11 @@ pub fn format_locks_human(report: &LockReport, compact: bool) -> String {
 mod tests {
     use super::*;
     use fs4::fs_std::FileExt;
-    use tsift_index::config::Config;
-    use tsift_sqlite::wal_sidecar_path;
     use rusqlite::Connection;
     use std::fs::OpenOptions;
     use tempfile::TempDir;
+    use tsift_index::config::Config;
+    use tsift_sqlite::wal_sidecar_path;
 
     fn setup_workspace() -> TempDir {
         let dir = TempDir::new().unwrap();

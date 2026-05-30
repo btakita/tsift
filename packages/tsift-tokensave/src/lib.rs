@@ -93,19 +93,25 @@ impl TokensaveDb {
     pub fn node_count(&self) -> Result<usize> {
         Ok(self
             .conn
-            .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get::<_, usize>(0))?)
+            .query_row("SELECT COUNT(*) FROM nodes", [], |row| {
+                row.get::<_, usize>(0)
+            })?)
     }
 
     pub fn edge_count(&self) -> Result<usize> {
         Ok(self
             .conn
-            .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get::<_, usize>(0))?)
+            .query_row("SELECT COUNT(*) FROM edges", [], |row| {
+                row.get::<_, usize>(0)
+            })?)
     }
 
     pub fn file_count(&self) -> Result<usize> {
         Ok(self
             .conn
-            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, usize>(0))?)
+            .query_row("SELECT COUNT(*) FROM files", [], |row| {
+                row.get::<_, usize>(0)
+            })?)
     }
 
     pub fn kinds(&self) -> Result<Vec<(String, usize)>> {
@@ -155,8 +161,12 @@ impl TokensaveDb {
 
     pub fn edges_from(&self, source_id: &str, kind: Option<&str>) -> Result<Vec<TokensaveEdge>> {
         let sql = match kind {
-            Some(_) => "SELECT id, source, target, kind, line FROM edges WHERE source = ?1 AND kind = ?2 ORDER BY target",
-            None => "SELECT id, source, target, kind, line FROM edges WHERE source = ?1 ORDER BY kind, target",
+            Some(_) => {
+                "SELECT id, source, target, kind, line FROM edges WHERE source = ?1 AND kind = ?2 ORDER BY target"
+            }
+            None => {
+                "SELECT id, source, target, kind, line FROM edges WHERE source = ?1 ORDER BY kind, target"
+            }
         };
         let mut stmt = self.conn.prepare(sql)?;
         let rows = match kind {
@@ -168,8 +178,12 @@ impl TokensaveDb {
 
     pub fn edges_to(&self, target_id: &str, kind: Option<&str>) -> Result<Vec<TokensaveEdge>> {
         let sql = match kind {
-            Some(_) => "SELECT id, source, target, kind, line FROM edges WHERE target = ?1 AND kind = ?2 ORDER BY source",
-            None => "SELECT id, source, target, kind, line FROM edges WHERE target = ?1 ORDER BY kind, source",
+            Some(_) => {
+                "SELECT id, source, target, kind, line FROM edges WHERE target = ?1 AND kind = ?2 ORDER BY source"
+            }
+            None => {
+                "SELECT id, source, target, kind, line FROM edges WHERE target = ?1 ORDER BY kind, source"
+            }
         };
         let mut stmt = self.conn.prepare(sql)?;
         let rows = match kind {
@@ -180,9 +194,9 @@ impl TokensaveDb {
     }
 
     pub fn files(&self) -> Result<Vec<TokensaveFile>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT path, content_hash, size, node_count FROM files ORDER BY path",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, content_hash, size, node_count FROM files ORDER BY path")?;
         let rows = stmt.query_map([], |row| {
             Ok(TokensaveFile {
                 path: row.get(0)?,
@@ -234,9 +248,15 @@ impl TokensaveDb {
 
     pub fn to_graph_node(tokensave_node: &TokensaveNode) -> GraphNode {
         let mut properties = BTreeMap::new();
-        properties.insert("qualified_name".to_string(), tokensave_node.qualified_name.clone());
+        properties.insert(
+            "qualified_name".to_string(),
+            tokensave_node.qualified_name.clone(),
+        );
         properties.insert("file_path".to_string(), tokensave_node.file_path.clone());
-        properties.insert("start_line".to_string(), tokensave_node.start_line.to_string());
+        properties.insert(
+            "start_line".to_string(),
+            tokensave_node.start_line.to_string(),
+        );
         properties.insert("end_line".to_string(), tokensave_node.end_line.to_string());
         properties.insert("visibility".to_string(), tokensave_node.visibility.clone());
         if tokensave_node.is_async {
@@ -377,10 +397,7 @@ impl GraphStore for TokensaveDb {
 
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>> {
         let ts_nodes = self.nodes_by_kind(kind)?;
-        let mut nodes: Vec<GraphNode> = ts_nodes
-            .iter()
-            .map(Self::to_graph_node)
-            .collect();
+        let mut nodes: Vec<GraphNode> = ts_nodes.iter().map(Self::to_graph_node).collect();
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(nodes)
     }
@@ -388,11 +405,7 @@ impl GraphStore for TokensaveDb {
     fn outgoing_edges(&self, from_id: &str, kind: Option<&str>) -> Result<Vec<GraphEdge>> {
         let ts_edges = self.edges_from(from_id, kind)?;
         let mut edges: Vec<GraphEdge> = ts_edges.iter().map(Self::to_graph_edge).collect();
-        edges.sort_by(|a, b| {
-            a.to_id
-                .cmp(&b.to_id)
-                .then(a.kind.cmp(&b.kind))
-        });
+        edges.sort_by(|a, b| a.to_id.cmp(&b.to_id).then(a.kind.cmp(&b.kind)));
         Ok(edges)
     }
 
@@ -516,7 +529,8 @@ mod tests {
             "INSERT INTO nodes (id, kind, name, qualified_name, file_path, start_line, end_line) \
              VALUES ('fn:main', 'function', 'main', 'main', 'src/main.rs', 1, 10)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO nodes (id, kind, name, qualified_name, file_path, start_line, end_line, docstring, is_async) \
              VALUES ('fn:alpha', 'function', 'alpha', 'alpha', 'src/lib.rs', 5, 15, 'Does the thing', 1)",
@@ -526,12 +540,14 @@ mod tests {
             "INSERT INTO nodes (id, kind, name, qualified_name, file_path, start_line, end_line) \
              VALUES ('fn:beta', 'function', 'beta', 'beta', 'src/lib.rs', 20, 30)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO nodes (id, kind, name, qualified_name, file_path, start_line, end_line) \
              VALUES ('struct:Config', 'struct', 'Config', 'Config', 'src/lib.rs', 35, 40)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO edges (source, target, kind, line) VALUES ('fn:main', 'fn:alpha', 'calls', 3)",
             [],
@@ -548,22 +564,26 @@ mod tests {
             "INSERT INTO nodes_fts (rowid, name, qualified_name, docstring, signature) \
              VALUES (1, 'main', 'main', NULL, NULL)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO nodes_fts (rowid, name, qualified_name, docstring, signature) \
              VALUES (2, 'alpha', 'alpha', 'Does the thing', 'fn alpha() -> Result<()>')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO nodes_fts (rowid, name, qualified_name, docstring, signature) \
              VALUES (3, 'beta', 'beta', NULL, NULL)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO files (path, content_hash, size, modified_at, indexed_at, node_count) \
              VALUES ('src/lib.rs', 'abc123', 500, 1000, 1001, 3)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         drop(conn);
         db_path
@@ -600,10 +620,7 @@ mod tests {
         let results = db.search_fts("alpha", Some(10)).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].name, "alpha");
-        assert_eq!(
-            results[0].docstring.as_deref(),
-            Some("Does the thing")
-        );
+        assert_eq!(results[0].docstring.as_deref(), Some("Does the thing"));
     }
 
     #[test]
@@ -621,7 +638,8 @@ mod tests {
         assert_eq!(node.label, "alpha");
         assert_eq!(node.properties.get("is_async"), Some(&"true".to_string()));
 
-        let path = db.shortest_path("fn:main", "fn:beta", Some("calls"))
+        let path = db
+            .shortest_path("fn:main", "fn:beta", Some("calls"))
             .unwrap()
             .unwrap();
         assert_eq!(path.nodes, vec!["fn:main", "fn:alpha", "fn:beta"]);

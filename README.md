@@ -127,11 +127,13 @@ GitHub release assets are built by the `Release` workflow for:
 - `aarch64-apple-darwin`
 - `x86_64-pc-windows-msvc`
 
-The crates.io package path is enabled after `cargo publish --dry-run` passes.
-The release workflow uses the `TSIFT_ENABLE_CRATES_PUBLISH=true` repository
-variable and `CARGO_REGISTRY_TOKEN` repository secret to turn on tagged
-crates.io publishes. The default lexical search adapter is maintained in-tree,
-so publishing no longer depends on an upstream git-only `sift` crate.
+The crates.io package path lists every split Rust crate package during release
+verification, then the tagged publish job runs `cargo publish --locked --dry-run`
+immediately before each real publish in dependency order. The release workflow
+uses the `TSIFT_ENABLE_CRATES_PUBLISH=true` repository variable and
+`CARGO_REGISTRY_TOKEN` repository secret to turn on tagged crates.io publishes.
+The default lexical search adapter is maintained in-tree, so publishing no
+longer depends on an upstream git-only `sift` crate.
 
 The OpenCode command pack under `packages/opencode-tsift` is publishable to npm.
 The release workflow dry-runs `npm publish --access public`; tagged npm

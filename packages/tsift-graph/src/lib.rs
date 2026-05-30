@@ -2,8 +2,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet, VecDeque};
-use tsift_core::{GraphEdge, GraphNode, GraphProjection, GraphProvenance};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
+use tsift_core::{GraphEdge, GraphNode, GraphProjection, GraphProvenance};
 
 pub mod lang;
 pub use lang::{Lang, Symbol};

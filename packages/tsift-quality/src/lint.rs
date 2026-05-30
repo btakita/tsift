@@ -1,8 +1,8 @@
-use tsift_index::{config, index::IndexDb};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use tsift_index::{config, index::IndexDb};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LintResult {

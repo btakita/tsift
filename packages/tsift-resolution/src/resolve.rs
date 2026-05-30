@@ -127,7 +127,9 @@ mod tests {
         let mut index = HashMap::new();
         index.insert("tok1".to_string(), vec![0, 1]);
         index.insert("tok2".to_string(), vec![1, 2]);
-        let tokens: BTreeSet<String> = ["tok1".to_string(), "tok2".to_string()].into_iter().collect();
+        let tokens: BTreeSet<String> = ["tok1".to_string(), "tok2".to_string()]
+            .into_iter()
+            .collect();
         let ranked = token_overlap_rank(&tokens, &entries, &index);
         assert_eq!(ranked[0].0, 2);
         assert_eq!(*ranked[0].1, "beta");
