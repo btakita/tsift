@@ -165,6 +165,21 @@ impl MemoryEventKind {
             Self::ImportedUserPrompt => "imported_user_prompt",
         }
     }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "prompt_target" => Ok(Self::PromptTarget),
+            "tool_call" => Ok(Self::ToolCall),
+            "tool_result_artifact" => Ok(Self::ToolResultArtifact),
+            "response_summary" => Ok(Self::ResponseSummary),
+            "closeout_proof" => Ok(Self::CloseoutProof),
+            "session_check" => Ok(Self::SessionCheck),
+            "imported_observation" => Ok(Self::ImportedObservation),
+            "imported_session_summary" => Ok(Self::ImportedSessionSummary),
+            "imported_user_prompt" => Ok(Self::ImportedUserPrompt),
+            other => bail!("unsupported memory event kind `{other}`"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -714,6 +729,50 @@ impl MemoryStore {
     }
 }
 
+pub fn read_memory_events(memory_db_path: &Path, limit: usize) -> Result<Vec<MemoryEvent>> {
+    if !memory_db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open_with_flags(
+        memory_db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("open memory db {}", memory_db_path.display()))?;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT kind, session_id, source_ref, text, metadata_json,
+               observed_at_unix, token_estimate, imported_from, imported_id
+        FROM memory_events
+        ORDER BY COALESCE(observed_at_unix, created_at_unix), id
+        LIMIT ?1
+        "#,
+    )?;
+    let mut rows = stmt.query([limit as i64])?;
+    let mut events = Vec::new();
+    while let Some(row) = rows.next()? {
+        let kind_raw: String = row.get(0)?;
+        let session_id: Option<String> = row.get(1)?;
+        let source_ref: String = row.get(2)?;
+        let text: String = row.get(3)?;
+        let metadata_json: String = row.get(4)?;
+        let observed_at_unix: Option<i64> = row.get(5)?;
+        let token_estimate: i64 = row.get(6)?;
+        let imported_from: Option<String> = row.get(7)?;
+        let imported_id: Option<String> = row.get(8)?;
+        let metadata = serde_json::from_str::<BTreeMap<String, String>>(&metadata_json)
+            .with_context(|| format!("parse memory metadata for {source_ref}"))?;
+        let mut event = MemoryEvent::new(MemoryEventKind::parse(&kind_raw)?, source_ref, text);
+        event.session_id = session_id;
+        event.metadata = metadata;
+        event.observed_at_unix = observed_at_unix;
+        event.token_estimate = token_estimate.max(0) as usize;
+        event.imported_from = imported_from;
+        event.imported_id = imported_id;
+        events.push(event);
+    }
+    Ok(events)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeMemTablePlan {
     pub table: String,
@@ -1210,6 +1269,33 @@ mod tests {
         let second = store.insert_event(&event).unwrap();
         assert_eq!(first, second);
         assert_eq!(store.event_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn read_memory_events_round_trips_closeout_events() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("memory.db");
+        let store = MemoryStore::open_or_create(&db).unwrap();
+        for event in agent_doc_closeout_events(
+            Path::new("tasks/software/tsift.md"),
+            "do [#tsiftmemhooks]",
+            "wired closeout capture",
+            Some("abc123"),
+            "ok",
+        ) {
+            store.insert_event(&event).unwrap();
+        }
+
+        let events = read_memory_events(&db, 10).unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == MemoryEventKind::PromptTarget
+                && event.text == "do [#tsiftmemhooks]"
+                && event.session_id.as_deref() == Some("tasks/software/tsift.md")
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == MemoryEventKind::CloseoutProof
+                && event.metadata.get("commit_hash") == Some(&"abc123".to_string())
+        }));
     }
 
     #[test]

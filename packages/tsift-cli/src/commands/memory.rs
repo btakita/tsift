@@ -6,9 +6,10 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tsift_memory::{
     ClaudeMemImportPlan, MemoryBudget, MemoryBudgetGuardInput, MemoryEvent, MemoryEventKind,
-    MemoryHandoffPlan, MemoryQueryPlan, agent_doc_hook_contract, default_claude_mem_db_path,
-    default_memory_db_path, guard_memory_handoff, import_claude_mem, inspect_claude_mem,
-    memory_graph_node_kinds, memory_schema_sql, plan_capture_handoff, plan_memory_query,
+    MemoryHandoffPlan, MemoryQueryPlan, MemoryStore, agent_doc_closeout_events,
+    agent_doc_hook_contract, default_claude_mem_db_path, default_memory_db_path,
+    guard_memory_handoff, import_claude_mem, inspect_claude_mem, memory_graph_node_kinds,
+    memory_schema_sql, plan_capture_handoff, plan_memory_query,
 };
 
 #[derive(Serialize)]
@@ -32,6 +33,18 @@ struct MemoryInitReport {
     memory_db: String,
     schema_version: i64,
     event_count: usize,
+    next_commands: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct MemoryCaptureReport {
+    contract_version: String,
+    memory_db: String,
+    session_path: String,
+    captured_events: usize,
+    new_events: usize,
+    event_ids: Vec<String>,
+    event_kinds: Vec<String>,
     next_commands: Vec<String>,
 }
 
@@ -60,6 +73,23 @@ pub(crate) fn cmd_memory(command: MemoryCommand, format: OutputFormat) -> Result
             apply,
             ..
         } => cmd_memory_import_claude_mem(&path, db.as_deref(), limit, apply, format),
+        MemoryCommand::CaptureAgentDocCloseout {
+            path,
+            session_path,
+            prompt_target,
+            response_summary,
+            commit_hash,
+            session_check_status,
+            ..
+        } => cmd_memory_capture_agent_doc_closeout(
+            &path,
+            &session_path,
+            &prompt_target,
+            &response_summary,
+            commit_hash.as_deref(),
+            &session_check_status,
+            format,
+        ),
         MemoryCommand::HandoffPlan {
             text,
             budget_tokens,
@@ -221,8 +251,62 @@ fn cmd_memory_import_claude_mem(
         },
         vec![
             format!("tsift memory status {} --json", path.display()),
-            "tsift graph-db --path . refresh --json".to_string(),
+            format!("tsift graph-db --path {} --json refresh", path.display()),
         ],
+    )
+}
+
+fn cmd_memory_capture_agent_doc_closeout(
+    path: &Path,
+    session_path: &Path,
+    prompt_target: &str,
+    response_summary: &str,
+    commit_hash: Option<&str>,
+    session_check_status: &str,
+    format: OutputFormat,
+) -> Result<()> {
+    let memory_db = default_memory_db_path(path);
+    let store = MemoryStore::open_or_create(&memory_db)?;
+    let before = store.event_count()?;
+    let events = agent_doc_closeout_events(
+        session_path,
+        prompt_target,
+        response_summary,
+        commit_hash,
+        session_check_status,
+    );
+    let mut event_ids = Vec::with_capacity(events.len());
+    let mut event_kinds = Vec::with_capacity(events.len());
+    for event in &events {
+        event_ids.push(store.insert_event(event)?);
+        event_kinds.push(event.kind.as_str().to_string());
+    }
+    let after = store.event_count()?;
+    let report = MemoryCaptureReport {
+        contract_version: tsift_memory::MEMORY_CONTRACT_VERSION.to_string(),
+        memory_db: memory_db.display().to_string(),
+        session_path: session_path.display().to_string(),
+        captured_events: events.len(),
+        new_events: after.saturating_sub(before),
+        event_ids,
+        event_kinds,
+        next_commands: vec![
+            format!("tsift memory status {} --json", path.display()),
+            format!("tsift graph-db --path {} --json refresh", path.display()),
+        ],
+    };
+    print_memory_report(
+        &report,
+        &format,
+        "capture-agent-doc-closeout",
+        ToolEnvelopeSummary {
+            text: "agent-doc closeout captured into tsift-memory".to_string(),
+            metrics: vec![
+                envelope_metric("captured_events", report.captured_events),
+                envelope_metric("new_events", report.new_events),
+            ],
+        },
+        report.next_commands.clone(),
     )
 }
 

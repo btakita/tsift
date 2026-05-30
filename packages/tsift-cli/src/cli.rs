@@ -882,6 +882,30 @@ pub enum MemoryCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Capture an agent-doc closeout event bundle into tsift memory
+    CaptureAgentDocCloseout {
+        /// Project root whose .tsift/memory.db should receive captured events
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Session document path that produced the closeout
+        #[arg(long)]
+        session_path: PathBuf,
+        /// Prompt target or queue head that was answered
+        #[arg(long)]
+        prompt_target: String,
+        /// Bounded response summary to store
+        #[arg(long)]
+        response_summary: String,
+        /// Optional commit hash from the closeout
+        #[arg(long)]
+        commit_hash: Option<String>,
+        /// Final session-check status for the closeout
+        #[arg(long, default_value = "unknown")]
+        session_check_status: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Estimate whether memory text can fit into a bounded model handoff
     HandoffPlan {
         /// Text to include in the memory handoff
@@ -948,6 +972,7 @@ impl MemoryCommand {
             Self::Status { json, .. }
             | Self::Init { json, .. }
             | Self::ImportClaudeMem { json, .. }
+            | Self::CaptureAgentDocCloseout { json, .. }
             | Self::HandoffPlan { json, .. }
             | Self::BudgetGuard { json, .. }
             | Self::QueryPlan { json, .. } => *json,
