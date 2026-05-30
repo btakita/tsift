@@ -2731,6 +2731,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 name = "tsift"
 version = "0.1.62"
 dependencies = [
+ "tsift-agent-doc",
  "tsift-digest",
  "tsift-graph",
  "tsift-index",
@@ -2738,10 +2739,20 @@ dependencies = [
  "tsift-quality",
  "tsift-resolution",
  "tsift-search",
- "tsift-session",
  "tsift-sqlite",
  "tsift-status",
  "tsift-summarize",
+]
+
+[[package]]
+name = "tsift-agent-doc"
+version = "0.1.62"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tsift-quality",
 ]
 
 [[package]]
@@ -2777,7 +2788,6 @@ dependencies = [
  "tsift-index",
  "tsift-quality",
  "tsift-resolution",
- "tsift-session",
  "tsift-sqlite",
  "tsift-summarize",
  "ureq",
@@ -2897,11 +2907,7 @@ dependencies = [
 name = "tsift-session"
 version = "0.1.62"
 dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "tempfile",
- "tsift-quality",
+ "tsift-agent-doc",
 ]
 
 [[package]]

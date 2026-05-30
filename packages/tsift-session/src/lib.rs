@@ -1,3 +1,1 @@
-pub mod session_cost;
-pub mod session_digest;
-pub mod session_review;
+pub use tsift_agent_doc::{session_cost, session_digest, session_review};

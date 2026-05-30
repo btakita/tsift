@@ -8,7 +8,6 @@ use std::time::{Instant, UNIX_EPOCH};
 
 const SESSION_HEADER_PROBE_BUDGET_BYTES: usize = 256 * 1024;
 
-use tsift_quality::runtime_churn::RestartChurnSummary;
 use crate::{
     session_cost::{
         self, SessionCostFileReadDiagnostic, SessionCostGuardrail, SessionCostGuardrailInput,
@@ -16,6 +15,7 @@ use crate::{
     },
     session_digest,
 };
+use tsift_quality::runtime_churn::RestartChurnSummary;
 
 const MAX_SESSIONS: usize = 12;
 const MAX_AGGREGATE_ITEMS: usize = 12;

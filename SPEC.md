@@ -60,11 +60,13 @@ tsift (root crate — thin re-export shim: lib.rs + graph/lang/resolution/substr
 │   ├── init module — instruction injection, OpenCode/Codex hook setup, npm package parity
 │   ├── index module — AST symbol/index DB management, writer/reader, lock probes, snapshot fallback
 │   └── re-exported via root `tsift` `pub use tsift_index::{config, index, init, walk};`
-├── tsift-session crate (packages/tsift-session — session observability across harnesses)
+├── tsift-agent-doc crate (packages/tsift-agent-doc — agent-doc/session observability domain)
 │   ├── session_cost module — token/runtime-cost digest for Claude JSONL, Codex JSONL, agent-doc logs
 │   ├── session_digest module — bounded session transcript/log digest with restart-churn families
 │   ├── session_review module — cross-harness aggregate review combining digest + cost + log discovery
-│   └── re-exported via root `tsift` `pub use tsift_session::{session_cost, session_digest, session_review};`
+│   └── re-exported via root `tsift` `pub use tsift_agent_doc::{session_cost, session_digest, session_review};`
+├── tsift-session crate (packages/tsift-session — compatibility shim)
+│   └── re-exports `tsift-agent-doc::{session_cost, session_digest, session_review}` for existing consumers
 ├── tsift-summarize crate (packages/tsift-summarize — cached LLM analysis foundation)
 │   ├── summarize module — SummaryDb (read-only / read-write opens), entities/relationships/concepts JSON, snapshot fallback for rollback-journal contention, Anthropic API extract pipeline
 │   ├── shared by tsift-digest (diff/log/test consume cached summaries) and the tsift-search crate
