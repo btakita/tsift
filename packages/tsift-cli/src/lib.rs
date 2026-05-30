@@ -19012,6 +19012,20 @@ struct SessionReviewBudgetReport {
 }
 
 #[derive(Clone, Serialize)]
+struct SessionReviewNextTokenAction {
+    priority: usize,
+    kind: String,
+    severity: String,
+    message: String,
+    guidance: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compact_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restart_command: Option<String>,
+    digest_commands: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
 struct SessionReviewNextContextBudgetReport {
     contract_version: &'static str,
     target: String,
@@ -19028,6 +19042,8 @@ struct SessionReviewNextContextBudgetReport {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     touched_symbol_refs: Vec<CompactSymbolRefPreview>,
     unresolved_failures: Vec<SessionReviewBudgetFailurePreview>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    next_token_actions: Vec<SessionReviewNextTokenAction>,
     next_digest_commands: Vec<String>,
 }
 
@@ -19416,6 +19432,7 @@ pub(crate) fn build_session_review_next_context_budget_report(
                 ),
             })
             .collect(),
+        next_token_actions: build_next_token_actions(report, max_items, max_bytes),
         next_digest_commands: report
             .next_context
             .next_digest_commands
@@ -19423,6 +19440,62 @@ pub(crate) fn build_session_review_next_context_budget_report(
             .take(follow_up_items)
             .cloned()
             .collect(),
+    }
+}
+
+fn build_next_token_actions(
+    report: &tsift::session_review::SessionReviewReport,
+    max_items: usize,
+    max_bytes: usize,
+) -> Vec<SessionReviewNextTokenAction> {
+    let target = shell_quote(&report.target);
+    let doc_command_target =
+        (report.target_kind == "file" && report.target.ends_with(".md")).then_some(target.clone());
+    let mut actions = report
+        .guardrails
+        .iter()
+        .filter_map(|guardrail| {
+            let priority = token_action_priority(&guardrail.kind)?;
+            let compact_command = doc_command_target
+                .as_ref()
+                .map(|target| format!("agent-doc compact {target} --commit"));
+            let restart_command = doc_command_target
+                .as_ref()
+                .map(|target| format!("agent-doc start {target}"));
+            Some(SessionReviewNextTokenAction {
+                priority,
+                kind: guardrail.kind.clone(),
+                severity: guardrail.severity.clone(),
+                message: truncate_for_budget(&guardrail.message, max_bytes),
+                guidance: truncate_for_budget(&guardrail.guidance, max_bytes),
+                compact_command,
+                restart_command,
+                digest_commands: vec![
+                    format!(
+                        "tsift --envelope session-review {target} --next-context --budget normal"
+                    ),
+                    format!("tsift --envelope context-pack {target} --budget normal"),
+                ],
+            })
+        })
+        .collect::<Vec<_>>();
+    actions.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then(left.kind.cmp(&right.kind))
+    });
+    actions.dedup_by(|left, right| left.kind == right.kind);
+    actions.truncate(max_items);
+    actions
+}
+
+fn token_action_priority(kind: &str) -> Option<usize> {
+    match kind {
+        "prompt_budget" => Some(1),
+        "cache_resend" => Some(2),
+        "restart_loop" => Some(3),
+        "noop_closeout" => Some(4),
+        _ => None,
     }
 }
 
@@ -19555,6 +19628,21 @@ pub(crate) fn print_session_review_next_context_budget_human(report: &SessionRev
                 .unwrap_or_default(),
             failure.expand
         );
+    }
+    for action in &report.next_token_actions {
+        println!(
+            "token-action {} {} severity:{} {} guidance:{}",
+            action.priority, action.kind, action.severity, action.message, action.guidance
+        );
+        if let Some(command) = &action.compact_command {
+            println!("token-action-command {} compact {}", action.kind, command);
+        }
+        if let Some(command) = &action.restart_command {
+            println!("token-action-command {} restart {}", action.kind, command);
+        }
+        for command in &action.digest_commands {
+            println!("token-action-command {} digest {}", action.kind, command);
+        }
     }
     for command in &report.next_digest_commands {
         println!("next {command}");
@@ -20660,6 +20748,16 @@ pub(crate) fn print_context_pack_human(report: &ContextPackReport, compact: bool
         for prompt in &report.next_context.prompt_targets {
             println!("prompt {prompt}");
         }
+        for action in &report.next_context.next_token_actions {
+            println!(
+                "token-action {} {} commands:{}",
+                action.priority,
+                action.kind,
+                action.digest_commands.len()
+                    + usize::from(action.compact_command.is_some())
+                    + usize::from(action.restart_command.is_some())
+            );
+        }
         for file in &report.diff_digest.files {
             println!(
                 "diff {} status:{} syms:{} sums:{}",
@@ -20772,6 +20870,24 @@ pub(crate) fn print_context_pack_human(report: &ContextPackReport, compact: bool
                     symbol.tag_alias.as_deref()
                 )
             );
+        }
+    }
+    if !report.next_context.next_token_actions.is_empty() {
+        println!("  token actions:");
+        for action in &report.next_context.next_token_actions {
+            println!(
+                "  - [{}:{}] {} | guidance: {}",
+                action.priority, action.kind, action.message, action.guidance
+            );
+            if let Some(command) = &action.compact_command {
+                println!("    compact: {command}");
+            }
+            if let Some(command) = &action.restart_command {
+                println!("    restart: {command}");
+            }
+            for command in &action.digest_commands {
+                println!("    digest: {command}");
+            }
         }
     }
 
@@ -29035,7 +29151,32 @@ tier = "private"
                 cached_input_ratio: Some(66.67),
                 largest_turn_total_tokens: 240,
             }),
-            guardrails: vec![],
+            guardrails: vec![
+                tsift::session_cost::SessionCostGuardrail {
+                    kind: "cache_resend".to_string(),
+                    severity: "warn".to_string(),
+                    message: "cached input ratio was high".to_string(),
+                    guidance: "compact or restart the session".to_string(),
+                },
+                tsift::session_cost::SessionCostGuardrail {
+                    kind: "prompt_budget".to_string(),
+                    severity: "warn".to_string(),
+                    message: "largest prompt turn reached 999999 tokens".to_string(),
+                    guidance: "compact the session before another large turn".to_string(),
+                },
+                tsift::session_cost::SessionCostGuardrail {
+                    kind: "restart_loop".to_string(),
+                    severity: "warn".to_string(),
+                    message: "restart churn detected".to_string(),
+                    guidance: "restart cleanly".to_string(),
+                },
+                tsift::session_cost::SessionCostGuardrail {
+                    kind: "noop_closeout".to_string(),
+                    severity: "warn".to_string(),
+                    message: "commit_already_current appeared 8 times".to_string(),
+                    guidance: "avoid reopening without new edits".to_string(),
+                },
+            ],
             loop_clusters: vec![],
             file_read_diagnostics: vec![],
             prompt_targets: vec![
@@ -29131,6 +29272,46 @@ tier = "private"
         assert_eq!(
             budget_report.next_digest_commands[2],
             "tsift test-digest --path . < target/very-long-test-output-file-name-that-must-remain-executable.log"
+        );
+        assert_eq!(budget_report.next_token_actions.len(), 1);
+        assert_eq!(budget_report.next_token_actions[0].kind, "prompt_budget");
+
+        let full_action_report = build_session_review_next_context_budget_report(
+            &report,
+            ResponseBudget::new(Some(4), Some(120)),
+            None,
+        );
+        assert_eq!(
+            full_action_report
+                .next_token_actions
+                .iter()
+                .map(|action| action.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "prompt_budget",
+                "cache_resend",
+                "restart_loop",
+                "noop_closeout"
+            ]
+        );
+        assert_eq!(
+            full_action_report.next_token_actions[0]
+                .compact_command
+                .as_deref(),
+            Some("agent-doc compact \"tasks/software/tsift.md\" --commit")
+        );
+        assert_eq!(
+            full_action_report.next_token_actions[0]
+                .restart_command
+                .as_deref(),
+            Some("agent-doc start \"tasks/software/tsift.md\"")
+        );
+        assert!(
+            full_action_report.next_token_actions[0]
+                .digest_commands
+                .iter()
+                .any(|command| command
+                    == "tsift --envelope context-pack \"tasks/software/tsift.md\" --budget normal")
         );
     }
 
