@@ -29198,6 +29198,36 @@ tier = "private"
     }
 
     #[test]
+    fn cli_parses_memory_budget_guard_command() {
+        let cli = parse_cli([
+            "tsift",
+            "memory",
+            "budget-guard",
+            "--file",
+            "tool.log",
+            "--budget-tokens",
+            "1000",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::Memory {
+                command:
+                    crate::cli::MemoryCommand::BudgetGuard {
+                        file,
+                        budget_tokens,
+                        json,
+                        ..
+                    },
+            }) => {
+                assert_eq!(file.as_deref(), Some(std::path::Path::new("tool.log")));
+                assert_eq!(budget_tokens, 1000);
+                assert!(json);
+            }
+            _ => panic!("expected memory budget-guard command"),
+        }
+    }
+
+    #[test]
     fn cli_locks_accepts_scope_flag() {
         let cli = parse_cli(["tsift", "locks", "--scope", "alpha"]);
         match cli.command {

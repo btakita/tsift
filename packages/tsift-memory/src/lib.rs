@@ -10,6 +10,7 @@ pub const MEMORY_SCHEMA_VERSION: i64 = 1;
 pub const DEFAULT_MAX_PROMPT_TOKENS: usize = 4096;
 pub const DEFAULT_RESERVE_TOKENS: usize = 512;
 pub const DEFAULT_MAX_EVENT_TOKENS: usize = 1536;
+pub const MEMORY_BUDGET_GUARD_CONTRACT_VERSION: &str = "tsift-memory-budget-guard-v1";
 
 const MEMORY_SCHEMA_SQL: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -360,6 +361,214 @@ pub fn plan_capture_handoff(events: &[MemoryEvent], budget: MemoryBudget) -> Mem
             "tsift memory handoff-plan '<event text>' --budget-tokens <n> --json".to_string(),
             "tsift --envelope context-pack <session.md> --budget normal".to_string(),
         ],
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryBudgetGuardInput {
+    pub source_ref: String,
+    pub payload_kind: String,
+    pub text: String,
+}
+
+impl MemoryBudgetGuardInput {
+    pub fn new(
+        source_ref: impl Into<String>,
+        payload_kind: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_ref: source_ref.into(),
+            payload_kind: payload_kind.into(),
+            text: text.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryBudgetReplacement {
+    pub strategy: String,
+    pub artifact_ref: String,
+    pub digest_command: String,
+    pub context_command: String,
+    pub session_review_command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRetryChunk {
+    pub index: usize,
+    pub source_ref: String,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub token_estimate: usize,
+    pub retry_command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryBudgetGuardReport {
+    pub contract_version: String,
+    pub status: String,
+    pub allowed: bool,
+    pub source_ref: String,
+    pub payload_kind: String,
+    pub byte_count: usize,
+    pub estimated_tokens: usize,
+    pub max_prompt_tokens: usize,
+    pub reserve_tokens: usize,
+    pub available_tokens: usize,
+    pub max_chunk_tokens: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<MemoryBudgetReplacement>,
+    pub retryable_chunk_plan: Vec<MemoryRetryChunk>,
+    pub warnings: Vec<String>,
+    pub next_commands: Vec<String>,
+}
+
+pub fn guard_memory_handoff(
+    input: MemoryBudgetGuardInput,
+    budget: MemoryBudget,
+) -> MemoryBudgetGuardReport {
+    let estimated_tokens = estimate_tokens(&input.text);
+    let available_tokens = budget.available_tokens();
+    let allowed =
+        estimated_tokens <= available_tokens && estimated_tokens <= budget.max_event_tokens;
+    let replacement = (!allowed).then(|| replacement_for_budget_guard(&input));
+    let retryable_chunk_plan = if allowed {
+        Vec::new()
+    } else {
+        retry_chunks_for_budget_guard(&input, budget.max_event_tokens.min(available_tokens).max(1))
+    };
+    let mut warnings = Vec::new();
+    if estimated_tokens > available_tokens {
+        warnings.push("payload_exceeds_available_prompt_budget".to_string());
+    }
+    if estimated_tokens > budget.max_event_tokens {
+        warnings.push("payload_exceeds_max_chunk_tokens".to_string());
+    }
+
+    MemoryBudgetGuardReport {
+        contract_version: MEMORY_BUDGET_GUARD_CONTRACT_VERSION.to_string(),
+        status: if allowed {
+            "ready".to_string()
+        } else {
+            "blocked_split_required".to_string()
+        },
+        allowed,
+        source_ref: input.source_ref.clone(),
+        payload_kind: input.payload_kind.clone(),
+        byte_count: input.text.len(),
+        estimated_tokens,
+        max_prompt_tokens: budget.max_prompt_tokens,
+        reserve_tokens: budget.reserve_tokens,
+        available_tokens,
+        max_chunk_tokens: budget.max_event_tokens,
+        replacement,
+        retryable_chunk_plan,
+        warnings,
+        next_commands: vec![
+            format!(
+                "tsift memory budget-guard --file {} --json",
+                shell_quote(&input.source_ref)
+            ),
+            "tsift --envelope context-pack <session.md> --budget normal".to_string(),
+            "tsift --envelope session-review <session.md> --next-context --budget normal"
+                .to_string(),
+        ],
+    }
+}
+
+fn replacement_for_budget_guard(input: &MemoryBudgetGuardInput) -> MemoryBudgetReplacement {
+    let quoted_ref = shell_quote(&input.source_ref);
+    let is_transcript = matches!(
+        input.payload_kind.as_str(),
+        "transcript" | "session" | "session_transcript" | "agent_doc"
+    ) || input.source_ref.ends_with(".jsonl")
+        || input.source_ref.ends_with(".md");
+    let strategy = if is_transcript {
+        "replace_raw_transcript_with_session_review_or_context_pack_handle"
+    } else {
+        "replace_raw_tool_or_log_payload_with_digest_artifact_handle"
+    };
+    MemoryBudgetReplacement {
+        strategy: strategy.to_string(),
+        artifact_ref: format!(
+            "artifact:{}",
+            blake3::hash(input.source_ref.as_bytes()).to_hex()
+        ),
+        digest_command: if is_transcript {
+            format!("tsift --envelope session-review {quoted_ref} --next-context --budget normal")
+        } else {
+            format!("tsift log-digest --path . --input {quoted_ref} --json")
+        },
+        context_command: format!("tsift --envelope context-pack {quoted_ref} --budget normal"),
+        session_review_command: format!(
+            "tsift --envelope session-review {quoted_ref} --next-context --budget normal"
+        ),
+    }
+}
+
+fn retry_chunks_for_budget_guard(
+    input: &MemoryBudgetGuardInput,
+    max_chunk_tokens: usize,
+) -> Vec<MemoryRetryChunk> {
+    let byte_budget = max_chunk_tokens.saturating_mul(4).max(1);
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < input.text.len() {
+        let mut end = (start + byte_budget).min(input.text.len());
+        while end > start && !input.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            if let Some((offset, ch)) = input.text[start..].char_indices().next() {
+                end = start + offset + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let token_estimate = estimate_tokens(&input.text[start..end]);
+        let index = chunks.len() + 1;
+        chunks.push(MemoryRetryChunk {
+            index,
+            source_ref: format!("{}#chunk-{index}", input.source_ref),
+            byte_start: start,
+            byte_end: end,
+            token_estimate,
+            retry_command: retry_chunk_command(input, index, start, end),
+        });
+        start = end;
+    }
+    chunks
+}
+
+fn retry_chunk_command(
+    input: &MemoryBudgetGuardInput,
+    index: usize,
+    byte_start: usize,
+    byte_end: usize,
+) -> String {
+    let chunk_ref = format!("{}#chunk-{index}", input.source_ref);
+    if input.source_ref == "inline" {
+        format!(
+            "tsift memory budget-guard --text '<chunk {index} payload>' --source-ref {} --budget-tokens <n> --json",
+            shell_quote(&chunk_ref)
+        )
+    } else {
+        format!(
+            "tsift memory budget-guard --file {} --byte-start {byte_start} --byte-end {byte_end} --source-ref {} --budget-tokens <n> --json",
+            shell_quote(&input.source_ref),
+            shell_quote(&chunk_ref)
+        )
+    }
+}
+
+fn shell_quote(s: &str) -> String {
+    if s.chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
 
@@ -980,5 +1189,51 @@ mod tests {
                 .iter()
                 .any(|node| node.kind == "memory_event")
         );
+    }
+
+    #[test]
+    fn budget_guard_fails_closed_with_retryable_chunks() {
+        let report = guard_memory_handoff(
+            MemoryBudgetGuardInput::new("tool.log", "tool_result", "x".repeat(5_000)),
+            MemoryBudget {
+                max_prompt_tokens: 1000,
+                reserve_tokens: 100,
+                max_event_tokens: 400,
+            },
+        );
+
+        assert!(!report.allowed);
+        assert_eq!(report.status, "blocked_split_required");
+        assert!(report.replacement.is_some());
+        assert!(report.retryable_chunk_plan.len() > 1);
+        assert!(
+            report
+                .retryable_chunk_plan
+                .iter()
+                .all(|chunk| chunk.token_estimate <= 400)
+        );
+    }
+
+    #[test]
+    fn budget_guard_replaces_transcripts_with_session_review_commands() {
+        let report = guard_memory_handoff(
+            MemoryBudgetGuardInput::new("session.jsonl", "transcript", "x".repeat(5_000)),
+            MemoryBudget {
+                max_prompt_tokens: 1000,
+                reserve_tokens: 100,
+                max_event_tokens: 400,
+            },
+        );
+        let replacement = report.replacement.unwrap();
+        assert_eq!(
+            replacement.strategy,
+            "replace_raw_transcript_with_session_review_or_context_pack_handle"
+        );
+        assert!(
+            replacement
+                .session_review_command
+                .contains("session-review")
+        );
+        assert!(replacement.context_command.contains("context-pack"));
     }
 }

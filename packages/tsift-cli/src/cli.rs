@@ -893,6 +893,39 @@ pub enum MemoryCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Fail closed before oversized memory/tool payloads are sent to a model
+    BudgetGuard {
+        /// Inline payload text to guard
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+        /// Payload file to guard
+        #[arg(long, conflicts_with = "text")]
+        file: Option<PathBuf>,
+        /// Start byte when guarding a file chunk
+        #[arg(long)]
+        byte_start: Option<usize>,
+        /// End byte when guarding a file chunk
+        #[arg(long)]
+        byte_end: Option<usize>,
+        /// Stable source reference used in retry commands
+        #[arg(long, default_value = "inline")]
+        source_ref: String,
+        /// Payload kind: tool_result, raw_log, transcript, or session
+        #[arg(long, default_value = "tool_result")]
+        payload_kind: String,
+        /// Maximum prompt token budget before reserve
+        #[arg(long, default_value = "4096")]
+        budget_tokens: usize,
+        /// Tokens reserved for system, instruction, and response overhead
+        #[arg(long, default_value = "512")]
+        reserve_tokens: usize,
+        /// Maximum tokens allowed for any single memory event/chunk
+        #[arg(long, default_value = "1536")]
+        max_chunk_tokens: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Describe the stable query packet contract for memory retrieval
     QueryPlan {
         /// Query text
@@ -916,6 +949,7 @@ impl MemoryCommand {
             | Self::Init { json, .. }
             | Self::ImportClaudeMem { json, .. }
             | Self::HandoffPlan { json, .. }
+            | Self::BudgetGuard { json, .. }
             | Self::QueryPlan { json, .. } => *json,
         }
     }

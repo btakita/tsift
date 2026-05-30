@@ -1,14 +1,14 @@
 use crate::cli::MemoryCommand;
 use crate::output::{OutputFormat, ToolEnvelopeSummary};
 use crate::{envelope_metric, print_json_or_envelope, to_json_schema};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tsift_memory::{
-    ClaudeMemImportPlan, MemoryBudget, MemoryEvent, MemoryEventKind, MemoryHandoffPlan,
-    MemoryQueryPlan, agent_doc_hook_contract, default_claude_mem_db_path, default_memory_db_path,
-    import_claude_mem, inspect_claude_mem, memory_graph_node_kinds, memory_schema_sql,
-    plan_capture_handoff, plan_memory_query,
+    ClaudeMemImportPlan, MemoryBudget, MemoryBudgetGuardInput, MemoryEvent, MemoryEventKind,
+    MemoryHandoffPlan, MemoryQueryPlan, agent_doc_hook_contract, default_claude_mem_db_path,
+    default_memory_db_path, guard_memory_handoff, import_claude_mem, inspect_claude_mem,
+    memory_graph_node_kinds, memory_schema_sql, plan_capture_handoff, plan_memory_query,
 };
 
 #[derive(Serialize)]
@@ -35,6 +35,16 @@ struct MemoryInitReport {
     next_commands: Vec<String>,
 }
 
+struct MemoryBudgetGuardOptions<'a> {
+    text: Option<&'a str>,
+    file: Option<&'a Path>,
+    byte_start: Option<usize>,
+    byte_end: Option<usize>,
+    source_ref: &'a str,
+    payload_kind: &'a str,
+    budget: MemoryBudget,
+}
+
 pub(crate) fn cmd_memory(command: MemoryCommand, format: OutputFormat) -> Result<()> {
     match command {
         MemoryCommand::Status {
@@ -55,6 +65,33 @@ pub(crate) fn cmd_memory(command: MemoryCommand, format: OutputFormat) -> Result
             budget_tokens,
             ..
         } => cmd_memory_handoff_plan(&text, budget_tokens, format),
+        MemoryCommand::BudgetGuard {
+            text,
+            file,
+            byte_start,
+            byte_end,
+            source_ref,
+            payload_kind,
+            budget_tokens,
+            reserve_tokens,
+            max_chunk_tokens,
+            ..
+        } => cmd_memory_budget_guard(
+            MemoryBudgetGuardOptions {
+                text: text.as_deref(),
+                file: file.as_deref(),
+                byte_start,
+                byte_end,
+                source_ref: &source_ref,
+                payload_kind: &payload_kind,
+                budget: MemoryBudget {
+                    max_prompt_tokens: budget_tokens,
+                    reserve_tokens,
+                    max_event_tokens: max_chunk_tokens,
+                },
+            },
+            format,
+        ),
         MemoryCommand::QueryPlan {
             query,
             limit,
@@ -199,6 +236,65 @@ fn cmd_memory_handoff_plan(text: &str, budget_tokens: usize, format: OutputForma
         handoff_summary(&plan),
         plan.next_commands.clone(),
     )
+}
+
+fn cmd_memory_budget_guard(
+    options: MemoryBudgetGuardOptions<'_>,
+    format: OutputFormat,
+) -> Result<()> {
+    let (payload, resolved_source_ref) = match (options.text, options.file) {
+        (Some(text), None) => (text.to_string(), options.source_ref.to_string()),
+        (None, Some(file)) => {
+            let full_payload = std::fs::read_to_string(file)
+                .with_context(|| format!("read {}", file.display()))?;
+            let payload = slice_payload(&full_payload, options.byte_start, options.byte_end)?;
+            let source_ref = if options.source_ref == "inline" {
+                file.display().to_string()
+            } else {
+                options.source_ref.to_string()
+            };
+            (payload, source_ref)
+        }
+        (None, None) => bail!("memory budget-guard requires --text or --file"),
+        (Some(_), Some(_)) => bail!("memory budget-guard accepts only one of --text or --file"),
+    };
+    let report = guard_memory_handoff(
+        MemoryBudgetGuardInput::new(resolved_source_ref, options.payload_kind, payload),
+        options.budget,
+    );
+    print_memory_report(
+        &report,
+        &format,
+        "budget-guard",
+        ToolEnvelopeSummary {
+            text: format!("memory budget guard {}", report.status),
+            metrics: vec![
+                envelope_metric("allowed", report.allowed),
+                envelope_metric("estimated_tokens", report.estimated_tokens),
+                envelope_metric("chunks", report.retryable_chunk_plan.len()),
+            ],
+        },
+        report.next_commands.clone(),
+    )
+}
+
+fn slice_payload(
+    payload: &str,
+    byte_start: Option<usize>,
+    byte_end: Option<usize>,
+) -> Result<String> {
+    let start = byte_start.unwrap_or(0);
+    let end = byte_end.unwrap_or(payload.len());
+    if start > end || end > payload.len() {
+        bail!(
+            "invalid byte range {start}..{end} for payload with {} bytes",
+            payload.len()
+        );
+    }
+    if !payload.is_char_boundary(start) || !payload.is_char_boundary(end) {
+        bail!("byte range {start}..{end} does not align with UTF-8 character boundaries");
+    }
+    Ok(payload[start..end].to_string())
 }
 
 fn cmd_memory_query_plan(

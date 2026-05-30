@@ -72,6 +72,7 @@ tsift (root crate — public package shim: lib.rs + graph/lang/resolution/substr
 ├── tsift-memory crate (packages/tsift-memory — first-party memory substrate)
 │   ├── owns `.tsift/memory.db` schema versioning for memory events, summaries, artifacts, tool spans, embeddings, graph links, and import runs
 │   ├── exposes token-budgeted handoff planning so observer/plugin prompts split before model calls instead of overflowing
+│   ├── exposes a budget guard that rejects oversized raw tool/log/transcript payloads, replaces them with digest/context/session-review commands, and emits retryable chunk plans
 │   ├── defines agent-doc hook event contracts for prompt targets, tool artifacts, response summaries, closeout proof, and session-check results
 │   ├── projects memory events into provider-neutral graph nodes/edges (`memory_session`, `memory_event`) with source handles for later graph-db integration
 │   ├── imports the observed `claude-mem` SQLite tables (`observations`, `session_summaries`, `user_prompts`) as migration events while recording adjacent Chroma availability as external vector handles

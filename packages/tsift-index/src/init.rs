@@ -432,6 +432,11 @@ const OPENCODE_COMMANDS: &[OpenCodeCommandSpec] = &[
         body: r#"Run `tsift memory status <target> --json`, where `<target>` is `$ARGUMENTS` or `.` when no argument is provided. Summarize schema initialization, agent-doc hook contract, claude-mem import readiness, and the next bounded memory command to run. Do not import data unless the user explicitly asks for `--apply`."#,
     },
     OpenCodeCommandSpec {
+        name: "tsift-memory-guard",
+        description: "Guard a memory or tool payload before model handoff",
+        body: r#"Run `tsift memory budget-guard --file <target> --json` when `$ARGUMENTS` names a file, or `tsift memory budget-guard --text '<payload>' --json` for inline payload text. Summarize whether the payload is allowed, the estimated token count, replacement digest/context commands, and retryable chunk commands; file retry commands may include `--byte-start` / `--byte-end`. Do not send the raw payload to a model when the guard returns `blocked_split_required`."#,
+    },
+    OpenCodeCommandSpec {
         name: "tsift-diff-digest",
         description: "Digest current or requested git diff",
         body: r#"Run `tsift diff-digest <target>`, where `<target>` is `$ARGUMENTS` or `.` when no argument is provided. Summarize changed paths, high-signal hunks, and any follow-up expansion commands instead of pasting the raw diff."#,
@@ -1136,6 +1141,12 @@ mod tests {
                 .unwrap();
         assert!(memory_status.contains("tsift memory status"));
         assert!(memory_status.contains("claude-mem import readiness"));
+
+        let memory_guard =
+            std::fs::read_to_string(dir.path().join(".opencode/commands/tsift-memory-guard.md"))
+                .unwrap();
+        assert!(memory_guard.contains("tsift memory budget-guard"));
+        assert!(memory_guard.contains("blocked_split_required"));
     }
 
     #[test]
