@@ -20323,15 +20323,18 @@ fn cmd_dci_benchmark(fixture_path: &Path, format: OutputFormat) -> Result<()> {
         );
         for summary in &report.strategy_summaries {
             println!(
-                "{} rank:{} loc:{}/{} rate:{} calls:{} latency_ms:{} tokens:{}",
+                "{} rank:{} loc:{}/{} rate:{} useful_hits:{} zero_output:{} calls:{} latency_ms:{} tokens:{} output_tokens:{}",
                 summary.strategy,
                 summary.rank,
                 summary.localized,
                 summary.task_runs,
                 dci_benchmark::format_number(summary.localization_rate * 100.0),
+                dci_benchmark::format_number(summary.avg_useful_hits),
+                dci_benchmark::format_number(summary.zero_output_rate * 100.0),
                 dci_benchmark::format_number(summary.avg_tool_calls),
                 dci_benchmark::format_number(summary.avg_latency_ms),
-                dci_benchmark::format_number(summary.avg_estimated_tokens)
+                dci_benchmark::format_number(summary.avg_estimated_tokens),
+                dci_benchmark::format_number(summary.avg_output_tokens)
             );
         }
         for warning in &report.warnings {
@@ -20351,15 +20354,18 @@ fn cmd_dci_benchmark(fixture_path: &Path, format: OutputFormat) -> Result<()> {
     println!("Strategy summary:");
     for summary in &report.strategy_summaries {
         println!(
-            "  #{} {}: localization {}/{} ({:.1}%), avg calls {}, avg latency {}ms, avg tokens {}",
+            "  #{} {}: localization {}/{} ({:.1}%), avg useful hits {}, zero output {:.1}%, avg calls {}, avg latency {}ms, avg tokens {}, avg output tokens {}",
             summary.rank,
             summary.strategy,
             summary.localized,
             summary.task_runs,
             summary.localization_rate * 100.0,
+            dci_benchmark::format_number(summary.avg_useful_hits),
+            summary.zero_output_rate * 100.0,
             dci_benchmark::format_number(summary.avg_tool_calls),
             dci_benchmark::format_number(summary.avg_latency_ms),
-            dci_benchmark::format_number(summary.avg_estimated_tokens)
+            dci_benchmark::format_number(summary.avg_estimated_tokens),
+            dci_benchmark::format_number(summary.avg_output_tokens)
         );
     }
 
@@ -20373,12 +20379,17 @@ fn cmd_dci_benchmark(fixture_path: &Path, format: OutputFormat) -> Result<()> {
             .unwrap_or_default();
         println!("  {}{}", row.task_id, label);
         println!("    localized: {}", row.best_localization.join(", "));
+        println!("    most useful hits: {}", row.most_useful_hits.join(", "));
         println!(
-            "    lowest calls: {}, lowest latency: {}, lowest tokens: {}",
+            "    lowest calls: {}, lowest latency: {}, lowest tokens: {}, lowest output tokens: {}",
             row.lowest_tool_calls.as_deref().unwrap_or("-"),
             row.lowest_latency.as_deref().unwrap_or("-"),
-            row.lowest_token_budget.as_deref().unwrap_or("-")
+            row.lowest_token_budget.as_deref().unwrap_or("-"),
+            row.lowest_output_tokens.as_deref().unwrap_or("-")
         );
+        if !row.zero_output_failures.is_empty() {
+            println!("    zero output: {}", row.zero_output_failures.join(", "));
+        }
     }
 
     for warning in &report.warnings {

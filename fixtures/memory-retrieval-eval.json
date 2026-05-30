@@ -1,0 +1,170 @@
+{
+  "description": "Recorded memory retrieval eval fixture from the Claude Code Insights report and sampled claude-mem failures for the May 28-30 tsift/agent-doc workflow. The fixture compares raw claude-mem API retrieval, tsift session-review/context-pack handoff retrieval, and graph-db related retrieval on useful hits, output tokens, latency, and zero-output failures.",
+  "expected_strategies": [
+    "claude_mem_api",
+    "tsift_session_review_context_pack",
+    "graph_db_related"
+  ],
+  "tasks": [
+    {
+      "id": "observer-prompt-too-long",
+      "label": "Recover the observer memory prompt-too-long failure class",
+      "target": "Claude Code Insights report: observer/memory sessions with context-overflow and Prompt is too long failures",
+      "runs": [
+        {
+          "strategy": "claude_mem_api",
+          "localized": false,
+          "useful_hits": 0,
+          "zero_output": true,
+          "tool_calls": 1,
+          "latency_ms": 190,
+          "estimated_tokens": 0,
+          "output_tokens": 0,
+          "notes": "Sampled claude-mem search returned no usable observer-overflow row for the prompt-too-long query."
+        },
+        {
+          "strategy": "tsift_session_review_context_pack",
+          "localized": true,
+          "useful_hits": 4,
+          "zero_output": false,
+          "tool_calls": 2,
+          "latency_ms": 880,
+          "estimated_tokens": 1550,
+          "output_tokens": 980,
+          "notes": "session-review --next-context plus context-pack surfaced prompt-size failures, restart churn, and handoff commands."
+        },
+        {
+          "strategy": "graph_db_related",
+          "localized": true,
+          "useful_hits": 3,
+          "zero_output": false,
+          "tool_calls": 2,
+          "latency_ms": 520,
+          "estimated_tokens": 920,
+          "output_tokens": 640,
+          "notes": "graph-db related recovered semantic rows and source handles with the lowest result budget."
+        }
+      ]
+    },
+    {
+      "id": "budgeted-memory-handoff",
+      "label": "Find the tsift-owned budget guard that prevents oversized memory prompts",
+      "target": "tsift memory budget-guard and query-plan contract",
+      "runs": [
+        {
+          "strategy": "claude_mem_api",
+          "localized": true,
+          "useful_hits": 1,
+          "zero_output": false,
+          "tool_calls": 1,
+          "latency_ms": 220,
+          "estimated_tokens": 780,
+          "output_tokens": 520,
+          "notes": "claude-mem history could identify memory entries but not the tsift budget contract."
+        },
+        {
+          "strategy": "tsift_session_review_context_pack",
+          "localized": true,
+          "useful_hits": 3,
+          "zero_output": false,
+          "tool_calls": 2,
+          "latency_ms": 760,
+          "estimated_tokens": 1320,
+          "output_tokens": 850,
+          "notes": "session-review/context-pack carried the budget-guard backlog and verification context."
+        },
+        {
+          "strategy": "graph_db_related",
+          "localized": true,
+          "useful_hits": 4,
+          "zero_output": false,
+          "tool_calls": 2,
+          "latency_ms": 470,
+          "estimated_tokens": 870,
+          "output_tokens": 610,
+          "notes": "graph-db related ranked the memory budget contract and its source handles together."
+        }
+      ]
+    },
+    {
+      "id": "claude-mem-import-sample",
+      "label": "Retrieve imported claude-mem observations linked into graph memory",
+      "target": "sampled claude-mem observation and investigation rows projected as source_handle and semantic_concept nodes",
+      "runs": [
+        {
+          "strategy": "claude_mem_api",
+          "localized": false,
+          "useful_hits": 0,
+          "zero_output": true,
+          "tool_calls": 1,
+          "latency_ms": 210,
+          "estimated_tokens": 0,
+          "output_tokens": 0,
+          "notes": "Sampled API query missed the graph memory adapter observation despite the local database containing matching rows."
+        },
+        {
+          "strategy": "tsift_session_review_context_pack",
+          "localized": true,
+          "useful_hits": 2,
+          "zero_output": false,
+          "tool_calls": 3,
+          "latency_ms": 940,
+          "estimated_tokens": 1480,
+          "output_tokens": 910,
+          "notes": "context-pack identified the adapter work and source windows but returned broader session context."
+        },
+        {
+          "strategy": "graph_db_related",
+          "localized": true,
+          "useful_hits": 5,
+          "zero_output": false,
+          "tool_calls": 2,
+          "latency_ms": 490,
+          "estimated_tokens": 930,
+          "output_tokens": 620,
+          "notes": "graph-db related returned imported claude-mem source handles plus the semantic concept rows."
+        }
+      ]
+    },
+    {
+      "id": "restart-churn-closeout-proof",
+      "label": "Recover session-review evidence for restart churn and no-op closeouts",
+      "target": "Claude Code Insights report plus tsift session-review next-context closeout diagnostics",
+      "runs": [
+        {
+          "strategy": "claude_mem_api",
+          "localized": false,
+          "useful_hits": 0,
+          "zero_output": true,
+          "tool_calls": 1,
+          "latency_ms": 200,
+          "estimated_tokens": 0,
+          "output_tokens": 0,
+          "notes": "Sampled claude-mem query returned no usable restart/no-op closeout evidence row."
+        },
+        {
+          "strategy": "tsift_session_review_context_pack",
+          "localized": true,
+          "useful_hits": 5,
+          "zero_output": false,
+          "tool_calls": 2,
+          "latency_ms": 830,
+          "estimated_tokens": 1600,
+          "output_tokens": 1020,
+          "notes": "session-review/context-pack directly surfaced restart churn, no-op closeouts, and closeout commands."
+        },
+        {
+          "strategy": "graph_db_related",
+          "localized": true,
+          "useful_hits": 3,
+          "zero_output": false,
+          "tool_calls": 2,
+          "latency_ms": 510,
+          "estimated_tokens": 900,
+          "output_tokens": 650,
+          "notes": "graph-db related recovered the backlog/source handles but less of the time-ordered closeout narrative."
+        }
+      ]
+    }
+  ]
+}

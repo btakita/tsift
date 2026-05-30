@@ -5385,6 +5385,62 @@ fn dci_benchmark_summarizes_recorded_strategy_fixture() {
 }
 
 #[test]
+fn dci_benchmark_summarizes_memory_retrieval_eval_fixture() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/memory-retrieval-eval.json");
+    assert!(
+        fixture.exists(),
+        "memory retrieval eval fixture should exist at {}",
+        fixture.display()
+    );
+
+    let output = tsift_bin()
+        .args([
+            "dci-benchmark",
+            "--fixture",
+            fixture.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "memory retrieval eval should pass: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tasks_loaded"], 4);
+    assert_eq!(json["strategies_compared"], 3);
+    assert_eq!(
+        json["strategy_summaries"][0]["strategy"],
+        "graph_db_related"
+    );
+    assert_eq!(json["strategy_summaries"][0]["localized"], 4);
+    assert!(
+        json["strategy_summaries"][0]["avg_useful_hits"]
+            .as_f64()
+            .unwrap()
+            > 3.0
+    );
+    assert_eq!(
+        json["strategy_summaries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|summary| summary["strategy"] == "claude_mem_api")
+            .unwrap()["zero_output_failures"],
+        3
+    );
+    assert!(json["task_rows"].as_array().unwrap().iter().any(|row| {
+        row["zero_output_failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|strategy| strategy == "claude_mem_api")
+    }));
+}
+
+#[test]
 fn session_digest_reads_markdown_session_from_stdin() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
