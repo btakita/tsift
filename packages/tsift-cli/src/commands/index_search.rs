@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use tsift_index::{config, index};
+use tsift_index::{config, index, multiplicity};
 use tsift_quality::lint;
 
 use crate::output::{OutputFormat, ResponseBudget, ToolEnvelopeSummary};
@@ -43,14 +43,40 @@ pub(crate) fn cmd_index(
 
     if workspace || submodule.is_some() {
         let cfg = config::Config::load(&root)?;
-        let targets: Vec<(String, PathBuf, Option<config::WorkspaceScope>)> =
+        let targets: Vec<(String, PathBuf, PathBuf, Option<config::WorkspaceScope>)> =
             if let Some(name) = submodule {
-                let scope = config::Config::resolve_submodule(&root, name)?;
-                vec![(scope.id.clone(), scope.source_root.clone(), Some(scope))]
+                if let Some(scope) = config::Config::find_submodule(&root, name)? {
+                    let db_path = cfg.db_path_for(&root, &scope.id);
+                    vec![(
+                        scope.id.clone(),
+                        scope.source_root.clone(),
+                        db_path,
+                        Some(scope),
+                    )]
+                } else if let Some(package) = multiplicity::find_cargo_package(&root, name)? {
+                    let db_path = multiplicity::cargo_package_db_path(&root, &package.scope_id);
+                    vec![(
+                        package.scope_id.clone(),
+                        package.package_root.clone(),
+                        db_path,
+                        None,
+                    )]
+                } else {
+                    config::Config::resolve_submodule(&root, name)?;
+                    Vec::new()
+                }
             } else {
                 config::Config::submodule_dirs(&root)?
                     .into_iter()
-                    .map(|scope| (scope.id.clone(), scope.source_root.clone(), Some(scope)))
+                    .map(|scope| {
+                        let db_path = cfg.db_path_for(&root, &scope.id);
+                        (
+                            scope.id.clone(),
+                            scope.source_root.clone(),
+                            db_path,
+                            Some(scope),
+                        )
+                    })
                     .collect()
             };
 
@@ -59,15 +85,14 @@ pub(crate) fn cmd_index(
         }
 
         let mut any_stale = false;
-        for (name, sub_path, scope) in &targets {
+        for (name, sub_path, db_path, scope) in &targets {
             if !sub_path.exists() {
                 eprintln!("  skip {} (not found: {})", name, sub_path.display());
                 continue;
             }
-            let db_path = cfg.db_path_for(&root, name);
             let mut summary = if rebuild {
                 run_index_update(
-                    &db_path,
+                    db_path,
                     sub_path,
                     format!("rebuilding submodule `{}` index", name),
                     &root,
@@ -76,10 +101,10 @@ pub(crate) fn cmd_index(
                     false,
                 )?
             } else if check {
-                index::IndexDb::inspect_read_only(&db_path, sub_path, prune)?.summary
+                index::IndexDb::inspect_read_only(db_path, sub_path, prune)?.summary
             } else if prune {
                 run_index_update(
-                    &db_path,
+                    db_path,
                     sub_path,
                     format!("pruning submodule `{}` index", name),
                     &root,
@@ -89,7 +114,7 @@ pub(crate) fn cmd_index(
                 )?
             } else {
                 run_index_update(
-                    &db_path,
+                    db_path,
                     sub_path,
                     format!("indexing submodule `{}`", name),
                     &root,

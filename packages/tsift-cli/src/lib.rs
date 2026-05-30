@@ -63,7 +63,7 @@ use tsift_agent_doc::session_cost;
 use tsift_agent_doc::{session_digest, session_review};
 use tsift_digest::{diff_digest, log_digest, metric_digest, test_digest};
 use tsift_graph as graph;
-use tsift_index::{config, index, init, walk};
+use tsift_index::{config, index, init, multiplicity, walk};
 use tsift_quality::{dci_benchmark, lint, perf_gate};
 use tsift_resolution as resolution;
 use tsift_search::{impact, sift, tagpath_adapter};
@@ -3731,14 +3731,19 @@ fn resolve_query_index_target(
 ) -> Result<SearchIndexTarget> {
     let cfg = config::Config::load(root)?;
     if let Some(scope_name) = scope {
-        let scope = config::Config::resolve_submodule(root, scope_name)?;
-        return Ok(SearchIndexTarget {
-            label: format!("submodule `{}` index", scope.id),
-            db_path: cfg.db_path_for(root, &scope.id),
-            source_root: scope.source_root.clone(),
-            scope_name: Some(scope.id.clone()),
-            reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
-        });
+        if let Some(scope) = config::Config::find_submodule(root, scope_name)? {
+            return Ok(SearchIndexTarget {
+                label: format!("submodule `{}` index", scope.id),
+                db_path: cfg.db_path_for(root, &scope.id),
+                source_root: scope.source_root.clone(),
+                scope_name: Some(scope.id.clone()),
+                reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
+            });
+        }
+        if let Some(package) = multiplicity::find_cargo_package(root, scope_name)? {
+            return Ok(cargo_package_index_target(root, package));
+        }
+        config::Config::resolve_submodule(root, scope_name)?;
     }
 
     if let Some(scope) = config::Config::infer_submodule_from_path(root, path_hint)? {
@@ -3749,6 +3754,10 @@ fn resolve_query_index_target(
             scope_name: Some(scope.id.clone()),
             reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
         });
+    }
+
+    if let Some(package) = multiplicity::infer_cargo_package_from_path(root, path_hint)? {
+        return Ok(cargo_package_index_target(root, package));
     }
 
     if let Some(scope) = infer_agent_doc_task_submodule(root, path_hint)? {
@@ -3857,10 +3866,19 @@ pub(crate) fn query_tagpath_root(
     scope: Option<&str>,
 ) -> Result<PathBuf> {
     if let Some(scope_name) = scope {
-        return Ok(config::Config::resolve_submodule(root, scope_name)?.source_root);
+        if let Some(scope) = config::Config::find_submodule(root, scope_name)? {
+            return Ok(scope.source_root);
+        }
+        if let Some(package) = multiplicity::find_cargo_package(root, scope_name)? {
+            return Ok(package.package_root);
+        }
+        config::Config::resolve_submodule(root, scope_name)?;
     }
     if let Some(scope) = config::Config::infer_submodule_from_path(root, path_hint)? {
         return Ok(scope.source_root);
+    }
+    if let Some(package) = multiplicity::infer_cargo_package_from_path(root, path_hint)? {
+        return Ok(package.package_root);
     }
     Ok(root.to_path_buf())
 }
@@ -4011,13 +4029,22 @@ struct TraversalRouteIndexEntry {
     tokens: BTreeSet<String>,
 }
 
+#[derive(Clone)]
+struct TraversalMultiplicityIndexEntry {
+    handle: String,
+    node: TraversalNode,
+    tokens: BTreeSet<String>,
+}
+
 struct TraversalCodeLookup<'a> {
     symbols: &'a [TraversalSymbolIndexEntry],
     files: &'a [TraversalFileIndexEntry],
     routes: &'a [TraversalRouteIndexEntry],
+    multiplicities: &'a [TraversalMultiplicityIndexEntry],
     symbol_index: HashMap<String, Vec<usize>>,
     file_index: HashMap<String, Vec<usize>>,
     route_index: HashMap<String, Vec<usize>>,
+    multiplicity_index: HashMap<String, Vec<usize>>,
     file_path_index: HashMap<String, String>,
 }
 
@@ -4667,7 +4694,10 @@ fn push_traversal_backlog_target_handles<'a>(
         let Some(target_node) = node_by_handle.get(edge.to.as_str()) else {
             continue;
         };
-        if !matches!(target_node.kind.as_str(), "file" | "symbol" | "route") {
+        if !matches!(
+            target_node.kind.as_str(),
+            "file" | "symbol" | "route" | "cargo_package" | "cargo_workspace"
+        ) {
             continue;
         }
         if target_node
@@ -11596,6 +11626,99 @@ fn traversal_route_node(root: &Path, route: &index::StoredRoute) -> TraversalNod
     }
 }
 
+fn traversal_cargo_workspace_node(
+    root: &Path,
+    workspace: &multiplicity::CargoWorkspaceInfo,
+) -> TraversalNode {
+    let manifest = relativize_pathbuf(&workspace.manifest_path, root)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let workspace_root = relativize_pathbuf(&workspace.workspace_root, root)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let handle = stable_handle("gcwk", &format!("cargo-workspace:{manifest}"));
+    let mut properties = BTreeMap::new();
+    properties.insert("layer".to_string(), "cargo_workspace".to_string());
+    properties.insert("workspace_root".to_string(), workspace_root.clone());
+    properties.insert("members".to_string(), workspace.members.join(","));
+    properties.insert(
+        "default_members".to_string(),
+        workspace.default_members.join(","),
+    );
+    TraversalNode {
+        handle: handle.clone(),
+        kind: "cargo_workspace".to_string(),
+        label: if workspace_root.is_empty() {
+            "root cargo workspace".to_string()
+        } else {
+            workspace_root
+        },
+        ref_id: Some(workspace.id.clone()),
+        path: Some(manifest),
+        line: None,
+        detail: Some("Cargo workspace manifest".to_string()),
+        properties,
+        expand: traversal_expand_command(root, &handle),
+    }
+}
+
+fn traversal_cargo_package_node(
+    root: &Path,
+    package: &multiplicity::CargoPackageInfo,
+) -> TraversalNode {
+    let manifest = relativize_pathbuf(&package.manifest_path, root)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let package_root = relativize_pathbuf(&package.package_root, root)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let workspace_root = relativize_pathbuf(&package.workspace_root, root)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let handle = stable_handle(
+        "gcpk",
+        &format!("cargo-package:{manifest}:{}", package.name),
+    );
+    let mut properties = BTreeMap::new();
+    properties.insert("layer".to_string(), "cargo_package".to_string());
+    properties.insert("package_name".to_string(), package.name.clone());
+    properties.insert(
+        "normalized_name".to_string(),
+        package.normalized_name.clone(),
+    );
+    properties.insert("package_root".to_string(), package_root.clone());
+    properties.insert("workspace_root".to_string(), workspace_root);
+    properties.insert("features".to_string(), package.features.join(","));
+    properties.insert("targets".to_string(), package.targets.join(","));
+    properties.insert(
+        "dependencies".to_string(),
+        package
+            .dependencies
+            .iter()
+            .map(|dependency| format!("{}:{}", dependency.kind, dependency.name))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    TraversalNode {
+        handle: handle.clone(),
+        kind: "cargo_package".to_string(),
+        label: package.name.clone(),
+        ref_id: Some(package.scope_id.clone()),
+        path: Some(manifest),
+        line: None,
+        detail: Some(format!(
+            "Cargo package in {}",
+            if package_root.is_empty() {
+                "."
+            } else {
+                package_root.as_str()
+            }
+        )),
+        properties,
+        expand: traversal_expand_command(root, &handle),
+    }
+}
+
 fn traversal_session_node(
     root: &Path,
     markdown_path: &Path,
@@ -11813,6 +11936,7 @@ impl<'a> TraversalCodeLookup<'a> {
         symbols: &'a [TraversalSymbolIndexEntry],
         files: &'a [TraversalFileIndexEntry],
         routes: &'a [TraversalRouteIndexEntry],
+        multiplicities: &'a [TraversalMultiplicityIndexEntry],
     ) -> Self {
         let mut symbol_index = HashMap::new();
         for (idx, entry) in symbols.iter().enumerate() {
@@ -11830,13 +11954,19 @@ impl<'a> TraversalCodeLookup<'a> {
         for (idx, entry) in routes.iter().enumerate() {
             push_traversal_token_index(&mut route_index, &entry.tokens, idx);
         }
+        let mut multiplicity_index = HashMap::new();
+        for (idx, entry) in multiplicities.iter().enumerate() {
+            push_traversal_token_index(&mut multiplicity_index, &entry.tokens, idx);
+        }
         Self {
             symbols,
             files,
             routes,
+            multiplicities,
             symbol_index,
             file_index,
             route_index,
+            multiplicity_index,
             file_path_index,
         }
     }
@@ -12200,6 +12330,33 @@ fn ranked_route_matches<'a>(
     matches
 }
 
+fn ranked_multiplicity_matches<'a>(
+    query_tokens: &BTreeSet<String>,
+    entries: &'a [TraversalMultiplicityIndexEntry],
+    index: &HashMap<String, Vec<usize>>,
+) -> Vec<(usize, &'a TraversalMultiplicityIndexEntry)> {
+    let mut scores = BTreeMap::<usize, usize>::new();
+    for token in query_tokens {
+        if let Some(indices) = index.get(token) {
+            for idx in indices {
+                *scores.entry(*idx).or_default() += 1;
+            }
+        }
+    }
+    let mut matches = scores
+        .into_iter()
+        .map(|(idx, score)| (score, &entries[idx]))
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.node.kind.cmp(&right.node.kind))
+            .then_with(|| left.node.label.cmp(&right.node.label))
+            .then_with(|| left.handle.cmp(&right.handle))
+    });
+    matches
+}
+
 fn link_backlog_to_code_nodes(
     graph: &mut TraversalGraphBuild,
     backlog: &TraversalNode,
@@ -12250,6 +12407,23 @@ fn link_backlog_to_code_nodes(
             &entry.handle,
             "mentions",
             Some("backlog text matches route tokens".to_string()),
+            score,
+        );
+    }
+
+    for (score, entry) in ranked_multiplicity_matches(
+        &query_tokens,
+        lookup.multiplicities,
+        &lookup.multiplicity_index,
+    )
+    .into_iter()
+    .take(limit.min(5))
+    {
+        graph.add_edge(
+            &backlog.handle,
+            &entry.handle,
+            "mentions",
+            Some("backlog text matches multiplicity tokens".to_string()),
             score,
         );
     }
@@ -12515,12 +12689,20 @@ fn index_refresh_fallback_diagnostic(
 
 fn graph_fallback_source_root(root: &Path, path_hint: &Path, scope: Option<&str>) -> PathBuf {
     if let Some(scope_name) = scope
-        && let Ok(scope) = config::Config::resolve_submodule(root, scope_name)
+        && let Ok(Some(scope)) = config::Config::find_submodule(root, scope_name)
     {
         return scope.source_root;
     }
+    if let Some(scope_name) = scope
+        && let Ok(Some(package)) = multiplicity::find_cargo_package(root, scope_name)
+    {
+        return package.package_root;
+    }
     if let Ok(Some(scope)) = config::Config::infer_submodule_from_path(root, path_hint) {
         return scope.source_root;
+    }
+    if let Ok(Some(package)) = multiplicity::infer_cargo_package_from_path(root, path_hint) {
+        return package.package_root;
     }
     if let Ok(Some(scope)) = infer_agent_doc_task_submodule(root, path_hint) {
         return scope.source_root;
@@ -12635,6 +12817,139 @@ fn add_raw_source_file_nodes(
     Ok(())
 }
 
+fn relative_path_inside_scope(path: &str, scope_root: &str) -> bool {
+    if scope_root.is_empty() {
+        return true;
+    }
+    path == scope_root || path.starts_with(&format!("{scope_root}/"))
+}
+
+fn cargo_import_alias_from_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let rest = trimmed
+        .strip_prefix("pub use ")
+        .or_else(|| trimmed.strip_prefix("use "))
+        .or_else(|| trimmed.strip_prefix("extern crate "))?;
+    let alias = rest
+        .split([':', ';', ' ', '\t'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    (!alias.is_empty()).then(|| alias.to_string())
+}
+
+fn cargo_import_aliases(package: &multiplicity::CargoPackageInfo) -> Result<BTreeSet<String>> {
+    let mut aliases = BTreeSet::new();
+    for entry in walk::walk_files(&package.package_root)? {
+        if entry.path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let content = fs::read_to_string(&entry.path)
+            .with_context(|| format!("reading Rust source {}", entry.path.display()))?;
+        aliases.extend(content.lines().filter_map(cargo_import_alias_from_line));
+    }
+    Ok(aliases)
+}
+
+fn load_multiplicity_traversal_nodes(
+    root: &Path,
+    source_root: &Path,
+    graph: &mut TraversalGraphBuild,
+    file_handle_by_path: &HashMap<String, String>,
+    multiplicity_entries: &mut Vec<TraversalMultiplicityIndexEntry>,
+) -> Result<()> {
+    let inventory = multiplicity::discover_cargo_inventory(source_root)?;
+    let mut workspace_handle_by_root = BTreeMap::<String, String>::new();
+    for workspace in &inventory.workspaces {
+        let node = traversal_cargo_workspace_node(root, workspace);
+        workspace_handle_by_root.insert(workspace.relative_root.clone(), node.handle.clone());
+        multiplicity_entries.push(TraversalMultiplicityIndexEntry {
+            handle: node.handle.clone(),
+            tokens: traversal_node_tokens(&node),
+            node: node.clone(),
+        });
+        graph.add_node(node);
+    }
+
+    let mut package_handle_by_name = BTreeMap::<String, Vec<String>>::new();
+    let mut package_nodes = Vec::new();
+    for package in &inventory.packages {
+        let node = traversal_cargo_package_node(root, package);
+        package_handle_by_name
+            .entry(package.name.clone())
+            .or_default()
+            .push(node.handle.clone());
+        package_handle_by_name
+            .entry(package.normalized_name.clone())
+            .or_default()
+            .push(node.handle.clone());
+        multiplicity_entries.push(TraversalMultiplicityIndexEntry {
+            handle: node.handle.clone(),
+            tokens: traversal_node_tokens(&node),
+            node: node.clone(),
+        });
+        graph.add_node(node.clone());
+        package_nodes.push((package, node));
+    }
+
+    for (package, node) in &package_nodes {
+        if let Some(workspace_handle) =
+            workspace_handle_by_root.get(&package.relative_workspace_root)
+        {
+            graph.add_edge(
+                workspace_handle,
+                &node.handle,
+                "contains_package",
+                Some("Cargo workspace member package".to_string()),
+                1,
+            );
+        }
+        let package_root = relativize_pathbuf(&package.package_root, root)
+            .to_string_lossy()
+            .replace('\\', "/");
+        for (file, handle) in file_handle_by_path {
+            if relative_path_inside_scope(file, &package_root) {
+                graph.add_edge(
+                    &node.handle,
+                    handle,
+                    "owns_file",
+                    Some("Cargo package owns source file".to_string()),
+                    1,
+                );
+            }
+        }
+        for dependency in &package.dependencies {
+            if let Some(handles) = package_handle_by_name.get(&dependency.name)
+                && handles.len() == 1
+            {
+                graph.add_edge(
+                    &node.handle,
+                    &handles[0],
+                    "declares_dependency",
+                    Some(format!("{} Cargo dependency", dependency.kind)),
+                    1,
+                );
+            }
+        }
+        for alias in cargo_import_aliases(package)? {
+            if let Some(handles) = package_handle_by_name.get(&alias)
+                && handles.len() == 1
+                && handles[0] != node.handle
+            {
+                graph.add_edge(
+                    &node.handle,
+                    &handles[0],
+                    "uses_crate",
+                    Some("Rust use/extern crate reference".to_string()),
+                    1,
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn build_traversal_graph_source_with_options(
     root: &Path,
     path_hint: &Path,
@@ -12645,21 +12960,23 @@ fn build_traversal_graph_source_with_options(
     let mut symbol_entries = Vec::new();
     let mut file_entries = Vec::new();
     let mut route_entries = Vec::new();
+    let mut multiplicity_entries = Vec::new();
+    let mut file_handle_by_path = HashMap::<String, String>::new();
     let bounded_session_projection = hinted_markdown_file(root, path_hint).is_some();
     if !session_only || hinted_markdown_file(root, path_hint).is_none() {
         let (gate, _cache_detail) =
             prepare_agent_doc_index_gate_cached(root, path_hint, scope, "graph traversal packet");
         graph.warnings.extend(gate.diagnostics);
+        let gate_source_root = gate.source_root.clone();
 
         match gate.db_path {
             Some(db_path) if db_path.exists() => {
                 let db = index::IndexDb::open_read_only_resilient(&db_path)?;
                 let file_paths = db.file_paths()?;
-                let mut file_handle_by_path = HashMap::<String, String>::new();
                 for file in file_paths {
                     if traversal_path_is_generated_artifact(
                         root,
-                        &gate.source_root,
+                        &gate_source_root,
                         Path::new(&file),
                     ) {
                         continue;
@@ -12683,7 +13000,7 @@ fn build_traversal_graph_source_with_options(
                 for symbol in symbols.iter().filter(|symbol| {
                     !traversal_path_is_generated_artifact(
                         root,
-                        &gate.source_root,
+                        &gate_source_root,
                         Path::new(&symbol.file),
                     )
                 }) {
@@ -12718,7 +13035,7 @@ fn build_traversal_graph_source_with_options(
                     for edge in db.all_stored_edges()? {
                         if traversal_path_is_generated_artifact(
                             root,
-                            &gate.source_root,
+                            &gate_source_root,
                             Path::new(&edge.caller_file),
                         ) {
                             continue;
@@ -12754,7 +13071,7 @@ fn build_traversal_graph_source_with_options(
                 for route in db.all_routes()? {
                     if traversal_path_is_generated_artifact(
                         root,
-                        &gate.source_root,
+                        &gate_source_root,
                         Path::new(&route.file),
                     ) {
                         continue;
@@ -12797,18 +13114,35 @@ fn build_traversal_graph_source_with_options(
                 }
             }
             _ => {
-                add_raw_source_file_nodes(root, &gate.source_root, &mut graph, &mut file_entries)
+                add_raw_source_file_nodes(root, &gate_source_root, &mut graph, &mut file_entries)
                     .with_context(|| {
                     format!(
                         "loading raw source fallback nodes from {}",
-                        gate.source_root.display()
+                        gate_source_root.display()
                     )
                 })?;
+                for entry in &file_entries {
+                    if let Some(path) = entry.node.path.as_ref() {
+                        file_handle_by_path.insert(path.clone(), entry.handle.clone());
+                    }
+                }
             }
         }
+        load_multiplicity_traversal_nodes(
+            root,
+            &gate_source_root,
+            &mut graph,
+            &file_handle_by_path,
+            &mut multiplicity_entries,
+        )?;
     }
 
-    let code_lookup = TraversalCodeLookup::new(&symbol_entries, &file_entries, &route_entries);
+    let code_lookup = TraversalCodeLookup::new(
+        &symbol_entries,
+        &file_entries,
+        &route_entries,
+        &multiplicity_entries,
+    );
     load_agent_doc_traversal_nodes(root, path_hint, &mut graph, &code_lookup)?;
     Ok(graph)
 }
@@ -12894,10 +13228,12 @@ fn traversal_query_kind_priority(kind: &str) -> usize {
         "symbol" => 3,
         "file" => 4,
         "route" => 5,
-        "session" => 6,
-        "semantic_concept" => 7,
-        "semantic_entity" => 8,
-        _ => 9,
+        "cargo_package" => 6,
+        "cargo_workspace" => 7,
+        "session" => 8,
+        "semantic_concept" => 9,
+        "semantic_entity" => 10,
+        _ => 11,
     }
 }
 
@@ -22015,6 +22351,23 @@ struct SearchIndexTarget {
     reindex_cmd: String,
 }
 
+fn cargo_package_index_target(
+    root: &Path,
+    package: multiplicity::CargoPackageInfo,
+) -> SearchIndexTarget {
+    SearchIndexTarget {
+        label: format!("cargo package `{}` index", package.scope_id),
+        db_path: multiplicity::cargo_package_db_path(root, &package.scope_id),
+        source_root: package.package_root.clone(),
+        scope_name: Some(package.scope_id.clone()),
+        reindex_cmd: format!(
+            "tsift index --submodule {} {}",
+            package.scope_id,
+            root.display()
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchIndexState {
     Missing,
@@ -22029,15 +22382,20 @@ fn resolve_search_index_targets(
     federated: bool,
 ) -> Result<Vec<SearchIndexTarget>> {
     if let Some(scope_name) = scope {
-        let scope = config::Config::resolve_submodule(root, scope_name)?;
-        let cfg = config::Config::load(root)?;
-        return Ok(vec![SearchIndexTarget {
-            label: format!("submodule `{}` index", scope.id),
-            db_path: cfg.db_path_for(root, &scope.id),
-            source_root: scope.source_root.clone(),
-            scope_name: Some(scope.id.clone()),
-            reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
-        }]);
+        if let Some(scope) = config::Config::find_submodule(root, scope_name)? {
+            let cfg = config::Config::load(root)?;
+            return Ok(vec![SearchIndexTarget {
+                label: format!("submodule `{}` index", scope.id),
+                db_path: cfg.db_path_for(root, &scope.id),
+                source_root: scope.source_root.clone(),
+                scope_name: Some(scope.id.clone()),
+                reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
+            }]);
+        }
+        if let Some(package) = multiplicity::find_cargo_package(root, scope_name)? {
+            return Ok(vec![cargo_package_index_target(root, package)]);
+        }
+        config::Config::resolve_submodule(root, scope_name)?;
     }
 
     if federated {
@@ -22067,6 +22425,10 @@ fn resolve_search_index_targets(
             scope_name: Some(scope.id.clone()),
             reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
         }]);
+    }
+
+    if let Some(package) = multiplicity::infer_cargo_package_from_path(root, path_hint)? {
+        return Ok(vec![cargo_package_index_target(root, package)]);
     }
 
     if let Some(scope) = infer_agent_doc_task_submodule(root, path_hint)? {
@@ -24593,6 +24955,77 @@ dispatch #spec-test-build-install-commit-push
         dir
     }
 
+    fn setup_multiplicity_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/core-lib", "crates/cli-app"]
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/core-lib/src")).unwrap();
+        std::fs::write(
+            dir.path().join("crates/core-lib/Cargo.toml"),
+            r#"[package]
+name = "core-lib"
+
+[lib]
+name = "core_lib"
+
+[features]
+default = []
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("crates/core-lib/src/lib.rs"),
+            "pub fn run() {}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("crates/cli-app/src")).unwrap();
+        std::fs::write(
+            dir.path().join("crates/cli-app/Cargo.toml"),
+            r#"[package]
+name = "cli-app"
+
+[[bin]]
+name = "cli-app"
+
+[dependencies]
+core-lib = { path = "../core-lib" }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("crates/cli-app/src/main.rs"),
+            "use core_lib::run;\nfn main() { run(); }\n",
+        )
+        .unwrap();
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+
+        let task_dir = dir.path().join("tasks/software");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        std::fs::write(
+            task_dir.join("tsift.md"),
+            r#"---
+agent_doc_session: tsift-multiplicity
+agent_doc_format: template
+---
+
+## Backlog
+
+<!-- agent:backlog -->
+- [ ] [#corepkg] Update the core-lib Cargo package ownership model.
+<!-- /agent:backlog -->
+"#,
+        )
+        .unwrap();
+        init_git_repo(dir.path());
+        dir
+    }
+
     fn setup_dependency_dag_project() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -24847,6 +25280,106 @@ agent_doc_format: template
                 .ends_with(".tsift/indexes/tsift/index.db")
         );
         assert_eq!(query_db_path, cfg.db_path_for(dir.path(), "tsift"));
+    }
+
+    #[test]
+    fn cargo_package_scope_selector_indexes_package_db() {
+        let dir = setup_multiplicity_project();
+        let targets =
+            resolve_search_index_targets(dir.path(), dir.path(), Some("core_lib"), false).unwrap();
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].scope_name.as_deref(), Some("core-lib"));
+        assert_eq!(targets[0].source_root, dir.path().join("crates/core-lib"));
+        assert!(
+            targets[0]
+                .db_path
+                .ends_with(".tsift/indexes/cargo/core-lib/index.db")
+        );
+
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            Some("core_lib"),
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(targets[0].db_path.exists());
+    }
+
+    #[test]
+    fn path_inference_prefers_nested_cargo_package_without_submodule() {
+        let dir = setup_multiplicity_project();
+        let source = dir.path().join("crates/cli-app/src/main.rs");
+        let targets = resolve_search_index_targets(dir.path(), &source, None, false).unwrap();
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].scope_name.as_deref(), Some("cli-app"));
+        assert_eq!(targets[0].source_root, dir.path().join("crates/cli-app"));
+    }
+
+    #[test]
+    fn traversal_graph_projects_cargo_multiplicity_nodes_and_edges() {
+        let dir = setup_multiplicity_project();
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let workspace = resolve_traversal_node(&graph, "root cargo workspace").unwrap();
+        let core = resolve_traversal_node(&graph, "core-lib").unwrap();
+        let cli = resolve_traversal_node(&graph, "cli-app").unwrap();
+        let core_file = resolve_traversal_node(&graph, "crates/core-lib/src/lib.rs").unwrap();
+
+        assert_eq!(workspace.kind, "cargo_workspace");
+        assert_eq!(core.kind, "cargo_package");
+        assert_eq!(
+            core.properties.get("features"),
+            Some(&"default".to_string())
+        );
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == workspace.handle
+                && edge.to == core.handle
+                && edge.relation == "contains_package"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == core.handle && edge.to == core_file.handle && edge.relation == "owns_file"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == cli.handle
+                && edge.to == core.handle
+                && (edge.relation == "declares_dependency" || edge.relation == "uses_crate")
+        }));
+    }
+
+    #[test]
+    fn conflict_matrix_uses_cargo_package_mentions_as_ownership_evidence() {
+        let dir = setup_multiplicity_project();
+        let session = dir.path().join("tasks/software/tsift.md");
+        let report =
+            build_conflict_matrix_report(&session, None, &["corepkg".to_string()], 3, 8, 20)
+                .unwrap();
+
+        assert!(report.per_target_fail_closed.is_empty());
+        let candidate = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.target == "corepkg")
+            .unwrap();
+        assert!(
+            candidate
+                .owned_files
+                .iter()
+                .any(|file| file == "crates/core-lib/Cargo.toml"),
+            "{:?}",
+            candidate.owned_files
+        );
     }
 
     #[test]

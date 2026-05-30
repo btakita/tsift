@@ -241,6 +241,22 @@ federation = false
 
 Workspace scope ids default to the submodule leaf name when it is unique. If two submodules share the same trailing directory name, tsift promotes those scopes to their full `.gitmodules` paths (for example `pkg/app/foo`, `vendor/foo`) so `--scope` / `--submodule` selectors and `.tsift/indexes/<scope>/index.db` stay collision-free. To target one duplicate scope in `.tsift/config.toml`, use the quoted full path key such as `[overrides."vendor/foo"]`.
 
+## Multiplicity Model
+
+tsift treats repository multiplicity as an ordered ownership stack rather than a flat set of paths. The precedence is:
+
+1. repository root — the fallback project boundary and shared runtime artifact root
+2. git submodule scope — the privacy/federation boundary used by `.tsift/config.toml`
+3. Cargo workspace — the Rust build graph boundary declared by `[workspace]`
+4. Cargo package/crate — the source, feature, target, dependency, and test ownership boundary declared by `[package]`
+5. language package-manager workspace — future npm/pnpm/yarn/Python workspace boundaries
+6. generated/runtime scope — `.tsift`, `.agent-doc`, build output, caches, and other generated paths excluded from source watermarks
+7. agent-doc session scope — the document, backlog, queue, worker-result, and source-window boundary used for orchestration
+
+Higher-numbered layers refine lower-numbered ownership without overriding isolation. For example, a Cargo package inside an isolated git submodule can be selected and indexed locally, but it is still excluded from federated search unless the enclosing submodule permits federation. Selectors are deterministic and fail closed: `--scope <selector>` first preserves existing git-submodule matching, then accepts Cargo package selectors by package name, normalized crate name (`foo-bar` and `foo_bar`), relative package root, or manifest path. Duplicate package names promote selectors to relative package roots, mirroring duplicate submodule leaf-name handling.
+
+Cargo multiplicity is projected into the provider-neutral graph as `cargo_workspace` and `cargo_package` nodes. Workspace nodes use `contains_package` edges. Package nodes carry package name, normalized crate name, package root, workspace root, features, targets, and dependency metadata; they link to owned source files with `owns_file`, to manifest dependencies with `declares_dependency`, and to direct Rust `use` / `extern crate` references with `uses_crate`. These edges stay separate from ordinary call edges so `conflict-matrix`, `dependency-dag`, `dispatch-trace`, and graph-db evidence can reason about package ownership and cross-crate coupling without pretending package dependencies are call sites.
+
 ## Storage Layout
 
 ```
