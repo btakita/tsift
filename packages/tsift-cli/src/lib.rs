@@ -6194,6 +6194,26 @@ struct GraphDbPageReport {
 
 type GraphDbRankedNeighbor = resolution::RankedNeighbor;
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct GraphDbDroppedByBudget {
+    item: String,
+    kind: String,
+    dropped: usize,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct GraphDbOutputBudgetReport {
+    max_tokens: usize,
+    estimated_tokens: usize,
+    selected_nodes: usize,
+    selected_edges: usize,
+    candidate_nodes: usize,
+    candidate_edges: usize,
+    dropped_by_budget: Vec<GraphDbDroppedByBudget>,
+    diagnostics: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 struct GraphDbKnowledgeRetrieval {
     mode: String,
@@ -6247,6 +6267,8 @@ struct GraphDbReport {
     neighborhood_ranking_gate: Option<GraphDbNeighborhoodRankingGate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     knowledge_retrieval: Option<GraphDbKnowledgeRetrieval>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_budget: Option<GraphDbOutputBudgetReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<substrate::GraphPath>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6958,6 +6980,8 @@ struct GraphDbEvidenceReport {
     worker_results: Vec<SubstrateGraphNode>,
     semantic_related: Vec<SubstrateGraphNode>,
     shortest_paths: Vec<GraphDbEvidencePath>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_budget: Option<GraphDbOutputBudgetReport>,
     next_commands: Vec<String>,
     replay_commands: Vec<String>,
     repair_commands: Vec<String>,
@@ -8839,6 +8863,484 @@ fn graph_db_ranked_neighbors(
     resolution::ranked_neighbors_capped(center_id, nodes, edges, cap)
 }
 
+struct GraphDbBudgetedSubgraph {
+    nodes: Vec<SubstrateGraphNode>,
+    edges: Vec<SubstrateGraphEdge>,
+    report: GraphDbOutputBudgetReport,
+}
+
+const GRAPH_DB_OUTPUT_DEFAULT_TOKEN_CAP: usize = 6_000;
+const GRAPH_DB_OUTPUT_MIN_TOKEN_CAP: usize = 1_200;
+const GRAPH_DB_OUTPUT_MAX_TOKEN_CAP: usize = 12_000;
+
+fn graph_db_output_token_cap(limit: Option<usize>) -> usize {
+    match limit {
+        Some(0) | None => GRAPH_DB_OUTPUT_DEFAULT_TOKEN_CAP,
+        Some(limit) => limit
+            .saturating_mul(320)
+            .clamp(GRAPH_DB_OUTPUT_MIN_TOKEN_CAP, GRAPH_DB_OUTPUT_MAX_TOKEN_CAP),
+    }
+}
+
+fn graph_db_node_kind_quota(kind: &str, limit: Option<usize>) -> usize {
+    if matches!(limit, Some(0) | None) {
+        return match kind {
+            "source_handle" => 10,
+            "worker_context" | "worker_result" => 8,
+            "semantic_concept" | "semantic_entity" => 10,
+            "file" | "symbol" | "route" => 12,
+            _ => 8,
+        };
+    }
+    let base = limit.unwrap_or(0).max(1);
+    match kind {
+        "source_handle" => base.saturating_add(4),
+        "worker_context" | "worker_result" => base.saturating_add(2),
+        "semantic_concept" | "semantic_entity" => base.saturating_add(4),
+        "file" | "symbol" | "route" => base.saturating_add(4),
+        _ => base.saturating_add(1),
+    }
+}
+
+fn graph_db_edge_kind_quota(kind: &str, limit: Option<usize>) -> usize {
+    if matches!(limit, Some(0) | None) {
+        return match kind {
+            "mentions" | "mentions_concept" | "mentions_entity" => 24,
+            "semantic_relation" | "calls" | "defines" => 20,
+            _ => 16,
+        };
+    }
+    let base = limit.unwrap_or(0).max(1);
+    match kind {
+        "mentions" | "mentions_concept" | "mentions_entity" => base.saturating_mul(3),
+        "semantic_relation" | "calls" | "defines" => base.saturating_mul(2),
+        _ => base.saturating_add(2),
+    }
+}
+
+fn graph_db_estimated_tokens<T: Serialize>(value: &T) -> usize {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len().div_ceil(4).max(1))
+        .unwrap_or(1)
+}
+
+fn graph_db_node_search_text(node: &SubstrateGraphNode) -> String {
+    let mut parts = vec![node.kind.clone(), node.label.clone()];
+    for key in [
+        "detail",
+        "description",
+        "source_ref",
+        "path",
+        "source_file",
+        "source_symbol",
+        "text_preview",
+    ] {
+        if let Some(value) = node.properties.get(key) {
+            parts.push(value.clone());
+        }
+    }
+    parts.join(" ")
+}
+
+fn graph_db_semantic_scores_for_query(
+    query: Option<&str>,
+    nodes: &[SubstrateGraphNode],
+) -> BTreeMap<String, f64> {
+    let Some(query) = query.filter(|value| !value.trim().is_empty()) else {
+        return BTreeMap::new();
+    };
+    let query_embedding = semantic_embedding(query);
+    nodes
+        .iter()
+        .filter(|node| matches!(node.kind.as_str(), "semantic_concept" | "semantic_entity"))
+        .filter_map(|node| {
+            let embedding = node
+                .properties
+                .get("embedding")
+                .and_then(|value| parse_semantic_embedding_property(value))?;
+            Some((
+                node.id.clone(),
+                semantic_cosine(&query_embedding, &embedding),
+            ))
+        })
+        .collect()
+}
+
+fn graph_db_depth_by_id(
+    origin_ids: &[String],
+    edges: &[SubstrateGraphEdge],
+) -> BTreeMap<String, usize> {
+    let mut adjacency = BTreeMap::<String, Vec<String>>::new();
+    for edge in edges {
+        adjacency
+            .entry(edge.from_id.clone())
+            .or_default()
+            .push(edge.to_id.clone());
+        adjacency
+            .entry(edge.to_id.clone())
+            .or_default()
+            .push(edge.from_id.clone());
+    }
+
+    let mut depth_by_id = BTreeMap::<String, usize>::new();
+    let mut queue = VecDeque::<String>::new();
+    for origin in origin_ids {
+        if depth_by_id.insert(origin.clone(), 0).is_none() {
+            queue.push_back(origin.clone());
+        }
+    }
+    while let Some(current) = queue.pop_front() {
+        let depth = depth_by_id.get(&current).copied().unwrap_or(0);
+        for next in adjacency.get(&current).into_iter().flatten() {
+            if depth_by_id.contains_key(next) {
+                continue;
+            }
+            depth_by_id.insert(next.clone(), depth.saturating_add(1));
+            queue.push_back(next.clone());
+        }
+    }
+    depth_by_id
+}
+
+fn graph_db_source_covered_ids(
+    nodes: &[SubstrateGraphNode],
+    edges: &[SubstrateGraphEdge],
+) -> BTreeSet<String> {
+    let source_ids = nodes
+        .iter()
+        .filter(|node| node.kind == "source_handle")
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut covered = source_ids
+        .iter()
+        .map(|id| (*id).to_string())
+        .collect::<BTreeSet<_>>();
+    for edge in edges {
+        if source_ids.contains(edge.from_id.as_str()) {
+            covered.insert(edge.to_id.clone());
+        }
+        if source_ids.contains(edge.to_id.as_str()) {
+            covered.insert(edge.from_id.clone());
+        }
+    }
+    covered
+}
+
+fn graph_db_recency_score(node: &SubstrateGraphNode) -> i64 {
+    for key in [
+        "observed_at_unix",
+        "completed_at_unix",
+        "created_at_unix",
+        "started_at_unix",
+    ] {
+        if let Some(value) = node.properties.get(key)
+            && let Ok(epoch) = value.parse::<i64>()
+        {
+            return epoch.div_euclid(86_400).clamp(0, 40_000);
+        }
+    }
+    0
+}
+
+fn graph_db_node_kind_score(kind: &str) -> i64 {
+    match kind {
+        "source_handle" => 180,
+        "worker_context" => 170,
+        "worker_result" => 160,
+        "semantic_concept" | "semantic_entity" => 150,
+        "backlog" | "job_packet" => 130,
+        "symbol" => 120,
+        "file" => 110,
+        "route" => 105,
+        "session" => 90,
+        _ => 40,
+    }
+}
+
+fn graph_db_edge_kind_score(kind: &str) -> i64 {
+    match kind {
+        "mentions_concept" | "mentions_entity" => 180,
+        "semantic_relation" => 170,
+        "mentions" => 165,
+        "requests_context" | "scopes_context" | "scopes_source" => 155,
+        "explains_result" => 150,
+        "calls" => 145,
+        "defines" | "handled_by" | "defines_route" => 130,
+        "contains" | "targets" => 120,
+        "records_memory_source" | "has_vector_handle" => 115,
+        _ => 40,
+    }
+}
+
+fn graph_db_node_usefulness_score(
+    node: &SubstrateGraphNode,
+    depth_by_id: &BTreeMap<String, usize>,
+    semantic_scores: &BTreeMap<String, f64>,
+    source_covered_ids: &BTreeSet<String>,
+    origin_ids: &[String],
+) -> i64 {
+    if origin_ids.iter().any(|origin| origin == &node.id) {
+        return 1_000_000;
+    }
+    let semantic = semantic_scores
+        .get(&node.id)
+        .map(|score| (score.max(0.0) * 1_000.0) as i64)
+        .unwrap_or(0);
+    let depth_penalty = depth_by_id
+        .get(&node.id)
+        .map(|depth| (*depth as i64).saturating_mul(55))
+        .unwrap_or(180);
+    let source_coverage = if source_covered_ids.contains(&node.id)
+        || node.properties.contains_key("source_ref")
+        || node.properties.contains_key("path")
+    {
+        120
+    } else {
+        0
+    };
+    graph_db_node_kind_score(&node.kind)
+        + semantic
+        + source_coverage
+        + graph_db_recency_score(node).min(80)
+        - depth_penalty
+}
+
+fn graph_db_edge_usefulness_score(
+    edge: &SubstrateGraphEdge,
+    node_score_by_id: &BTreeMap<String, i64>,
+    depth_by_id: &BTreeMap<String, usize>,
+) -> i64 {
+    let endpoint_score = node_score_by_id
+        .get(&edge.from_id)
+        .copied()
+        .unwrap_or_default()
+        .max(
+            node_score_by_id
+                .get(&edge.to_id)
+                .copied()
+                .unwrap_or_default(),
+        );
+    let depth_penalty = depth_by_id
+        .get(&edge.from_id)
+        .into_iter()
+        .chain(depth_by_id.get(&edge.to_id))
+        .min()
+        .map(|depth| (*depth as i64).saturating_mul(35))
+        .unwrap_or(140);
+    graph_db_edge_kind_score(&edge.kind) + (endpoint_score / 8) - depth_penalty
+}
+
+fn graph_db_push_drop(
+    drops: &mut BTreeMap<(String, String, String), usize>,
+    item: &str,
+    kind: &str,
+    reason: &str,
+) {
+    *drops
+        .entry((item.to_string(), kind.to_string(), reason.to_string()))
+        .or_default() += 1;
+}
+
+fn graph_db_budget_drop_report(
+    drops: BTreeMap<(String, String, String), usize>,
+) -> Vec<GraphDbDroppedByBudget> {
+    drops
+        .into_iter()
+        .map(|((item, kind, reason), dropped)| GraphDbDroppedByBudget {
+            item,
+            kind,
+            reason,
+            dropped,
+        })
+        .collect()
+}
+
+fn graph_db_apply_output_budget(
+    origin_ids: &[String],
+    semantic_scores: &BTreeMap<String, f64>,
+    nodes: Vec<SubstrateGraphNode>,
+    edges: Vec<SubstrateGraphEdge>,
+    limit: Option<usize>,
+) -> GraphDbBudgetedSubgraph {
+    graph_db_apply_output_budget_with_depths(origin_ids, semantic_scores, nodes, edges, limit, None)
+}
+
+fn graph_db_apply_output_budget_with_depths(
+    origin_ids: &[String],
+    semantic_scores: &BTreeMap<String, f64>,
+    nodes: Vec<SubstrateGraphNode>,
+    edges: Vec<SubstrateGraphEdge>,
+    limit: Option<usize>,
+    depth_overrides: Option<&BTreeMap<String, usize>>,
+) -> GraphDbBudgetedSubgraph {
+    let max_tokens = graph_db_output_token_cap(limit);
+    let candidate_nodes = nodes.len();
+    let candidate_edges = edges.len();
+    let mut depth_by_id = graph_db_depth_by_id(origin_ids, &edges);
+    if let Some(depth_overrides) = depth_overrides {
+        for (id, depth) in depth_overrides {
+            depth_by_id
+                .entry(id.clone())
+                .and_modify(|current| *current = (*current).min(*depth))
+                .or_insert(*depth);
+        }
+    }
+    let source_covered_ids = graph_db_source_covered_ids(&nodes, &edges);
+    let node_score_by_id = nodes
+        .iter()
+        .map(|node| {
+            (
+                node.id.clone(),
+                graph_db_node_usefulness_score(
+                    node,
+                    &depth_by_id,
+                    semantic_scores,
+                    &source_covered_ids,
+                    origin_ids,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut node_candidates = nodes.iter().collect::<Vec<_>>();
+    node_candidates.sort_by(|left, right| {
+        node_score_by_id
+            .get(&right.id)
+            .cmp(&node_score_by_id.get(&left.id))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let mut selected_node_ids = BTreeSet::new();
+    let mut selected_node_counts = BTreeMap::<String, usize>::new();
+    let mut estimated_tokens = 0usize;
+    let mut drops = BTreeMap::<(String, String, String), usize>::new();
+    for node in node_candidates {
+        let kind_count = selected_node_counts
+            .get(&node.kind)
+            .copied()
+            .unwrap_or_default();
+        if !origin_ids.iter().any(|origin| origin == &node.id)
+            && kind_count >= graph_db_node_kind_quota(&node.kind, limit)
+        {
+            graph_db_push_drop(&mut drops, "node", &node.kind, "per_kind_quota");
+            continue;
+        }
+        let tokens = graph_db_estimated_tokens(node);
+        if !origin_ids.iter().any(|origin| origin == &node.id)
+            && estimated_tokens.saturating_add(tokens) > max_tokens
+        {
+            graph_db_push_drop(&mut drops, "node", &node.kind, "estimated_token_cap");
+            continue;
+        }
+        selected_node_ids.insert(node.id.clone());
+        *selected_node_counts.entry(node.kind.clone()).or_default() += 1;
+        estimated_tokens = estimated_tokens.saturating_add(tokens);
+    }
+
+    let mut selected_nodes = nodes
+        .into_iter()
+        .filter(|node| selected_node_ids.contains(&node.id))
+        .collect::<Vec<_>>();
+
+    let mut edge_candidates = edges
+        .iter()
+        .filter(|edge| {
+            selected_node_ids.contains(&edge.from_id) && selected_node_ids.contains(&edge.to_id)
+        })
+        .collect::<Vec<_>>();
+    let edge_score_by_key = edge_candidates
+        .iter()
+        .map(|edge| {
+            (
+                graph_db_edge_key(edge),
+                graph_db_edge_usefulness_score(edge, &node_score_by_id, &depth_by_id),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    edge_candidates.sort_by(|left, right| {
+        edge_score_by_key
+            .get(&graph_db_edge_key(right))
+            .cmp(&edge_score_by_key.get(&graph_db_edge_key(left)))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.from_id.cmp(&right.from_id))
+            .then_with(|| left.to_id.cmp(&right.to_id))
+    });
+
+    let endpoint_dropped_edges = edges
+        .iter()
+        .filter(|edge| {
+            !selected_node_ids.contains(&edge.from_id) || !selected_node_ids.contains(&edge.to_id)
+        })
+        .count();
+    if endpoint_dropped_edges > 0 {
+        drops.insert(
+            (
+                "edge".to_string(),
+                "*".to_string(),
+                "endpoint_node_dropped".to_string(),
+            ),
+            endpoint_dropped_edges,
+        );
+    }
+
+    let mut selected_edge_ids = BTreeSet::new();
+    let mut selected_edge_counts = BTreeMap::<String, usize>::new();
+    for edge in edge_candidates {
+        let kind_count = selected_edge_counts
+            .get(&edge.kind)
+            .copied()
+            .unwrap_or_default();
+        if kind_count >= graph_db_edge_kind_quota(&edge.kind, limit) {
+            graph_db_push_drop(&mut drops, "edge", &edge.kind, "per_kind_quota");
+            continue;
+        }
+        let tokens = graph_db_estimated_tokens(edge);
+        if estimated_tokens.saturating_add(tokens) > max_tokens {
+            graph_db_push_drop(&mut drops, "edge", &edge.kind, "estimated_token_cap");
+            continue;
+        }
+        selected_edge_ids.insert(graph_db_edge_key(edge));
+        *selected_edge_counts.entry(edge.kind.clone()).or_default() += 1;
+        estimated_tokens = estimated_tokens.saturating_add(tokens);
+    }
+
+    let selected_edges = edges
+        .into_iter()
+        .filter(|edge| selected_edge_ids.contains(&graph_db_edge_key(edge)))
+        .collect::<Vec<_>>();
+    let dropped_by_budget = graph_db_budget_drop_report(drops);
+    let diagnostics = vec![
+        "budget ranking signals: semantic_match, edge_kind, depth, recency, source_handle_coverage"
+            .to_string(),
+        format!(
+            "selected {} of {} candidate node(s) and {} of {} candidate edge(s) within estimated token cap {}",
+            selected_nodes.len(),
+            candidate_nodes,
+            selected_edges.len(),
+            candidate_edges,
+            max_tokens
+        ),
+    ];
+    selected_nodes.shrink_to_fit();
+
+    GraphDbBudgetedSubgraph {
+        nodes: selected_nodes,
+        edges: selected_edges,
+        report: GraphDbOutputBudgetReport {
+            max_tokens,
+            estimated_tokens,
+            selected_nodes: selected_node_ids.len(),
+            selected_edges: selected_edge_ids.len(),
+            candidate_nodes,
+            candidate_edges,
+            dropped_by_budget,
+            diagnostics,
+        },
+    }
+}
+
 fn graph_db_edge_key(edge: &SubstrateGraphEdge) -> String {
     if edge.id.is_empty() {
         substrate::ConvexEdgeRow::stable_key(&edge.from_id, &edge.to_id, &edge.kind)
@@ -9385,20 +9887,54 @@ pub(crate) fn graph_db_evidence_report_from_store<S: GraphStore>(
         semantic_paths.truncate(max_rows);
     }
 
+    let evidence_nodes = worker_paths
+        .iter()
+        .chain(source_paths.iter())
+        .chain(worker_result_paths.iter())
+        .chain(semantic_paths.iter())
+        .map(|(node, _)| node.clone())
+        .collect::<Vec<_>>();
+    let evidence_depth_by_id = worker_paths
+        .iter()
+        .chain(source_paths.iter())
+        .chain(worker_result_paths.iter())
+        .chain(semantic_paths.iter())
+        .map(|(node, path)| (node.id.clone(), path.hops))
+        .collect::<BTreeMap<_, _>>();
+    let target_query = graph_db_node_search_text(&target_node);
+    let semantic_scores = graph_db_semantic_scores_for_query(Some(&target_query), &evidence_nodes);
+    let budgeted = graph_db_apply_output_budget_with_depths(
+        std::slice::from_ref(&target_node.id),
+        &semantic_scores,
+        evidence_nodes,
+        Vec::new(),
+        Some(limit),
+        Some(&evidence_depth_by_id),
+    );
+    let output_budget = budgeted.report;
+    let retained_evidence_ids = budgeted
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
     let worker_context = worker_paths
         .iter()
+        .filter(|(node, _)| retained_evidence_ids.contains(node.id.as_str()))
         .map(|(node, _)| node.clone())
         .collect::<Vec<_>>();
     let source_handles = source_paths
         .iter()
+        .filter(|(node, _)| retained_evidence_ids.contains(node.id.as_str()))
         .map(|(node, _)| node.clone())
         .collect::<Vec<_>>();
     let worker_results = worker_result_paths
         .iter()
+        .filter(|(node, _)| retained_evidence_ids.contains(node.id.as_str()))
         .map(|(node, _)| node.clone())
         .collect::<Vec<_>>();
     let semantic_related = semantic_paths
         .iter()
+        .filter(|(node, _)| retained_evidence_ids.contains(node.id.as_str()))
         .map(|(node, _)| node.clone())
         .collect::<Vec<_>>();
     warnings.extend(graph_db_evidence_completed_queue_drift_warnings(
@@ -9421,6 +9957,7 @@ pub(crate) fn graph_db_evidence_report_from_store<S: GraphStore>(
         .chain(source_paths.iter())
         .chain(worker_result_paths.iter())
         .chain(semantic_paths.iter())
+        .filter(|(node, _)| retained_evidence_ids.contains(node.id.as_str()))
         .map(|(node, path)| GraphDbEvidencePath {
             to: node.id.clone(),
             kind: node.kind.clone(),
@@ -9457,6 +9994,7 @@ pub(crate) fn graph_db_evidence_report_from_store<S: GraphStore>(
         worker_results,
         semantic_related,
         shortest_paths,
+        output_budget: Some(output_budget),
         next_commands,
         replay_commands,
         repair_commands,
@@ -9574,6 +10112,7 @@ pub(crate) fn graph_db_report_from_store(
         semantic_related: Vec::new(),
         neighborhood_ranking_gate: None,
         knowledge_retrieval: None,
+        output_budget: None,
         path: None,
         page: None,
         warnings,
@@ -9620,12 +10159,27 @@ pub(crate) fn graph_db_report_from_store(
                 .iter()
                 .map(|item| item.handle.clone())
                 .collect::<Vec<_>>();
+            let semantic_scores = items
+                .iter()
+                .map(|item| (item.handle.clone(), item.score))
+                .collect::<BTreeMap<_, _>>();
             let subgraph = graph_db_semantic_seeded_neighborhood(store, &seed_ids, depth, limit)?;
             let seed_count = seed_ids.len();
+            let mut diagnostics = subgraph.diagnostics;
+            let budgeted = graph_db_apply_output_budget(
+                &seed_ids,
+                &semantic_scores,
+                subgraph.nodes,
+                subgraph.edges,
+                Some(limit),
+            );
+            let budget_report = budgeted.report;
+            let dropped_by_budget = !budget_report.dropped_by_budget.is_empty();
+            diagnostics.extend(budget_report.diagnostics.clone());
 
             report.semantic_related = items;
-            report.nodes = subgraph.nodes;
-            report.edges = subgraph.edges;
+            report.nodes = budgeted.nodes;
+            report.edges = budgeted.edges;
             if let Some(seed_id) = seed_ids.first() {
                 let ranked_neighbor_cap = graph_db_ranked_neighbor_cap(Some(limit));
                 report.ranked_neighbors = graph_db_ranked_neighbors(
@@ -9647,15 +10201,16 @@ pub(crate) fn graph_db_report_from_store(
                 limit,
                 node_count: report.nodes.len(),
                 edge_count: report.edges.len(),
-                truncated: subgraph.truncated,
+                truncated: subgraph.truncated || dropped_by_budget,
                 traversal: "incident_plus_outgoing_edges".to_string(),
                 freshness_boundary:
                     "semantic rows must come from refreshed summary graph records".to_string(),
                 privacy_boundary:
                     "GraphStore stores substrate records only; user consent, deletion policy, persona policy, and LiveKit session state stay in the avatar/agent adapter"
                         .to_string(),
-                diagnostics: subgraph.diagnostics,
+                diagnostics,
             });
+            report.output_budget = Some(budget_report);
         }
         GraphDbQuery::Schema => {
             report.schema = Some(graph_db_schema());
@@ -9733,8 +10288,16 @@ pub(crate) fn graph_db_report_from_store(
                 edge_kind.as_deref(),
                 graph_db_query_options_for_store(&options),
             )? {
-                report.nodes = paged.nodes;
-                report.edges = paged.edges;
+                let budgeted = graph_db_apply_output_budget(
+                    std::slice::from_ref(&id),
+                    &BTreeMap::new(),
+                    paged.nodes,
+                    paged.edges,
+                    options.limit,
+                );
+                let budget_report = budgeted.report;
+                report.nodes = budgeted.nodes;
+                report.edges = budgeted.edges;
                 let ranked_neighbor_cap = graph_db_ranked_neighbor_cap(options.limit);
                 report.ranked_neighbors = graph_db_ranked_neighbors(
                     &id,
@@ -9744,10 +10307,14 @@ pub(crate) fn graph_db_report_from_store(
                 );
                 report.neighborhood_ranking_gate =
                     Some(graph_db_neighborhood_ranking_gate(ranked_neighbor_cap));
-                report.page = Some(graph_db_page_report_from_store(
-                    paged.page,
-                    options.property_filters,
-                ));
+                let mut page =
+                    graph_db_page_report_from_store(paged.page, options.property_filters);
+                page.returned_nodes = report.nodes.len();
+                page.returned_edges = report.edges.len();
+                page.truncated |= !budget_report.dropped_by_budget.is_empty();
+                page.diagnostics.extend(budget_report.diagnostics.clone());
+                report.page = Some(page);
+                report.output_budget = Some(budget_report);
             }
         }
         GraphDbQuery::Path {
@@ -26117,6 +26684,14 @@ def list_items():
                 .iter()
                 .any(|edge| edge.kind == "mentions_concept")
         );
+        assert!(
+            report.output_budget.as_ref().is_some_and(|budget| budget
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.contains("budget ranking signals") })),
+            "expected related output budget diagnostics, got {:?}",
+            report.output_budget
+        );
     }
 
     #[test]
@@ -26205,6 +26780,17 @@ def list_items():
                 .iter()
                 .map(|node| (&node.kind, &node.label))
                 .collect::<Vec<_>>()
+        );
+        assert!(
+            evidence
+                .output_budget
+                .as_ref()
+                .is_some_and(|budget| budget.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.contains("semantic_match")
+                        && diagnostic.contains("source_handle_coverage")
+                })),
+            "expected evidence output budget diagnostics, got {:?}",
+            evidence.output_budget
         );
 
         let cached_diff = diff_digest::compute(
@@ -26542,6 +27128,121 @@ def list_items():
                 .operations
                 .iter()
                 .any(|operation| operation.command.starts_with("neighborhood"))
+        );
+    }
+
+    #[test]
+    fn graph_db_neighborhood_reports_dropped_by_budget_diagnostics() {
+        let mut nodes = vec![SubstrateGraphNode::new(
+            "origin",
+            "backlog",
+            "#budgeted-neighborhood",
+        )];
+        let mut edges = Vec::new();
+        for idx in 0..32 {
+            let id = format!("src-{idx:02}");
+            nodes.push(
+                SubstrateGraphNode::new(id.clone(), "source_handle", format!("source {idx}"))
+                    .with_property("source_ref", format!("fixture:{idx}"))
+                    .with_property("detail", "x".repeat(600)),
+            );
+            edges.push(SubstrateGraphEdge::new("origin", id, "mentions"));
+        }
+        let store = SqliteGraphStore::in_memory().unwrap();
+        GraphProjection { nodes, edges }
+            .upsert_into(&store)
+            .unwrap();
+
+        let report = graph_db_report_from_store(
+            Path::new("."),
+            None,
+            "fixture",
+            GraphDbQuery::Neighborhood {
+                id: "origin".to_string(),
+                depth: 1,
+                edge_kind: None,
+                cursor: None,
+                limit: None,
+                property_filters: Vec::new(),
+            },
+            &store,
+            current_graph_db_freshness(),
+            Vec::new(),
+        )
+        .unwrap();
+        let budget = report.output_budget.as_ref().unwrap();
+        assert!(budget.selected_nodes < budget.candidate_nodes);
+        assert!(
+            budget.dropped_by_budget.iter().any(|drop| {
+                drop.item == "node"
+                    && drop.kind == "source_handle"
+                    && drop.reason == "per_kind_quota"
+            }),
+            "expected source_handle budget drops, got {:?}",
+            budget.dropped_by_budget
+        );
+        assert!(report.page.as_ref().unwrap().truncated);
+        assert!(
+            report
+                .page
+                .as_ref()
+                .unwrap()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("budget ranking signals")),
+            "{:?}",
+            report.page
+        );
+    }
+
+    #[test]
+    fn graph_db_output_budget_uses_depth_overrides_for_evidence_rows() {
+        let mut nodes = vec![SubstrateGraphNode::new("near", "note", "zzz shallow row")];
+        let mut depth_by_id = BTreeMap::from([("near".to_string(), 1usize)]);
+        for idx in 0..8 {
+            let id = format!("far-{idx:02}");
+            nodes.push(SubstrateGraphNode::new(
+                id.clone(),
+                "note",
+                format!("aaa deeper row {idx}"),
+            ));
+            depth_by_id.insert(id, 6);
+        }
+
+        let origin_ids = vec!["target".to_string()];
+        let budgeted = graph_db_apply_output_budget_with_depths(
+            &origin_ids,
+            &BTreeMap::new(),
+            nodes,
+            Vec::new(),
+            Some(3),
+            Some(&depth_by_id),
+        );
+
+        assert!(
+            budgeted.nodes.iter().any(|node| node.id == "near"),
+            "expected the shallow evidence row to outrank deeper rows, got {:?}",
+            budgeted
+                .nodes
+                .iter()
+                .map(|node| (&node.id, &node.label))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            budgeted.report.dropped_by_budget.iter().any(|drop| {
+                drop.item == "node" && drop.kind == "note" && drop.reason == "per_kind_quota"
+            }),
+            "expected node quota drops, got {:?}",
+            budgeted.report.dropped_by_budget
+        );
+        assert!(
+            budgeted
+                .report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("depth")),
+            "{:?}",
+            budgeted.report.diagnostics
         );
     }
 
