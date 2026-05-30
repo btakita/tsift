@@ -173,6 +173,19 @@ pub fn ranked_neighbors(
     ranked
 }
 
+pub fn ranked_neighbors_capped(
+    center_id: &str,
+    nodes: &[GraphNode],
+    edges: &[GraphEdge],
+    cap: usize,
+) -> Vec<RankedNeighbor> {
+    let mut ranked = ranked_neighbors(center_id, nodes, edges);
+    if cap > 0 && ranked.len() > cap {
+        ranked.truncate(cap);
+    }
+    ranked
+}
+
 pub fn neighborhood_depths(
     center_id: &str,
     node_by_id: &BTreeMap<String, &GraphNode>,
@@ -376,6 +389,24 @@ mod tests {
         let ranked = ranked_neighbors("center", &nodes, &[]);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].node_id, "other");
+    }
+
+    #[test]
+    fn ranked_neighbors_capped_truncates_after_scoring() {
+        let center = GraphNode::new("center", "file", "center");
+        let low = GraphNode::new("low", "symbol", "low");
+        let high = GraphNode::new("high", "source_handle", "high");
+        let nodes = vec![center, low, high];
+        let edges = vec![
+            GraphEdge::new("center", "low", "unknown"),
+            GraphEdge::new("center", "high", "mentions_concept"),
+        ];
+
+        let ranked = ranked_neighbors_capped("center", &nodes, &edges, 1);
+
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].rank, 1);
+        assert_eq!(ranked[0].node_id, "high");
     }
 
     #[test]

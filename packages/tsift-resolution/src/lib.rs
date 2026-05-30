@@ -4,7 +4,7 @@ pub mod resolve;
 
 pub use scoring::{
     RankedNeighbor, NeighborhoodRankingGate,
-    ranked_neighbors, neighborhood_depths,
+    ranked_neighbors, ranked_neighbors_capped, neighborhood_depths,
     page_handle_coverage_pct, node_has_handle_coverage,
     duplicate_name_precision, has_community_signal, has_semantic_signal,
     source_handle_is_fresh, edge_kind_rank_score,

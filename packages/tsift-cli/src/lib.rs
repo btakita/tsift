@@ -3885,6 +3885,9 @@ const SESSION_REVIEW_FOLLOW_UP_CONTRACT_VERSION: &str = "session-review-follow-u
 const DISPATCH_TRACE_CONTRACT_VERSION: &str = "dispatch-trace-v1";
 const DEPENDENCY_DAG_CONTRACT_VERSION: &str = "dependency-dag-v1";
 const GRAPH_PROJECTION_META_KIND: &str = "projection_meta";
+const GRAPH_DB_RANKED_NEIGHBOR_CAP: usize = 12;
+const GRAPH_DB_SEMANTIC_MIN_EDGE_SCAN_CAP: usize = 16;
+const GRAPH_DB_SEMANTIC_MAX_EDGE_SCAN_CAP: usize = 64;
 
 #[derive(Debug, Serialize, PartialEq)]
 struct TraversalTotals {
@@ -8471,7 +8474,7 @@ fn graph_db_page_report_from_store(
     }
 }
 
-fn graph_db_neighborhood_ranking_gate() -> GraphDbNeighborhoodRankingGate {
+fn graph_db_neighborhood_ranking_gate(ranked_neighbor_cap: usize) -> GraphDbNeighborhoodRankingGate {
     GraphDbNeighborhoodRankingGate {
         status: "held_default_order_unchanged".to_string(),
         ranked_output_default: false,
@@ -8491,8 +8494,18 @@ fn graph_db_neighborhood_ranking_gate() -> GraphDbNeighborhoodRankingGate {
         min_top_community_stability: tsift::metric_digest::COMMUNITY_MIN_TOP_COMMUNITY_STABILITY,
         diagnostics: vec![
             "ranked_neighbors is additive; neighborhood nodes remain ordered by stable node id for cursor pagination".to_string(),
+            format!(
+                "ranked_neighbors is score-capped at {ranked_neighbor_cap} entries so previews stay bounded while cursor pagination remains exhaustive"
+            ),
             "changing the default neighborhood order requires the community-search gate to pass for every required workload".to_string(),
         ],
+    }
+}
+
+fn graph_db_ranked_neighbor_cap(limit: Option<usize>) -> usize {
+    match limit {
+        Some(0) | None => GRAPH_DB_RANKED_NEIGHBOR_CAP,
+        Some(limit) => limit.clamp(1, GRAPH_DB_RANKED_NEIGHBOR_CAP),
     }
 }
 
@@ -8500,8 +8513,9 @@ fn graph_db_ranked_neighbors(
     center_id: &str,
     nodes: &[SubstrateGraphNode],
     edges: &[SubstrateGraphEdge],
+    cap: usize,
 ) -> Vec<GraphDbRankedNeighbor> {
-    tsift::resolution::ranked_neighbors(center_id, nodes, edges)
+    tsift::resolution::ranked_neighbors_capped(center_id, nodes, edges, cap)
 }
 
 fn graph_db_edge_key(edge: &SubstrateGraphEdge) -> String {
@@ -9217,9 +9231,11 @@ pub(crate) fn graph_db_report_from_store(
             report.nodes = subgraph.nodes;
             report.edges = subgraph.edges;
             if let Some(seed_id) = seed_ids.first() {
+                let ranked_neighbor_cap = graph_db_ranked_neighbor_cap(Some(limit));
                 report.ranked_neighbors =
-                    graph_db_ranked_neighbors(seed_id, &report.nodes, &report.edges);
-                report.neighborhood_ranking_gate = Some(graph_db_neighborhood_ranking_gate());
+                    graph_db_ranked_neighbors(seed_id, &report.nodes, &report.edges, ranked_neighbor_cap);
+                report.neighborhood_ranking_gate =
+                    Some(graph_db_neighborhood_ranking_gate(ranked_neighbor_cap));
             }
             report.knowledge_retrieval = Some(GraphDbKnowledgeRetrieval {
                 mode: "semantic_seeded_neighborhood".to_string(),
@@ -9319,9 +9335,11 @@ pub(crate) fn graph_db_report_from_store(
             )? {
                 report.nodes = paged.nodes;
                 report.edges = paged.edges;
+                let ranked_neighbor_cap = graph_db_ranked_neighbor_cap(options.limit);
                 report.ranked_neighbors =
-                    graph_db_ranked_neighbors(&id, &report.nodes, &report.edges);
-                report.neighborhood_ranking_gate = Some(graph_db_neighborhood_ranking_gate());
+                    graph_db_ranked_neighbors(&id, &report.nodes, &report.edges, ranked_neighbor_cap);
+                report.neighborhood_ranking_gate =
+                    Some(graph_db_neighborhood_ranking_gate(ranked_neighbor_cap));
                 report.page = Some(graph_db_page_report_from_store(
                     paged.page,
                     options.property_filters,
@@ -12866,13 +12884,37 @@ fn traversal_shortest_handles(
     None
 }
 
+fn traversal_scored_neighbors(edges: &[TraversalEdge], current: &str) -> Vec<String> {
+    let mut best_score_by_neighbor = BTreeMap::<String, usize>::new();
+    for edge in edges {
+        let neighbor = if edge.from == current {
+            edge.to.as_str()
+        } else if edge.to == current {
+            edge.from.as_str()
+        } else {
+            continue;
+        };
+        let score = traversal_relation_score(edge, current);
+        best_score_by_neighbor
+            .entry(neighbor.to_string())
+            .and_modify(|best| *best = (*best).max(score))
+            .or_insert(score);
+    }
+    let mut ranked = best_score_by_neighbor.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|(left_handle, left_score), (right_handle, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_handle.cmp(right_handle))
+    });
+    ranked.into_iter().map(|(handle, _)| handle).collect()
+}
+
 fn traversal_neighborhood_handles(
     edges: &[TraversalEdge],
     origin: &str,
     depth: usize,
     limit: usize,
 ) -> BTreeSet<String> {
-    let adj = traversal_adjacency(edges);
     let mut seen = BTreeSet::new();
     let mut queue = VecDeque::new();
     seen.insert(origin.to_string());
@@ -12881,14 +12923,12 @@ fn traversal_neighborhood_handles(
         if current_depth >= depth {
             continue;
         }
-        if let Some(neighbors) = adj.get(&current) {
-            for neighbor in neighbors {
-                if limit > 0 && seen.len() >= limit {
-                    return seen;
-                }
-                if seen.insert(neighbor.clone()) {
-                    queue.push_back((neighbor.clone(), current_depth + 1));
-                }
+        for neighbor in traversal_scored_neighbors(edges, &current) {
+            if limit > 0 && seen.len() >= limit {
+                return seen;
+            }
+            if seen.insert(neighbor.clone()) {
+                queue.push_back((neighbor, current_depth + 1));
             }
         }
     }
@@ -13514,6 +13554,51 @@ fn semantic_related_report_from_store(
     })
 }
 
+fn graph_db_semantic_edge_scan_cap(limit: usize) -> usize {
+    if limit == 0 {
+        return 0;
+    }
+    limit
+        .saturating_mul(4)
+        .clamp(GRAPH_DB_SEMANTIC_MIN_EDGE_SCAN_CAP, GRAPH_DB_SEMANTIC_MAX_EDGE_SCAN_CAP)
+}
+
+fn graph_db_semantic_node_discovery_cap(seed_count: usize, limit: usize) -> usize {
+    if limit == 0 {
+        return usize::MAX;
+    }
+    limit.saturating_mul(3).max(limit).max(seed_count)
+}
+
+fn graph_db_semantic_edge_other_id<'a>(
+    edge: &'a SubstrateGraphEdge,
+    current_id: &str,
+) -> Option<&'a str> {
+    if edge.from_id == current_id {
+        Some(edge.to_id.as_str())
+    } else if edge.to_id == current_id {
+        Some(edge.from_id.as_str())
+    } else {
+        None
+    }
+}
+
+fn graph_db_semantic_edge_score(edge: &SubstrateGraphEdge, current_id: &str) -> i64 {
+    let mut score = tsift::resolution::edge_kind_rank_score(&edge.kind).saturating_mul(10);
+    score += if edge.from_id == current_id { 8 } else { 4 };
+    score += match edge.kind.as_str() {
+        "mentions_concept" | "mentions_entity" | "tagged_concept" | "tagged_entity"
+        | "related_concept" => 30,
+        "semantic_relation" => 28,
+        "calls" => 24,
+        "mentions" => 22,
+        "requests_context" | "scopes_context" | "scopes_source" | "explains_result" => 18,
+        "defines" | "contains" | "belongs_to" => 12,
+        _ => 0,
+    };
+    score
+}
+
 fn graph_db_semantic_seeded_neighborhood(
     store: &impl GraphStore,
     seed_ids: &[String],
@@ -13527,16 +13612,37 @@ fn graph_db_semantic_seeded_neighborhood(
         .collect::<BTreeMap<_, _>>();
     let mut nodes = BTreeMap::<String, SubstrateGraphNode>::new();
     let mut edges = BTreeMap::<String, SubstrateGraphEdge>::new();
+    let mut node_score_by_id = BTreeMap::<String, i64>::new();
     let mut queue = VecDeque::<(String, usize)>::new();
     let mut seen_at_depth = BTreeMap::<String, usize>::new();
+    let edge_scan_cap = graph_db_semantic_edge_scan_cap(limit);
+    let node_discovery_cap = graph_db_semantic_node_discovery_cap(seed_ids.len(), limit);
+    let mut skipped_by_edge_cap = 0usize;
+    let mut skipped_by_node_cap = 0usize;
     let mut diagnostics = vec![
         "semantic-seeded retrieval uses phrase similarity to pick graph seeds".to_string(),
         "seed expansion traverses both outgoing and incident edges so code, markdown, conversation, and memory adapters can link into semantic rows without reversing their edge direction".to_string(),
+        format!(
+            "seed expansion ranks incident/outgoing edges before caps; per-node edge scan cap={} node discovery cap={}",
+            if edge_scan_cap == 0 {
+                "unbounded".to_string()
+            } else {
+                edge_scan_cap.to_string()
+            },
+            if node_discovery_cap == usize::MAX {
+                "unbounded".to_string()
+            } else {
+                node_discovery_cap.to_string()
+            }
+        ),
     ];
 
-    for seed_id in seed_ids {
+    for (idx, seed_id) in seed_ids.iter().enumerate() {
         if let Some(node) = store.node(seed_id)? {
             nodes.entry(seed_id.clone()).or_insert(node);
+            node_score_by_id
+                .entry(seed_id.clone())
+                .or_insert(1_000_000i64.saturating_sub(idx as i64));
             queue.push_back((seed_id.clone(), 0));
             seen_at_depth.entry(seed_id.clone()).or_insert(0);
         } else {
@@ -13551,22 +13657,53 @@ fn graph_db_semantic_seeded_neighborhood(
             continue;
         }
 
-        let mut expansion_edges = store.outgoing_edges(&current_id, None)?;
-        expansion_edges.extend(store.incident_edges(&current_id, None)?);
+        let mut expansion_edges_by_key = BTreeMap::<String, SubstrateGraphEdge>::new();
+        for edge in store.outgoing_edges(&current_id, None)? {
+            expansion_edges_by_key
+                .entry(graph_db_edge_key(&edge))
+                .or_insert(edge);
+        }
+        for edge in store.incident_edges(&current_id, None)? {
+            expansion_edges_by_key
+                .entry(graph_db_edge_key(&edge))
+                .or_insert(edge);
+        }
+        let mut expansion_edges = expansion_edges_by_key.into_values().collect::<Vec<_>>();
+        expansion_edges.sort_by(|left, right| {
+            graph_db_semantic_edge_score(right, &current_id)
+                .cmp(&graph_db_semantic_edge_score(left, &current_id))
+                .then_with(|| graph_db_edge_key(left).cmp(&graph_db_edge_key(right)))
+        });
+        if edge_scan_cap > 0 && expansion_edges.len() > edge_scan_cap {
+            skipped_by_edge_cap += expansion_edges.len() - edge_scan_cap;
+            expansion_edges.truncate(edge_scan_cap);
+        }
+
         for edge in expansion_edges {
-            let edge_key = graph_db_edge_key(&edge);
-            edges.entry(edge_key).or_insert_with(|| edge.clone());
-            let other_id = if edge.from_id == current_id {
-                edge.to_id.clone()
-            } else if edge.to_id == current_id {
-                edge.from_id.clone()
-            } else {
+            let Some(other_id) = graph_db_semantic_edge_other_id(&edge, &current_id) else {
                 continue;
             };
+            let other_known = nodes.contains_key(other_id);
+            if !other_known && nodes.len() >= node_discovery_cap {
+                skipped_by_node_cap += 1;
+                continue;
+            }
+            let other_id = other_id.to_string();
+            let edge_score = graph_db_semantic_edge_score(&edge, &current_id)
+                .saturating_add((depth.saturating_sub(current_depth) as i64).saturating_mul(5));
+            node_score_by_id
+                .entry(other_id.clone())
+                .and_modify(|score| *score = (*score).max(edge_score))
+                .or_insert(edge_score);
+            let edge_key = graph_db_edge_key(&edge);
+            edges.entry(edge_key).or_insert_with(|| edge.clone());
             if let std::collections::btree_map::Entry::Vacant(entry) = nodes.entry(other_id.clone())
                 && let Some(node) = store.node(&other_id)?
             {
                 entry.insert(node);
+            }
+            if !nodes.contains_key(&other_id) {
+                continue;
             }
             let next_depth = current_depth + 1;
             let should_queue = seen_at_depth
@@ -13579,6 +13716,17 @@ fn graph_db_semantic_seeded_neighborhood(
         }
     }
 
+    if skipped_by_edge_cap > 0 {
+        diagnostics.push(format!(
+            "semantic-seeded expansion skipped {skipped_by_edge_cap} lower-scoring incident/outgoing edge(s) after per-node caps"
+        ));
+    }
+    if skipped_by_node_cap > 0 {
+        diagnostics.push(format!(
+            "semantic-seeded expansion skipped {skipped_by_node_cap} lower-scoring node discovery edge(s) after the discovery cap"
+        ));
+    }
+
     let mut nodes = nodes.into_values().collect::<Vec<_>>();
     nodes.sort_by(|left, right| {
         seed_rank
@@ -13586,6 +13734,13 @@ fn graph_db_semantic_seeded_neighborhood(
             .copied()
             .unwrap_or(usize::MAX)
             .cmp(&seed_rank.get(&right.id).copied().unwrap_or(usize::MAX))
+            .then_with(|| {
+                node_score_by_id
+                    .get(&right.id)
+                    .copied()
+                    .unwrap_or_default()
+                    .cmp(&node_score_by_id.get(&left.id).copied().unwrap_or_default())
+            })
             .then(left.id.cmp(&right.id))
     });
 
@@ -24631,6 +24786,32 @@ def list_items():
     }
 
     #[test]
+    fn traversal_neighborhood_handles_prioritizes_high_signal_edges_when_limited() {
+        let edges = vec![
+            TraversalEdge {
+                from: "origin".to_string(),
+                to: "aaa_low".to_string(),
+                relation: "unknown".to_string(),
+                label: None,
+                weight: 1,
+            },
+            TraversalEdge {
+                from: "origin".to_string(),
+                to: "zzz_high".to_string(),
+                relation: "mentions".to_string(),
+                label: None,
+                weight: 1,
+            },
+        ];
+
+        let handles = traversal_neighborhood_handles(&edges, "origin", 1, 2);
+
+        assert!(handles.contains("origin"));
+        assert!(handles.contains("zzz_high"), "{handles:?}");
+        assert!(!handles.contains("aaa_low"), "{handles:?}");
+    }
+
+    #[test]
     fn traversal_materializes_provider_neutral_sqlite_graph() {
         let dir = setup_traversal_project();
         let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
@@ -24821,8 +25002,56 @@ def list_items():
         assert!(
             report
                 .edges
+            .iter()
+            .any(|edge| edge.kind == "mentions_concept")
+        );
+    }
+
+    #[test]
+    fn graph_db_semantic_seeded_neighborhood_scores_before_caps() {
+        let mut nodes = vec![
+            SubstrateGraphNode::new("seed", "semantic_concept", "graph budget"),
+            SubstrateGraphNode::new("zzz_high", "symbol", "high_signal"),
+        ];
+        let mut edges = vec![SubstrateGraphEdge::new(
+            "zzz_high",
+            "seed",
+            "mentions_concept",
+        )];
+        for idx in 0..24 {
+            let id = format!("aaa_low_{idx:02}");
+            nodes.push(SubstrateGraphNode::new(id.clone(), "note", format!("low {idx}")));
+            edges.push(SubstrateGraphEdge::new(id, "seed", "weak_link"));
+        }
+        let mut store = SqliteGraphStore::in_memory().unwrap();
+        store.replace_projection(&GraphProjection { nodes, edges }).unwrap();
+
+        let subgraph =
+            graph_db_semantic_seeded_neighborhood(&store, &["seed".to_string()], 1, 3).unwrap();
+
+        assert_eq!(subgraph.nodes.len(), 3);
+        assert_eq!(subgraph.nodes[0].id, "seed");
+        assert_eq!(
+            subgraph.nodes[1].id, "zzz_high",
+            "expected semantic mention edge to survive caps before lexicographic low-signal nodes: {:?}",
+            subgraph.nodes
+        );
+        assert!(subgraph.truncated);
+        assert!(
+            subgraph
+                .diagnostics
                 .iter()
-                .any(|edge| edge.kind == "mentions_concept")
+                .any(|diagnostic| diagnostic.contains("per-node edge scan cap")),
+            "{:?}",
+            subgraph.diagnostics
+        );
+        assert!(
+            subgraph
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("skipped")),
+            "{:?}",
+            subgraph.diagnostics
         );
     }
 
@@ -25072,9 +25301,17 @@ def list_items():
             "expected ranked neighborhood neighbors with quality scores, got {:?}",
             report.ranked_neighbors
         );
+        assert!(report.ranked_neighbors.len() <= GRAPH_DB_RANKED_NEIGHBOR_CAP);
         let ranking_gate = report.neighborhood_ranking_gate.as_ref().unwrap();
         assert!(!ranking_gate.ranked_output_default);
         assert_eq!(ranking_gate.default_order, "stable_node_id");
+        assert!(
+            ranking_gate
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("score-capped")),
+            "{ranking_gate:?}"
+        );
         assert!(
             ranking_gate
                 .required_metrics
