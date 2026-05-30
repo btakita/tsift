@@ -779,6 +779,8 @@ pub struct ClaudeMemTablePlan {
     pub supported: bool,
     pub rows: usize,
     pub columns: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsupported_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -803,8 +805,11 @@ fn empty_table_plan(table: &str) -> ClaudeMemTablePlan {
         supported: false,
         rows: 0,
         columns: Vec::new(),
+        unsupported_reason: None,
     }
 }
+
+const PENDING_MESSAGES_EXCLUSION_REASON: &str = "pending_messages is intentionally excluded from claude-mem import because it contains transient queue state and raw tool payload fields, not durable replacement memory";
 
 pub fn inspect_claude_mem(db_path: &Path) -> Result<ClaudeMemImportPlan> {
     let chroma_path = db_path.parent().map(|parent| parent.join("chroma"));
@@ -838,10 +843,19 @@ pub fn inspect_claude_mem(db_path: &Path) -> Result<ClaudeMemImportPlan> {
     )
     .with_context(|| format!("open claude-mem db {}", db_path.display()))?;
     plan.readable = true;
-    plan.observations = inspect_table(&conn, "observations")?;
-    plan.session_summaries = inspect_table(&conn, "session_summaries")?;
-    plan.user_prompts = inspect_table(&conn, "user_prompts")?;
-    plan.pending_messages = inspect_table(&conn, "pending_messages")?;
+    plan.observations = inspect_table(&conn, "observations", true, None)?;
+    plan.session_summaries = inspect_table(&conn, "session_summaries", true, None)?;
+    plan.user_prompts = inspect_table(&conn, "user_prompts", true, None)?;
+    plan.pending_messages = inspect_table(
+        &conn,
+        "pending_messages",
+        false,
+        Some(PENDING_MESSAGES_EXCLUSION_REASON),
+    )?;
+    if plan.pending_messages.rows > 0 {
+        plan.warnings
+            .push(PENDING_MESSAGES_EXCLUSION_REASON.to_string());
+    }
 
     if !plan.chroma_present {
         plan.warnings
@@ -851,7 +865,12 @@ pub fn inspect_claude_mem(db_path: &Path) -> Result<ClaudeMemImportPlan> {
     Ok(plan)
 }
 
-fn inspect_table(conn: &Connection, table: &str) -> Result<ClaudeMemTablePlan> {
+fn inspect_table(
+    conn: &Connection,
+    table: &str,
+    supported: bool,
+    unsupported_reason: Option<&str>,
+) -> Result<ClaudeMemTablePlan> {
     if !table_exists(conn, table)? {
         return Ok(empty_table_plan(table));
     }
@@ -861,9 +880,10 @@ fn inspect_table(conn: &Connection, table: &str) -> Result<ClaudeMemTablePlan> {
     let columns = table_columns(conn, table)?;
     Ok(ClaudeMemTablePlan {
         table: table.to_string(),
-        supported: true,
+        supported,
         rows: rows as usize,
         columns,
+        unsupported_reason: unsupported_reason.map(str::to_string),
     })
 }
 
@@ -1269,6 +1289,63 @@ mod tests {
         let second = store.insert_event(&event).unwrap();
         assert_eq!(first, second);
         assert_eq!(store.event_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn claude_mem_pending_messages_are_reported_but_not_imported() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("claude-mem.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE pending_messages (
+              id INTEGER PRIMARY KEY,
+              session_db_id INTEGER NOT NULL,
+              content_session_id TEXT NOT NULL,
+              message_type TEXT NOT NULL CHECK(message_type IN ('observation', 'summarize')),
+              tool_name TEXT,
+              tool_input TEXT,
+              tool_response TEXT,
+              cwd TEXT,
+              last_user_message TEXT,
+              last_assistant_message TEXT,
+              prompt_number INTEGER,
+              status TEXT NOT NULL DEFAULT 'pending',
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              created_at_epoch INTEGER NOT NULL,
+              started_processing_at_epoch INTEGER,
+              completed_at_epoch INTEGER,
+              failed_at_epoch INTEGER
+            );
+            INSERT INTO pending_messages (
+              id, session_db_id, content_session_id, message_type, tool_name,
+              tool_input, tool_response, cwd, last_user_message,
+              last_assistant_message, prompt_number, status, retry_count,
+              created_at_epoch
+            ) VALUES (
+              1, 10, 'session-a', 'observation', 'bash',
+              '{"cmd":"cat large.log"}', 'raw tool response', '/repo',
+              'run tests', 'done', 7, 'pending', 0, 1700000000
+            );
+            "#,
+        )
+        .unwrap();
+
+        let plan = inspect_claude_mem(&db).unwrap();
+        assert_eq!(plan.pending_messages.rows, 1);
+        assert!(!plan.pending_messages.supported);
+        assert_eq!(
+            plan.pending_messages.unsupported_reason.as_deref(),
+            Some(PENDING_MESSAGES_EXCLUSION_REASON)
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("pending_messages"))
+        );
+
+        let read_report = read_claude_mem_events(&db, 100).unwrap();
+        assert!(read_report.events.is_empty());
     }
 
     #[test]
