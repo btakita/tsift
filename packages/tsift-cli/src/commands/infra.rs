@@ -1161,6 +1161,24 @@ pub(crate) fn cmd_graph_db(
     };
 
     if format.json_output {
+        let mut metrics = vec![
+            envelope_metric("backend", &report.backend),
+            envelope_metric(
+                "nodes",
+                report.nodes.len() + usize::from(report.node.is_some()),
+            ),
+            envelope_metric("edges", report.edges.len()),
+            envelope_metric("freshness", &report.freshness.status),
+        ];
+        let mut next_commands = Vec::new();
+        if let Some(readiness) = &report.readiness {
+            metrics.push(envelope_metric("readiness", &readiness.status));
+            next_commands.extend(readiness.next_commands.clone());
+        }
+        next_commands.push(format!(
+            "Use tsift convex-sync {} --json to inspect or refresh Convex projection rows",
+            shell_quote(root.to_string_lossy().as_ref())
+        ));
         print_json_or_envelope(
             &report,
             &format,
@@ -1174,21 +1192,10 @@ pub(crate) fn cmd_graph_db(
                     report.edges.len(),
                     report.freshness.status
                 ),
-                metrics: vec![
-                    envelope_metric("backend", &report.backend),
-                    envelope_metric(
-                        "nodes",
-                        report.nodes.len() + usize::from(report.node.is_some()),
-                    ),
-                    envelope_metric("edges", report.edges.len()),
-                    envelope_metric("freshness", &report.freshness.status),
-                ],
+                metrics,
             },
             false,
-            vec![format!(
-                "Use tsift convex-sync {} --json to inspect or refresh Convex projection rows",
-                shell_quote(root.to_string_lossy().as_ref())
-            )],
+            next_commands,
         )
     } else {
         print_graph_db_human(&report, format.compact);

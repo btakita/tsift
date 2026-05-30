@@ -1672,6 +1672,55 @@ fn graph_db_semantic_readiness_clears_after_summarize_extract_and_refresh() {
 }
 
 #[test]
+fn graph_db_related_json_reports_summary_extract_readiness_gate() {
+    let project = graph_db_project();
+    let refresh = graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
+    assert_eq!(refresh["readiness"]["reason"], "summary_cache_empty");
+
+    let related = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "related".to_string(),
+            "graph navigation".to_string(),
+            "--limit".to_string(),
+            "8".to_string(),
+        ],
+    );
+
+    assert_eq!(related["readiness"]["status"], "blocked", "{related}");
+    assert_eq!(
+        related["readiness"]["reason"], "summary_cache_empty",
+        "{related}"
+    );
+    assert_eq!(related["readiness"]["fail_closed"], true, "{related}");
+    let next_commands = related["readiness"]["next_commands"].as_array().unwrap();
+    assert!(
+        next_commands
+            .iter()
+            .any(|command| command.as_str().unwrap() == "tsift summarize --extract ."),
+        "{related}"
+    );
+    assert!(
+        next_commands.iter().any(|command| {
+            let command = command.as_str().unwrap();
+            command.contains("graph-db --path")
+                && command.contains("refresh --json")
+                && command.contains(project.path().to_string_lossy().as_ref())
+        }),
+        "{related}"
+    );
+    assert!(
+        related["knowledge_retrieval"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic.as_str().unwrap().contains("summary cache empty")),
+        "{related}"
+    );
+}
+
+#[test]
 fn graph_db_compact_reports_policy_and_guarded_apply() {
     let project = graph_db_project();
     let refresh = graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);

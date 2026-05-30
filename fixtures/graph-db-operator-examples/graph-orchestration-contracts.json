@@ -123,6 +123,7 @@
       "required_fields": [
         "contract_version",
         "projection_freshness",
+        "readiness",
         "projection_hashes",
         "evidence_packet_ids",
         "conflict_matrix_decisions",

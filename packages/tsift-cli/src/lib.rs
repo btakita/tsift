@@ -6250,6 +6250,8 @@ struct GraphDbReport {
     query: String,
     freshness: GraphDbFreshnessReport,
     #[serde(skip_serializing_if = "Option::is_none")]
+    readiness: Option<GraphEffectivenessReadiness>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     schema: Option<GraphDbSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node: Option<SubstrateGraphNode>,
@@ -8627,13 +8629,20 @@ fn status_run_command_without_notes(run: &str) -> &str {
         .unwrap_or(run)
 }
 
+fn status_summarize_extract_command(run: &str) -> &str {
+    let run = status_run_command_without_notes(run);
+    run.split(" && ")
+        .find(|command| command.contains("summarize --extract"))
+        .unwrap_or(run)
+}
+
 fn graph_db_status_summarize_command(report: &status::StatusReport) -> String {
     report
         .recommendations
         .run
         .as_deref()
         .filter(|command| command.contains("summarize --extract"))
-        .map(status_run_command_without_notes)
+        .map(status_summarize_extract_command)
         .unwrap_or("tsift summarize --extract .")
         .to_string()
 }
@@ -10103,6 +10112,7 @@ pub(crate) fn graph_db_report_from_store(
         backend: backend.to_string(),
         query: format!("{query:?}"),
         freshness,
+        readiness: None,
         schema: None,
         node: None,
         edge: None,
@@ -10147,6 +10157,7 @@ pub(crate) fn graph_db_report_from_store(
             seed_limit,
             limit,
         } => {
+            let readiness = graph_db_semantic_readiness(root, scope);
             let semantic =
                 semantic_related_report_from_store(root, scope, &query, seed_limit, kind, store)?;
             let SemanticRelatedReport {
@@ -10176,7 +10187,9 @@ pub(crate) fn graph_db_report_from_store(
             let budget_report = budgeted.report;
             let dropped_by_budget = !budget_report.dropped_by_budget.is_empty();
             diagnostics.extend(budget_report.diagnostics.clone());
+            diagnostics.extend(readiness.diagnostics.clone());
 
+            report.readiness = Some(readiness);
             report.semantic_related = items;
             report.nodes = budgeted.nodes;
             report.edges = budgeted.edges;
@@ -10352,6 +10365,18 @@ pub(crate) fn print_graph_db_human(report: &GraphDbReport, compact: bool) {
     }
     println!("graph-db backend: {}", report.backend);
     println!("freshness: {}", report.freshness.status);
+    if let Some(readiness) = &report.readiness {
+        println!(
+            "readiness: {} reason: {} fail_closed: {}",
+            readiness.status, readiness.reason, readiness.fail_closed
+        );
+        for diagnostic in &readiness.diagnostics {
+            println!("readiness diagnostic: {diagnostic}");
+        }
+        for command in &readiness.next_commands {
+            println!("readiness next: {command}");
+        }
+    }
     if let Some(schema) = &report.schema {
         println!(
             "schema: {} node fields, {} edge fields, {} operations",
@@ -20495,6 +20520,7 @@ struct ContextPackGraphOrchestration {
     contract_version: &'static str,
     graph_db_command: String,
     projection_freshness: GraphDbFreshnessReport,
+    readiness: GraphEffectivenessReadiness,
     projection_hashes: Vec<String>,
     evidence_packet_ids: Vec<String>,
     conflict_matrix_decisions: Vec<String>,
@@ -22096,6 +22122,10 @@ fn context_pack_graph_orchestration(
     if let Some(recovery) = store.read_only_recovery() {
         warnings.push(graph_db_read_recovery_diagnostic(recovery));
     }
+    let readiness = graph_db_semantic_readiness(root, None);
+    if readiness.fail_closed {
+        warnings.extend(readiness.diagnostics.clone());
+    }
     let mut targets = next_context
         .prompt_targets
         .iter()
@@ -22131,6 +22161,7 @@ fn context_pack_graph_orchestration(
         "tsift graph-db --path {} status --json",
         shell_quote(root.to_string_lossy().as_ref())
     )];
+    follow_up_commands.extend(readiness.next_commands.clone());
     for target in &resolvable_targets {
         follow_up_commands.push(format!(
             "tsift graph-db --path {} evidence {} --depth 3 --limit 8 --json",
@@ -22176,6 +22207,7 @@ fn context_pack_graph_orchestration(
             shell_quote(root.to_string_lossy().as_ref())
         ),
         projection_freshness,
+        readiness,
         projection_hashes,
         evidence_packet_ids,
         conflict_matrix_decisions,
@@ -22261,8 +22293,9 @@ pub(crate) fn print_context_pack_human(report: &ContextPackReport, compact: bool
             report.exploration.budget.project_size
         );
         println!(
-            "graph-orchestration freshness:{} evidence:{} ownership:{}",
+            "graph-orchestration freshness:{} readiness:{} evidence:{} ownership:{}",
             report.graph_orchestration.projection_freshness.status,
+            report.graph_orchestration.readiness.status,
             report.graph_orchestration.evidence_packet_ids.len(),
             report.graph_orchestration.worker_ownership_blocks.len()
         );
@@ -22513,6 +22546,13 @@ pub(crate) fn print_context_pack_human(report: &ContextPackReport, compact: bool
         "  projection freshness:   {}",
         report.graph_orchestration.projection_freshness.status
     );
+    println!(
+        "  readiness:              {} ({})",
+        report.graph_orchestration.readiness.status, report.graph_orchestration.readiness.reason
+    );
+    for diagnostic in &report.graph_orchestration.readiness.diagnostics {
+        println!("  - readiness diagnostic: {diagnostic}");
+    }
     for evidence in &report.graph_orchestration.evidence_packet_ids {
         println!("  - evidence: {evidence}");
     }
@@ -26655,6 +26695,13 @@ def list_items():
         assert_eq!(knowledge.mode, "semantic_seeded_neighborhood");
         assert_eq!(knowledge.seed_kind, "all");
         assert_eq!(knowledge.depth, 1);
+        assert_eq!(
+            report
+                .readiness
+                .as_ref()
+                .map(|readiness| readiness.status.as_str()),
+            Some("ready")
+        );
         assert!(
             knowledge
                 .diagnostics
@@ -26702,6 +26749,54 @@ def list_items():
                 .any(|diagnostic| { diagnostic.contains("budget ranking signals") })),
             "expected related output budget diagnostics, got {:?}",
             report.output_budget
+        );
+    }
+
+    #[test]
+    fn graph_db_related_reports_summary_extract_gate_when_summary_cache_empty() {
+        let dir = setup_graph_index();
+        refresh_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
+        let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
+
+        let report = graph_db_report_from_store(
+            dir.path(),
+            None,
+            "sqlite",
+            GraphDbQuery::Related {
+                query: "graph navigation".to_string(),
+                kind: SemanticRelatedKind::All,
+                depth: 1,
+                seed_limit: 2,
+                limit: 20,
+            },
+            &store,
+            sqlite_graph_freshness(&store, "root").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let readiness = report.readiness.as_ref().unwrap();
+        assert_eq!(readiness.status, "blocked");
+        assert_eq!(readiness.reason, "summary_cache_empty");
+        assert!(readiness.fail_closed);
+        assert_eq!(
+            readiness.next_commands,
+            vec![
+                "tsift summarize --extract .".to_string(),
+                graph_db_refresh_command(dir.path(), None)
+            ]
+        );
+        assert!(
+            report
+                .knowledge_retrieval
+                .as_ref()
+                .unwrap()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("summary cache empty")
+                    && diagnostic.contains("graph-db materialized code/session rows")),
+            "expected related diagnostics to carry readiness gate, got {:?}",
+            report.knowledge_retrieval.as_ref().unwrap().diagnostics
         );
     }
 
@@ -31689,6 +31784,22 @@ tier = "private"
             "current"
         );
         assert!(!report.graph_orchestration.projection_hashes.is_empty());
+        assert_eq!(report.graph_orchestration.readiness.status, "blocked");
+        assert_eq!(
+            report.graph_orchestration.readiness.reason,
+            "summary_cache_empty"
+        );
+        assert!(report.graph_orchestration.readiness.fail_closed);
+        assert!(
+            report
+                .graph_orchestration
+                .readiness
+                .next_commands
+                .iter()
+                .any(|command| command == "tsift summarize --extract ."),
+            "{:?}",
+            report.graph_orchestration.readiness.next_commands
+        );
         assert!(
             report
                 .graph_orchestration
@@ -31713,6 +31824,15 @@ tier = "private"
                 .follow_up_commands
                 .iter()
                 .any(|command| command.contains("conflict-matrix")),
+            "{:?}",
+            report.graph_orchestration.follow_up_commands
+        );
+        assert!(
+            report
+                .graph_orchestration
+                .follow_up_commands
+                .iter()
+                .any(|command| command == "tsift summarize --extract ."),
             "{:?}",
             report.graph_orchestration.follow_up_commands
         );
