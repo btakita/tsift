@@ -6536,6 +6536,107 @@ fn session_review_next_context_collapses_noop_closeout_guidance() {
 }
 
 #[test]
+fn session_review_next_context_collapses_actionable_guardrail_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let target = root.path().join("tasks/software/tsift.md");
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(
+        &target,
+        "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n",
+    )
+    .unwrap();
+
+    let root_text = root.path().display().to_string();
+    let codex_dir = home.path().join(".codex/sessions/2026/05/05");
+    fs::create_dir_all(&codex_dir).unwrap();
+    fs::write(
+        codex_dir.join("token-action-guardrails.jsonl"),
+        include_str!("../../../fixtures/session-review/token-action-guardrails.codex.jsonl")
+            .replace("/tmp/replace-me", &root_text),
+    )
+    .unwrap();
+
+    let agent_doc_logs = root.path().join(".agent-doc/logs");
+    fs::create_dir_all(&agent_doc_logs).unwrap();
+    fs::write(
+        agent_doc_logs.join("tsift-v0.1.log"),
+        include_str!("../../../fixtures/session-review/restart-loop.log")
+            .replace("/tmp/replace-me", &root_text),
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["session-review", "--json", target.to_str().unwrap()])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "session-review should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for kind in ["prompt_budget", "cache_resend", "restart_loop"] {
+        assert!(
+            json["guardrails"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|guardrail| guardrail["kind"] == kind),
+            "missing {kind} guardrail in {json}"
+        );
+        assert!(
+            json["next_context"]["unresolved_failures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|failure| failure["kind"] == format!("guardrail:{kind}")),
+            "missing unresolved guardrail failure for {kind} in {json}"
+        );
+    }
+
+    let next_context_output = tsift_bin()
+        .args([
+            "--envelope",
+            "session-review",
+            "--next-context",
+            "--json",
+            target.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        next_context_output.status.success(),
+        "session-review --next-context should succeed"
+    );
+    let next_context_json: serde_json::Value =
+        serde_json::from_slice(&next_context_output.stdout).unwrap();
+    let next_context_report = next_context_json
+        .get("report")
+        .unwrap_or(&next_context_json);
+    let actions = next_context_report["next_token_actions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing next_token_actions in {next_context_json}"));
+    for kind in ["prompt_budget", "cache_resend", "restart_loop"] {
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action["kind"] == kind)
+                .count(),
+            1,
+            "expected exactly one {kind} action in {next_context_json}"
+        );
+        assert!(
+            next_context_report["unresolved_failures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|failure| failure["kind"] != format!("guardrail:{kind}")),
+            "actionable {kind} failure should be collapsed in {next_context_json}"
+        );
+    }
+}
+
+#[test]
 fn session_review_aggregates_only_visible_bounded_session_rows() {
     let root = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
