@@ -14,7 +14,7 @@ use commands::digests::{
 #[cfg(test)]
 use commands::graph::cmd_explain;
 use commands::graph::{
-    cmd_communities, cmd_explain_with_budget, cmd_graph, cmd_path, cmd_traverse,
+    cmd_analyze, cmd_communities, cmd_explain_with_budget, cmd_graph, cmd_path, cmd_traverse,
 };
 #[cfg(test)]
 use commands::index_search::cmd_search;
@@ -70,6 +70,7 @@ use tsift_search::{impact, sift, tagpath_adapter};
 use tsift_sqlite as substrate;
 use tsift_status::status;
 use tsift_summarize::summarize;
+use tsift_tokensave::TokensaveDb;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub(crate) enum GraphDbExperimentalBackend {
@@ -493,6 +494,26 @@ pub fn run() -> Result<()> {
             TagpathSearchOpts {
                 no_tagpath,
                 strict: tagpath_strict,
+            },
+        ),
+        Some(Commands::Analyze {
+            path,
+            scope,
+            entry_points,
+            limit,
+            json,
+        }) => cmd_analyze(
+            &path,
+            scope.as_deref(),
+            &entry_points,
+            limit,
+            OutputFormat {
+                json_output: json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                schema,
+                envelope,
             },
         ),
         Some(Commands::Path {
@@ -8767,6 +8788,78 @@ pub(crate) fn convex_graph_freshness(
         content_hash: freshness.snapshot_hash,
         source_watermark: None,
         diagnostics: freshness.diagnostics,
+    }
+}
+
+pub(crate) fn tokensave_graph_freshness(store: &TokensaveDb) -> Result<GraphDbFreshnessReport> {
+    let (nodes, edges) = store.graph_counts()?;
+    let files = store.file_count()?;
+    Ok(GraphDbFreshnessReport {
+        status: "current".to_string(),
+        fail_closed: false,
+        projection_version: Some("tokensave-readonly".to_string()),
+        content_hash: None,
+        source_watermark: Some(store.db_path().to_string_lossy().to_string()),
+        diagnostics: vec![format!(
+            "tokensave read-only adapter opened {} node(s), {} edge(s), {} file(s)",
+            nodes, edges, files
+        )],
+    })
+}
+
+pub(crate) fn append_tokensave_graph_doctor_checks(report: &mut GraphDbDoctorReport, root: &Path) {
+    match TokensaveDb::discover(root) {
+        Ok(Some(store)) => {
+            report.push_check(GraphDbDoctorCheck {
+                name: "tokensave_db_open".to_string(),
+                status: "ok".to_string(),
+                fail_closed: false,
+                diagnostics: vec![format!(
+                    "opened tokensave database at {}",
+                    store.db_path().display()
+                )],
+                repair_commands: Vec::new(),
+            });
+            match (store.node_count(), store.edge_count(), store.file_count()) {
+                (Ok(nodes), Ok(edges), Ok(files)) => {
+                    report.push_check(GraphDbDoctorCheck {
+                        name: "tokensave_counts".to_string(),
+                        status: "ok".to_string(),
+                        fail_closed: false,
+                        diagnostics: vec![format!(
+                            "tokensave contains {} node(s), {} edge(s), {} file(s)",
+                            nodes, edges, files
+                        )],
+                        repair_commands: Vec::new(),
+                    });
+                }
+                (nodes, edges, files) => {
+                    report.push_check(graph_db_doctor_check(
+                        "tokensave_counts",
+                        vec![format!(
+                            "tokensave count inspection failed: nodes={:?} edges={:?} files={:?}",
+                            nodes.err(),
+                            edges.err(),
+                            files.err()
+                        )],
+                        Vec::new(),
+                    ));
+                }
+            }
+        }
+        Ok(None) => report.push_check(graph_db_doctor_check(
+            "tokensave_db_exists",
+            vec![format!(
+                "tokensave database is missing at {}",
+                root.join(".tokensave").join("tokensave.db").display()
+            )],
+            Vec::new(),
+        )),
+        Err(err) => report.push_check(graph_db_doctor_check(
+            "tokensave_db_open",
+            vec![err.to_string()],
+            Vec::new(),
+        )),
     }
 }
 
@@ -30561,6 +30654,59 @@ tier = "private"
                 }
             }
             _ => panic!("expected GraphDb command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_db_tokensave_backend() {
+        let cli = parse_cli([
+            "tsift",
+            "graph-db",
+            "--backend",
+            "tokensave",
+            "--json",
+            "node",
+            "fn:main",
+        ]);
+        match cli.command {
+            Some(Commands::GraphDb {
+                backend,
+                json,
+                query,
+                ..
+            }) => {
+                assert_eq!(backend, GraphDbBackend::Tokensave);
+                assert!(json);
+                match query {
+                    GraphDbQuery::Node { id } => assert_eq!(id, "fn:main"),
+                    _ => panic!("expected graph-db node query"),
+                }
+            }
+            _ => panic!("expected GraphDb command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_analyze_command() {
+        let cli = parse_cli([
+            "tsift", "analyze", ".", "--scope", "core", "--entry", "main", "--entry", "run",
+            "--limit", "7", "--json",
+        ]);
+        match cli.command {
+            Some(Commands::Analyze {
+                path,
+                scope,
+                entry_points,
+                limit,
+                json,
+            }) => {
+                assert_eq!(path, PathBuf::from("."));
+                assert_eq!(scope.as_deref(), Some("core"));
+                assert_eq!(entry_points, vec!["main".to_string(), "run".to_string()]);
+                assert_eq!(limit, 7);
+                assert!(json);
+            }
+            _ => panic!("expected Analyze command"),
         }
     }
 

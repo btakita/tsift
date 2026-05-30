@@ -24,7 +24,14 @@ pub struct HealthReport {
 }
 
 #[allow(clippy::type_complexity)]
-fn build_graph(edges: &[(String, String)]) -> (Vec<String>, HashMap<String, usize>, Vec<HashSet<usize>>, Vec<HashSet<usize>>) {
+fn build_graph(
+    edges: &[(String, String)],
+) -> (
+    Vec<String>,
+    HashMap<String, usize>,
+    Vec<HashSet<usize>>,
+    Vec<HashSet<usize>>,
+) {
     let mut node_vec: Vec<String> = Vec::new();
     let mut node_idx: HashMap<String, usize> = HashMap::new();
     for (a, b) in edges {
@@ -96,7 +103,7 @@ fn find_cycles(n: usize, adj: &[HashSet<usize>]) -> HashSet<usize> {
 
         for &w in &adj[v] {
             if indices[w].is_none() {
-                strongconnect(v.max(w), adj, index, stack, on_stack, indices, lowlinks, in_cycle);
+                strongconnect(w, adj, index, stack, on_stack, indices, lowlinks, in_cycle);
             }
             if w != v && on_stack[w] {
                 lowlinks[v] = lowlinks[v].min(indices[w].unwrap());
@@ -124,8 +131,14 @@ fn find_cycles(n: usize, adj: &[HashSet<usize>]) -> HashSet<usize> {
     for v in 0..n {
         if indices[v].is_none() {
             strongconnect(
-                v, adj, &mut index, &mut stack, &mut on_stack,
-                &mut indices, &mut lowlinks, &mut in_cycle,
+                v,
+                adj,
+                &mut index,
+                &mut stack,
+                &mut on_stack,
+                &mut indices,
+                &mut lowlinks,
+                &mut in_cycle,
             );
         }
     }
@@ -173,7 +186,8 @@ pub fn composite_health_score(edges: &[(String, String)]) -> HealthReport {
     for (i, name) in node_vec.iter().enumerate() {
         let out_degree = out_adj[i].len() as f64;
         let in_degree = in_adj[i].len() as f64;
-        let connectivity = (out_degree + in_degree) / (2.0 * avg_degree.max(1.0)).min(total_degree.max(1.0));
+        let connectivity =
+            (out_degree + in_degree) / (2.0 * avg_degree.max(1.0)).min(total_degree.max(1.0));
         let connectivity = connectivity.min(1.0);
 
         let reach_fwd = (fwd_reach[i] as f64 - 1.0) / total_possible;
@@ -188,7 +202,10 @@ pub fn composite_health_score(edges: &[(String, String)]) -> HealthReport {
 
         let cycle_risk = if cycle_nodes.contains(&i) { 1.0 } else { 0.0 };
 
-        let overall = connectivity * 0.25 + reachability * 0.25 + centrality * 0.25 + (1.0 - cycle_risk) * 0.25;
+        let overall = connectivity * 0.25
+            + reachability * 0.25
+            + centrality * 0.25
+            + (1.0 - cycle_risk) * 0.25;
 
         scores.push(HealthScore {
             name: name.clone(),
@@ -206,7 +223,11 @@ pub fn composite_health_score(edges: &[(String, String)]) -> HealthReport {
     let avg_cycle_risk = scores.iter().map(|s| s.cycle_risk).sum::<f64>() / n as f64;
     let avg_overall = scores.iter().map(|s| s.overall).sum::<f64>() / n as f64;
 
-    scores.sort_by(|a, b| b.overall.partial_cmp(&a.overall).unwrap_or(std::cmp::Ordering::Equal));
+    scores.sort_by(|a, b| {
+        b.overall
+            .partial_cmp(&a.overall)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     HealthReport {
         scores,
@@ -245,12 +266,7 @@ mod tests {
 
     #[test]
     fn hub_node_scores_higher() {
-        let edges = vec![
-            e("hub", "a"),
-            e("hub", "b"),
-            e("hub", "c"),
-            e("a", "b"),
-        ];
+        let edges = vec![e("hub", "a"), e("hub", "b"), e("hub", "c"), e("a", "b")];
         let report = composite_health_score(&edges);
         let hub = report.scores.iter().find(|s| s.name == "hub").unwrap();
         let a = report.scores.iter().find(|s| s.name == "a").unwrap();
@@ -262,7 +278,11 @@ mod tests {
         let edges = vec![e("a", "b"), e("b", "c")];
         let report = composite_health_score(&edges);
         for score in &report.scores {
-            assert_eq!(score.cycle_risk, 0.0, "{} should have no cycle risk", score.name);
+            assert_eq!(
+                score.cycle_risk, 0.0,
+                "{} should have no cycle risk",
+                score.name
+            );
         }
     }
 
@@ -271,8 +291,27 @@ mod tests {
         let edges = vec![e("a", "b"), e("b", "a")];
         let report = composite_health_score(&edges);
         for score in &report.scores {
-            assert_eq!(score.cycle_risk, 1.0, "{} should have cycle risk", score.name);
+            assert_eq!(
+                score.cycle_risk, 1.0,
+                "{} should have cycle risk",
+                score.name
+            );
         }
+    }
+
+    #[test]
+    fn dense_cycle_does_not_recurse_on_current_node() {
+        let edges = vec![
+            e("alpha", "beta"),
+            e("alpha", "gamma"),
+            e("beta", "alpha"),
+            e("beta", "gamma"),
+            e("gamma", "alpha"),
+            e("gamma", "beta"),
+        ];
+        let report = composite_health_score(&edges);
+        assert_eq!(report.node_count, 3);
+        assert_eq!(report.avg_cycle_risk, 1.0);
     }
 
     #[test]
@@ -286,7 +325,12 @@ mod tests {
         ];
         let report = composite_health_score(&edges);
         for score in &report.scores {
-            assert!(score.overall >= 0.0 && score.overall <= 1.0, "{} overall={}", score.name, score.overall);
+            assert!(
+                score.overall >= 0.0 && score.overall <= 1.0,
+                "{} overall={}",
+                score.name,
+                score.overall
+            );
             assert!(score.connectivity >= 0.0 && score.connectivity <= 1.0);
             assert!(score.reachability >= 0.0 && score.reachability <= 1.0);
             assert!(score.centrality >= 0.0 && score.centrality <= 1.0);

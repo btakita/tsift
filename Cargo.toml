@@ -19,6 +19,8 @@ categories = ["command-line-utilities", "development-tools"]
 # / `resolution` / `substrate` / `libsql_backend` modules only `pub use` sibling
 # crates. It therefore carries no external crate dependencies of its own — every
 # real implementation lives in a `tsift-*` workspace crate.
+tsift-algorithms = { path = "packages/tsift-algorithms" }
+tsift-tokensave = { path = "packages/tsift-tokensave" }
 tsift-sqlite = { path = "packages/tsift-sqlite" }
 tsift-graph = { path = "packages/tsift-graph" }
 tsift-resolution = { path = "packages/tsift-resolution" }

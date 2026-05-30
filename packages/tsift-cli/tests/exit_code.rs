@@ -119,6 +119,7 @@ fn cli_manifest_uses_split_crates_without_root_shim() {
     );
     for name in [
         "tsift-agent-doc",
+        "tsift-algorithms",
         "tsift-core",
         "tsift-digest",
         "tsift-graph",
@@ -129,6 +130,7 @@ fn cli_manifest_uses_split_crates_without_root_shim() {
         "tsift-sqlite",
         "tsift-status",
         "tsift-summarize",
+        "tsift-tokensave",
     ] {
         assert!(
             deps.contains_key(name),
@@ -316,6 +318,84 @@ fn indexed_cli_fixture() -> tempfile::TempDir {
     );
 
     dir
+}
+
+fn setup_tokensave_db(dir: &Path) {
+    let tokensave_dir = dir.join(".tokensave");
+    fs::create_dir_all(&tokensave_dir).unwrap();
+    let db_path = tokensave_dir.join("tokensave.db");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE nodes (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            qualified_name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            start_column INTEGER NOT NULL DEFAULT 0,
+            end_column INTEGER NOT NULL DEFAULT 0,
+            docstring TEXT,
+            signature TEXT,
+            visibility TEXT NOT NULL DEFAULT 'private',
+            is_async INTEGER NOT NULL DEFAULT 0,
+            branches INTEGER NOT NULL DEFAULT 0,
+            loops INTEGER NOT NULL DEFAULT 0,
+            returns INTEGER NOT NULL DEFAULT 0,
+            max_nesting INTEGER NOT NULL DEFAULT 0,
+            unsafe_blocks INTEGER NOT NULL DEFAULT 0,
+            unchecked_calls INTEGER NOT NULL DEFAULT 0,
+            assertions INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            attrs_start_line INTEGER NOT NULL DEFAULT 0,
+            parent_id TEXT
+        );
+        CREATE TABLE edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            target TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            line INTEGER
+        );
+        CREATE TABLE files (
+            path TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            modified_at INTEGER NOT NULL,
+            indexed_at INTEGER NOT NULL,
+            node_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX idx_nodes_kind ON nodes(kind);
+        CREATE INDEX idx_edges_source_kind ON edges(source, kind);
+        CREATE INDEX idx_edges_target_kind ON edges(target, kind);
+        "#,
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO nodes (id, kind, name, qualified_name, file_path, start_line, end_line) \
+         VALUES ('fn:main', 'function', 'main', 'main', 'src/main.rs', 1, 8)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO nodes (id, kind, name, qualified_name, file_path, start_line, end_line) \
+         VALUES ('fn:helper', 'function', 'helper', 'helper', 'src/lib.rs', 2, 4)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO edges (source, target, kind, line) VALUES ('fn:main', 'fn:helper', 'calls', 3)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO files (path, content_hash, size, modified_at, indexed_at, node_count) \
+         VALUES ('src/main.rs', 'abc123', 128, 1000, 1001, 1)",
+        [],
+    )
+    .unwrap();
 }
 
 fn indexed_workspace_cli_fixture() -> tempfile::TempDir {
@@ -667,6 +747,80 @@ fn graph_json_reports_callers_and_callees() {
     for callee in callees {
         assert!(callee.get("tagpath_handle").is_none(), "{callee}");
     }
+}
+
+#[test]
+fn analyze_json_runs_graph_algorithms() {
+    let dir = indexed_cli_fixture();
+
+    let output = tsift_bin()
+        .args([
+            "analyze",
+            dir.path().to_str().unwrap(),
+            "--entry",
+            "main",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "analyze stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(json["edge_count"].as_u64(), Some(12));
+    assert_eq!(json["entry_points"], serde_json::json!(["main"]));
+    assert!(
+        json["scc"]["non_trivial_count"].as_u64().unwrap_or(0) >= 2,
+        "expected cycle analysis in scc report: {json}"
+    );
+    assert!(
+        json["health"]["avg_overall"].as_f64().is_some(),
+        "expected health report: {json}"
+    );
+    assert!(
+        json["dead_code"]["dead_count"].as_u64().unwrap_or(0) >= 2,
+        "expected disconnected delta/epsilon cycle as dead code: {json}"
+    );
+    assert!(
+        json["coupling"]["total_modules"].as_u64().unwrap_or(0) >= 1,
+        "expected coupling report: {json}"
+    );
+}
+
+#[test]
+fn graph_db_tokensave_backend_queries_tokensave_db() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_tokensave_db(dir.path());
+
+    let output = tsift_bin()
+        .args([
+            "graph-db",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--backend",
+            "tokensave",
+            "--json",
+            "node",
+            "fn:main",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "graph-db tokensave stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(json["backend"], "tokensave");
+    assert_eq!(json["freshness"]["status"], "current");
+    assert_eq!(json["node"]["id"], "fn:main");
+    assert_eq!(json["node"]["kind"], "function");
 }
 
 #[test]
@@ -6511,17 +6665,29 @@ fn session_review_next_context_collapses_noop_closeout_guidance() {
         .unwrap();
     assert!(output.status.success(), "session-review should succeed");
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(json["guardrails"].as_array().unwrap().iter().any(|guardrail| {
-        guardrail["kind"] == "noop_closeout"
-            && guardrail["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("commit_already_current appeared 3 times"))
-    }));
-    assert!(json["loop_clusters"].as_array().unwrap().iter().any(|cluster| {
-        cluster["kind"] == "closeout_churn"
-            && cluster["label"] == "commit_already_current"
-            && cluster["occurrences"] == 3
-    }));
+    assert!(
+        json["guardrails"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|guardrail| {
+                guardrail["kind"] == "noop_closeout"
+                    && guardrail["message"].as_str().is_some_and(|message| {
+                        message.contains("commit_already_current appeared 3 times")
+                    })
+            })
+    );
+    assert!(
+        json["loop_clusters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cluster| {
+                cluster["kind"] == "closeout_churn"
+                    && cluster["label"] == "commit_already_current"
+                    && cluster["occurrences"] == 3
+            })
+    );
 
     let next_context_output = tsift_bin()
         .args([
@@ -6553,13 +6719,12 @@ fn session_review_next_context_collapses_noop_closeout_guidance() {
             .count(),
         1
     );
-    assert!(
-        actions
-            .iter()
-            .any(|action| action["kind"] == "noop_closeout"
-                && action["message"].as_str().is_some_and(|message| message
-                    .contains("commit_already_current appeared 3 times")))
-    );
+    assert!(actions.iter().any(|action| {
+        action["kind"] == "noop_closeout"
+            && action["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("commit_already_current appeared 3 times"))
+    }));
     assert!(
         next_context_report["unresolved_failures"]
             .as_array()

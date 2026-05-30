@@ -253,6 +253,24 @@ pub enum Commands {
         #[arg(long)]
         tagpath_strict: bool,
     },
+    /// Run graph algorithms over the indexed call graph
+    Analyze {
+        /// Path to the indexed codebase (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Restrict to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Entry point for dead-code reachability. Repeatable. Defaults to detected roots.
+        #[arg(long = "entry")]
+        entry_points: Vec<String>,
+        /// Max rows shown in human output (0 = unlimited)
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Find the shortest path between two symbols in the call graph
     Path {
         /// Source symbol name
@@ -367,7 +385,7 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Query the provider-neutral graph database API over SQLite or a Convex snapshot
+    /// Query the provider-neutral graph database API over SQLite, tokensave, or a Convex snapshot
     GraphDb {
         /// Path to the indexed codebase or workspace (defaults to current directory)
         #[arg(long, default_value = ".")]
@@ -841,6 +859,7 @@ pub enum SemanticRelatedKind {
 pub enum GraphDbBackend {
     Sqlite,
     ConvexSnapshot,
+    Tokensave,
 }
 
 #[derive(Subcommand, Debug, Clone)]

@@ -26,10 +26,10 @@ use crate::{
     GraphDbRefreshSummary, append_convex_snapshot_doctor_checks,
     append_graph_db_backend_eval_normalized_duration_metric,
     append_graph_db_backend_eval_phase_metrics, append_sqlite_graph_doctor_checks,
-    apply_edit_plan_atomically, apply_rewrite_output_format, apply_status_fixes,
-    autoindex_missing_workspace_scopes, build_convex_sync_report_with_snapshot, build_edit_plan,
-    classify_task, convex_graph_freshness, convex_rows_from_graph_store, dedupe_preserve_order,
-    envelope_metric, execute_query, execute_rewritten_command,
+    append_tokensave_graph_doctor_checks, apply_edit_plan_atomically, apply_rewrite_output_format,
+    apply_status_fixes, autoindex_missing_workspace_scopes, build_convex_sync_report_with_snapshot,
+    build_edit_plan, classify_task, convex_graph_freshness, convex_rows_from_graph_store,
+    dedupe_preserve_order, envelope_metric, execute_query, execute_rewritten_command,
     graph_db_backend_eval_cached_refresh, graph_db_backend_eval_dataset,
     graph_db_backend_eval_full_projection_with_profile, graph_db_backend_eval_graph_rows,
     graph_db_backend_eval_metric_digest_command, graph_db_backend_eval_metrics,
@@ -49,10 +49,11 @@ use crate::{
     print_graph_db_evidence_report, print_graph_db_human, print_graph_db_operator_report,
     print_json_or_envelope, rewrite_command, schema_overview, shell_quote,
     sqlite_convex_rows_from_conn, sqlite_graph_freshness, status_missing_workspace_scopes,
-    table_columns, to_json_schema, traversal_source_watermark, truncate_for_compact,
-    validate_convex_projection_rows, write_traversal_graph_store,
+    table_columns, to_json_schema, tokensave_graph_freshness, traversal_source_watermark,
+    truncate_for_compact, validate_convex_projection_rows, write_traversal_graph_store,
     write_traversal_graph_store_with_options,
 };
+use tsift_tokensave::TokensaveDb;
 
 pub(crate) fn cmd_route(task: &str, id_only: bool) -> Result<()> {
     let (tier, model_id) = classify_task(task);
@@ -337,10 +338,21 @@ pub(crate) fn cmd_graph_db_doctor(
     let backend_name = match backend {
         GraphDbBackend::Sqlite => "sqlite",
         GraphDbBackend::ConvexSnapshot => "convex-snapshot",
+        GraphDbBackend::Tokensave => "tokensave",
+    };
+    let doctor_path = if backend == GraphDbBackend::Tokensave {
+        root.join(".tokensave").join("tokensave.db")
+    } else {
+        graph_db.clone()
     };
     let mut report =
-        GraphDbDoctorReport::new(root, scope, backend_name, &graph_db, convex_snapshot);
-    let conn = append_sqlite_graph_doctor_checks(&mut report, root, scope, &graph_db);
+        GraphDbDoctorReport::new(root, scope, backend_name, &doctor_path, convex_snapshot);
+    let conn = if backend == GraphDbBackend::Tokensave {
+        append_tokensave_graph_doctor_checks(&mut report, root);
+        None
+    } else {
+        append_sqlite_graph_doctor_checks(&mut report, root, scope, &graph_db)
+    };
     let local_rows = conn
         .as_ref()
         .and_then(|conn| sqlite_convex_rows_from_conn(conn.conn()).ok());
@@ -1035,7 +1047,11 @@ pub(crate) fn cmd_graph_db(
     }
     let graph_db = graph_substrate_db_path(&root, scope);
     let mut warnings = Vec::new();
-    if let GraphDbQuery::Evidence { target, .. } = &query {
+    if matches!(
+        backend,
+        GraphDbBackend::Sqlite | GraphDbBackend::ConvexSnapshot
+    ) && let GraphDbQuery::Evidence { target, .. } = &query
+    {
         let needs_refresh = if graph_db.exists() {
             let store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
             sqlite_graph_freshness(&store, scope.unwrap_or("root"))?.fail_closed
@@ -1113,6 +1129,29 @@ pub(crate) fn cmd_graph_db(
                 &root,
                 scope,
                 "convex-snapshot",
+                query,
+                &store,
+                freshness,
+                warnings,
+            )?
+        }
+        GraphDbBackend::Tokensave => {
+            let store = TokensaveDb::discover(&root)?.with_context(|| {
+                format!(
+                    "--backend tokensave requires {}",
+                    root.join(".tokensave").join("tokensave.db").display()
+                )
+            })?;
+            let freshness = tokensave_graph_freshness(&store)?;
+            if let GraphDbQuery::Evidence { .. } = &query {
+                bail!(
+                    "graph-db evidence is not supported for --backend tokensave; use node, kind, edges, incident, neighborhood, or path queries"
+                );
+            }
+            graph_db_report_from_store(
+                &root,
+                scope,
+                "tokensave",
                 query,
                 &store,
                 freshness,

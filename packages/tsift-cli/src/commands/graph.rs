@@ -1,7 +1,11 @@
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::Result;
+use serde::Serialize;
+use tsift_algorithms as algorithms;
 use tsift_graph as graph;
+use tsift_index::index;
 use tsift_quality::lint;
 
 use crate::cli::TraverseFormat;
@@ -436,6 +440,273 @@ pub(crate) fn cmd_communities(
         }
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct GraphAnalysisReport {
+    root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    node_count: usize,
+    edge_count: usize,
+    symbol_count: usize,
+    entry_points: Vec<String>,
+    scc: algorithms::SccResult,
+    health: algorithms::HealthReport,
+    dead_code: algorithms::DeadCodeResult,
+    coupling: algorithms::CouplingReport,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+pub(crate) fn cmd_analyze(
+    path: &Path,
+    scope: Option<&str>,
+    entry_points: &[String],
+    limit: usize,
+    format: OutputFormat,
+) -> Result<()> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let db = open_index_db(path, scope)?;
+    let edges = db.all_edges()?;
+    let symbols = db.all_symbols()?;
+    let mut module_of = analysis_module_map(&symbols);
+    for (from, to) in &edges {
+        module_of
+            .entry(from.clone())
+            .or_insert_with(|| "unknown".to_string());
+        module_of
+            .entry(to.clone())
+            .or_insert_with(|| "unknown".to_string());
+    }
+    let entries = if entry_points.is_empty() {
+        default_analysis_entry_points(&edges)
+    } else {
+        dedupe_analysis_strings(entry_points.iter().cloned())
+    };
+    let mut warnings = Vec::new();
+    if edges.is_empty() {
+        warnings
+            .push("call graph is empty; run `tsift index` after adding code symbols".to_string());
+    }
+    if entries.is_empty() {
+        warnings.push(
+            "dead-code reachability has no entry point; pass --entry <symbol> for stricter results"
+                .to_string(),
+        );
+    }
+
+    let node_count = analysis_node_count(&edges);
+    let report = GraphAnalysisReport {
+        root: root.to_string_lossy().to_string(),
+        scope: scope.map(str::to_string),
+        node_count,
+        edge_count: edges.len(),
+        symbol_count: symbols.len(),
+        entry_points: entries.clone(),
+        scc: algorithms::tarjan_scc(&edges),
+        health: algorithms::composite_health_score(&edges),
+        dead_code: algorithms::detect_dead_code(&edges, &entries),
+        coupling: algorithms::coupling_analysis(&edges, &module_of),
+        warnings,
+    };
+
+    if format.json_output {
+        print_json_or_envelope(
+            &report,
+            &format,
+            "analyze",
+            "graph",
+            ToolEnvelopeSummary {
+                text: format!(
+                    "Graph analysis ran {} edge(s) through SCC, health, dead-code, and coupling algorithms",
+                    report.edge_count
+                ),
+                metrics: vec![
+                    envelope_metric("nodes", report.node_count),
+                    envelope_metric("edges", report.edge_count),
+                    envelope_metric("non_trivial_scc", report.scc.non_trivial_count),
+                    envelope_metric("dead_nodes", report.dead_code.dead_count),
+                    envelope_metric("modules", report.coupling.total_modules),
+                ],
+            },
+            false,
+            vec![format!(
+                "Use `tsift graph --path {} <symbol>` or `tsift explain --path {} <symbol>` to inspect individual call edges",
+                shell_quote(root.to_string_lossy().as_ref()),
+                shell_quote(root.to_string_lossy().as_ref())
+            )],
+        )
+    } else {
+        print_graph_analysis_human(&report, limit, format.compact);
+        Ok(())
+    }
+}
+
+fn dedupe_analysis_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        if seen.insert(value.clone()) {
+            out.push(value);
+        }
+    }
+    out
+}
+
+fn analysis_node_count(edges: &[(String, String)]) -> usize {
+    edges
+        .iter()
+        .flat_map(|(from, to)| [from.as_str(), to.as_str()])
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn default_analysis_entry_points(edges: &[(String, String)]) -> Vec<String> {
+    let mut nodes = BTreeSet::new();
+    let mut inbound = BTreeSet::new();
+    let mut outbound = BTreeSet::new();
+    for (from, to) in edges {
+        nodes.insert(from.clone());
+        nodes.insert(to.clone());
+        outbound.insert(from.clone());
+        inbound.insert(to.clone());
+    }
+
+    let preferred = nodes
+        .iter()
+        .filter(|node| matches!(node.as_str(), "main" | "run" | "start" | "init"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !preferred.is_empty() {
+        return preferred;
+    }
+
+    let roots = outbound
+        .difference(&inbound)
+        .cloned()
+        .collect::<Vec<String>>();
+    if !roots.is_empty() {
+        return roots;
+    }
+
+    nodes.into_iter().next().into_iter().collect()
+}
+
+fn analysis_module_map(symbols: &[index::StoredSymbol]) -> HashMap<String, String> {
+    let mut module_of = HashMap::new();
+    for symbol in symbols {
+        module_of
+            .entry(symbol.name.clone())
+            .or_insert_with(|| analysis_module_name(symbol));
+    }
+    module_of
+}
+
+fn analysis_module_name(symbol: &index::StoredSymbol) -> String {
+    if let Some(module) = symbol
+        .parent_module
+        .as_ref()
+        .filter(|module| !module.trim().is_empty())
+    {
+        return module.clone();
+    }
+    let path = Path::new(&symbol.file);
+    if let Some(parent) = path
+        .parent()
+        .map(|parent| parent.to_string_lossy().to_string())
+        .filter(|parent| !parent.is_empty())
+    {
+        return parent;
+    }
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn print_graph_analysis_human(report: &GraphAnalysisReport, limit: usize, compact: bool) {
+    if compact {
+        println!(
+            "analysis nodes:{} edges:{} scc:{} cycles:{} health:{:.3} dead:{} modules:{}",
+            report.node_count,
+            report.edge_count,
+            report.scc.total_components,
+            report.scc.non_trivial_count,
+            report.health.avg_overall,
+            report.dead_code.dead_count,
+            report.coupling.total_modules
+        );
+        return;
+    }
+
+    println!(
+        "Graph analysis ({} node(s), {} edge(s), {} indexed symbol(s))",
+        report.node_count, report.edge_count, report.symbol_count
+    );
+    println!("entry_points: {}", report.entry_points.join(", "));
+    println!(
+        "scc: {} component(s), {} non-trivial, largest {}",
+        report.scc.total_components,
+        report.scc.non_trivial_count,
+        report.scc.largest_component_size
+    );
+    println!(
+        "health: avg_overall {:.3}, avg_cycle_risk {:.3}",
+        report.health.avg_overall, report.health.avg_cycle_risk
+    );
+    println!(
+        "dead_code: {} / {} node(s) ({:.1}%)",
+        report.dead_code.dead_count,
+        report.dead_code.total_nodes,
+        report.dead_code.dead_ratio * 100.0
+    );
+    println!(
+        "coupling: {} module(s), max fan-out {}, max fan-in {}",
+        report.coupling.total_modules, report.coupling.max_fan_out, report.coupling.max_fan_in
+    );
+
+    let display_limit = |len: usize| if limit == 0 { len } else { len.min(limit) };
+    let scc_limit = display_limit(report.scc.components.len());
+    if scc_limit > 0 {
+        println!();
+        println!("largest_scc:");
+        for component in report.scc.components.iter().take(scc_limit) {
+            if component.is_trivial {
+                continue;
+            }
+            println!(
+                "  {} node(s): {}",
+                component.size,
+                component.nodes.join(", ")
+            );
+        }
+    }
+    let dead_limit = display_limit(report.dead_code.dead_nodes.len());
+    if dead_limit > 0 {
+        println!();
+        println!("dead_nodes:");
+        for node in report.dead_code.dead_nodes.iter().take(dead_limit) {
+            println!(
+                "  {} ({}, in:{}, out:{})",
+                node.name, node.reason, node.inbound_count, node.outbound_count
+            );
+        }
+    }
+    let module_limit = display_limit(report.coupling.modules.len());
+    if module_limit > 0 {
+        println!();
+        println!("coupled_modules:");
+        for module in report.coupling.modules.iter().take(module_limit) {
+            println!(
+                "  {} fan_out:{} fan_in:{} instability:{:.3}",
+                module.module, module.fan_out, module.fan_in, module.instability
+            );
+        }
+    }
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
