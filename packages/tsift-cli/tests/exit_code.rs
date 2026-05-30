@@ -6450,6 +6450,92 @@ fn session_review_json_surfaces_loop_clusters() {
 }
 
 #[test]
+fn session_review_next_context_collapses_noop_closeout_guidance() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let target = root.path().join("tasks/software/tsift.md");
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(
+        &target,
+        "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n",
+    )
+    .unwrap();
+
+    let agent_doc_logs = root.path().join(".agent-doc/logs");
+    fs::create_dir_all(&agent_doc_logs).unwrap();
+    fs::write(
+        agent_doc_logs.join("tsift-v0.1.log"),
+        include_str!("../../../fixtures/session-review/commit-already-current-churn.log"),
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["session-review", "--json", target.to_str().unwrap()])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "session-review should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["guardrails"].as_array().unwrap().iter().any(|guardrail| {
+        guardrail["kind"] == "noop_closeout"
+            && guardrail["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("commit_already_current appeared 3 times"))
+    }));
+    assert!(json["loop_clusters"].as_array().unwrap().iter().any(|cluster| {
+        cluster["kind"] == "closeout_churn"
+            && cluster["label"] == "commit_already_current"
+            && cluster["occurrences"] == 3
+    }));
+
+    let next_context_output = tsift_bin()
+        .args([
+            "--envelope",
+            "session-review",
+            "--next-context",
+            "--json",
+            target.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        next_context_output.status.success(),
+        "session-review --next-context should succeed"
+    );
+    let next_context_json: serde_json::Value =
+        serde_json::from_slice(&next_context_output.stdout).unwrap();
+    let next_context_report = next_context_json
+        .get("report")
+        .unwrap_or(&next_context_json);
+    let actions = next_context_report["next_token_actions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing next_token_actions in {next_context_json}"));
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|action| action["kind"] == "noop_closeout")
+            .count(),
+        1
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|action| action["kind"] == "noop_closeout"
+                && action["message"].as_str().is_some_and(|message| message
+                    .contains("commit_already_current appeared 3 times")))
+    );
+    assert!(
+        next_context_report["unresolved_failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|failure| failure["kind"] != "guardrail:noop_closeout")
+    );
+}
+
+#[test]
 fn session_review_aggregates_only_visible_bounded_session_rows() {
     let root = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

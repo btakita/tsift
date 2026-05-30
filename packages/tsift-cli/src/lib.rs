@@ -19357,6 +19357,18 @@ pub(crate) fn build_session_review_next_context_budget_report(
     let max_items = budget.preview_items();
     let max_bytes = budget.preview_bytes();
     let follow_up_items = budget.follow_up_items();
+    let next_token_actions = build_next_token_actions(report, max_items, max_bytes);
+    let actionable_guardrail_failures = next_token_actions
+        .iter()
+        .map(|action| format!("guardrail:{}", action.kind))
+        .collect::<BTreeSet<_>>();
+    let unresolved_failures = report
+        .next_context
+        .unresolved_failures
+        .iter()
+        .filter(|entry| !actionable_guardrail_failures.contains(&entry.kind))
+        .collect::<Vec<_>>();
+    let unresolved_failure_total = unresolved_failures.len();
     SessionReviewNextContextBudgetReport {
         contract_version: SESSION_REVIEW_FOLLOW_UP_CONTRACT_VERSION,
         target: report.next_context.target.clone(),
@@ -19365,11 +19377,11 @@ pub(crate) fn build_session_review_next_context_budget_report(
         prompt_target_total: report.next_context.active_prompt_targets.len(),
         touched_file_total: report.next_context.touched_files.len(),
         touched_symbol_total: report.next_context.touched_symbols.len(),
-        unresolved_failure_total: report.next_context.unresolved_failures.len(),
+        unresolved_failure_total,
         truncated: report.next_context.active_prompt_targets.len() > max_items
             || report.next_context.touched_files.len() > max_items
             || report.next_context.touched_symbols.len() > max_items
-            || report.next_context.unresolved_failures.len() > max_items
+            || unresolved_failure_total > max_items
             || report.next_context.next_digest_commands.len() > follow_up_items,
         prompt_targets: report
             .next_context
@@ -19408,9 +19420,7 @@ pub(crate) fn build_session_review_next_context_budget_report(
                 )
             })
             .collect(),
-        unresolved_failures: report
-            .next_context
-            .unresolved_failures
+        unresolved_failures: unresolved_failures
             .iter()
             .take(max_items)
             .map(|entry| SessionReviewBudgetFailurePreview {
@@ -19432,7 +19442,7 @@ pub(crate) fn build_session_review_next_context_budget_report(
                 ),
             })
             .collect(),
-        next_token_actions: build_next_token_actions(report, max_items, max_bytes),
+        next_token_actions,
         next_digest_commands: report
             .next_context
             .next_digest_commands
