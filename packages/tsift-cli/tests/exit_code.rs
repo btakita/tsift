@@ -79,7 +79,7 @@ fn release_publish_gate_requires_secret_variable_and_dry_run() {
     let readme = fs::read_to_string(root.join("README.md")).unwrap();
 
     assert!(
-        workflow.contains("cargo package -p \"$package\" --locked --list"),
+        workflow.contains("cargo package -p \"$package\" --locked --allow-dirty --list"),
         "release verification should list each split crate package payload"
     );
     assert!(
@@ -103,7 +103,7 @@ fn release_publish_gate_requires_secret_variable_and_dry_run() {
     assert!(
         spec.contains("TSIFT_ENABLE_CRATES_PUBLISH=true")
             && spec.contains("CARGO_REGISTRY_TOKEN")
-            && spec.contains("cargo package -p <crate> --locked --list")
+            && spec.contains("cargo package -p <crate> --locked --allow-dirty --list")
             && spec.contains("cargo publish -p <crate> --locked --dry-run"),
         "release spec should document the publish gate"
     );

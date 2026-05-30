@@ -82,7 +82,7 @@ jobs:
             tsift-sim-world \
             tsift
           do
-            cargo package -p "$package" --locked --list > "/tmp/${package}.package-files"
+            cargo package -p "$package" --locked --allow-dirty --list > "/tmp/${package}.package-files"
           done
 
       - name: OpenCode plugin publish dry run

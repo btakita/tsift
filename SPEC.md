@@ -761,7 +761,7 @@ tsift release automation is tag-driven:
 
 - `push` of a `vX.Y.Z` tag runs the release workflow
 - the workflow fails closed if the tag does not exactly match `Cargo.toml` `package.version`
-- release verification includes `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo package -p <crate> --locked --list` for every split Rust crate in dependency order
+- release verification includes `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo package -p <crate> --locked --allow-dirty --list` for every split Rust crate in dependency order
 - successful tagged releases attach prebuilt archives plus `.sha256` checksum files to the matching GitHub Release
 - prebuilt binaries are emitted for `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`; macOS x86_64 users install from crates.io with `cargo install tsift`
 - the crates.io publish job is enabled with the `TSIFT_ENABLE_CRATES_PUBLISH=true` repo variable and a `CARGO_REGISTRY_TOKEN` repo secret; it runs `cargo publish -p <crate> --locked --dry-run` immediately before each real publish after earlier dependency crates have landed
