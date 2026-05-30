@@ -54,12 +54,12 @@ For agent-doc projects, run `tsift status` from the repository root at session
 start. If `status` recommends a fix, run `tsift status --fix` before depending
 on search or digest output. OpenCode users can run `tsift init --opencode` to
 install project-local `.opencode/commands/tsift-*.md` shortcuts for status,
-session-review, context-pack, diff-digest, test-digest, and log-digest
-workflows; existing same-name command files without tsift ownership markers are
-left untouched and reported as conflicts. The same command pack is packaged as
-the `opencode-tsift` npm plugin; once it is published to npm, OpenCode users can
-run `opencode plugin opencode-tsift` and get the marker-owned shortcuts without
-cloning this repository.
+session-review, context-pack, diff-digest, test-digest, log-digest, and
+rewrite-run workflows; existing same-name command files without tsift ownership
+markers are left untouched and reported as conflicts. The same command pack is
+packaged as the `opencode-tsift` npm plugin; once it is published to npm,
+OpenCode users can run `opencode plugin opencode-tsift` and get the marker-owned
+shortcuts without cloning this repository.
 
 Graph DB and Convex operator examples live under
 `fixtures/graph-db-operator-examples`; the reusable Convex app-side schema,

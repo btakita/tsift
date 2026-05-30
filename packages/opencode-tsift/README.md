@@ -19,6 +19,7 @@ available in a project without cloning the `tsift` repository:
 - `/tsift-diff-digest`
 - `/tsift-test-digest`
 - `/tsift-log-digest`
+- `/tsift-rewrite-run`
 
 The commands shell out to the `tsift` binary. Install `tsift` first:
 
@@ -49,9 +50,11 @@ shell invocation. The required permissions break down by command:
 | `/tsift-diff-digest` | `tsift diff-digest` | `.tsift/`, git working tree | — |
 | `/tsift-test-digest` | `tsift --envelope __digest-runner --kind test` | `.tsift/`, test output | — |
 | `/tsift-log-digest` | `tsift --envelope __digest-runner --kind log` | `.tsift/`, build output | — |
+| `/tsift-rewrite-run` | `tsift rewrite --run` | `.tsift/`, command-dependent input | command-dependent |
 
 `/tsift-status` is the only command that writes files (index, instructions).
-The other commands are read-only.
+`/tsift-rewrite-run` has the same read/write profile as the rewritten command it
+executes. The other commands are read-only.
 
 ## Troubleshooting
 

@@ -25,7 +25,7 @@ test("installs marker-owned tsift commands", async () => {
   const project = await tempProject();
   try {
     const updates = await installCommands(project);
-    assert.equal(updates.length, 6);
+    assert.equal(updates.length, 7);
     assert.ok(updates.every((update) => update.action === "created"));
 
     const status = await readFile(
@@ -34,6 +34,13 @@ test("installs marker-owned tsift commands", async () => {
     );
     assert.match(status, /tsift:opencode-command/);
     assert.match(status, /tsift status --fix/);
+
+    const rewriteRun = await readFile(
+      join(project, ".opencode", "commands", "tsift-rewrite-run.md"),
+      "utf8",
+    );
+    assert.match(rewriteRun, /tsift rewrite --run/);
+    assert.match(rewriteRun, /digest-runner/);
   } finally {
     await rm(project, { recursive: true, force: true });
   }
