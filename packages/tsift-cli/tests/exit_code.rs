@@ -83,10 +83,19 @@ fn release_publish_gate_requires_secret_variable_and_dry_run() {
         "release verification should list each split crate package payload"
     );
     assert!(
-        workflow.contains(
-            "cargo publish -p \"$package\" --locked --dry-run\n            cargo publish -p \"$package\" --locked"
-        ),
+        workflow.contains("cargo publish -p \"$package\" --locked --dry-run")
+            && workflow.contains("output=\"$(cargo publish -p \"$package\" --locked 2>&1)\""),
         "publish job should dry-run each split crate immediately before upload"
+    );
+    assert!(
+        workflow.contains("cargo info --registry crates-io \"$package@$release_version\"")
+            && workflow.contains("already exists on crates.io; skipping"),
+        "publish job should be resumable when earlier split crates are already published"
+    );
+    assert!(
+        workflow.contains("Too Many Requests|rate limit|try again after")
+            && workflow.contains("retrying in 180 seconds"),
+        "publish job should retry crates.io rate limits"
     );
     assert!(
         workflow.contains("cargo build -p tsift --release --locked"),
@@ -104,12 +113,16 @@ fn release_publish_gate_requires_secret_variable_and_dry_run() {
         spec.contains("TSIFT_ENABLE_CRATES_PUBLISH=true")
             && spec.contains("CARGO_REGISTRY_TOKEN")
             && spec.contains("cargo package -p <crate> --locked --allow-dirty --list")
-            && spec.contains("cargo publish -p <crate> --locked --dry-run"),
+            && spec.contains("cargo publish -p <crate> --locked --dry-run")
+            && spec.contains("skips crate versions that already exist on crates.io")
+            && spec.contains("retries crates.io rate limits"),
         "release spec should document the publish gate"
     );
     assert!(
         readme.contains("TSIFT_ENABLE_CRATES_PUBLISH=true")
-            && readme.contains("CARGO_REGISTRY_TOKEN"),
+            && readme.contains("CARGO_REGISTRY_TOKEN")
+            && readme.contains("skips crate versions that already exist on crates.io")
+            && readme.contains("retries crates.io rate limits"),
         "README should document the repo variable and secret"
     );
 

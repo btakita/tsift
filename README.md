@@ -132,6 +132,8 @@ verification, then the tagged publish job runs `cargo publish --locked --dry-run
 immediately before each real publish in dependency order. The release workflow
 uses the `TSIFT_ENABLE_CRATES_PUBLISH=true` repository variable and
 `CARGO_REGISTRY_TOKEN` repository secret to turn on tagged crates.io publishes.
+It skips crate versions that already exist on crates.io so interrupted releases
+can resume, and retries crates.io rate limits.
 The default lexical search adapter is maintained in-tree, so publishing no
 longer depends on an upstream git-only `sift` crate.
 

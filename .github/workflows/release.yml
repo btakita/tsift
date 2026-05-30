@@ -196,6 +196,60 @@ jobs:
       - name: Publish crate
         shell: bash
         run: |
+          release_version="${GITHUB_REF_NAME#v}"
+          max_attempts=12
+
+          crate_version_exists() {
+            local package="$1"
+            cargo info --registry crates-io "$package@$release_version" >/dev/null 2>&1
+          }
+
+          publish_package() {
+            local package="$1"
+            local attempt=1
+            local output
+            local status
+
+            if crate_version_exists "$package"; then
+              echo "$package v$release_version already exists on crates.io; skipping"
+              return 0
+            fi
+
+            while true; do
+              cargo publish -p "$package" --locked --dry-run
+
+              set +e
+              output="$(cargo publish -p "$package" --locked 2>&1)"
+              status=$?
+              set -e
+              printf '%s\n' "$output"
+
+              if [ "$status" -eq 0 ]; then
+                sleep 20
+                return 0
+              fi
+
+              if crate_version_exists "$package"; then
+                echo "$package v$release_version is visible on crates.io after publish attempt; continuing"
+                sleep 20
+                return 0
+              fi
+
+              if ! printf '%s\n' "$output" | grep -Eiq 'Too Many Requests|rate limit|try again after'; then
+                return "$status"
+              fi
+
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "crates.io rate limit did not clear for $package after $max_attempts attempts" >&2
+                return "$status"
+              fi
+
+              echo "crates.io rate-limited $package publish attempt $attempt/$max_attempts; retrying in 180 seconds"
+              sleep 180
+              attempt=$((attempt + 1))
+            done
+          }
+
           for package in \
             tsift-core \
             tsift-graph \
@@ -216,9 +270,7 @@ jobs:
             tsift-sim-world \
             tsift
           do
-            cargo publish -p "$package" --locked --dry-run
-            cargo publish -p "$package" --locked
-            sleep 20
+            publish_package "$package"
           done
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

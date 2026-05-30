@@ -764,7 +764,7 @@ tsift release automation is tag-driven:
 - release verification includes `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo package -p <crate> --locked --allow-dirty --list` for every split Rust crate in dependency order
 - successful tagged releases attach prebuilt archives plus `.sha256` checksum files to the matching GitHub Release
 - prebuilt binaries are emitted for `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`; macOS x86_64 users install from crates.io with `cargo install tsift`
-- the crates.io publish job is enabled with the `TSIFT_ENABLE_CRATES_PUBLISH=true` repo variable and a `CARGO_REGISTRY_TOKEN` repo secret; it runs `cargo publish -p <crate> --locked --dry-run` immediately before each real publish after earlier dependency crates have landed
+- the crates.io publish job is enabled with the `TSIFT_ENABLE_CRATES_PUBLISH=true` repo variable and a `CARGO_REGISTRY_TOKEN` repo secret; it runs `cargo publish -p <crate> --locked --dry-run` immediately before each real publish after earlier dependency crates have landed, skips crate versions that already exist on crates.io so interrupted releases can resume, and retries crates.io rate limits
 
 tsift's default lexical search adapter is maintained in-tree so crates.io publishing does not depend on the upstream git-only `github.com/rupurt/sift` project. The existing crates.io `sift` crate remains a different project and is intentionally not used.
 
