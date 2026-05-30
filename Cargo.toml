@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-resolution", "packages/tsift-quality", "packages/tsift-index", "packages/tsift-agent-doc", "packages/tsift-session", "packages/tsift-summarize", "packages/tsift-digest", "packages/tsift-search", "packages/tsift-status", "packages/tsift-cli", "packages/tsift-sim-world"]
+members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-memory", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-resolution", "packages/tsift-quality", "packages/tsift-index", "packages/tsift-agent-doc", "packages/tsift-session", "packages/tsift-summarize", "packages/tsift-digest", "packages/tsift-search", "packages/tsift-status", "packages/tsift-cli", "packages/tsift-sim-world"]
 resolver = "3"
 
 [package]
@@ -30,6 +30,7 @@ tsift-cli = { path = "packages/tsift-cli", version = "0.1.62", optional = true }
 tsift-digest = { path = "packages/tsift-digest", version = "0.1.62" }
 tsift-graph = { path = "packages/tsift-graph", version = "0.1.62" }
 tsift-index = { path = "packages/tsift-index", version = "0.1.62" }
+tsift-memory = { path = "packages/tsift-memory", version = "0.1.62" }
 tsift-quality = { path = "packages/tsift-quality", version = "0.1.62" }
 tsift-resolution = { path = "packages/tsift-resolution", version = "0.1.62" }
 tsift-search = { path = "packages/tsift-search", version = "0.1.62" }

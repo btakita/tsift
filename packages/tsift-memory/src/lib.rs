@@ -1,0 +1,984 @@
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use tsift_core::{GraphEdge, GraphNode, GraphProjection, GraphProvenance};
+
+pub const MEMORY_CONTRACT_VERSION: &str = "tsift-memory-v1";
+pub const MEMORY_SCHEMA_VERSION: i64 = 1;
+pub const DEFAULT_MAX_PROMPT_TOKENS: usize = 4096;
+pub const DEFAULT_RESERVE_TOKENS: usize = 512;
+pub const DEFAULT_MAX_EVENT_TOKENS: usize = 1536;
+
+const MEMORY_SCHEMA_SQL: &str = r#"
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS memory_schema_versions (
+  version INTEGER PRIMARY KEY,
+  applied_at_unix INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO memory_schema_versions(version, applied_at_unix)
+VALUES (1, strftime('%s','now'));
+
+CREATE TABLE IF NOT EXISTS memory_events (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  session_id TEXT,
+  source_ref TEXT NOT NULL,
+  text TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  observed_at_unix INTEGER,
+  token_estimate INTEGER NOT NULL,
+  imported_from TEXT,
+  imported_id TEXT,
+  created_at_unix INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_events_kind
+ON memory_events(kind);
+
+CREATE INDEX IF NOT EXISTS idx_memory_events_session
+ON memory_events(session_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_events_import_source
+ON memory_events(imported_from, imported_id)
+WHERE imported_from IS NOT NULL AND imported_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS memory_session_summaries (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  observed_at_unix INTEGER,
+  token_estimate INTEGER NOT NULL,
+  created_at_unix INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+CREATE TABLE IF NOT EXISTS memory_artifacts (
+  id TEXT PRIMARY KEY,
+  session_id TEXT,
+  source_ref TEXT NOT NULL,
+  artifact_kind TEXT NOT NULL,
+  path TEXT,
+  handle TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  token_estimate INTEGER NOT NULL DEFAULT 0,
+  created_at_unix INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+CREATE TABLE IF NOT EXISTS memory_tool_spans (
+  id TEXT PRIMARY KEY,
+  session_id TEXT,
+  tool_name TEXT NOT NULL,
+  input_artifact_id TEXT,
+  output_artifact_id TEXT,
+  status TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  started_at_unix INTEGER,
+  completed_at_unix INTEGER,
+  FOREIGN KEY(input_artifact_id) REFERENCES memory_artifacts(id),
+  FOREIGN KEY(output_artifact_id) REFERENCES memory_artifacts(id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+  id TEXT PRIMARY KEY,
+  owner_kind TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  vector_ref TEXT NOT NULL,
+  dimensions INTEGER,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at_unix INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+CREATE TABLE IF NOT EXISTS memory_graph_links (
+  id TEXT PRIMARY KEY,
+  memory_event_id TEXT NOT NULL,
+  graph_node_id TEXT NOT NULL,
+  graph_edge_id TEXT,
+  link_kind TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at_unix INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+  FOREIGN KEY(memory_event_id) REFERENCES memory_events(id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_import_runs (
+  id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  source_ref TEXT NOT NULL,
+  status TEXT NOT NULL,
+  imported_events INTEGER NOT NULL DEFAULT 0,
+  warnings_json TEXT NOT NULL DEFAULT '[]',
+  started_at_unix INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+  completed_at_unix INTEGER
+);
+"#;
+
+pub fn memory_schema_sql() -> &'static str {
+    MEMORY_SCHEMA_SQL
+}
+
+pub fn default_memory_db_path(project_root: &Path) -> PathBuf {
+    project_root.join(".tsift").join("memory.db")
+}
+
+pub fn default_claude_mem_db_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".claude-mem").join("claude-mem.db"))
+}
+
+pub fn estimate_tokens(text: &str) -> usize {
+    let bytes = text.trim().len();
+    if bytes == 0 { 0 } else { bytes.div_ceil(4) }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryEventKind {
+    PromptTarget,
+    ToolCall,
+    ToolResultArtifact,
+    ResponseSummary,
+    CloseoutProof,
+    SessionCheck,
+    ImportedObservation,
+    ImportedSessionSummary,
+    ImportedUserPrompt,
+}
+
+impl MemoryEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PromptTarget => "prompt_target",
+            Self::ToolCall => "tool_call",
+            Self::ToolResultArtifact => "tool_result_artifact",
+            Self::ResponseSummary => "response_summary",
+            Self::CloseoutProof => "closeout_proof",
+            Self::SessionCheck => "session_check",
+            Self::ImportedObservation => "imported_observation",
+            Self::ImportedSessionSummary => "imported_session_summary",
+            Self::ImportedUserPrompt => "imported_user_prompt",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEvent {
+    pub kind: MemoryEventKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub source_ref: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at_unix: Option<i64>,
+    pub token_estimate: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imported_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imported_id: Option<String>,
+}
+
+impl MemoryEvent {
+    pub fn new(
+        kind: MemoryEventKind,
+        source_ref: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        let text = text.into();
+        Self {
+            kind,
+            session_id: None,
+            source_ref: source_ref.into(),
+            token_estimate: estimate_tokens(&text),
+            text,
+            metadata: BTreeMap::new(),
+            observed_at_unix: None,
+            imported_from: None,
+            imported_id: None,
+        }
+    }
+
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn with_observed_at_unix(mut self, observed_at_unix: i64) -> Self {
+        self.observed_at_unix = Some(observed_at_unix);
+        self
+    }
+
+    pub fn with_import(mut self, source: impl Into<String>, id: impl Into<String>) -> Self {
+        self.imported_from = Some(source.into());
+        self.imported_id = Some(id.into());
+        self
+    }
+
+    pub fn stable_id(&self) -> String {
+        let raw = serde_json::json!([
+            self.kind.as_str(),
+            self.session_id,
+            self.source_ref,
+            self.text,
+            self.observed_at_unix,
+            self.imported_from,
+            self.imported_id
+        ])
+        .to_string();
+        format!("memevt:{}", blake3::hash(raw.as_bytes()).to_hex())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryBudget {
+    pub max_prompt_tokens: usize,
+    pub reserve_tokens: usize,
+    pub max_event_tokens: usize,
+}
+
+impl Default for MemoryBudget {
+    fn default() -> Self {
+        Self {
+            max_prompt_tokens: DEFAULT_MAX_PROMPT_TOKENS,
+            reserve_tokens: DEFAULT_RESERVE_TOKENS,
+            max_event_tokens: DEFAULT_MAX_EVENT_TOKENS,
+        }
+    }
+}
+
+impl MemoryBudget {
+    pub fn new(max_prompt_tokens: usize) -> Self {
+        Self {
+            max_prompt_tokens,
+            ..Self::default()
+        }
+    }
+
+    pub fn available_tokens(self) -> usize {
+        self.max_prompt_tokens.saturating_sub(self.reserve_tokens)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetedMemoryEvent {
+    pub id: String,
+    pub kind: String,
+    pub source_ref: String,
+    pub token_estimate: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredMemoryEvent {
+    pub id: String,
+    pub kind: String,
+    pub source_ref: String,
+    pub token_estimate: usize,
+    pub reason: String,
+    pub recommended_chunks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryHandoffPlan {
+    pub contract_version: String,
+    pub status: String,
+    pub max_prompt_tokens: usize,
+    pub reserve_tokens: usize,
+    pub available_tokens: usize,
+    pub estimated_included_tokens: usize,
+    pub included_events: Vec<BudgetedMemoryEvent>,
+    pub deferred_events: Vec<DeferredMemoryEvent>,
+    pub next_commands: Vec<String>,
+}
+
+pub fn plan_capture_handoff(events: &[MemoryEvent], budget: MemoryBudget) -> MemoryHandoffPlan {
+    let mut used = 0usize;
+    let mut included_events = Vec::new();
+    let mut deferred_events = Vec::new();
+    let available = budget.available_tokens();
+
+    for event in events {
+        let id = event.stable_id();
+        if event.token_estimate > budget.max_event_tokens {
+            deferred_events.push(DeferredMemoryEvent {
+                id,
+                kind: event.kind.as_str().to_string(),
+                source_ref: event.source_ref.clone(),
+                token_estimate: event.token_estimate,
+                reason: "event_exceeds_max_event_tokens".to_string(),
+                recommended_chunks: event
+                    .token_estimate
+                    .div_ceil(budget.max_event_tokens.max(1)),
+            });
+            continue;
+        }
+
+        if used + event.token_estimate <= available {
+            used += event.token_estimate;
+            included_events.push(BudgetedMemoryEvent {
+                id,
+                kind: event.kind.as_str().to_string(),
+                source_ref: event.source_ref.clone(),
+                token_estimate: event.token_estimate,
+            });
+        } else {
+            deferred_events.push(DeferredMemoryEvent {
+                id,
+                kind: event.kind.as_str().to_string(),
+                source_ref: event.source_ref.clone(),
+                token_estimate: event.token_estimate,
+                reason: "handoff_budget_exhausted".to_string(),
+                recommended_chunks: 1,
+            });
+        }
+    }
+
+    MemoryHandoffPlan {
+        contract_version: MEMORY_CONTRACT_VERSION.to_string(),
+        status: if deferred_events.is_empty() {
+            "ready".to_string()
+        } else {
+            "split_required".to_string()
+        },
+        max_prompt_tokens: budget.max_prompt_tokens,
+        reserve_tokens: budget.reserve_tokens,
+        available_tokens: available,
+        estimated_included_tokens: used,
+        included_events,
+        deferred_events,
+        next_commands: vec![
+            "tsift memory handoff-plan '<event text>' --budget-tokens <n> --json".to_string(),
+            "tsift --envelope context-pack <session.md> --budget normal".to_string(),
+        ],
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryHookSpec {
+    pub name: String,
+    pub event_kind: String,
+    pub required_fields: Vec<String>,
+    pub budget_behavior: String,
+}
+
+pub fn agent_doc_hook_contract() -> Vec<MemoryHookSpec> {
+    vec![
+        MemoryHookSpec {
+            name: "prompt_target".to_string(),
+            event_kind: MemoryEventKind::PromptTarget.as_str().to_string(),
+            required_fields: vec!["session_path".to_string(), "prompt_target".to_string()],
+            budget_behavior:
+                "capture text plus graph/source handles; never inline raw transcript blobs"
+                    .to_string(),
+        },
+        MemoryHookSpec {
+            name: "tool_result_artifact".to_string(),
+            event_kind: MemoryEventKind::ToolResultArtifact.as_str().to_string(),
+            required_fields: vec!["tool_name".to_string(), "artifact_handle".to_string()],
+            budget_behavior: "store artifact handle and digest, not full raw output".to_string(),
+        },
+        MemoryHookSpec {
+            name: "response_summary".to_string(),
+            event_kind: MemoryEventKind::ResponseSummary.as_str().to_string(),
+            required_fields: vec!["response_topic".to_string(), "summary".to_string()],
+            budget_behavior: "summaries are capped before write and linked to source handles"
+                .to_string(),
+        },
+        MemoryHookSpec {
+            name: "closeout_proof".to_string(),
+            event_kind: MemoryEventKind::CloseoutProof.as_str().to_string(),
+            required_fields: vec!["commit_hash".to_string(), "changed_paths".to_string()],
+            budget_behavior: "proof records are structured metadata with compact prose".to_string(),
+        },
+        MemoryHookSpec {
+            name: "session_check".to_string(),
+            event_kind: MemoryEventKind::SessionCheck.as_str().to_string(),
+            required_fields: vec!["status".to_string(), "session_path".to_string()],
+            budget_behavior: "persist pass/fail state and recovery commands".to_string(),
+        },
+    ]
+}
+
+pub fn agent_doc_closeout_events(
+    session_path: &Path,
+    prompt_target: &str,
+    response_summary: &str,
+    commit_hash: Option<&str>,
+    session_check_status: &str,
+) -> Vec<MemoryEvent> {
+    let session_id = session_path.display().to_string();
+    let mut events = vec![
+        MemoryEvent::new(
+            MemoryEventKind::PromptTarget,
+            session_path.display().to_string(),
+            prompt_target,
+        )
+        .with_session_id(session_id.clone()),
+        MemoryEvent::new(
+            MemoryEventKind::ResponseSummary,
+            session_path.display().to_string(),
+            response_summary,
+        )
+        .with_session_id(session_id.clone()),
+        MemoryEvent::new(
+            MemoryEventKind::SessionCheck,
+            session_path.display().to_string(),
+            session_check_status,
+        )
+        .with_session_id(session_id.clone())
+        .with_metadata("status", session_check_status),
+    ];
+
+    if let Some(commit_hash) = commit_hash {
+        events.push(
+            MemoryEvent::new(
+                MemoryEventKind::CloseoutProof,
+                session_path.display().to_string(),
+                commit_hash,
+            )
+            .with_session_id(session_id)
+            .with_metadata("commit_hash", commit_hash),
+        );
+    }
+
+    events
+}
+
+pub struct MemoryStore {
+    conn: Connection,
+}
+
+impl MemoryStore {
+    pub fn open_or_create(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        conn.execute_batch(MEMORY_SCHEMA_SQL)
+            .with_context(|| format!("initialize {}", path.display()))?;
+        Ok(Self { conn })
+    }
+
+    pub fn insert_event(&self, event: &MemoryEvent) -> Result<String> {
+        let id = event.stable_id();
+        let metadata_json = serde_json::to_string(&event.metadata)?;
+        self.conn.execute(
+            r#"
+            INSERT OR IGNORE INTO memory_events(
+              id, kind, session_id, source_ref, text, metadata_json,
+              observed_at_unix, token_estimate, imported_from, imported_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+            params![
+                &id,
+                event.kind.as_str(),
+                event.session_id.as_deref(),
+                &event.source_ref,
+                &event.text,
+                &metadata_json,
+                event.observed_at_unix,
+                event.token_estimate as i64,
+                event.imported_from.as_deref(),
+                event.imported_id.as_deref()
+            ],
+        )?;
+        Ok(id)
+    }
+
+    pub fn event_count(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_events", [], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeMemTablePlan {
+    pub table: String,
+    pub supported: bool,
+    pub rows: usize,
+    pub columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeMemImportPlan {
+    pub db_path: String,
+    pub exists: bool,
+    pub readable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chroma_path: Option<String>,
+    pub chroma_present: bool,
+    pub observations: ClaudeMemTablePlan,
+    pub session_summaries: ClaudeMemTablePlan,
+    pub user_prompts: ClaudeMemTablePlan,
+    pub pending_messages: ClaudeMemTablePlan,
+    pub warnings: Vec<String>,
+    pub next_commands: Vec<String>,
+}
+
+fn empty_table_plan(table: &str) -> ClaudeMemTablePlan {
+    ClaudeMemTablePlan {
+        table: table.to_string(),
+        supported: false,
+        rows: 0,
+        columns: Vec::new(),
+    }
+}
+
+pub fn inspect_claude_mem(db_path: &Path) -> Result<ClaudeMemImportPlan> {
+    let chroma_path = db_path.parent().map(|parent| parent.join("chroma"));
+    let chroma_present = chroma_path.as_ref().is_some_and(|path| path.exists());
+    let mut plan = ClaudeMemImportPlan {
+        db_path: db_path.display().to_string(),
+        exists: db_path.exists(),
+        readable: false,
+        chroma_path: chroma_path.as_ref().map(|path| path.display().to_string()),
+        chroma_present,
+        observations: empty_table_plan("observations"),
+        session_summaries: empty_table_plan("session_summaries"),
+        user_prompts: empty_table_plan("user_prompts"),
+        pending_messages: empty_table_plan("pending_messages"),
+        warnings: Vec::new(),
+        next_commands: vec![
+            "tsift memory import-claude-mem . --apply --json".to_string(),
+            "tsift graph-db --path . refresh --json".to_string(),
+        ],
+    };
+
+    if !plan.exists {
+        plan.warnings
+            .push("claude-mem database not found; pass --db to inspect another path".to_string());
+        return Ok(plan);
+    }
+
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("open claude-mem db {}", db_path.display()))?;
+    plan.readable = true;
+    plan.observations = inspect_table(&conn, "observations")?;
+    plan.session_summaries = inspect_table(&conn, "session_summaries")?;
+    plan.user_prompts = inspect_table(&conn, "user_prompts")?;
+    plan.pending_messages = inspect_table(&conn, "pending_messages")?;
+
+    if !plan.chroma_present {
+        plan.warnings
+            .push("chroma directory was not found next to the claude-mem SQLite DB".to_string());
+    }
+
+    Ok(plan)
+}
+
+fn inspect_table(conn: &Connection, table: &str) -> Result<ClaudeMemTablePlan> {
+    if !table_exists(conn, table)? {
+        return Ok(empty_table_plan(table));
+    }
+    let rows: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })?;
+    let columns = table_columns(conn, table)?;
+    Ok(ClaudeMemTablePlan {
+        table: table.to_string(),
+        supported: true,
+        rows: rows as usize,
+        columns,
+    })
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(exists.is_some())
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    let mut columns = Vec::new();
+    while let Some(row) = rows.next()? {
+        columns.push(row.get::<_, String>(1)?);
+    }
+    Ok(columns)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeMemImportReport {
+    pub contract_version: String,
+    pub source: String,
+    pub target: String,
+    pub dry_run: bool,
+    pub limit_per_table: usize,
+    pub imported_events: usize,
+    pub planned_events: usize,
+    pub event_ids: Vec<String>,
+    pub plan: ClaudeMemImportPlan,
+}
+
+pub fn import_claude_mem(
+    source_db_path: &Path,
+    target_memory_db_path: &Path,
+    limit_per_table: usize,
+    dry_run: bool,
+) -> Result<ClaudeMemImportReport> {
+    let plan = inspect_claude_mem(source_db_path)?;
+    if !plan.exists || !plan.readable {
+        return Ok(ClaudeMemImportReport {
+            contract_version: MEMORY_CONTRACT_VERSION.to_string(),
+            source: source_db_path.display().to_string(),
+            target: target_memory_db_path.display().to_string(),
+            dry_run,
+            limit_per_table,
+            imported_events: 0,
+            planned_events: 0,
+            event_ids: Vec::new(),
+            plan,
+        });
+    }
+
+    let conn = Connection::open_with_flags(
+        source_db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let mut events = Vec::new();
+    if plan.observations.supported {
+        events.extend(read_claude_mem_observations(&conn, limit_per_table)?);
+    }
+    if plan.session_summaries.supported {
+        events.extend(read_claude_mem_summaries(&conn, limit_per_table)?);
+    }
+    if plan.user_prompts.supported {
+        events.extend(read_claude_mem_user_prompts(&conn, limit_per_table)?);
+    }
+
+    let planned_events = events.len();
+    let mut event_ids = Vec::new();
+    if !dry_run {
+        let store = MemoryStore::open_or_create(target_memory_db_path)?;
+        for event in &events {
+            event_ids.push(store.insert_event(event)?);
+        }
+    }
+
+    Ok(ClaudeMemImportReport {
+        contract_version: MEMORY_CONTRACT_VERSION.to_string(),
+        source: source_db_path.display().to_string(),
+        target: target_memory_db_path.display().to_string(),
+        dry_run,
+        limit_per_table,
+        imported_events: event_ids.len(),
+        planned_events,
+        event_ids,
+        plan,
+    })
+}
+
+fn read_claude_mem_observations(conn: &Connection, limit: usize) -> Result<Vec<MemoryEvent>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, memory_session_id, project, type, title, subtitle, text, facts,
+               narrative, concepts, prompt_number, discovery_tokens, created_at_epoch,
+               content_hash
+        FROM observations
+        ORDER BY created_at_epoch ASC, id ASC
+        LIMIT ?1
+        "#,
+    )?;
+    let rows = stmt.query_map([limit as i64], |row| {
+        let id: i64 = row.get(0)?;
+        let session_id: String = row.get(1)?;
+        let project: String = row.get(2)?;
+        let observation_type: String = row.get(3)?;
+        let title: Option<String> = row.get(4)?;
+        let subtitle: Option<String> = row.get(5)?;
+        let text: Option<String> = row.get(6)?;
+        let facts: Option<String> = row.get(7)?;
+        let narrative: Option<String> = row.get(8)?;
+        let concepts: Option<String> = row.get(9)?;
+        let prompt_number: Option<i64> = row.get(10)?;
+        let discovery_tokens: i64 = row.get(11)?;
+        let created_at_epoch: i64 = row.get(12)?;
+        let content_hash: Option<String> = row.get(13)?;
+        let body = join_non_empty([title, subtitle, text, facts, narrative, concepts]);
+        let mut event = MemoryEvent::new(
+            MemoryEventKind::ImportedObservation,
+            format!("claude-mem:observations:{id}"),
+            body,
+        )
+        .with_session_id(session_id)
+        .with_observed_at_unix(created_at_epoch)
+        .with_import("claude-mem", format!("observations:{id}"))
+        .with_metadata("project", project)
+        .with_metadata("observation_type", observation_type)
+        .with_metadata("discovery_tokens", discovery_tokens.to_string());
+        if let Some(prompt_number) = prompt_number {
+            event = event.with_metadata("prompt_number", prompt_number.to_string());
+        }
+        if let Some(content_hash) = content_hash {
+            event = event.with_metadata("content_hash", content_hash);
+        }
+        Ok(event)
+    })?;
+    collect_rows(rows)
+}
+
+fn read_claude_mem_summaries(conn: &Connection, limit: usize) -> Result<Vec<MemoryEvent>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, memory_session_id, project, request, investigated, learned,
+               completed, next_steps, notes, prompt_number, discovery_tokens,
+               created_at_epoch
+        FROM session_summaries
+        ORDER BY created_at_epoch ASC, id ASC
+        LIMIT ?1
+        "#,
+    )?;
+    let rows = stmt.query_map([limit as i64], |row| {
+        let id: i64 = row.get(0)?;
+        let session_id: String = row.get(1)?;
+        let project: String = row.get(2)?;
+        let request: Option<String> = row.get(3)?;
+        let investigated: Option<String> = row.get(4)?;
+        let learned: Option<String> = row.get(5)?;
+        let completed: Option<String> = row.get(6)?;
+        let next_steps: Option<String> = row.get(7)?;
+        let notes: Option<String> = row.get(8)?;
+        let prompt_number: Option<i64> = row.get(9)?;
+        let discovery_tokens: i64 = row.get(10)?;
+        let created_at_epoch: i64 = row.get(11)?;
+        let body = join_non_empty([request, investigated, learned, completed, next_steps, notes]);
+        let mut event = MemoryEvent::new(
+            MemoryEventKind::ImportedSessionSummary,
+            format!("claude-mem:session_summaries:{id}"),
+            body,
+        )
+        .with_session_id(session_id)
+        .with_observed_at_unix(created_at_epoch)
+        .with_import("claude-mem", format!("session_summaries:{id}"))
+        .with_metadata("project", project)
+        .with_metadata("discovery_tokens", discovery_tokens.to_string());
+        if let Some(prompt_number) = prompt_number {
+            event = event.with_metadata("prompt_number", prompt_number.to_string());
+        }
+        Ok(event)
+    })?;
+    collect_rows(rows)
+}
+
+fn read_claude_mem_user_prompts(conn: &Connection, limit: usize) -> Result<Vec<MemoryEvent>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, content_session_id, prompt_number, prompt_text, created_at_epoch
+        FROM user_prompts
+        ORDER BY created_at_epoch ASC, id ASC
+        LIMIT ?1
+        "#,
+    )?;
+    let rows = stmt.query_map([limit as i64], |row| {
+        let id: i64 = row.get(0)?;
+        let session_id: String = row.get(1)?;
+        let prompt_number: i64 = row.get(2)?;
+        let prompt_text: String = row.get(3)?;
+        let created_at_epoch: i64 = row.get(4)?;
+        Ok(MemoryEvent::new(
+            MemoryEventKind::ImportedUserPrompt,
+            format!("claude-mem:user_prompts:{id}"),
+            prompt_text,
+        )
+        .with_session_id(session_id)
+        .with_observed_at_unix(created_at_epoch)
+        .with_import("claude-mem", format!("user_prompts:{id}"))
+        .with_metadata("prompt_number", prompt_number.to_string()))
+    })?;
+    collect_rows(rows)
+}
+
+fn collect_rows<T>(rows: impl Iterator<Item = rusqlite::Result<T>>) -> Result<Vec<T>> {
+    let mut values = Vec::new();
+    for row in rows {
+        values.push(row?);
+    }
+    Ok(values)
+}
+
+fn join_non_empty(values: impl IntoIterator<Item = Option<String>>) -> String {
+    let parts: Vec<String> = values
+        .into_iter()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    parts.join("\n\n")
+}
+
+pub fn memory_graph_node_kinds() -> Vec<&'static str> {
+    vec!["memory_session", "memory_event"]
+}
+
+pub fn project_memory_events(events: &[MemoryEvent]) -> GraphProjection {
+    let mut projection = GraphProjection::default();
+    let mut sessions = BTreeSet::new();
+
+    for event in events {
+        let event_id = event.stable_id();
+        if let Some(session_id) = &event.session_id
+            && sessions.insert(session_id.clone())
+        {
+            projection.nodes.push(
+                GraphNode::new(
+                    format!("memsess:{}", blake3::hash(session_id.as_bytes()).to_hex()),
+                    "memory_session",
+                    session_id,
+                )
+                .with_property("session_id", session_id)
+                .with_provenance(GraphProvenance::new("tsift-memory", session_id)),
+            );
+        }
+
+        let mut node = GraphNode::new(&event_id, "memory_event", event.kind.as_str())
+            .with_property("event_kind", event.kind.as_str())
+            .with_property("source_ref", &event.source_ref)
+            .with_property("token_estimate", event.token_estimate.to_string())
+            .with_provenance(GraphProvenance::new("tsift-memory", &event.source_ref));
+        if let Some(imported_from) = &event.imported_from {
+            node = node.with_property("imported_from", imported_from);
+        }
+        if let Some(imported_id) = &event.imported_id {
+            node = node.with_property("imported_id", imported_id);
+        }
+        projection.nodes.push(node);
+
+        if let Some(session_id) = &event.session_id {
+            let session_node_id =
+                format!("memsess:{}", blake3::hash(session_id.as_bytes()).to_hex());
+            projection.edges.push(
+                GraphEdge::new(session_node_id, event_id, "records_memory_event")
+                    .with_provenance(GraphProvenance::new("tsift-memory", &event.source_ref)),
+            );
+        }
+    }
+
+    projection
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryQueryPlan {
+    pub contract_version: String,
+    pub query: String,
+    pub limit: usize,
+    pub max_tokens: usize,
+    pub estimated_query_tokens: usize,
+    pub output_contract: Vec<String>,
+    pub next_commands: Vec<String>,
+}
+
+pub fn plan_memory_query(query: &str, limit: usize, max_tokens: usize) -> Result<MemoryQueryPlan> {
+    if query.trim().is_empty() {
+        bail!("memory query must not be empty");
+    }
+    Ok(MemoryQueryPlan {
+        contract_version: MEMORY_CONTRACT_VERSION.to_string(),
+        query: query.to_string(),
+        limit,
+        max_tokens,
+        estimated_query_tokens: estimate_tokens(query),
+        output_contract: vec![
+            "ranked memory_event ids".to_string(),
+            "source_ref handles for expansion".to_string(),
+            "graph node ids for neighborhood projection".to_string(),
+            "token estimates for every returned packet".to_string(),
+        ],
+        next_commands: vec![
+            "tsift memory status . --json".to_string(),
+            "tsift graph-db --path . related '<query>' --json".to_string(),
+        ],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn handoff_plan_defers_oversized_events_before_model_call() {
+        let small = MemoryEvent::new(MemoryEventKind::PromptTarget, "session.md", "short");
+        let large = MemoryEvent::new(
+            MemoryEventKind::ToolResultArtifact,
+            "artifact:log",
+            "x".repeat(10_000),
+        );
+        let plan = plan_capture_handoff(
+            &[small, large],
+            MemoryBudget {
+                max_prompt_tokens: 1000,
+                reserve_tokens: 100,
+                max_event_tokens: 500,
+            },
+        );
+        assert_eq!(plan.status, "split_required");
+        assert_eq!(plan.included_events.len(), 1);
+        assert_eq!(
+            plan.deferred_events[0].reason,
+            "event_exceeds_max_event_tokens"
+        );
+    }
+
+    #[test]
+    fn memory_store_initializes_schema_and_dedupes_imported_events() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("memory.db");
+        let store = MemoryStore::open_or_create(&db).unwrap();
+        let event = MemoryEvent::new(
+            MemoryEventKind::ImportedObservation,
+            "claude-mem:observations:1",
+            "fact",
+        )
+        .with_session_id("session-a")
+        .with_import("claude-mem", "observations:1");
+
+        let first = store.insert_event(&event).unwrap();
+        let second = store.insert_event(&event).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(store.event_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn graph_projection_links_events_to_sessions() {
+        let event = MemoryEvent::new(MemoryEventKind::ResponseSummary, "session.md", "done")
+            .with_session_id("session-a");
+        let projection = project_memory_events(&[event]);
+        assert_eq!(projection.nodes.len(), 2);
+        assert_eq!(projection.edges.len(), 1);
+        assert!(
+            projection
+                .nodes
+                .iter()
+                .any(|node| node.kind == "memory_session")
+        );
+        assert!(
+            projection
+                .nodes
+                .iter()
+                .any(|node| node.kind == "memory_event")
+        );
+    }
+}

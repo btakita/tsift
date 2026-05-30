@@ -23,6 +23,7 @@ use commands::infra::{
     cmd_convex_sync, cmd_edit, cmd_graph_db, cmd_init, cmd_locks, cmd_rewrite, cmd_route, cmd_sql,
     cmd_status,
 };
+use commands::memory::cmd_memory;
 use commands::quality::{cmd_audit, cmd_audit_tagpath, cmd_lint};
 use commands::summarize::cmd_summarize;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
@@ -428,6 +429,20 @@ pub fn run() -> Result<()> {
             },
         ),
         Some(Commands::Route { task, id }) => cmd_route(&task, id),
+        Some(Commands::Memory { command }) => {
+            let json = command.json_output();
+            cmd_memory(
+                command,
+                OutputFormat {
+                    json_output: json || terse || schema || envelope,
+                    compact,
+                    pretty,
+                    terse,
+                    schema,
+                    envelope,
+                },
+            )
+        }
         Some(Commands::Graph {
             symbol,
             path,

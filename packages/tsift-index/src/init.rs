@@ -427,6 +427,11 @@ const OPENCODE_COMMANDS: &[OpenCodeCommandSpec] = &[
         body: r#"Run `tsift --envelope context-pack <target> --budget normal`, where `<target>` is `$ARGUMENTS` or `.` when no argument is provided. Use source handles and expansion commands from the packet before reading whole files."#,
     },
     OpenCodeCommandSpec {
+        name: "tsift-memory-status",
+        description: "Inspect first-party tsift memory readiness",
+        body: r#"Run `tsift memory status <target> --json`, where `<target>` is `$ARGUMENTS` or `.` when no argument is provided. Summarize schema initialization, agent-doc hook contract, claude-mem import readiness, and the next bounded memory command to run. Do not import data unless the user explicitly asks for `--apply`."#,
+    },
+    OpenCodeCommandSpec {
         name: "tsift-diff-digest",
         description: "Digest current or requested git diff",
         body: r#"Run `tsift diff-digest <target>`, where `<target>` is `$ARGUMENTS` or `.` when no argument is provided. Summarize changed paths, high-signal hunks, and any follow-up expansion commands instead of pasting the raw diff."#,
@@ -1125,6 +1130,12 @@ mod tests {
         assert!(rewrite_run.contains("tsift rewrite --run"));
         assert!(rewrite_run.contains("broad `rg`/recursive `grep`"));
         assert!(rewrite_run.contains("digest-runner"));
+
+        let memory_status =
+            std::fs::read_to_string(dir.path().join(".opencode/commands/tsift-memory-status.md"))
+                .unwrap();
+        assert!(memory_status.contains("tsift memory status"));
+        assert!(memory_status.contains("claude-mem import readiness"));
     }
 
     #[test]

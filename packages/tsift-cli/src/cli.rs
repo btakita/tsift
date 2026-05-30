@@ -146,6 +146,11 @@ pub enum Commands {
         #[arg(long)]
         id: bool,
     },
+    /// Manage first-party tsift memory state and migration imports
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
     /// Rewrite a shell command to use tsift, or run the bounded tsift equivalent directly
     Rewrite {
         /// The shell command to potentially rewrite
@@ -834,6 +839,86 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum MemoryCommand {
+    /// Report schema, hook, query, and claude-mem import readiness
+    Status {
+        /// Project root whose .tsift/memory.db should be inspected
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Override the claude-mem SQLite DB path
+        #[arg(long)]
+        claude_mem_db: Option<PathBuf>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Initialize the tsift memory database
+    Init {
+        /// Project root whose .tsift/memory.db should be initialized
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Plan or apply a read-only import from claude-mem SQLite into tsift memory
+    ImportClaudeMem {
+        /// Project root whose .tsift/memory.db should receive imported rows
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Override the claude-mem SQLite DB path
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Maximum rows to read from each supported claude-mem table
+        #[arg(long, default_value = "1000")]
+        limit: usize,
+        /// Apply the import; omitted means dry-run plan only
+        #[arg(long)]
+        apply: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Estimate whether memory text can fit into a bounded model handoff
+    HandoffPlan {
+        /// Text to include in the memory handoff
+        text: String,
+        /// Maximum prompt token budget before reserve
+        #[arg(long, default_value = "4096")]
+        budget_tokens: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Describe the stable query packet contract for memory retrieval
+    QueryPlan {
+        /// Query text
+        query: String,
+        /// Maximum memory packets a future query should return
+        #[arg(long, default_value = "10")]
+        limit: usize,
+        /// Maximum output tokens a future query should use
+        #[arg(long, default_value = "2000")]
+        max_tokens: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+impl MemoryCommand {
+    pub fn json_output(&self) -> bool {
+        match self {
+            Self::Status { json, .. }
+            | Self::Init { json, .. }
+            | Self::ImportClaudeMem { json, .. }
+            | Self::HandoffPlan { json, .. }
+            | Self::QueryPlan { json, .. } => *json,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

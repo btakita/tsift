@@ -2738,6 +2738,7 @@ dependencies = [
  "tsift-graph",
  "tsift-index",
  "tsift-libsql",
+ "tsift-memory",
  "tsift-quality",
  "tsift-resolution",
  "tsift-search",
@@ -2790,6 +2791,7 @@ dependencies = [
  "tsift-digest",
  "tsift-graph",
  "tsift-index",
+ "tsift-memory",
  "tsift-quality",
  "tsift-resolution",
  "tsift-search",
@@ -2869,6 +2871,19 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tsift-core",
+]
+
+[[package]]
+name = "tsift-memory"
+version = "0.1.62"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tsift-core",
 ]
 

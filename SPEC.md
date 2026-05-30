@@ -69,6 +69,14 @@ tsift (root crate — public package shim: lib.rs + graph/lang/resolution/substr
 │   ├── session_digest module — bounded session transcript/log digest with restart-churn families
 │   ├── session_review module — cross-harness aggregate review combining digest + cost + log discovery
 │   └── re-exported via root `tsift` `pub use tsift_agent_doc::{session_cost, session_digest, session_review};`
+├── tsift-memory crate (packages/tsift-memory — first-party memory substrate)
+│   ├── owns `.tsift/memory.db` schema versioning for memory events, summaries, artifacts, tool spans, embeddings, graph links, and import runs
+│   ├── exposes token-budgeted handoff planning so observer/plugin prompts split before model calls instead of overflowing
+│   ├── defines agent-doc hook event contracts for prompt targets, tool artifacts, response summaries, closeout proof, and session-check results
+│   ├── projects memory events into provider-neutral graph nodes/edges (`memory_session`, `memory_event`) with source handles for later graph-db integration
+│   ├── imports the observed `claude-mem` SQLite tables (`observations`, `session_summaries`, `user_prompts`) as migration events while recording adjacent Chroma availability as external vector handles
+│   ├── exposes a query packet contract for future ranked, token-capped memory retrieval
+│   └── re-exported via root `tsift` as `tsift::memory`
 ├── tsift-session crate (packages/tsift-session — compatibility shim)
 │   └── re-exports `tsift-agent-doc::{session_cost, session_digest, session_review}` for existing consumers
 ├── tsift-summarize crate (packages/tsift-summarize — cached LLM analysis foundation)
