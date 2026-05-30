@@ -162,8 +162,8 @@ fn release_crate_order() -> &'static [&'static str] {
         "tsift-status",
         "tsift-session",
         "tsift-cli",
-        "tsift-sim-world",
         "tsift",
+        "tsift-sim-world",
     ]
 }
 

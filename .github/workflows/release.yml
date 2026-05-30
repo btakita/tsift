@@ -79,8 +79,8 @@ jobs:
             tsift-status \
             tsift-session \
             tsift-cli \
-            tsift-sim-world \
-            tsift
+            tsift \
+            tsift-sim-world
           do
             cargo package -p "$package" --locked --allow-dirty --list > "/tmp/${package}.package-files"
           done
@@ -267,8 +267,8 @@ jobs:
             tsift-status \
             tsift-session \
             tsift-cli \
-            tsift-sim-world \
-            tsift
+            tsift \
+            tsift-sim-world
           do
             publish_package "$package"
           done
