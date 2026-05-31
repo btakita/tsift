@@ -5385,6 +5385,60 @@ fn dci_benchmark_summarizes_recorded_strategy_fixture() {
 }
 
 #[test]
+fn memory_status_prefers_graph_db_related_with_claude_mem_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing_claude_mem = dir.path().join("missing-claude-mem.db");
+
+    let output = tsift_bin()
+        .args([
+            "memory",
+            "status",
+            dir.path().to_str().unwrap(),
+            "--claude-mem-db",
+            missing_claude_mem.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "memory status should pass: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let next_commands = json["next_commands"].as_array().unwrap();
+    assert!(next_commands.iter().any(|command| {
+        command.as_str().unwrap().contains("graph-db --path")
+            && command
+                .as_str()
+                .unwrap()
+                .contains(" --json related '<query>'")
+    }));
+    assert!(next_commands.iter().any(|command| {
+        command
+            .as_str()
+            .unwrap()
+            .contains("memory import-claude-mem")
+    }));
+    let graph_idx = next_commands
+        .iter()
+        .position(|command| command.as_str().unwrap().contains("graph-db --path"))
+        .unwrap();
+    let fallback_idx = next_commands
+        .iter()
+        .position(|command| {
+            command
+                .as_str()
+                .unwrap()
+                .contains("memory import-claude-mem")
+        })
+        .unwrap();
+    assert!(graph_idx < fallback_idx);
+    assert_eq!(json["claude_mem"]["exists"], false);
+}
+
+#[test]
 fn dci_benchmark_summarizes_memory_retrieval_eval_fixture() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/memory-retrieval-eval.json");
     assert!(

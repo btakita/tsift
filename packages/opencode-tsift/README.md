@@ -16,6 +16,9 @@ available in a project without cloning the `tsift` repository:
 - `/tsift-status`
 - `/tsift-session-review`
 - `/tsift-context-pack`
+- `/tsift-memory-status`
+- `/tsift-memory-search`
+- `/tsift-memory-guard`
 - `/tsift-diff-digest`
 - `/tsift-test-digest`
 - `/tsift-log-digest`
@@ -47,6 +50,9 @@ shell invocation. The required permissions break down by command:
 | `/tsift-status` | `tsift status --fix` | `.tsift/`, source tree | `.tsift/`, AGENTS.md, CLAUDE.md |
 | `/tsift-session-review` | `tsift --envelope session-review` | `.tsift/`, agent-doc logs | — |
 | `/tsift-context-pack` | `tsift --envelope context-pack` | `.tsift/`, source files | — |
+| `/tsift-memory-status` | `tsift memory status` | `.tsift/`, `.claude-mem/` fallback import source | — |
+| `/tsift-memory-search` | `tsift graph-db --path . --json related` | `.tsift/graph.db`, `.tsift/memory.db` projected rows | — |
+| `/tsift-memory-guard` | `tsift memory budget-guard` | target payload | — |
 | `/tsift-diff-digest` | `tsift diff-digest` | `.tsift/`, git working tree | — |
 | `/tsift-test-digest` | `tsift --envelope __digest-runner --kind test` | `.tsift/`, test output | — |
 | `/tsift-log-digest` | `tsift --envelope __digest-runner --kind log` | `.tsift/`, build output | — |

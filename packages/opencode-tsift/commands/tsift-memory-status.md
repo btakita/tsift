@@ -3,4 +3,4 @@
 description: Inspect first-party tsift memory readiness
 ---
 
-Run `tsift memory status <target> --json`, where `<target>` is `$ARGUMENTS` or `.` when no argument is provided. Summarize schema initialization, agent-doc hook contract, claude-mem import readiness, and the next bounded memory command to run. Do not import data unless the user explicitly asks for `--apply`.
+Run `tsift memory status <target> --json`, where `<target>` is `$ARGUMENTS` or `.` when no argument is provided. Summarize schema initialization, agent-doc hook contract, graph-db retrieval readiness, and claude-mem fallback import readiness. Do not import data unless the user explicitly asks for `--apply`.

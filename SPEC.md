@@ -316,8 +316,9 @@ tsift graph-db --path . doctor --json # validate local graph.db without refreshi
 tsift graph-db --backend convex-snapshot --convex-snapshot rows.json node <id> --json # Convex snapshot read
 tsift graph-db --backend convex-snapshot --convex-snapshot rows.json drift --json # SQLite vs Convex projection diff
 tsift graph-db --backend convex-snapshot --convex-snapshot rows.json doctor --json # validate Convex rows/index metadata
+tsift graph-db --path . --json related 'memory retrieval query' # first-party tsift-memory / semantic graph retrieval; use instead of direct claude-mem or /mem-search
 tsift memory init . --json # initialize first-party .tsift/memory.db
-tsift memory import-claude-mem . --all --apply --json # migrate all supported claude-mem rows into tsift-memory with per-table count reconciliation; pending_messages is reported but intentionally excluded; large reports cap event_ids and expose event_ids_total/event_ids_truncated
+tsift memory import-claude-mem . --all --apply --json # fallback migration for supported claude-mem rows into tsift-memory with per-table count reconciliation; pending_messages is reported but intentionally excluded; large reports cap event_ids and expose event_ids_total/event_ids_truncated
 tsift memory capture-agent-doc-closeout . --session-path tasks/software/tsift.md --prompt-target 'do [#id]' --response-summary '<summary>' --commit-hash <sha> --session-check-status clean --json # capture agent-doc closeout events into tsift-memory
 tsift --envelope explain <symbol> --budget normal # bounded agent preview
 tsift --envelope source-read src/main.rs --start 1 --lines 80 --budget normal # bounded source-file preview with expansion handles

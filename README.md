@@ -39,7 +39,7 @@ tsift graph-db --path . status --json
 tsift graph-db --path . compact --json
 tsift graph-db --path . kind backlog --property ref_id=cvxa --limit 5 --json
 tsift graph-db --path . evidence cvxa --depth 3 --limit 8 --json
-tsift graph-db --path . related "realtime avatar memory" --kind all --json
+tsift graph-db --path . --json related --kind all "realtime avatar memory"
 tsift conflict-matrix --path tasks/software/tsift.md cvxa --json
 tsift dependency-dag --path tasks/software/tsift.md cvxa --json
 tsift graph-db --path . doctor --json
@@ -73,17 +73,15 @@ node, edge, and materialized-property delta counts so unchanged property rows do
 not hide write amplification. Use
 `tsift graph-db evidence <backlog-id-or-job-handle>` for bounded
 worker-context/source-handle/semantic handoff packets. Use `tsift graph-db
-related <phrase>` to turn natural-language concept phrases into semantic
-concept/entity seeds and expand incident/outgoing graph neighborhoods around
-them for knowledge retrieval. Refresh also projects matching read-only
-`claude-mem` rows from a project-local `.claude-mem/claude-mem.db` or the
-default `~/.claude-mem/claude-mem.db`, including Chroma vector handles, so
-existing memory can seed those semantic graph queries without importing capture.
-`tsift memory import-claude-mem . --all --apply --json` migrates every
-supported `observations`, `session_summaries`, and `user_prompts` row into
-`.tsift/memory.db` and reports table-level count reconciliation. Large imports
-cap returned `event_ids` while preserving `event_ids_total` and
-`event_ids_truncated` for proof without oversized JSON.
+related <phrase>` as the memory-search surface: it turns natural-language
+concept phrases into semantic concept/entity seeds and expands incident/outgoing
+graph neighborhoods around them for knowledge retrieval from projected
+`.tsift/memory.db` rows. `tsift memory import-claude-mem . --all --apply
+--json` is the fallback migration path for existing claude-mem stores; it
+migrates every supported `observations`, `session_summaries`, and
+`user_prompts` row into `.tsift/memory.db` and reports table-level count
+reconciliation. Large imports cap returned `event_ids` while preserving
+`event_ids_total` and `event_ids_truncated` for proof without oversized JSON.
 Use `tsift
 conflict-matrix` to rank candidate worker scopes, flag shared
 file/symbol/test/config ownership, and emit first-class worker prompt packets

@@ -429,7 +429,12 @@ const OPENCODE_COMMANDS: &[OpenCodeCommandSpec] = &[
     OpenCodeCommandSpec {
         name: "tsift-memory-status",
         description: "Inspect first-party tsift memory readiness",
-        body: r#"Run `tsift memory status <target> --json`, where `<target>` is `$ARGUMENTS` or `.` when no argument is provided. Summarize schema initialization, agent-doc hook contract, claude-mem import readiness, and the next bounded memory command to run. Do not import data unless the user explicitly asks for `--apply`."#,
+        body: r#"Run `tsift memory status <target> --json`, where `<target>` is `$ARGUMENTS` or `.` when no argument is provided. Summarize schema initialization, agent-doc hook contract, graph-db retrieval readiness, and claude-mem fallback import readiness. Do not import data unless the user explicitly asks for `--apply`."#,
+    },
+    OpenCodeCommandSpec {
+        name: "tsift-memory-search",
+        description: "Search first-party tsift memory graph",
+        body: r#"Run `tsift graph-db --path . --json related '<query>'`, where `<query>` is `$ARGUMENTS`; ask for a query if `$ARGUMENTS` is empty. Summarize semantic readiness, useful memory/source hits, and any refresh/import fallback commands. Prefer tsift-memory/graph-db retrieval and do not call direct claude-mem or `/mem-search`; claude-mem remains only a fallback import source through `tsift memory import-claude-mem` when graph memory is missing."#,
     },
     OpenCodeCommandSpec {
         name: "tsift-memory-guard",
@@ -1140,7 +1145,14 @@ mod tests {
             std::fs::read_to_string(dir.path().join(".opencode/commands/tsift-memory-status.md"))
                 .unwrap();
         assert!(memory_status.contains("tsift memory status"));
-        assert!(memory_status.contains("claude-mem import readiness"));
+        assert!(memory_status.contains("graph-db retrieval readiness"));
+        assert!(memory_status.contains("claude-mem fallback import readiness"));
+
+        let memory_search =
+            std::fs::read_to_string(dir.path().join(".opencode/commands/tsift-memory-search.md"))
+                .unwrap();
+        assert!(memory_search.contains("tsift graph-db --path . --json related"));
+        assert!(memory_search.contains("do not call direct claude-mem or `/mem-search`"));
 
         let memory_guard =
             std::fs::read_to_string(dir.path().join(".opencode/commands/tsift-memory-guard.md"))

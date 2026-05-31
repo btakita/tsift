@@ -181,6 +181,10 @@ fn cmd_memory_status(
         next_commands: vec![
             format!("tsift memory init {}", path.display()),
             format!(
+                "tsift graph-db --path {} --json related '<query>'",
+                path.display()
+            ),
+            format!(
                 "tsift memory import-claude-mem {} --all --apply --json",
                 path.display()
             ),
@@ -192,7 +196,7 @@ fn cmd_memory_status(
         &format,
         "status",
         ToolEnvelopeSummary {
-            text: "tsift-memory schema and import readiness".to_string(),
+            text: "tsift-memory graph retrieval and fallback import readiness".to_string(),
             metrics: vec![
                 envelope_metric("schema_version", report.schema_version),
                 envelope_metric("initialized", report.initialized),
@@ -264,11 +268,15 @@ fn cmd_memory_import_claude_mem(
         },
         vec![
             format!("tsift memory status {} --json", path.display()),
+            format!("tsift graph-db --path {} --json refresh", path.display()),
+            format!(
+                "tsift graph-db --path {} --json related '<query>'",
+                path.display()
+            ),
             format!(
                 "tsift memory import-claude-mem {} --all --apply --json",
                 path.display()
             ),
-            format!("tsift graph-db --path {} --json refresh", path.display()),
         ],
     )
 }
@@ -310,6 +318,10 @@ fn cmd_memory_capture_agent_doc_closeout(
         next_commands: vec![
             format!("tsift memory status {} --json", path.display()),
             format!("tsift graph-db --path {} --json refresh", path.display()),
+            format!(
+                "tsift graph-db --path {} --json related '<query>'",
+                path.display()
+            ),
         ],
     };
     print_memory_report(
