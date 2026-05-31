@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -179,6 +180,74 @@ impl SearchInput {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenIndex {
+    token_to_files: HashMap<String, Vec<String>>,
+    total_files: usize,
+}
+
+impl TokenIndex {
+    pub fn build(root: &Path) -> Result<Self> {
+        let mut token_to_files: HashMap<String, Vec<String>> = HashMap::new();
+        let mut total_files = 0usize;
+        for path in candidate_files(root)? {
+            let Ok(contents) = fs::read_to_string(&path) else {
+                continue;
+            };
+            total_files += 1;
+            let path_str = path.display().to_string();
+            let mut seen = HashSet::new();
+            for line in contents.lines() {
+                for token in tokenize_iter(line) {
+                    if seen.insert(token.clone()) {
+                        token_to_files
+                            .entry(token)
+                            .or_default()
+                            .push(path_str.clone());
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            token_to_files,
+            total_files,
+        })
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let data = fs::read_to_string(path)
+            .with_context(|| format!("loading token index from {}", path.display()))?;
+        Ok(serde_json::from_str(&data)?)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let data = serde_json::to_string(self)?;
+        fs::write(path, data)
+            .with_context(|| format!("saving token index to {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn files_matching_any(&self, tokens: &[String]) -> HashSet<PathBuf> {
+        let mut files = HashSet::new();
+        for token in tokens {
+            if let Some(paths) = self.token_to_files.get(token) {
+                for p in paths {
+                    files.insert(PathBuf::from(p));
+                }
+            }
+        }
+        files
+    }
+
+    pub fn total_files(&self) -> usize {
+        self.total_files
+    }
+
+    pub fn unique_tokens(&self) -> usize {
+        self.token_to_files.len()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SiftBuilder {
     cache_dir: Option<PathBuf>,
@@ -226,10 +295,22 @@ impl Sift {
         }
 
         let query_tokens = tokenize(&input.query);
+        let token_index = self.load_or_build_token_index(&input.root)?;
+
+        let filtered_files = if query_tokens.is_empty() {
+            candidate_files(&input.root)?
+        } else {
+            token_index
+                .files_matching_any(&query_tokens)
+                .into_iter()
+                .filter(|p| p.exists())
+                .collect()
+        };
+
         let mut candidates = Vec::new();
         let mut indexed_artifacts = 0usize;
         let mut skipped_artifacts = 0usize;
-        for path in candidate_files(&input.root)? {
+        for path in filtered_files {
             let Ok(contents) = fs::read_to_string(&path) else {
                 skipped_artifacts += 1;
                 continue;
@@ -264,6 +345,21 @@ impl Sift {
             skipped_artifacts,
             strategy: input.options.strategy,
         })
+    }
+
+    fn load_or_build_token_index(&self, root: &Path) -> Result<TokenIndex> {
+        if let Some(cache_dir) = &self.cache_dir {
+            let index_path = cache_dir.join("token-index.json");
+            if index_path.exists() {
+                if let Ok(index) = TokenIndex::load(&index_path) {
+                    return Ok(index);
+                }
+            }
+            let index = TokenIndex::build(root)?;
+            let _ = index.save(&index_path);
+            return Ok(index);
+        }
+        TokenIndex::build(root)
     }
 }
 
@@ -341,6 +437,13 @@ fn tokenize(value: &str) -> Vec<String> {
         .filter(|token| !token.is_empty())
         .map(|token| token.to_lowercase())
         .collect()
+}
+
+fn tokenize_iter(value: &str) -> impl Iterator<Item = String> + '_ {
+    value
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_lowercase())
 }
 
 fn score_file(
@@ -432,7 +535,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.strategy, "lexical");
-        assert_eq!(response.indexed_artifacts, 2);
+        assert_eq!(response.indexed_artifacts, 1);
         assert_eq!(response.hits.len(), 1);
         assert!(response.hits[0].path.ends_with("beta.rs"));
         assert_eq!(response.hits[0].location.as_deref(), Some("line 1"));
@@ -486,5 +589,106 @@ mod tests {
         assert!(!terse_json.contains("budget"));
         assert!(!terse_json.contains("freshness"));
         assert!(!terse_json.contains("provenance"));
+    }
+
+    #[test]
+    fn token_index_build_and_query() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("alpha.rs"), "fn route_dispatch() {}\n").unwrap();
+        fs::write(dir.path().join("beta.rs"), "fn unrelated() {}\n").unwrap();
+
+        let index = TokenIndex::build(dir.path()).unwrap();
+        assert_eq!(index.total_files(), 2);
+        assert!(index.unique_tokens() > 0);
+
+        let matching = index.files_matching_any(&["route".to_string()]);
+        assert_eq!(matching.len(), 1);
+        assert!(matching.iter().any(|p| p.ends_with("alpha.rs")));
+    }
+
+    #[test]
+    fn token_index_skips_files_with_no_matching_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn target_function() {}\n").unwrap();
+        fs::write(dir.path().join("b.rs"), "fn completely_different() {}\n").unwrap();
+        fs::write(dir.path().join("c.rs"), "struct Widget;\n").unwrap();
+
+        let index = TokenIndex::build(dir.path()).unwrap();
+        let matching = index.files_matching_any(&["target".to_string()]);
+        assert_eq!(matching.len(), 1);
+        assert!(matching.iter().any(|p| p.ends_with("a.rs")));
+    }
+
+    #[test]
+    fn token_index_multi_token_union() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn alpha() {}\n").unwrap();
+        fs::write(dir.path().join("b.rs"), "fn beta() {}\n").unwrap();
+        fs::write(dir.path().join("c.rs"), "fn gamma() {}\n").unwrap();
+
+        let index = TokenIndex::build(dir.path()).unwrap();
+        let matching = index.files_matching_any(&["alpha".to_string(), "gamma".to_string()]);
+        assert_eq!(matching.len(), 2);
+    }
+
+    #[test]
+    fn token_index_no_match_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn foo() {}\n").unwrap();
+
+        let index = TokenIndex::build(dir.path()).unwrap();
+        let matching = index.files_matching_any(&["nonexistent".to_string()]);
+        assert!(matching.is_empty());
+    }
+
+    #[test]
+    fn token_index_save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn hello() {}\n").unwrap();
+
+        let index = TokenIndex::build(dir.path()).unwrap();
+        let cache_path = dir.path().join("token-index.json");
+        index.save(&cache_path).unwrap();
+
+        let loaded = TokenIndex::load(&cache_path).unwrap();
+        assert_eq!(loaded.total_files(), index.total_files());
+        assert_eq!(loaded.unique_tokens(), index.unique_tokens());
+
+        let orig_matching = index.files_matching_any(&["hello".to_string()]);
+        let loaded_matching = loaded.files_matching_any(&["hello".to_string()]);
+        assert_eq!(orig_matching.len(), loaded_matching.len());
+    }
+
+    #[test]
+    fn search_uses_token_index_to_skip_unrelated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        fs::write(dir.path().join("target.rs"), "fn target_function() {}\n").unwrap();
+        fs::write(dir.path().join("noise.rs"), "fn unrelated_stuff() {}\n").unwrap();
+        fs::write(dir.path().join("other.rs"), "struct Placeholder;\n").unwrap();
+
+        let response = Sift::builder()
+            .with_cache_dir(&cache_dir)
+            .build()
+            .search(SearchInput::new(dir.path(), "target_function"))
+            .unwrap();
+
+        assert_eq!(response.hits.len(), 1);
+        assert!(response.hits[0].path.ends_with("target.rs"));
+        assert!(cache_dir.join("token-index.json").exists());
+    }
+
+    #[test]
+    fn token_index_empty_query_returns_all() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn foo() {}\n").unwrap();
+
+        let response = Sift::builder()
+            .build()
+            .search(SearchInput::new(dir.path(), ""))
+            .unwrap();
+
+        assert_eq!(response.indexed_artifacts, 1);
+        assert_eq!(response.hits.len(), 0);
     }
 }

@@ -96,6 +96,8 @@ tsift (root crate — public package shim: lib.rs + graph/lang/resolution/substr
 │   └── re-exported via root `tsift` `pub use tsift_digest::{diff_digest, log_digest, metric_digest, test_digest};`
 ├── tsift-search crate (packages/tsift-search — search ranking, impact analysis, tagpath annotation)
 │   ├── sift module — local lexical search adapter (ranked BM25-ish lexical hits, cache serialization)
+│   │   ├── TokenIndex — inverted token→files index for pre-filtering; skips files with no matching query tokens; cached as token-index.json in cache_dir
+│   │   └── Sift::search builds/loads TokenIndex automatically; only reads+scores files in the token-match set
 │   ├── impact module — change-impact analysis (call-edge/route/import impacts; per-language import detection gated by lang-* features)
 │   ├── tagpath_adapter module — tagpath `.naming/index.json` family/member lookup + handle round-trip
 │   ├── depends on tsift-index (config/index/walk), tsift-digest (diff_digest), tsift-graph (Lang), tsift-quality (lint), tsift-summarize
