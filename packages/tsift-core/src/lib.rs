@@ -141,6 +141,105 @@ impl GraphEdge {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerseGraphNode {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, String>,
+}
+
+impl From<GraphNode> for TerseGraphNode {
+    fn from(node: GraphNode) -> Self {
+        Self {
+            id: node.id,
+            kind: node.kind,
+            label: node.label,
+            properties: node.properties,
+        }
+    }
+}
+
+impl From<&GraphNode> for TerseGraphNode {
+    fn from(node: &GraphNode) -> Self {
+        Self {
+            id: node.id.clone(),
+            kind: node.kind.clone(),
+            label: node.label.clone(),
+            properties: node.properties.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerseGraphEdge {
+    #[serde(default)]
+    pub id: String,
+    pub from_id: String,
+    pub to_id: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, String>,
+}
+
+impl From<GraphEdge> for TerseGraphEdge {
+    fn from(edge: GraphEdge) -> Self {
+        Self {
+            id: edge.id,
+            from_id: edge.from_id,
+            to_id: edge.to_id,
+            kind: edge.kind,
+            properties: edge.properties,
+        }
+    }
+}
+
+impl From<&GraphEdge> for TerseGraphEdge {
+    fn from(edge: &GraphEdge) -> Self {
+        Self {
+            id: edge.id.clone(),
+            from_id: edge.from_id.clone(),
+            to_id: edge.to_id.clone(),
+            kind: edge.kind.clone(),
+            properties: edge.properties.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TerseGraphSubgraph {
+    pub nodes: Vec<TerseGraphNode>,
+    pub edges: Vec<TerseGraphEdge>,
+}
+
+impl From<GraphSubgraph> for TerseGraphSubgraph {
+    fn from(subgraph: GraphSubgraph) -> Self {
+        Self {
+            nodes: subgraph.nodes.into_iter().map(TerseGraphNode::from).collect(),
+            edges: subgraph.edges.into_iter().map(TerseGraphEdge::from).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerseSearchHit {
+    pub artifact_id: String,
+    pub confidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    pub path: String,
+    pub rank: usize,
+    pub score: f64,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerseHealthScore {
+    pub name: String,
+    pub overall: f64,
+}
+
 pub fn stable_graph_edge_id(from_id: &str, to_id: &str, kind: &str) -> String {
     let raw = serde_json::json!([from_id, kind, to_id]).to_string();
     format!("edge:{}", blake3::hash(raw.as_bytes()).to_hex())
@@ -513,14 +612,25 @@ pub trait GraphStore {
             if current_depth >= depth {
                 continue;
             }
-            for edge in self.outgoing_edges(&current, kind)? {
+            let outgoing = self.outgoing_edges(&current, kind)?;
+            let mut missing_ids = Vec::new();
+            for edge in &outgoing {
                 let edge_key = (edge.from_id.clone(), edge.kind.clone(), edge.to_id.clone());
                 edges.entry(edge_key).or_insert_with(|| edge.clone());
-                if !nodes.contains_key(&edge.to_id)
-                    && let Some(node) = self.node(&edge.to_id)?
-                {
-                    nodes.insert(edge.to_id.clone(), node);
-                    queue.push_back((edge.to_id.clone(), current_depth + 1));
+                if !nodes.contains_key(&edge.to_id) {
+                    missing_ids.push(edge.to_id.clone());
+                }
+            }
+            if !missing_ids.is_empty() {
+                missing_ids.sort();
+                missing_ids.dedup();
+                for id in &missing_ids {
+                    if !nodes.contains_key(id) {
+                        if let Some(node) = self.node(id)? {
+                            nodes.insert(id.clone(), node);
+                            queue.push_back((id.clone(), current_depth + 1));
+                        }
+                    }
                 }
             }
         }
@@ -1027,12 +1137,12 @@ pub fn shortest_path_using_outgoing(
     }
 
     let mut queue = VecDeque::new();
-    let mut parent = BTreeMap::<String, String>::new();
-    parent.insert(from_id.to_string(), String::new());
+    let mut parent = BTreeMap::<String, (usize, String)>::new();
+    parent.insert(from_id.to_string(), (0, String::new()));
     queue.push_back(from_id.to_string());
 
     while let Some(current) = queue.pop_front() {
-        let current_depth = parent_depth(&parent, &current);
+        let current_depth = parent.get(&current).map(|(d, _)| *d).unwrap_or(0);
         if max_hops.is_some_and(|max_hops| current_depth >= max_hops) {
             continue;
         }
@@ -1040,11 +1150,11 @@ pub fn shortest_path_using_outgoing(
             if parent.contains_key(&edge.to_id) {
                 continue;
             }
-            parent.insert(edge.to_id.clone(), current.clone());
+            parent.insert(edge.to_id.clone(), (current_depth + 1, current.clone()));
             if edge.to_id == to_id {
                 let mut nodes = vec![to_id.to_string()];
                 let mut cursor = to_id;
-                while let Some(previous) = parent.get(cursor) {
+                while let Some((_, previous)) = parent.get(cursor) {
                     if previous.is_empty() {
                         break;
                     }
@@ -1060,19 +1170,6 @@ pub fn shortest_path_using_outgoing(
     }
 
     Ok(None)
-}
-
-fn parent_depth(parent: &BTreeMap<String, String>, id: &str) -> usize {
-    let mut depth = 0usize;
-    let mut cursor = id;
-    while let Some(previous) = parent.get(cursor) {
-        if previous.is_empty() {
-            break;
-        }
-        depth += 1;
-        cursor = previous;
-    }
-    depth
 }
 
 #[cfg(test)]
@@ -1310,6 +1407,64 @@ mod tests {
             ConvexEdgeRow::stable_key("doc:livekit", "topic:rooms", "mentions")
         );
         assert!(mentions.edge_key.starts_with("edge:"));
+    }
+
+    #[test]
+    fn terse_graph_node_strips_provenance_and_freshness() {
+        let node = GraphNode::new("doc:livekit", "document", "LiveKit guide")
+            .with_property("domain", "livekit")
+            .with_provenance(GraphProvenance::new("fixture", "src/lib.rs:1"))
+            .with_freshness(GraphFreshness::content_hash("hash-1"));
+        let terse = TerseGraphNode::from(&node);
+        assert_eq!(terse.id, "doc:livekit");
+        assert_eq!(terse.kind, "document");
+        assert_eq!(terse.label, "LiveKit guide");
+        assert_eq!(terse.properties.get("domain"), Some(&"livekit".to_string()));
+        let json = serde_json::to_value(&terse).unwrap();
+        assert!(json.get("provenance").is_none());
+        assert!(json.get("freshness").is_none());
+        let full_json = serde_json::to_string(&node).unwrap();
+        let terse_json = serde_json::to_string(&terse).unwrap();
+        assert!(
+            terse_json.len() < full_json.len(),
+            "terse ({}) should be shorter than full ({})",
+            terse_json.len(),
+            full_json.len()
+        );
+    }
+
+    #[test]
+    fn terse_graph_edge_strips_provenance_and_freshness() {
+        let edge = GraphEdge::new("a", "b", "calls")
+            .with_property("line", "10")
+            .with_provenance(GraphProvenance::new("fixture", "src/lib.rs:5"))
+            .with_freshness(GraphFreshness::content_hash("edge-hash"));
+        let terse = TerseGraphEdge::from(&edge);
+        assert_eq!(terse.from_id, "a");
+        assert_eq!(terse.to_id, "b");
+        assert_eq!(terse.kind, "calls");
+        assert_eq!(terse.properties.get("line"), Some(&"10".to_string()));
+        let json = serde_json::to_value(&terse).unwrap();
+        assert!(json.get("provenance").is_none());
+        assert!(json.get("freshness").is_none());
+    }
+
+    #[test]
+    fn terse_graph_subgraph_rounds_trip() {
+        let subgraph = GraphSubgraph {
+            nodes: vec![
+                GraphNode::new("a", "fn", "alpha")
+                    .with_provenance(GraphProvenance::new("src", "a.rs")),
+                GraphNode::new("b", "fn", "beta"),
+            ],
+            edges: vec![GraphEdge::new("a", "b", "calls")
+                .with_freshness(GraphFreshness::content_hash("h"))],
+        }
+        .sorted();
+        let terse = TerseGraphSubgraph::from(subgraph);
+        assert_eq!(terse.nodes.len(), 2);
+        assert_eq!(terse.edges.len(), 1);
+        assert_eq!(terse.edges[0].from_id, "a");
     }
 
     #[test]

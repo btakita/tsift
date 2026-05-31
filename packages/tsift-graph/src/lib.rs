@@ -644,6 +644,17 @@ pub fn detect_communities(edges: &[(String, String)]) -> CommunityResult {
 
     let mut community: Vec<usize> = (0..n).collect();
     let mut comm_degree: Vec<f64> = degree.clone();
+    let mut ki_in: Vec<HashMap<usize, f64>> = adj
+        .iter()
+        .enumerate()
+        .map(|(_i, neighbors)| {
+            let mut map = HashMap::new();
+            for &nb in neighbors {
+                *map.entry(community[nb]).or_insert(0.0) += 1.0;
+            }
+            map
+        })
+        .collect();
 
     let mut iterations = 0;
     loop {
@@ -654,19 +665,16 @@ pub fn detect_communities(edges: &[(String, String)]) -> CommunityResult {
             let cur_c = community[i];
             let ki = degree[i];
 
-            let ki_in_cur = adj[i].iter().filter(|&&nb| community[nb] == cur_c).count() as f64;
+            let ki_in_cur = ki_in[i].get(&cur_c).copied().unwrap_or(0.0);
             let cur_gain = ki_in_cur / m - ki * (comm_degree[cur_c] - ki) / (2.0 * m * m);
 
             let mut best_delta = 0.0f64;
             let mut best_c = cur_c;
 
-            let mut seen_comms: HashSet<usize> = HashSet::new();
-            for &nb in &adj[i] {
-                let c = community[nb];
-                if c == cur_c || !seen_comms.insert(c) {
+            for (&c, &ki_in_c) in &ki_in[i] {
+                if c == cur_c {
                     continue;
                 }
-                let ki_in_c = adj[i].iter().filter(|&&nb2| community[nb2] == c).count() as f64;
                 let target_gain = ki_in_c / m - ki * comm_degree[c] / (2.0 * m * m);
                 let delta = target_gain - cur_gain;
                 if delta > best_delta {
@@ -678,6 +686,10 @@ pub fn detect_communities(edges: &[(String, String)]) -> CommunityResult {
             if best_c != cur_c {
                 comm_degree[cur_c] -= ki;
                 comm_degree[best_c] += ki;
+                for &nb in &adj[i] {
+                    ki_in[nb].entry(cur_c).and_modify(|v| *v -= 1.0).or_insert(-1.0);
+                    *ki_in[nb].entry(best_c).or_insert(0.0) += 1.0;
+                }
                 community[i] = best_c;
                 improved = true;
             }

@@ -23,6 +23,53 @@ pub struct HealthReport {
     pub edge_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerseHealthReport {
+    pub top_scores: Vec<TerseHealthScore>,
+    pub bottom_scores: Vec<TerseHealthScore>,
+    pub avg_overall: f64,
+    pub avg_cycle_risk: f64,
+    pub node_count: usize,
+    pub edge_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerseHealthScore {
+    pub name: String,
+    pub overall: f64,
+}
+
+pub fn terse_health_report(edges: &[(String, String)], n: usize) -> TerseHealthReport {
+    let report = composite_health_score(edges);
+    let top_scores: Vec<TerseHealthScore> = report
+        .scores
+        .iter()
+        .take(n)
+        .map(|s| TerseHealthScore {
+            name: s.name.clone(),
+            overall: s.overall,
+        })
+        .collect();
+    let bottom_scores: Vec<TerseHealthScore> = report
+        .scores
+        .iter()
+        .rev()
+        .take(n)
+        .map(|s| TerseHealthScore {
+            name: s.name.clone(),
+            overall: s.overall,
+        })
+        .collect();
+    TerseHealthReport {
+        top_scores,
+        bottom_scores,
+        avg_overall: report.avg_overall,
+        avg_cycle_risk: report.avg_cycle_risk,
+        node_count: report.node_count,
+        edge_count: report.edge_count,
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn build_graph(
     edges: &[(String, String)],
@@ -57,23 +104,110 @@ fn build_graph(
 }
 
 fn compute_reachability(n: usize, adj: &[HashSet<usize>]) -> Vec<usize> {
-    let mut reach = vec![0usize; n];
-    for start in 0..n {
-        let mut visited = vec![false; n];
-        let mut queue = std::collections::VecDeque::new();
-        visited[start] = true;
-        queue.push_back(start);
-        while let Some(v) = queue.pop_front() {
-            for &w in &adj[v] {
-                if !visited[w] {
-                    visited[w] = true;
-                    queue.push_back(w);
+    let sccs = compute_sccs(n, adj);
+    let mut comp_of = vec![0usize; n];
+    for (comp_id, members) in sccs.iter().enumerate() {
+        for &node in members {
+            comp_of[node] = comp_id;
+        }
+    }
+    let num_comps = sccs.len();
+    let mut comp_adj: Vec<HashSet<usize>> = vec![HashSet::new(); num_comps];
+    for u in 0..n {
+        for &v in &adj[u] {
+            let cu = comp_of[u];
+            let cv = comp_of[v];
+            if cu != cv {
+                comp_adj[cu].insert(cv);
+            }
+        }
+    }
+    let mut comp_reach = vec![0usize; num_comps];
+    for c in 0..num_comps {
+        let mut visited = vec![false; num_comps];
+        visited[c] = true;
+        let mut count = 0usize;
+        let mut queue = std::collections::VecDeque::from([c]);
+        while let Some(cur) = queue.pop_front() {
+            count += sccs[cur].len();
+            for &next in &comp_adj[cur] {
+                if !visited[next] {
+                    visited[next] = true;
+                    queue.push_back(next);
                 }
             }
         }
-        reach[start] = visited.iter().filter(|&&v| v).count();
+        comp_reach[c] = count;
+    }
+    let mut reach = vec![0usize; n];
+    for i in 0..n {
+        reach[i] = comp_reach[comp_of[i]];
     }
     reach
+}
+
+fn compute_sccs(n: usize, adj: &[HashSet<usize>]) -> Vec<Vec<usize>> {
+    let mut index = 0usize;
+    let mut stack = Vec::new();
+    let mut on_stack = vec![false; n];
+    let mut indices = vec![None::<usize>; n];
+    let mut lowlinks = vec![0usize; n];
+    let mut components: Vec<Vec<usize>> = Vec::new();
+
+    fn strongconnect(
+        v: usize,
+        adj: &[HashSet<usize>],
+        index: &mut usize,
+        stack: &mut Vec<usize>,
+        on_stack: &mut Vec<bool>,
+        indices: &mut Vec<Option<usize>>,
+        lowlinks: &mut Vec<usize>,
+        components: &mut Vec<Vec<usize>>,
+    ) {
+        indices[v] = Some(*index);
+        lowlinks[v] = *index;
+        *index += 1;
+        stack.push(v);
+        on_stack[v] = true;
+
+        for &w in &adj[v] {
+            if indices[w].is_none() {
+                strongconnect(w, adj, index, stack, on_stack, indices, lowlinks, components);
+            }
+            if on_stack[w] {
+                lowlinks[v] = lowlinks[v].min(indices[w].unwrap());
+            }
+        }
+
+        if indices[v] == Some(lowlinks[v]) {
+            let mut component = Vec::new();
+            loop {
+                let w = stack.pop().unwrap();
+                on_stack[w] = false;
+                component.push(w);
+                if w == v {
+                    break;
+                }
+            }
+            components.push(component);
+        }
+    }
+
+    for v in 0..n {
+        if indices[v].is_none() {
+            strongconnect(
+                v,
+                adj,
+                &mut index,
+                &mut stack,
+                &mut on_stack,
+                &mut indices,
+                &mut lowlinks,
+                &mut components,
+            );
+        }
+    }
+    components
 }
 
 fn find_cycles(n: usize, adj: &[HashSet<usize>]) -> HashSet<usize> {

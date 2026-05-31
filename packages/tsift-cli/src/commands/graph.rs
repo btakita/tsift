@@ -70,7 +70,7 @@ pub(crate) fn cmd_graph(
         }
     };
 
-    if callers || show_both {
+    let callers_result = if callers || show_both {
         let mut edges = db.callers_of(symbol)?;
         let diag = annotate_stored_edges_with_tagpath(
             &mut edges,
@@ -84,15 +84,41 @@ pub(crate) fn cmd_graph(
         if !absolute {
             relativize_edges(&mut edges, &root);
         }
+        Some(edges)
+    } else {
+        None
+    };
+
+    let callees_result = if callees || show_both {
+        let mut edges = db.callees_of(symbol)?;
+        let diag = annotate_stored_edges_with_tagpath(
+            &mut edges,
+            &db,
+            &root,
+            scope,
+            EdgeSide::Callee,
+            &tagpath_opts,
+        )?;
+        maybe_emit_stale_diagnostic(&diag);
+        if !absolute {
+            relativize_edges(&mut edges, &root);
+        }
+        Some(edges)
+    } else {
+        None
+    };
+
+    if let Some(ref edges) = callers_result {
         let total = edges.len();
         let truncated = limit > 0 && total > limit;
+        let mut display_edges = edges.clone();
         if truncated {
-            edges.truncate(limit);
+            display_edges.truncate(limit);
         }
         if json_output {
             if !show_both {
                 let mut out = serde_json::json!({
-                    "callers": edges,
+                    "callers": display_edges,
                     "total": total,
                     "truncated": truncated,
                 });
@@ -108,7 +134,7 @@ pub(crate) fn cmd_graph(
             }
         } else if tabular {
             println!("direction\tname\tfile\tline");
-            for edge in &edges {
+            for edge in &display_edges {
                 println!(
                     "caller\t{}\t{}\t{}",
                     edge.caller_name, edge.caller_file, edge.call_site_line
@@ -119,10 +145,10 @@ pub(crate) fn cmd_graph(
             }
         } else if compact {
             println!("crs[{}]:", total);
-            if edges.is_empty() {
+            if display_edges.is_empty() {
                 println!("  (none)");
             } else {
-                for edge in &edges {
+                for edge in &display_edges {
                     println!(
                         "  {} {}:{}",
                         edge.caller_name, edge.caller_file, edge.call_site_line
@@ -134,10 +160,10 @@ pub(crate) fn cmd_graph(
             }
         } else {
             println!("Callers of `{}`:", symbol);
-            if edges.is_empty() {
+            if display_edges.is_empty() {
                 println!("  (none)");
             } else {
-                for edge in &edges {
+                for edge in &display_edges {
                     println!(
                         "  {} ({}:{})",
                         edge.caller_name, edge.caller_file, edge.call_site_line
@@ -153,29 +179,17 @@ pub(crate) fn cmd_graph(
         }
     }
 
-    if callees || show_both {
-        let mut edges = db.callees_of(symbol)?;
-        let diag = annotate_stored_edges_with_tagpath(
-            &mut edges,
-            &db,
-            &root,
-            scope,
-            EdgeSide::Callee,
-            &tagpath_opts,
-        )?;
-        maybe_emit_stale_diagnostic(&diag);
-        if !absolute {
-            relativize_edges(&mut edges, &root);
-        }
+    if let Some(ref edges) = callees_result {
         let total = edges.len();
         let truncated = limit > 0 && total > limit;
+        let mut display_edges = edges.clone();
         if truncated {
-            edges.truncate(limit);
+            display_edges.truncate(limit);
         }
         if json_output {
             if !show_both {
                 let mut out = serde_json::json!({
-                    "callees": edges,
+                    "callees": display_edges,
                     "total": total,
                     "truncated": truncated,
                 });
@@ -193,7 +207,7 @@ pub(crate) fn cmd_graph(
             if !show_both {
                 println!("direction\tname\tfile\tline");
             }
-            for edge in &edges {
+            for edge in &display_edges {
                 println!(
                     "callee\t{}\t{}\t{}",
                     edge.callee_name, edge.caller_file, edge.call_site_line
@@ -204,10 +218,10 @@ pub(crate) fn cmd_graph(
             }
         } else if compact {
             println!("ces[{}]:", total);
-            if edges.is_empty() {
+            if display_edges.is_empty() {
                 println!("  (none)");
             } else {
-                for edge in &edges {
+                for edge in &display_edges {
                     println!(
                         "  {} {}:{}",
                         edge.callee_name, edge.caller_file, edge.call_site_line
@@ -219,10 +233,10 @@ pub(crate) fn cmd_graph(
             }
         } else {
             println!("Callees of `{}`:", symbol);
-            if edges.is_empty() {
+            if display_edges.is_empty() {
                 println!("  (none)");
             } else {
-                for edge in &edges {
+                for edge in &display_edges {
                     println!(
                         "  {} ({}:{})",
                         edge.callee_name, edge.caller_file, edge.call_site_line
@@ -236,46 +250,26 @@ pub(crate) fn cmd_graph(
     }
 
     if show_both && json_output {
-        let mut callers_edges = db.callers_of(symbol)?;
-        let mut callees_edges = db.callees_of(symbol)?;
-        let caller_diag = annotate_stored_edges_with_tagpath(
-            &mut callers_edges,
-            &db,
-            &root,
-            scope,
-            EdgeSide::Caller,
-            &tagpath_opts,
-        )?;
-        let callee_diag = annotate_stored_edges_with_tagpath(
-            &mut callees_edges,
-            &db,
-            &root,
-            scope,
-            EdgeSide::Callee,
-            &tagpath_opts,
-        )?;
-        maybe_emit_stale_diagnostic(&caller_diag);
-        maybe_emit_stale_diagnostic(&callee_diag);
-        if !absolute {
-            relativize_edges(&mut callers_edges, &root);
-            relativize_edges(&mut callees_edges, &root);
-        }
+        let callers_edges = callers_result.unwrap_or_default();
+        let callees_edges = callees_result.unwrap_or_default();
         let callers_total = callers_edges.len();
         let callees_total = callees_edges.len();
         let callers_truncated = limit > 0 && callers_total > limit;
         let callees_truncated = limit > 0 && callees_total > limit;
+        let mut callers_display = callers_edges;
+        let mut callees_display = callees_edges;
         if callers_truncated {
-            callers_edges.truncate(limit);
+            callers_display.truncate(limit);
         }
         if callees_truncated {
-            callees_edges.truncate(limit);
+            callees_display.truncate(limit);
         }
         let mut combined = serde_json::json!({
             "symbol": symbol,
-            "callers": callers_edges,
+            "callers": callers_display,
             "callers_total": callers_total,
             "callers_truncated": callers_truncated,
-            "callees": callees_edges,
+            "callees": callees_display,
             "callees_total": callees_total,
             "callees_truncated": callees_truncated,
         });

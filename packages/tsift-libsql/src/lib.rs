@@ -409,6 +409,48 @@ impl GraphStore for LibsqlGraphStore {
         })
     }
 
+    fn edge(&self, edge_id: &str) -> Result<Option<GraphEdge>> {
+        block_on(&self.rt, async {
+            let mut rows = self
+                .conn
+                .query(
+                    r#"
+                    SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                    FROM graph_edges
+                    WHERE edge_key = ?1
+                    "#,
+                    [edge_id],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(Some(edge_from_row(&row)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn graph_counts(&self) -> Result<(usize, usize)> {
+        let nodes = block_on(&self.rt, async {
+            let mut rows = self
+                .conn
+                .query("SELECT COUNT(*) FROM graph_nodes", ())
+                .await?;
+            let row = rows.next().await?.context("no row")?;
+            let count: u64 = row.get(0)?;
+            Ok::<u64, anyhow::Error>(count)
+        })?;
+        let edges = block_on(&self.rt, async {
+            let mut rows = self
+                .conn
+                .query("SELECT COUNT(*) FROM graph_edges", ())
+                .await?;
+            let row = rows.next().await?.context("no row")?;
+            let count: u64 = row.get(0)?;
+            Ok::<u64, anyhow::Error>(count)
+        })?;
+        Ok((nodes as usize, edges as usize))
+    }
+
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>> {
         block_on(&self.rt, async {
             let mut rows = self

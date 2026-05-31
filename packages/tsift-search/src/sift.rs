@@ -81,6 +81,32 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
+impl SearchHit {
+    pub fn to_terse(&self) -> TerseSearchHit {
+        TerseSearchHit {
+            artifact_id: self.artifact_id.clone(),
+            confidence: format!("{:?}", self.confidence).to_lowercase(),
+            location: self.location.clone(),
+            path: self.path.clone(),
+            rank: self.rank,
+            score: self.score,
+            snippet: self.snippet.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TerseSearchHit {
+    pub artifact_id: String,
+    pub confidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    pub path: String,
+    pub rank: usize,
+    pub score: f64,
+    pub snippet: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SearchCoverageSnapshot {
     pub active_rebuild: Option<String>,
@@ -434,5 +460,31 @@ mod tests {
         assert_eq!(json["hits"][0]["artifact_kind"], "file");
         assert_eq!(json["hits"][0]["confidence"], "High");
         assert_eq!(json["hits"][0]["provenance"]["adapter"], "file-system");
+    }
+
+    #[test]
+    fn terse_search_hit_strips_budget_freshness_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let response = Sift::builder()
+            .build()
+            .search(SearchInput::new(dir.path(), "main"))
+            .unwrap();
+        let hit = &response.hits[0];
+        let terse = hit.to_terse();
+        assert_eq!(terse.artifact_id, hit.artifact_id);
+        assert_eq!(terse.path, hit.path);
+        assert_eq!(terse.rank, hit.rank);
+        let terse_json = serde_json::to_string(&terse).unwrap();
+        let full_json = serde_json::to_string(hit).unwrap();
+        assert!(
+            terse_json.len() < full_json.len(),
+            "terse ({}) should be shorter than full ({})",
+            terse_json.len(),
+            full_json.len()
+        );
+        assert!(!terse_json.contains("budget"));
+        assert!(!terse_json.contains("freshness"));
+        assert!(!terse_json.contains("provenance"));
     }
 }

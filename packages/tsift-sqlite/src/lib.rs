@@ -1539,6 +1539,35 @@ fn sqlite_query_plan_diagnostics(plan: &[String], expected_indexes: &[&str]) -> 
     diagnostics
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerseDiagnostic {
+    pub code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+}
+
+#[allow(dead_code)]
+fn terse_query_plan_diagnostics(plan: &[String], expected_indexes: &[&str]) -> Vec<TerseDiagnostic> {
+    let mut diagnostics = vec![TerseDiagnostic {
+        code: "plan_active",
+        index: None,
+    }];
+    for expected_index in expected_indexes {
+        if plan.iter().any(|row| row.contains(expected_index)) {
+            diagnostics.push(TerseDiagnostic {
+                code: "idx_ok",
+                index: Some(expected_index.to_string()),
+            });
+        } else {
+            diagnostics.push(TerseDiagnostic {
+                code: "idx_missing",
+                index: Some(expected_index.to_string()),
+            });
+        }
+    }
+    diagnostics
+}
+
 fn push_sqlite_property_filter_exists(
     sql: &mut String,
     values: &mut Vec<Value>,
@@ -2207,42 +2236,37 @@ impl GraphStore for SqliteGraphStore {
         if node_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let node_ids = node_ids.iter().cloned().collect::<Vec<_>>();
-        let mut edges = BTreeMap::<(String, String, String), GraphEdge>::new();
-        for from_chunk in node_ids.chunks(450) {
-            let from_placeholders = std::iter::repeat_n("?", from_chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            for to_chunk in node_ids.chunks(450) {
-                let to_placeholders = std::iter::repeat_n("?", to_chunk.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!(
-                    r#"
-                    SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
-                    FROM graph_edges INDEXED BY idx_graph_edges_from_kind
-                    WHERE from_id IN ({from_placeholders})
-                      AND to_id IN ({to_placeholders})
-                    ORDER BY from_id, kind, to_id
-                    "#
-                );
-                let mut values = from_chunk
-                    .iter()
-                    .cloned()
-                    .map(Value::Text)
-                    .collect::<Vec<_>>();
-                values.extend(to_chunk.iter().cloned().map(Value::Text));
-                let mut stmt = self.conn.prepare(&sql)?;
-                for edge in
-                    collect_rows(stmt.query_map(params_from_iter(values.iter()), edge_from_row)?)?
-                {
-                    edges
-                        .entry((edge.from_id.clone(), edge.kind.clone(), edge.to_id.clone()))
-                        .or_insert(edge);
-                }
-            }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            r#"
+            CREATE TEMP TABLE IF NOT EXISTS _edges_between_ids (id TEXT PRIMARY KEY);
+            DELETE FROM _edges_between_ids;
+            "#,
+        )?;
+        for chunk in node_ids.iter().collect::<Vec<_>>().chunks(450) {
+            let row_placeholders: Vec<String> =
+                chunk.iter().map(|_| "(?)".to_string()).collect();
+            let placeholders = row_placeholders.join(", ");
+            let sql = format!(
+                "INSERT OR IGNORE INTO _edges_between_ids (id) VALUES {placeholders}"
+            );
+            let values: Vec<Value> = chunk.iter().map(|id| Value::Text((*id).clone())).collect();
+            tx.execute(&sql, params_from_iter(values.iter()))?;
         }
-        Ok(edges.into_values().collect())
+        let edges = {
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT e.edge_key, e.from_id, e.to_id, e.kind, e.properties_json, e.provenance_json, e.freshness_json
+                FROM graph_edges e
+                WHERE EXISTS (SELECT 1 FROM _edges_between_ids f WHERE f.id = e.from_id)
+                  AND EXISTS (SELECT 1 FROM _edges_between_ids t WHERE t.id = e.to_id)
+                ORDER BY e.from_id, e.kind, e.to_id
+                "#,
+            )?;
+            collect_rows(stmt.query_map([], edge_from_row)?)?
+        };
+        tx.finish()?;
+        Ok(edges)
     }
 
     fn neighborhood(
