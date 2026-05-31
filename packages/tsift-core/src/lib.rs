@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
 pub const SQLITE_GRAPH_SCHEMA_VERSION: i64 = 5;
 
@@ -314,6 +314,53 @@ pub struct GraphQueryOptions {
     pub property_filters: Vec<GraphPropertyFilter>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NeighborhoodScoring {
+    #[default]
+    BreadthFirst,
+    EdgeKindWeighted,
+    DegreeWeighted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankedNeighborhoodOptions {
+    pub depth: usize,
+    pub max_nodes: usize,
+    pub scoring: NeighborhoodScoring,
+    #[serde(default)]
+    pub edge_kind: Option<String>,
+}
+
+impl RankedNeighborhoodOptions {
+    pub fn new(depth: usize, max_nodes: usize) -> Self {
+        Self {
+            depth,
+            max_nodes,
+            scoring: NeighborhoodScoring::BreadthFirst,
+            edge_kind: None,
+        }
+    }
+
+    pub fn with_scoring(mut self, scoring: NeighborhoodScoring) -> Self {
+        self.scoring = scoring;
+        self
+    }
+
+    pub fn with_edge_kind(mut self, kind: impl Into<String>) -> Self {
+        self.edge_kind = Some(kind.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankedNeighborhoodResult {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    pub pruned_count: usize,
+    pub total_discovered: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GraphQueryPage {
     pub cursor: Option<String>,
@@ -336,6 +383,73 @@ fn graph_node_matches_filters(node: &GraphNode, filters: &[GraphPropertyFilter])
     filters
         .iter()
         .all(|filter| node.properties.get(&filter.key) == Some(&filter.value))
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ScoredQueueEntry {
+    id: String,
+    depth: usize,
+    score: i64,
+}
+
+impl Ord for ScoredQueueEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score
+            .cmp(&other.score)
+            .then_with(|| other.depth.cmp(&self.depth))
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl PartialOrd for ScoredQueueEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn compute_neighborhood_score(
+    strategy: &NeighborhoodScoring,
+    depth: usize,
+    edge_kind: &str,
+    _node: &GraphNode,
+    degree_map: &BTreeMap<String, usize>,
+) -> i64 {
+    match strategy {
+        NeighborhoodScoring::BreadthFirst => {
+            (120i64.saturating_sub((depth as i64).saturating_mul(18))).max(0)
+        }
+        NeighborhoodScoring::EdgeKindWeighted => {
+            let depth_score = (120i64.saturating_sub((depth as i64).saturating_mul(18))).max(0);
+            let kind_score = edge_kind_weighted_score(edge_kind);
+            depth_score.saturating_add(kind_score)
+        }
+        NeighborhoodScoring::DegreeWeighted => {
+            let depth_score = (120i64.saturating_sub((depth as i64).saturating_mul(18))).max(0);
+            let degree = degree_map.values().copied().max().unwrap_or(1) as i64;
+            let degree_bonus = if degree <= 3 { 20 } else if degree <= 10 { 10 } else { 0 };
+            depth_score.saturating_add(degree_bonus)
+        }
+    }
+}
+
+fn edge_kind_weighted_score(edge_kind: &str) -> i64 {
+    match edge_kind {
+        "semantic_relation" => 34,
+        "mentions_entity" | "mentions_concept" | "tagged_entity" | "tagged_concept"
+        | "related_concept" => 28,
+        "mentions" => 22,
+        "calls" => 20,
+        "requests_context" | "scopes_context" | "scopes_source" | "explains_result" => 18,
+        "defines" | "contains" | "belongs_to" => 12,
+        kind if kind.contains("community") => 20,
+        kind if kind.contains("semantic")
+            || kind.contains("concept")
+            || kind.contains("entity") =>
+        {
+            24
+        }
+        _ => 8,
+    }
 }
 
 fn graph_edge_matches_filters(edge: &GraphEdge, filters: &[GraphPropertyFilter]) -> bool {
@@ -625,11 +739,11 @@ pub trait GraphStore {
                 missing_ids.sort();
                 missing_ids.dedup();
                 for id in &missing_ids {
-                    if !nodes.contains_key(id) {
-                        if let Some(node) = self.node(id)? {
-                            nodes.insert(id.clone(), node);
-                            queue.push_back((id.clone(), current_depth + 1));
-                        }
+                    if !nodes.contains_key(id)
+                        && let Some(node) = self.node(id)?
+                    {
+                        nodes.insert(id.clone(), node);
+                        queue.push_back((id.clone(), current_depth + 1));
                     }
                 }
             }
@@ -664,6 +778,74 @@ pub trait GraphStore {
     ) -> Result<Option<GraphPagedSubgraph>> {
         Ok(self.neighborhood(center_id, depth, kind)?.map(|subgraph| {
             apply_graph_query_page(subgraph.nodes, subgraph.edges, options, Vec::new())
+        }))
+    }
+    fn ranked_neighborhood(
+        &self,
+        center_id: &str,
+        options: &RankedNeighborhoodOptions,
+    ) -> Result<Option<RankedNeighborhoodResult>> {
+        let Some(center) = self.node(center_id)? else {
+            return Ok(None);
+        };
+        let mut nodes = BTreeMap::from([(center_id.to_string(), center)]);
+        let mut edges = BTreeMap::<(String, String, String), GraphEdge>::new();
+        let mut queue = BinaryHeap::from([ScoredQueueEntry {
+            id: center_id.to_string(),
+            depth: 0usize,
+            score: i64::MAX,
+        }]);
+        let mut seen = BTreeSet::from([center_id.to_string()]);
+        let mut pruned_count = 0usize;
+        let mut total_discovered = 1usize;
+        let mut degree_map: BTreeMap<String, usize> = BTreeMap::new();
+
+        while let Some(entry) = queue.pop() {
+            if entry.depth >= options.depth {
+                continue;
+            }
+            let outgoing = self.outgoing_edges(&entry.id, options.edge_kind.as_deref())?;
+            for edge in &outgoing {
+                let edge_key = (edge.from_id.clone(), edge.kind.clone(), edge.to_id.clone());
+                edges.entry(edge_key).or_insert_with(|| edge.clone());
+                *degree_map.entry(edge.from_id.clone()).or_default() += 1;
+                *degree_map.entry(edge.to_id.clone()).or_default() += 1;
+                if seen.contains(&edge.to_id) {
+                    continue;
+                }
+                seen.insert(edge.to_id.clone());
+                total_discovered += 1;
+                let Some(neighbor) = self.node(&edge.to_id)? else {
+                    continue;
+                };
+                if nodes.len() > options.max_nodes {
+                    pruned_count += 1;
+                    continue;
+                }
+                let score = compute_neighborhood_score(
+                    &options.scoring,
+                    entry.depth + 1,
+                    &edge.kind,
+                    &neighbor,
+                    &degree_map,
+                );
+                nodes.insert(edge.to_id.clone(), neighbor.clone());
+                queue.push(ScoredQueueEntry {
+                    id: edge.to_id.clone(),
+                    depth: entry.depth + 1,
+                    score,
+                });
+            }
+        }
+
+        let node_ids: BTreeSet<_> = nodes.keys().cloned().collect();
+        edges.retain(|_, edge| node_ids.contains(&edge.from_id) && node_ids.contains(&edge.to_id));
+
+        Ok(Some(RankedNeighborhoodResult {
+            nodes: nodes.into_values().collect(),
+            edges: edges.into_values().collect(),
+            pruned_count,
+            total_discovered,
         }))
     }
     fn reachable_nodes_by_kind(
@@ -1481,5 +1663,140 @@ mod tests {
             err.to_string().contains("references missing to node"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn ranked_neighborhood_returns_none_for_missing_center() {
+        let store = ConvexGraphStore::new(MemoryConvexGraphClient::default());
+        let options = RankedNeighborhoodOptions::new(2, 10);
+        let result = store.ranked_neighborhood("missing", &options).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn ranked_neighborhood_breadth_first_respects_max_nodes() {
+        let store = ConvexGraphStore::new(MemoryConvexGraphClient::default());
+        store.upsert_node(&GraphNode::new("a", "file", "a")).unwrap();
+        store.upsert_node(&GraphNode::new("b", "symbol", "b")).unwrap();
+        store.upsert_node(&GraphNode::new("c", "symbol", "c")).unwrap();
+        store.upsert_node(&GraphNode::new("d", "symbol", "d")).unwrap();
+        store.upsert_edge(&GraphEdge::new("a", "b", "calls")).unwrap();
+        store.upsert_edge(&GraphEdge::new("a", "c", "calls")).unwrap();
+        store.upsert_edge(&GraphEdge::new("a", "d", "calls")).unwrap();
+
+        let options = RankedNeighborhoodOptions::new(2, 2);
+        let result = store.ranked_neighborhood("a", &options).unwrap().unwrap();
+        assert!(result.nodes.len() <= 3, "center + max 2 neighbors, got {}", result.nodes.len());
+        assert!(result.pruned_count > 0, "should have pruned some nodes");
+        assert!(result.total_discovered >= 4);
+    }
+
+    #[test]
+    fn ranked_neighborhood_edge_kind_weighted_prefers_high_score_edges() {
+        let store = ConvexGraphStore::new(MemoryConvexGraphClient::default());
+        store.upsert_node(&GraphNode::new("a", "file", "a")).unwrap();
+        store.upsert_node(&GraphNode::new("b", "symbol", "b")).unwrap();
+        store.upsert_node(&GraphNode::new("c", "symbol", "c")).unwrap();
+        store.upsert_edge(&GraphEdge::new("a", "b", "semantic_relation")).unwrap();
+        store.upsert_edge(&GraphEdge::new("a", "c", "unknown")).unwrap();
+
+        let options = RankedNeighborhoodOptions::new(1, 1)
+            .with_scoring(NeighborhoodScoring::EdgeKindWeighted);
+        let result = store.ranked_neighborhood("a", &options).unwrap().unwrap();
+        let neighbor_ids: Vec<_> = result.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(
+            neighbor_ids.contains(&"b"),
+            "semantic_relation neighbor should survive pruning"
+        );
+    }
+
+    #[test]
+    fn ranked_neighborhood_includes_center_node() {
+        let store = ConvexGraphStore::new(MemoryConvexGraphClient::default());
+        store.upsert_node(&GraphNode::new("center", "file", "center")).unwrap();
+        store.upsert_node(&GraphNode::new("neighbor", "symbol", "neighbor")).unwrap();
+        store.upsert_edge(&GraphEdge::new("center", "neighbor", "calls")).unwrap();
+
+        let options = RankedNeighborhoodOptions::new(1, 10);
+        let result = store.ranked_neighborhood("center", &options).unwrap().unwrap();
+        let ids: Vec<_> = result.nodes.iter().map(|n| n.id.clone()).collect();
+        assert!(ids.contains(&"center".to_string()));
+        assert!(ids.contains(&"neighbor".to_string()));
+        assert_eq!(result.pruned_count, 0);
+    }
+
+    #[test]
+    fn ranked_neighborhood_edge_kind_filter() {
+        let store = ConvexGraphStore::new(MemoryConvexGraphClient::default());
+        store.upsert_node(&GraphNode::new("a", "file", "a")).unwrap();
+        store.upsert_node(&GraphNode::new("b", "symbol", "b")).unwrap();
+        store.upsert_node(&GraphNode::new("c", "symbol", "c")).unwrap();
+        store.upsert_edge(&GraphEdge::new("a", "b", "calls")).unwrap();
+        store.upsert_edge(&GraphEdge::new("a", "c", "mentions")).unwrap();
+
+        let options = RankedNeighborhoodOptions::new(1, 10)
+            .with_edge_kind("calls");
+        let result = store.ranked_neighborhood("a", &options).unwrap().unwrap();
+        let ids: Vec<_> = result.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"b"));
+        assert!(!ids.contains(&"c"), "mentions edge should be filtered out");
+    }
+
+    #[test]
+    fn ranked_neighborhood_degree_weighted_prefers_low_degree() {
+        let store = ConvexGraphStore::new(MemoryConvexGraphClient::default());
+        store.upsert_node(&GraphNode::new("a", "file", "a")).unwrap();
+        store.upsert_node(&GraphNode::new("b", "symbol", "b")).unwrap();
+        store.upsert_node(&GraphNode::new("c", "symbol", "c")).unwrap();
+        store.upsert_node(&GraphNode::new("d", "symbol", "d")).unwrap();
+        store.upsert_node(&GraphNode::new("e", "symbol", "e")).unwrap();
+        store.upsert_edge(&GraphEdge::new("a", "b", "calls")).unwrap();
+        store.upsert_edge(&GraphEdge::new("b", "c", "calls")).unwrap();
+        store.upsert_edge(&GraphEdge::new("b", "d", "calls")).unwrap();
+        store.upsert_edge(&GraphEdge::new("b", "e", "calls")).unwrap();
+
+        let options = RankedNeighborhoodOptions::new(2, 3)
+            .with_scoring(NeighborhoodScoring::DegreeWeighted);
+        let result = store.ranked_neighborhood("a", &options).unwrap().unwrap();
+        assert!(result.nodes.len() <= 4);
+    }
+
+    #[test]
+    fn compute_neighborhood_score_breadth_first() {
+        let score = compute_neighborhood_score(
+            &NeighborhoodScoring::BreadthFirst,
+            0,
+            "calls",
+            &GraphNode::new("x", "symbol", "x"),
+            &BTreeMap::new(),
+        );
+        assert_eq!(score, 120);
+        let score_d2 = compute_neighborhood_score(
+            &NeighborhoodScoring::BreadthFirst,
+            2,
+            "calls",
+            &GraphNode::new("x", "symbol", "x"),
+            &BTreeMap::new(),
+        );
+        assert_eq!(score_d2, 84);
+    }
+
+    #[test]
+    fn compute_neighborhood_score_edge_kind_weighted() {
+        let score_semantic = compute_neighborhood_score(
+            &NeighborhoodScoring::EdgeKindWeighted,
+            1,
+            "semantic_relation",
+            &GraphNode::new("x", "symbol", "x"),
+            &BTreeMap::new(),
+        );
+        let score_unknown = compute_neighborhood_score(
+            &NeighborhoodScoring::EdgeKindWeighted,
+            1,
+            "unknown",
+            &GraphNode::new("x", "symbol", "x"),
+            &BTreeMap::new(),
+        );
+        assert!(score_semantic > score_unknown);
     }
 }
