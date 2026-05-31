@@ -843,7 +843,7 @@ pub enum Commands {
 
 #[derive(Subcommand)]
 pub enum MemoryCommand {
-    /// Report schema, hook, graph retrieval, and claude-mem fallback import readiness
+    /// Report schema, hook, graph retrieval, and claude-mem retirement readiness
     Status {
         /// Project root whose .tsift/memory.db should be inspected
         #[arg(default_value = ".")]

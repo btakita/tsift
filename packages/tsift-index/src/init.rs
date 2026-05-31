@@ -429,7 +429,7 @@ const OPENCODE_COMMANDS: &[OpenCodeCommandSpec] = &[
     OpenCodeCommandSpec {
         name: "tsift-memory-status",
         description: "Inspect first-party tsift memory readiness",
-        body: r#"Run `tsift memory status <target> --json`, where `<target>` is `$ARGUMENTS` or `.` when no argument is provided. Summarize schema initialization, agent-doc hook contract, graph-db retrieval readiness, and claude-mem fallback import readiness. Do not import data unless the user explicitly asks for `--apply`."#,
+        body: r#"Run `tsift memory status <target> --json`, where `<target>` is `$ARGUMENTS` or `.` when no argument is provided. Summarize schema initialization, agent-doc hook contract, graph-db retrieval readiness, the claude-mem retirement gate, and rollback commands. Do not import data unless the user explicitly asks for `--apply`."#,
     },
     OpenCodeCommandSpec {
         name: "tsift-memory-search",
@@ -1146,7 +1146,8 @@ mod tests {
                 .unwrap();
         assert!(memory_status.contains("tsift memory status"));
         assert!(memory_status.contains("graph-db retrieval readiness"));
-        assert!(memory_status.contains("claude-mem fallback import readiness"));
+        assert!(memory_status.contains("claude-mem retirement gate"));
+        assert!(memory_status.contains("rollback commands"));
 
         let memory_search =
             std::fs::read_to_string(dir.path().join(".opencode/commands/tsift-memory-search.md"))

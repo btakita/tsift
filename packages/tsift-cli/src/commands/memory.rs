@@ -2,6 +2,7 @@ use crate::cli::MemoryCommand;
 use crate::output::{OutputFormat, ToolEnvelopeSummary};
 use crate::{envelope_metric, print_json_or_envelope, to_json_schema};
 use anyhow::{Context, Result, bail};
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tsift_memory::{
@@ -25,8 +26,27 @@ struct MemoryStatusReport {
     graph_node_kinds: Vec<&'static str>,
     hook_contract: Vec<tsift_memory::MemoryHookSpec>,
     claude_mem: ClaudeMemImportPlan,
+    claude_mem_retirement: ClaudeMemRetirementGate,
     query_api: MemoryQueryPlan,
     next_commands: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ClaudeMemRetirementGate {
+    decision: &'static str,
+    direct_reads_allowed: bool,
+    rollback_until_normal_session_cycle: bool,
+    conditions: Vec<ClaudeMemRetirementCondition>,
+    rollback_commands: Vec<String>,
+    next_commands: Vec<String>,
+    notes: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ClaudeMemRetirementCondition {
+    name: &'static str,
+    status: &'static str,
+    evidence: String,
 }
 
 #[derive(Serialize)]
@@ -147,17 +167,29 @@ fn cmd_memory_status(
     format: OutputFormat,
 ) -> Result<()> {
     let memory_db = default_memory_db_path(path);
-    let event_count = if memory_db.exists() {
+    let (event_count, imported_claude_mem_events) = if memory_db.exists() {
         let conn = rusqlite::Connection::open(&memory_db)
             .with_context(|| format!("open {}", memory_db.display()))?;
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM memory_events", [], |row| row.get(0))?;
-        Some(count as usize)
+        let imported_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memory_events WHERE imported_from = 'claude-mem'",
+            [],
+            |row| row.get(0),
+        )?;
+        (Some(count as usize), Some(imported_count as usize))
     } else {
-        None
+        (None, None)
     };
     let claude_mem_path = resolve_claude_mem_path(claude_mem_db)?;
     let claude_mem = inspect_claude_mem(&claude_mem_path)?;
+    let semantic_graph_rows = graph_semantic_row_count(path).map_err(|err| err.to_string());
+    let claude_mem_retirement = build_claude_mem_retirement_gate(
+        path,
+        &claude_mem,
+        imported_claude_mem_events,
+        semantic_graph_rows,
+    );
     let query_api = plan_memory_query("prompt too long", 10, 2000)?;
     let report = MemoryStatusReport {
         contract_version: tsift_memory::MEMORY_CONTRACT_VERSION.to_string(),
@@ -177,6 +209,7 @@ fn cmd_memory_status(
         graph_node_kinds: memory_graph_node_kinds(),
         hook_contract: agent_doc_hook_contract(),
         claude_mem,
+        claude_mem_retirement,
         query_api,
         next_commands: vec![
             format!("tsift memory init {}", path.display()),
@@ -204,6 +237,160 @@ fn cmd_memory_status(
         },
         report.next_commands.clone(),
     )
+}
+
+fn build_claude_mem_retirement_gate(
+    path: &Path,
+    claude_mem: &ClaudeMemImportPlan,
+    imported_claude_mem_events: Option<usize>,
+    semantic_graph_rows: Result<Option<usize>, String>,
+) -> ClaudeMemRetirementGate {
+    let source_rows = claude_mem_source_rows(claude_mem);
+    let full_import = if !claude_mem.exists {
+        ClaudeMemRetirementCondition {
+            name: "full_import",
+            status: "pass",
+            evidence: format!(
+                "no claude-mem database found at {}; no source rows require migration",
+                claude_mem.db_path
+            ),
+        }
+    } else if !claude_mem.readable {
+        ClaudeMemRetirementCondition {
+            name: "full_import",
+            status: "block",
+            evidence: format!(
+                "claude-mem database exists at {} but is not readable; inspect or pass --claude-mem-db",
+                claude_mem.db_path
+            ),
+        }
+    } else if source_rows == 0 {
+        ClaudeMemRetirementCondition {
+            name: "full_import",
+            status: "pass",
+            evidence: "claude-mem readable, but supported durable tables have zero rows"
+                .to_string(),
+        }
+    } else {
+        let imported = imported_claude_mem_events.unwrap_or_default();
+        let status = if imported >= source_rows {
+            "pass"
+        } else {
+            "block"
+        };
+        ClaudeMemRetirementCondition {
+            name: "full_import",
+            status,
+            evidence: format!(
+                "{imported}/{source_rows} supported claude-mem rows are present in .tsift/memory.db"
+            ),
+        }
+    };
+
+    let semantic_retrieval = match semantic_graph_rows {
+        Ok(Some(rows)) if rows > 0 => ClaudeMemRetirementCondition {
+            name: "semantic_retrieval",
+            status: "pass",
+            evidence: format!(
+                ".tsift/graph.db has {rows} semantic_concept/semantic_entity row(s) for graph-db related retrieval"
+            ),
+        },
+        Ok(Some(_)) => ClaudeMemRetirementCondition {
+            name: "semantic_retrieval",
+            status: "block",
+            evidence: "graph.db exists but has no semantic_concept/semantic_entity rows; run summarize extract and graph-db refresh".to_string(),
+        },
+        Ok(None) => ClaudeMemRetirementCondition {
+            name: "semantic_retrieval",
+            status: "block",
+            evidence: "graph.db is missing or not initialized; run graph-db refresh and prove graph-db related retrieval".to_string(),
+        },
+        Err(err) => ClaudeMemRetirementCondition {
+            name: "semantic_retrieval",
+            status: "block",
+            evidence: format!(
+                "graph semantic readiness could not be inspected; run graph-db status/doctor before retiring claude-mem: {err}"
+            ),
+        },
+    };
+
+    let parity_eval = ClaudeMemRetirementCondition {
+        name: "parity_eval",
+        status: "manual_required",
+        evidence: "run `tsift dci-benchmark --fixture packages/tsift-cli/fixtures/memory-retrieval-eval.json --json` and require memory_retrieval_gate.decision=pass".to_string(),
+    };
+    let normal_session = ClaudeMemRetirementCondition {
+        name: "normal_session_cycle",
+        status: "manual_required",
+        evidence: "keep rollback available until one normal agent-doc session cycle succeeds without direct claude-mem or /mem-search reads".to_string(),
+    };
+
+    ClaudeMemRetirementGate {
+        decision: "hold",
+        direct_reads_allowed: true,
+        rollback_until_normal_session_cycle: true,
+        conditions: vec![full_import, semantic_retrieval, parity_eval, normal_session],
+        rollback_commands: vec![
+            format!(
+                "tsift memory import-claude-mem {} --all --apply --json",
+                path.display()
+            ),
+            format!("tsift graph-db --path {} --json refresh", path.display()),
+            format!(
+                "tsift graph-db --path {} --json related '<query>'",
+                path.display()
+            ),
+        ],
+        next_commands: vec![
+            format!(
+                "tsift memory import-claude-mem {} --all --apply --json",
+                path.display()
+            ),
+            format!("tsift graph-db --path {} --json refresh", path.display()),
+            format!(
+                "tsift graph-db --path {} --json related '<query>'",
+                path.display()
+            ),
+            "tsift dci-benchmark --fixture packages/tsift-cli/fixtures/memory-retrieval-eval.json --json".to_string(),
+        ],
+        notes: vec![
+            "direct claude-mem reads are retained as fallback until this gate is retired manually"
+                .to_string(),
+            "do not remove rollback commands until a normal session cycle proves no direct claude-mem dependency".to_string(),
+        ],
+    }
+}
+
+fn claude_mem_source_rows(plan: &ClaudeMemImportPlan) -> usize {
+    plan.observations.rows + plan.session_summaries.rows + plan.user_prompts.rows
+}
+
+fn graph_semantic_row_count(path: &Path) -> Result<Option<usize>> {
+    let graph_db = path.join(".tsift").join("graph.db");
+    if !graph_db.exists() {
+        return Ok(None);
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &graph_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("open {}", graph_db.display()))?;
+    let table_exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = 'graph_nodes'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if table_exists.is_none() {
+        return Ok(None);
+    }
+    let rows: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM graph_nodes WHERE kind IN ('semantic_concept', 'semantic_entity')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(Some(rows as usize))
 }
 
 fn cmd_memory_init(path: &Path, format: OutputFormat) -> Result<()> {

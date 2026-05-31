@@ -48,7 +48,8 @@ test("installs marker-owned tsift commands", async () => {
     );
     assert.match(memoryStatus, /tsift memory status/);
     assert.match(memoryStatus, /graph-db retrieval readiness/);
-    assert.match(memoryStatus, /claude-mem fallback import readiness/);
+    assert.match(memoryStatus, /claude-mem retirement gate/);
+    assert.match(memoryStatus, /rollback commands/);
 
     const memorySearch = await readFile(
       join(project, ".opencode", "commands", "tsift-memory-search.md"),

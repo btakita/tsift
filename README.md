@@ -34,15 +34,15 @@ tsift --envelope search "route dispatch" --budget normal
 tsift --envelope source-read src/main.rs --start 1 --lines 120 --budget normal
 tsift diff-digest .
 tsift --envelope session-review tasks/software/tsift.md --next-context --budget normal
-tsift graph-db --path . refresh --json
-tsift graph-db --path . status --json
-tsift graph-db --path . compact --json
-tsift graph-db --path . kind backlog --property ref_id=cvxa --limit 5 --json
-tsift graph-db --path . evidence cvxa --depth 3 --limit 8 --json
+tsift graph-db --path . --json refresh
+tsift graph-db --path . --json status
+tsift graph-db --path . --json compact
+tsift graph-db --path . --json kind backlog --property ref_id=cvxa --limit 5
+tsift graph-db --path . --json evidence cvxa --depth 3 --limit 8
 tsift graph-db --path . --json related --kind all "realtime avatar memory"
 tsift conflict-matrix --path tasks/software/tsift.md cvxa --json
 tsift dependency-dag --path tasks/software/tsift.md cvxa --json
-tsift graph-db --path . doctor --json
+tsift graph-db --path . --json doctor
 tsift graph-db --path . --json backend-eval --candidate kuzu
 tsift graph-db --path . --json backend-eval | tsift metric-digest --baseline fixtures/graph-db-performance-history.json
 tsift traverse --path . --format html > traversal.html
@@ -82,6 +82,10 @@ migrates every supported `observations`, `session_summaries`, and
 `user_prompts` row into `.tsift/memory.db` and reports table-level count
 reconciliation. Large imports cap returned `event_ids` while preserving
 `event_ids_total` and `event_ids_truncated` for proof without oversized JSON.
+`tsift memory status . --json` includes a `claude_mem_retirement` gate that
+keeps direct claude-mem reads available as rollback until full import, graph-db
+semantic retrieval, the recorded memory parity eval, and one normal session
+cycle without direct claude-mem or `/mem-search` reads are proven.
 Use `tsift
 conflict-matrix` to rank candidate worker scopes, flag shared
 file/symbol/test/config ownership, and emit first-class worker prompt packets

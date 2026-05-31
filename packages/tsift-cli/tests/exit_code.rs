@@ -5436,6 +5436,93 @@ fn memory_status_prefers_graph_db_related_with_claude_mem_fallback() {
         .unwrap();
     assert!(graph_idx < fallback_idx);
     assert_eq!(json["claude_mem"]["exists"], false);
+    let retirement = &json["claude_mem_retirement"];
+    assert_eq!(retirement["decision"], "hold");
+    assert_eq!(retirement["direct_reads_allowed"], true);
+    assert_eq!(retirement["rollback_until_normal_session_cycle"], true);
+    assert!(
+        retirement["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["name"] == "full_import" && row["status"] == "pass" })
+    );
+    assert!(
+        retirement["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["name"] == "semantic_retrieval" && row["status"] == "block" })
+    );
+    assert!(
+        retirement["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["name"] == "parity_eval" && row["status"] == "manual_required" })
+    );
+    assert!(
+        retirement["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| {
+                row["name"] == "normal_session_cycle" && row["status"] == "manual_required"
+            })
+    );
+    assert!(
+        retirement["rollback_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| {
+                command
+                    .as_str()
+                    .unwrap()
+                    .contains("memory import-claude-mem")
+            })
+    );
+    assert!(
+        retirement["rollback_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| {
+                command.as_str().unwrap().contains("graph-db --path")
+                    && command
+                        .as_str()
+                        .unwrap()
+                        .contains(" --json related '<query>'")
+            })
+    );
+}
+
+#[test]
+fn memory_query_plan_uses_graph_db_related_with_parent_json_flag() {
+    let output = tsift_bin()
+        .args(["memory", "query-plan", "memory retrieval", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "memory query-plan should pass: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let next_commands = json["next_commands"].as_array().unwrap();
+    assert!(next_commands.iter().any(|command| {
+        command
+            .as_str()
+            .unwrap()
+            .contains("tsift graph-db --path . --json related '<query>'")
+    }));
+    assert!(!next_commands.iter().any(|command| {
+        command
+            .as_str()
+            .unwrap()
+            .contains("related '<query>' --json")
+    }));
 }
 
 #[test]

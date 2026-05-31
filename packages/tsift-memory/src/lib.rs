@@ -884,7 +884,7 @@ pub fn inspect_claude_mem(db_path: &Path) -> Result<ClaudeMemImportPlan> {
         warnings: Vec::new(),
         next_commands: vec![
             "tsift memory import-claude-mem . --all --apply --json".to_string(),
-            "tsift graph-db --path . refresh --json".to_string(),
+            "tsift graph-db --path . --json refresh".to_string(),
         ],
     };
 
@@ -1488,7 +1488,7 @@ pub fn plan_memory_query(query: &str, limit: usize, max_tokens: usize) -> Result
         ],
         next_commands: vec![
             "tsift memory status . --json".to_string(),
-            "tsift graph-db --path . related '<query>' --json".to_string(),
+            "tsift graph-db --path . --json related '<query>'".to_string(),
         ],
     })
 }
