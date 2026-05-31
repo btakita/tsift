@@ -36,6 +36,7 @@ tsift (root crate — public package shim: lib.rs + graph/lang/resolution/substr
 │   ├── complexity module — ComplexityMetrics, LanguageExtractor trait, LanguageRegistry
 │   └── re-exported via src/graph.rs and src/lang/mod.rs as thin shims
 ├── tsift-algorithms crate (packages/tsift-algorithms — graph algorithms)
+│   ├── graph_builder module — shared Graph struct, build_graph() (node index + directed adjacency), build_node_index() (node index only); reused by health, dead_code, scc
 │   ├── scc module — iterative Tarjan SCC (strongly connected components)
 │   ├── health module — composite health score (connectivity, reachability, centrality, cycle risk); terse_health_report computes top/bottom N scores directly without allocating full per-node sub-metrics
 │   ├── dead_code module — dead code detection (unreachable, isolated, orphaned nodes)

@@ -1,5 +1,6 @@
+use crate::graph_builder::build_graph;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthScore {
@@ -51,8 +52,11 @@ pub fn terse_health_report(edges: &[(String, String)], n: usize) -> TerseHealthR
         };
     }
 
-    let (node_vec, _node_idx, out_adj, in_adj) = build_graph(edges);
-    let node_count = node_vec.len();
+    let graph = build_graph(edges);
+    let node_vec = &graph.node_vec;
+    let out_adj = &graph.out_adj;
+    let in_adj = &graph.in_adj;
+    let node_count = graph.node_count();
     if node_count == 0 {
         return TerseHealthReport {
             top_scores: Vec::new(),
@@ -133,39 +137,6 @@ pub fn terse_health_report(edges: &[(String, String)], n: usize) -> TerseHealthR
         node_count,
         edge_count: edges.len(),
     }
-}
-
-#[allow(clippy::type_complexity)]
-fn build_graph(
-    edges: &[(String, String)],
-) -> (
-    Vec<String>,
-    HashMap<String, usize>,
-    Vec<HashSet<usize>>,
-    Vec<HashSet<usize>>,
-) {
-    let mut node_vec: Vec<String> = Vec::new();
-    let mut node_idx: HashMap<String, usize> = HashMap::new();
-    for (a, b) in edges {
-        for name in [a, b] {
-            if !node_idx.contains_key(name) {
-                node_idx.insert(name.clone(), node_vec.len());
-                node_vec.push(name.clone());
-            }
-        }
-    }
-    let n = node_vec.len();
-    let mut out_adj: Vec<HashSet<usize>> = vec![HashSet::new(); n];
-    let mut in_adj: Vec<HashSet<usize>> = vec![HashSet::new(); n];
-    for (a, b) in edges {
-        let ai = node_idx[a];
-        let bi = node_idx[b];
-        if ai != bi {
-            out_adj[ai].insert(bi);
-            in_adj[bi].insert(ai);
-        }
-    }
-    (node_vec, node_idx, out_adj, in_adj)
 }
 
 fn compute_reachability_with_sccs(
@@ -309,8 +280,11 @@ pub fn composite_health_score(edges: &[(String, String)]) -> HealthReport {
         };
     }
 
-    let (node_vec, _node_idx, out_adj, in_adj) = build_graph(edges);
-    let n = node_vec.len();
+    let graph = build_graph(edges);
+    let node_vec = &graph.node_vec;
+    let out_adj = &graph.out_adj;
+    let in_adj = &graph.in_adj;
+    let n = graph.node_count();
     if n == 0 {
         return HealthReport {
             scores: Vec::new(),

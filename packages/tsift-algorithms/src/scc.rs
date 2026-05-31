@@ -1,5 +1,5 @@
+use crate::graph_builder::build_node_index;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SccComponent {
@@ -30,16 +30,7 @@ pub fn tarjan_scc(edges: &[(String, String)]) -> SccResult {
         };
     }
 
-    let mut node_vec: Vec<String> = Vec::new();
-    let mut node_idx: HashMap<String, usize> = HashMap::new();
-    for (a, b) in edges {
-        for name in [a, b] {
-            if !node_idx.contains_key(name) {
-                node_idx.insert(name.clone(), node_vec.len());
-                node_vec.push(name.clone());
-            }
-        }
-    }
+    let (node_vec, node_idx) = build_node_index(edges);
     let n = node_vec.len();
 
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];

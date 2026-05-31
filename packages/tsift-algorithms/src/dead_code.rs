@@ -1,5 +1,6 @@
+use crate::graph_builder::build_graph;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeadCodeNode {
@@ -50,35 +51,14 @@ pub fn detect_dead_code(edges: &[(String, String)], entry_points: &[String]) -> 
         };
     }
 
-    let mut node_vec: Vec<String> = Vec::new();
-    let mut node_idx: HashMap<String, usize> = HashMap::new();
-    for (a, b) in edges {
-        for name in [a, b] {
-            if !node_idx.contains_key(name) {
-                node_idx.insert(name.clone(), node_vec.len());
-                node_vec.push(name.clone());
-            }
-        }
-    }
+    let mut graph = build_graph(edges);
+    graph.ensure_nodes(entry_points);
 
-    for name in entry_points {
-        if !node_idx.contains_key(name) {
-            node_idx.insert(name.clone(), node_vec.len());
-            node_vec.push(name.clone());
-        }
-    }
-
-    let n = node_vec.len();
-    let mut out_adj: Vec<HashSet<usize>> = vec![HashSet::new(); n];
-    let mut in_adj: Vec<HashSet<usize>> = vec![HashSet::new(); n];
-    for (a, b) in edges {
-        let ai = node_idx[a];
-        let bi = node_idx[b];
-        if ai != bi {
-            out_adj[ai].insert(bi);
-            in_adj[bi].insert(ai);
-        }
-    }
+    let node_vec = &graph.node_vec;
+    let node_idx = &graph.node_idx;
+    let out_adj = &graph.out_adj;
+    let in_adj = &graph.in_adj;
+    let n = graph.node_count();
 
     let mut reachable = vec![false; n];
     let mut queue: VecDeque<usize> = VecDeque::new();
