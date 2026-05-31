@@ -765,11 +765,11 @@ tsift communities --limit 3           # top 3 communities only
 tsift communities [--path <path>] [--scope <submod>] [--min-size N] [--json]
 ```
 
-**Algorithm:** greedy modularity optimization over an undirected, deduplicated call graph.
-1. Each symbol starts in its own community
-2. For each node, compute modularity gain of moving to each neighbor's community
-3. Move to the best community if gain > 0
-4. Repeat until convergence (no improving moves or 100 iterations)
+**Algorithm:** multi-level Louvain (greedy modularity optimization with super-node coarsening) over an undirected, deduplicated call graph.
+1. **Phase 1 — local moving:** each symbol starts in its own community. For each node, compute modularity gain of moving to each neighbor's community. Move to the best community if gain > 0. Repeat until convergence (no improving moves or 100 iterations).
+2. **Phase 2 — coarsening:** collapse communities into super-nodes. Internal edges become weighted self-loops; inter-community edges become weighted edges between super-nodes.
+3. **Repeat** phase 1 on the coarsened graph until no further improvement (up to 10 levels).
+4. Map final super-node assignments back to original symbols.
 
 **Output:** communities sorted by size (largest first), total modularity Q ∈ [-0.5, 1.0] (higher = stronger community structure), per-community member list and modularity contribution. JSON `CommunityMember` rows always include `name` and may include `file`, `line`, bounded `refs` (`file`, `line`, `role`, `peer`), and `tagpath_handle` when local index/tagpath evidence can resolve them.
 

@@ -651,6 +651,130 @@ impl CommunityResult {
     }
 }
 
+struct LouvainGraph {
+    n: usize,
+    adj: Vec<HashMap<usize, f64>>,
+    degree: Vec<f64>,
+    m: f64,
+}
+
+impl LouvainGraph {
+    fn from_indexed(n: usize, adj: Vec<HashSet<usize>>) -> Self {
+        let degree: Vec<f64> = adj.iter().map(|nb| nb.len() as f64).collect();
+        let m = degree.iter().sum::<f64>() / 2.0;
+        let weighted: Vec<HashMap<usize, f64>> = adj
+            .iter()
+            .map(|nb| nb.iter().map(|&j| (j, 1.0_f64)).collect())
+            .collect();
+        Self {
+            n,
+            adj: weighted,
+            degree,
+            m,
+        }
+    }
+
+    fn phase1(&self) -> (Vec<usize>, usize, bool) {
+        let n = self.n;
+        let m = self.m;
+        let mut community: Vec<usize> = (0..n).collect();
+        let mut comm_degree = self.degree.clone();
+        let mut ki_in: Vec<HashMap<usize, f64>> = (0..n)
+            .map(|i| {
+                let mut map = HashMap::new();
+                for (&nb, &w) in &self.adj[i] {
+                    *map.entry(community[nb]).or_insert(0.0) += w;
+                }
+                map
+            })
+            .collect();
+
+        let mut iterations = 0;
+        let mut any_improved = false;
+        loop {
+            let mut improved = false;
+            iterations += 1;
+
+            for i in 0..n {
+                let cur_c = community[i];
+                let ki = self.degree[i];
+
+                let ki_in_cur = ki_in[i].get(&cur_c).copied().unwrap_or(0.0);
+                let cur_gain =
+                    ki_in_cur / m - ki * (comm_degree[cur_c] - ki) / (2.0 * m * m);
+
+                let mut best_delta = 0.0f64;
+                let mut best_c = cur_c;
+
+                for (&c, &ki_in_c) in &ki_in[i] {
+                    if c == cur_c {
+                        continue;
+                    }
+                    let target_gain = ki_in_c / m - ki * comm_degree[c] / (2.0 * m * m);
+                    let delta = target_gain - cur_gain;
+                    if delta > best_delta {
+                        best_delta = delta;
+                        best_c = c;
+                    }
+                }
+
+                if best_c != cur_c {
+                    comm_degree[cur_c] -= ki;
+                    comm_degree[best_c] += ki;
+                    for (&nb, &w) in &self.adj[i] {
+                        ki_in[nb]
+                            .entry(cur_c)
+                            .and_modify(|v| *v -= w)
+                            .or_insert(-w);
+                        *ki_in[nb].entry(best_c).or_insert(0.0) += w;
+                    }
+                    community[i] = best_c;
+                    improved = true;
+                    any_improved = true;
+                }
+            }
+
+            if !improved || iterations >= 100 {
+                break;
+            }
+        }
+        (community, iterations, any_improved)
+    }
+
+    fn coarsen(&self, community: &[usize]) -> LouvainGraph {
+        let mut remap = HashMap::new();
+        for &c in community {
+            if !remap.contains_key(&c) {
+                let idx = remap.len();
+                remap.insert(c, idx);
+            }
+        }
+        let n2 = remap.len();
+        let mut adj2: Vec<HashMap<usize, f64>> = vec![HashMap::new(); n2];
+
+        for i in 0..self.n {
+            let ci = remap[&community[i]];
+            for (&j, &w) in &self.adj[i] {
+                let cj = remap[&community[j]];
+                if ci == cj {
+                    *adj2[ci].entry(ci).or_insert(0.0) += w / 2.0;
+                } else {
+                    *adj2[ci].entry(cj).or_insert(0.0) += w;
+                }
+            }
+        }
+
+        LouvainGraph::from_weighted(n2, adj2)
+    }
+
+    #[allow(dead_code)]
+    fn from_weighted(n: usize, adj: Vec<HashMap<usize, f64>>) -> Self {
+        let degree: Vec<f64> = (0..n).map(|i| adj[i].values().sum::<f64>()).collect();
+        let m = degree.iter().sum::<f64>() / 2.0;
+        Self { n, adj, degree, m }
+    }
+}
+
 pub fn detect_communities(edges: &[(String, String)]) -> CommunityResult {
     if edges.is_empty() {
         return CommunityResult {
@@ -684,8 +808,7 @@ pub fn detect_communities(edges: &[(String, String)]) -> CommunityResult {
         }
     }
 
-    let degree: Vec<f64> = adj.iter().map(|nb| nb.len() as f64).collect();
-    let m = degree.iter().sum::<f64>() / 2.0;
+    let m = adj.iter().map(|nb| nb.len() as f64).sum::<f64>() / 2.0;
 
     if m == 0.0 {
         let communities = node_vec
@@ -706,75 +829,78 @@ pub fn detect_communities(edges: &[(String, String)]) -> CommunityResult {
         };
     }
 
-    let mut community: Vec<usize> = (0..n).collect();
-    let mut comm_degree: Vec<f64> = degree.clone();
-    let mut ki_in: Vec<HashMap<usize, f64>> = adj
-        .iter()
-        .enumerate()
-        .map(|(_i, neighbors)| {
-            let mut map = HashMap::new();
-            for &nb in neighbors {
-                *map.entry(community[nb]).or_insert(0.0) += 1.0;
-            }
-            map
-        })
-        .collect();
+    let graph = LouvainGraph::from_indexed(n, adj);
+    let mut total_iterations = 0;
+    let original_degrees: Vec<f64> = graph.degree.clone();
 
-    let mut iterations = 0;
-    loop {
-        let mut improved = false;
-        iterations += 1;
+    let (community, iter1, _) = graph.phase1();
+    total_iterations += iter1;
 
-        for i in 0..n {
-            let cur_c = community[i];
-            let ki = degree[i];
+    let mut level_assignment = community;
+    let mut current_graph = graph;
 
-            let ki_in_cur = ki_in[i].get(&cur_c).copied().unwrap_or(0.0);
-            let cur_gain = ki_in_cur / m - ki * (comm_degree[cur_c] - ki) / (2.0 * m * m);
-
-            let mut best_delta = 0.0f64;
-            let mut best_c = cur_c;
-
-            for (&c, &ki_in_c) in &ki_in[i] {
-                if c == cur_c {
-                    continue;
-                }
-                let target_gain = ki_in_c / m - ki * comm_degree[c] / (2.0 * m * m);
-                let delta = target_gain - cur_gain;
-                if delta > best_delta {
-                    best_delta = delta;
-                    best_c = c;
-                }
-            }
-
-            if best_c != cur_c {
-                comm_degree[cur_c] -= ki;
-                comm_degree[best_c] += ki;
-                for &nb in &adj[i] {
-                    ki_in[nb].entry(cur_c).and_modify(|v| *v -= 1.0).or_insert(-1.0);
-                    *ki_in[nb].entry(best_c).or_insert(0.0) += 1.0;
-                }
-                community[i] = best_c;
-                improved = true;
-            }
-        }
-
-        if !improved || iterations >= 100 {
+    for _level in 0..10 {
+        let coarse = current_graph.coarsen(&level_assignment);
+        if coarse.n == current_graph.n {
             break;
         }
+        let (coarse_community, iters, improved) = coarse.phase1();
+        total_iterations += iters;
+        if !improved {
+            break;
+        }
+
+        let mut remap = HashMap::new();
+        for &c in &level_assignment {
+            if !remap.contains_key(&c) {
+                let idx = remap.len();
+                remap.insert(c, idx);
+            }
+        }
+
+        let mut final_community = vec![0usize; n];
+        for i in 0..n {
+            let coarse_node = remap[&level_assignment[i]];
+            final_community[i] = coarse_community[coarse_node];
+        }
+
+        let mut final_remap = HashMap::new();
+        let mut next_id = 0usize;
+        for c in &final_community {
+            if let Some(&_id) = final_remap.get(c) {
+                continue;
+            }
+            final_remap.insert(*c, next_id);
+            next_id += 1;
+        }
+        for i in 0..n {
+            final_community[i] = final_remap[&final_community[i]];
+        }
+
+        level_assignment = final_community;
+        current_graph = coarse;
+    }
+
+    let community = level_assignment;
+
+    let mut node_to_comm: HashMap<String, usize> = HashMap::new();
+    for (i, &c) in community.iter().enumerate() {
+        node_to_comm.insert(node_vec[i].clone(), c);
     }
 
     let mut comm_members: HashMap<usize, Vec<String>> = HashMap::new();
     let mut comm_internal: HashMap<usize, f64> = HashMap::new();
+    let mut comm_degree_map: HashMap<usize, f64> = HashMap::new();
 
     for (i, &c) in community.iter().enumerate() {
         comm_members.entry(c).or_default().push(node_vec[i].clone());
+        *comm_degree_map.entry(c).or_insert(0.0) += original_degrees[i];
     }
-    for i in 0..n {
-        for &nb in &adj[i] {
-            if nb > i && community[nb] == community[i] {
-                *comm_internal.entry(community[i]).or_insert(0.0) += 1.0;
-            }
+    for (a, b) in edges {
+        let ca = node_to_comm[a];
+        let cb = node_to_comm[b];
+        if ca == cb {
+            *comm_internal.entry(ca).or_insert(0.0) += 1.0;
         }
     }
 
@@ -784,7 +910,7 @@ pub fn detect_communities(edges: &[(String, String)]) -> CommunityResult {
         .map(|(id, mut members)| {
             members.sort();
             let lc = comm_internal.get(&id).copied().unwrap_or(0.0);
-            let dc = comm_degree[id];
+            let dc = comm_degree_map[&id];
             let mod_contrib = lc / m - (dc / (2.0 * m)).powi(2);
             total_modularity += mod_contrib;
             Community {
@@ -800,7 +926,7 @@ pub fn detect_communities(edges: &[(String, String)]) -> CommunityResult {
     CommunityResult {
         communities,
         modularity: total_modularity,
-        iterations,
+        iterations: total_iterations,
         node_count: n,
         edge_count: m as usize,
     }
@@ -1305,6 +1431,31 @@ function createUser() {}
         ];
         let result = detect_communities(&edges);
         assert!(result.modularity >= 0.0, "Q={}", result.modularity);
+    }
+
+    #[test]
+    fn communities_hierarchical_phase2_improves_modularity() {
+        let mut edges = Vec::new();
+        for cluster in 0..4 {
+            let base = cluster * 6;
+            for i in 0..6 {
+                for j in (i + 1)..6 {
+                    edges.push((format!("c{}n{}", cluster, base + i), format!("c{}n{}", cluster, base + j)));
+                }
+            }
+        }
+        edges.push(("c0n0".to_string(), "c1n6".to_string()));
+        edges.push(("c2n12".to_string(), "c3n18".to_string()));
+        edges.push(("c0n1".to_string(), "c2n12".to_string()));
+
+        let result = detect_communities(&edges);
+        assert!(result.modularity > 0.0, "Q={}", result.modularity);
+        assert!(
+            result.communities.len() >= 2,
+            "expected >= 2 communities for hierarchical structure, got {}",
+            result.communities.len()
+        );
+        assert!(result.iterations >= 1);
     }
 
     fn path_names(result: &PathResult) -> Vec<&str> {
