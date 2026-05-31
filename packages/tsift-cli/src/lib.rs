@@ -4346,11 +4346,12 @@ fn insert_semantic_edge(
 }
 
 fn memory_event_key(event: &MemoryEvent) -> String {
-    event
-        .imported_id
-        .as_deref()
-        .unwrap_or(event.source_ref.as_str())
-        .to_string()
+    match (event.imported_from.as_deref(), event.imported_id.as_deref()) {
+        (Some(imported_from), Some(imported_id)) => {
+            format!("{imported_from}:{imported_id}")
+        }
+        _ => event.stable_id(),
+    }
 }
 
 fn memory_event_label(event: &MemoryEvent) -> String {
@@ -7196,6 +7197,18 @@ fn sqlite_graph_counts(conn: &Connection, scope: &str) -> Result<GraphDbOperator
     })
 }
 
+fn sqlite_graph_semantic_node_count(conn: &Connection) -> Result<usize> {
+    if !sqlite_table_exists(conn, "graph_nodes")? {
+        return Ok(0);
+    }
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM graph_nodes WHERE kind IN ('semantic_concept', 'semantic_entity')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
 pub(crate) fn graph_db_compaction_policy(
     root: &Path,
     scope: Option<&str>,
@@ -8427,6 +8440,7 @@ pub(crate) fn graph_db_operator_report_from_disk(
         freshness.status = "stale".to_string();
     }
     let counts = sqlite_graph_counts(conn.conn(), scope.unwrap_or("root"))?;
+    let semantic_row_count = sqlite_graph_semantic_node_count(conn.conn()).ok();
     warnings.extend(
         sqlite_graph_tombstone_retention_diagnostics(conn.conn(), scope.unwrap_or("root"))
             .unwrap_or_else(|err| {
@@ -8450,7 +8464,7 @@ pub(crate) fn graph_db_operator_report_from_disk(
         status,
         materialized: true,
         freshness,
-        readiness: graph_db_semantic_readiness(root, scope),
+        readiness: graph_db_semantic_readiness(root, scope, semantic_row_count),
         compaction: graph_db_compaction_policy(root, scope, &counts, false),
         counts,
         refresh,
@@ -8607,7 +8621,25 @@ fn graph_db_status_summarize_command(report: &status::StatusReport) -> String {
         .to_string()
 }
 
-fn graph_db_semantic_readiness(root: &Path, scope: Option<&str>) -> GraphEffectivenessReadiness {
+fn graph_db_semantic_rows_readiness(row_count: usize, source: &str) -> GraphEffectivenessReadiness {
+    let mut readiness = graph_effectiveness_ready("semantic_rows_available");
+    readiness.diagnostics.push(format!(
+        "graph projection has {row_count} semantic_concept/semantic_entity row(s) from {source}; graph semantic rows are available"
+    ));
+    readiness
+}
+
+fn graph_db_semantic_readiness(
+    root: &Path,
+    scope: Option<&str>,
+    semantic_row_count: Option<usize>,
+) -> GraphEffectivenessReadiness {
+    if let Some(row_count) = semantic_row_count
+        && row_count > 0
+    {
+        return graph_db_semantic_rows_readiness(row_count, "materialized graph projection");
+    }
+
     let report = match status::check_status(root) {
         Ok(report) => report,
         Err(err) => {
@@ -10117,7 +10149,6 @@ pub(crate) fn graph_db_report_from_store(
             seed_limit,
             limit,
         } => {
-            let readiness = graph_db_semantic_readiness(root, scope);
             let semantic =
                 semantic_related_report_from_store(root, scope, &query, seed_limit, kind, store)?;
             let SemanticRelatedReport {
@@ -10125,6 +10156,11 @@ pub(crate) fn graph_db_report_from_store(
                 warnings: semantic_warnings,
                 ..
             } = semantic;
+            let readiness = graph_db_semantic_readiness(
+                root,
+                scope,
+                (!items.is_empty()).then_some(items.len()),
+            );
             report.warnings.extend(semantic_warnings);
             let seed_ids = items
                 .iter()
@@ -10177,7 +10213,8 @@ pub(crate) fn graph_db_report_from_store(
                 truncated: subgraph.truncated || dropped_by_budget,
                 traversal: "incident_plus_outgoing_edges".to_string(),
                 freshness_boundary:
-                    "semantic rows must come from refreshed summary graph records".to_string(),
+                    "semantic rows must come from refreshed summary or tsift-memory graph records"
+                        .to_string(),
                 privacy_boundary:
                     "GraphStore stores substrate records only; user consent, deletion policy, persona policy, and LiveKit session state stay in the avatar/agent adapter"
                         .to_string(),
@@ -14818,6 +14855,11 @@ fn semantic_related_report_from_store(
         items,
         warnings,
     })
+}
+
+fn graph_store_semantic_node_count(store: &impl GraphStore) -> Result<usize> {
+    Ok(store.nodes_by_kind("semantic_concept")?.len()
+        + store.nodes_by_kind("semantic_entity")?.len())
 }
 
 fn graph_db_semantic_edge_scan_cap(limit: usize) -> usize {
@@ -22082,7 +22124,8 @@ fn context_pack_graph_orchestration(
     if let Some(recovery) = store.read_only_recovery() {
         warnings.push(graph_db_read_recovery_diagnostic(recovery));
     }
-    let readiness = graph_db_semantic_readiness(root, None);
+    let readiness =
+        graph_db_semantic_readiness(root, None, graph_store_semantic_node_count(&store).ok());
     if readiness.fail_closed {
         warnings.extend(readiness.diagnostics.clone());
     }
@@ -26459,8 +26502,36 @@ def list_items():
     fn traversal_projection_materializes_tsift_memory_rows() {
         let dir = setup_traversal_project();
         seed_tsift_memory_graph_db(dir.path());
+        let memory_db = dir.path().join(".tsift").join("memory.db");
+        let store = MemoryStore::open_or_create(&memory_db).unwrap();
+        for summary in ["first closeout", "second closeout"] {
+            let event = MemoryEvent::new(
+                MemoryEventKind::ResponseSummary,
+                "tasks/software/tsift.md",
+                summary,
+            )
+            .with_session_id("tasks/software/tsift.md")
+            .with_observed_at_unix(1_700_000_100);
+            store.insert_event(&event).unwrap();
+        }
         refresh_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
         let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
+
+        let native_sources = store
+            .nodes_by_kind("source_handle")
+            .unwrap()
+            .into_iter()
+            .filter(|node| {
+                node.properties.get("provider") == Some(&"tsift-memory".to_string())
+                    && node.properties.get("source_ref")
+                        == Some(&"tasks/software/tsift.md".to_string())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            native_sources.len(),
+            2,
+            "same-source native memory events must get distinct source handles"
+        );
 
         let source = store
             .nodes_by_kind("source_handle")
@@ -26549,6 +26620,38 @@ def list_items():
                 .any(|item| item.handle == concept.id && item.score > 0.0),
             "expected semantic query to retrieve tsift-memory concept, got {:?}",
             related.items
+        );
+
+        let graph_related = graph_db_report_from_store(
+            dir.path(),
+            None,
+            "sqlite",
+            GraphDbQuery::Related {
+                query: "tsift memory graph adapter".to_string(),
+                kind: SemanticRelatedKind::Concept,
+                depth: 1,
+                seed_limit: 5,
+                limit: 20,
+            },
+            &store,
+            sqlite_graph_freshness(&store, "root").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            graph_related
+                .readiness
+                .as_ref()
+                .map(|readiness| readiness.status.as_str()),
+            Some("ready"),
+            "tsift-memory semantic rows should satisfy graph-db related readiness"
+        );
+        assert!(
+            graph_related.nodes.iter().any(|node| {
+                node.kind == "semantic_concept"
+                    && node.properties.get("provider") == Some(&"tsift-memory".to_string())
+            }),
+            "expected related graph output to include tsift-memory semantic rows"
         );
     }
 
