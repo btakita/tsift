@@ -872,9 +872,12 @@ pub enum MemoryCommand {
         /// Override the claude-mem SQLite DB path
         #[arg(long)]
         db: Option<PathBuf>,
-        /// Maximum rows to read from each supported claude-mem table
-        #[arg(long, default_value = "1000")]
-        limit: usize,
+        /// Maximum rows to read from each supported claude-mem table; defaults to 1000 unless --all is set
+        #[arg(long, conflicts_with = "all", value_name = "ROWS")]
+        limit: Option<usize>,
+        /// Read every supported claude-mem row instead of applying the default per-table cap
+        #[arg(long)]
+        all: bool,
         /// Apply the import; omitted means dry-run plan only
         #[arg(long)]
         apply: bool,

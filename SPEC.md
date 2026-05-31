@@ -75,7 +75,7 @@ tsift (root crate — public package shim: lib.rs + graph/lang/resolution/substr
 │   ├── exposes a budget guard that rejects oversized raw tool/log/transcript payloads, replaces them with digest/context/session-review commands, and emits retryable chunk plans
 │   ├── defines agent-doc hook event contracts for prompt targets, tool artifacts, response summaries, closeout proof, and session-check results
 │   ├── projects first-party `.tsift/memory.db` rows into provider-neutral graph nodes/edges (`memory_session`, `memory_event`) plus semantic/source rows for graph-db retrieval
-│   ├── reads the observed `claude-mem` SQLite tables (`observations`, `session_summaries`, `user_prompts`) without mutating them and can optionally migrate them as imported memory events before graph projection
+│   ├── reads the observed `claude-mem` SQLite tables (`observations`, `session_summaries`, `user_prompts`) without mutating them and can optionally migrate all supported rows as imported memory events before graph projection, with per-table source/read/import reconciliation
 │   ├── exposes a query packet contract for future ranked, token-capped memory retrieval
 │   └── re-exported via root `tsift` as `tsift::memory`
 ├── tsift-session crate (packages/tsift-session — compatibility shim)
@@ -317,7 +317,7 @@ tsift graph-db --backend convex-snapshot --convex-snapshot rows.json node <id> -
 tsift graph-db --backend convex-snapshot --convex-snapshot rows.json drift --json # SQLite vs Convex projection diff
 tsift graph-db --backend convex-snapshot --convex-snapshot rows.json doctor --json # validate Convex rows/index metadata
 tsift memory init . --json # initialize first-party .tsift/memory.db
-tsift memory import-claude-mem . --apply --limit 1000 --json # migrate supported claude-mem rows into tsift-memory; pending_messages is reported but intentionally excluded
+tsift memory import-claude-mem . --all --apply --json # migrate all supported claude-mem rows into tsift-memory with per-table count reconciliation; pending_messages is reported but intentionally excluded; large reports cap event_ids and expose event_ids_total/event_ids_truncated
 tsift memory capture-agent-doc-closeout . --session-path tasks/software/tsift.md --prompt-target 'do [#id]' --response-summary '<summary>' --commit-hash <sha> --session-check-status clean --json # capture agent-doc closeout events into tsift-memory
 tsift --envelope explain <symbol> --budget normal # bounded agent preview
 tsift --envelope source-read src/main.rs --start 1 --lines 80 --budget normal # bounded source-file preview with expansion handles

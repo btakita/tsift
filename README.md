@@ -79,6 +79,11 @@ them for knowledge retrieval. Refresh also projects matching read-only
 `claude-mem` rows from a project-local `.claude-mem/claude-mem.db` or the
 default `~/.claude-mem/claude-mem.db`, including Chroma vector handles, so
 existing memory can seed those semantic graph queries without importing capture.
+`tsift memory import-claude-mem . --all --apply --json` migrates every
+supported `observations`, `session_summaries`, and `user_prompts` row into
+`.tsift/memory.db` and reports table-level count reconciliation. Large imports
+cap returned `event_ids` while preserving `event_ids_total` and
+`event_ids_truncated` for proof without oversized JSON.
 Use `tsift
 conflict-matrix` to rank candidate worker scopes, flag shared
 file/symbol/test/config ownership, and emit first-class worker prompt packets

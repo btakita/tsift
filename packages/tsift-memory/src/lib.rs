@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -11,6 +11,8 @@ pub const DEFAULT_MAX_PROMPT_TOKENS: usize = 4096;
 pub const DEFAULT_RESERVE_TOKENS: usize = 512;
 pub const DEFAULT_MAX_EVENT_TOKENS: usize = 1536;
 pub const MEMORY_BUDGET_GUARD_CONTRACT_VERSION: &str = "tsift-memory-budget-guard-v1";
+
+const MAX_IMPORT_EVENT_IDS: usize = 100;
 
 const MEMORY_SCHEMA_SQL: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -678,6 +680,12 @@ pub fn agent_doc_closeout_events(
     events
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryInsertResult {
+    pub id: String,
+    pub inserted: bool,
+}
+
 pub struct MemoryStore {
     conn: Connection,
 }
@@ -695,30 +703,21 @@ impl MemoryStore {
     }
 
     pub fn insert_event(&self, event: &MemoryEvent) -> Result<String> {
-        let id = event.stable_id();
-        let metadata_json = serde_json::to_string(&event.metadata)?;
-        self.conn.execute(
-            r#"
-            INSERT OR IGNORE INTO memory_events(
-              id, kind, session_id, source_ref, text, metadata_json,
-              observed_at_unix, token_estimate, imported_from, imported_id
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            "#,
-            params![
-                &id,
-                event.kind.as_str(),
-                event.session_id.as_deref(),
-                &event.source_ref,
-                &event.text,
-                &metadata_json,
-                event.observed_at_unix,
-                event.token_estimate as i64,
-                event.imported_from.as_deref(),
-                event.imported_id.as_deref()
-            ],
-        )?;
-        Ok(id)
+        Ok(self.insert_event_result(event)?.id)
+    }
+
+    pub fn insert_event_result(&self, event: &MemoryEvent) -> Result<MemoryInsertResult> {
+        insert_event_on(&self.conn, event)
+    }
+
+    pub fn insert_events(&mut self, events: &[MemoryEvent]) -> Result<Vec<MemoryInsertResult>> {
+        let tx = self.conn.transaction()?;
+        let mut results = Vec::with_capacity(events.len());
+        for event in events {
+            results.push(insert_event_on(&tx, event)?);
+        }
+        tx.commit()?;
+        Ok(results)
     }
 
     pub fn event_count(&self) -> Result<usize> {
@@ -727,6 +726,36 @@ impl MemoryStore {
             .query_row("SELECT COUNT(*) FROM memory_events", [], |row| row.get(0))?;
         Ok(count as usize)
     }
+}
+
+fn insert_event_on(conn: &Connection, event: &MemoryEvent) -> Result<MemoryInsertResult> {
+    let id = event.stable_id();
+    let metadata_json = serde_json::to_string(&event.metadata)?;
+    let changed = conn.execute(
+        r#"
+            INSERT OR IGNORE INTO memory_events(
+              id, kind, session_id, source_ref, text, metadata_json,
+              observed_at_unix, token_estimate, imported_from, imported_id
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+        params![
+            &id,
+            event.kind.as_str(),
+            event.session_id.as_deref(),
+            &event.source_ref,
+            &event.text,
+            &metadata_json,
+            event.observed_at_unix,
+            event.token_estimate as i64,
+            event.imported_from.as_deref(),
+            event.imported_id.as_deref()
+        ],
+    )?;
+    Ok(MemoryInsertResult {
+        id,
+        inserted: changed > 0,
+    })
 }
 
 pub fn read_memory_events(memory_db_path: &Path, limit: usize) -> Result<Vec<MemoryEvent>> {
@@ -799,6 +828,34 @@ pub struct ClaudeMemImportPlan {
     pub next_commands: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeMemTableReconciliation {
+    pub table: String,
+    pub source_rows: usize,
+    pub read_events: usize,
+    pub planned_events: usize,
+    pub imported_events: usize,
+    pub already_present_events: usize,
+    pub skipped_source_rows: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_per_table: Option<usize>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeMemImportReconciliation {
+    pub observations: ClaudeMemTableReconciliation,
+    pub session_summaries: ClaudeMemTableReconciliation,
+    pub user_prompts: ClaudeMemTableReconciliation,
+    pub total_source_rows: usize,
+    pub total_read_events: usize,
+    pub total_planned_events: usize,
+    pub total_imported_events: usize,
+    pub total_already_present_events: usize,
+    pub total_skipped_source_rows: usize,
+    pub complete: bool,
+}
+
 fn empty_table_plan(table: &str) -> ClaudeMemTablePlan {
     ClaudeMemTablePlan {
         table: table.to_string(),
@@ -826,7 +883,7 @@ pub fn inspect_claude_mem(db_path: &Path) -> Result<ClaudeMemImportPlan> {
         pending_messages: empty_table_plan("pending_messages"),
         warnings: Vec::new(),
         next_commands: vec![
-            "tsift memory import-claude-mem . --apply --json".to_string(),
+            "tsift memory import-claude-mem . --all --apply --json".to_string(),
             "tsift graph-db --path . refresh --json".to_string(),
         ],
     };
@@ -914,10 +971,16 @@ pub struct ClaudeMemImportReport {
     pub source: String,
     pub target: String,
     pub dry_run: bool,
-    pub limit_per_table: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_per_table: Option<usize>,
+    pub import_all: bool,
     pub imported_events: usize,
+    pub already_present_events: usize,
     pub planned_events: usize,
     pub event_ids: Vec<String>,
+    pub event_ids_total: usize,
+    pub event_ids_truncated: bool,
+    pub reconciliation: ClaudeMemImportReconciliation,
     pub plan: ClaudeMemImportPlan,
 }
 
@@ -925,22 +988,29 @@ pub struct ClaudeMemImportReport {
 pub struct ClaudeMemReadReport {
     pub contract_version: String,
     pub source: String,
-    pub limit_per_table: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_per_table: Option<usize>,
+    pub import_all: bool,
     pub events: Vec<MemoryEvent>,
+    pub reconciliation: ClaudeMemImportReconciliation,
     pub plan: ClaudeMemImportPlan,
 }
 
 pub fn read_claude_mem_events(
     source_db_path: &Path,
-    limit_per_table: usize,
+    limit_per_table: Option<usize>,
 ) -> Result<ClaudeMemReadReport> {
     let plan = inspect_claude_mem(source_db_path)?;
     if !plan.exists || !plan.readable {
+        let reconciliation =
+            reconcile_claude_mem_import(&plan, limit_per_table, &[], &BTreeMap::new());
         return Ok(ClaudeMemReadReport {
             contract_version: MEMORY_CONTRACT_VERSION.to_string(),
             source: source_db_path.display().to_string(),
             limit_per_table,
+            import_all: limit_per_table.is_none(),
             events: Vec::new(),
+            reconciliation,
             plan,
         });
     }
@@ -959,12 +1029,16 @@ pub fn read_claude_mem_events(
     if plan.user_prompts.supported {
         events.extend(read_claude_mem_user_prompts(&conn, limit_per_table)?);
     }
+    let reconciliation =
+        reconcile_claude_mem_import(&plan, limit_per_table, &events, &BTreeMap::new());
 
     Ok(ClaudeMemReadReport {
         contract_version: MEMORY_CONTRACT_VERSION.to_string(),
         source: source_db_path.display().to_string(),
         limit_per_table,
+        import_all: limit_per_table.is_none(),
         events,
+        reconciliation,
         plan,
     })
 }
@@ -972,21 +1046,28 @@ pub fn read_claude_mem_events(
 pub fn import_claude_mem(
     source_db_path: &Path,
     target_memory_db_path: &Path,
-    limit_per_table: usize,
+    limit_per_table: Option<usize>,
     dry_run: bool,
 ) -> Result<ClaudeMemImportReport> {
     let read_report = read_claude_mem_events(source_db_path, limit_per_table)?;
     let plan = read_report.plan;
     if !plan.exists || !plan.readable {
+        let reconciliation =
+            reconcile_claude_mem_import(&plan, limit_per_table, &[], &BTreeMap::new());
         return Ok(ClaudeMemImportReport {
             contract_version: MEMORY_CONTRACT_VERSION.to_string(),
             source: source_db_path.display().to_string(),
             target: target_memory_db_path.display().to_string(),
             dry_run,
             limit_per_table,
+            import_all: limit_per_table.is_none(),
             imported_events: 0,
+            already_present_events: 0,
             planned_events: 0,
             event_ids: Vec::new(),
+            event_ids_total: 0,
+            event_ids_truncated: false,
+            reconciliation,
             plan,
         });
     }
@@ -994,12 +1075,21 @@ pub fn import_claude_mem(
     let events = read_report.events;
     let planned_events = events.len();
     let mut event_ids = Vec::new();
+    let mut event_ids_total = 0;
+    let mut write_results = BTreeMap::new();
     if !dry_run {
-        let store = MemoryStore::open_or_create(target_memory_db_path)?;
-        for event in &events {
-            event_ids.push(store.insert_event(event)?);
+        let mut store = MemoryStore::open_or_create(target_memory_db_path)?;
+        let results = store.insert_events(&events)?;
+        for (event, result) in events.iter().zip(results) {
+            record_claude_mem_write(&mut write_results, event, result.inserted);
+            event_ids_total += 1;
+            if event_ids.len() < MAX_IMPORT_EVENT_IDS {
+                event_ids.push(result.id);
+            }
         }
     }
+    let reconciliation =
+        reconcile_claude_mem_import(&plan, limit_per_table, &events, &write_results);
 
     Ok(ClaudeMemImportReport {
         contract_version: MEMORY_CONTRACT_VERSION.to_string(),
@@ -1007,25 +1097,34 @@ pub fn import_claude_mem(
         target: target_memory_db_path.display().to_string(),
         dry_run,
         limit_per_table,
-        imported_events: event_ids.len(),
+        import_all: limit_per_table.is_none(),
+        imported_events: reconciliation.total_imported_events,
+        already_present_events: reconciliation.total_already_present_events,
         planned_events,
         event_ids,
+        event_ids_total,
+        event_ids_truncated: event_ids_total > MAX_IMPORT_EVENT_IDS,
+        reconciliation,
         plan,
     })
 }
 
-fn read_claude_mem_observations(conn: &Connection, limit: usize) -> Result<Vec<MemoryEvent>> {
-    let mut stmt = conn.prepare(
+fn read_claude_mem_observations(
+    conn: &Connection,
+    limit: Option<usize>,
+) -> Result<Vec<MemoryEvent>> {
+    let sql = format!(
         r#"
         SELECT id, memory_session_id, project, type, title, subtitle, text, facts,
                narrative, concepts, prompt_number, discovery_tokens, created_at_epoch,
                content_hash
         FROM observations
-        ORDER BY created_at_epoch ASC, id ASC
-        LIMIT ?1
+        ORDER BY created_at_epoch ASC, id ASC{}
         "#,
-    )?;
-    let rows = stmt.query_map([limit as i64], |row| {
+        claude_mem_limit_clause(limit)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(limit.map(|value| value as i64)), |row| {
         let id: i64 = row.get(0)?;
         let session_id: String = row.get(1)?;
         let project: String = row.get(2)?;
@@ -1063,18 +1162,19 @@ fn read_claude_mem_observations(conn: &Connection, limit: usize) -> Result<Vec<M
     collect_rows(rows)
 }
 
-fn read_claude_mem_summaries(conn: &Connection, limit: usize) -> Result<Vec<MemoryEvent>> {
-    let mut stmt = conn.prepare(
+fn read_claude_mem_summaries(conn: &Connection, limit: Option<usize>) -> Result<Vec<MemoryEvent>> {
+    let sql = format!(
         r#"
         SELECT id, memory_session_id, project, request, investigated, learned,
                completed, next_steps, notes, prompt_number, discovery_tokens,
                created_at_epoch
         FROM session_summaries
-        ORDER BY created_at_epoch ASC, id ASC
-        LIMIT ?1
+        ORDER BY created_at_epoch ASC, id ASC{}
         "#,
-    )?;
-    let rows = stmt.query_map([limit as i64], |row| {
+        claude_mem_limit_clause(limit)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(limit.map(|value| value as i64)), |row| {
         let id: i64 = row.get(0)?;
         let session_id: String = row.get(1)?;
         let project: String = row.get(2)?;
@@ -1106,16 +1206,20 @@ fn read_claude_mem_summaries(conn: &Connection, limit: usize) -> Result<Vec<Memo
     collect_rows(rows)
 }
 
-fn read_claude_mem_user_prompts(conn: &Connection, limit: usize) -> Result<Vec<MemoryEvent>> {
-    let mut stmt = conn.prepare(
+fn read_claude_mem_user_prompts(
+    conn: &Connection,
+    limit: Option<usize>,
+) -> Result<Vec<MemoryEvent>> {
+    let sql = format!(
         r#"
         SELECT id, content_session_id, prompt_number, prompt_text, created_at_epoch
         FROM user_prompts
-        ORDER BY created_at_epoch ASC, id ASC
-        LIMIT ?1
+        ORDER BY created_at_epoch ASC, id ASC{}
         "#,
-    )?;
-    let rows = stmt.query_map([limit as i64], |row| {
+        claude_mem_limit_clause(limit)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(limit.map(|value| value as i64)), |row| {
         let id: i64 = row.get(0)?;
         let session_id: String = row.get(1)?;
         let prompt_number: i64 = row.get(2)?;
@@ -1132,6 +1236,152 @@ fn read_claude_mem_user_prompts(conn: &Connection, limit: usize) -> Result<Vec<M
         .with_metadata("prompt_number", prompt_number.to_string()))
     })?;
     collect_rows(rows)
+}
+
+fn claude_mem_limit_clause(limit: Option<usize>) -> &'static str {
+    if limit.is_some() {
+        "\n        LIMIT ?1"
+    } else {
+        ""
+    }
+}
+
+fn record_claude_mem_write(
+    write_results: &mut BTreeMap<String, ClaudeMemTableWriteCounts>,
+    event: &MemoryEvent,
+    inserted: bool,
+) {
+    let Some(table) = claude_mem_event_table(event) else {
+        return;
+    };
+    let counts = write_results.entry(table.to_string()).or_default();
+    if inserted {
+        counts.imported_events += 1;
+    } else {
+        counts.already_present_events += 1;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ClaudeMemTableWriteCounts {
+    imported_events: usize,
+    already_present_events: usize,
+}
+
+fn reconcile_claude_mem_import(
+    plan: &ClaudeMemImportPlan,
+    limit_per_table: Option<usize>,
+    events: &[MemoryEvent],
+    write_results: &BTreeMap<String, ClaudeMemTableWriteCounts>,
+) -> ClaudeMemImportReconciliation {
+    let event_counts = claude_mem_event_counts(events);
+    let observations = reconcile_claude_mem_table(
+        &plan.observations,
+        limit_per_table,
+        event_counts
+            .get("observations")
+            .copied()
+            .unwrap_or_default(),
+        write_results
+            .get("observations")
+            .copied()
+            .unwrap_or_default(),
+    );
+    let session_summaries = reconcile_claude_mem_table(
+        &plan.session_summaries,
+        limit_per_table,
+        event_counts
+            .get("session_summaries")
+            .copied()
+            .unwrap_or_default(),
+        write_results
+            .get("session_summaries")
+            .copied()
+            .unwrap_or_default(),
+    );
+    let user_prompts = reconcile_claude_mem_table(
+        &plan.user_prompts,
+        limit_per_table,
+        event_counts
+            .get("user_prompts")
+            .copied()
+            .unwrap_or_default(),
+        write_results
+            .get("user_prompts")
+            .copied()
+            .unwrap_or_default(),
+    );
+    let total_source_rows =
+        observations.source_rows + session_summaries.source_rows + user_prompts.source_rows;
+    let total_read_events =
+        observations.read_events + session_summaries.read_events + user_prompts.read_events;
+    let total_planned_events = observations.planned_events
+        + session_summaries.planned_events
+        + user_prompts.planned_events;
+    let total_imported_events = observations.imported_events
+        + session_summaries.imported_events
+        + user_prompts.imported_events;
+    let total_already_present_events = observations.already_present_events
+        + session_summaries.already_present_events
+        + user_prompts.already_present_events;
+    let total_skipped_source_rows = observations.skipped_source_rows
+        + session_summaries.skipped_source_rows
+        + user_prompts.skipped_source_rows;
+    let complete = observations.complete && session_summaries.complete && user_prompts.complete;
+    ClaudeMemImportReconciliation {
+        observations,
+        session_summaries,
+        user_prompts,
+        total_source_rows,
+        total_read_events,
+        total_planned_events,
+        total_imported_events,
+        total_already_present_events,
+        total_skipped_source_rows,
+        complete,
+    }
+}
+
+fn reconcile_claude_mem_table(
+    table_plan: &ClaudeMemTablePlan,
+    limit_per_table: Option<usize>,
+    read_events: usize,
+    write_counts: ClaudeMemTableWriteCounts,
+) -> ClaudeMemTableReconciliation {
+    let source_rows = table_plan.rows;
+    let skipped_source_rows = source_rows.saturating_sub(read_events);
+    ClaudeMemTableReconciliation {
+        table: table_plan.table.clone(),
+        source_rows,
+        read_events,
+        planned_events: read_events,
+        imported_events: write_counts.imported_events,
+        already_present_events: write_counts.already_present_events,
+        skipped_source_rows,
+        limit_per_table,
+        complete: skipped_source_rows == 0,
+    }
+}
+
+fn claude_mem_event_counts(events: &[MemoryEvent]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for event in events {
+        if let Some(table) = claude_mem_event_table(event) {
+            *counts.entry(table.to_string()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+fn claude_mem_event_table(event: &MemoryEvent) -> Option<&str> {
+    if event.imported_from.as_deref() != Some("claude-mem") {
+        return None;
+    }
+    event
+        .imported_id
+        .as_deref()?
+        .split_once(':')
+        .map(|(table, _)| table)
 }
 
 fn collect_rows<T>(rows: impl Iterator<Item = rusqlite::Result<T>>) -> Result<Vec<T>> {
@@ -1344,8 +1594,177 @@ mod tests {
                 .any(|warning| warning.contains("pending_messages"))
         );
 
-        let read_report = read_claude_mem_events(&db, 100).unwrap();
+        let read_report = read_claude_mem_events(&db, Some(100)).unwrap();
         assert!(read_report.events.is_empty());
+    }
+
+    #[test]
+    fn claude_mem_import_all_reconciles_supported_table_counts() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("claude-mem.db");
+        let target = dir.path().join("memory.db");
+        let conn = Connection::open(&source).unwrap();
+        create_supported_claude_mem_fixture(&conn);
+
+        let dry_run = import_claude_mem(&source, &target, None, true).unwrap();
+        assert!(dry_run.import_all);
+        assert!(dry_run.reconciliation.complete);
+        assert_eq!(dry_run.reconciliation.total_source_rows, 6);
+        assert_eq!(dry_run.reconciliation.total_read_events, 6);
+        assert_eq!(dry_run.reconciliation.total_skipped_source_rows, 0);
+        assert_eq!(dry_run.reconciliation.observations.source_rows, 2);
+        assert_eq!(dry_run.reconciliation.session_summaries.source_rows, 1);
+        assert_eq!(dry_run.reconciliation.user_prompts.source_rows, 3);
+
+        let applied = import_claude_mem(&source, &target, None, false).unwrap();
+        assert_eq!(applied.planned_events, 6);
+        assert_eq!(applied.imported_events, 6);
+        assert_eq!(applied.already_present_events, 0);
+        assert_eq!(applied.event_ids_total, 6);
+        assert_eq!(applied.event_ids.len(), 6);
+        assert!(!applied.event_ids_truncated);
+        assert_eq!(
+            MemoryStore::open_or_create(&target)
+                .unwrap()
+                .event_count()
+                .unwrap(),
+            6
+        );
+
+        let second_apply = import_claude_mem(&source, &target, None, false).unwrap();
+        assert_eq!(second_apply.imported_events, 0);
+        assert_eq!(second_apply.already_present_events, 6);
+        assert_eq!(second_apply.reconciliation.total_already_present_events, 6);
+    }
+
+    #[test]
+    fn claude_mem_limited_import_reports_skipped_source_rows() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("claude-mem.db");
+        let conn = Connection::open(&source).unwrap();
+        create_supported_claude_mem_fixture(&conn);
+
+        let read_report = read_claude_mem_events(&source, Some(1)).unwrap();
+        assert!(!read_report.import_all);
+        assert!(!read_report.reconciliation.complete);
+        assert_eq!(read_report.reconciliation.total_source_rows, 6);
+        assert_eq!(read_report.reconciliation.total_read_events, 3);
+        assert_eq!(read_report.reconciliation.total_skipped_source_rows, 3);
+        assert_eq!(
+            read_report.reconciliation.observations.skipped_source_rows,
+            1
+        );
+        assert_eq!(
+            read_report
+                .reconciliation
+                .session_summaries
+                .skipped_source_rows,
+            0
+        );
+        assert_eq!(
+            read_report.reconciliation.user_prompts.skipped_source_rows,
+            2
+        );
+    }
+
+    #[test]
+    fn claude_mem_import_caps_reported_event_ids() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("claude-mem.db");
+        let target = dir.path().join("memory.db");
+        let conn = Connection::open(&source).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE user_prompts (
+              id INTEGER PRIMARY KEY,
+              content_session_id TEXT NOT NULL,
+              prompt_number INTEGER NOT NULL,
+              prompt_text TEXT NOT NULL,
+              created_at_epoch INTEGER NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        for id in 1..=(MAX_IMPORT_EVENT_IDS + 1) {
+            conn.execute(
+                "INSERT INTO user_prompts (id, content_session_id, prompt_number, prompt_text, created_at_epoch) VALUES (?1, 'session-a', ?2, ?3, ?4)",
+                params![id as i64, id as i64, format!("prompt {id}"), 1700000000_i64 + id as i64],
+            )
+            .unwrap();
+        }
+
+        let applied = import_claude_mem(&source, &target, None, false).unwrap();
+        assert_eq!(applied.planned_events, MAX_IMPORT_EVENT_IDS + 1);
+        assert_eq!(applied.event_ids_total, MAX_IMPORT_EVENT_IDS + 1);
+        assert_eq!(applied.event_ids.len(), MAX_IMPORT_EVENT_IDS);
+        assert!(applied.event_ids_truncated);
+        assert!(applied.reconciliation.complete);
+    }
+
+    fn create_supported_claude_mem_fixture(conn: &Connection) {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE observations (
+              id INTEGER PRIMARY KEY,
+              memory_session_id TEXT NOT NULL,
+              project TEXT NOT NULL,
+              type TEXT NOT NULL,
+              title TEXT,
+              subtitle TEXT,
+              text TEXT,
+              facts TEXT,
+              narrative TEXT,
+              concepts TEXT,
+              prompt_number INTEGER,
+              discovery_tokens INTEGER NOT NULL,
+              created_at_epoch INTEGER NOT NULL,
+              content_hash TEXT
+            );
+            CREATE TABLE session_summaries (
+              id INTEGER PRIMARY KEY,
+              memory_session_id TEXT NOT NULL,
+              project TEXT NOT NULL,
+              request TEXT,
+              investigated TEXT,
+              learned TEXT,
+              completed TEXT,
+              next_steps TEXT,
+              notes TEXT,
+              prompt_number INTEGER,
+              discovery_tokens INTEGER NOT NULL,
+              created_at_epoch INTEGER NOT NULL
+            );
+            CREATE TABLE user_prompts (
+              id INTEGER PRIMARY KEY,
+              content_session_id TEXT NOT NULL,
+              prompt_number INTEGER NOT NULL,
+              prompt_text TEXT NOT NULL,
+              created_at_epoch INTEGER NOT NULL
+            );
+            INSERT INTO observations (
+              id, memory_session_id, project, type, title, subtitle, text, facts,
+              narrative, concepts, prompt_number, discovery_tokens, created_at_epoch,
+              content_hash
+            ) VALUES
+              (1, 'session-a', 'agent-loop', 'fact', 'Title A', NULL, 'Text A', NULL, NULL, 'tsift', 1, 42, 1700000001, 'hash-a'),
+              (2, 'session-b', 'agent-loop', 'fact', 'Title B', NULL, 'Text B', NULL, NULL, 'memory', 2, 43, 1700000002, 'hash-b');
+            INSERT INTO session_summaries (
+              id, memory_session_id, project, request, investigated, learned,
+              completed, next_steps, notes, prompt_number, discovery_tokens,
+              created_at_epoch
+            ) VALUES (
+              1, 'session-a', 'agent-loop', 'replace claude-mem', 'tables',
+              'all rows', 'imported', 'refresh graph', NULL, 3, 44, 1700000003
+            );
+            INSERT INTO user_prompts (
+              id, content_session_id, prompt_number, prompt_text, created_at_epoch
+            ) VALUES
+              (1, 'session-a', 1, 'first prompt', 1700000004),
+              (2, 'session-a', 2, 'second prompt', 1700000005),
+              (3, 'session-b', 1, 'third prompt', 1700000006);
+            "#,
+        )
+        .unwrap();
     }
 
     #[test]

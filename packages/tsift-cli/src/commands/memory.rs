@@ -12,6 +12,8 @@ use tsift_memory::{
     memory_schema_sql, plan_capture_handoff, plan_memory_query,
 };
 
+const DEFAULT_CLAUDE_MEM_IMPORT_LIMIT: usize = 1000;
+
 #[derive(Serialize)]
 struct MemoryStatusReport {
     contract_version: String,
@@ -70,9 +72,17 @@ pub(crate) fn cmd_memory(command: MemoryCommand, format: OutputFormat) -> Result
             path,
             db,
             limit,
+            all,
             apply,
             ..
-        } => cmd_memory_import_claude_mem(&path, db.as_deref(), limit, apply, format),
+        } => {
+            let limit_per_table = if all {
+                None
+            } else {
+                Some(limit.unwrap_or(DEFAULT_CLAUDE_MEM_IMPORT_LIMIT))
+            };
+            cmd_memory_import_claude_mem(&path, db.as_deref(), limit_per_table, apply, format)
+        }
         MemoryCommand::CaptureAgentDocCloseout {
             path,
             session_path,
@@ -171,7 +181,7 @@ fn cmd_memory_status(
         next_commands: vec![
             format!("tsift memory init {}", path.display()),
             format!(
-                "tsift memory import-claude-mem {} --apply --json",
+                "tsift memory import-claude-mem {} --all --apply --json",
                 path.display()
             ),
             "tsift memory handoff-plan '<event text>' --budget-tokens 4096 --json".to_string(),
@@ -203,7 +213,7 @@ fn cmd_memory_init(path: &Path, format: OutputFormat) -> Result<()> {
         next_commands: vec![
             format!("tsift memory status {} --json", path.display()),
             format!(
-                "tsift memory import-claude-mem {} --apply --json",
+                "tsift memory import-claude-mem {} --all --apply --json",
                 path.display()
             ),
         ],
@@ -226,13 +236,13 @@ fn cmd_memory_init(path: &Path, format: OutputFormat) -> Result<()> {
 fn cmd_memory_import_claude_mem(
     path: &Path,
     db: Option<&Path>,
-    limit: usize,
+    limit_per_table: Option<usize>,
     apply: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let source = resolve_claude_mem_path(db)?;
     let target = default_memory_db_path(path);
-    let report = import_claude_mem(&source, &target, limit, !apply)?;
+    let report = import_claude_mem(&source, &target, limit_per_table, !apply)?;
     print_memory_report(
         &report,
         &format,
@@ -245,12 +255,19 @@ fn cmd_memory_import_claude_mem(
             }
             .to_string(),
             metrics: vec![
+                envelope_metric("source_rows", report.reconciliation.total_source_rows),
                 envelope_metric("planned_events", report.planned_events),
                 envelope_metric("imported_events", report.imported_events),
+                envelope_metric("already_present_events", report.already_present_events),
+                envelope_metric("complete", report.reconciliation.complete),
             ],
         },
         vec![
             format!("tsift memory status {} --json", path.display()),
+            format!(
+                "tsift memory import-claude-mem {} --all --apply --json",
+                path.display()
+            ),
             format!("tsift graph-db --path {} --json refresh", path.display()),
         ],
     )
