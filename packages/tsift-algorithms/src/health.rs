@@ -40,33 +40,98 @@ pub struct TerseHealthScore {
 }
 
 pub fn terse_health_report(edges: &[(String, String)], n: usize) -> TerseHealthReport {
-    let report = composite_health_score(edges);
-    let top_scores: Vec<TerseHealthScore> = report
-        .scores
-        .iter()
-        .take(n)
-        .map(|s| TerseHealthScore {
-            name: s.name.clone(),
-            overall: s.overall,
-        })
-        .collect();
-    let bottom_scores: Vec<TerseHealthScore> = report
-        .scores
-        .iter()
-        .rev()
-        .take(n)
-        .map(|s| TerseHealthScore {
-            name: s.name.clone(),
-            overall: s.overall,
-        })
-        .collect();
+    if edges.is_empty() {
+        return TerseHealthReport {
+            top_scores: Vec::new(),
+            bottom_scores: Vec::new(),
+            avg_overall: 0.0,
+            avg_cycle_risk: 0.0,
+            node_count: 0,
+            edge_count: 0,
+        };
+    }
+
+    let (node_vec, _node_idx, out_adj, in_adj) = build_graph(edges);
+    let node_count = node_vec.len();
+    if node_count == 0 {
+        return TerseHealthReport {
+            top_scores: Vec::new(),
+            bottom_scores: Vec::new(),
+            avg_overall: 0.0,
+            avg_cycle_risk: 0.0,
+            node_count: 0,
+            edge_count: 0,
+        };
+    }
+
+    let fwd_sccs = compute_sccs(node_count, &out_adj);
+    let bwd_sccs = compute_sccs(node_count, &in_adj);
+    let cycle_nodes = find_cycles_from_sccs(&out_adj, &fwd_sccs);
+
+    let fwd_reach = compute_reachability_with_sccs(node_count, &out_adj, &fwd_sccs);
+    let bwd_reach = compute_reachability_with_sccs(node_count, &in_adj, &bwd_sccs);
+
+    let total_possible = (node_count - 1).max(1) as f64;
+    let total_degree: f64 = out_adj.iter().map(|s| s.len()).sum::<usize>() as f64;
+    let avg_degree = total_degree / node_count as f64;
+
+    let mut raw_scores: Vec<TerseHealthScore> = Vec::with_capacity(node_count);
+    let mut sum_overall: f64 = 0.0;
+    let mut sum_cycle_risk: f64 = 0.0;
+
+    for (i, name) in node_vec.iter().enumerate() {
+        let out_degree = out_adj[i].len() as f64;
+        let in_degree = in_adj[i].len() as f64;
+        let connectivity =
+            (out_degree + in_degree) / (2.0 * avg_degree.max(1.0)).min(total_degree.max(1.0));
+        let connectivity = connectivity.min(1.0);
+
+        let reach_fwd = (fwd_reach[i] as f64 - 1.0) / total_possible;
+        let reach_bwd = (bwd_reach[i] as f64 - 1.0) / total_possible;
+        let reachability = (reach_fwd + reach_bwd) / 2.0;
+
+        let centrality = if node_count > 1 {
+            (fwd_reach[i] + bwd_reach[i]) as f64 / (2.0 * node_count as f64)
+        } else {
+            1.0
+        };
+
+        let cycle_risk = if cycle_nodes.contains(&i) { 1.0 } else { 0.0 };
+
+        let overall = connectivity * 0.25
+            + reachability * 0.25
+            + centrality * 0.25
+            + (1.0 - cycle_risk) * 0.25;
+
+        sum_overall += overall;
+        sum_cycle_risk += cycle_risk;
+
+        raw_scores.push(TerseHealthScore {
+            name: name.clone(),
+            overall,
+        });
+    }
+
+    let n = n.min(node_count);
+
+    let (mut top_candidates, mut bottom_candidates) = {
+        let mut sorted = raw_scores;
+        sorted.sort_by(|a, b| b.overall.partial_cmp(&a.overall).unwrap_or(std::cmp::Ordering::Equal));
+        let top: Vec<TerseHealthScore> = sorted.iter().take(n).cloned().collect();
+        let bottom: Vec<TerseHealthScore> = sorted.iter().rev().take(n).cloned().collect();
+        (top, bottom)
+    };
+
+    top_candidates.sort_by(|a, b| b.overall.partial_cmp(&a.overall).unwrap_or(std::cmp::Ordering::Equal));
+    bottom_candidates.sort_by(|a, b| a.overall.partial_cmp(&b.overall).unwrap_or(std::cmp::Ordering::Equal));
+
     TerseHealthReport {
-        top_scores,
-        bottom_scores,
-        avg_overall: report.avg_overall,
-        avg_cycle_risk: report.avg_cycle_risk,
-        node_count: report.node_count,
-        edge_count: report.edge_count,
+        top_scores: top_candidates,
+        bottom_scores: bottom_candidates,
+        avg_overall: sum_overall / node_count as f64,
+        avg_cycle_risk: sum_cycle_risk / node_count as f64,
+        node_count,
+        edge_count: edges.len(),
     }
 }
 
@@ -432,5 +497,77 @@ mod tests {
         for i in 1..report.scores.len() {
             assert!(report.scores[i - 1].overall >= report.scores[i].overall);
         }
+    }
+
+    #[test]
+    fn terse_empty() {
+        let report = terse_health_report(&[], 5);
+        assert_eq!(report.node_count, 0);
+        assert_eq!(report.top_scores.len(), 0);
+        assert_eq!(report.bottom_scores.len(), 0);
+        assert_eq!(report.avg_overall, 0.0);
+    }
+
+    #[test]
+    fn terse_matches_composite() {
+        let edges = vec![e("a", "b"), e("a", "c"), e("b", "c"), e("c", "d"), e("d", "a")];
+        let full = composite_health_score(&edges);
+        let terse = terse_health_report(&edges, 2);
+        assert_eq!(terse.node_count, full.node_count);
+        assert_eq!(terse.edge_count, full.edge_count);
+        assert!((terse.avg_overall - full.avg_overall).abs() < 1e-10);
+        assert!((terse.avg_cycle_risk - full.avg_cycle_risk).abs() < 1e-10);
+        assert_eq!(terse.top_scores.len(), 2);
+        assert_eq!(terse.bottom_scores.len(), 2);
+        assert_eq!(terse.top_scores[0].name, full.scores[0].name);
+        assert!((terse.top_scores[0].overall - full.scores[0].overall).abs() < 1e-10);
+    }
+
+    #[test]
+    fn terse_top_sorted_descending() {
+        let edges = vec![e("hub", "a"), e("hub", "b"), e("hub", "c"), e("a", "b")];
+        let terse = terse_health_report(&edges, 2);
+        for i in 1..terse.top_scores.len() {
+            assert!(terse.top_scores[i - 1].overall >= terse.top_scores[i].overall);
+        }
+    }
+
+    #[test]
+    fn terse_bottom_sorted_ascending() {
+        let edges = vec![e("hub", "a"), e("hub", "b"), e("hub", "c"), e("a", "b")];
+        let terse = terse_health_report(&edges, 2);
+        for i in 1..terse.bottom_scores.len() {
+            assert!(terse.bottom_scores[i - 1].overall <= terse.bottom_scores[i].overall);
+        }
+    }
+
+    #[test]
+    fn terse_n_larger_than_nodes() {
+        let edges = vec![e("a", "b")];
+        let terse = terse_health_report(&edges, 10);
+        assert_eq!(terse.top_scores.len(), 2);
+        assert_eq!(terse.bottom_scores.len(), 2);
+    }
+
+    #[test]
+    fn terse_scores_bounded() {
+        let edges = vec![
+            e("a", "b"),
+            e("b", "c"),
+            e("c", "d"),
+            e("d", "a"),
+            e("a", "c"),
+        ];
+        let terse = terse_health_report(&edges, 2);
+        for s in terse.top_scores.iter().chain(terse.bottom_scores.iter()) {
+            assert!(s.overall >= 0.0 && s.overall <= 1.0, "{} overall={}", s.name, s.overall);
+        }
+    }
+
+    #[test]
+    fn terse_cycle_avg() {
+        let edges = vec![e("a", "b"), e("b", "a")];
+        let terse = terse_health_report(&edges, 1);
+        assert!((terse.avg_cycle_risk - 1.0).abs() < 1e-10);
     }
 }

@@ -36,7 +36,7 @@ tsift (root crate — public package shim: lib.rs + graph/lang/resolution/substr
 │   └── re-exported via src/graph.rs and src/lang/mod.rs as thin shims
 ├── tsift-algorithms crate (packages/tsift-algorithms — graph algorithms)
 │   ├── scc module — iterative Tarjan SCC (strongly connected components)
-│   ├── health module — composite health score (connectivity, reachability, centrality, cycle risk)
+│   ├── health module — composite health score (connectivity, reachability, centrality, cycle risk); terse_health_report computes top/bottom N scores directly without allocating full per-node sub-metrics
 │   ├── dead_code module — dead code detection (unreachable, isolated, orphaned nodes)
 │   ├── coupling module — coupling analysis (fan-in, fan-out, instability metrics per module)
 │   ├── surfaced by `tsift analyze` over the indexed call graph
