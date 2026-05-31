@@ -572,6 +572,45 @@ impl CommunityMember {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerseCommunityMember {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tagpath_handle: Option<String>,
+}
+
+impl From<&CommunityMember> for TerseCommunityMember {
+    fn from(m: &CommunityMember) -> Self {
+        Self {
+            name: m.name.clone(),
+            tagpath_handle: m.tagpath_handle.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerseCommunity {
+    pub id: usize,
+    pub members: Vec<TerseCommunityMember>,
+    pub modularity_contribution: f64,
+}
+
+impl TerseCommunity {
+    pub fn from_community(community: &Community, top_n: usize) -> Self {
+        let members: Vec<TerseCommunityMember> = community
+            .members
+            .iter()
+            .take(top_n)
+            .map(TerseCommunityMember::from)
+            .collect();
+        Self {
+            id: community.id,
+            members,
+            modularity_contribution: community.modularity_contribution,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Community {
     pub id: usize,
     pub members: Vec<CommunityMember>,
@@ -585,6 +624,31 @@ pub struct CommunityResult {
     pub iterations: usize,
     pub node_count: usize,
     pub edge_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerseCommunityResult {
+    pub communities: Vec<TerseCommunity>,
+    pub modularity: f64,
+    pub iterations: usize,
+    pub node_count: usize,
+    pub edge_count: usize,
+}
+
+impl CommunityResult {
+    pub fn to_terse(&self, top_n: usize) -> TerseCommunityResult {
+        TerseCommunityResult {
+            communities: self
+                .communities
+                .iter()
+                .map(|c| TerseCommunity::from_community(c, top_n))
+                .collect(),
+            modularity: self.modularity,
+            iterations: self.iterations,
+            node_count: self.node_count,
+            edge_count: self.edge_count,
+        }
+    }
 }
 
 pub fn detect_communities(edges: &[(String, String)]) -> CommunityResult {
@@ -1297,5 +1361,86 @@ function createUser() {}
         let edges = vec![s("a", "a"), s("a", "b")];
         let result = shortest_path(&edges, "a", "b").unwrap();
         assert_eq!(result.hops, 1);
+    }
+
+    #[test]
+    fn terse_community_drops_optional_fields() {
+        let member = CommunityMember {
+            name: "foo".to_string(),
+            file: Some("src/lib.rs".to_string()),
+            line: Some(42),
+            refs: vec![CommunityMemberRef {
+                file: "src/lib.rs".to_string(),
+                line: 42,
+                role: "call".to_string(),
+                peer: "bar".to_string(),
+            }],
+            tagpath_handle: Some("foo::lib".to_string()),
+        };
+        let terse = TerseCommunityMember::from(&member);
+        assert_eq!(terse.name, "foo");
+        assert_eq!(terse.tagpath_handle, Some("foo::lib".to_string()));
+    }
+
+    #[test]
+    fn terse_community_top_n_truncates_members() {
+        let community = Community {
+            id: 0,
+            members: vec![
+                CommunityMember::new("a"),
+                CommunityMember::new("b"),
+                CommunityMember::new("c"),
+                CommunityMember::new("d"),
+                CommunityMember::new("e"),
+            ],
+            modularity_contribution: 0.25,
+        };
+        let terse = TerseCommunity::from_community(&community, 3);
+        assert_eq!(terse.id, 0);
+        assert_eq!(terse.members.len(), 3);
+        assert_eq!(terse.members[0].name, "a");
+        assert_eq!(terse.members[2].name, "c");
+        assert_eq!(terse.modularity_contribution, 0.25);
+    }
+
+    #[test]
+    fn terse_community_result_from_detect_communities() {
+        let edges = vec![s("a", "b"), s("b", "c"), s("c", "d")];
+        let result = detect_communities(&edges);
+        let terse = result.to_terse(2);
+        assert_eq!(terse.node_count, result.node_count);
+        assert_eq!(terse.edge_count, result.edge_count);
+        assert_eq!(terse.modularity, result.modularity);
+        assert_eq!(terse.communities.len(), result.communities.len());
+        for tc in &terse.communities {
+            assert!(tc.members.len() <= 2);
+        }
+    }
+
+    #[test]
+    fn terse_community_json_smaller_than_full() {
+        let edges: Vec<(String, String)> = (0..20)
+            .flat_map(|i| {
+                let base = i * 5;
+                vec![
+                    (format!("n{}", base), format!("n{}", base + 1)),
+                    (format!("n{}", base), format!("n{}", base + 2)),
+                    (format!("n{}", base + 1), format!("n{}", base + 2)),
+                    (format!("n{}", base + 2), format!("n{}", base + 3)),
+                    (format!("n{}", base + 3), format!("n{}", base + 4)),
+                ]
+            })
+            .chain(std::iter::once(("n0".to_string(), "n5".to_string())))
+            .collect();
+        let result = detect_communities(&edges);
+        let terse = result.to_terse(2);
+        let full_member_count: usize = result.communities.iter().map(|c| c.members.len()).sum();
+        let terse_member_count: usize = terse.communities.iter().map(|c| c.members.len()).sum();
+        assert!(
+            terse_member_count < full_member_count,
+            "terse members ({}) should be fewer than full ({})",
+            terse_member_count,
+            full_member_count
+        );
     }
 }

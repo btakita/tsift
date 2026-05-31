@@ -32,6 +32,7 @@ tsift (root crate — public package shim: lib.rs + graph/lang/resolution/substr
 ├── tsift-graph crate (packages/tsift-graph — language-aware graph extraction)
 │   ├── lang module — Lang enum, Symbol, tree-sitter symbol/call queries, extract_symbols
 │   ├── graph extraction — call sites, routes, edge resolution, community detection, shortest path
+│   ├── TerseCommunityMember, TerseCommunity, TerseCommunityResult — compact community serialization (name + tagpath_handle only, top-N member slice)
 │   ├── complexity module — ComplexityMetrics, LanguageExtractor trait, LanguageRegistry
 │   └── re-exported via src/graph.rs and src/lang/mod.rs as thin shims
 ├── tsift-algorithms crate (packages/tsift-algorithms — graph algorithms)
@@ -771,6 +772,8 @@ tsift communities [--path <path>] [--scope <submod>] [--min-size N] [--json]
 4. Repeat until convergence (no improving moves or 100 iterations)
 
 **Output:** communities sorted by size (largest first), total modularity Q ∈ [-0.5, 1.0] (higher = stronger community structure), per-community member list and modularity contribution. JSON `CommunityMember` rows always include `name` and may include `file`, `line`, bounded `refs` (`file`, `line`, `role`, `peer`), and `tagpath_handle` when local index/tagpath evidence can resolve them.
+
+**Terse serialization.** `TerseCommunityMember` strips `file`, `line`, and `refs`, keeping only `name` and `tagpath_handle`. `TerseCommunity` wraps a top-N member slice of `TerseCommunityMember` rows plus `id` and `modularity_contribution`. `CommunityResult::to_terse(top_n)` converts the full result into a `TerseCommunityResult` with truncated member lists. On codebases with large communities, terse output achieves ~40–60% JSON savings compared to full `CommunityResult` serialization by eliminating per-member file/line/refs fields and capping the member list.
 
 **`--min-size N` (default 2):** filter out singleton communities (external symbols with no definition in the indexed codebase).
 
