@@ -103,8 +103,11 @@ fn build_graph(
     (node_vec, node_idx, out_adj, in_adj)
 }
 
-fn compute_reachability(n: usize, adj: &[HashSet<usize>]) -> Vec<usize> {
-    let sccs = compute_sccs(n, adj);
+fn compute_reachability_with_sccs(
+    n: usize,
+    adj: &[HashSet<usize>],
+    sccs: &[Vec<usize>],
+) -> Vec<usize> {
     let mut comp_of = vec![0usize; n];
     for (comp_id, members) in sccs.iter().enumerate() {
         for &node in members {
@@ -210,70 +213,18 @@ fn compute_sccs(n: usize, adj: &[HashSet<usize>]) -> Vec<Vec<usize>> {
     components
 }
 
-fn find_cycles(n: usize, adj: &[HashSet<usize>]) -> HashSet<usize> {
+fn find_cycles_from_sccs(adj: &[HashSet<usize>], sccs: &[Vec<usize>]) -> HashSet<usize> {
     let mut in_cycle = HashSet::new();
-    let mut index = 0usize;
-    let mut stack = Vec::new();
-    let mut on_stack = vec![false; n];
-    let mut indices = vec![None::<usize>; n];
-    let mut lowlinks = vec![0usize; n];
-
-    #[allow(clippy::too_many_arguments)]
-    fn strongconnect(
-        v: usize,
-        adj: &[HashSet<usize>],
-        index: &mut usize,
-        stack: &mut Vec<usize>,
-        on_stack: &mut Vec<bool>,
-        indices: &mut Vec<Option<usize>>,
-        lowlinks: &mut Vec<usize>,
-        in_cycle: &mut HashSet<usize>,
-    ) {
-        indices[v] = Some(*index);
-        lowlinks[v] = *index;
-        *index += 1;
-        stack.push(v);
-        on_stack[v] = true;
-
-        for &w in &adj[v] {
-            if indices[w].is_none() {
-                strongconnect(w, adj, index, stack, on_stack, indices, lowlinks, in_cycle);
+    for component in sccs {
+        if component.len() > 1 {
+            for &node in component {
+                in_cycle.insert(node);
             }
-            if w != v && on_stack[w] {
-                lowlinks[v] = lowlinks[v].min(indices[w].unwrap());
+        } else if component.len() == 1 {
+            let v = component[0];
+            if adj[v].contains(&v) {
+                in_cycle.insert(v);
             }
-        }
-
-        if indices[v] == Some(lowlinks[v]) {
-            let mut component = Vec::new();
-            loop {
-                let w = stack.pop().unwrap();
-                on_stack[w] = false;
-                component.push(w);
-                if w == v {
-                    break;
-                }
-            }
-            if component.len() > 1 || adj[v].contains(&v) {
-                for &node in &component {
-                    in_cycle.insert(node);
-                }
-            }
-        }
-    }
-
-    for v in 0..n {
-        if indices[v].is_none() {
-            strongconnect(
-                v,
-                adj,
-                &mut index,
-                &mut stack,
-                &mut on_stack,
-                &mut indices,
-                &mut lowlinks,
-                &mut in_cycle,
-            );
         }
     }
     in_cycle
@@ -308,9 +259,12 @@ pub fn composite_health_score(edges: &[(String, String)]) -> HealthReport {
         };
     }
 
-    let fwd_reach = compute_reachability(n, &out_adj);
-    let bwd_reach = compute_reachability(n, &in_adj);
-    let cycle_nodes = find_cycles(n, &out_adj);
+    let fwd_sccs = compute_sccs(n, &out_adj);
+    let bwd_sccs = compute_sccs(n, &in_adj);
+    let cycle_nodes = find_cycles_from_sccs(&out_adj, &fwd_sccs);
+
+    let fwd_reach = compute_reachability_with_sccs(n, &out_adj, &fwd_sccs);
+    let bwd_reach = compute_reachability_with_sccs(n, &in_adj, &bwd_sccs);
 
     let total_possible = (n - 1).max(1) as f64;
     let total_degree: f64 = out_adj.iter().map(|s| s.len()).sum::<usize>() as f64;
