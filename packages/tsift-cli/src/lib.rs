@@ -20364,6 +20364,16 @@ fn cmd_dci_benchmark(fixture_path: &Path, format: OutputFormat) -> Result<()> {
                 dci_benchmark::format_number(summary.avg_output_tokens)
             );
         }
+        if let Some(gate) = &report.memory_retrieval_gate {
+            println!(
+                "memory_retrieval_gate decision:{} baseline:{} min_avg_useful_hits:{} max_zero_output_failures:{} diagnostics:{}",
+                gate.decision,
+                gate.baseline_strategy,
+                dci_benchmark::format_number(gate.min_avg_useful_hits),
+                gate.max_zero_output_failures,
+                gate.diagnostics.len()
+            );
+        }
         for warning in &report.warnings {
             println!("warning: {warning}");
         }
@@ -20394,6 +20404,30 @@ fn cmd_dci_benchmark(fixture_path: &Path, format: OutputFormat) -> Result<()> {
             dci_benchmark::format_number(summary.avg_estimated_tokens),
             dci_benchmark::format_number(summary.avg_output_tokens)
         );
+    }
+
+    if let Some(gate) = &report.memory_retrieval_gate {
+        println!();
+        println!("Memory retrieval gate:");
+        println!("  decision: {}", gate.decision);
+        println!(
+            "  baseline: {}, min avg useful hits {}, max zero-output failures {}",
+            gate.baseline_strategy,
+            dci_benchmark::format_number(gate.min_avg_useful_hits),
+            gate.max_zero_output_failures
+        );
+        for row in &gate.rows {
+            println!(
+                "  {}: status {}, avg useful hits {}, zero-output failures {}",
+                row.strategy,
+                row.status,
+                dci_benchmark::format_number(row.avg_useful_hits),
+                row.zero_output_failures
+            );
+        }
+        for diagnostic in &gate.diagnostics {
+            println!("  diagnostic: {diagnostic}");
+        }
     }
 
     println!();

@@ -5438,6 +5438,25 @@ fn dci_benchmark_summarizes_memory_retrieval_eval_fixture() {
             .iter()
             .any(|strategy| strategy == "claude_mem_api")
     }));
+    let gate = &json["memory_retrieval_gate"];
+    assert_eq!(gate["decision"], "pass");
+    assert_eq!(gate["baseline_strategy"], "claude_mem_api");
+    assert_eq!(
+        gate["candidate_strategies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|strategy| strategy.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["tsift_session_review_context_pack", "graph_db_related"]
+    );
+    assert!(
+        gate["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["status"] == "pass")
+    );
 }
 
 #[test]

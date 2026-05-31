@@ -49,6 +49,8 @@ pub struct DciBenchmarkReport {
     pub expected_strategies: Vec<String>,
     pub strategy_summaries: Vec<DciStrategySummary>,
     pub task_rows: Vec<DciTaskRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_retrieval_gate: Option<MemoryRetrievalGate>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
 }
@@ -84,6 +86,28 @@ pub struct DciTaskRow {
     pub lowest_token_budget: Option<String>,
     pub lowest_output_tokens: Option<String>,
     pub zero_output_failures: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MemoryRetrievalGate {
+    pub decision: String,
+    pub baseline_strategy: String,
+    pub candidate_strategies: Vec<String>,
+    pub min_avg_useful_hits: f64,
+    pub max_zero_output_failures: usize,
+    pub rows: Vec<MemoryRetrievalGateRow>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MemoryRetrievalGateRow {
+    pub strategy: String,
+    pub avg_useful_hits: f64,
+    pub zero_output_failures: usize,
+    pub useful_hits_pass: bool,
+    pub zero_output_pass: bool,
+    pub status: String,
 }
 
 #[derive(Default)]
@@ -252,6 +276,8 @@ pub fn compute(input: &str) -> Result<DciBenchmarkReport> {
     for (index, summary) in summaries.iter_mut().enumerate() {
         summary.rank = index + 1;
     }
+    let memory_retrieval_gate =
+        build_memory_retrieval_gate(&summaries, &expected_strategies, fixture.tasks.len());
 
     Ok(DciBenchmarkReport {
         description: fixture.description,
@@ -260,7 +286,127 @@ pub fn compute(input: &str) -> Result<DciBenchmarkReport> {
         expected_strategies,
         strategy_summaries: summaries,
         task_rows,
+        memory_retrieval_gate,
         warnings,
+    })
+}
+
+fn build_memory_retrieval_gate(
+    summaries: &[DciStrategySummary],
+    expected_strategies: &[String],
+    tasks_loaded: usize,
+) -> Option<MemoryRetrievalGate> {
+    const BASELINE: &str = "claude_mem_api";
+    const CANDIDATES: [&str; 2] = ["tsift_session_review_context_pack", "graph_db_related"];
+
+    let expected = expected_strategies
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if !expected.contains(BASELINE)
+        || !CANDIDATES
+            .iter()
+            .all(|candidate| expected.contains(candidate))
+    {
+        return None;
+    }
+
+    let baseline = summaries
+        .iter()
+        .find(|summary| summary.strategy == BASELINE);
+    let min_avg_useful_hits = baseline
+        .map(|summary| summary.avg_useful_hits)
+        .unwrap_or_default();
+    let baseline_zero_output_failures = baseline
+        .map(|summary| summary.zero_output_failures)
+        .unwrap_or(tasks_loaded);
+    let max_zero_output_failures = if baseline_zero_output_failures == 0 {
+        0
+    } else {
+        baseline_zero_output_failures - 1
+    };
+
+    let mut diagnostics = Vec::new();
+    if baseline.is_none() {
+        diagnostics.push(format!(
+            "baseline strategy {BASELINE} was not present; memory retrieval gate blocks"
+        ));
+    }
+
+    let mut rows = Vec::new();
+    for candidate in CANDIDATES {
+        match summaries
+            .iter()
+            .find(|summary| summary.strategy == candidate)
+        {
+            Some(summary) => {
+                let useful_hits_pass =
+                    summary.avg_useful_hits + f64::EPSILON >= min_avg_useful_hits;
+                let zero_output_pass = if baseline_zero_output_failures == 0 {
+                    summary.zero_output_failures == 0
+                } else {
+                    summary.zero_output_failures < baseline_zero_output_failures
+                };
+                let status = if useful_hits_pass && zero_output_pass {
+                    "pass"
+                } else {
+                    "block"
+                };
+                if !useful_hits_pass {
+                    diagnostics.push(format!(
+                        "{candidate} avg useful hits {} is below baseline {}",
+                        format_number(summary.avg_useful_hits),
+                        format_number(min_avg_useful_hits)
+                    ));
+                }
+                if !zero_output_pass {
+                    diagnostics.push(format!(
+                        "{candidate} zero-output failures {} did not improve on baseline {}",
+                        summary.zero_output_failures, baseline_zero_output_failures
+                    ));
+                }
+                rows.push(MemoryRetrievalGateRow {
+                    strategy: candidate.to_string(),
+                    avg_useful_hits: summary.avg_useful_hits,
+                    zero_output_failures: summary.zero_output_failures,
+                    useful_hits_pass,
+                    zero_output_pass,
+                    status: status.to_string(),
+                });
+            }
+            None => {
+                diagnostics.push(format!(
+                    "candidate strategy {candidate} was not present; memory retrieval gate blocks"
+                ));
+                rows.push(MemoryRetrievalGateRow {
+                    strategy: candidate.to_string(),
+                    avg_useful_hits: 0.0,
+                    zero_output_failures: tasks_loaded,
+                    useful_hits_pass: false,
+                    zero_output_pass: false,
+                    status: "block".to_string(),
+                });
+            }
+        }
+    }
+
+    let decision = if diagnostics.is_empty() && rows.iter().all(|row| row.status == "pass") {
+        "pass"
+    } else {
+        "block"
+    };
+
+    Some(MemoryRetrievalGate {
+        decision: decision.to_string(),
+        baseline_strategy: BASELINE.to_string(),
+        candidate_strategies: CANDIDATES
+            .iter()
+            .map(|candidate| candidate.to_string())
+            .collect(),
+        min_avg_useful_hits,
+        max_zero_output_failures,
+        rows,
+        diagnostics,
     })
 }
 
@@ -419,6 +565,45 @@ mod tests {
             report.task_rows[0].zero_output_failures,
             vec!["claude_mem_api".to_string()]
         );
+        let gate = report.memory_retrieval_gate.as_ref().unwrap();
+        assert_eq!(gate.decision, "pass");
+        assert_eq!(gate.baseline_strategy, "claude_mem_api");
+        assert_eq!(gate.min_avg_useful_hits, 0.0);
+        assert_eq!(gate.max_zero_output_failures, 0);
+        assert!(gate.rows.iter().all(|row| row.status == "pass"));
         assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn memory_retrieval_gate_blocks_when_candidate_regresses() {
+        let report = compute(
+            r#"{
+  "expected_strategies": ["claude_mem_api", "tsift_session_review_context_pack", "graph_db_related"],
+  "tasks": [
+    {
+      "id": "regressed-cutover",
+      "runs": [
+        {"strategy": "claude_mem_api", "localized": true, "useful_hits": 2, "zero_output": false, "tool_calls": 1, "latency_ms": 180, "estimated_tokens": 800, "output_tokens": 600},
+        {"strategy": "tsift_session_review_context_pack", "localized": true, "useful_hits": 1, "zero_output": false, "tool_calls": 2, "latency_ms": 510, "estimated_tokens": 1450, "output_tokens": 950},
+        {"strategy": "graph_db_related", "localized": true, "useful_hits": 3, "zero_output": true, "tool_calls": 2, "latency_ms": 430, "estimated_tokens": 880, "output_tokens": 620}
+      ]
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let gate = report.memory_retrieval_gate.as_ref().unwrap();
+        assert_eq!(gate.decision, "block");
+        assert!(
+            gate.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("avg useful hits"))
+        );
+        assert!(
+            gate.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("zero-output failures"))
+        );
     }
 }
