@@ -562,6 +562,55 @@ impl GraphStore for LibsqlGraphStore {
         })
     }
 
+    fn edges_between_nodes(&self, node_ids: &BTreeSet<String>) -> Result<Vec<GraphEdge>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        block_on(&self.rt, async {
+            self.conn
+                .execute_batch(
+                    r#"
+                CREATE TEMP TABLE IF NOT EXISTS _edges_between_ids (id TEXT PRIMARY KEY);
+                DELETE FROM _edges_between_ids;
+                "#,
+                )
+                .await?;
+            for chunk in node_ids.iter().collect::<Vec<_>>().chunks(450) {
+                let row_placeholders: Vec<String> =
+                    chunk.iter().map(|_| "(?)".to_string()).collect();
+                let placeholders = row_placeholders.join(", ");
+                let sql = format!(
+                    "INSERT OR IGNORE INTO _edges_between_ids (id) VALUES {placeholders}"
+                );
+                let values: Vec<String> = chunk.iter().map(|id| (*id).clone()).collect();
+                self.conn
+                    .execute(
+                        &sql,
+                        libsql::params_from_iter(values.iter().map(|v| v.as_str())),
+                    )
+                    .await?;
+            }
+            let mut rows = self
+                .conn
+                .query(
+                    r#"
+                SELECT e.edge_key, e.from_id, e.to_id, e.kind, e.properties_json, e.provenance_json, e.freshness_json
+                FROM graph_edges e
+                WHERE EXISTS (SELECT 1 FROM _edges_between_ids f WHERE f.id = e.from_id)
+                  AND EXISTS (SELECT 1 FROM _edges_between_ids t WHERE t.id = e.to_id)
+                ORDER BY e.from_id, e.kind, e.to_id
+                "#,
+                    (),
+                )
+                .await?;
+            let mut edges = Vec::new();
+            while let Some(row) = rows.next().await? {
+                edges.push(edge_from_row(&row)?);
+            }
+            Ok::<Vec<GraphEdge>, anyhow::Error>(edges)
+        })
+    }
+
     fn shortest_path(
         &self,
         from_id: &str,
@@ -842,5 +891,47 @@ mod tests {
         let d_incident = store.incident_edges("d", None).unwrap();
         assert_eq!(d_incident.len(), 1);
         assert_eq!(d_incident[0].to_id, "b");
+    }
+
+    #[test]
+    fn libsql_store_edges_between_nodes_pushdown() {
+        let store = LibsqlGraphStore::in_memory().unwrap();
+        for id in ["a", "b", "c", "outside"] {
+            store
+                .upsert_node(&GraphNode::new(id, "symbol", id))
+                .unwrap();
+        }
+        for edge in [
+            GraphEdge::new("a", "b", "calls"),
+            GraphEdge::new("b", "c", "calls"),
+            GraphEdge::new("a", "outside", "calls"),
+            GraphEdge::new("outside", "c", "calls"),
+        ] {
+            store.upsert_edge(&edge).unwrap();
+        }
+
+        let scoped = ["a".to_string(), "b".to_string(), "c".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let edge_keys = store
+            .edges_between_nodes(&scoped)
+            .unwrap()
+            .into_iter()
+            .map(|edge| (edge.from_id, edge.kind, edge.to_id))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            edge_keys,
+            vec![
+                ("a".to_string(), "calls".to_string(), "b".to_string()),
+                ("b".to_string(), "calls".to_string(), "c".to_string()),
+            ]
+        );
+
+        let empty: BTreeSet<String> = BTreeSet::new();
+        assert!(store.edges_between_nodes(&empty).unwrap().is_empty());
+
+        let single = ["a".to_string()].into_iter().collect::<BTreeSet<_>>();
+        assert!(store.edges_between_nodes(&single).unwrap().is_empty());
     }
 }
