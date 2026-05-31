@@ -148,7 +148,7 @@ pub(crate) fn cmd_summarize(
         }
 
         if json_output {
-            println!("{}", to_json_schema(&report, pretty, terse, schema)?);
+            println!("{}", to_json_schema(&report, pretty, terse, false, schema)?);
         } else if compact {
             println!(
                 "extract files:{} symbols:{} tokens_in:{} tokens_out:{} errors:{}",
@@ -178,7 +178,7 @@ pub(crate) fn cmd_summarize(
         let summary_db = open_existing_summary_db_read_only(&db_path)?;
         let s = summary_db.stats(&root)?;
         if json_output {
-            println!("{}", to_json_schema(&s, pretty, terse, schema)?);
+            println!("{}", to_json_schema(&s, pretty, terse, false, schema)?);
         } else if compact {
             println!(
                 "summaries:{} files:{} stale:{} in:{} out:{} saved:{}",
@@ -222,7 +222,7 @@ pub(crate) fn cmd_summarize(
             return Ok(());
         }
         if json_output {
-            println!("{}", to_json_schema(&results, pretty, terse, schema)?);
+            println!("{}", to_json_schema(&results, pretty, terse, false, schema)?);
         } else if compact {
             for summary in &results {
                 println!(
@@ -252,7 +252,7 @@ pub(crate) fn cmd_summarize(
             return Ok(());
         }
         if json_output {
-            println!("{}", to_json_schema(&results, pretty, terse, schema)?);
+            println!("{}", to_json_schema(&results, pretty, terse, false, schema)?);
         } else if compact {
             for summary in &results {
                 println!(

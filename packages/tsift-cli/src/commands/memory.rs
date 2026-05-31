@@ -646,7 +646,7 @@ fn print_memory_report<T: Serialize>(
     if format.json_output {
         print_json_or_envelope(report, format, "memory", view, summary, false, follow_up)
     } else {
-        println!("{}", to_json_schema(report, format.pretty, false, false)?);
+        println!("{}", to_json_schema(report, format.pretty, false, false, false)?);
         Ok(())
     }
 }

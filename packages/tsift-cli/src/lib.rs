@@ -310,7 +310,8 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let compact = cli.compact;
     let pretty = cli.pretty;
-    let terse = cli.terse;
+    let terse = cli.terse || cli.ultra_terse;
+    let ultra_terse = cli.ultra_terse;
     let absolute = cli.absolute;
     let tabular = cli.tabular;
     let schema = cli.schema;
@@ -350,6 +351,7 @@ pub fn run() -> Result<()> {
             compact,
             pretty,
             terse,
+            ultra_terse,
             absolute,
             tabular,
             schema,
@@ -384,6 +386,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -425,6 +428,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -439,6 +443,7 @@ pub fn run() -> Result<()> {
                     compact,
                     pretty,
                     terse,
+                    ultra_terse,
                     schema,
                     envelope,
                 },
@@ -528,6 +533,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -575,6 +581,7 @@ pub fn run() -> Result<()> {
             compact,
             pretty,
             terse,
+            ultra_terse,
             absolute,
             tabular,
             schema,
@@ -633,6 +640,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -655,6 +663,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -682,6 +691,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -790,6 +800,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -812,6 +823,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -830,6 +842,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -842,6 +855,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -866,6 +880,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -892,6 +907,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -924,6 +940,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -946,6 +963,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -962,6 +980,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -990,6 +1009,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -1001,6 +1021,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -1012,6 +1033,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -1030,6 +1052,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -1046,6 +1069,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -1065,6 +1089,7 @@ pub fn run() -> Result<()> {
                 compact,
                 pretty,
                 terse,
+                ultra_terse,
                 schema,
                 envelope,
             },
@@ -1142,7 +1167,7 @@ pub fn classify_task(task: &str) -> (&'static str, &'static str) {
 
 #[cfg(test)]
 fn to_json<T: serde::Serialize>(val: &T, pretty: bool, terse: bool) -> anyhow::Result<String> {
-    to_json_schema(val, pretty, terse, false)
+    to_json_schema(val, pretty, terse, false, false)
 }
 
 /// Add top-level `tagpath_index_stale: true` + `tagpath_stale_reason: <reason>`
@@ -1177,11 +1202,15 @@ pub(crate) fn to_json_schema<T: serde::Serialize>(
     val: &T,
     pretty: bool,
     terse: bool,
+    ultra_terse: bool,
     schema: bool,
 ) -> anyhow::Result<String> {
     if terse || schema {
         let value = serde_json::to_value(val)?;
         let mut transformed = if terse { terse_transform(value) } else { value };
+        if ultra_terse {
+            transformed = ultra_terse_transform(transformed);
+        }
         if schema {
             transformed = schema_transform(transformed);
         }
@@ -1243,12 +1272,12 @@ pub(crate) fn print_json_or_envelope<T: Serialize>(
         };
         println!(
             "{}",
-            to_json_schema(&envelope, format.pretty, format.terse, format.schema)?
+            to_json_schema(&envelope, format.pretty, format.terse, format.ultra_terse, format.schema)?
         );
     } else {
         println!(
             "{}",
-            to_json_schema(report, format.pretty, format.terse, format.schema)?
+            to_json_schema(report, format.pretty, format.terse, format.ultra_terse, format.schema)?
         );
     }
     Ok(())
@@ -2096,6 +2125,57 @@ fn terse_transform(val: serde_json::Value) -> serde_json::Value {
             serde_json::Value::Array(arr.into_iter().map(terse_transform).collect())
         }
         other => other,
+    }
+}
+
+fn ultra_terse_transform(val: serde_json::Value) -> serde_json::Value {
+    match val {
+        serde_json::Value::Object(mut map) => {
+            let is_graph_node = map.contains_key("id")
+                && map.contains_key("k")
+                && map.contains_key("n");
+            let is_graph_edge = map.contains_key("from_id")
+                && map.contains_key("to_id")
+                && map.contains_key("k");
+            if is_graph_node || is_graph_edge {
+                map.remove("properties");
+            }
+            let is_coverage = map.contains_key("mode")
+                && (map.contains_key("total_sector_count")
+                    || map.contains_key("dirty_sector_count"));
+            if is_coverage {
+                map.remove("active_rebuild");
+                map.remove("completed_dirty_sector_count");
+                map.remove("mounted_sector_count");
+                map.remove("rebuilding_sector_count");
+                map.remove("resumed_sector_count");
+                map.remove("reused_sector_count");
+            }
+            if let Some(serde_json::Value::String(s)) = map.get_mut("sn") {
+                *s = truncate_for_ultra_terse(s, 80);
+            }
+            if let Some(serde_json::Value::String(s)) = map.get_mut("snippet") {
+                *s = truncate_for_ultra_terse(s, 80);
+            }
+            let new_map: serde_json::Map<String, serde_json::Value> = map
+                .into_iter()
+                .map(|(k, v)| (k, ultra_terse_transform(v)))
+                .collect();
+            serde_json::Value::Object(new_map)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(ultra_terse_transform).collect())
+        }
+        other => other,
+    }
+}
+
+fn truncate_for_ultra_terse(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{truncated}...")
     }
 }
 
@@ -15107,7 +15187,7 @@ fn cmd_semantic_related(
     }
 
     if json_output {
-        println!("{}", to_json_schema(&report, pretty, terse, schema)?);
+        println!("{}", to_json_schema(&report, pretty, terse, false, schema)?);
     } else if compact {
         for item in &report.items {
             println!(
@@ -16018,7 +16098,7 @@ fn cmd_impact(
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
         );
         return Ok(());
     }
@@ -16083,7 +16163,7 @@ pub(crate) fn render_test_digest_from_input(
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
         );
         return Ok(());
     }
@@ -19308,6 +19388,7 @@ fn cmd_dispatch_trace(
                         &report,
                         output_format.pretty,
                         output_format.terse,
+                        output_format.ultra_terse,
                         output_format.schema
                     )?
                 );
@@ -20143,7 +20224,7 @@ pub(crate) fn render_log_digest_from_input(
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
         );
         return Ok(());
     }
@@ -20336,7 +20417,7 @@ fn cmd_dci_benchmark(fixture_path: &Path, format: OutputFormat) -> Result<()> {
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
         );
         return Ok(());
     }
@@ -25701,6 +25782,7 @@ mod tests {
                 compact: false,
                 pretty: false,
                 terse: false,
+                ultra_terse: false,
                 schema: false,
                 envelope: true,
             },
@@ -25721,6 +25803,7 @@ mod tests {
                 compact: false,
                 pretty: true,
                 terse: false,
+                ultra_terse: false,
                 schema: false,
                 envelope: false,
             },
@@ -27068,6 +27151,7 @@ def list_items():
                 compact: false,
                 pretty: false,
                 terse: false,
+                ultra_terse: false,
                 schema: false,
                 envelope: false,
             },
@@ -27479,6 +27563,7 @@ def list_items():
                 compact: true,
                 pretty: false,
                 terse: false,
+                ultra_terse: false,
                 schema: false,
                 envelope: false,
             },
@@ -28361,6 +28446,7 @@ tier = "private"
             false,
             false,
             false,
+            false,
         )
         .unwrap_err();
 
@@ -28400,6 +28486,7 @@ tier = "private"
             false,
             false,
             0,
+            false,
             false,
             false,
             false,
@@ -28764,6 +28851,7 @@ tier = "private"
             false,
             false,
             false,
+            false,
         )
         .unwrap_err();
 
@@ -28805,6 +28893,7 @@ tier = "private"
             false,
             false,
             false,
+            false,
         );
 
         assert!(result.is_ok());
@@ -28821,6 +28910,7 @@ tier = "private"
             dir.path(),
             None,
             15,
+            false,
             false,
             false,
             false,
@@ -28934,6 +29024,7 @@ tier = "private"
             false,
             false,
             false,
+            false,
         );
 
         assert!(result.is_ok());
@@ -29040,6 +29131,7 @@ tier = "private"
             false,
             false,
             false,
+            false,
         );
 
         assert!(result.is_ok());
@@ -29061,6 +29153,7 @@ tier = "private"
             false,
             0,
             true,
+            false,
             false,
             false,
             false,
@@ -29092,6 +29185,7 @@ tier = "private"
             false,
             false,
             false,
+            false,
         );
 
         assert!(result.is_ok());
@@ -29117,6 +29211,7 @@ tier = "private"
             false,
             false,
             0,
+            false,
             false,
             false,
             false,
@@ -29158,6 +29253,7 @@ tier = "private"
             false,
             false,
             false,
+            false,
         )
         .unwrap_err();
 
@@ -29186,6 +29282,7 @@ tier = "private"
             false,
             true,
             0,
+            false,
             false,
             false,
             false,
@@ -29228,6 +29325,7 @@ tier = "private"
             false,
             false,
             false,
+            false,
         );
 
         assert!(result.is_ok());
@@ -29264,6 +29362,7 @@ tier = "private"
             false,
             false,
             false,
+            false,
         )
         .unwrap_err();
 
@@ -29290,6 +29389,7 @@ tier = "private"
             false,
             true,
             0,
+            false,
             false,
             false,
             false,
@@ -29342,6 +29442,7 @@ tier = "private"
             false,
             false,
             false,
+            false,
         );
 
         assert!(result.is_ok());
@@ -29378,6 +29479,7 @@ tier = "private"
             false,
             false,
             0,
+            false,
             false,
             false,
             false,
@@ -29442,6 +29544,7 @@ tier = "private"
             false,
             false,
             0,
+            false,
             false,
             false,
             false,
@@ -29663,6 +29766,7 @@ tier = "private"
             false,
             false,
             false,
+            false,
         );
 
         assert!(result.is_ok());
@@ -29721,6 +29825,7 @@ tier = "private"
             false,
             false,
             false,
+            false,
         )
         .unwrap_err();
 
@@ -29768,6 +29873,7 @@ tier = "private"
             false,
             true,
             0,
+            false,
             false,
             false,
             false,
@@ -29832,6 +29938,7 @@ tier = "private"
             false,
             false,
             false,
+            false,
         )
         .unwrap_err();
 
@@ -29871,6 +29978,7 @@ tier = "private"
             false,
             true,
             0,
+            false,
             false,
             false,
             false,
@@ -29917,6 +30025,7 @@ tier = "private"
             false,
             false,
             0,
+            false,
             false,
             false,
             false,
@@ -30425,6 +30534,101 @@ tier = "private"
         assert_eq!(d["n"], "test");
     }
 
+    // --- ultra-terse ---
+
+    #[test]
+    fn ultra_terse_strips_properties_from_graph_nodes() {
+        let val = serde_json::json!({
+            "nodes": [{"id": "fn:main", "kind": "fn", "name": "main", "properties": {"line": "10"}}]
+        });
+        let result = to_json_schema(&val, false, true, true, false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let node = &parsed["d"]["nodes"][0];
+        assert_eq!(node["id"], "fn:main");
+        assert_eq!(node["k"], "fn");
+        assert_eq!(node["n"], "main");
+        assert!(node.get("properties").is_none());
+    }
+
+    #[test]
+    fn ultra_terse_strips_properties_from_graph_edges() {
+        let val = serde_json::json!({
+            "edges": [{"from_id": "a", "to_id": "b", "kind": "calls", "properties": {"weight": "2"}}]
+        });
+        let result = to_json_schema(&val, false, true, true, false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let edge = &parsed["d"]["edges"][0];
+        assert_eq!(edge["from_id"], "a");
+        assert_eq!(edge["to_id"], "b");
+        assert_eq!(edge["k"], "calls");
+        assert!(edge.get("properties").is_none());
+    }
+
+    #[test]
+    fn ultra_terse_truncates_snippets() {
+        let long_snippet = "x".repeat(120);
+        let val = serde_json::json!({"snippet": long_snippet});
+        let result = to_json_schema(&val, false, true, true, false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let snipped = parsed["d"]["sn"].as_str().unwrap();
+        assert_eq!(snipped.len(), 80);
+        assert!(snipped.ends_with("..."));
+    }
+
+    #[test]
+    fn ultra_terse_truncates_abbreviated_snippet_key() {
+        let long_snippet = "y".repeat(100);
+        let val = serde_json::json!({"snippet": long_snippet});
+        let result = to_json_schema(&val, false, true, true, false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let snipped = parsed["d"]["sn"].as_str().unwrap();
+        assert_eq!(snipped.len(), 80);
+        assert!(snipped.ends_with("..."));
+    }
+
+    #[test]
+    fn ultra_terse_compacts_coverage_snapshot() {
+        let val = serde_json::json!({
+            "mode": "incremental",
+            "total_sector_count": 10,
+            "dirty_sector_count": 2,
+            "active_rebuild": Some("rebuild-1"),
+            "completed_dirty_sector_count": 1,
+            "mounted_sector_count": 8,
+            "rebuilding_sector_count": 1,
+            "resumed_sector_count": 3,
+            "reused_sector_count": 5
+        });
+        let result = to_json_schema(&val, false, true, true, false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let d = &parsed["d"];
+        assert_eq!(d["mode"], "incremental");
+        assert_eq!(d["total_sector_count"], 10);
+        assert_eq!(d["dirty_sector_count"], 2);
+        assert!(d.get("active_rebuild").is_none());
+        assert!(d.get("completed_dirty_sector_count").is_none());
+        assert!(d.get("mounted_sector_count").is_none());
+        assert!(d.get("rebuilding_sector_count").is_none());
+        assert!(d.get("resumed_sector_count").is_none());
+        assert!(d.get("reused_sector_count").is_none());
+    }
+
+    #[test]
+    fn ultra_terse_short_snippet_unchanged() {
+        let val = serde_json::json!({"snippet": "short text"});
+        let result = to_json_schema(&val, false, true, true, false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["d"]["sn"], "short text");
+    }
+
+    #[test]
+    fn ultra_terse_non_graph_object_properties_preserved() {
+        let val = serde_json::json!({"config": {"properties": {"a": "1"}}});
+        let result = to_json_schema(&val, false, true, true, false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["d"]["config"]["properties"].is_object());
+    }
+
     // --- schema-then-values ---
 
     #[test]
@@ -30433,7 +30637,7 @@ tier = "private"
             {"name": "foo", "kind": "fn", "line": 10},
             {"name": "bar", "kind": "fn", "line": 20}
         ]});
-        let result = to_json_schema(&val, false, false, true).unwrap();
+        let result = to_json_schema(&val, false, false, false, true).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let syms = &parsed["symbols"];
         // serde_json uses BTreeMap — keys sorted alphabetically
@@ -30445,7 +30649,7 @@ tier = "private"
     #[test]
     fn schema_skips_short_arrays() {
         let val = serde_json::json!({"items": [{"name": "only"}]});
-        let result = to_json_schema(&val, false, false, true).unwrap();
+        let result = to_json_schema(&val, false, false, false, true).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["items"].is_array());
         assert_eq!(parsed["items"][0]["name"], "only");
@@ -30454,7 +30658,7 @@ tier = "private"
     #[test]
     fn schema_skips_heterogeneous_arrays() {
         let val = serde_json::json!({"items": [{"a": 1}, {"b": 2}]});
-        let result = to_json_schema(&val, false, false, true).unwrap();
+        let result = to_json_schema(&val, false, false, false, true).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["items"].is_array());
         assert_eq!(parsed["items"][0]["a"], 1);
@@ -30466,7 +30670,7 @@ tier = "private"
             {"caller_name": "a", "caller_file": "x.rs"},
             {"caller_name": "b", "caller_file": "y.rs"}
         ]});
-        let result = to_json_schema(&val, false, true, true).unwrap();
+        let result = to_json_schema(&val, false, true, false, true).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["_s"].is_object());
         let d = &parsed["d"];
@@ -30480,7 +30684,7 @@ tier = "private"
     #[test]
     fn schema_preserves_non_object_arrays() {
         let val = serde_json::json!({"tags": ["a", "b", "c"]});
-        let result = to_json_schema(&val, false, false, true).unwrap();
+        let result = to_json_schema(&val, false, false, false, true).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["tags"], serde_json::json!(["a", "b", "c"]));
     }
@@ -32104,6 +32308,7 @@ tier = "private"
                 compact: true,
                 pretty: false,
                 terse: false,
+                ultra_terse: false,
                 schema: false,
                 envelope: false,
             },
@@ -33090,6 +33295,7 @@ tier = "private"
             false,
             false,
             true,
+            false,
             false,
         );
         assert!(result.is_ok());

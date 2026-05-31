@@ -37,7 +37,7 @@ pub(crate) fn cmd_diff_digest(
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
         );
         return Ok(());
     }
@@ -266,7 +266,7 @@ pub(crate) fn cmd_metric_digest(
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
         );
         return Ok(());
     }
@@ -460,7 +460,7 @@ pub(crate) fn cmd_session_digest(
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
         );
         return Ok(());
     }
@@ -652,7 +652,7 @@ pub(crate) fn cmd_session_cost(
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.schema)?
+            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
         );
         return Ok(());
     }

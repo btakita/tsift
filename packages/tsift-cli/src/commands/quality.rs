@@ -166,7 +166,7 @@ pub(crate) fn cmd_audit_tagpath(
         if tagpath_state == "stale" {
             inject_tagpath_stale_into_json(&mut value, true, Some("stale_snapshot_loaded"));
         }
-        println!("{}", to_json_schema(&value, pretty, terse, schema)?);
+        println!("{}", to_json_schema(&value, pretty, terse, false, schema)?);
     } else {
         println!("tagpath audit for {}", tagpath_root.display());
         if let Some(scope) = scope {
@@ -261,7 +261,7 @@ pub(crate) fn cmd_audit(
     }
 
     if json_output {
-        println!("{}", to_json_schema(&result, pretty, terse, schema)?);
+        println!("{}", to_json_schema(&result, pretty, terse, false, schema)?);
     } else if compact {
         println!(
             "skills:{} healthy:{} broken:{}",
@@ -393,7 +393,7 @@ pub(crate) fn cmd_lint(
     let result = lint::lint_markdown(file_path, &entities)?;
 
     if json_output {
-        println!("{}", to_json_schema(&result, pretty, terse, schema)?);
+        println!("{}", to_json_schema(&result, pretty, terse, false, schema)?);
     } else if compact {
         if result.annotations.is_empty() {
             println!("ok {}", file);

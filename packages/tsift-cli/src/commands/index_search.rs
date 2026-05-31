@@ -156,7 +156,7 @@ pub(crate) fn cmd_index(
                     if quiet {
                         serde_json::to_string(&entry)?
                     } else {
-                        to_json_schema(&entry, pretty, terse, schema)?
+                        to_json_schema(&entry, pretty, terse, false, schema)?
                     }
                 );
             } else if compact {
@@ -275,7 +275,7 @@ pub(crate) fn cmd_index(
             });
             println!("{}", serde_json::to_string(&compact)?);
         } else {
-            println!("{}", to_json_schema(&summary, pretty, terse, schema)?);
+            println!("{}", to_json_schema(&summary, pretty, terse, false, schema)?);
         }
     } else if compact {
         let mode = if rebuild {
@@ -358,6 +358,7 @@ pub(crate) fn cmd_search(
     compact: bool,
     pretty: bool,
     terse: bool,
+    ultra_terse: bool,
     absolute: bool,
     tabular: bool,
     schema: bool,
@@ -375,6 +376,7 @@ pub(crate) fn cmd_search(
         compact,
         pretty,
         terse,
+        ultra_terse,
         absolute,
         tabular,
         schema,
@@ -398,6 +400,7 @@ pub(crate) fn cmd_search_with_budget(
     compact: bool,
     pretty: bool,
     terse: bool,
+    ultra_terse: bool,
     absolute: bool,
     tabular: bool,
     schema: bool,
@@ -411,6 +414,7 @@ pub(crate) fn cmd_search_with_budget(
         compact,
         pretty,
         terse,
+        ultra_terse,
         schema,
         envelope,
     };

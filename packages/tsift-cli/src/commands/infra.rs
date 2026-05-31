@@ -135,6 +135,7 @@ pub(crate) fn cmd_edit(
                 }),
                 pretty,
                 terse,
+                false,
                 schema
             )?
         );
@@ -1227,7 +1228,7 @@ pub(crate) fn cmd_status(
         }
     }
     if json_output {
-        println!("{}", to_json_schema(&report, pretty, terse, schema)?);
+        println!("{}", to_json_schema(&report, pretty, terse, false, schema)?);
     } else {
         print!("{}", status::format_human(&report, compact));
     }
@@ -1246,7 +1247,7 @@ pub(crate) fn cmd_locks(
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     let report = status::check_locks(&root, Some(path), scope)?;
     if json_output {
-        println!("{}", to_json_schema(&report, pretty, terse, schema)?);
+        println!("{}", to_json_schema(&report, pretty, terse, false, schema)?);
     } else {
         print!("{}", status::format_locks_human(&report, compact));
     }
@@ -1357,7 +1358,7 @@ pub(crate) fn cmd_sql(
                         serde_json::Value::Object(obj)
                     })
                     .collect();
-                println!("{}", to_json_schema(&json_rows, pretty, terse, schema)?);
+                println!("{}", to_json_schema(&json_rows, pretty, terse, false, schema)?);
             } else if compact {
                 println!("rows:{} cols:{}", rows.len(), columns.len());
                 for row in &rows {
@@ -1407,7 +1408,7 @@ pub(crate) fn cmd_sql(
                 bail!("table '{}' not found or has no columns", tbl);
             }
             if json_output {
-                println!("{}", to_json_schema(&cols, pretty, terse, schema)?);
+                println!("{}", to_json_schema(&cols, pretty, terse, false, schema)?);
             } else if compact {
                 println!("table:{} columns:{}", tbl, cols.len());
                 for col in &cols {
@@ -1431,7 +1432,7 @@ pub(crate) fn cmd_sql(
         (None, None) => {
             let tables = schema_overview(&conn)?;
             if json_output {
-                println!("{}", to_json_schema(&tables, pretty, terse, schema)?);
+                println!("{}", to_json_schema(&tables, pretty, terse, false, schema)?);
             } else if compact {
                 println!("tables:{}", tables.len());
                 for tbl in &tables {

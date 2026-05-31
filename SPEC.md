@@ -636,6 +636,26 @@ tsift --terse --pretty status .            # terse + pretty-printed
 
 Unknown keys pass through unchanged.
 
+## Ultra-Terse Mode
+
+`tsift --ultra-terse` is a global flag that applies additional token reduction on top of `--terse` (it implies `--terse`). Targeted at agents operating under tight context budgets.
+
+**Transforms applied (on top of terse key abbreviation):**
+
+1. **Graph node/edge property stripping** — removes the `properties` field from objects detected as graph nodes (have `id` + `kind` + `label`) or graph edges (have `from_id` + `to_id` + `kind`), keeping only `id`, `kind`, `label` for nodes and `id`, `from_id`, `to_id`, `kind` for edges.
+
+2. **Snippet truncation** — `snippet`/`sn` string values are truncated to 80 characters with a `...` ellipsis suffix when the original exceeds 80 chars.
+
+3. **Coverage snapshot compaction** — `SearchCoverageSnapshot` objects retain only `mode`, `total_sector_count`, and `dirty_sector_count`. Removes `active_rebuild`, `completed_dirty_sector_count`, `mounted_sector_count`, `rebuilding_sector_count`, `resumed_sector_count`, `reused_sector_count`.
+
+**Expected savings:** ~25-40% token reduction over terse mode for graph-heavy and search-heavy responses.
+
+```bash
+tsift --ultra-terse search "main"          # ultra-terse JSON (implies --terse --json)
+tsift --ultra-terse explain main            # stripped graph output
+tsift --ultra-terse --envelope search "fn"  # envelope + ultra-terse
+```
+
 ## Tabular Output
 
 `tsift --tabular` is a global flag that outputs repeated structures as TSV (tab-separated values) with a header row. Designed for structured, token-efficient display that agents and scripts can parse without JSON overhead.

@@ -22,12 +22,13 @@ pub(crate) const DEFAULT_BUDGET_ITEMS: usize = 5;
 pub(crate) const DEFAULT_BUDGET_BYTES: usize = 160;
 pub(crate) const DEFAULT_FOLLOW_UP_ITEMS: usize = 4;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct OutputFormat {
     pub json_output: bool,
     pub compact: bool,
     pub pretty: bool,
     pub terse: bool,
+    pub ultra_terse: bool,
     pub schema: bool,
     pub envelope: bool,
 }

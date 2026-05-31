@@ -130,7 +130,7 @@ pub(crate) fn cmd_graph(
                         state.2.as_deref(),
                     );
                 }
-                println!("{}", to_json_schema(&out, pretty, terse, schema)?);
+                println!("{}", to_json_schema(&out, pretty, terse, false, schema)?);
             }
         } else if tabular {
             println!("direction\tname\tfile\tline");
@@ -201,7 +201,7 @@ pub(crate) fn cmd_graph(
                         state.2.as_deref(),
                     );
                 }
-                println!("{}", to_json_schema(&out, pretty, terse, schema)?);
+                println!("{}", to_json_schema(&out, pretty, terse, false, schema)?);
             }
         } else if tabular {
             if !show_both {
@@ -281,7 +281,7 @@ pub(crate) fn cmd_graph(
                 state.2.as_deref(),
             );
         }
-        println!("{}", to_json_schema(&combined, pretty, terse, schema)?);
+        println!("{}", to_json_schema(&combined, pretty, terse, false, schema)?);
     }
 
     Ok(())
@@ -363,7 +363,7 @@ pub(crate) fn cmd_communities(
             tagpath_stale && !tagpath_opts.no_tagpath,
             tagpath_stale_reason.as_deref(),
         );
-        println!("{}", to_json_schema(&out, pretty, terse, schema)?);
+        println!("{}", to_json_schema(&out, pretty, terse, false, schema)?);
     } else if tabular {
         println!("id\tsize\tmembers");
         for (i, community) in display.iter().enumerate() {
@@ -725,7 +725,7 @@ pub(crate) fn cmd_traverse(
     let report = traversal_report(&root, scope, graph, node, to, depth, limit)?;
     match format {
         TraverseFormat::Json => {
-            println!("{}", to_json_schema(&report, pretty, terse, schema)?);
+            println!("{}", to_json_schema(&report, pretty, terse, false, schema)?);
         }
         TraverseFormat::Html => {
             println!("{}", traversal_report_html(&report)?);
@@ -767,7 +767,7 @@ pub(crate) fn cmd_path(
                     tagpath_diag.stale && !tagpath_opts.no_tagpath,
                     tagpath_diag.reason.as_deref(),
                 );
-                println!("{}", to_json_schema(&value, pretty, terse, schema)?);
+                println!("{}", to_json_schema(&value, pretty, terse, false, schema)?);
             } else if compact {
                 println!(
                     "{} ({} hop{})",
@@ -808,6 +808,7 @@ pub(crate) fn cmd_path(
                         }),
                         pretty,
                         terse,
+                        false,
                         schema
                     )?
                 );
@@ -832,6 +833,7 @@ pub(crate) fn cmd_explain(
     compact: bool,
     pretty: bool,
     terse: bool,
+    ultra_terse: bool,
     absolute: bool,
     tabular: bool,
     schema: bool,
@@ -845,6 +847,7 @@ pub(crate) fn cmd_explain(
         compact,
         pretty,
         terse,
+        ultra_terse,
         absolute,
         tabular,
         schema,
@@ -864,6 +867,7 @@ pub(crate) fn cmd_explain_with_budget(
     compact: bool,
     pretty: bool,
     terse: bool,
+    ultra_terse: bool,
     absolute: bool,
     tabular: bool,
     schema: bool,
@@ -878,6 +882,7 @@ pub(crate) fn cmd_explain_with_budget(
         compact,
         pretty,
         terse,
+        ultra_terse,
         schema,
         envelope,
     };

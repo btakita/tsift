@@ -23,6 +23,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub terse: bool,
 
+    /// Ultra-terse: strip properties from graph nodes/edges, truncate snippets to 80 chars, compact coverage snapshots (implies --terse)
+    #[arg(long, global = true)]
+    pub ultra_terse: bool,
+
     /// Show absolute paths instead of project-relative
     #[arg(long, global = true)]
     pub absolute: bool,
