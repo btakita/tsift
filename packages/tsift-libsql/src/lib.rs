@@ -510,6 +510,58 @@ impl GraphStore for LibsqlGraphStore {
         })
     }
 
+    fn incident_edges(&self, node_id: &str, kind: Option<&str>) -> Result<Vec<GraphEdge>> {
+        block_on(&self.rt, async {
+            let sql = match kind {
+                Some(_) => r#"
+                    SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                    FROM (
+                        SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                        FROM graph_edges
+                        WHERE from_id = ?1 AND kind = ?2
+                        UNION
+                        SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                        FROM graph_edges
+                        WHERE to_id = ?1 AND kind = ?2
+                    ) e
+                    ORDER BY e.edge_key
+                    "#,
+                None => r#"
+                    SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                    FROM (
+                        SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                        FROM graph_edges
+                        WHERE from_id = ?1
+                        UNION
+                        SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
+                        FROM graph_edges
+                        WHERE to_id = ?1
+                    ) e
+                    ORDER BY e.edge_key
+                    "#,
+            };
+            let mut edges = Vec::new();
+            match kind {
+                Some(kind) => {
+                    let mut rows = self.conn.query(
+                        sql,
+                        libsql::params![node_id, kind],
+                    ).await?;
+                    while let Some(row) = rows.next().await? {
+                        edges.push(edge_from_row(&row)?);
+                    }
+                }
+                None => {
+                    let mut rows = self.conn.query(sql, [node_id]).await?;
+                    while let Some(row) = rows.next().await? {
+                        edges.push(edge_from_row(&row)?);
+                    }
+                }
+            }
+            Ok(edges)
+        })
+    }
+
     fn shortest_path(
         &self,
         from_id: &str,
@@ -750,5 +802,45 @@ mod tests {
         let (nodes, edges) = store.graph_counts().unwrap();
         assert_eq!(nodes, 3);
         assert_eq!(edges, 2);
+    }
+
+    #[test]
+    fn libsql_incident_edges_pushdown() {
+        let store = LibsqlGraphStore::in_memory().unwrap();
+        for id in ["a", "b", "c", "d"] {
+            store
+                .upsert_node(&GraphNode::new(id, "symbol", id))
+                .unwrap();
+        }
+        store
+            .upsert_edge(&GraphEdge::new("a", "b", "calls"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("a", "c", "documents"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("d", "b", "calls"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("c", "b", "references"))
+            .unwrap();
+
+        let all_incident = store.incident_edges("b", None).unwrap();
+        assert_eq!(all_incident.len(), 3);
+
+        let calls_incident = store.incident_edges("b", Some("calls")).unwrap();
+        assert_eq!(calls_incident.len(), 2);
+        assert!(calls_incident.iter().all(|e| e.kind == "calls"));
+
+        let docs_incident = store.incident_edges("b", Some("documents")).unwrap();
+        assert!(docs_incident.is_empty());
+
+        let a_incident = store.incident_edges("a", None).unwrap();
+        assert_eq!(a_incident.len(), 2);
+        assert!(a_incident.iter().all(|e| e.from_id == "a"));
+
+        let d_incident = store.incident_edges("d", None).unwrap();
+        assert_eq!(d_incident.len(), 1);
+        assert_eq!(d_incident[0].to_id, "b");
     }
 }
