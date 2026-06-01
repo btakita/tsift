@@ -13703,8 +13703,9 @@ fn prepare_agent_doc_index_gate(
         Ok(summary) => {
             // #gdbgatecold: the index was just rewritten, so any cached
             // pre-refresh inspection result for this scope (held by the
-            // active `InspectScopeGuard`) is stale. Drop it so the next
-            // `inspect_read_only` re-reads the fresh index.
+            // active lazily-backed `InspectScopeGuard`) is stale. Invalidate
+            // the scope epoch so the next `inspect_read_only` re-reads the
+            // fresh index.
             index::inspect_scope_invalidate_all();
             let diagnostics = vec![index_refresh_diagnostic(
                 &target,

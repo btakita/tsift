@@ -1,6 +1,7 @@
 use crate::walk::{self, FileEntry, PruneStats};
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
+use lazily::{CellHandle, Context as LazyContext, SlotHandle};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 #[cfg(test)]
@@ -46,36 +47,50 @@ impl Drop for SnapshotCopyGuard {
 
 const INDEX_DB_WAL_AUTOCHECKPOINT_PAGES: i64 = 256;
 
-// #gdbgatecold scope-bounded inspection sharing.
-//
-// Design choice (option 2): a thread-local cache guard that lets a trusted
-// pipeline (currently the conflict-matrix prep / context-pack handoff)
-// share one `IndexDb::inspect_read_only` result per `(db_path, root, prune)`
-// key. The cache is only populated while an `InspectScopeGuard` is held on
-// the current thread, so the search command and any other top-level path
-// runs outside the scope and gets the original fresh-per-call behavior.
-//
-// This avoids the regression hit by the prior process-wide cache attempt:
-// `tests/exit_code.rs::search_timeout_reports_reindex_when_index_turns_stale_during_worker_run`
-// — search's post-timeout freshness re-check must observe newly modified
-// files. Because search never enters the scope, it never sees a cached
-// inspection.
 type InspectScopeKey = (PathBuf, PathBuf, bool);
+type CachedInspectResult = std::result::Result<ReadOnlyInspectResult, String>;
+
+struct InspectScopeState {
+    ctx: LazyContext,
+    epoch: CellHandle<u64>,
+    slots: HashMap<InspectScopeKey, SlotHandle<CachedInspectResult>>,
+    hits: usize,
+    misses: usize,
+}
+
+impl InspectScopeState {
+    fn new() -> Self {
+        let ctx = LazyContext::new();
+        let epoch = ctx.cell(0u64);
+        Self {
+            ctx,
+            epoch,
+            slots: HashMap::new(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn invalidate_all(&self) {
+        let epoch = self.ctx.get_cell(&self.epoch);
+        self.ctx.set_cell(&self.epoch, epoch.wrapping_add(1));
+    }
+}
 
 thread_local! {
-    static INSPECT_SCOPE_CACHE: std::cell::RefCell<Option<HashMap<InspectScopeKey, ReadOnlyInspectResult>>> =
+    static INSPECT_SCOPE_STATE: std::cell::RefCell<Option<InspectScopeState>> =
         const { std::cell::RefCell::new(None) };
     static INSPECT_SCOPE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static INSPECT_SCOPE_MISSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static INSPECT_SCOPE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// RAII guard that activates the per-thread inspection-sharing scope. While
 /// any guard is alive the same `(db_path, root, prune)` triple will only
-/// inspect the underlying SQLite index once on this thread; subsequent
-/// callers reuse the cached `ReadOnlyInspectResult`. Guards nest safely
-/// (inner scopes reuse the outer cache); the cache clears when the
-/// outermost guard drops.
+/// inspect the underlying SQLite index once on this thread. The cache is
+/// backed by lazily-rs Slots inside a thread-local Context: each key gets a
+/// Slot, and `inspect_scope_invalidate_all` bumps an epoch Cell so dependent
+/// Slots clear lazily before the next read. Guards nest safely (inner scopes
+/// reuse the outer Context); the Context clears when the outermost guard
+/// drops.
 pub struct InspectScopeGuard {
     _private: (),
 }
@@ -94,11 +109,9 @@ impl InspectScopeGuard {
             next
         });
         if depth == 1 {
-            INSPECT_SCOPE_CACHE.with(|cache| {
-                *cache.borrow_mut() = Some(HashMap::new());
+            INSPECT_SCOPE_STATE.with(|state| {
+                *state.borrow_mut() = Some(InspectScopeState::new());
             });
-            INSPECT_SCOPE_MISSES.with(|cell| cell.set(0));
-            INSPECT_SCOPE_HITS.with(|cell| cell.set(0));
         }
         InspectScopeGuard { _private: () }
     }
@@ -113,8 +126,8 @@ impl Drop for InspectScopeGuard {
             next
         });
         if depth == 0 {
-            INSPECT_SCOPE_CACHE.with(|cache| {
-                *cache.borrow_mut() = None;
+            INSPECT_SCOPE_STATE.with(|state| {
+                *state.borrow_mut() = None;
             });
         }
     }
@@ -124,33 +137,42 @@ fn inspect_scope_key(db_path: &Path, root: &Path, prune: bool) -> InspectScopeKe
     (db_path.to_path_buf(), root.to_path_buf(), prune)
 }
 
-fn inspect_scope_cache_lookup(
+fn inspect_scope_cache_get(
     db_path: &Path,
     root: &Path,
     prune: bool,
-) -> Option<ReadOnlyInspectResult> {
-    INSPECT_SCOPE_CACHE.with(|cache| {
-        let borrow = cache.borrow();
-        let cache = borrow.as_ref()?;
-        let cached = cache.get(&inspect_scope_key(db_path, root, prune))?.clone();
-        INSPECT_SCOPE_HITS.with(|cell| cell.set(cell.get() + 1));
-        Some(cached)
-    })
-}
-
-fn inspect_scope_cache_store(
-    db_path: &Path,
-    root: &Path,
-    prune: bool,
-    result: &ReadOnlyInspectResult,
-) {
-    INSPECT_SCOPE_CACHE.with(|cache| {
-        let mut borrow = cache.borrow_mut();
-        if let Some(cache) = borrow.as_mut() {
-            cache.insert(inspect_scope_key(db_path, root, prune), result.clone());
-            INSPECT_SCOPE_MISSES.with(|cell| cell.set(cell.get() + 1));
+) -> Option<Result<ReadOnlyInspectResult>> {
+    INSPECT_SCOPE_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let state = state.as_mut()?;
+        let key = inspect_scope_key(db_path, root, prune);
+        let slot = if let Some(slot) = state.slots.get(&key) {
+            *slot
+        } else {
+            let slot_key = key.clone();
+            let epoch = state.epoch;
+            let slot = state.ctx.slot(move |ctx| {
+                let _epoch = ctx.get_cell(&epoch);
+                IndexDb::inspect_read_only_uncached(&slot_key.0, &slot_key.1, slot_key.2)
+                    .map_err(|err| format!("{err:#}"))
+            });
+            state.slots.insert(key, slot);
+            slot
+        };
+        if state.ctx.is_set(&slot) {
+            state.hits += 1;
+        } else {
+            state.misses += 1;
         }
-    });
+        let result = state
+            .ctx
+            .get(&slot)
+            .map_err(|message| anyhow::anyhow!("{message}"));
+        if result.is_err() {
+            slot.clear(&state.ctx);
+        }
+        Some(result)
+    })
 }
 
 /// Test/inspection helper: returns (hits, misses) recorded while a scope
@@ -158,19 +180,23 @@ fn inspect_scope_cache_store(
 /// is held. Used by test assertions that verify the trusted pipeline only
 /// inspects the underlying DB once per scope.
 pub fn inspect_scope_stats() -> (usize, usize) {
-    let hits = INSPECT_SCOPE_HITS.with(|cell| cell.get());
-    let misses = INSPECT_SCOPE_MISSES.with(|cell| cell.get());
-    (hits, misses)
+    INSPECT_SCOPE_STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|state| (state.hits, state.misses))
+            .unwrap_or((0, 0))
+    })
 }
 
-/// Drop all cached inspection entries for the active scope on this thread.
+/// Invalidate all cached inspection entries for the active scope on this thread.
 /// Must be called whenever a writer mutates the index (refresh / rebuild)
 /// inside the scope, otherwise a subsequent inspect would replay the
 /// pre-write snapshot. No-op when no scope is active.
 pub fn inspect_scope_invalidate_all() {
-    INSPECT_SCOPE_CACHE.with(|cache| {
-        if let Some(cache) = cache.borrow_mut().as_mut() {
-            cache.clear();
+    INSPECT_SCOPE_STATE.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            state.invalidate_all();
         }
     });
 }
@@ -545,9 +571,17 @@ impl IndexDb {
         root: &Path,
         prune: bool,
     ) -> Result<ReadOnlyInspectResult> {
-        if let Some(cached) = inspect_scope_cache_lookup(db_path, root, prune) {
-            return Ok(cached);
+        if let Some(cached) = inspect_scope_cache_get(db_path, root, prune) {
+            return cached;
         }
+        Self::inspect_read_only_uncached(db_path, root, prune)
+    }
+
+    fn inspect_read_only_uncached(
+        db_path: &Path,
+        root: &Path,
+        prune: bool,
+    ) -> Result<ReadOnlyInspectResult> {
         let result = match Self::inspect_read_only_once(db_path, root, prune) {
             Ok(result) => result,
             Err(err) => {
@@ -570,7 +604,6 @@ impl IndexDb {
                 }
             }
         };
-        inspect_scope_cache_store(db_path, root, prune, &result);
         Ok(result)
     }
 
@@ -2536,6 +2569,33 @@ def list_items():
             inspection.recovery,
             Some(ReadOnlyRecovery::SnapshotFallbackWal)
         );
+    }
+
+    #[test]
+    fn inspect_scope_lazily_reuses_until_epoch_invalidation() {
+        let dir = setup_tree();
+        let db_path = dir.path().join(".tsift/index.db");
+        let db = IndexDb::open(&db_path).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+        drop(db);
+
+        let _guard = InspectScopeGuard::new();
+        let first = IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
+        assert_eq!(first.recovery, None);
+        assert_eq!(inspect_scope_stats(), (0, 1));
+
+        let _lock = hold_wal_lock(&db_path);
+        let cached = IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
+        assert_eq!(cached.recovery, None);
+        assert_eq!(inspect_scope_stats(), (1, 1));
+
+        inspect_scope_invalidate_all();
+        let refreshed = IndexDb::inspect_read_only(&db_path, dir.path(), false).unwrap();
+        assert_eq!(
+            refreshed.recovery,
+            Some(ReadOnlyRecovery::SnapshotFallbackWal)
+        );
+        assert_eq!(inspect_scope_stats(), (1, 2));
     }
 
     #[test]

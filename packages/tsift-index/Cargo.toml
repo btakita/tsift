@@ -19,6 +19,7 @@ toml = "0.8"
 rusqlite = { version = "0.34", features = ["bundled"] }
 fs4 = "0.13"
 ignore = "0.4"
+lazily = "0.2"
 tagpath = { version = "0.11.1", default-features = false, features = ["lang-rust", "lang-python", "lang-javascript", "lang-typescript"] }
 tsift-graph = { path = "../tsift-graph", version = "0.1.62" }
 tsift-sqlite = { path = "../tsift-sqlite", version = "0.1.62" }
