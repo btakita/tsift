@@ -72,6 +72,8 @@ use tsift_search::{impact, sift, tagpath_adapter};
 use tsift_sqlite as substrate;
 use tsift_status::status;
 use tsift_summarize::summarize;
+#[cfg(feature = "backend-surrealdb")]
+use tsift_surrealdb::SurrealdbGraphStore;
 use tsift_tokensave::TokensaveDb;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -12352,6 +12354,32 @@ pub(crate) fn graph_db_backend_eval_performance_gate(
     }
 }
 
+#[cfg(feature = "backend-surrealdb")]
+fn graph_db_backend_eval_path_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "backend-surrealdb")]
+fn graph_db_backend_eval_surrealdb_store_path(
+    root: &Path,
+    scope: Option<&str>,
+    dataset: &str,
+) -> PathBuf {
+    root.join(".tsift/backend-eval-cache/surrealdb")
+        .join(graph_db_backend_eval_path_segment(scope.unwrap_or("root")))
+        .join(graph_db_backend_eval_path_segment(dataset))
+        .join("surrealkv")
+}
+
 pub(crate) struct GraphDbBackendEvalOptions<'a> {
     path: &'a Path,
     scope: Option<&'a str>,
@@ -12405,6 +12433,47 @@ pub(crate) fn graph_db_backend_eval_dataset(
 
     let mut backends = vec![sqlite_report];
     for candidate in candidates {
+        #[cfg(feature = "backend-surrealdb")]
+        if *candidate == GraphDbExperimentalBackend::Surrealdb {
+            let started = Instant::now();
+            let store_path = graph_db_backend_eval_surrealdb_store_path(root, scope, name);
+            let store = SurrealdbGraphStore::from_rows_file_backed(&store_path, &sqlite_rows)?;
+            let (candidate_nodes, candidate_edges) = store.graph_counts()?;
+            let rows = candidate_nodes + candidate_edges;
+            let refresh = graph_db_backend_eval_refresh_operation(
+                started.elapsed().as_micros(),
+                rows,
+                serde_json::json!({
+                    "nodes": candidate_nodes,
+                    "edges": candidate_edges,
+                }),
+            );
+            let freshness = sqlite_graph_freshness(sqlite_store, scope.unwrap_or("root"))?;
+            let (candidate_report, _signatures) = graph_db_backend_eval_report_for_store(
+                candidate.name(),
+                "SurrealDB SurrealKV optional adapter spike",
+                false,
+                root,
+                path,
+                scope,
+                targets,
+                depth,
+                limit,
+                impact_limit,
+                &store,
+                freshness,
+                refresh.0,
+                Some(refresh.1),
+                Some(&sqlite_signatures),
+                extra_warnings.clone(),
+                prepared,
+                "provider-neutral rows written into an embedded/file-backed SurrealDB SurrealKV store through the optional tsift-surrealdb adapter",
+                "embedded/file-backed writer through SurrealDB SurrealKV rewrites backend-eval rows before read-only measurements; promotion still requires multi-process/read-only contention samples",
+                "feature-gated optional tsift-surrealdb crate; default cargo build/install does not pull SurrealDB into the dependency graph",
+            );
+            backends.push(candidate_report);
+            continue;
+        }
         let started = Instant::now();
         let store = ExperimentalReadOnlyGraphStore::from_rows(*candidate, &sqlite_rows)?;
         let (candidate_nodes, candidate_edges) = store.graph_counts()?;
@@ -30723,10 +30792,23 @@ tier = "private"
         let result = to_json_schema(&val, false, false, false, true).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let syms = &parsed["symbols"];
-        // serde_json uses BTreeMap — keys sorted alphabetically
-        assert_eq!(syms["_c"], serde_json::json!(["kind", "line", "name"]));
-        assert_eq!(syms["_r"][0], serde_json::json!(["fn", 10, "foo"]));
-        assert_eq!(syms["_r"][1], serde_json::json!(["fn", 20, "bar"]));
+        let columns = syms["_c"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        let row0 = syms["_r"][0].as_array().unwrap();
+        let row1 = syms["_r"][1].as_array().unwrap();
+        let name_index = columns.iter().position(|column| *column == "name").unwrap();
+        let kind_index = columns.iter().position(|column| *column == "kind").unwrap();
+        let line_index = columns.iter().position(|column| *column == "line").unwrap();
+        assert_eq!(row0[name_index], "foo");
+        assert_eq!(row0[kind_index], "fn");
+        assert_eq!(row0[line_index], 10);
+        assert_eq!(row1[name_index], "bar");
+        assert_eq!(row1[kind_index], "fn");
+        assert_eq!(row1[line_index], 20);
     }
 
     #[test]
@@ -30760,8 +30842,17 @@ tier = "private"
         let crs = &d["crs"];
         assert!(crs["_c"].is_array());
         assert!(crs["_r"].is_array());
-        // terse: caller_file→cf, caller_name→cn; BTreeMap sorts: cf < cn
-        assert_eq!(crs["_r"][0], serde_json::json!(["x.rs", "a"]));
+        let columns = crs["_c"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        let row = crs["_r"][0].as_array().unwrap();
+        let name_index = columns.iter().position(|column| *column == "cn").unwrap();
+        let file_index = columns.iter().position(|column| *column == "cf").unwrap();
+        assert_eq!(row[name_index], "a");
+        assert_eq!(row[file_index], "x.rs");
     }
 
     #[test]

@@ -43,7 +43,11 @@ tsift-search = { path = "../tsift-search", version = "0.1.62" }
 tsift-sqlite = { path = "../tsift-sqlite", version = "0.1.62" }
 tsift-status = { path = "../tsift-status", version = "0.1.62" }
 tsift-summarize = { path = "../tsift-summarize", version = "0.1.62" }
+tsift-surrealdb = { path = "../tsift-surrealdb", version = "0.1.62", optional = true }
 tsift-tokensave = { path = "../tsift-tokensave", version = "0.1.62" }
+
+[features]
+backend-surrealdb = ["dep:tsift-surrealdb"]
 
 [dev-dependencies]
 fs4 = "0.13"

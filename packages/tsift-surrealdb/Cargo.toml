@@ -1,0 +1,23 @@
+[package]
+name = "tsift-surrealdb"
+version = "0.1.62"
+edition = "2024"
+description = "Optional SurrealDB graph store backend spike for tsift"
+license = "MIT"
+repository = "https://github.com/btakita/tsift"
+authors = ["Brian Takita <brian.takita@gmail.com>"]
+readme = "README.md"
+keywords = ["agent", "search", "rag", "cli", "context"]
+categories = ["command-line-utilities", "development-tools"]
+publish = true
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+surrealdb = { version = "2.3.10", default-features = false, features = ["kv-mem", "kv-surrealkv"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+tsift-core = { path = "../tsift-core", version = "0.1.62" }
+
+[dev-dependencies]
+tempfile = "3"

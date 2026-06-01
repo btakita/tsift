@@ -2026,7 +2026,9 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                 "{report}"
             );
             if backend["backend"] != "sqlite" {
-                assert_eq!(backend["read_only"], true, "{report}");
+                let expected_read_only =
+                    !(backend["backend"] == "surrealdb" && cfg!(feature = "backend-surrealdb"));
+                assert_eq!(backend["read_only"], expected_read_only, "{report}");
                 assert_eq!(backend["parity"]["matches_sqlite"], true, "{report}");
             }
             if backend["backend"] == "kuzu" {
@@ -2081,12 +2083,21 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                     "{report}"
                 );
                 assert!(
-                    backend["projection_load"]
-                        .as_str()
-                        .unwrap()
-                        .contains("SurrealDB-compatible"),
+                    backend["projection_load"].as_str().unwrap().contains(
+                        if cfg!(feature = "backend-surrealdb") {
+                            "file-backed SurrealDB"
+                        } else {
+                            "SurrealDB-compatible"
+                        }
+                    ),
                     "{report}"
                 );
+                if cfg!(feature = "backend-surrealdb") {
+                    assert!(
+                        backend["adapter"].as_str().unwrap().contains("SurrealKV"),
+                        "{report}"
+                    );
+                }
                 assert!(
                     backend["lock_behavior"]
                         .as_str()
@@ -2106,7 +2117,11 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         let dataset_name = dataset["name"].as_str().unwrap();
         let sqlite_backend = backend_eval_backend(dataset, "sqlite", &report);
         let surrealdb_backend = backend_eval_backend(dataset, "surrealdb", &report);
-        assert_eq!(surrealdb_backend["read_only"], true, "{report}");
+        assert_eq!(
+            surrealdb_backend["read_only"],
+            !cfg!(feature = "backend-surrealdb"),
+            "{report}"
+        );
         assert_eq!(
             surrealdb_backend["parity"]["matches_sqlite"], true,
             "{report}"

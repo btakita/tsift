@@ -110,7 +110,11 @@ on cache hits, per-operation promotion gates, projection
 load/concurrent-writer/install-portability notes, batched context-pack graph
 writes for source/worker context rows, compressed full-projection cache footprint
 metrics, and a `performance_gate`/`metric-digest` command for bounded regression
-review. All read-only prototype backends remain held until a native production
+review. Enable `--features backend-surrealdb` to replace the SurrealDB
+read-only prototype with the excluded optional `tsift-surrealdb` SurrealKV
+adapter spike; default `cargo build` and `cargo install` do not pull SurrealDB
+into the dependency graph.
+All read-only prototype backends remain held until a native production
 adapter beats SQLite across the full-projection promotion gate without weakening
 install or lock behavior.
 Use `tsift graph-db doctor` to validate local `graph.db` and Convex snapshot

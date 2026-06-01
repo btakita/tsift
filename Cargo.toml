@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-memory", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-resolution", "packages/tsift-quality", "packages/tsift-index", "packages/tsift-agent-doc", "packages/tsift-session", "packages/tsift-summarize", "packages/tsift-digest", "packages/tsift-search", "packages/tsift-status", "packages/tsift-cli", "packages/tsift-sim-world"]
+exclude = ["packages/tsift-surrealdb"]
 resolver = "3"
 
 [package]
@@ -44,6 +45,7 @@ tsift-libsql = { path = "packages/tsift-libsql", version = "0.1.62", optional = 
 [features]
 default = ["cli", "lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]
 backend-libsql = ["dep:tsift-libsql"]
+backend-surrealdb = ["cli", "tsift-cli/backend-surrealdb"]
 cli = ["dep:tsift-cli"]
 lang-rust = ["tsift-graph/lang-rust", "tsift-search/lang-rust"]
 lang-python = ["tsift-graph/lang-python", "tsift-search/lang-python"]
