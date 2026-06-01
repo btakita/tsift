@@ -1799,6 +1799,8 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             "ladybug".to_string(),
             "--candidate".to_string(),
             "kuzu".to_string(),
+            "--candidate".to_string(),
+            "surrealdb".to_string(),
             "--target".to_string(),
             "gval".to_string(),
         ]
@@ -1809,7 +1811,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
     assert_eq!(report["baseline_backend"], "sqlite", "{report}");
     assert_eq!(
         report["candidates"],
-        json!(["duckdb-duckpgq", "falkordb", "ladybug", "kuzu"]),
+        json!(["duckdb-duckpgq", "falkordb", "ladybug", "kuzu", "surrealdb"]),
         "{report}"
     );
     let phases = report["phase_timings"].as_array().unwrap();
@@ -1935,7 +1937,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         assert!(dataset["nodes"].as_u64().unwrap() > 0, "{report}");
         assert!(dataset["edges"].as_u64().unwrap() > 0, "{report}");
         let backends = dataset["backends"].as_array().unwrap();
-        assert_eq!(backends.len(), 5, "{report}");
+        assert_eq!(backends.len(), 6, "{report}");
         for backend in backends {
             let operations = backend["operations"]
                 .as_array()
@@ -2022,9 +2024,36 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                     "{report}"
                 );
             }
+            if backend["backend"] == "surrealdb" {
+                assert!(
+                    backend["adapter"].as_str().unwrap().contains("SurrealDB"),
+                    "{report}"
+                );
+                assert!(
+                    backend["projection_load"]
+                        .as_str()
+                        .unwrap()
+                        .contains("SurrealDB-compatible"),
+                    "{report}"
+                );
+                assert!(
+                    backend["lock_behavior"]
+                        .as_str()
+                        .unwrap()
+                        .contains("file-backed writer"),
+                    "{report}"
+                );
+                assert!(
+                    backend["install_portability"]
+                        .as_str()
+                        .unwrap()
+                        .contains("cargo build/install"),
+                    "{report}"
+                );
+            }
         }
     }
-    assert_eq!(report["promotion"].as_array().unwrap().len(), 4, "{report}");
+    assert_eq!(report["promotion"].as_array().unwrap().len(), 5, "{report}");
     assert!(
         report["promotion"]
             .as_array()
@@ -2274,6 +2303,13 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "{report}"
     );
     assert!(
+        report["metrics"]
+            .as_object()
+            .unwrap()
+            .contains_key("synthetic_high_degree.surrealdb.total_duration_micros"),
+        "{report}"
+    );
+    assert!(
         report["metric_digest_command"]
             .as_str()
             .unwrap()
@@ -2379,7 +2415,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .contains("do not promote a read-only prototype"),
         "{report}"
     );
-    for backend in ["falkordb", "kuzu"] {
+    for backend in ["falkordb", "kuzu", "surrealdb"] {
         let candidate = adapter_spike["candidate_backends"]
             .as_array()
             .unwrap()
@@ -2487,7 +2523,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                 .contains("full_projection conflict-matrix")),
         "{report}"
     );
-    for backend in ["duckdb-duckpgq", "falkordb", "ladybug", "kuzu"] {
+    for backend in ["duckdb-duckpgq", "falkordb", "ladybug", "kuzu", "surrealdb"] {
         let decision = report["promotion"]
             .as_array()
             .unwrap()
@@ -2541,6 +2577,28 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                 .as_str()
                 .unwrap()
                 .contains("native_kuzu_projection_load")),
+        "{report}"
+    );
+    let surreal_gate = &report["promotion"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|decision| decision["backend"] == "surrealdb")
+        .unwrap()["gate"];
+    assert_eq!(
+        surreal_gate["status"], "hold_native_adapter_required",
+        "{report}"
+    );
+    assert_eq!(surreal_gate["native_adapter_required"], true, "{report}");
+    assert!(
+        surreal_gate["required_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check
+                .as_str()
+                .unwrap()
+                .contains("native_surrealdb_projection_load")),
         "{report}"
     );
     let artifact_file_query = graph_db_json(

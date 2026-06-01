@@ -1040,7 +1040,7 @@ pub enum GraphDbQuery {
     },
     /// Benchmark experimental read-only GraphStore candidates against SQLite before promotion
     BackendEval {
-        /// Candidate backend prototype to evaluate. Repeatable; defaults to DuckDB/DuckPGQ, FalkorDB, Ladybug, and Kuzu. Values: duckdb-duckpgq, falkordb, ladybug, kuzu.
+        /// Candidate backend prototype to evaluate. Repeatable; defaults to DuckDB/DuckPGQ, FalkorDB, Ladybug, Kuzu, and SurrealDB. Values: duckdb-duckpgq, falkordb, ladybug, kuzu, surrealdb.
         #[arg(long = "candidate")]
         candidates: Vec<String>,
         /// Backlog ids, job handles, or graph node ids to use for evidence/planning benchmarks

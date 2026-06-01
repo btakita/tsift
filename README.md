@@ -101,8 +101,8 @@ running DAG-shaped dispatch. Those orchestration surfaces include stable
 contract versions, evidence packet ids, projection hashes, replay commands, and
 repair commands so agent-doc can consume them as JSON rather than parsing prose.
 Use `tsift graph-db backend-eval` to compare SQLite against experimental
-read-only candidates, including DuckDB/DuckPGQ, FalkorDB, Ladybug, and the
-dependency-free Vela-Engineering/kuzu row prototype, with adaptive
+read-only candidates, including DuckDB/DuckPGQ, FalkorDB, Ladybug, SurrealDB,
+and the dependency-free Vela-Engineering/kuzu row prototype, with adaptive
 1/64/128/256/512-hop path probes that keep the default cap at 64 until real and
 synthetic extended-hop gates pass, an opt-in `--full-projection` dataset, split
 conflict-matrix preparation timings/cache keys that report skipped heavy phases

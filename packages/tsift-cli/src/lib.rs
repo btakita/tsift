@@ -80,6 +80,7 @@ pub(crate) enum GraphDbExperimentalBackend {
     Falkordb,
     Ladybug,
     Kuzu,
+    Surrealdb,
 }
 
 #[derive(Serialize)]
@@ -96,6 +97,7 @@ impl GraphDbExperimentalBackend {
             Self::Falkordb => "falkordb",
             Self::Ladybug => "ladybug",
             Self::Kuzu => "kuzu",
+            Self::Surrealdb => "surrealdb",
         }
     }
 
@@ -105,6 +107,7 @@ impl GraphDbExperimentalBackend {
             Self::Falkordb => "FalkorDB read-only prototype",
             Self::Ladybug => "Ladybug read-only prototype",
             Self::Kuzu => "Kuzu (Vela-Engineering/kuzu) read-only prototype",
+            Self::Surrealdb => "SurrealDB read-only prototype",
         }
     }
 
@@ -115,6 +118,9 @@ impl GraphDbExperimentalBackend {
             }
             Self::Kuzu => {
                 "provider-neutral rows loaded into a Kuzu-compatible in-process read snapshot for parity and performance gates; production Vela-Engineering/kuzu storage remains behind a future optional adapter"
+            }
+            Self::Surrealdb => {
+                "provider-neutral rows loaded into a SurrealDB-compatible read snapshot for parity and timing only; production SurrealDB storage remains behind backend-eval until a real optional adapter passes the full-projection gate"
             }
             _ => {
                 "provider-neutral rows loaded into a dependency-free in-process read snapshot for parity and performance gates"
@@ -130,6 +136,9 @@ impl GraphDbExperimentalBackend {
             Self::Kuzu => {
                 "read-only Kuzu prototype snapshot; no SQLite writer lock is taken during benchmarks, and production Vela-Engineering/kuzu promotion must prove concurrent writer semantics before replacing SQLite"
             }
+            Self::Surrealdb => {
+                "read-only SurrealDB prototype snapshot; production promotion must prove embedded/file-backed writer and read-only lock behavior before replacing SQLite"
+            }
             _ => "read-only snapshot/row adapter; no writer lock is taken during query benchmarks",
         }
     }
@@ -141,6 +150,9 @@ impl GraphDbExperimentalBackend {
             }
             Self::Kuzu => {
                 "prototype is dependency-free in this binary; production Vela-Engineering/kuzu integration must stay optional so cargo build/install works without a native Kuzu toolchain"
+            }
+            Self::Surrealdb => {
+                "prototype is dependency-free in this binary; production SurrealDB integration must stay optional so cargo build/install works without pulling SurrealDB into the default build"
             }
             _ => {
                 "prototype is dependency-free in this binary; a production engine adapter must remain optional before promotion"
@@ -161,6 +173,9 @@ impl GraphDbExperimentalBackend {
             ),
             Self::Kuzu => Some(
                 "Kuzu remains behind backend-eval until a native optional adapter proves projection writes/load, SQLite parity, full_projection wins, install portability, and lock behavior",
+            ),
+            Self::Surrealdb => Some(
+                "SurrealDB remains behind backend-eval until a feature-gated optional adapter proves provider-neutral projection writes/load, SQLite parity, full_projection wins, install portability, and lock behavior",
             ),
         }
     }
@@ -222,6 +237,20 @@ impl GraphDbExperimentalBackend {
                         .to_string(),
                 ],
             },
+            Self::Surrealdb => GraphDbBackendPromotionGate {
+                status: "hold_native_adapter_required".to_string(),
+                native_adapter_required: true,
+                required_checks: vec![
+                    "native_surrealdb_projection_load_writes_provider_neutral_rows_without_sqlite_row_replay"
+                        .to_string(),
+                    "freshness_and_parity_match_sqlite_on_real_and_full_projection_datasets"
+                        .to_string(),
+                    "embedded_file_backed_writer_and_read_only_lock_behavior_match_or_beat_sqlite"
+                        .to_string(),
+                    "operator_install_cost_keeps_cargo_build_install_surrealdb_free_by_default"
+                        .to_string(),
+                ],
+            },
         }
     }
 
@@ -231,9 +260,10 @@ impl GraphDbExperimentalBackend {
             "falkordb" | "falkor" => Ok(Self::Falkordb),
             "ladybug" => Ok(Self::Ladybug),
             "kuzu" | "vela-kuzu" => Ok(Self::Kuzu),
+            "surrealdb" | "surreal" | "surreal-db" => Ok(Self::Surrealdb),
             _ => {
                 bail!(
-                    "unknown backend-eval candidate {raw:?}; expected duckdb-duckpgq, falkordb, ladybug, or kuzu"
+                    "unknown backend-eval candidate {raw:?}; expected duckdb-duckpgq, falkordb, ladybug, kuzu, or surrealdb"
                 )
             }
         }
@@ -9563,7 +9593,7 @@ fn graph_db_schema() -> GraphDbSchema {
                 description: "Return or apply the post-reconciliation SQLite graph compaction policy, including WAL checkpoint/VACUUM proof and guarded tombstone pruning",
             },
             GraphDbSchemaOperation {
-                command: "backend-eval [--candidate duckdb-duckpgq|falkordb|ladybug|kuzu] [--target ID] [--full-projection]",
+                command: "backend-eval [--candidate duckdb-duckpgq|falkordb|ladybug|kuzu|surrealdb] [--target ID] [--full-projection]",
                 description: "Benchmark experimental read-only GraphStore backend prototypes against SQLite on bounded real, optional full-project, and synthetic projections across refresh/status/path tiers/evidence/conflict-matrix/dispatch-trace and emit promotion hold/eligibility gates",
             },
             GraphDbSchemaOperation {
@@ -12182,6 +12212,7 @@ fn graph_db_backend_eval_backend_adapter_spike_gate() -> GraphDbBackendAdapterSp
     let candidate_backends = [
         GraphDbExperimentalBackend::Falkordb,
         GraphDbExperimentalBackend::Kuzu,
+        GraphDbExperimentalBackend::Surrealdb,
     ]
     .into_iter()
     .map(|backend| GraphDbBackendAdapterSpikeCandidate {
@@ -12211,7 +12242,7 @@ fn graph_db_backend_eval_backend_adapter_spike_gate() -> GraphDbBackendAdapterSp
             "beats_sqlite_on_every_required_workload_and_metric_in_backend_eval".to_string(),
         ],
         decision_rule:
-            "do not promote a read-only prototype; FalkorDB or Kuzu can only advance after a real optional adapter proves projection writes/load, lock semantics, install portability, full parity, and faster-than-SQLite results across every required workload"
+            "do not promote a read-only prototype; FalkorDB, Kuzu, or SurrealDB can only advance after a real optional adapter proves projection writes/load, lock semantics, install portability, full parity, and faster-than-SQLite results across every required workload"
                 .to_string(),
         evidence_plan: "plans/gback-evidence.md".to_string(),
     }
@@ -32871,6 +32902,39 @@ tier = "private"
                         );
                     }
                     _ => panic!("expected graph-db neighborhood query"),
+                }
+            }
+            _ => panic!("expected GraphDb command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_db_backend_eval_surrealdb_candidate() {
+        let cli = parse_cli([
+            "tsift",
+            "graph-db",
+            "--json",
+            "backend-eval",
+            "--candidate",
+            "surrealdb",
+            "--target",
+            "gval",
+            "--full-projection",
+        ]);
+        match cli.command {
+            Some(Commands::GraphDb { json, query, .. }) => {
+                assert!(json);
+                match query {
+                    GraphDbQuery::BackendEval {
+                        candidates,
+                        targets,
+                        full_projection,
+                    } => {
+                        assert_eq!(candidates, vec!["surrealdb".to_string()]);
+                        assert_eq!(targets, vec!["gval".to_string()]);
+                        assert!(full_projection);
+                    }
+                    _ => panic!("expected graph-db backend-eval query"),
                 }
             }
             _ => panic!("expected GraphDb command"),

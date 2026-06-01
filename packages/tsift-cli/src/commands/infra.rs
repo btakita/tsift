@@ -586,6 +586,7 @@ pub(crate) fn cmd_graph_db_backend_eval(
             GraphDbExperimentalBackend::Falkordb,
             GraphDbExperimentalBackend::Ladybug,
             GraphDbExperimentalBackend::Kuzu,
+            GraphDbExperimentalBackend::Surrealdb,
         ]
     } else {
         candidates
