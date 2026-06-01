@@ -144,6 +144,43 @@ fn release_publish_gate_requires_secret_variable_and_dry_run() {
     }
 }
 
+#[test]
+fn spec_documents_lazily_rs_cache_contracts() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let packaged_spec = fs::read_to_string(root.join("SPEC.md")).unwrap();
+    let workspace_spec = fs::read_to_string(root.join("../../SPEC.md")).unwrap();
+    assert_eq!(
+        packaged_spec, workspace_spec,
+        "packaged CLI spec should stay in sync with the workspace spec"
+    );
+
+    let required = [
+        "### lazily-rs Cache Contracts",
+        "`SummaryCache` (`packages/tsift-summarize`)",
+        "Normalized project-relative file key",
+        "summary_cache_reuses_file_snapshot_until_content_hash_changes",
+        "`InspectScopeGuard` / `IndexDb::inspect_read_only` (`packages/tsift-index`)",
+        "`(db_path, root, prune)` plus a thread-local scope epoch Cell",
+        "inspect_scope_lazily_reuses_until_epoch_invalidation",
+        "`StatusCheckCache` (`packages/tsift-status`)",
+        "StatusInspectKey { db_path, root, prune }",
+        "status_cache_reuses_index_inspection_until_invalidated",
+        "`ResolveEdgesCache` (`packages/tsift-graph`)",
+        "`(file, content_hash)` plus a per-slot mtime Cell",
+        "resolve_edges_cache_reuses_slots_until_mtime_or_hash_changes",
+        "`GraphStore::neighborhood` (`packages/tsift-core`)",
+        "graph_store_contract_covers_crud_neighborhood_and_ordering",
+        "`GraphStore::ranked_neighborhood` (`packages/tsift-core`)",
+        "ranked_neighborhood_breadth_first_respects_max_nodes",
+    ];
+    for needle in required {
+        assert!(
+            packaged_spec.contains(needle),
+            "lazily-rs cache contract table missing {needle:?}"
+        );
+    }
+}
+
 fn release_crate_order() -> &'static [&'static str] {
     &[
         "tsift-core",
