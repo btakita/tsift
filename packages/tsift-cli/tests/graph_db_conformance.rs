@@ -536,6 +536,41 @@ fn phase_duration(report: &Value, phase: &str) -> u64 {
         .unwrap_or_else(|| panic!("missing phase {phase}: {report}"))
 }
 
+fn backend_eval_backend<'a>(dataset: &'a Value, backend: &str, report: &Value) -> &'a Value {
+    dataset["backends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["backend"] == backend)
+        .unwrap_or_else(|| {
+            panic!(
+                "missing backend-eval backend {backend} in dataset {}: {report}",
+                dataset["name"]
+            )
+        })
+}
+
+fn backend_eval_operation<'a>(backend: &'a Value, operation: &str, report: &Value) -> &'a Value {
+    backend["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == operation)
+        .unwrap_or_else(|| {
+            panic!(
+                "missing backend-eval operation {operation} for backend {}: {report}",
+                backend["backend"]
+            )
+        })
+}
+
+fn assert_backend_eval_metric(report: &Value, metric: &str) {
+    assert!(
+        report["metrics"].as_object().unwrap().contains_key(metric),
+        "missing backend-eval metric {metric}: {report}"
+    );
+}
+
 fn edge_keys(report: &Value) -> Vec<String> {
     report["edges"]
         .as_array()
@@ -1933,6 +1968,22 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
             .any(|dataset| dataset["name"] == "synthetic_deep_chain"),
         "{report}"
     );
+    let surrealdb_parity_operations = [
+        "status",
+        "edge_lookup",
+        "edge_property_scan",
+        "incident_edges",
+        "neighborhood",
+        "related",
+        "path_max_hops",
+        "path_max_hops_128",
+        "path_max_hops_256",
+        "path_max_hops_512",
+        "evidence_target_resolution",
+        "evidence",
+        "conflict_matrix",
+        "dispatch_trace",
+    ];
     for dataset in datasets {
         assert!(dataset["nodes"].as_u64().unwrap() > 0, "{report}");
         assert!(dataset["edges"].as_u64().unwrap() > 0, "{report}");
@@ -2049,6 +2100,65 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
                         .unwrap()
                         .contains("cargo build/install"),
                     "{report}"
+                );
+            }
+        }
+        let dataset_name = dataset["name"].as_str().unwrap();
+        let sqlite_backend = backend_eval_backend(dataset, "sqlite", &report);
+        let surrealdb_backend = backend_eval_backend(dataset, "surrealdb", &report);
+        assert_eq!(surrealdb_backend["read_only"], true, "{report}");
+        assert_eq!(
+            surrealdb_backend["parity"]["matches_sqlite"], true,
+            "{report}"
+        );
+        assert!(
+            surrealdb_backend["parity"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{report}"
+        );
+        assert_backend_eval_metric(
+            &report,
+            &format!("{dataset_name}.surrealdb.total_duration_micros"),
+        );
+        assert_backend_eval_metric(
+            &report,
+            &format!("{dataset_name}.surrealdb.total_duration_micros_per_1k_graph_rows"),
+        );
+        let status = backend_eval_operation(surrealdb_backend, "status", &report);
+        assert_eq!(
+            status["rows"].as_u64().unwrap(),
+            dataset["nodes"].as_u64().unwrap() + dataset["edges"].as_u64().unwrap(),
+            "SurrealDB status/count rows should match dataset graph rows: {report}"
+        );
+        for operation in surrealdb_parity_operations {
+            let sqlite_operation = backend_eval_operation(sqlite_backend, operation, &report);
+            let surrealdb_operation = backend_eval_operation(surrealdb_backend, operation, &report);
+            assert_eq!(
+                sqlite_operation["status"], "ok",
+                "SQLite baseline operation {operation} must pass before SurrealDB parity is meaningful: {report}"
+            );
+            assert_eq!(
+                surrealdb_operation["status"], "ok",
+                "SurrealDB operation {operation} should pass on dataset {dataset_name}: {report}"
+            );
+            assert_eq!(
+                surrealdb_operation["rows"], sqlite_operation["rows"],
+                "SurrealDB operation {operation} should return SQLite-equivalent row counts on dataset {dataset_name}: {report}"
+            );
+            assert_backend_eval_metric(
+                &report,
+                &format!("{dataset_name}.surrealdb.{operation}.duration_micros"),
+            );
+            assert_backend_eval_metric(
+                &report,
+                &format!("{dataset_name}.surrealdb.{operation}.duration_micros_per_1k_graph_rows"),
+            );
+            if !sqlite_operation["rows"].is_null() {
+                assert_backend_eval_metric(
+                    &report,
+                    &format!("{dataset_name}.surrealdb.{operation}.rows"),
                 );
             }
         }
