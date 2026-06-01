@@ -1,11 +1,14 @@
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
+use lazily::{CellHandle, Context as LazyContext, SlotHandle};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 use tsift_index::index::IndexDb;
 use tsift_sqlite::{ReadOnlyRecovery, copy_read_only_snapshot, read_only_snapshot_recovery};
@@ -18,6 +21,43 @@ pub struct SummaryDb {
 pub struct SummaryReadOnlyOpen {
     pub db: SummaryDb,
     pub recovery: Option<ReadOnlyRecovery>,
+}
+
+type CachedSummaryFileSnapshot = std::result::Result<SummaryFileSnapshot, String>;
+
+#[derive(Debug, Clone)]
+pub struct SummaryFileSnapshot {
+    pub file_path: String,
+    pub requested_content_hash: Option<String>,
+    pub summaries: Vec<Summary>,
+    pub current: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryCacheSource {
+    Cached,
+    Extracted,
+}
+
+#[derive(Debug, Clone)]
+pub struct SummaryCacheLookup {
+    pub summaries: Vec<Summary>,
+    pub source: SummaryCacheSource,
+}
+
+#[derive(Clone, Copy)]
+struct SummaryFileSlot {
+    content_hash: CellHandle<Option<String>>,
+    epoch: CellHandle<u64>,
+    snapshot: SlotHandle<CachedSummaryFileSnapshot>,
+}
+
+pub struct SummaryCache {
+    db: Rc<SummaryDb>,
+    ctx: LazyContext,
+    slots: RefCell<HashMap<String, SummaryFileSlot>>,
+    hits: Cell<usize>,
+    misses: Cell<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -511,6 +551,136 @@ impl SummaryDb {
                 paths: cleanup_paths,
             }),
         })
+    }
+}
+
+impl SummaryCache {
+    pub fn new(db: SummaryDb) -> Self {
+        Self {
+            db: Rc::new(db),
+            ctx: LazyContext::new(),
+            slots: RefCell::new(HashMap::new()),
+            hits: Cell::new(0),
+            misses: Cell::new(0),
+        }
+    }
+
+    pub fn db(&self) -> &SummaryDb {
+        &self.db
+    }
+
+    pub fn stats(&self) -> (usize, usize) {
+        (self.hits.get(), self.misses.get())
+    }
+
+    pub fn file_snapshot(
+        &self,
+        file_path: &str,
+        content_hash: Option<&str>,
+    ) -> Result<SummaryFileSnapshot> {
+        let normalized = normalize_summary_file_key_str(file_path);
+        let requested_content_hash = content_hash.map(str::to_string);
+        let slot = {
+            let mut slots = self.slots.borrow_mut();
+            if let Some(slot) = slots.get(&normalized) {
+                self.ctx
+                    .set_cell(&slot.content_hash, requested_content_hash.clone());
+                *slot
+            } else {
+                let db = Rc::clone(&self.db);
+                let file_key = normalized.clone();
+                let content_hash_cell = self.ctx.cell(requested_content_hash.clone());
+                let epoch = self.ctx.cell(0u64);
+                let snapshot = self.ctx.slot(move |ctx| {
+                    let requested_content_hash = ctx.get_cell(&content_hash_cell);
+                    let _epoch = ctx.get_cell(&epoch);
+                    let summaries = db
+                        .get_by_file(&file_key)
+                        .map_err(|err| format!("{err:#}"))?;
+                    let current = requested_content_hash.as_ref().is_some_and(|hash| {
+                        summaries
+                            .iter()
+                            .any(|summary| summary.content_hash == *hash)
+                    });
+                    Ok(SummaryFileSnapshot {
+                        file_path: file_key.clone(),
+                        requested_content_hash,
+                        summaries,
+                        current,
+                    })
+                });
+                let slot = SummaryFileSlot {
+                    content_hash: content_hash_cell,
+                    epoch,
+                    snapshot,
+                };
+                slots.insert(normalized.clone(), slot);
+                slot
+            }
+        };
+
+        if self.ctx.is_set(&slot.snapshot) {
+            self.hits.set(self.hits.get() + 1);
+        } else {
+            self.misses.set(self.misses.get() + 1);
+        }
+        let result = self
+            .ctx
+            .get(&slot.snapshot)
+            .map_err(|message| anyhow::anyhow!("{message}"));
+        if result.is_err() {
+            slot.snapshot.clear(&self.ctx);
+        }
+        result
+    }
+
+    pub fn current_by_file(
+        &self,
+        file_path: &str,
+        content_hash: &str,
+    ) -> Result<Option<Vec<Summary>>> {
+        let snapshot = self.file_snapshot(file_path, Some(content_hash))?;
+        if snapshot.current {
+            Ok(Some(snapshot.summaries))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_or_extract_file<F>(
+        &self,
+        file_path: &str,
+        content_hash: &str,
+        extract: F,
+    ) -> Result<SummaryCacheLookup>
+    where
+        F: FnOnce() -> Result<Vec<Summary>>,
+    {
+        if let Some(summaries) = self.current_by_file(file_path, content_hash)? {
+            return Ok(SummaryCacheLookup {
+                summaries,
+                source: SummaryCacheSource::Cached,
+            });
+        }
+
+        let summaries = extract()?;
+        self.db.replace_file(file_path, &summaries)?;
+        self.invalidate_file(file_path, Some(content_hash));
+        Ok(SummaryCacheLookup {
+            summaries,
+            source: SummaryCacheSource::Extracted,
+        })
+    }
+
+    pub fn invalidate_file(&self, file_path: &str, content_hash: Option<&str>) {
+        let normalized = normalize_summary_file_key_str(file_path);
+        let Some(slot) = self.slots.borrow().get(&normalized).copied() else {
+            return;
+        };
+        self.ctx
+            .set_cell(&slot.content_hash, content_hash.map(str::to_string));
+        let epoch = self.ctx.get_cell(&slot.epoch);
+        self.ctx.set_cell(&slot.epoch, epoch.wrapping_add(1));
     }
 }
 
@@ -1211,6 +1381,81 @@ mod tests {
             .unwrap();
         assert!(db.is_current("src/main.rs", "hash_v1").unwrap());
         assert!(!db.is_current("src/main.rs", "hash_v2").unwrap());
+    }
+
+    #[test]
+    fn summary_cache_reuses_file_snapshot_until_content_hash_changes() {
+        let (_tmp, db) = test_db();
+        db.insert(&make_summary("stale", "src/lib.rs", "hash_v1"))
+            .unwrap();
+        let cache = SummaryCache::new(db);
+
+        let first = cache
+            .current_by_file("src/lib.rs", "hash_v1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first[0].symbol_name, "stale");
+        assert_eq!(cache.stats(), (0, 1));
+
+        cache
+            .db()
+            .replace_file(
+                "src/lib.rs",
+                &[make_summary("fresh", "src/lib.rs", "hash_v2")],
+            )
+            .unwrap();
+        let second = cache
+            .current_by_file("src/lib.rs", "hash_v1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second[0].symbol_name, "stale",
+            "same content hash should reuse the cached Slot"
+        );
+        assert_eq!(cache.stats(), (1, 1));
+
+        let third = cache
+            .current_by_file("src/lib.rs", "hash_v2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(third[0].symbol_name, "fresh");
+        assert_eq!(cache.stats(), (1, 2));
+    }
+
+    #[test]
+    fn summary_cache_get_or_extract_file_computes_once_until_hash_changes() {
+        let (_tmp, db) = test_db();
+        let cache = SummaryCache::new(db);
+        let extractions = Cell::new(0usize);
+
+        let first = cache
+            .get_or_extract_file("src/lib.rs", "hash_v1", || {
+                extractions.set(extractions.get() + 1);
+                Ok(vec![make_summary("first", "src/lib.rs", "hash_v1")])
+            })
+            .unwrap();
+        assert_eq!(first.source, SummaryCacheSource::Extracted);
+        assert_eq!(first.summaries[0].symbol_name, "first");
+        assert_eq!(extractions.get(), 1);
+
+        let second = cache
+            .get_or_extract_file("src/lib.rs", "hash_v1", || {
+                bail!("same hash should reuse cached summaries")
+            })
+            .unwrap();
+        assert_eq!(second.source, SummaryCacheSource::Cached);
+        assert_eq!(second.summaries[0].symbol_name, "first");
+        assert_eq!(extractions.get(), 1);
+
+        let third = cache
+            .get_or_extract_file("src/lib.rs", "hash_v2", || {
+                extractions.set(extractions.get() + 1);
+                Ok(vec![make_summary("second", "src/lib.rs", "hash_v2")])
+            })
+            .unwrap();
+        assert_eq!(third.source, SummaryCacheSource::Extracted);
+        assert_eq!(third.summaries[0].symbol_name, "second");
+        assert_eq!(extractions.get(), 2);
     }
 
     #[test]

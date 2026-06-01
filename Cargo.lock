@@ -2988,6 +2988,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "fs4",
+ "lazily",
  "rusqlite",
  "serde",
  "serde_json",

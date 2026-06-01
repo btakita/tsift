@@ -64,11 +64,11 @@ pub(crate) fn cmd_summarize(
         }
 
         let _summary_write_lock = summarize::acquire_write_lock(&db_path)?;
-        let summary_db = summarize::SummaryDb::open(&db_path)?;
+        let summary_cache = summarize::SummaryCache::new(summarize::SummaryDb::open(&db_path)?);
 
         if !diff {
             deleted_summary_paths.extend(summarize_full_extract_deleted_summary_paths(
-                &summary_db,
+                summary_cache.db(),
                 &root,
                 &extract_scope,
                 &files_to_extract,
@@ -81,7 +81,8 @@ pub(crate) fn cmd_summarize(
         }
 
         for rel_path in &deleted_summary_paths {
-            summary_db.delete_by_file(rel_path)?;
+            summary_cache.db().delete_by_file(rel_path)?;
+            summary_cache.invalidate_file(rel_path, None);
         }
 
         let mut report = summarize::ExtractionReport {
@@ -105,31 +106,34 @@ pub(crate) fn cmd_summarize(
             let hash = summarize::content_hash(&content);
             let rel_path = summarize_relative_file_path(&root, file_path);
 
-            if summary_db.is_current(&rel_path, &hash)? {
-                continue; // already extracted for this version
-            }
-
-            let symbol_context = find_symbols_db_for_file(&root, file_path)?;
-            match summarize::extract_for_file(
-                file_path,
-                symbol_context.as_ref().map(|ctx| ctx.db_path.as_path()),
-                symbol_context.as_ref().map(|ctx| ctx.source_root.as_path()),
-                &cfg,
-            ) {
-                Ok(mut summaries) => {
-                    for summary in &mut summaries {
-                        summary.file_path = rel_path.clone();
+            match summary_cache.get_or_extract_file(&rel_path, &hash, || {
+                let symbol_context = find_symbols_db_for_file(&root, file_path)?;
+                let mut summaries = summarize::extract_for_file(
+                    file_path,
+                    symbol_context.as_ref().map(|ctx| ctx.db_path.as_path()),
+                    symbol_context.as_ref().map(|ctx| ctx.source_root.as_path()),
+                    &cfg,
+                )?;
+                for summary in &mut summaries {
+                    summary.file_path = rel_path.clone();
+                }
+                Ok(summaries)
+            }) {
+                Ok(lookup) => {
+                    if lookup.source == summarize::SummaryCacheSource::Cached {
+                        continue;
                     }
-                    let extracted_count = summaries.len();
-                    let tokens_input = summaries
+                    let extracted_count = lookup.summaries.len();
+                    let tokens_input = lookup
+                        .summaries
                         .iter()
                         .map(|summary| summary.tokens_input.unwrap_or(0))
                         .sum::<i64>();
-                    let tokens_output = summaries
+                    let tokens_output = lookup
+                        .summaries
                         .iter()
                         .map(|summary| summary.tokens_output.unwrap_or(0))
                         .sum::<i64>();
-                    summary_db.replace_file(&rel_path, &summaries)?;
                     report.symbols_extracted += extracted_count;
                     report.tokens_input += tokens_input;
                     report.tokens_output += tokens_output;
@@ -222,7 +226,10 @@ pub(crate) fn cmd_summarize(
             return Ok(());
         }
         if json_output {
-            println!("{}", to_json_schema(&results, pretty, terse, false, schema)?);
+            println!(
+                "{}",
+                to_json_schema(&results, pretty, terse, false, schema)?
+            );
         } else if compact {
             for summary in &results {
                 println!(
@@ -252,7 +259,10 @@ pub(crate) fn cmd_summarize(
             return Ok(());
         }
         if json_output {
-            println!("{}", to_json_schema(&results, pretty, terse, false, schema)?);
+            println!(
+                "{}",
+                to_json_schema(&results, pretty, terse, false, schema)?
+            );
         } else if compact {
             for summary in &results {
                 println!(
