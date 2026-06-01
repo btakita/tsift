@@ -824,8 +824,11 @@ pub enum Commands {
         /// Path to the codebase (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// Apply safe local fixes before reporting: refresh tsift instructions and rebuild stale/missing indexes
+        /// Skip automatic index fixes (auto-fix is now the default)
         #[arg(long)]
+        no_fix: bool,
+        /// [deprecated] Auto-fix is now the default; use --no-fix to skip
+        #[arg(long, hide = true)]
         fix: bool,
         /// Output as JSON
         #[arg(long)]

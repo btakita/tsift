@@ -3236,6 +3236,87 @@ fn status_json_auto_fixes_stale_index_without_fix_flag() {
 }
 
 #[test]
+fn status_auto_fixes_stale_index_by_default() {
+    let dir = indexed_cli_fixture();
+    std::thread::sleep(Duration::from_millis(50));
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn helper() { println!(\"updated\"); }\nfn main() { helper(); Vec::new(); }\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["status", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("status fix: refreshing index"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn status_no_fix_skips_auto_fix() {
+    let dir = indexed_cli_fixture();
+    std::thread::sleep(Duration::from_millis(50));
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn helper() { println!(\"updated\"); }\nfn main() { helper(); Vec::new(); }\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["status", "--no-fix", "--json", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"state\":\"stale\""),
+        "stdout was: {stdout}"
+    );
+}
+
+#[test]
+fn status_deprecated_fix_flag_shows_warning() {
+    let dir = indexed_cli_fixture();
+    std::thread::sleep(Duration::from_millis(50));
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn helper() { println!(\"updated\"); }\nfn main() { helper(); Vec::new(); }\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["status", "--fix", "--json", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--fix is deprecated"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
 fn status_autoindexes_missing_workspace_scopes_even_when_root_index_exists_in_json() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(

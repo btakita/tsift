@@ -1216,19 +1216,24 @@ fn status_index_needs_auto_fix(report: &status::StatusReport) -> bool {
 pub(crate) fn cmd_status(
     path: &std::path::Path,
     fix: bool,
+    no_fix: bool,
     json_output: bool,
     compact: bool,
     pretty: bool,
     terse: bool,
     schema: bool,
 ) -> Result<()> {
+    if fix {
+        eprintln!("warning: --fix is deprecated; auto-fix is now the default. Use --no-fix to skip.");
+    }
+    let auto_fix = !no_fix;
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     let mut report = status::check_status(&root)?;
     if status_missing_workspace_scopes(&report) {
         autoindex_missing_workspace_scopes(&root, &report)?;
         report = status::check_status(&root)?;
     }
-    if fix || (json_output && status_index_needs_auto_fix(&report)) {
+    if auto_fix && status_index_needs_auto_fix(&report) {
         apply_status_fixes(&root, &report)?;
         report = status::check_status(&root)?;
         if status_missing_workspace_scopes(&report) {

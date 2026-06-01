@@ -1095,9 +1095,10 @@ pub fn run() -> Result<()> {
             },
             ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
         ),
-        Some(Commands::Status { path, fix, json }) => cmd_status(
+        Some(Commands::Status { path, fix, no_fix, json }) => cmd_status(
             &path,
             fix,
+            no_fix,
             json || terse || schema || envelope,
             compact,
             pretty,
@@ -29604,7 +29605,7 @@ tier = "private"
         let beta_db_path = cfg.db_path_for(dir.path(), "beta");
         assert!(!beta_db_path.exists());
 
-        cmd_status(dir.path(), false, true, false, false, false, false).unwrap();
+        cmd_status(dir.path(), false, false, true, false, false, false, false).unwrap();
 
         assert!(beta_db_path.exists());
         let report = status::check_status(dir.path()).unwrap();
@@ -29616,7 +29617,7 @@ tier = "private"
         let dir = setup_workspace();
         let cfg = config::Config::load(dir.path()).unwrap();
 
-        cmd_status(dir.path(), false, true, false, false, false, false).unwrap();
+        cmd_status(dir.path(), false, false, true, false, false, false, false).unwrap();
 
         assert!(cfg.db_path_for(dir.path(), "alpha").exists());
         assert!(cfg.db_path_for(dir.path(), "beta").exists());
@@ -29637,7 +29638,7 @@ tier = "private"
         let report = status::check_status(dir.path()).unwrap();
         assert!(matches!(report.index, status::IndexStatus::Stale { .. }));
 
-        cmd_status(dir.path(), true, true, false, false, false, false).unwrap();
+        cmd_status(dir.path(), false, false, true, false, false, false, false).unwrap();
 
         let report = status::check_status(dir.path()).unwrap();
         assert!(matches!(report.index, status::IndexStatus::Fresh { .. }));
@@ -29649,7 +29650,7 @@ tier = "private"
         let db_path = dir.path().join(".tsift/index.db");
         let _lock = hold_wal_database_lock(&db_path);
 
-        cmd_status(dir.path(), false, true, false, false, false, false).unwrap();
+        cmd_status(dir.path(), false, false, true, false, false, false, false).unwrap();
 
         let report = status::check_status(dir.path()).unwrap();
         assert!(matches!(

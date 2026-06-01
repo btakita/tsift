@@ -364,7 +364,8 @@ tsift search <query>            # lexical by default; gains AST-aware ranking wh
 tsift search --exact <query>    # literal text lookup via `rg -F`
 tsift search --autoindex <query> # explicit compatibility flag: build/rebuild before search
 tsift search --scope <submod>   # restrict to one submodule's index + lexical root
-tsift status --fix              # refresh stale/missing indexes and tsift instructions, then report status
+tsift status              # auto-fixes stale indexes by default, then reports status
+tsift status --no-fix     # skip auto-fix, report status only
 tsift index --submodule <submod> # unknown/ambiguous workspace scopes fail closed
 tsift search --strategy hybrid  # opt-in to slower hybrid BM25 + vector search
 tsift search --timeout 60       # custom timeout in seconds (default: 30, 0 = no timeout)
@@ -1196,19 +1197,19 @@ The opening marker embeds the tsift version (`v=X.Y.Z`) that generated it. When 
 - Pre-versioned markers (no `v=` attribute) are treated as stale
 
 This ensures agent sessions always use instructions matching the installed binary.
-Release-bump regressions are covered through the compiled CLI path: a stale Code Navigation marker from the previous binary version must be rewritten by `tsift status --fix --json`, and the final JSON report must show `instructions.state=current` for the installed version.
+Release-bump regressions are covered through the compiled CLI path: a stale Code Navigation marker from the previous binary version must be rewritten by `tsift status --json`, and the final JSON report must show `instructions.state=current` for the installed version.
 
 ## Status (Session Health Check)
 
- `tsift status` reports index freshness, instruction version, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session. When the input path is a nested subdirectory, `status` first promotes it to the nearest ancestor that already owns `.tsift/` so the check reuses the existing project/workspace state, but it stops at a nested git root before considering parent `.tsift/` directories and ignores ambient system-temp-root project markers for child temp dirs so unrelated temp or parent workspaces cannot capture a child repo. On workspace roots, it treats scoped indexes under `.tsift/indexes/<scope>/index.db` as the authoritative status surface even if a shared `.tsift/index.db` also exists. If one or more configured workspace scopes are present on disk but their scoped `index.db` files are missing, the CLI auto-builds just those missing scoped indexes before it prints the final status so a partially initialized workspace does not stay stuck at `index: missing` / `stale` after a successful status pass. `tsift status --json` automatically applies the same safe local fixes as `--fix` when the index or instructions are stale, so agents calling `status --json` always receive a fresh report without needing a separate `--fix` invocation. `tsift status --fix` additionally applies the safe local fixes behind the `run:` recommendation: refresh stale or missing indexes, rebuild all existing workspace scopes when the workspace index is stale, refresh stale/missing Code Navigation instructions via `tsift init`, and then print the final status. When status recommends `tsift summarize --extract ...`, that extract scope is derived from the indexed layout: it uses the common indexed root (for example `src/` when every tracked file or scope lives under `src/`) and falls back to `.` when the indexed files span the project root or multiple unrelated workspace roots.
+ `tsift status` reports index freshness, instruction version, summary cache availability, and a machine-parseable `use:` list so the agent knows which tsift commands are worth calling this session. When the input path is a nested subdirectory, `status` first promotes it to the nearest ancestor that already owns `.tsift/` so the check reuses the existing project/workspace state, but it stops at a nested git root before considering parent `.tsift/` directories and ignores ambient system-temp-root project markers for child temp dirs so unrelated temp or parent workspaces cannot capture a child repo. On workspace roots, it treats scoped indexes under `.tsift/indexes/<scope>/index.db` as the authoritative status surface even if a shared `.tsift/index.db` also exists. If one or more configured workspace scopes are present on disk but their scoped `index.db` files are missing, the CLI auto-builds just those missing scoped indexes before it prints the final status so a partially initialized workspace does not stay stuck at `index: missing` / `stale` after a successful status pass. `tsift status` automatically applies safe local fixes when the index or instructions are stale: refresh stale or missing indexes, rebuild all existing workspace scopes when the workspace index is stale, refresh stale/missing Code Navigation instructions via `tsift init`, and then print the final status. Use `--no-fix` to skip auto-fix and report raw status. The deprecated `--fix` flag still works but is a no-op since auto-fix is now the default. When status recommends `tsift summarize --extract ...`, that extract scope is derived from the indexed layout: it uses the common indexed root (for example `src/` when every tracked file or scope lives under `src/`) and falls back to `.` when the indexed files span the project root or multiple unrelated workspace roots.
 
 When the index is stale, `status` also emits a lightweight `reminders` list in JSON and a matching human `reminders:` section. The reminder repeats the concrete reindex command, includes the stale-file or missing-scope count, and notes when no summary cache is available so agents know to refresh the index before relying on search/explain/graph and to run `tsift summarize --extract <scope>` after the index is fresh when summary refs are needed.
 
 ```bash
-tsift status            # human-readable output
-tsift status --json     # structured JSON output (auto-fixes stale index/instructions)
+tsift status            # auto-fixes stale index/instructions by default, human-readable output
+tsift status --json     # structured JSON output (also auto-fixes by default)
 tsift status <path>     # check a specific codebase directory
-tsift status --fix      # apply safe local index/instruction refreshes before reporting
+tsift status --no-fix   # skip auto-fix, report raw status
 ```
 
 ### Output
