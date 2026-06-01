@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use lazily::{Context as LazyContext, SlotHandle};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
@@ -216,8 +217,16 @@ pub struct TerseGraphSubgraph {
 impl From<GraphSubgraph> for TerseGraphSubgraph {
     fn from(subgraph: GraphSubgraph) -> Self {
         Self {
-            nodes: subgraph.nodes.into_iter().map(TerseGraphNode::from).collect(),
-            edges: subgraph.edges.into_iter().map(TerseGraphEdge::from).collect(),
+            nodes: subgraph
+                .nodes
+                .into_iter()
+                .map(TerseGraphNode::from)
+                .collect(),
+            edges: subgraph
+                .edges
+                .into_iter()
+                .map(TerseGraphEdge::from)
+                .collect(),
         }
     }
 }
@@ -426,10 +435,102 @@ fn compute_neighborhood_score(
         NeighborhoodScoring::DegreeWeighted => {
             let depth_score = (120i64.saturating_sub((depth as i64).saturating_mul(18))).max(0);
             let degree = degree_map.values().copied().max().unwrap_or(1) as i64;
-            let degree_bonus = if degree <= 3 { 20 } else if degree <= 10 { 10 } else { 0 };
+            let degree_bonus = if degree <= 3 {
+                20
+            } else if degree <= 10 {
+                10
+            } else {
+                0
+            };
             depth_score.saturating_add(degree_bonus)
         }
     }
+}
+
+#[derive(Clone)]
+struct NeighborhoodLayerState {
+    nodes: BTreeMap<String, GraphNode>,
+    edges: BTreeMap<(String, String, String), GraphEdge>,
+    frontier: Vec<String>,
+}
+
+#[derive(Clone)]
+struct NeighborhoodFetchedLayer {
+    edges: Vec<GraphEdge>,
+    nodes: Vec<GraphNode>,
+}
+
+#[derive(Clone)]
+struct RankedNeighborhoodLayerState {
+    nodes: BTreeMap<String, GraphNode>,
+    edges: BTreeMap<(String, String, String), GraphEdge>,
+    queue: BinaryHeap<ScoredQueueEntry>,
+    seen: BTreeSet<String>,
+    pruned_count: usize,
+    total_discovered: usize,
+    degree_map: BTreeMap<String, usize>,
+}
+
+#[derive(Clone)]
+struct RankedNeighborhoodFetchedExpansion {
+    edges: Vec<GraphEdge>,
+    neighbor_nodes: BTreeMap<String, GraphNode>,
+}
+
+fn graph_cache_error(message: String) -> anyhow::Error {
+    anyhow::anyhow!("{message}")
+}
+
+fn fetch_neighborhood_layer<S: GraphStore + ?Sized>(
+    store: &S,
+    frontier: &[String],
+    known_nodes: &BTreeMap<String, GraphNode>,
+    kind: Option<&str>,
+) -> Result<NeighborhoodFetchedLayer> {
+    let mut edges = Vec::new();
+    let mut missing_ids = Vec::new();
+    for current in frontier {
+        let outgoing = store.outgoing_edges(current, kind)?;
+        for edge in outgoing {
+            if !known_nodes.contains_key(&edge.to_id) {
+                missing_ids.push(edge.to_id.clone());
+            }
+            edges.push(edge);
+        }
+    }
+    missing_ids.sort();
+    missing_ids.dedup();
+    let mut nodes = Vec::new();
+    for id in missing_ids {
+        if !known_nodes.contains_key(&id)
+            && let Some(node) = store.node(&id)?
+        {
+            nodes.push(node);
+        }
+    }
+    Ok(NeighborhoodFetchedLayer { edges, nodes })
+}
+
+fn fetch_ranked_neighborhood_expansion<S: GraphStore + ?Sized>(
+    store: &S,
+    entry: &ScoredQueueEntry,
+    state: &RankedNeighborhoodLayerState,
+    kind: Option<&str>,
+) -> Result<RankedNeighborhoodFetchedExpansion> {
+    let edges = store.outgoing_edges(&entry.id, kind)?;
+    let mut neighbor_nodes = BTreeMap::new();
+    for edge in &edges {
+        if state.seen.contains(&edge.to_id) {
+            continue;
+        }
+        if let Some(node) = store.node(&edge.to_id)? {
+            neighbor_nodes.insert(edge.to_id.clone(), node);
+        }
+    }
+    Ok(RankedNeighborhoodFetchedExpansion {
+        edges,
+        neighbor_nodes,
+    })
 }
 
 fn edge_kind_weighted_score(edge_kind: &str) -> i64 {
@@ -718,41 +819,44 @@ pub trait GraphStore {
         let Some(center) = self.node(center_id)? else {
             return Ok(None);
         };
-        let mut nodes = BTreeMap::from([(center_id.to_string(), center)]);
-        let mut edges = BTreeMap::<(String, String, String), GraphEdge>::new();
-        let mut queue = VecDeque::from([(center_id.to_string(), 0usize)]);
+        let ctx = LazyContext::new();
+        let initial = NeighborhoodLayerState {
+            nodes: BTreeMap::from([(center_id.to_string(), center)]),
+            edges: BTreeMap::new(),
+            frontier: vec![center_id.to_string()],
+        };
+        let mut layer: SlotHandle<std::result::Result<NeighborhoodLayerState, String>> =
+            ctx.slot(move |_| Ok(initial.clone()));
+        let mut state = ctx.get(&layer).map_err(graph_cache_error)?;
 
-        while let Some((current, current_depth)) = queue.pop_front() {
-            if current_depth >= depth {
-                continue;
+        for _ in 0..depth {
+            if state.frontier.is_empty() {
+                break;
             }
-            let outgoing = self.outgoing_edges(&current, kind)?;
-            let mut missing_ids = Vec::new();
-            for edge in &outgoing {
-                let edge_key = (edge.from_id.clone(), edge.kind.clone(), edge.to_id.clone());
-                edges.entry(edge_key).or_insert_with(|| edge.clone());
-                if !nodes.contains_key(&edge.to_id) {
-                    missing_ids.push(edge.to_id.clone());
+            let fetched = fetch_neighborhood_layer(self, &state.frontier, &state.nodes, kind)?;
+            let previous = layer;
+            layer = ctx.slot(move |ctx| {
+                let mut state = ctx.get(&previous)?;
+                for edge in &fetched.edges {
+                    let edge_key = (edge.from_id.clone(), edge.kind.clone(), edge.to_id.clone());
+                    state.edges.entry(edge_key).or_insert_with(|| edge.clone());
                 }
-            }
-            if !missing_ids.is_empty() {
-                missing_ids.sort();
-                missing_ids.dedup();
-                for id in &missing_ids {
-                    if !nodes.contains_key(id)
-                        && let Some(node) = self.node(id)?
-                    {
-                        nodes.insert(id.clone(), node);
-                        queue.push_back((id.clone(), current_depth + 1));
+                state.frontier.clear();
+                for node in &fetched.nodes {
+                    if !state.nodes.contains_key(&node.id) {
+                        state.frontier.push(node.id.clone());
+                        state.nodes.insert(node.id.clone(), node.clone());
                     }
                 }
-            }
+                Ok(state)
+            });
+            state = ctx.get(&layer).map_err(graph_cache_error)?;
         }
 
         Ok(Some(
             GraphSubgraph {
-                nodes: nodes.into_values().collect(),
-                edges: edges.into_values().collect(),
+                nodes: state.nodes.into_values().collect(),
+                edges: state.edges.into_values().collect(),
             }
             .sorted(),
         ))
@@ -788,64 +892,92 @@ pub trait GraphStore {
         let Some(center) = self.node(center_id)? else {
             return Ok(None);
         };
-        let mut nodes = BTreeMap::from([(center_id.to_string(), center)]);
-        let mut edges = BTreeMap::<(String, String, String), GraphEdge>::new();
-        let mut queue = BinaryHeap::from([ScoredQueueEntry {
-            id: center_id.to_string(),
-            depth: 0usize,
-            score: i64::MAX,
-        }]);
-        let mut seen = BTreeSet::from([center_id.to_string()]);
-        let mut pruned_count = 0usize;
-        let mut total_discovered = 1usize;
-        let mut degree_map: BTreeMap<String, usize> = BTreeMap::new();
+        let ctx = LazyContext::new();
+        let initial = RankedNeighborhoodLayerState {
+            nodes: BTreeMap::from([(center_id.to_string(), center)]),
+            edges: BTreeMap::new(),
+            queue: BinaryHeap::from([ScoredQueueEntry {
+                id: center_id.to_string(),
+                depth: 0usize,
+                score: i64::MAX,
+            }]),
+            seen: BTreeSet::from([center_id.to_string()]),
+            pruned_count: 0,
+            total_discovered: 1,
+            degree_map: BTreeMap::new(),
+        };
+        let mut layer: SlotHandle<std::result::Result<RankedNeighborhoodLayerState, String>> =
+            ctx.slot(move |_| Ok(initial.clone()));
+        let mut state = ctx.get(&layer).map_err(graph_cache_error)?;
+        let options = options.clone();
 
-        while let Some(entry) = queue.pop() {
-            if entry.depth >= options.depth {
-                continue;
-            }
-            let outgoing = self.outgoing_edges(&entry.id, options.edge_kind.as_deref())?;
-            for edge in &outgoing {
-                let edge_key = (edge.from_id.clone(), edge.kind.clone(), edge.to_id.clone());
-                edges.entry(edge_key).or_insert_with(|| edge.clone());
-                *degree_map.entry(edge.from_id.clone()).or_default() += 1;
-                *degree_map.entry(edge.to_id.clone()).or_default() += 1;
-                if seen.contains(&edge.to_id) {
-                    continue;
-                }
-                seen.insert(edge.to_id.clone());
-                total_discovered += 1;
-                let Some(neighbor) = self.node(&edge.to_id)? else {
-                    continue;
+        while let Some(entry) = state.queue.peek().cloned() {
+            let fetched = if entry.depth < options.depth {
+                Some(fetch_ranked_neighborhood_expansion(
+                    self,
+                    &entry,
+                    &state,
+                    options.edge_kind.as_deref(),
+                )?)
+            } else {
+                None
+            };
+            let previous = layer;
+            let options = options.clone();
+            layer = ctx.slot(move |ctx| {
+                let mut state = ctx.get(&previous)?;
+                let Some(entry) = state.queue.pop() else {
+                    return Ok(state);
                 };
-                if nodes.len() > options.max_nodes {
-                    pruned_count += 1;
-                    continue;
+                let Some(fetched) = &fetched else {
+                    return Ok(state);
+                };
+                for edge in &fetched.edges {
+                    let edge_key = (edge.from_id.clone(), edge.kind.clone(), edge.to_id.clone());
+                    state.edges.entry(edge_key).or_insert_with(|| edge.clone());
+                    *state.degree_map.entry(edge.from_id.clone()).or_default() += 1;
+                    *state.degree_map.entry(edge.to_id.clone()).or_default() += 1;
+                    if state.seen.contains(&edge.to_id) {
+                        continue;
+                    }
+                    state.seen.insert(edge.to_id.clone());
+                    state.total_discovered += 1;
+                    let Some(neighbor) = fetched.neighbor_nodes.get(&edge.to_id) else {
+                        continue;
+                    };
+                    if state.nodes.len() > options.max_nodes {
+                        state.pruned_count += 1;
+                        continue;
+                    }
+                    let score = compute_neighborhood_score(
+                        &options.scoring,
+                        entry.depth + 1,
+                        &edge.kind,
+                        neighbor,
+                        &state.degree_map,
+                    );
+                    state.nodes.insert(edge.to_id.clone(), neighbor.clone());
+                    state.queue.push(ScoredQueueEntry {
+                        id: edge.to_id.clone(),
+                        depth: entry.depth + 1,
+                        score,
+                    });
                 }
-                let score = compute_neighborhood_score(
-                    &options.scoring,
-                    entry.depth + 1,
-                    &edge.kind,
-                    &neighbor,
-                    &degree_map,
-                );
-                nodes.insert(edge.to_id.clone(), neighbor.clone());
-                queue.push(ScoredQueueEntry {
-                    id: edge.to_id.clone(),
-                    depth: entry.depth + 1,
-                    score,
-                });
-            }
+                Ok(state)
+            });
+            state = ctx.get(&layer).map_err(graph_cache_error)?;
         }
 
-        let node_ids: BTreeSet<_> = nodes.keys().cloned().collect();
-        edges.retain(|_, edge| node_ids.contains(&edge.from_id) && node_ids.contains(&edge.to_id));
+        let node_ids: BTreeSet<_> = state.nodes.keys().cloned().collect();
+        state
+            .edges
+            .retain(|_, edge| node_ids.contains(&edge.from_id) && node_ids.contains(&edge.to_id));
 
         Ok(Some(RankedNeighborhoodResult {
-            nodes: nodes.into_values().collect(),
-            edges: edges.into_values().collect(),
-            pruned_count,
-            total_discovered,
+            nodes: state.nodes.into_values().collect(),
+            edges: state.edges.into_values().collect(),
+            pruned_count: state.pruned_count,
+            total_discovered: state.total_discovered,
         }))
     }
     fn reachable_nodes_by_kind(
@@ -1639,8 +1771,9 @@ mod tests {
                     .with_provenance(GraphProvenance::new("src", "a.rs")),
                 GraphNode::new("b", "fn", "beta"),
             ],
-            edges: vec![GraphEdge::new("a", "b", "calls")
-                .with_freshness(GraphFreshness::content_hash("h"))],
+            edges: vec![
+                GraphEdge::new("a", "b", "calls").with_freshness(GraphFreshness::content_hash("h")),
+            ],
         }
         .sorted();
         let terse = TerseGraphSubgraph::from(subgraph);
@@ -1676,17 +1809,35 @@ mod tests {
     #[test]
     fn ranked_neighborhood_breadth_first_respects_max_nodes() {
         let store = ConvexGraphStore::new(MemoryConvexGraphClient::default());
-        store.upsert_node(&GraphNode::new("a", "file", "a")).unwrap();
-        store.upsert_node(&GraphNode::new("b", "symbol", "b")).unwrap();
-        store.upsert_node(&GraphNode::new("c", "symbol", "c")).unwrap();
-        store.upsert_node(&GraphNode::new("d", "symbol", "d")).unwrap();
-        store.upsert_edge(&GraphEdge::new("a", "b", "calls")).unwrap();
-        store.upsert_edge(&GraphEdge::new("a", "c", "calls")).unwrap();
-        store.upsert_edge(&GraphEdge::new("a", "d", "calls")).unwrap();
+        store
+            .upsert_node(&GraphNode::new("a", "file", "a"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("b", "symbol", "b"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("c", "symbol", "c"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("d", "symbol", "d"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("a", "b", "calls"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("a", "c", "calls"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("a", "d", "calls"))
+            .unwrap();
 
         let options = RankedNeighborhoodOptions::new(2, 2);
         let result = store.ranked_neighborhood("a", &options).unwrap().unwrap();
-        assert!(result.nodes.len() <= 3, "center + max 2 neighbors, got {}", result.nodes.len());
+        assert!(
+            result.nodes.len() <= 3,
+            "center + max 2 neighbors, got {}",
+            result.nodes.len()
+        );
         assert!(result.pruned_count > 0, "should have pruned some nodes");
         assert!(result.total_discovered >= 4);
     }
@@ -1694,11 +1845,21 @@ mod tests {
     #[test]
     fn ranked_neighborhood_edge_kind_weighted_prefers_high_score_edges() {
         let store = ConvexGraphStore::new(MemoryConvexGraphClient::default());
-        store.upsert_node(&GraphNode::new("a", "file", "a")).unwrap();
-        store.upsert_node(&GraphNode::new("b", "symbol", "b")).unwrap();
-        store.upsert_node(&GraphNode::new("c", "symbol", "c")).unwrap();
-        store.upsert_edge(&GraphEdge::new("a", "b", "semantic_relation")).unwrap();
-        store.upsert_edge(&GraphEdge::new("a", "c", "unknown")).unwrap();
+        store
+            .upsert_node(&GraphNode::new("a", "file", "a"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("b", "symbol", "b"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("c", "symbol", "c"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("a", "b", "semantic_relation"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("a", "c", "unknown"))
+            .unwrap();
 
         let options = RankedNeighborhoodOptions::new(1, 1)
             .with_scoring(NeighborhoodScoring::EdgeKindWeighted);
@@ -1713,12 +1874,21 @@ mod tests {
     #[test]
     fn ranked_neighborhood_includes_center_node() {
         let store = ConvexGraphStore::new(MemoryConvexGraphClient::default());
-        store.upsert_node(&GraphNode::new("center", "file", "center")).unwrap();
-        store.upsert_node(&GraphNode::new("neighbor", "symbol", "neighbor")).unwrap();
-        store.upsert_edge(&GraphEdge::new("center", "neighbor", "calls")).unwrap();
+        store
+            .upsert_node(&GraphNode::new("center", "file", "center"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("neighbor", "symbol", "neighbor"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("center", "neighbor", "calls"))
+            .unwrap();
 
         let options = RankedNeighborhoodOptions::new(1, 10);
-        let result = store.ranked_neighborhood("center", &options).unwrap().unwrap();
+        let result = store
+            .ranked_neighborhood("center", &options)
+            .unwrap()
+            .unwrap();
         let ids: Vec<_> = result.nodes.iter().map(|n| n.id.clone()).collect();
         assert!(ids.contains(&"center".to_string()));
         assert!(ids.contains(&"neighbor".to_string()));
@@ -1728,14 +1898,23 @@ mod tests {
     #[test]
     fn ranked_neighborhood_edge_kind_filter() {
         let store = ConvexGraphStore::new(MemoryConvexGraphClient::default());
-        store.upsert_node(&GraphNode::new("a", "file", "a")).unwrap();
-        store.upsert_node(&GraphNode::new("b", "symbol", "b")).unwrap();
-        store.upsert_node(&GraphNode::new("c", "symbol", "c")).unwrap();
-        store.upsert_edge(&GraphEdge::new("a", "b", "calls")).unwrap();
-        store.upsert_edge(&GraphEdge::new("a", "c", "mentions")).unwrap();
+        store
+            .upsert_node(&GraphNode::new("a", "file", "a"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("b", "symbol", "b"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("c", "symbol", "c"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("a", "b", "calls"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("a", "c", "mentions"))
+            .unwrap();
 
-        let options = RankedNeighborhoodOptions::new(1, 10)
-            .with_edge_kind("calls");
+        let options = RankedNeighborhoodOptions::new(1, 10).with_edge_kind("calls");
         let result = store.ranked_neighborhood("a", &options).unwrap().unwrap();
         let ids: Vec<_> = result.nodes.iter().map(|n| n.id.as_str()).collect();
         assert!(ids.contains(&"b"));
@@ -1745,18 +1924,36 @@ mod tests {
     #[test]
     fn ranked_neighborhood_degree_weighted_prefers_low_degree() {
         let store = ConvexGraphStore::new(MemoryConvexGraphClient::default());
-        store.upsert_node(&GraphNode::new("a", "file", "a")).unwrap();
-        store.upsert_node(&GraphNode::new("b", "symbol", "b")).unwrap();
-        store.upsert_node(&GraphNode::new("c", "symbol", "c")).unwrap();
-        store.upsert_node(&GraphNode::new("d", "symbol", "d")).unwrap();
-        store.upsert_node(&GraphNode::new("e", "symbol", "e")).unwrap();
-        store.upsert_edge(&GraphEdge::new("a", "b", "calls")).unwrap();
-        store.upsert_edge(&GraphEdge::new("b", "c", "calls")).unwrap();
-        store.upsert_edge(&GraphEdge::new("b", "d", "calls")).unwrap();
-        store.upsert_edge(&GraphEdge::new("b", "e", "calls")).unwrap();
+        store
+            .upsert_node(&GraphNode::new("a", "file", "a"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("b", "symbol", "b"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("c", "symbol", "c"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("d", "symbol", "d"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("e", "symbol", "e"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("a", "b", "calls"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("b", "c", "calls"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("b", "d", "calls"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("b", "e", "calls"))
+            .unwrap();
 
-        let options = RankedNeighborhoodOptions::new(2, 3)
-            .with_scoring(NeighborhoodScoring::DegreeWeighted);
+        let options =
+            RankedNeighborhoodOptions::new(2, 3).with_scoring(NeighborhoodScoring::DegreeWeighted);
         let result = store.ranked_neighborhood("a", &options).unwrap().unwrap();
         assert!(result.nodes.len() <= 4);
     }
