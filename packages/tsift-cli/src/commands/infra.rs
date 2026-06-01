@@ -1204,6 +1204,15 @@ pub(crate) fn cmd_graph_db(
     }
 }
 
+fn status_index_needs_auto_fix(report: &status::StatusReport) -> bool {
+    match &report.index {
+        status::IndexStatus::Fresh { .. } => false,
+        status::IndexStatus::Stale { recovery: None, .. } => true,
+        status::IndexStatus::Stale { recovery: Some(_), .. } => false,
+        status::IndexStatus::Missing { .. } => true,
+    }
+}
+
 pub(crate) fn cmd_status(
     path: &std::path::Path,
     fix: bool,
@@ -1219,7 +1228,7 @@ pub(crate) fn cmd_status(
         autoindex_missing_workspace_scopes(&root, &report)?;
         report = status::check_status(&root)?;
     }
-    if fix {
+    if fix || (json_output && status_index_needs_auto_fix(&report)) {
         apply_status_fixes(&root, &report)?;
         report = status::check_status(&root)?;
         if status_missing_workspace_scopes(&report) {

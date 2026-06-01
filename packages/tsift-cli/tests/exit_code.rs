@@ -3200,6 +3200,42 @@ fn status_fix_refreshes_stale_instructions_after_version_bump_in_json() {
 }
 
 #[test]
+fn status_json_auto_fixes_stale_index_without_fix_flag() {
+    let dir = indexed_cli_fixture();
+    std::thread::sleep(Duration::from_millis(50));
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn helper() { println!(\"updated\"); }\nfn main() { helper(); Vec::new(); }\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["status", "--json", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"state\":\"fresh\""),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"state\":\"stale\""),
+        "stdout was: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("status fix: refreshing index"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
 fn status_autoindexes_missing_workspace_scopes_even_when_root_index_exists_in_json() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
