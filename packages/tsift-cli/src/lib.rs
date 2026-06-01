@@ -21,7 +21,7 @@ use commands::index_search::cmd_search;
 use commands::index_search::{cmd_index, cmd_search_with_budget, cmd_search_worker};
 use commands::infra::{
     cmd_convex_sync, cmd_edit, cmd_graph_db, cmd_init, cmd_locks, cmd_rewrite, cmd_route, cmd_sql,
-    cmd_status,
+    cmd_status, StatusCommandOptions,
 };
 use commands::memory::cmd_memory;
 use commands::quality::{cmd_audit, cmd_audit_tagpath, cmd_lint};
@@ -1097,13 +1097,15 @@ pub fn run() -> Result<()> {
         ),
         Some(Commands::Status { path, fix, no_fix, json }) => cmd_status(
             &path,
-            fix,
-            no_fix,
-            json || terse || schema || envelope,
-            compact,
-            pretty,
-            terse,
-            schema,
+            StatusCommandOptions {
+                fix,
+                no_fix,
+                json_output: json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                schema,
+            },
         ),
         Some(Commands::Locks { path, scope, json }) => cmd_locks(
             &path,
@@ -29605,7 +29607,19 @@ tier = "private"
         let beta_db_path = cfg.db_path_for(dir.path(), "beta");
         assert!(!beta_db_path.exists());
 
-        cmd_status(dir.path(), false, false, true, false, false, false, false).unwrap();
+        cmd_status(
+            dir.path(),
+            StatusCommandOptions {
+                fix: false,
+                no_fix: false,
+                json_output: true,
+                compact: false,
+                pretty: false,
+                terse: false,
+                schema: false,
+            },
+        )
+        .unwrap();
 
         assert!(beta_db_path.exists());
         let report = status::check_status(dir.path()).unwrap();
@@ -29617,7 +29631,19 @@ tier = "private"
         let dir = setup_workspace();
         let cfg = config::Config::load(dir.path()).unwrap();
 
-        cmd_status(dir.path(), false, false, true, false, false, false, false).unwrap();
+        cmd_status(
+            dir.path(),
+            StatusCommandOptions {
+                fix: false,
+                no_fix: false,
+                json_output: true,
+                compact: false,
+                pretty: false,
+                terse: false,
+                schema: false,
+            },
+        )
+        .unwrap();
 
         assert!(cfg.db_path_for(dir.path(), "alpha").exists());
         assert!(cfg.db_path_for(dir.path(), "beta").exists());
@@ -29638,7 +29664,19 @@ tier = "private"
         let report = status::check_status(dir.path()).unwrap();
         assert!(matches!(report.index, status::IndexStatus::Stale { .. }));
 
-        cmd_status(dir.path(), false, false, true, false, false, false, false).unwrap();
+        cmd_status(
+            dir.path(),
+            StatusCommandOptions {
+                fix: false,
+                no_fix: false,
+                json_output: true,
+                compact: false,
+                pretty: false,
+                terse: false,
+                schema: false,
+            },
+        )
+        .unwrap();
 
         let report = status::check_status(dir.path()).unwrap();
         assert!(matches!(report.index, status::IndexStatus::Fresh { .. }));
@@ -29650,7 +29688,19 @@ tier = "private"
         let db_path = dir.path().join(".tsift/index.db");
         let _lock = hold_wal_database_lock(&db_path);
 
-        cmd_status(dir.path(), false, false, true, false, false, false, false).unwrap();
+        cmd_status(
+            dir.path(),
+            StatusCommandOptions {
+                fix: false,
+                no_fix: false,
+                json_output: true,
+                compact: false,
+                pretty: false,
+                terse: false,
+                schema: false,
+            },
+        )
+        .unwrap();
 
         let report = status::check_status(dir.path()).unwrap();
         assert!(matches!(

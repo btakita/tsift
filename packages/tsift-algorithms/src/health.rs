@@ -68,12 +68,12 @@ pub fn terse_health_report(edges: &[(String, String)], n: usize) -> TerseHealthR
         };
     }
 
-    let fwd_sccs = compute_sccs(node_count, &out_adj);
-    let bwd_sccs = compute_sccs(node_count, &in_adj);
-    let cycle_nodes = find_cycles_from_sccs(&out_adj, &fwd_sccs);
+    let fwd_sccs = compute_sccs(node_count, out_adj);
+    let bwd_sccs = compute_sccs(node_count, in_adj);
+    let cycle_nodes = find_cycles_from_sccs(out_adj, &fwd_sccs);
 
-    let fwd_reach = compute_reachability_with_sccs(node_count, &out_adj, &fwd_sccs);
-    let bwd_reach = compute_reachability_with_sccs(node_count, &in_adj, &bwd_sccs);
+    let fwd_reach = compute_reachability_with_sccs(node_count, out_adj, &fwd_sccs);
+    let bwd_reach = compute_reachability_with_sccs(node_count, in_adj, &bwd_sccs);
 
     let total_possible = (node_count - 1).max(1) as f64;
     let total_degree: f64 = out_adj.iter().map(|s| s.len()).sum::<usize>() as f64;
@@ -186,67 +186,68 @@ fn compute_reachability_with_sccs(
 }
 
 fn compute_sccs(n: usize, adj: &[HashSet<usize>]) -> Vec<Vec<usize>> {
-    let mut index = 0usize;
-    let mut stack = Vec::new();
-    let mut on_stack = vec![false; n];
-    let mut indices = vec![None::<usize>; n];
-    let mut lowlinks = vec![0usize; n];
-    let mut components: Vec<Vec<usize>> = Vec::new();
+    struct Tarjan<'a> {
+        adj: &'a [HashSet<usize>],
+        index: usize,
+        stack: Vec<usize>,
+        on_stack: Vec<bool>,
+        indices: Vec<Option<usize>>,
+        lowlinks: Vec<usize>,
+        components: Vec<Vec<usize>>,
+    }
 
-    fn strongconnect(
-        v: usize,
-        adj: &[HashSet<usize>],
-        index: &mut usize,
-        stack: &mut Vec<usize>,
-        on_stack: &mut Vec<bool>,
-        indices: &mut Vec<Option<usize>>,
-        lowlinks: &mut Vec<usize>,
-        components: &mut Vec<Vec<usize>>,
-    ) {
-        indices[v] = Some(*index);
-        lowlinks[v] = *index;
-        *index += 1;
-        stack.push(v);
-        on_stack[v] = true;
-
-        for &w in &adj[v] {
-            if indices[w].is_none() {
-                strongconnect(w, adj, index, stack, on_stack, indices, lowlinks, components);
-            }
-            if on_stack[w] {
-                lowlinks[v] = lowlinks[v].min(indices[w].unwrap());
+    impl<'a> Tarjan<'a> {
+        fn new(n: usize, adj: &'a [HashSet<usize>]) -> Self {
+            Self {
+                adj,
+                index: 0,
+                stack: Vec::new(),
+                on_stack: vec![false; n],
+                indices: vec![None; n],
+                lowlinks: vec![0; n],
+                components: Vec::new(),
             }
         }
 
-        if indices[v] == Some(lowlinks[v]) {
-            let mut component = Vec::new();
-            loop {
-                let w = stack.pop().unwrap();
-                on_stack[w] = false;
-                component.push(w);
-                if w == v {
-                    break;
+        fn strongconnect(&mut self, v: usize) {
+            self.indices[v] = Some(self.index);
+            self.lowlinks[v] = self.index;
+            self.index += 1;
+            self.stack.push(v);
+            self.on_stack[v] = true;
+
+            let neighbors: Vec<usize> = self.adj[v].iter().copied().collect();
+            for w in neighbors {
+                if self.indices[w].is_none() {
+                    self.strongconnect(w);
+                }
+                if self.on_stack[w] {
+                    self.lowlinks[v] = self.lowlinks[v].min(self.indices[w].unwrap());
                 }
             }
-            components.push(component);
+
+            if self.indices[v] == Some(self.lowlinks[v]) {
+                let mut component = Vec::new();
+                loop {
+                    let w = self.stack.pop().unwrap();
+                    self.on_stack[w] = false;
+                    component.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                self.components.push(component);
+            }
         }
     }
 
+    let mut tarjan = Tarjan::new(n, adj);
     for v in 0..n {
-        if indices[v].is_none() {
-            strongconnect(
-                v,
-                adj,
-                &mut index,
-                &mut stack,
-                &mut on_stack,
-                &mut indices,
-                &mut lowlinks,
-                &mut components,
-            );
+        if tarjan.indices[v].is_none() {
+            tarjan.strongconnect(v);
         }
     }
-    components
+    tarjan.components
 }
 
 fn find_cycles_from_sccs(adj: &[HashSet<usize>], sccs: &[Vec<usize>]) -> HashSet<usize> {
@@ -298,12 +299,12 @@ pub fn composite_health_score(edges: &[(String, String)]) -> HealthReport {
         };
     }
 
-    let fwd_sccs = compute_sccs(n, &out_adj);
-    let bwd_sccs = compute_sccs(n, &in_adj);
-    let cycle_nodes = find_cycles_from_sccs(&out_adj, &fwd_sccs);
+    let fwd_sccs = compute_sccs(n, out_adj);
+    let bwd_sccs = compute_sccs(n, in_adj);
+    let cycle_nodes = find_cycles_from_sccs(out_adj, &fwd_sccs);
 
-    let fwd_reach = compute_reachability_with_sccs(n, &out_adj, &fwd_sccs);
-    let bwd_reach = compute_reachability_with_sccs(n, &in_adj, &bwd_sccs);
+    let fwd_reach = compute_reachability_with_sccs(n, out_adj, &fwd_sccs);
+    let bwd_reach = compute_reachability_with_sccs(n, in_adj, &bwd_sccs);
 
     let total_possible = (n - 1).max(1) as f64;
     let total_degree: f64 = out_adj.iter().map(|s| s.len()).sum::<usize>() as f64;

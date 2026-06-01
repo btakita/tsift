@@ -1213,38 +1213,49 @@ fn status_index_needs_auto_fix(report: &status::StatusReport) -> bool {
     }
 }
 
+pub(crate) struct StatusCommandOptions {
+    pub fix: bool,
+    pub no_fix: bool,
+    pub json_output: bool,
+    pub compact: bool,
+    pub pretty: bool,
+    pub terse: bool,
+    pub schema: bool,
+}
+
 pub(crate) fn cmd_status(
     path: &std::path::Path,
-    fix: bool,
-    no_fix: bool,
-    json_output: bool,
-    compact: bool,
-    pretty: bool,
-    terse: bool,
-    schema: bool,
+    options: StatusCommandOptions,
 ) -> Result<()> {
-    if fix {
+    if options.fix {
         eprintln!("warning: --fix is deprecated; auto-fix is now the default. Use --no-fix to skip.");
     }
-    let auto_fix = !no_fix;
+    let auto_fix = !options.no_fix;
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    let mut report = status::check_status(&root)?;
+    let status_cache = status::StatusCheckCache::new();
+    let mut report = status::check_status_with_cache(&root, &status_cache)?;
     if status_missing_workspace_scopes(&report) {
         autoindex_missing_workspace_scopes(&root, &report)?;
-        report = status::check_status(&root)?;
+        status_cache.invalidate_all();
+        report = status::check_status_with_cache(&root, &status_cache)?;
     }
     if auto_fix && status_index_needs_auto_fix(&report) {
         apply_status_fixes(&root, &report)?;
-        report = status::check_status(&root)?;
+        status_cache.invalidate_all();
+        report = status::check_status_with_cache(&root, &status_cache)?;
         if status_missing_workspace_scopes(&report) {
             autoindex_missing_workspace_scopes(&root, &report)?;
-            report = status::check_status(&root)?;
+            status_cache.invalidate_all();
+            report = status::check_status_with_cache(&root, &status_cache)?;
         }
     }
-    if json_output {
-        println!("{}", to_json_schema(&report, pretty, terse, false, schema)?);
+    if options.json_output {
+        println!(
+            "{}",
+            to_json_schema(&report, options.pretty, options.terse, false, options.schema)?
+        );
     } else {
-        print!("{}", status::format_human(&report, compact));
+        print!("{}", status::format_human(&report, options.compact));
     }
     Ok(())
 }

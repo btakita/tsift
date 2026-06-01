@@ -350,10 +350,10 @@ impl Sift {
     fn load_or_build_token_index(&self, root: &Path) -> Result<TokenIndex> {
         if let Some(cache_dir) = &self.cache_dir {
             let index_path = cache_dir.join("token-index.json");
-            if index_path.exists() {
-                if let Ok(index) = TokenIndex::load(&index_path) {
-                    return Ok(index);
-                }
+            if index_path.exists()
+                && let Ok(index) = TokenIndex::load(&index_path)
+            {
+                return Ok(index);
             }
             let index = TokenIndex::build(root)?;
             let _ = index.save(&index_path);

@@ -1,15 +1,89 @@
 use anyhow::Result;
+use lazily::{CellHandle, Context as LazyContext, SlotHandle};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tsift_index::config;
-use tsift_index::index::{IndexDb, WriterLockProbe, probe_writer_lock, writer_lock_path};
+use tsift_index::index::{
+    IndexDb, ReadOnlyInspectResult, WriterLockProbe, probe_writer_lock, writer_lock_path,
+};
 use tsift_index::init::{self, InstructionStatus};
 use tsift_sqlite::{
     ReadOnlyRecovery, rollback_journal_path, shared_memory_sidecar_path, wal_sidecar_path,
 };
 use tsift_summarize::summarize::SummaryDb;
+
+type CachedInspectResult = std::result::Result<ReadOnlyInspectResult, String>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StatusInspectKey {
+    db_path: PathBuf,
+    root: PathBuf,
+    prune: bool,
+}
+
+pub struct StatusCheckCache {
+    ctx: LazyContext,
+    epoch: CellHandle<u64>,
+    inspect_slots: RefCell<HashMap<StatusInspectKey, SlotHandle<CachedInspectResult>>>,
+}
+
+impl Default for StatusCheckCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StatusCheckCache {
+    pub fn new() -> Self {
+        let ctx = LazyContext::new();
+        let epoch = ctx.cell(0u64);
+        Self {
+            ctx,
+            epoch,
+            inspect_slots: RefCell::new(HashMap::new()),
+        }
+    }
+
+    pub fn invalidate_all(&self) {
+        let epoch = self.ctx.get_cell(&self.epoch);
+        self.ctx.set_cell(&self.epoch, epoch.wrapping_add(1));
+    }
+
+    fn inspect_read_only(
+        &self,
+        db_path: &Path,
+        root: &Path,
+        prune: bool,
+    ) -> Result<ReadOnlyInspectResult> {
+        let key = StatusInspectKey {
+            db_path: db_path.to_path_buf(),
+            root: root.to_path_buf(),
+            prune,
+        };
+        let slot = {
+            let mut slots = self.inspect_slots.borrow_mut();
+            if let Some(slot) = slots.get(&key) {
+                *slot
+            } else {
+                let slot_key = key.clone();
+                let epoch = self.epoch;
+                let slot = self.ctx.slot(move |ctx| {
+                    let _epoch = ctx.get_cell(&epoch);
+                    IndexDb::inspect_read_only(&slot_key.db_path, &slot_key.root, slot_key.prune)
+                        .map_err(|err| format!("{err:#}"))
+                });
+                slots.insert(key, slot);
+                slot
+            }
+        };
+        self.ctx
+            .get(&slot)
+            .map_err(|message| anyhow::anyhow!("{message}"))
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub struct StatusReport {
@@ -129,12 +203,17 @@ pub struct SidecarStatus {
 }
 
 pub fn check_status(root: &Path) -> Result<StatusReport> {
+    let cache = StatusCheckCache::new();
+    check_status_with_cache(root, &cache)
+}
+
+pub fn check_status_with_cache(root: &Path, cache: &StatusCheckCache) -> Result<StatusReport> {
     let workspace_scopes = config::Config::submodule_dirs(root)?;
     let workspace = !workspace_scopes.is_empty();
     let summaries_db_path = root.join(".tsift/summaries.db");
 
-    let index = check_index(root)?;
-    let summaries = check_summaries(root, &summaries_db_path, &index)?;
+    let index = check_index(root, cache)?;
+    let summaries = check_summaries(root, &summaries_db_path, &index, cache)?;
     let summarize_extract = recommended_summarize_extract_path(root, &index, &workspace_scopes);
     let instructions = init::check_instruction_version(root);
     let recommendations = build_recommendations(
@@ -155,18 +234,18 @@ pub fn check_status(root: &Path) -> Result<StatusReport> {
     })
 }
 
-fn check_index(root: &Path) -> Result<IndexStatus> {
+fn check_index(root: &Path, cache: &StatusCheckCache) -> Result<IndexStatus> {
     if !config::Config::submodule_dirs(root)?.is_empty() {
-        return check_workspace_index(root);
+        return check_workspace_index(root, cache);
     }
 
-    check_single_index(root)
+    check_single_index(root, cache)
 }
 
-fn check_single_index(root: &Path) -> Result<IndexStatus> {
+fn check_single_index(root: &Path, cache: &StatusCheckCache) -> Result<IndexStatus> {
     let db_path = root.join(".tsift/index.db");
     if !db_path.exists() {
-        return check_workspace_index(root);
+        return check_workspace_index(root, cache);
     }
 
     let last_indexed_secs_ago = db_path
@@ -177,7 +256,7 @@ fn check_single_index(root: &Path) -> Result<IndexStatus> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let inspection = IndexDb::inspect_read_only(&db_path, root, false)?;
+    let inspection = cache.inspect_read_only(&db_path, root, false)?;
     let stale_files =
         inspection.summary.new + inspection.summary.modified + inspection.summary.deleted;
 
@@ -202,7 +281,7 @@ fn check_single_index(root: &Path) -> Result<IndexStatus> {
     }
 }
 
-fn check_workspace_index(root: &Path) -> Result<IndexStatus> {
+fn check_workspace_index(root: &Path, cache: &StatusCheckCache) -> Result<IndexStatus> {
     let cfg = config::Config::load(root)?;
     let mut scopes = Vec::new();
     let mut missing_scopes = Vec::new();
@@ -223,7 +302,7 @@ fn check_workspace_index(root: &Path) -> Result<IndexStatus> {
             .and_then(|t| SystemTime::now().duration_since(t).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let inspection = IndexDb::inspect_read_only(&db_path, &scope.source_root, false)?;
+        let inspection = cache.inspect_read_only(&db_path, &scope.source_root, false)?;
         let stale_files =
             inspection.summary.new + inspection.summary.modified + inspection.summary.deleted;
         scopes.push(WorkspaceScopeStatus {
@@ -318,7 +397,12 @@ pub fn check_locks(
     })
 }
 
-fn check_summaries(root: &Path, db_path: &Path, index: &IndexStatus) -> Result<SummaryStatus> {
+fn check_summaries(
+    root: &Path,
+    db_path: &Path,
+    index: &IndexStatus,
+    cache: &StatusCheckCache,
+) -> Result<SummaryStatus> {
     if matches!(index, IndexStatus::Missing { .. }) {
         return Ok(SummaryStatus::Unavailable);
     }
@@ -330,7 +414,7 @@ fn check_summaries(root: &Path, db_path: &Path, index: &IndexStatus) -> Result<S
     let recovery = read_only.recovery;
     let db = read_only.db;
     let cached_summary_paths = db.cached_file_paths()?.into_iter().collect::<HashSet<_>>();
-    let live_indexed_files = live_indexed_summary_paths(root, index)?;
+    let live_indexed_files = live_indexed_summary_paths(root, index, cache)?;
     let total_indexed_files = live_indexed_files.len();
     let cached_files = cached_summary_paths
         .intersection(&live_indexed_files)
@@ -354,7 +438,11 @@ fn check_summaries(root: &Path, db_path: &Path, index: &IndexStatus) -> Result<S
     })
 }
 
-fn live_indexed_summary_paths(root: &Path, index: &IndexStatus) -> Result<HashSet<String>> {
+fn live_indexed_summary_paths(
+    root: &Path,
+    index: &IndexStatus,
+    cache: &StatusCheckCache,
+) -> Result<HashSet<String>> {
     match index {
         IndexStatus::Fresh {
             workspace_scopes, ..
@@ -363,11 +451,29 @@ fn live_indexed_summary_paths(root: &Path, index: &IndexStatus) -> Result<HashSe
             workspace_scopes, ..
         } => {
             if workspace_scopes.is_empty() {
-                tracked_summary_paths_from_index(&root.join(".tsift/index.db"), root)
+                tracked_summary_paths_from_inspection(
+                    cache,
+                    &root.join(".tsift/index.db"),
+                    root,
+                    root,
+                )
             } else {
                 let mut paths = HashSet::new();
+                let source_roots = config::Config::submodule_dirs(root)?
+                    .into_iter()
+                    .map(|scope| (scope.id, scope.source_root))
+                    .collect::<HashMap<_, _>>();
                 for scope in workspace_scopes {
-                    paths.extend(tracked_summary_paths_from_index(&scope.db_path, root)?);
+                    let source_root = source_roots
+                        .get(&scope.scope)
+                        .map(PathBuf::as_path)
+                        .unwrap_or(root);
+                    paths.extend(tracked_summary_paths_from_inspection(
+                        cache,
+                        &scope.db_path,
+                        root,
+                        source_root,
+                    )?);
                 }
                 Ok(paths)
             }
@@ -376,14 +482,20 @@ fn live_indexed_summary_paths(root: &Path, index: &IndexStatus) -> Result<HashSe
     }
 }
 
-fn tracked_summary_paths_from_index(db_path: &Path, root: &Path) -> Result<HashSet<String>> {
-    let tracked = IndexDb::file_paths_read_only(db_path)?;
-    Ok(tracked
+fn tracked_summary_paths_from_inspection(
+    cache: &StatusCheckCache,
+    db_path: &Path,
+    report_root: &Path,
+    inspect_root: &Path,
+) -> Result<HashSet<String>> {
+    let inspection = cache.inspect_read_only(db_path, inspect_root, false)?;
+    Ok(inspection
+        .tracked_file_paths
         .into_iter()
         .map(PathBuf::from)
         .filter(|path| path.is_file())
         .map(|path| {
-            path.strip_prefix(root)
+            path.strip_prefix(report_root)
                 .unwrap_or(path.as_path())
                 .to_string_lossy()
                 .to_string()
@@ -1258,6 +1370,40 @@ mod tests {
             report.recommendations.run.as_deref(),
             Some("tsift init && tsift summarize --extract .")
         );
+    }
+
+    #[test]
+    fn status_cache_reuses_index_inspection_until_invalidated() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let db_path = dir.path().join(".tsift/index.db");
+        let db = IndexDb::open(&db_path).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+        drop(db);
+
+        let cache = StatusCheckCache::new();
+        let report = check_status_with_cache(dir.path(), &cache).unwrap();
+        assert!(matches!(
+            report.index,
+            IndexStatus::Fresh { recovery: None, .. }
+        ));
+
+        let _lock = hold_wal_lock(&db_path);
+        let cached_report = check_status_with_cache(dir.path(), &cache).unwrap();
+        assert!(matches!(
+            cached_report.index,
+            IndexStatus::Fresh { recovery: None, .. }
+        ));
+
+        cache.invalidate_all();
+        let refreshed_report = check_status_with_cache(dir.path(), &cache).unwrap();
+        assert!(matches!(
+            refreshed_report.index,
+            IndexStatus::Fresh {
+                recovery: Some(ReadOnlyRecovery::SnapshotFallbackWal),
+                ..
+            }
+        ));
     }
 
     #[test]

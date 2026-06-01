@@ -300,6 +300,7 @@ impl IndexSummary {
 pub struct ReadOnlyInspectResult {
     pub total_files: usize,
     pub summary: IndexSummary,
+    pub tracked_file_paths: Vec<String>,
     pub recovery: Option<ReadOnlyRecovery>,
 }
 
@@ -560,9 +561,11 @@ impl IndexDb {
                 } else {
                     db.compute_changes(root)?
                 };
+                let tracked_file_paths = db.file_paths()?;
                 ReadOnlyInspectResult {
                     total_files,
                     summary,
+                    tracked_file_paths,
                     recovery: Some(recovery),
                 }
             }
@@ -583,9 +586,11 @@ impl IndexDb {
         } else {
             db.compute_changes(root)?
         };
+        let tracked_file_paths = db.file_paths()?;
         Ok(ReadOnlyInspectResult {
             total_files,
             summary,
+            tracked_file_paths,
             recovery: None,
         })
     }
