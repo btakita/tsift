@@ -13,6 +13,8 @@ publish = true
 
 [dependencies]
 anyhow = "1"
+blake3 = "1"
+lazily = "0.2"
 serde = { version = "1", features = ["derive"] }
 tsift-core = { path = "../tsift-core", version = "0.1.62" }
 tree-sitter = "0.26"

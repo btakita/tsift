@@ -911,6 +911,7 @@ impl IndexDb {
                 "INSERT INTO route_nodes (framework, method, route_path, handler_name, file, line, handler_line) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
             )?;
             let mut warnings = Vec::new();
+            let resolve_edges_cache = graph::ResolveEdgesCache::new();
 
             for change in &summary.changes {
                 let path_str = change.path.to_string_lossy();
@@ -980,7 +981,14 @@ impl IndexDb {
                                     IndexWarningStage::ExtractCallSites,
                                 );
                                 if let (Some(sites), Some(symbols)) = (call_sites, &symbols) {
-                                    let edges = graph::resolve_edges(symbols, &sites);
+                                    let content_hash = graph::source_content_hash(source);
+                                    let edges = resolve_edges_cache.resolve_edges_for_file(
+                                        &change.path,
+                                        &content_hash,
+                                        graph::FileMtime::new(secs, nanos),
+                                        symbols,
+                                        &sites,
+                                    );
                                     for edge in &edges {
                                         insert_edge.execute(rusqlite::params![
                                             &path_str,

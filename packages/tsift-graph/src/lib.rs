@@ -1,7 +1,9 @@
 use anyhow::Result;
+use lazily::{CellHandle, Context as LazyContext, SlotHandle};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 use tsift_core::{GraphEdge, GraphNode, GraphProjection, GraphProvenance};
 
@@ -23,6 +25,99 @@ pub struct CallEdge {
     pub callee: String,
     pub caller_line: usize,
     pub call_site_line: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileMtime {
+    pub secs: i64,
+    pub nanos: u32,
+}
+
+impl FileMtime {
+    pub fn new(secs: i64, nanos: u32) -> Self {
+        Self { secs, nanos }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ResolveEdgesKey {
+    file: PathBuf,
+    content_hash: String,
+}
+
+#[derive(Clone, Copy)]
+struct ResolveEdgesSlot {
+    mtime: CellHandle<FileMtime>,
+    edges: SlotHandle<Vec<CallEdge>>,
+}
+
+pub struct ResolveEdgesCache {
+    ctx: LazyContext,
+    slots: RefCell<HashMap<ResolveEdgesKey, ResolveEdgesSlot>>,
+    hits: Cell<usize>,
+    misses: Cell<usize>,
+}
+
+impl Default for ResolveEdgesCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResolveEdgesCache {
+    pub fn new() -> Self {
+        Self {
+            ctx: LazyContext::new(),
+            slots: RefCell::new(HashMap::new()),
+            hits: Cell::new(0),
+            misses: Cell::new(0),
+        }
+    }
+
+    pub fn resolve_edges_for_file(
+        &self,
+        file: &Path,
+        content_hash: &str,
+        mtime: FileMtime,
+        symbols: &[Symbol],
+        call_sites: &[CallSite],
+    ) -> Vec<CallEdge> {
+        let key = ResolveEdgesKey {
+            file: file.to_path_buf(),
+            content_hash: content_hash.to_string(),
+        };
+        let slot = {
+            let mut slots = self.slots.borrow_mut();
+            if let Some(slot) = slots.get(&key) {
+                self.ctx.set_cell(&slot.mtime, mtime);
+                *slot
+            } else {
+                let mtime_cell = self.ctx.cell(mtime);
+                let symbols = symbols.to_vec();
+                let call_sites = call_sites.to_vec();
+                let edges = self.ctx.slot(move |ctx| {
+                    let _mtime = ctx.get_cell(&mtime_cell);
+                    resolve_edges_uncached(&symbols, &call_sites)
+                });
+                let slot = ResolveEdgesSlot {
+                    mtime: mtime_cell,
+                    edges,
+                };
+                slots.insert(key, slot);
+                slot
+            }
+        };
+        if self.ctx.is_set(&slot.edges) {
+            self.hits.set(self.hits.get() + 1);
+        } else {
+            self.misses.set(self.misses.get() + 1);
+        }
+        self.ctx.get(&slot.edges)
+    }
+
+    pub fn stats(&self) -> (usize, usize) {
+        (self.hits.get(), self.misses.get())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +176,10 @@ pub fn extract_call_sites(lang: Lang, source: &[u8]) -> Result<Vec<CallSite>> {
         }
     }
     Ok(sites)
+}
+
+pub fn source_content_hash(source: &[u8]) -> String {
+    blake3::hash(source).to_hex().to_string()
 }
 
 pub fn extract_route_sites(lang: Lang, source: &[u8]) -> Result<Vec<RouteSite>> {
@@ -414,6 +513,10 @@ fn extract_typescript_routes(text: &str) -> Vec<RouteSite> {
 }
 
 pub fn resolve_edges(symbols: &[Symbol], call_sites: &[CallSite]) -> Vec<CallEdge> {
+    resolve_edges_uncached(symbols, call_sites)
+}
+
+fn resolve_edges_uncached(symbols: &[Symbol], call_sites: &[CallSite]) -> Vec<CallEdge> {
     let mut edges = Vec::new();
     for site in call_sites {
         let caller = symbols
@@ -1256,6 +1359,42 @@ function createUser() {}
         }];
         let edges = resolve_edges(&symbols, &sites);
         assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn resolve_edges_cache_reuses_slots_until_mtime_or_hash_changes() {
+        let cache = ResolveEdgesCache::new();
+        let file = std::path::Path::new("src/lib.rs");
+        let symbols = vec![Symbol {
+            name: "main".into(),
+            kind: "function".into(),
+            line: 1,
+            end_line: 3,
+        }];
+        let sites = vec![CallSite {
+            callee: "helper".into(),
+            line: 2,
+        }];
+
+        let first =
+            cache.resolve_edges_for_file(file, "hash-a", FileMtime::new(10, 0), &symbols, &sites);
+        assert_eq!(first.len(), 1);
+        assert_eq!(cache.stats(), (0, 1));
+
+        let cached =
+            cache.resolve_edges_for_file(file, "hash-a", FileMtime::new(10, 0), &symbols, &sites);
+        assert_eq!(cached, first);
+        assert_eq!(cache.stats(), (1, 1));
+
+        let refreshed =
+            cache.resolve_edges_for_file(file, "hash-a", FileMtime::new(11, 0), &symbols, &sites);
+        assert_eq!(refreshed, first);
+        assert_eq!(cache.stats(), (1, 2));
+
+        let new_hash =
+            cache.resolve_edges_for_file(file, "hash-b", FileMtime::new(11, 0), &symbols, &sites);
+        assert_eq!(new_hash, first);
+        assert_eq!(cache.stats(), (1, 3));
     }
 
     #[test]

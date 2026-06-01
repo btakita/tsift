@@ -2836,6 +2836,8 @@ name = "tsift-graph"
 version = "0.1.62"
 dependencies = [
  "anyhow",
+ "blake3",
+ "lazily",
  "serde",
  "tree-sitter",
  "tree-sitter-bash",
