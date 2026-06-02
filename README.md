@@ -33,6 +33,7 @@ tsift --envelope search "route dispatch" --budget normal
 tsift --envelope source-read src/main.rs --start 1 --lines 120 --budget normal
 tsift --envelope symbol-read main --file src/main.rs --budget normal
 tsift --envelope edit-intents --path . --budget normal < intents.json
+tsift --envelope edit-intents --path . --apply --budget normal < intents.json
 tsift diff-digest .
 tsift --envelope session-review tasks/software/tsift.md --next-context --budget normal
 tsift graph-db --path . --json refresh

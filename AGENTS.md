@@ -6,6 +6,7 @@ Run `tsift status` at session start from the owning repo root. If the task or fi
 Use the commands listed in its `use:` output:
 - `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)
 - `tsift --envelope symbol-read <symbol> --budget normal` — token-budgeted symbol body, child refs, and graph/source expansion commands
+- `tsift --envelope edit-intents --path . --budget normal` — semantic edit dry-run plans; add `--apply` for supported, conflict-free Rust intents with formatting and rollback
 - `tsift --envelope explain <symbol> --budget normal` — callers, callees, community preview
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)

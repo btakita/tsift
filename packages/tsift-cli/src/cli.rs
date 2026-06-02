@@ -142,7 +142,7 @@ pub enum Commands {
         #[arg(short, long)]
         file: Option<PathBuf>,
     },
-    /// Validate semantic AST edit intents and emit a dry-run execution plan
+    /// Validate semantic AST edit intents and optionally apply supported edits
     EditIntents {
         /// Path to the indexed codebase (defaults to current directory)
         #[arg(long, default_value = ".")]
@@ -156,6 +156,9 @@ pub enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Apply supported, conflict-free semantic edit intents
+        #[arg(long)]
+        apply: bool,
         /// Preview-mode item cap for planned intents
         #[arg(long)]
         max_items: Option<usize>,

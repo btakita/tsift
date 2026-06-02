@@ -2766,7 +2766,11 @@ fn edit_intents_json_validates_semantic_write_plan_without_mutating() {
             .starts_with("eintent-")
     );
     assert_eq!(json["report"]["plans"][0]["target_symbol"]["name"], "alpha");
-    assert_eq!(json["report"]["plans"][0]["apply_supported"], false);
+    assert_eq!(json["report"]["applied_total"], 0);
+    assert_eq!(json["report"]["formatted_total"], 0);
+    assert_eq!(json["report"]["plans"][0]["apply_supported"], true);
+    assert_eq!(json["report"]["plans"][0]["applied"], false);
+    assert!(json["report"]["plans"][0]["diff"].as_str().unwrap().contains("alpha_renamed"));
     assert!(
         json["follow_up"]
             .as_array()
@@ -2774,6 +2778,178 @@ fn edit_intents_json_validates_semantic_write_plan_without_mutating() {
             .iter()
             .any(|cmd| cmd.as_str().unwrap().contains("tsift source-read"))
     );
+}
+
+#[test]
+fn edit_intents_apply_formats_and_mutates_supported_rust_intents() {
+    let dir = indexed_cli_fixture();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "insert_import",
+                "file": "main.rs",
+                "replacement": "std::fmt"
+            },
+            {
+                "kind": "rename_symbol",
+                "symbol": "alpha",
+                "file": "main.rs",
+                "new_name": "alpha_renamed"
+            },
+            {
+                "kind": "replace_function_body",
+                "symbol": "beta",
+                "file": "main.rs",
+                "replacement": "gamma();"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--apply",
+            "--budget",
+            "normal",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "edit-intents --apply stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "edit-intents");
+    assert_eq!(json["view"], "apply");
+    assert_eq!(json["report"]["mode"], "apply");
+    assert_eq!(json["report"]["planned_total"], 3);
+    assert_eq!(json["report"]["applied_total"], 3);
+    assert_eq!(json["report"]["formatted_total"], 1);
+    assert!(json["report"]["plans"].as_array().unwrap().iter().all(|plan| {
+        plan["status"] == "applied"
+            && plan["applied"] == true
+            && plan["formatter"] == "rustfmt --edition 2024"
+    }));
+
+    let source = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    assert!(source.contains("use std::fmt;"), "{source}");
+    assert!(source.contains("fn alpha_renamed()"), "{source}");
+    assert!(source.contains("alpha_renamed();"), "{source}");
+    assert!(source.contains("fn beta() {\n    gamma();\n}"), "{source}");
+}
+
+#[test]
+fn edit_intents_apply_refuses_stale_hash_without_mutating() {
+    let dir = indexed_cli_fixture();
+    let before = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "rename_symbol",
+                "symbol": "alpha",
+                "file": "main.rs",
+                "new_name": "alpha_renamed",
+                "expected_content_hash": "stale"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success(), "stale hash apply should fail");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+        before
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("conflict"), "stderr was: {stderr}");
+}
+
+#[test]
+fn edit_intents_apply_formats_before_write_and_leaves_source_on_formatter_failure() {
+    let dir = indexed_cli_fixture();
+    let before = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "replace_function_body",
+                "symbol": "beta",
+                "file": "main.rs",
+                "replacement": "let broken = ;"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success(), "formatter failure should fail");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+        before
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("rustfmt rejected"), "stderr was: {stderr}");
 }
 
 #[test]

@@ -365,6 +365,7 @@ tsift --envelope source-read src/main.rs --start 1 --lines 80 --budget normal # 
 tsift --envelope symbol-read <symbol> --file src/main.rs --budget normal # bounded symbol body packet with child refs and graph/source expansion commands
 tsift edit < edits.json         # staged multi-file search/replace batch
 tsift --envelope edit-intents --path . --budget normal < intents.json # validate semantic AST edit intents and emit dry-run execution plans
+tsift --envelope edit-intents --path . --apply --budget normal < intents.json # apply supported, conflict-free Rust semantic edit intents with formatting and rollback
 tsift audit                     # scan installed skills, check health
 tsift audit --manifest <file>   # compare against expected skill list
 tsift summarize <symbol>        # cached LLM summary for a symbol
@@ -471,7 +472,7 @@ The command still returns the source preview when index or summary stores are mi
 
 `source-read` symbol refs now expand to `symbol-read`, while `symbol-read` preserves `explain` and graph commands as secondary expansion links. This makes whole-file `Read` fallback unnecessary for the normal search -> source window -> symbol body navigation path.
 
-`tsift edit-intents` is the semantic write-planning surface. It accepts JSON `{ "intents": [...] }` batches with normalized intent kinds `rename_symbol`, `replace_function_body`, `insert_import`, `add_method`, `update_call_signature`, `move_declaration`, and `rewrite_call_sites`. The command resolves symbol/file targets against the current index, reports the current content hash and target line range, detects optional `expected_content_hash` conflicts, and emits dry-run plans without mutating files. Actual AST mutation remains disabled until per-language executors can prove formatting, conflict detection, rollback, and conformance coverage.
+`tsift edit-intents` is the semantic write-planning and guarded write-executor surface. It accepts JSON `{ "intents": [...] }` batches with normalized intent kinds `rename_symbol`, `replace_function_body`, `insert_import`, `add_method`, `update_call_signature`, `move_declaration`, and `rewrite_call_sites`. The command resolves symbol/file targets against the current index, reports the current content hash and target line range, detects optional `expected_content_hash` conflicts, and emits dry-run plans with bounded diff previews by default. With `--apply`, supported Rust intents (`rename_symbol`, `replace_function_body`, `insert_import`) are composed per file, formatted through `rustfmt --edition 2024` before any source file is swapped, and committed through the same backup/rollback atomic edit path as `tsift edit`. Conflicts, unsupported intent kinds, unsupported languages, and formatter failures fail closed before mutation.
 
 ## Handle-Preserving Search Workflow
 
@@ -1215,6 +1216,7 @@ Run `tsift status` at session start from the owning repo root. If the task or fi
 Use the commands listed in its `use:` output:
 - `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)
 - `tsift --envelope symbol-read <symbol> --budget normal` — token-budgeted symbol body, child refs, and graph/source expansion commands
+- `tsift --envelope edit-intents --path . --budget normal` — semantic edit dry-run plans; add `--apply` for supported, conflict-free Rust intents with formatting and rollback
 - `tsift --envelope explain <symbol> --budget normal` — callers, callees, community preview
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)

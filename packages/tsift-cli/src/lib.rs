@@ -58,7 +58,7 @@ use substrate::{
     SqliteGraphStore, SqliteProjectionRefresh,
 };
 use tagpath::{family as tagpath_family, ontology as tagpath_ontology};
-use tempfile::NamedTempFile;
+use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 #[cfg(test)]
 use tsift_agent_doc::session_cost;
 use tsift_agent_doc::{session_digest, session_review};
@@ -303,11 +303,16 @@ struct SemanticEditIntentPlan {
     kind: String,
     status: String,
     apply_supported: bool,
+    applied: bool,
     target_symbol: Option<SemanticEditSymbolTarget>,
     target_file: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_range: Option<SourceRangePreview>,
     content_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    formatter: Option<String>,
     message: String,
 }
 
@@ -328,11 +333,19 @@ struct SemanticEditIntentReport {
     mode: String,
     intents_total: usize,
     planned_total: usize,
+    applied_total: usize,
     conflict_total: usize,
     unsupported_total: usize,
+    formatted_total: usize,
     plans: Vec<SemanticEditIntentPlan>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     warnings: Vec<String>,
+}
+
+struct SemanticEditIntentDraft {
+    plan: SemanticEditIntentPlan,
+    file_abs: PathBuf,
+    language: String,
 }
 
 #[derive(Deserialize)]
@@ -499,6 +512,7 @@ pub fn run() -> Result<()> {
             scope,
             file,
             json,
+            apply,
             max_items,
             max_bytes,
             budget,
@@ -506,6 +520,7 @@ pub fn run() -> Result<()> {
             &path,
             scope.as_deref(),
             file,
+            apply,
             OutputFormat {
                 json_output: json || terse || schema || envelope,
                 compact,
@@ -3780,7 +3795,11 @@ fn semantic_edit_kind_requires_symbol(kind: &str) -> bool {
 fn semantic_edit_kind_requires_replacement(kind: &str) -> bool {
     matches!(
         kind,
-        "replace_function_body" | "insert_import" | "add_method" | "update_call_signature"
+        "replace_function_body"
+            | "insert_import"
+            | "add_method"
+            | "update_call_signature"
+            | "rewrite_call_sites"
     )
 }
 
@@ -3868,13 +3887,365 @@ fn semantic_edit_content_hash(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+fn semantic_edit_language_for_file(file_abs: &Path) -> String {
+    match file_abs.extension().and_then(|value| value.to_str()) {
+        Some("rs") => "rust".to_string(),
+        Some("ts") | Some("tsx") => "typescript".to_string(),
+        Some("js") | Some("jsx") => "javascript".to_string(),
+        Some(ext) => ext.to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+fn semantic_edit_target_language(
+    target_symbol: Option<&SemanticEditSymbolTarget>,
+    file_abs: &Path,
+) -> String {
+    target_symbol
+        .map(|symbol| symbol.language.clone())
+        .unwrap_or_else(|| semantic_edit_language_for_file(file_abs))
+}
+
+fn semantic_edit_is_rust(language: &str, file_abs: &Path) -> bool {
+    language.eq_ignore_ascii_case("rust") || file_abs.extension().is_some_and(|ext| ext == "rs")
+}
+
+fn rust_ident_char(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn validate_rust_identifier(name: &str, field: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        bail!("{field} must not be empty");
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) || !chars.all(rust_ident_char) {
+        bail!("{field} {name:?} is not a supported Rust identifier");
+    }
+    Ok(())
+}
+
+fn replace_rust_identifier(content: &str, old: &str, new: &str) -> Result<(String, usize)> {
+    validate_rust_identifier(old, "symbol")?;
+    validate_rust_identifier(new, "new_name")?;
+    if old == new {
+        bail!("old and new identifiers are identical");
+    }
+
+    let mut out = String::with_capacity(content.len());
+    let mut last = 0;
+    let mut replacements = 0;
+    for (idx, _) in content.match_indices(old) {
+        let before_is_ident = content[..idx]
+            .chars()
+            .next_back()
+            .is_some_and(rust_ident_char);
+        let after_idx = idx + old.len();
+        let after_is_ident = content[after_idx..]
+            .chars()
+            .next()
+            .is_some_and(rust_ident_char);
+        if before_is_ident || after_is_ident {
+            continue;
+        }
+        out.push_str(&content[last..idx]);
+        out.push_str(new);
+        last = after_idx;
+        replacements += 1;
+    }
+    if replacements == 0 {
+        bail!("identifier {old:?} was not found as a whole Rust identifier");
+    }
+    out.push_str(&content[last..]);
+    Ok((out, replacements))
+}
+
+fn line_indent_at(content: &str, idx: usize) -> String {
+    let line_start = content[..idx].rfind('\n').map(|pos| pos + 1).unwrap_or(0);
+    content[line_start..]
+        .chars()
+        .take_while(|ch| matches!(ch, ' ' | '\t'))
+        .collect()
+}
+
+fn find_matching_rust_brace(content: &str, open_idx: usize) -> Result<usize> {
+    let mut depth = 0usize;
+    for (idx, ch) in content[open_idx..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Ok(open_idx + idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    bail!("could not find matching Rust function body brace")
+}
+
+fn find_rust_function_open_brace(content: &str, name: &str) -> Result<usize> {
+    validate_rust_identifier(name, "symbol")?;
+    let needle = format!("fn {name}");
+    let mut search_start = 0;
+    while let Some(relative) = content[search_start..].find(&needle) {
+        let start = search_start + relative;
+        let name_end = start + needle.len();
+        let after_name_is_ident = content[name_end..]
+            .chars()
+            .next()
+            .is_some_and(rust_ident_char);
+        if !after_name_is_ident && let Some(brace_relative) = content[name_end..].find('{') {
+            return Ok(name_end + brace_relative);
+        }
+        search_start = name_end;
+    }
+    bail!("could not find Rust function {name:?}")
+}
+
+fn rust_function_body_replacement(replacement: &str, base_indent: &str) -> String {
+    let body_indent = format!("{base_indent}    ");
+    let trimmed = replacement.trim_matches('\n');
+    if trimmed.trim().is_empty() {
+        return format!("\n{base_indent}");
+    }
+
+    let mut body = String::new();
+    body.push('\n');
+    for line in trimmed.lines() {
+        if line.trim().is_empty() {
+            body.push('\n');
+        } else {
+            body.push_str(&body_indent);
+            body.push_str(line.trim());
+            body.push('\n');
+        }
+    }
+    body.push_str(base_indent);
+    body
+}
+
+fn replace_rust_function_body(
+    content: &str,
+    name: &str,
+    replacement: &str,
+) -> Result<(String, usize)> {
+    let open_idx = find_rust_function_open_brace(content, name)?;
+    let close_idx = find_matching_rust_brace(content, open_idx)?;
+    let base_indent = line_indent_at(content, open_idx);
+    let mut out = String::with_capacity(content.len() + replacement.len());
+    out.push_str(&content[..=open_idx]);
+    out.push_str(&rust_function_body_replacement(replacement, &base_indent));
+    out.push_str(&content[close_idx..]);
+    Ok((out, 1))
+}
+
+fn normalize_rust_import(replacement: &str) -> Result<String> {
+    let trimmed = replacement.trim();
+    if trimmed.is_empty() {
+        bail!("insert_import requires a non-empty replacement");
+    }
+    let mut import = if trimmed.starts_with("use ")
+        || trimmed.starts_with("pub use ")
+        || trimmed.starts_with("extern crate ")
+    {
+        trimmed.to_string()
+    } else {
+        format!("use {trimmed}")
+    };
+    if !import.ends_with(';') {
+        import.push(';');
+    }
+    Ok(import)
+}
+
+fn insert_rust_import(content: &str, replacement: &str) -> Result<(String, usize)> {
+    let import = normalize_rust_import(replacement)?;
+    if content.lines().any(|line| line.trim() == import) {
+        return Ok((content.to_string(), 0));
+    }
+
+    let mut offset = 0usize;
+    let mut insert_at = 0usize;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with("use ")
+            || trimmed.starts_with("pub use ")
+            || trimmed.starts_with("extern crate ")
+            || (insert_at == 0 && (trimmed.is_empty() || trimmed.starts_with("#!")))
+        {
+            insert_at = offset + line.len();
+            offset += line.len();
+            continue;
+        }
+        break;
+    }
+
+    let mut out = String::with_capacity(content.len() + import.len() + 1);
+    out.push_str(&content[..insert_at]);
+    out.push_str(&import);
+    out.push('\n');
+    out.push_str(&content[insert_at..]);
+    Ok((out, 1))
+}
+
+fn target_symbol_name<'a>(
+    target_symbol: Option<&'a SemanticEditSymbolTarget>,
+    kind: &str,
+) -> Result<&'a str> {
+    target_symbol
+        .map(|symbol| symbol.name.as_str())
+        .with_context(|| format!("semantic edit kind {kind:?} requires a resolved target symbol"))
+}
+
+fn preview_semantic_edit_content(
+    content: &str,
+    file_abs: &Path,
+    language: &str,
+    kind: &str,
+    intent: &SemanticEditIntent,
+    target_symbol: Option<&SemanticEditSymbolTarget>,
+) -> Result<(String, usize)> {
+    if !semantic_edit_is_rust(language, file_abs) {
+        bail!("no executor registered for language {language:?}");
+    }
+
+    match kind {
+        "rename_symbol" => replace_rust_identifier(
+            content,
+            target_symbol_name(target_symbol, kind)?,
+            intent
+                .new_name
+                .as_deref()
+                .context("rename_symbol requires new_name")?,
+        ),
+        "replace_function_body" => replace_rust_function_body(
+            content,
+            target_symbol_name(target_symbol, kind)?,
+            intent
+                .replacement
+                .as_deref()
+                .context("replace_function_body requires replacement")?,
+        ),
+        "insert_import" => insert_rust_import(
+            content,
+            intent
+                .replacement
+                .as_deref()
+                .context("insert_import requires replacement")?,
+        ),
+        _ => bail!("semantic edit kind {kind:?} is not supported by the Rust executor yet"),
+    }
+}
+
+fn semantic_edit_diff_preview(before: &str, after: &str, budget: ResponseBudget) -> Option<String> {
+    if before == after {
+        return None;
+    }
+
+    let before_lines = before.lines().collect::<Vec<_>>();
+    let after_lines = after.lines().collect::<Vec<_>>();
+    let mut prefix = 0usize;
+    while prefix < before_lines.len()
+        && prefix < after_lines.len()
+        && before_lines[prefix] == after_lines[prefix]
+    {
+        prefix += 1;
+    }
+
+    let mut suffix = 0usize;
+    while suffix < before_lines.len().saturating_sub(prefix)
+        && suffix < after_lines.len().saturating_sub(prefix)
+        && before_lines[before_lines.len() - 1 - suffix]
+            == after_lines[after_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let before_start = prefix.saturating_sub(2);
+    let after_start = before_start;
+    let before_end = before_lines.len().saturating_sub(suffix).min(prefix + 8);
+    let after_end = after_lines.len().saturating_sub(suffix).min(prefix + 8);
+    let mut lines = vec![
+        "--- before".to_string(),
+        "+++ after".to_string(),
+        format!(
+            "@@ -{},{} +{},{} @@",
+            before_start + 1,
+            before_end.saturating_sub(before_start),
+            after_start + 1,
+            after_end.saturating_sub(after_start)
+        ),
+    ];
+    for line in &before_lines[before_start..prefix] {
+        lines.push(format!(" {line}"));
+    }
+    for line in &before_lines[prefix..before_end] {
+        lines.push(format!("-{line}"));
+    }
+    for line in &after_lines[prefix..after_end] {
+        lines.push(format!("+{line}"));
+    }
+    Some(truncate_for_budget(
+        &lines.join("\n"),
+        budget.preview_bytes(),
+    ))
+}
+
+fn format_semantic_edit_content(
+    file_abs: &Path,
+    language: &str,
+    content: &str,
+) -> Result<(String, Option<String>)> {
+    if !semantic_edit_is_rust(language, file_abs) {
+        return Ok((content.to_string(), None));
+    }
+
+    let parent = file_abs.parent().unwrap_or_else(|| Path::new("."));
+    let mut staged = TempFileBuilder::new()
+        .prefix(".tsift-semantic-format-")
+        .suffix(".rs")
+        .tempfile_in(parent)
+        .with_context(|| {
+            format!(
+                "creating formatter staging file near {}",
+                file_abs.display()
+            )
+        })?;
+    staged
+        .write_all(content.as_bytes())
+        .with_context(|| format!("writing formatter staging file for {}", file_abs.display()))?;
+    staged
+        .as_file_mut()
+        .sync_all()
+        .with_context(|| format!("flushing formatter staging file for {}", file_abs.display()))?;
+
+    let output = Command::new("rustfmt")
+        .arg("--edition")
+        .arg("2024")
+        .arg(staged.path())
+        .output()
+        .with_context(|| "running rustfmt for semantic edit intent")?;
+    if !output.status.success() {
+        bail!(
+            "rustfmt rejected semantic edit output for {}: {}",
+            file_abs.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let formatted = fs::read_to_string(staged.path())
+        .with_context(|| format!("reading formatted staging file for {}", file_abs.display()))?;
+    Ok((formatted, Some("rustfmt --edition 2024".to_string())))
+}
+
 fn plan_semantic_edit_intent(
     root: &Path,
     scope: Option<&str>,
     intent: &SemanticEditIntent,
     index: usize,
     budget: ResponseBudget,
-) -> Result<SemanticEditIntentPlan> {
+) -> Result<SemanticEditIntentDraft> {
     let kind = normalize_semantic_edit_kind(&intent.kind);
     validate_semantic_edit_intent(&kind, intent)?;
 
@@ -3911,6 +4282,7 @@ fn plan_semantic_edit_intent(
     };
 
     let source = fs::read(&file_abs).with_context(|| format!("reading {}", file_abs.display()))?;
+    let source_text = String::from_utf8(source.clone());
     let total_lines = String::from_utf8_lossy(&source).lines().count();
     let content_hash = semantic_edit_content_hash(&source);
     let mut target_range = target_range;
@@ -3922,36 +4294,167 @@ fn plan_semantic_edit_intent(
         .expected_content_hash
         .as_deref()
         .is_some_and(|expected| expected != content_hash);
-    let status = if conflict { "conflict" } else { "planned" }.to_string();
-    let message = if conflict {
-        "expected_content_hash does not match current file content; intent was not planned for mutation"
-            .to_string()
-    } else {
-        format!(
-            "validated {kind} intent; AST mutation is dry-run only until per-language executor support is enabled"
+
+    let language = semantic_edit_target_language(target_symbol.as_ref(), &file_abs);
+    let (status, apply_supported, diff, message) = if conflict {
+        (
+            "conflict".to_string(),
+            semantic_edit_is_rust(&language, &file_abs),
+            None,
+            "expected_content_hash does not match current file content; intent was not planned for mutation"
+                .to_string(),
         )
+    } else {
+        match source_text {
+            Ok(source_text) => match preview_semantic_edit_content(
+                &source_text,
+                &file_abs,
+                &language,
+                &kind,
+                intent,
+                target_symbol.as_ref(),
+            ) {
+                Ok((preview, _)) => (
+                    "planned".to_string(),
+                    true,
+                    semantic_edit_diff_preview(&source_text, &preview, budget),
+                    format!("validated {kind} intent; Rust executor can apply this edit"),
+                ),
+                Err(err) => (
+                    "unsupported".to_string(),
+                    false,
+                    None,
+                    format!("{kind} intent is not applyable by the current executor: {err:#}"),
+                ),
+            },
+            Err(err) => (
+                "unsupported".to_string(),
+                false,
+                None,
+                format!("semantic edit executor requires UTF-8 source: {err}"),
+            ),
+        }
     };
 
-    Ok(SemanticEditIntentPlan {
-        handle: stable_handle(
-            "eintent",
-            &format!("{index}:{kind}:{target_file}:{content_hash}"),
-        ),
-        kind,
-        status,
-        apply_supported: false,
-        target_symbol,
-        target_file,
-        target_range,
-        content_hash,
-        message: truncate_for_budget(&message, budget.preview_bytes()),
+    Ok(SemanticEditIntentDraft {
+        plan: SemanticEditIntentPlan {
+            handle: stable_handle(
+                "eintent",
+                &format!("{index}:{kind}:{target_file}:{content_hash}"),
+            ),
+            kind,
+            status,
+            apply_supported,
+            applied: false,
+            target_symbol,
+            target_file,
+            target_range,
+            content_hash,
+            diff,
+            formatter: None,
+            message: truncate_for_budget(&message, budget.preview_bytes()),
+        },
+        file_abs,
+        language,
     })
+}
+
+struct SemanticEditFileBuffer {
+    original: String,
+    current: String,
+    language: String,
+    intents: usize,
+}
+
+fn apply_semantic_edit_drafts(
+    drafts: &mut [SemanticEditIntentDraft],
+    intents: &[SemanticEditIntent],
+    budget: ResponseBudget,
+) -> Result<usize> {
+    let blocked = drafts
+        .iter()
+        .filter(|draft| draft.plan.status != "planned")
+        .map(|draft| format!("{}:{}", draft.plan.handle, draft.plan.status))
+        .collect::<Vec<_>>();
+    if !blocked.is_empty() {
+        bail!(
+            "refusing to apply semantic edit intents because some plans are not applyable: {}",
+            blocked.join(", ")
+        );
+    }
+
+    let mut files = BTreeMap::<PathBuf, SemanticEditFileBuffer>::new();
+    for (idx, draft) in drafts.iter_mut().enumerate() {
+        let file_abs = draft.file_abs.clone();
+        let buffer = if files.contains_key(&file_abs) {
+            files.get_mut(&file_abs).unwrap()
+        } else {
+            let original = fs::read_to_string(&file_abs)
+                .with_context(|| format!("reading {}", file_abs.display()))?;
+            files.insert(
+                file_abs.clone(),
+                SemanticEditFileBuffer {
+                    original: original.clone(),
+                    current: original,
+                    language: draft.language.clone(),
+                    intents: 0,
+                },
+            );
+            files.get_mut(&file_abs).unwrap()
+        };
+        let (updated, replacements) = preview_semantic_edit_content(
+            &buffer.current,
+            &draft.file_abs,
+            &draft.language,
+            &draft.plan.kind,
+            &intents[idx],
+            draft.plan.target_symbol.as_ref(),
+        )
+        .with_context(|| format!("applying {}", draft.plan.handle))?;
+        buffer.current = updated;
+        buffer.intents += replacements.max(1);
+        draft.plan.status = "applied".to_string();
+        draft.plan.applied = true;
+        draft.plan.message = truncate_for_budget(
+            &format!(
+                "applied {} intent through the Rust semantic edit executor",
+                draft.plan.kind
+            ),
+            budget.preview_bytes(),
+        );
+    }
+
+    let mut formatted_total = 0usize;
+    let mut edit_plan = Vec::new();
+    for (index, (file, buffer)) in files.into_iter().enumerate() {
+        if buffer.original == buffer.current {
+            continue;
+        }
+        let (formatted, formatter) =
+            format_semantic_edit_content(&file, &buffer.language, &buffer.current)?;
+        if formatter.is_some() {
+            formatted_total += 1;
+        }
+        for draft in drafts.iter_mut().filter(|draft| draft.file_abs == file) {
+            draft.plan.formatter = formatter.clone();
+        }
+        edit_plan.push(PlannedEdit {
+            index,
+            file,
+            new_content: formatted,
+            replacements: buffer.intents,
+        });
+    }
+
+    apply_edit_plan_atomically(edit_plan)?;
+    Ok(formatted_total)
 }
 
 fn cmd_edit_intents(
     path: &Path,
     scope: Option<&str>,
     file: Option<PathBuf>,
+    apply: bool,
     format: OutputFormat,
     budget: ResponseBudget,
 ) -> Result<()> {
@@ -3969,26 +4472,49 @@ fn cmd_edit_intents(
     let batch: SemanticEditIntentBatch =
         serde_json::from_str(&input).context("parsing semantic edit intent JSON")?;
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    let max_items = budget.preview_items();
-    let plans = batch
+    let max_items = if apply {
+        batch.intents.len()
+    } else {
+        budget.preview_items()
+    };
+    let mut drafts = batch
         .intents
         .iter()
         .take(max_items)
         .enumerate()
         .map(|(idx, intent)| plan_semantic_edit_intent(&root, scope, intent, idx, budget))
         .collect::<Result<Vec<_>>>()?;
-    let planned_total = plans.iter().filter(|plan| plan.status == "planned").count();
-    let conflict_total = plans
+    let mut formatted_total = 0usize;
+    if apply {
+        formatted_total = apply_semantic_edit_drafts(&mut drafts, &batch.intents, budget)?;
+    }
+
+    let planned_total = drafts
         .iter()
-        .filter(|plan| plan.status == "conflict")
+        .filter(|draft| matches!(draft.plan.status.as_str(), "planned" | "applied"))
         .count();
+    let applied_total = drafts.iter().filter(|draft| draft.plan.applied).count();
+    let conflict_total = drafts
+        .iter()
+        .filter(|draft| draft.plan.status == "conflict")
+        .count();
+    let unsupported_total = drafts
+        .iter()
+        .filter(|draft| draft.plan.status == "unsupported")
+        .count();
+    let plans = drafts
+        .into_iter()
+        .map(|draft| draft.plan)
+        .collect::<Vec<_>>();
     let report = SemanticEditIntentReport {
         root: root.to_string_lossy().to_string(),
-        mode: "dry_run".to_string(),
+        mode: if apply { "apply" } else { "dry_run" }.to_string(),
         intents_total: batch.intents.len(),
         planned_total,
+        applied_total,
         conflict_total,
-        unsupported_total: 0,
+        unsupported_total,
+        formatted_total,
         plans,
         warnings: (batch.intents.len() > max_items)
             .then(|| {
@@ -4021,16 +4547,21 @@ fn cmd_edit_intents(
             &report,
             &format,
             "edit-intents",
-            "dry-run",
+            if apply { "apply" } else { "dry-run" },
             ToolEnvelopeSummary {
                 text: format!(
-                    "semantic edit intents planned={} conflicts={}",
-                    report.planned_total, report.conflict_total
+                    "semantic edit intents planned={} applied={} conflicts={} unsupported={}",
+                    report.planned_total,
+                    report.applied_total,
+                    report.conflict_total,
+                    report.unsupported_total
                 ),
                 metrics: vec![
                     envelope_metric("intents", report.intents_total),
                     envelope_metric("planned", report.planned_total),
+                    envelope_metric("applied", report.applied_total),
                     envelope_metric("conflicts", report.conflict_total),
+                    envelope_metric("unsupported", report.unsupported_total),
                 ],
             },
             report.intents_total > max_items || report.conflict_total > 0,
@@ -4038,16 +4569,28 @@ fn cmd_edit_intents(
         )?;
     } else {
         println!(
-            "Semantic edit intents: planned={} conflicts={} mode={}",
-            report.planned_total, report.conflict_total, report.mode
+            "Semantic edit intents: planned={} applied={} conflicts={} unsupported={} mode={}",
+            report.planned_total,
+            report.applied_total,
+            report.conflict_total,
+            report.unsupported_total,
+            report.mode
         );
         for plan in &report.plans {
             println!(
-                "  {} {} {} apply_supported={} {}",
-                plan.handle, plan.status, plan.kind, plan.apply_supported, plan.target_file
+                "  {} {} {} apply_supported={} applied={} {}",
+                plan.handle,
+                plan.status,
+                plan.kind,
+                plan.apply_supported,
+                plan.applied,
+                plan.target_file
             );
             if let Some(range) = &plan.target_range {
                 println!("    range: {}-{}", range.start, range.end);
+            }
+            if let Some(formatter) = &plan.formatter {
+                println!("    formatter: {formatter}");
             }
             println!("    {}", plan.message);
         }
