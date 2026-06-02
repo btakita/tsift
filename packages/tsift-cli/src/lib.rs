@@ -495,6 +495,8 @@ const SEMANTIC_EDIT_KINDS: &[&str] = &[
     "move_declaration",
     "rewrite_call_sites",
 ];
+const SEMANTIC_EDIT_SCRIPT_KINDS: &[&str] =
+    &["rename_symbol", "replace_function_body", "insert_import"];
 
 struct PlannedEdit {
     index: usize,
@@ -4053,16 +4055,12 @@ fn semantic_edit_content_hash(bytes: &[u8]) -> String {
 }
 
 fn semantic_edit_language_for_file(file_abs: &Path) -> String {
-    match file_abs.extension().and_then(|value| value.to_str()) {
-        Some("rs") => "rust".to_string(),
-        Some("py") | Some("pyi") => "python".to_string(),
-        Some("ts") => "typescript".to_string(),
-        Some("tsx") => "tsx".to_string(),
-        Some("js") | Some("mjs") | Some("cjs") => "javascript".to_string(),
-        Some("jsx") => "jsx".to_string(),
-        Some(ext) => ext.to_string(),
-        None => "unknown".to_string(),
-    }
+    let Some(ext) = file_abs.extension().and_then(|value| value.to_str()) else {
+        return "unknown".to_string();
+    };
+    semantic_edit_language_contract_for_extension(ext)
+        .map(|contract| contract.id.to_string())
+        .unwrap_or_else(|| ext.to_string())
 }
 
 fn semantic_edit_target_language(
@@ -4084,56 +4082,156 @@ enum SemanticEditExecutorLanguage {
     Jsx,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SemanticEditLanguageFamily {
+    Rust,
+    Python,
+    JsLike,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SemanticEditFormatterContract {
+    Rustfmt,
+    PythonAuto,
+    Prettier,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SemanticEditLanguageContract {
+    executor: SemanticEditExecutorLanguage,
+    id: &'static str,
+    name: &'static str,
+    graph_lang: graph::Lang,
+    temp_suffix: &'static str,
+    aliases: &'static [&'static str],
+    extensions: &'static [&'static str],
+    supported_intents: &'static [&'static str],
+    family: SemanticEditLanguageFamily,
+    formatter: SemanticEditFormatterContract,
+}
+
+const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Rust,
+        id: "rust",
+        name: "Rust",
+        graph_lang: graph::Lang::Rust,
+        temp_suffix: ".rs",
+        aliases: &["rust", "rs"],
+        extensions: &["rs"],
+        supported_intents: SEMANTIC_EDIT_KINDS,
+        family: SemanticEditLanguageFamily::Rust,
+        formatter: SemanticEditFormatterContract::Rustfmt,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Python,
+        id: "python",
+        name: "Python",
+        graph_lang: graph::Lang::Python,
+        temp_suffix: ".py",
+        aliases: &["python", "py", "pyi"],
+        extensions: &["py", "pyi"],
+        supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        family: SemanticEditLanguageFamily::Python,
+        formatter: SemanticEditFormatterContract::PythonAuto,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::TypeScript,
+        id: "typescript",
+        name: "TypeScript",
+        graph_lang: graph::Lang::TypeScript,
+        temp_suffix: ".ts",
+        aliases: &["typescript", "ts"],
+        extensions: &["ts"],
+        supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        family: SemanticEditLanguageFamily::JsLike,
+        formatter: SemanticEditFormatterContract::Prettier,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Tsx,
+        id: "tsx",
+        name: "TSX",
+        graph_lang: graph::Lang::Tsx,
+        temp_suffix: ".tsx",
+        aliases: &["tsx"],
+        extensions: &["tsx"],
+        supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        family: SemanticEditLanguageFamily::JsLike,
+        formatter: SemanticEditFormatterContract::Prettier,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::JavaScript,
+        id: "javascript",
+        name: "JavaScript",
+        graph_lang: graph::Lang::JavaScript,
+        temp_suffix: ".js",
+        aliases: &["javascript", "js", "mjs", "cjs"],
+        extensions: &["js", "mjs", "cjs"],
+        supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        family: SemanticEditLanguageFamily::JsLike,
+        formatter: SemanticEditFormatterContract::Prettier,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Jsx,
+        id: "jsx",
+        name: "JSX",
+        graph_lang: graph::Lang::Jsx,
+        temp_suffix: ".jsx",
+        aliases: &["jsx"],
+        extensions: &["jsx"],
+        supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        family: SemanticEditLanguageFamily::JsLike,
+        formatter: SemanticEditFormatterContract::Prettier,
+    },
+];
+
+fn semantic_edit_language_contract_for_extension(
+    ext: &str,
+) -> Option<&'static SemanticEditLanguageContract> {
+    let normalized = ext.trim().to_ascii_lowercase();
+    SEMANTIC_EDIT_LANGUAGE_CONTRACTS
+        .iter()
+        .find(|contract| contract.extensions.contains(&normalized.as_str()))
+}
+
 impl SemanticEditExecutorLanguage {
+    fn contract(self) -> &'static SemanticEditLanguageContract {
+        SEMANTIC_EDIT_LANGUAGE_CONTRACTS
+            .iter()
+            .find(|contract| contract.executor == self)
+            .expect("semantic edit executor language must have a contract")
+    }
+
     fn name(self) -> &'static str {
-        match self {
-            Self::Rust => "Rust",
-            Self::Python => "Python",
-            Self::TypeScript => "TypeScript",
-            Self::Tsx => "TSX",
-            Self::JavaScript => "JavaScript",
-            Self::Jsx => "JSX",
-        }
+        self.contract().name
     }
 
     fn graph_lang(self) -> graph::Lang {
-        match self {
-            Self::Rust => graph::Lang::Rust,
-            Self::Python => graph::Lang::Python,
-            Self::TypeScript => graph::Lang::TypeScript,
-            Self::Tsx => graph::Lang::Tsx,
-            Self::JavaScript => graph::Lang::JavaScript,
-            Self::Jsx => graph::Lang::Jsx,
-        }
+        self.contract().graph_lang
     }
 
     fn temp_suffix(self) -> &'static str {
-        match self {
-            Self::Rust => ".rs",
-            Self::Python => ".py",
-            Self::TypeScript => ".ts",
-            Self::Tsx => ".tsx",
-            Self::JavaScript => ".js",
-            Self::Jsx => ".jsx",
-        }
+        self.contract().temp_suffix
+    }
+
+    fn supported_intents(self) -> &'static [&'static str] {
+        self.contract().supported_intents
+    }
+
+    fn formatter(self) -> SemanticEditFormatterContract {
+        self.contract().formatter
     }
 
     fn is_script(self) -> bool {
-        matches!(
-            self,
-            Self::Python | Self::TypeScript | Self::Tsx | Self::JavaScript | Self::Jsx
-        )
+        self.contract().family != SemanticEditLanguageFamily::Rust
     }
 
     fn is_python(self) -> bool {
-        self == Self::Python
+        self.contract().family == SemanticEditLanguageFamily::Python
     }
 
     fn is_js_like(self) -> bool {
-        matches!(
-            self,
-            Self::TypeScript | Self::Tsx | Self::JavaScript | Self::Jsx
-        )
+        self.contract().family == SemanticEditLanguageFamily::JsLike
     }
 }
 
@@ -4142,44 +4240,126 @@ fn semantic_edit_executor_language(
     file_abs: &Path,
 ) -> Option<SemanticEditExecutorLanguage> {
     let normalized = language.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "rust" | "rs" => Some(SemanticEditExecutorLanguage::Rust),
-        "python" | "py" | "pyi" => Some(SemanticEditExecutorLanguage::Python),
-        "typescript" | "ts" => Some(SemanticEditExecutorLanguage::TypeScript),
-        "tsx" => Some(SemanticEditExecutorLanguage::Tsx),
-        "javascript" | "js" | "mjs" | "cjs" => Some(SemanticEditExecutorLanguage::JavaScript),
-        "jsx" => Some(SemanticEditExecutorLanguage::Jsx),
-        _ => match file_abs.extension().and_then(|value| value.to_str()) {
-            Some("rs") => Some(SemanticEditExecutorLanguage::Rust),
-            Some("py") | Some("pyi") => Some(SemanticEditExecutorLanguage::Python),
-            Some("ts") => Some(SemanticEditExecutorLanguage::TypeScript),
-            Some("tsx") => Some(SemanticEditExecutorLanguage::Tsx),
-            Some("js") | Some("mjs") | Some("cjs") => {
-                Some(SemanticEditExecutorLanguage::JavaScript)
-            }
-            Some("jsx") => Some(SemanticEditExecutorLanguage::Jsx),
-            _ => None,
-        },
+    if let Some(contract) = SEMANTIC_EDIT_LANGUAGE_CONTRACTS
+        .iter()
+        .find(|contract| contract.aliases.contains(&normalized.as_str()))
+    {
+        return Some(contract.executor);
     }
+    file_abs
+        .extension()
+        .and_then(|value| value.to_str())
+        .and_then(semantic_edit_language_contract_for_extension)
+        .map(|contract| contract.executor)
 }
 
 fn semantic_edit_kind_apply_supported(kind: &str, language: &str, file_abs: &Path) -> bool {
     let Some(executor) = semantic_edit_executor_language(language, file_abs) else {
         return false;
     };
-    if executor == SemanticEditExecutorLanguage::Rust {
-        return true;
-    }
-    matches!(
-        kind,
-        "rename_symbol" | "replace_function_body" | "insert_import"
-    )
+    executor.supported_intents().contains(&kind)
 }
 
 fn semantic_edit_executor_name(language: &str, file_abs: &Path) -> String {
     semantic_edit_executor_language(language, file_abs)
         .map(|executor| executor.name().to_string())
         .unwrap_or_else(|| language.to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn semantic_edit_language_contracts_resolve_current_executor_surface() {
+    let cases = [
+        (
+            "rust",
+            "src/lib.rs",
+            SemanticEditExecutorLanguage::Rust,
+            "rust",
+            SEMANTIC_EDIT_KINDS,
+            SemanticEditFormatterContract::Rustfmt,
+        ),
+        (
+            "python",
+            "script.py",
+            SemanticEditExecutorLanguage::Python,
+            "python",
+            SEMANTIC_EDIT_SCRIPT_KINDS,
+            SemanticEditFormatterContract::PythonAuto,
+        ),
+        (
+            "typescript",
+            "tool.ts",
+            SemanticEditExecutorLanguage::TypeScript,
+            "typescript",
+            SEMANTIC_EDIT_SCRIPT_KINDS,
+            SemanticEditFormatterContract::Prettier,
+        ),
+        (
+            "tsx",
+            "view.tsx",
+            SemanticEditExecutorLanguage::Tsx,
+            "tsx",
+            SEMANTIC_EDIT_SCRIPT_KINDS,
+            SemanticEditFormatterContract::Prettier,
+        ),
+        (
+            "javascript",
+            "app.js",
+            SemanticEditExecutorLanguage::JavaScript,
+            "javascript",
+            SEMANTIC_EDIT_SCRIPT_KINDS,
+            SemanticEditFormatterContract::Prettier,
+        ),
+        (
+            "jsx",
+            "view.jsx",
+            SemanticEditExecutorLanguage::Jsx,
+            "jsx",
+            SEMANTIC_EDIT_SCRIPT_KINDS,
+            SemanticEditFormatterContract::Prettier,
+        ),
+    ];
+
+    for (language, file, executor, canonical, supported, formatter) in cases {
+        let path = Path::new(file);
+        let contract = executor.contract();
+        assert_eq!(contract.id, canonical);
+        assert_eq!(contract.formatter, formatter);
+        assert!(contract.aliases.contains(&language));
+        assert_eq!(semantic_edit_language_for_file(path), canonical);
+        assert_eq!(
+            semantic_edit_executor_language(language, path),
+            Some(executor)
+        );
+        for &ext in contract.extensions {
+            assert_eq!(
+                semantic_edit_language_contract_for_extension(ext)
+                    .map(|contract| contract.executor),
+                Some(executor)
+            );
+        }
+        for &kind in SEMANTIC_EDIT_KINDS {
+            assert_eq!(
+                semantic_edit_kind_apply_supported(kind, language, path),
+                supported.contains(&kind),
+                "{language} support mismatch for {kind}"
+            );
+        }
+    }
+
+    assert_eq!(
+        semantic_edit_executor_language("unknown", Path::new("tool.ts")),
+        Some(SemanticEditExecutorLanguage::TypeScript)
+    );
+    assert_eq!(
+        semantic_edit_executor_language("markdown", Path::new("README.md")),
+        None
+    );
+    assert!(!semantic_edit_kind_apply_supported(
+        "rewrite_call_sites",
+        "typescript",
+        Path::new("tool.ts")
+    ));
 }
 
 fn rust_ident_char(ch: char) -> bool {
@@ -5536,24 +5716,19 @@ fn format_semantic_edit_content(
         parse_semantic_edit_source(content, executor, "formatter input")?;
     }
 
-    let formatter = match executor {
-        SemanticEditExecutorLanguage::Rust => Some((
+    let formatter = match executor.formatter() {
+        SemanticEditFormatterContract::Rustfmt => Some((
             "rustfmt",
             vec!["--edition", "2024"],
             "rustfmt --edition 2024",
         )),
-        SemanticEditExecutorLanguage::Python if command_available("ruff") => {
+        SemanticEditFormatterContract::PythonAuto if command_available("ruff") => {
             Some(("ruff", vec!["format"], "ruff format"))
         }
-        SemanticEditExecutorLanguage::Python if command_available("black") => {
+        SemanticEditFormatterContract::PythonAuto if command_available("black") => {
             Some(("black", vec!["--quiet"], "black --quiet"))
         }
-        SemanticEditExecutorLanguage::TypeScript
-        | SemanticEditExecutorLanguage::Tsx
-        | SemanticEditExecutorLanguage::JavaScript
-        | SemanticEditExecutorLanguage::Jsx
-            if command_available("prettier") =>
-        {
+        SemanticEditFormatterContract::Prettier if command_available("prettier") => {
             Some(("prettier", vec!["--write"], "prettier --write"))
         }
         _ => None,
