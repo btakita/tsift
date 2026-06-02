@@ -3241,10 +3241,113 @@ fn edit_intents_apply_mutates_markdown_section_intents() {
 }
 
 #[test]
-fn edit_intents_markdown_block_apply_refuses_without_mutating() {
+fn edit_intents_apply_mutates_markdown_block_intents() {
     let dir = markdown_edit_fixture();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "insert_list_item",
+                "symbol": "Confirm setup.",
+                "file": "README.md",
+                "position": "after",
+                "replacement": "Verify setup."
+            },
+            {
+                "kind": "rewrite_code_fence",
+                "symbol": "rust",
+                "file": "README.md",
+                "replacement": "fn sample() {\n    println!(\"ok\");\n}\n"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--apply",
+            "--budget",
+            "normal",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "markdown block apply stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "edit-intents");
+    assert_eq!(json["report"]["planned_total"], 2);
+    assert_eq!(json["report"]["applied_total"], 2);
+    assert_eq!(json["report"]["unsupported_total"], 0);
+    for plan in json["report"]["plans"].as_array().unwrap() {
+        assert_eq!(plan["status"], "applied");
+        assert_eq!(plan["apply_supported"], true);
+        assert_eq!(plan["applied"], true);
+    }
+
+    let after = fs::read_to_string(dir.path().join("README.md")).unwrap();
+    assert!(
+        after.contains("- Run setup.\n  - Confirm setup.\n  - Verify setup."),
+        "{after}"
+    );
+    assert!(
+        after.contains("```rust\nfn sample() {\n    println!(\"ok\");\n}\n```"),
+        "{after}"
+    );
+}
+
+#[test]
+fn edit_intents_markdown_block_apply_refuses_ambiguous_targets_without_mutating() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("README.md"),
+        "# Guide\n\n- Repeat\n- Repeat\n\n```rust\none();\n```\n\n```rust\ntwo();\n```\n",
+    )
+    .unwrap();
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let before = fs::read_to_string(dir.path().join("README.md")).unwrap();
-    let input = "{\n  \"intents\": [\n    {\n      \"kind\": \"insert_list_item\",\n      \"file\": \"README.md\",\n      \"replacement\": \"- Added\\n\"\n    }\n  ]\n}";
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "insert_list_item",
+                "symbol": "Repeat",
+                "file": "README.md",
+                "replacement": "Added"
+            },
+            {
+                "kind": "rewrite_code_fence",
+                "symbol": "rust",
+                "file": "README.md",
+                "replacement": "updated();\n"
+            }
+        ]
+    }"#;
 
     let mut child = tsift_bin()
         .args([
@@ -3270,13 +3373,17 @@ fn edit_intents_markdown_block_apply_refuses_without_mutating() {
             .unwrap();
     }
     let output = child.wait_with_output().unwrap();
-    assert!(!output.status.success(), "markdown apply should fail");
+    assert!(
+        !output.status.success(),
+        "ambiguous markdown apply should fail"
+    );
     assert_eq!(
         fs::read_to_string(dir.path().join("README.md")).unwrap(),
         before
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unsupported"), "stderr was: {stderr}");
+    assert!(stderr.contains("ambiguous"), "stderr was: {stderr}");
 }
 
 #[test]
