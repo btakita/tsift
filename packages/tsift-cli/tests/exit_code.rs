@@ -640,10 +640,19 @@ Intro text.
 ## Install
 
 - Run setup.
+  - Confirm setup.
 
 ```rust
 fn sample() {}
 ```
+
+### Troubleshooting
+
+Check logs.
+
+## Reference
+
+Done.
 "#,
     )
     .unwrap();
@@ -2791,6 +2800,89 @@ fn source_read_json_reports_bounded_window_handles_and_expansion_commands() {
 }
 
 #[test]
+fn source_read_json_reports_markdown_section_list_and_code_spans() {
+    let dir = markdown_edit_fixture();
+
+    let output = tsift_bin()
+        .args([
+            "--envelope",
+            "source-read",
+            "README.md",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--start",
+            "1",
+            "--lines",
+            "24",
+            "--json",
+            "--budget",
+            "normal",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "source-read markdown stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let symbols = json["report"]["symbols"].as_array().unwrap();
+    let install = symbols
+        .iter()
+        .find(|symbol| symbol["kind"] == "heading" && symbol["name"] == "Install")
+        .unwrap_or_else(|| panic!("expected Install heading ref: {json}"));
+    assert_eq!(install["span"]["node_kind"], "atx_heading");
+    assert_eq!(install["span"]["start_line"], 5);
+    assert_eq!(install["span"]["end_line"], 17);
+    assert_eq!(install["span"]["body_start_line"], 7);
+    assert_eq!(install["span"]["markdown"]["heading_level"], 2);
+    assert_eq!(
+        install["span"]["markdown"]["section_path"],
+        serde_json::json!(["Guide", "Install"])
+    );
+    assert!(
+        install["span"]["parent_handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("span-")
+    );
+    assert!(
+        install["span"]["child_handles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|handle| handle.as_str().unwrap().starts_with("span-"))
+    );
+
+    let list_item = symbols
+        .iter()
+        .find(|symbol| symbol["kind"] == "list_item" && symbol["name"] == "Run setup.")
+        .unwrap_or_else(|| panic!("expected Markdown list item ref: {json}"));
+    assert_eq!(list_item["span"]["node_kind"], "list_item");
+    assert_eq!(list_item["span"]["markdown"]["list_depth"], 0);
+    assert_eq!(
+        list_item["span"]["markdown"]["section_path"],
+        serde_json::json!(["Guide", "Install"])
+    );
+
+    let code_block = symbols
+        .iter()
+        .find(|symbol| symbol["kind"] == "code_block" && symbol["name"] == "rust")
+        .unwrap_or_else(|| panic!("expected Markdown code fence ref: {json}"));
+    assert_eq!(code_block["span"]["node_kind"], "fenced_code_block");
+    assert_eq!(code_block["span"]["markdown"]["fence_language"], "rust");
+    assert_eq!(
+        code_block["span"]["markdown"]["section_path"],
+        serde_json::json!(["Guide", "Install"])
+    );
+    assert!(
+        code_block["span"]["body_end_byte"].as_u64().unwrap()
+            > code_block["span"]["body_start_byte"].as_u64().unwrap()
+    );
+}
+
+#[test]
 fn symbol_read_json_reports_symbol_body_and_navigation_commands() {
     let dir = indexed_cli_fixture();
 
@@ -3038,6 +3130,8 @@ fn edit_intents_markdown_contract_recognizes_heading_intent_without_mutating() {
     assert_eq!(plan["target_symbol"]["name"], "Guide");
     assert_eq!(plan["target_symbol"]["kind"], "heading");
     assert_eq!(plan["target_symbol"]["language"], "markdown");
+    assert_eq!(plan["target_symbol"]["line"], 1);
+    assert_eq!(plan["target_symbol"]["end_line"], 20);
     assert!(
         plan["target_symbol"]["span"]["handle"]
             .as_str()
@@ -3045,6 +3139,12 @@ fn edit_intents_markdown_contract_recognizes_heading_intent_without_mutating() {
             .starts_with("span-")
     );
     assert_eq!(plan["target_symbol"]["span"]["node_kind"], "atx_heading");
+    assert_eq!(
+        plan["target_symbol"]["span"]["markdown"]["heading_level"],
+        1
+    );
+    assert_eq!(plan["target_range"]["start"], 1);
+    assert_eq!(plan["target_range"]["end"], 20);
     assert!(
         plan["message"]
             .as_str()

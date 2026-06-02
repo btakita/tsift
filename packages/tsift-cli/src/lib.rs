@@ -320,6 +320,22 @@ struct AstSpanPreview {
     parent_handle: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     child_handles: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    markdown: Option<MarkdownSpanMetadata>,
+}
+
+#[derive(Serialize, Clone)]
+struct MarkdownSpanMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heading_level: Option<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    section_path: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    section_handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    list_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fence_language: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -14032,6 +14048,9 @@ fn graph_db_backend_eval_full_projection_raw_watermark_rows(
         if traversal_path_is_generated_artifact(root, source_root, &entry.path) {
             continue;
         }
+        if traversal_path_is_session_markdown(root, source_root, &entry.path) {
+            continue;
+        }
         let bytes = fs::read(&entry.path)
             .with_context(|| format!("reading source input {}", entry.path.display()))?;
         rows.push(GraphDbBackendEvalRawSourceWatermarkRow {
@@ -14076,6 +14095,10 @@ fn graph_db_backend_eval_full_projection_source_watermark(
                         root,
                         &gate.source_root,
                         Path::new(&symbol.file),
+                    ) && !traversal_path_is_session_markdown(
+                        root,
+                        &gate.source_root,
+                        Path::new(&symbol.file),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -14091,6 +14114,10 @@ fn graph_db_backend_eval_full_projection_source_watermark(
                         root,
                         &gate.source_root,
                         Path::new(&edge.caller_file),
+                    ) && !traversal_path_is_session_markdown(
+                        root,
+                        &gate.source_root,
+                        Path::new(&edge.caller_file),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -14103,6 +14130,10 @@ fn graph_db_backend_eval_full_projection_source_watermark(
                 .into_iter()
                 .filter(|route| {
                     !traversal_path_is_generated_artifact(
+                        root,
+                        &gate.source_root,
+                        Path::new(&route.file),
+                    ) && !traversal_path_is_session_markdown(
                         root,
                         &gate.source_root,
                         Path::new(&route.file),
@@ -16231,6 +16262,26 @@ fn traversal_markdown_content_looks_like_session(content: &str) -> bool {
         || content.contains("<!-- agent:exchange")
         || content.contains("<!-- agent:backlog")
         || content.contains("## Backlog")
+}
+
+fn traversal_path_is_session_markdown(root: &Path, source_root: &Path, path: &Path) -> bool {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        source_root.join(path)
+    };
+    if !candidate.starts_with(source_root) && !candidate.starts_with(root) {
+        return false;
+    }
+    if !matches!(
+        candidate.extension().and_then(|ext| ext.to_str()),
+        Some("md" | "mdx")
+    ) {
+        return false;
+    }
+    fs::read_to_string(&candidate)
+        .map(|content| traversal_markdown_content_looks_like_session(&content))
+        .unwrap_or(false)
 }
 
 fn markdown_files_for_traversal(root: &Path, path_hint: &Path) -> Result<Vec<PathBuf>> {
@@ -18749,6 +18800,130 @@ fn stored_symbol_child_span_handles(
         .collect()
 }
 
+fn markdown_heading_level(source: &[u8], start_byte: usize) -> Option<usize> {
+    let start = start_byte.min(source.len());
+    let line_end = source[start..]
+        .iter()
+        .position(|value| *value == b'\n')
+        .map(|pos| start + pos)
+        .unwrap_or(source.len());
+    let line = std::str::from_utf8(&source[start..line_end]).unwrap_or("");
+    let marker = line.trim_start();
+    let level = marker.chars().take_while(|ch| *ch == '#').count();
+    (1..=6).contains(&level).then_some(level)
+}
+
+fn markdown_list_depth(source: &[u8], start_byte: usize) -> usize {
+    let start = start_byte.min(source.len());
+    let line_start = source[..start]
+        .iter()
+        .rposition(|value| *value == b'\n')
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    source[line_start..start]
+        .iter()
+        .map(|byte| match byte {
+            b'\t' => 4,
+            b' ' => 1,
+            _ => 0,
+        })
+        .sum::<usize>()
+        / 2
+}
+
+fn markdown_enclosing_heading_symbols<'a>(
+    file: &str,
+    start_byte: usize,
+    end_byte: usize,
+    symbols: &'a [index::StoredSymbol],
+) -> Vec<&'a index::StoredSymbol> {
+    let mut headings = symbols
+        .iter()
+        .filter(|candidate| candidate.file == file && candidate.kind == "heading")
+        .filter(|candidate| {
+            let Some((candidate_start, candidate_end)) = stored_symbol_span_bounds(candidate)
+            else {
+                return false;
+            };
+            candidate_start <= start_byte && candidate_end >= end_byte
+        })
+        .collect::<Vec<_>>();
+    headings.sort_by(|left, right| {
+        stored_symbol_span_bounds(left)
+            .map(|(start, _)| start)
+            .unwrap_or(usize::MAX)
+            .cmp(
+                &stored_symbol_span_bounds(right)
+                    .map(|(start, _)| start)
+                    .unwrap_or(usize::MAX),
+            )
+            .then(left.name.cmp(&right.name))
+    });
+    headings
+}
+
+fn markdown_stored_symbol_metadata(
+    symbol: &index::StoredSymbol,
+    source: &[u8],
+    symbols: &[index::StoredSymbol],
+) -> Option<MarkdownSpanMetadata> {
+    if symbol.language != "markdown" {
+        return None;
+    }
+    let (start_byte, end_byte) = stored_symbol_span_bounds(symbol)?;
+    let section_symbols =
+        markdown_enclosing_heading_symbols(&symbol.file, start_byte, end_byte, symbols);
+    let section_path = section_symbols
+        .iter()
+        .map(|heading| heading.name.clone())
+        .collect::<Vec<_>>();
+    let section_handle = section_symbols
+        .last()
+        .and_then(|heading| stored_symbol_span_handle(heading));
+    let heading_level = (symbol.kind == "heading")
+        .then(|| markdown_heading_level(source, start_byte))
+        .flatten();
+    let list_depth = (symbol.kind == "list_item").then(|| markdown_list_depth(source, start_byte));
+    let fence_language = (symbol.kind == "code_block").then(|| symbol.name.clone());
+
+    (heading_level.is_some()
+        || !section_path.is_empty()
+        || section_handle.is_some()
+        || list_depth.is_some()
+        || fence_language.is_some())
+    .then_some(MarkdownSpanMetadata {
+        heading_level,
+        section_path,
+        section_handle,
+        list_depth,
+        fence_language,
+    })
+}
+
+fn markdown_symbol_hit_metadata(
+    symbol: &index::SymbolHit,
+    source: &[u8],
+    start_byte: usize,
+) -> Option<MarkdownSpanMetadata> {
+    if symbol.language != "markdown" {
+        return None;
+    }
+    let heading_level = (symbol.kind == "heading")
+        .then(|| markdown_heading_level(source, start_byte))
+        .flatten();
+    let list_depth = (symbol.kind == "list_item").then(|| markdown_list_depth(source, start_byte));
+    let fence_language = (symbol.kind == "code_block").then(|| symbol.name.clone());
+    (heading_level.is_some() || list_depth.is_some() || fence_language.is_some()).then_some(
+        MarkdownSpanMetadata {
+            heading_level,
+            section_path: Vec::new(),
+            section_handle: None,
+            list_depth,
+            fence_language,
+        },
+    )
+}
+
 fn stored_symbol_ast_span(
     symbol: &index::StoredSymbol,
     source: &[u8],
@@ -18778,6 +18953,7 @@ fn stored_symbol_ast_span(
         body_end_line: body_end_byte.map(|byte| source_line_for_end_byte(source, byte)),
         parent_handle: stored_symbol_parent_span_handle(symbol, symbols),
         child_handles: stored_symbol_child_span_handles(symbol, symbols, child_limit),
+        markdown: markdown_stored_symbol_metadata(symbol, source, symbols),
     })
 }
 
@@ -18805,6 +18981,7 @@ fn symbol_hit_ast_span(symbol: &index::SymbolHit, source: &[u8]) -> Option<AstSp
         body_end_line: body_end_byte.map(|byte| source_line_for_end_byte(source, byte)),
         parent_handle: None,
         child_handles: Vec::new(),
+        markdown: markdown_symbol_hit_metadata(symbol, source, start_byte),
     })
 }
 
@@ -31066,12 +31243,30 @@ def list_items():
             "expected SQLite neighborhood query plan diagnostics, got {:?}",
             report.page.as_ref().unwrap().diagnostics
         );
-        let edge_id = graph_db_edge_key(
-            report
-                .edges
-                .iter()
-                .find(|edge| edge.from_id == backlog.handle && edge.kind == "mentions")
-                .unwrap(),
+        let edges_report = graph_db_report_from_store(
+            dir.path(),
+            None,
+            "sqlite",
+            GraphDbQuery::Edges {
+                edge_kind: Some("mentions".to_string()),
+                cursor: None,
+                limit: Some(2),
+                property_filters: Vec::new(),
+            },
+            &store,
+            sqlite_graph_freshness(&store, "root").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        let edge_id = edges_report
+            .edges
+            .first()
+            .map(|edge| edge.id.clone())
+            .expect("expected at least one paged mentions edge");
+        assert!(edges_report.edges.iter().any(|edge| edge.id == edge_id));
+        assert_eq!(
+            edges_report.page.as_ref().unwrap().returned_edges,
+            edges_report.edges.len()
         );
 
         let edge_report = graph_db_report_from_store(
@@ -31089,27 +31284,6 @@ def list_items():
         assert_eq!(
             edge_report.edge.as_ref().map(graph_db_edge_key),
             Some(edge_id.clone())
-        );
-
-        let edges_report = graph_db_report_from_store(
-            dir.path(),
-            None,
-            "sqlite",
-            GraphDbQuery::Edges {
-                edge_kind: Some("mentions".to_string()),
-                cursor: None,
-                limit: Some(2),
-                property_filters: Vec::new(),
-            },
-            &store,
-            sqlite_graph_freshness(&store, "root").unwrap(),
-            Vec::new(),
-        )
-        .unwrap();
-        assert!(edges_report.edges.iter().any(|edge| edge.id == edge_id));
-        assert_eq!(
-            edges_report.page.as_ref().unwrap().returned_edges,
-            edges_report.edges.len()
         );
 
         let incident_report = graph_db_report_from_store(
