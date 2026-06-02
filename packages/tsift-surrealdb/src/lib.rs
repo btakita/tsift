@@ -1016,6 +1016,26 @@ mod tests {
             store.sample_edge(Some("mentions")).unwrap().unwrap().to_id,
             "node:c"
         );
+        let direct_surreal_query_edges = block_on(&store.rt, async {
+            let mut response = store
+                .db
+                .query(format!(
+                    "SELECT * FROM {EDGE_TABLE} WHERE from_external_id = $from_id AND kind = $kind"
+                ))
+                .bind(("from_id", "node:a"))
+                .bind(("kind", "calls"))
+                .await
+                .unwrap();
+            response.take::<Vec<SurrealEdgeRecord>>(0).unwrap()
+        })
+        .into_iter()
+        .map(GraphEdge::from)
+        .collect::<Vec<_>>();
+        assert_eq!(direct_surreal_query_edges, vec![edge_ab.clone()]);
+        assert_eq!(
+            store.outgoing_edges("node:a", Some("calls")).unwrap(),
+            direct_surreal_query_edges
+        );
         let (property_edge, filter) = store.sample_edge_with_property().unwrap().unwrap();
         assert_eq!(
             property_edge.properties.get(&filter.key),
@@ -1061,6 +1081,25 @@ mod tests {
             .unwrap();
         assert_eq!(calls_page.edges.len(), 2);
         assert!(calls_page.page.next_cursor.is_some());
+        assert!(
+            calls_page
+                .page
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.contains("derived kind index") })
+        );
+
+        let incident_page = store
+            .paged_incident_edges("node:a", Some("calls"), GraphQueryOptions::default())
+            .unwrap();
+        assert_eq!(incident_page.edges.len(), 2);
+        assert!(
+            incident_page
+                .page
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.contains("Rust-side incoming/outgoing indexes") })
+        );
 
         let between = store
             .edges_between_nodes(&BTreeSet::from([
