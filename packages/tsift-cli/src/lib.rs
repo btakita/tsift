@@ -336,6 +336,8 @@ struct SemanticEditIntentPlan {
     cross_file_call_ref_total: Option<usize>,
     target_file: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    destination_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     target_range: Option<SourceRangePreview>,
     content_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -388,6 +390,7 @@ struct SemanticEditIntentReport {
 struct SemanticEditIntentDraft {
     plan: SemanticEditIntentPlan,
     file_abs: PathBuf,
+    destination_file_abs: Option<PathBuf>,
     language: String,
 }
 
@@ -3843,6 +3846,7 @@ fn semantic_edit_kind_requires_symbol(kind: &str) -> bool {
     matches!(
         kind,
         "rename_symbol"
+            | "add_method"
             | "replace_function_body"
             | "update_call_signature"
             | "move_declaration"
@@ -4419,6 +4423,399 @@ fn update_rust_call_signature(
     Ok((updated, replacements))
 }
 
+fn validate_rust_source_fragment(content: &str, context: &str) -> Result<()> {
+    let mut parser = tree_sitter::Parser::new();
+    let language = graph::Lang::Rust.tree_sitter_language();
+    parser.set_language(&language)?;
+    let tree = parser
+        .parse(content.as_bytes(), None)
+        .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
+    if tree.root_node().has_error() {
+        bail!("{context} produced Rust source with parse errors");
+    }
+    Ok(())
+}
+
+fn validate_rust_method_replacement(replacement: &str) -> Result<String> {
+    let trimmed = replacement.trim();
+    if trimmed.is_empty() {
+        bail!("add_method requires a non-empty Rust method replacement");
+    }
+    let probe = format!("struct __TsiftProbe;\nimpl __TsiftProbe {{\n{trimmed}\n}}\n");
+    validate_rust_source_fragment(&probe, "add_method")?;
+    let source = probe.as_bytes();
+    let mut parser = tree_sitter::Parser::new();
+    let language = graph::Lang::Rust.tree_sitter_language();
+    parser.set_language(&language)?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
+    let query =
+        tree_sitter::Query::new(&language, "(function_item name: (identifier) @method.name)")?;
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut method_count = 0usize;
+    let mut matches = cursor.matches(&query, tree.root_node(), source);
+    while let Some(m) = matches.next() {
+        method_count += m.captures.len();
+    }
+    match method_count {
+        1 => Ok(trimmed.to_string()),
+        0 => bail!("add_method replacement must contain one Rust method"),
+        _ => bail!("add_method replacement must contain exactly one Rust method"),
+    }
+}
+
+fn rust_indented_fragment(fragment: &str, indent: &str) -> String {
+    fragment
+        .trim_matches('\n')
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                format!("{indent}{}", line.trim())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn find_rust_inherent_impl_insert(
+    content: &str,
+    type_name: &str,
+) -> Result<Option<(usize, String)>> {
+    validate_rust_identifier(type_name, "symbol")?;
+    let source = content.as_bytes();
+    let mut parser = tree_sitter::Parser::new();
+    let language = graph::Lang::Rust.tree_sitter_language();
+    parser.set_language(&language)?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
+    if tree.root_node().has_error() {
+        bail!("Rust source has parse errors; refusing add_method");
+    }
+    let query = tree_sitter::Query::new(
+        &language,
+        r#"
+        (impl_item type: (type_identifier) @impl.type) @impl.item
+        (impl_item type: (generic_type type: (type_identifier) @impl.type)) @impl.item
+        "#,
+    )?;
+    let capture_names = query.capture_names();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source);
+    while let Some(m) = matches.next() {
+        let mut type_node = None;
+        let mut impl_node = None;
+        for capture in m.captures {
+            match capture_names[capture.index as usize] {
+                "impl.type" => type_node = Some(capture.node),
+                "impl.item" => impl_node = Some(capture.node),
+                _ => {}
+            }
+        }
+        let (Some(type_node), Some(impl_node)) = (type_node, impl_node) else {
+            continue;
+        };
+        if type_node.utf8_text(source)? != type_name {
+            continue;
+        }
+        if impl_node.child_by_field_name("trait").is_some() {
+            continue;
+        }
+        let Some(body) = impl_node.child_by_field_name("body") else {
+            continue;
+        };
+        let insert_at = body.end_byte().saturating_sub(1);
+        if source.get(insert_at).copied() != Some(b'}') {
+            bail!("could not find closing brace for Rust impl {type_name:?}");
+        }
+        return Ok(Some((
+            insert_at,
+            line_indent_at(content, impl_node.start_byte()),
+        )));
+    }
+    Ok(None)
+}
+
+fn find_rust_type_insert_after(content: &str, type_name: &str) -> Result<(usize, String)> {
+    validate_rust_identifier(type_name, "symbol")?;
+    let source = content.as_bytes();
+    let mut parser = tree_sitter::Parser::new();
+    let language = graph::Lang::Rust.tree_sitter_language();
+    parser.set_language(&language)?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
+    if tree.root_node().has_error() {
+        bail!("Rust source has parse errors; refusing add_method");
+    }
+    let query = tree_sitter::Query::new(
+        &language,
+        r#"
+        (struct_item name: (type_identifier) @type.name) @type.item
+        (enum_item name: (type_identifier) @type.name) @type.item
+        "#,
+    )?;
+    let capture_names = query.capture_names();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source);
+    while let Some(m) = matches.next() {
+        let mut name_node = None;
+        let mut item_node = None;
+        for capture in m.captures {
+            match capture_names[capture.index as usize] {
+                "type.name" => name_node = Some(capture.node),
+                "type.item" => item_node = Some(capture.node),
+                _ => {}
+            }
+        }
+        let (Some(name_node), Some(item_node)) = (name_node, item_node) else {
+            continue;
+        };
+        if name_node.utf8_text(source)? == type_name {
+            return Ok((
+                item_node.end_byte(),
+                line_indent_at(content, item_node.start_byte()),
+            ));
+        }
+    }
+    bail!("could not find Rust struct or enum {type_name:?} for add_method")
+}
+
+fn add_rust_method(content: &str, type_name: &str, replacement: &str) -> Result<(String, usize)> {
+    let method = validate_rust_method_replacement(replacement)?;
+    if let Some((insert_at, base_indent)) = find_rust_inherent_impl_insert(content, type_name)? {
+        let method_indent = format!("{base_indent}    ");
+        let insertion = format!(
+            "\n{}\n{base_indent}",
+            rust_indented_fragment(&method, &method_indent)
+        );
+        let mut out = String::with_capacity(content.len() + insertion.len());
+        out.push_str(&content[..insert_at]);
+        out.push_str(&insertion);
+        out.push_str(&content[insert_at..]);
+        return Ok((out, 1));
+    }
+
+    let (insert_at, base_indent) = find_rust_type_insert_after(content, type_name)?;
+    let method_indent = format!("{base_indent}    ");
+    let insertion = format!(
+        "\n\n{base_indent}impl {type_name} {{\n{}\n{base_indent}}}",
+        rust_indented_fragment(&method, &method_indent)
+    );
+    let mut out = String::with_capacity(content.len() + insertion.len());
+    out.push_str(&content[..insert_at]);
+    out.push_str(&insertion);
+    out.push_str(&content[insert_at..]);
+    Ok((out, 1))
+}
+
+fn rust_node_kind_matches_symbol_kind(node_kind: &str, symbol_kind: &str) -> bool {
+    matches!(
+        (node_kind, symbol_kind),
+        ("function_item", "function")
+            | ("struct_item", "struct")
+            | ("enum_item", "enum")
+            | ("trait_item", "trait")
+            | ("impl_item", "impl")
+            | ("mod_item", "mod")
+            | ("type_item", "type_alias")
+            | ("const_item", "const")
+            | ("static_item", "static")
+    )
+}
+
+fn rust_named_declaration_range(
+    content: &str,
+    symbol: &str,
+    symbol_kind: &str,
+) -> Result<(usize, usize, String)> {
+    let source = content.as_bytes();
+    let mut parser = tree_sitter::Parser::new();
+    let language = graph::Lang::Rust.tree_sitter_language();
+    parser.set_language(&language)?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
+    if tree.root_node().has_error() {
+        bail!("Rust source has parse errors; refusing move_declaration");
+    }
+    let query = tree_sitter::Query::new(
+        &language,
+        r#"
+        (function_item name: (identifier) @decl.name) @decl.item
+        (struct_item name: (type_identifier) @decl.name) @decl.item
+        (enum_item name: (type_identifier) @decl.name) @decl.item
+        (trait_item name: (type_identifier) @decl.name) @decl.item
+        (impl_item type: (type_identifier) @decl.name) @decl.item
+        (impl_item type: (generic_type type: (type_identifier) @decl.name)) @decl.item
+        (mod_item name: (identifier) @decl.name) @decl.item
+        (type_item name: (type_identifier) @decl.name) @decl.item
+        (const_item name: (identifier) @decl.name) @decl.item
+        (static_item name: (identifier) @decl.name) @decl.item
+        "#,
+    )?;
+    let capture_names = query.capture_names();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source);
+    while let Some(m) = matches.next() {
+        let mut name_node = None;
+        let mut item_node = None;
+        for capture in m.captures {
+            match capture_names[capture.index as usize] {
+                "decl.name" => name_node = Some(capture.node),
+                "decl.item" => item_node = Some(capture.node),
+                _ => {}
+            }
+        }
+        let (Some(name_node), Some(item_node)) = (name_node, item_node) else {
+            continue;
+        };
+        if name_node.utf8_text(source)? != symbol {
+            continue;
+        }
+        if !rust_node_kind_matches_symbol_kind(item_node.kind(), symbol_kind) {
+            continue;
+        }
+        return Ok((
+            item_node.start_byte(),
+            item_node.end_byte(),
+            item_node.utf8_text(source)?.to_string(),
+        ));
+    }
+    bail!("could not find Rust {symbol_kind} declaration {symbol:?}")
+}
+
+fn remove_rust_declaration_range(content: &str, start: usize, end: usize) -> String {
+    let mut remove_start = start;
+    let line_start = content[..start].rfind('\n').map(|pos| pos + 1).unwrap_or(0);
+    if content[line_start..start].trim().is_empty() {
+        remove_start = line_start;
+    }
+    let mut remove_end = end;
+    if content[remove_end..].starts_with("\n\n") {
+        remove_end += 2;
+    } else if content[remove_end..].starts_with('\n') {
+        remove_end += 1;
+    }
+
+    let mut out = String::with_capacity(content.len().saturating_sub(remove_end - remove_start));
+    out.push_str(&content[..remove_start]);
+    out.push_str(&content[remove_end..]);
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
+    }
+    out
+}
+
+fn rust_item_prelude_insert_offset(content: &str) -> usize {
+    let mut offset = 0usize;
+    let mut insert_at = 0usize;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("#!")
+            || trimmed.starts_with("//!")
+            || trimmed.starts_with("use ")
+            || trimmed.starts_with("pub use ")
+            || trimmed.starts_with("extern crate ")
+            || trimmed.starts_with("mod ")
+            || trimmed.starts_with("pub mod ")
+        {
+            insert_at = offset + line.len();
+            offset += line.len();
+            continue;
+        }
+        break;
+    }
+    insert_at
+}
+
+fn insert_rust_item_after_prelude(content: &str, item: &str) -> String {
+    let item = item.trim();
+    let insert_at = rust_item_prelude_insert_offset(content);
+    let before = &content[..insert_at];
+    let after = &content[insert_at..];
+    let prefix = if before.is_empty() || before.ends_with("\n\n") {
+        ""
+    } else {
+        "\n"
+    };
+    let suffix = if after.is_empty() || after.starts_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    format!("{before}{prefix}{item}{suffix}{after}")
+}
+
+fn rust_move_module_name(source_file: &Path, destination_file: &Path) -> Result<String> {
+    if source_file.parent() != destination_file.parent() {
+        bail!(
+            "move_declaration currently supports existing destination files in the same directory"
+        );
+    }
+    let module = destination_file
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .context("move_declaration destination file must have a UTF-8 file stem")?;
+    validate_rust_identifier(module, "destination module name")?;
+    Ok(module.to_string())
+}
+
+fn ensure_rust_mod_decl(content: &str, module: &str) -> Result<(String, usize)> {
+    validate_rust_identifier(module, "destination module name")?;
+    let private_decl = format!("mod {module};");
+    let public_decl = format!("pub mod {module};");
+    if content
+        .lines()
+        .any(|line| matches!(line.trim(), value if value == private_decl || value == public_decl))
+    {
+        return Ok((content.to_string(), 0));
+    }
+    Ok((insert_rust_item_after_prelude(content, &private_decl), 1))
+}
+
+fn ensure_rust_use_decl(content: &str, module: &str, symbol: &str) -> Result<(String, usize)> {
+    validate_rust_identifier(module, "destination module name")?;
+    validate_rust_identifier(symbol, "symbol")?;
+    let import = format!("use {module}::{symbol};");
+    if content.lines().any(|line| line.trim() == import) {
+        return Ok((content.to_string(), 0));
+    }
+    Ok((insert_rust_item_after_prelude(content, &import), 1))
+}
+
+fn preview_rust_move_declaration(
+    source_content: &str,
+    destination_content: &str,
+    source_file_abs: &Path,
+    destination_file_abs: &Path,
+    symbol: &str,
+    symbol_kind: &str,
+) -> Result<((String, usize), (String, usize))> {
+    if source_file_abs == destination_file_abs {
+        bail!("move_declaration destination must differ from source file");
+    }
+    let module = rust_move_module_name(source_file_abs, destination_file_abs)?;
+    let (start, end, declaration) =
+        rust_named_declaration_range(source_content, symbol, symbol_kind)?;
+    let mut updated_source = remove_rust_declaration_range(source_content, start, end);
+    let (with_mod, mod_count) = ensure_rust_mod_decl(&updated_source, &module)?;
+    updated_source = with_mod;
+    let (with_use, use_count) = ensure_rust_use_decl(&updated_source, &module, symbol)?;
+    updated_source = with_use;
+    let updated_destination = insert_rust_item_after_prelude(destination_content, &declaration);
+    validate_rust_source_fragment(&updated_source, "move_declaration source")?;
+    validate_rust_source_fragment(&updated_destination, "move_declaration destination")?;
+    Ok((
+        (updated_source, 1 + mod_count + use_count),
+        (updated_destination, 1),
+    ))
+}
+
 fn target_symbol_name<'a>(
     target_symbol: Option<&'a SemanticEditSymbolTarget>,
     kind: &str,
@@ -4478,6 +4875,22 @@ fn preview_semantic_edit_content(
                 .as_deref()
                 .context("insert_import requires replacement")?,
         ),
+        "add_method" => {
+            let target = target_symbol.with_context(
+                || "semantic edit kind \"add_method\" requires a resolved target symbol",
+            )?;
+            if !matches!(target.kind.as_str(), "struct" | "enum") {
+                bail!("add_method currently supports Rust struct and enum targets");
+            }
+            add_rust_method(
+                content,
+                &target.name,
+                intent
+                    .replacement
+                    .as_deref()
+                    .context("add_method requires replacement")?,
+            )
+        }
         "rewrite_call_sites" => rewrite_rust_call_sites(
             content,
             target_symbol_name(target_symbol, kind)?,
@@ -4610,42 +5023,58 @@ fn plan_semantic_edit_intent(
 ) -> Result<SemanticEditIntentDraft> {
     let kind = normalize_semantic_edit_kind(&intent.kind);
     validate_semantic_edit_intent(&kind, intent)?;
-
-    let mut target_hit = None;
-    let (mut target_symbol, file_abs, mut target_range) =
-        if let Some(symbol) = intent.symbol.as_deref() {
-            let (hit, file_abs) =
-                resolve_semantic_edit_symbol(root, scope, symbol, intent.file.as_deref(), budget)?;
-            let start = symbol_hit_line(&hit);
-            let end = symbol_hit_end_line(&hit).unwrap_or(start).max(start);
-            let file_display = semantic_edit_file_display(root, &file_abs);
-            target_hit = Some(hit.clone());
-            (
-                Some(SemanticEditSymbolTarget {
-                    name: hit.name,
-                    kind: hit.kind,
-                    language: hit.language,
-                    file: file_display,
-                    line: start,
-                    end_line: Some(end),
-                    span: None,
-                }),
-                file_abs,
-                Some(SourceRangePreview {
-                    start,
-                    end,
-                    total_lines: 0,
-                    truncated_before: false,
-                    truncated_after: false,
-                }),
-            )
-        } else {
-            let file = intent
+    let destination_file_abs = if kind == "move_declaration" {
+        Some(resolve_source_file(
+            root,
+            intent
                 .file
                 .as_deref()
-                .context("semantic edit intent requires `file` when `symbol` is omitted")?;
-            (None, resolve_source_file(root, file)?, None)
+                .context("move_declaration requires destination `file`")?,
+        )?)
+    } else {
+        None
+    };
+
+    let mut target_hit = None;
+    let (mut target_symbol, file_abs, mut target_range) = if let Some(symbol) =
+        intent.symbol.as_deref()
+    {
+        let file_hint = if kind == "move_declaration" {
+            None
+        } else {
+            intent.file.as_deref()
         };
+        let (hit, file_abs) = resolve_semantic_edit_symbol(root, scope, symbol, file_hint, budget)?;
+        let start = symbol_hit_line(&hit);
+        let end = symbol_hit_end_line(&hit).unwrap_or(start).max(start);
+        let file_display = semantic_edit_file_display(root, &file_abs);
+        target_hit = Some(hit.clone());
+        (
+            Some(SemanticEditSymbolTarget {
+                name: hit.name,
+                kind: hit.kind,
+                language: hit.language,
+                file: file_display,
+                line: start,
+                end_line: Some(end),
+                span: None,
+            }),
+            file_abs,
+            Some(SourceRangePreview {
+                start,
+                end,
+                total_lines: 0,
+                truncated_before: false,
+                truncated_after: false,
+            }),
+        )
+    } else {
+        let file = intent
+            .file
+            .as_deref()
+            .context("semantic edit intent requires `file` when `symbol` is omitted")?;
+        (None, resolve_source_file(root, file)?, None)
+    };
 
     let source = fs::read(&file_abs).with_context(|| format!("reading {}", file_abs.display()))?;
     let source_text = String::from_utf8(source.clone());
@@ -4666,6 +5095,9 @@ fn plan_semantic_edit_intent(
         range.total_lines = total_lines;
     }
     let target_file = semantic_edit_file_display(root, &file_abs);
+    let destination_file = destination_file_abs
+        .as_deref()
+        .map(|file| semantic_edit_file_display(root, file));
     let (call_refs, cross_file_call_ref_total) = if matches!(
         kind.as_str(),
         "rewrite_call_sites" | "update_call_signature"
@@ -4694,31 +5126,95 @@ fn plan_semantic_edit_intent(
         )
     } else {
         match source_text {
-            Ok(source_text) => match preview_semantic_edit_content(
-                &source_text,
-                &file_abs,
-                &language,
-                &kind,
-                intent,
-                target_symbol.as_ref(),
-                SemanticEditCallRefContext {
-                    refs: &call_refs,
-                    cross_file_total: cross_file_call_ref_total,
-                },
-            ) {
-                Ok((preview, _)) => (
-                    "planned".to_string(),
-                    true,
-                    semantic_edit_diff_preview(&source_text, &preview, budget),
-                    format!("validated {kind} intent; Rust executor can apply this edit"),
-                ),
-                Err(err) => (
-                    "unsupported".to_string(),
-                    false,
-                    None,
-                    format!("{kind} intent is not applyable by the current executor: {err:#}"),
-                ),
-            },
+            Ok(source_text) => {
+                if kind == "move_declaration" {
+                    let destination_file_abs = destination_file_abs
+                        .as_deref()
+                        .context("move_declaration requires destination `file`")?;
+                    match fs::read_to_string(destination_file_abs)
+                        .with_context(|| format!("reading {}", destination_file_abs.display()))
+                        .and_then(|destination_text| {
+                            let target = target_symbol
+                                .as_ref()
+                                .context("move_declaration requires a resolved target symbol")?;
+                            preview_rust_move_declaration(
+                                &source_text,
+                                &destination_text,
+                                &file_abs,
+                                destination_file_abs,
+                                &target.name,
+                                &target.kind,
+                            )
+                            .map(|preview| (destination_text, preview))
+                        }) {
+                        Ok((destination_text, ((source_preview, _), (destination_preview, _)))) => {
+                            let mut diff_parts = Vec::new();
+                            if let Some(source_diff) =
+                                semantic_edit_diff_preview(&source_text, &source_preview, budget)
+                            {
+                                diff_parts.push(format!("{target_file}\n{source_diff}"));
+                            }
+                            if let Some(destination_file) = &destination_file
+                                && let Some(destination_diff) = semantic_edit_diff_preview(
+                                    &destination_text,
+                                    &destination_preview,
+                                    budget,
+                                )
+                            {
+                                diff_parts.push(format!("{destination_file}\n{destination_diff}"));
+                            }
+                            (
+                                "planned".to_string(),
+                                true,
+                                (!diff_parts.is_empty()).then(|| {
+                                    truncate_for_budget(
+                                        &diff_parts.join("\n\n"),
+                                        budget.preview_bytes(),
+                                    )
+                                }),
+                                "validated move_declaration intent; Rust executor can apply this edit"
+                                    .to_string(),
+                            )
+                        }
+                        Err(err) => (
+                            "unsupported".to_string(),
+                            false,
+                            None,
+                            format!(
+                                "move_declaration intent is not applyable by the current executor: {err:#}"
+                            ),
+                        ),
+                    }
+                } else {
+                    match preview_semantic_edit_content(
+                        &source_text,
+                        &file_abs,
+                        &language,
+                        &kind,
+                        intent,
+                        target_symbol.as_ref(),
+                        SemanticEditCallRefContext {
+                            refs: &call_refs,
+                            cross_file_total: cross_file_call_ref_total,
+                        },
+                    ) {
+                        Ok((preview, _)) => (
+                            "planned".to_string(),
+                            true,
+                            semantic_edit_diff_preview(&source_text, &preview, budget),
+                            format!("validated {kind} intent; Rust executor can apply this edit"),
+                        ),
+                        Err(err) => (
+                            "unsupported".to_string(),
+                            false,
+                            None,
+                            format!(
+                                "{kind} intent is not applyable by the current executor: {err:#}"
+                            ),
+                        ),
+                    }
+                }
+            }
             Err(err) => (
                 "unsupported".to_string(),
                 false,
@@ -4743,6 +5239,7 @@ fn plan_semantic_edit_intent(
             cross_file_call_ref_total: (cross_file_call_ref_total > 0)
                 .then_some(cross_file_call_ref_total),
             target_file,
+            destination_file,
             target_range,
             content_hash,
             diff,
@@ -4750,6 +5247,7 @@ fn plan_semantic_edit_intent(
             message: truncate_for_budget(&message, budget.preview_bytes()),
         },
         file_abs,
+        destination_file_abs,
         language,
     })
 }
@@ -4759,6 +5257,28 @@ struct SemanticEditFileBuffer {
     current: String,
     language: String,
     intents: usize,
+}
+
+fn ensure_semantic_edit_file_buffer(
+    files: &mut BTreeMap<PathBuf, SemanticEditFileBuffer>,
+    file_abs: &Path,
+    language: String,
+) -> Result<()> {
+    if files.contains_key(file_abs) {
+        return Ok(());
+    }
+    let original =
+        fs::read_to_string(file_abs).with_context(|| format!("reading {}", file_abs.display()))?;
+    files.insert(
+        file_abs.to_path_buf(),
+        SemanticEditFileBuffer {
+            original: original.clone(),
+            current: original,
+            language,
+            intents: 0,
+        },
+    );
+    Ok(())
 }
 
 fn apply_semantic_edit_drafts(
@@ -4780,23 +5300,63 @@ fn apply_semantic_edit_drafts(
 
     let mut files = BTreeMap::<PathBuf, SemanticEditFileBuffer>::new();
     for (idx, draft) in drafts.iter_mut().enumerate() {
-        let file_abs = draft.file_abs.clone();
-        let buffer = if files.contains_key(&file_abs) {
-            files.get_mut(&file_abs).unwrap()
-        } else {
-            let original = fs::read_to_string(&file_abs)
-                .with_context(|| format!("reading {}", file_abs.display()))?;
-            files.insert(
-                file_abs.clone(),
-                SemanticEditFileBuffer {
-                    original: original.clone(),
-                    current: original,
-                    language: draft.language.clone(),
-                    intents: 0,
-                },
+        if draft.plan.kind == "move_declaration" {
+            let source_file_abs = draft.file_abs.clone();
+            let destination_file_abs = draft
+                .destination_file_abs
+                .clone()
+                .context("move_declaration requires destination file")?;
+            ensure_semantic_edit_file_buffer(&mut files, &source_file_abs, draft.language.clone())?;
+            ensure_semantic_edit_file_buffer(
+                &mut files,
+                &destination_file_abs,
+                semantic_edit_language_for_file(&destination_file_abs),
+            )?;
+
+            let source_current = files
+                .get(&source_file_abs)
+                .map(|buffer| buffer.current.clone())
+                .context("missing source buffer for move_declaration")?;
+            let destination_current = files
+                .get(&destination_file_abs)
+                .map(|buffer| buffer.current.clone())
+                .context("missing destination buffer for move_declaration")?;
+            let target = draft
+                .plan
+                .target_symbol
+                .as_ref()
+                .context("move_declaration requires a resolved target symbol")?;
+            let ((updated_source, source_replacements), (updated_destination, dest_replacements)) =
+                preview_rust_move_declaration(
+                    &source_current,
+                    &destination_current,
+                    &source_file_abs,
+                    &destination_file_abs,
+                    &target.name,
+                    &target.kind,
+                )
+                .with_context(|| format!("applying {}", draft.plan.handle))?;
+
+            if let Some(source) = files.get_mut(&source_file_abs) {
+                source.current = updated_source;
+                source.intents += source_replacements.max(1);
+            }
+            if let Some(destination) = files.get_mut(&destination_file_abs) {
+                destination.current = updated_destination;
+                destination.intents += dest_replacements.max(1);
+            }
+            draft.plan.status = "applied".to_string();
+            draft.plan.applied = true;
+            draft.plan.message = truncate_for_budget(
+                "applied move_declaration intent through the Rust semantic edit executor",
+                budget.preview_bytes(),
             );
-            files.get_mut(&file_abs).unwrap()
-        };
+            continue;
+        }
+
+        let file_abs = draft.file_abs.clone();
+        ensure_semantic_edit_file_buffer(&mut files, &file_abs, draft.language.clone())?;
+        let buffer = files.get_mut(&file_abs).unwrap();
         let (updated, replacements) = preview_semantic_edit_content(
             &buffer.current,
             &draft.file_abs,

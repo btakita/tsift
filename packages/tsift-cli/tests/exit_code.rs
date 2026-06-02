@@ -517,6 +517,46 @@ fn indexed_cli_fixture() -> tempfile::TempDir {
     dir
 }
 
+fn structural_edit_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        r#"pub struct Widget {
+    value: i32,
+}
+
+pub fn moved() -> i32 {
+    7
+}
+
+fn caller() -> i32 {
+    moved()
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("widget.rs"),
+        r#"pub fn existing() -> i32 {
+    1
+}
+"#,
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
+}
+
 fn setup_tokensave_db(dir: &Path) {
     let tokensave_dir = dir.join(".tokensave");
     fs::create_dir_all(&tokensave_dir).unwrap();
@@ -3094,6 +3134,189 @@ fn edit_intents_apply_refuses_signature_update_without_call_replacement() {
     assert_eq!(
         fs::read_to_string(dir.path().join("main.rs")).unwrap(),
         before
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unsupported"), "stderr was: {stderr}");
+}
+
+#[test]
+fn edit_intents_apply_adds_rust_method_to_struct_impl() {
+    let dir = structural_edit_fixture();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "add_method",
+                "symbol": "Widget",
+                "replacement": "pub fn value(&self) -> i32 { self.value }"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "add_method stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = &json["report"]["plans"][0];
+    assert_eq!(plan["kind"], "add_method");
+    assert_eq!(plan["status"], "applied");
+    assert_eq!(plan["target_symbol"]["kind"], "struct");
+    assert_eq!(plan["formatter"], "rustfmt --edition 2024");
+
+    let source = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    assert!(
+        source.contains(
+            "impl Widget {\n    pub fn value(&self) -> i32 {\n        self.value\n    }\n}"
+        ),
+        "{source}"
+    );
+}
+
+#[test]
+fn edit_intents_apply_moves_rust_declaration_between_module_files() {
+    let dir = structural_edit_fixture();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "move_declaration",
+                "symbol": "moved",
+                "file": "widget.rs"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "move_declaration stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = &json["report"]["plans"][0];
+    assert_eq!(plan["kind"], "move_declaration");
+    assert_eq!(plan["status"], "applied");
+    assert_eq!(plan["target_file"], "main.rs");
+    assert_eq!(plan["destination_file"], "widget.rs");
+
+    let source = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    assert!(source.contains("mod widget;"), "{source}");
+    assert!(source.contains("use widget::moved;"), "{source}");
+    assert!(!source.contains("pub fn moved()"), "{source}");
+    assert!(
+        source.contains("fn caller() -> i32 {\n    moved()\n}"),
+        "{source}"
+    );
+
+    let destination = fs::read_to_string(dir.path().join("widget.rs")).unwrap();
+    assert!(
+        destination.contains("pub fn moved() -> i32 {\n    7\n}"),
+        "{destination}"
+    );
+    assert!(
+        destination.contains("pub fn existing() -> i32 {\n    1\n}"),
+        "{destination}"
+    );
+}
+
+#[test]
+fn edit_intents_apply_refuses_move_declaration_without_mutating() {
+    let dir = structural_edit_fixture();
+    let before_source = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    let before_destination = fs::read_to_string(dir.path().join("widget.rs")).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "move_declaration",
+                "symbol": "moved",
+                "file": "main.rs"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "same-file move_declaration should fail"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+        before_source
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("widget.rs")).unwrap(),
+        before_destination
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unsupported"), "stderr was: {stderr}");
