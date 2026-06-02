@@ -385,6 +385,29 @@ struct MarkdownSpanMetadata {
     list_depth: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fence_language: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    embedded_symbols: Vec<MarkdownEmbeddedSymbol>,
+}
+
+#[derive(Serialize, Clone)]
+struct MarkdownEmbeddedSymbol {
+    handle: String,
+    name: String,
+    kind: String,
+    language: String,
+    node_kind: String,
+    start_byte: usize,
+    end_byte: usize,
+    start_line: usize,
+    end_line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_start_byte: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_end_byte: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_start_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_end_line: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -17177,6 +17200,140 @@ fn link_ast_navigation_edges(
     }
 }
 
+fn traversal_markdown_embedded_symbol_node(
+    root: &Path,
+    entry: &TraversalAstSpanIndexEntry,
+    markdown: &MarkdownSpanMetadata,
+    embedded: &MarkdownEmbeddedSymbol,
+) -> TraversalNode {
+    let mut properties = BTreeMap::new();
+    properties.insert("layer".to_string(), "embedded_code".to_string());
+    properties.insert("embedded".to_string(), "true".to_string());
+    properties.insert("language".to_string(), embedded.language.clone());
+    properties.insert("symbol_kind".to_string(), embedded.kind.clone());
+    properties.insert("node_kind".to_string(), embedded.node_kind.clone());
+    properties.insert("start_byte".to_string(), embedded.start_byte.to_string());
+    properties.insert("end_byte".to_string(), embedded.end_byte.to_string());
+    properties.insert("end_line".to_string(), embedded.end_line.to_string());
+    properties.insert("markdown_block_handle".to_string(), entry.handle.clone());
+    properties.insert(
+        "markdown_block_kind".to_string(),
+        markdown_ast_block_kind(&entry.kind),
+    );
+    if let Some(body_start_byte) = embedded.body_start_byte {
+        properties.insert("body_start_byte".to_string(), body_start_byte.to_string());
+    }
+    if let Some(body_end_byte) = embedded.body_end_byte {
+        properties.insert("body_end_byte".to_string(), body_end_byte.to_string());
+    }
+    if let Some(body_start_line) = embedded.body_start_line {
+        properties.insert("body_start_line".to_string(), body_start_line.to_string());
+    }
+    if let Some(body_end_line) = embedded.body_end_line {
+        properties.insert("body_end_line".to_string(), body_end_line.to_string());
+    }
+    if let Some(fence_language) = &markdown.fence_language {
+        properties.insert("fence_language".to_string(), fence_language.clone());
+    }
+    if !markdown.section_path.is_empty() {
+        properties.insert(
+            "section_path".to_string(),
+            markdown.section_path.join(" > "),
+        );
+    }
+    if let Some(section_handle) = &markdown.section_handle {
+        properties.insert("section_handle".to_string(), section_handle.clone());
+    }
+    let line_count = embedded
+        .end_line
+        .saturating_sub(embedded.start_line)
+        .saturating_add(1)
+        .max(1);
+    TraversalNode {
+        handle: embedded.handle.clone(),
+        kind: "ast_span".to_string(),
+        label: embedded.name.clone(),
+        ref_id: Some(embedded.name.clone()),
+        path: Some(entry.file.clone()),
+        line: Some(i64::try_from(embedded.start_line).unwrap_or(i64::MAX)),
+        detail: Some(format!(
+            "{} {} embedded in Markdown fence",
+            embedded.language, embedded.kind
+        )),
+        properties,
+        expand: source_read_command(root, &entry.file, embedded.start_line, line_count),
+    }
+}
+
+fn link_markdown_embedded_code_edges(
+    graph: &mut TraversalGraphBuild,
+    root: &Path,
+    entries: &[TraversalAstSpanIndexEntry],
+) {
+    for entry in entries {
+        let Some(markdown) = &entry.markdown else {
+            continue;
+        };
+        for embedded in &markdown.embedded_symbols {
+            let node = traversal_markdown_embedded_symbol_node(root, entry, markdown, embedded);
+            graph.add_node(node);
+            graph.add_edge(
+                &entry.handle,
+                &embedded.handle,
+                "contains",
+                Some("Markdown fence contains embedded AST symbol".to_string()),
+                1,
+            );
+            graph.add_edge(
+                &entry.handle,
+                &embedded.handle,
+                "child",
+                Some("embedded code symbol".to_string()),
+                1,
+            );
+            graph.add_edge(
+                &entry.handle,
+                &embedded.handle,
+                "contains_embedded_symbol",
+                Some("Markdown fence contains embedded code symbol".to_string()),
+                1,
+            );
+            graph.add_edge(
+                &embedded.handle,
+                &entry.handle,
+                "parent",
+                Some("Markdown fence parent span".to_string()),
+                1,
+            );
+            graph.add_edge(
+                &embedded.handle,
+                &entry.handle,
+                "embedded_in_fence",
+                Some("embedded code symbol belongs to Markdown fence".to_string()),
+                1,
+            );
+            if let Some(section_handle) = &markdown.section_handle
+                && section_handle != &entry.handle
+            {
+                graph.add_edge(
+                    section_handle,
+                    &embedded.handle,
+                    "contains_embedded_code",
+                    Some("Markdown section contains embedded code symbol".to_string()),
+                    1,
+                );
+                graph.add_edge(
+                    &embedded.handle,
+                    section_handle,
+                    "enclosing_section",
+                    Some("Markdown enclosing section".to_string()),
+                    1,
+                );
+            }
+        }
+    }
+}
+
 fn traversal_node_tokens(node: &TraversalNode) -> BTreeSet<String> {
     let mut tokens = traversal_tokens(&node.label);
     if let Some(ref_id) = &node.ref_id {
@@ -18438,6 +18595,7 @@ fn build_traversal_graph_source_with_options(
                     symbol_entries.push(entry);
                 }
                 link_ast_navigation_edges(&mut graph, &ast_entries);
+                link_markdown_embedded_code_edges(&mut graph, root, &ast_entries);
 
                 if !bounded_session_projection {
                     for edge in db.all_stored_edges()? {
@@ -18865,7 +19023,11 @@ fn traversal_relation_score(edge: &TraversalEdge, origin: &str) -> usize {
         "mentions" => 100,
         "contains" => 80,
         "parent" | "child" | "has_ast_span" | "represents_symbol" => 78,
-        "contains_markdown_block" | "enclosing_module" | "enclosing_section" => 76,
+        "contains_embedded_symbol" | "embedded_in_fence" => 77,
+        "contains_markdown_block"
+        | "contains_embedded_code"
+        | "enclosing_module"
+        | "enclosing_section" => 76,
         "calls" => {
             if edge.from == origin {
                 70
@@ -18903,6 +19065,9 @@ fn traversal_recommendation_reason(edge: &TraversalEdge, origin: &str) -> String
         "previous_sibling" => "previous AST sibling".to_string(),
         "next_sibling" => "next AST sibling".to_string(),
         "contains_markdown_block" => "Markdown section block".to_string(),
+        "contains_embedded_symbol" => "embedded code symbol in Markdown fence".to_string(),
+        "embedded_in_fence" => "Markdown fence containing the embedded symbol".to_string(),
+        "contains_embedded_code" => "embedded code symbol in Markdown section".to_string(),
         "enclosing_module" => "nearest enclosing module".to_string(),
         "enclosing_section" => "nearest enclosing Markdown section".to_string(),
         "defines" if edge.from == origin => "symbol defined in selected file".to_string(),
@@ -19906,6 +20071,8 @@ struct MarkdownAstNodeMetadata {
     fence_language: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fence_marker: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    embedded_symbols: Vec<MarkdownEmbeddedSymbol>,
 }
 
 #[derive(Serialize, Clone)]
@@ -20317,18 +20484,31 @@ fn markdown_stored_symbol_metadata(
         .flatten();
     let list_depth = (symbol.kind == "list_item").then(|| markdown_list_depth(source, start_byte));
     let fence_language = (symbol.kind == "code_block").then(|| symbol.name.clone());
+    let embedded_symbols = if symbol.kind == "code_block" {
+        markdown_embedded_symbols(
+            &symbol.file,
+            source,
+            symbol_span_byte(symbol.body_start_byte),
+            symbol_span_byte(symbol.body_end_byte),
+            fence_language.as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
 
     (heading_level.is_some()
         || !section_path.is_empty()
         || section_handle.is_some()
         || list_depth.is_some()
-        || fence_language.is_some())
+        || fence_language.is_some()
+        || !embedded_symbols.is_empty())
     .then_some(MarkdownSpanMetadata {
         heading_level,
         section_path,
         section_handle,
         list_depth,
         fence_language,
+        embedded_symbols,
     })
 }
 
@@ -20345,15 +20525,29 @@ fn markdown_symbol_hit_metadata(
         .flatten();
     let list_depth = (symbol.kind == "list_item").then(|| markdown_list_depth(source, start_byte));
     let fence_language = (symbol.kind == "code_block").then(|| symbol.name.clone());
-    (heading_level.is_some() || list_depth.is_some() || fence_language.is_some()).then_some(
-        MarkdownSpanMetadata {
-            heading_level,
-            section_path: Vec::new(),
-            section_handle: None,
-            list_depth,
-            fence_language,
-        },
-    )
+    let embedded_symbols = if symbol.kind == "code_block" {
+        markdown_embedded_symbols(
+            &symbol.file,
+            source,
+            symbol_span_byte(symbol.body_start_byte),
+            symbol_span_byte(symbol.body_end_byte),
+            fence_language.as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
+    (heading_level.is_some()
+        || list_depth.is_some()
+        || fence_language.is_some()
+        || !embedded_symbols.is_empty())
+    .then_some(MarkdownSpanMetadata {
+        heading_level,
+        section_path: Vec::new(),
+        section_handle: None,
+        list_depth,
+        fence_language,
+        embedded_symbols,
+    })
 }
 
 fn is_markdown_path(path: &Path) -> bool {
@@ -20371,6 +20565,115 @@ fn markdown_ast_block_kind(kind: &str) -> String {
         other => other,
     }
     .to_string()
+}
+
+fn markdown_embedded_language_key(language: &str) -> Option<String> {
+    let key = language
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches("language-")
+        .trim_start_matches("lang-")
+        .trim_matches(|ch| matches!(ch, '`' | '"' | '\''))
+        .to_ascii_lowercase();
+    (!key.is_empty()).then_some(key)
+}
+
+fn markdown_embedded_lang(language: &str) -> Option<graph::Lang> {
+    let key = markdown_embedded_language_key(language)?;
+    let extension = match key.as_str() {
+        "rust" => "rs",
+        "python" => "py",
+        "typescript" => "ts",
+        "javascript" => "js",
+        "kotlin" => "kt",
+        "shell" | "sh" | "zsh" => "bash",
+        other => other,
+    };
+    let lang = graph::Lang::from_extension(extension)?;
+    (lang.name() != "markdown").then_some(lang)
+}
+
+fn markdown_embedded_ast_span_handle(
+    file: &str,
+    language: &str,
+    name: &str,
+    kind: &str,
+    start_byte: usize,
+    end_byte: usize,
+) -> String {
+    stable_handle(
+        "span",
+        &format!("{file}:embedded:{language}:{kind}:{name}:{start_byte}:{end_byte}"),
+    )
+}
+
+fn markdown_embedded_symbols(
+    file: &str,
+    source: &[u8],
+    body_start_byte: Option<usize>,
+    body_end_byte: Option<usize>,
+    fence_language: Option<&str>,
+) -> Vec<MarkdownEmbeddedSymbol> {
+    let Some(fence_language) = fence_language else {
+        return Vec::new();
+    };
+    let Some(lang) = markdown_embedded_lang(fence_language) else {
+        return Vec::new();
+    };
+    let Some((body_start_byte, body_end_byte)) = body_start_byte.zip(body_end_byte) else {
+        return Vec::new();
+    };
+    let Some(body) = source.get(body_start_byte.min(source.len())..body_end_byte.min(source.len()))
+    else {
+        return Vec::new();
+    };
+    if body.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(symbols) = lang.extract_symbols(body) else {
+        return Vec::new();
+    };
+    let language = lang.name().to_string();
+    symbols
+        .into_iter()
+        .map(|symbol| {
+            let start_byte = body_start_byte.saturating_add(symbol.start_byte);
+            let end_byte = body_start_byte.saturating_add(symbol.end_byte);
+            let body_start = symbol
+                .body_start_byte
+                .map(|byte| body_start_byte.saturating_add(byte));
+            let body_end = symbol
+                .body_end_byte
+                .map(|byte| body_start_byte.saturating_add(byte));
+            let start_line = source_line_for_byte(source, start_byte);
+            let end_line = source_line_for_end_byte(source, end_byte).max(start_line);
+            MarkdownEmbeddedSymbol {
+                handle: markdown_embedded_ast_span_handle(
+                    file,
+                    &language,
+                    &symbol.name,
+                    &symbol.kind,
+                    start_byte,
+                    end_byte,
+                ),
+                name: symbol.name,
+                kind: symbol.kind,
+                language: language.clone(),
+                node_kind: symbol.node_kind,
+                start_byte,
+                end_byte,
+                start_line,
+                end_line,
+                body_start_byte: body_start,
+                body_end_byte: body_end,
+                body_start_line: body_start.map(|byte| source_line_for_byte(source, byte)),
+                body_end_line: body_end.map(|byte| source_line_for_end_byte(source, byte)),
+            }
+        })
+        .collect()
 }
 
 fn markdown_source_line(source: &[u8], start_byte: usize) -> &str {
@@ -20566,7 +20869,7 @@ fn markdown_ast_outline_entry(
         block_kind: node.block_kind.clone(),
         line,
         end_line,
-        section_path: markdown_ast_node_metadata(node, source, nodes).section_path,
+        section_path: markdown_ast_node_metadata(file, node, source, nodes).section_path,
         child_count: markdown_ast_node_direct_child_count(node, nodes),
         expand: markdown_ast_command(root, file, Some(&node.handle)),
     }
@@ -20718,6 +21021,7 @@ fn markdown_ast_section_nodes<'a>(
 }
 
 fn markdown_ast_node_metadata(
+    file: &str,
     node: &MarkdownAstRawNode,
     source: &[u8],
     nodes: &[MarkdownAstRawNode],
@@ -20736,6 +21040,18 @@ fn markdown_ast_node_metadata(
     } else {
         (None, None)
     };
+    let fence_language = (node.kind == "code_block").then(|| node.name.clone());
+    let embedded_symbols = if node.kind == "code_block" {
+        markdown_embedded_symbols(
+            file,
+            source,
+            node.body_start_byte,
+            node.body_end_byte,
+            fence_language.as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
     MarkdownAstNodeMetadata {
         heading_level,
         section_path,
@@ -20744,10 +21060,11 @@ fn markdown_ast_node_metadata(
             .then(|| markdown_list_depth(source, node.start_byte)),
         list_marker,
         list_order,
-        fence_language: (node.kind == "code_block").then(|| node.name.clone()),
+        fence_language,
         fence_marker: (node.kind == "code_block")
             .then(|| markdown_fence_marker(source, node.start_byte))
             .flatten(),
+        embedded_symbols,
     }
 }
 
@@ -20811,7 +21128,7 @@ fn markdown_ast_node(
         body_byte_span,
         parent_handle: markdown_ast_parent_handle(node, nodes),
         child_handles: markdown_ast_child_handles(node, nodes, child_limit),
-        metadata: markdown_ast_node_metadata(node, source, nodes),
+        metadata: markdown_ast_node_metadata(file, node, source, nodes),
         expand: markdown_ast_node_expand(root, file, node, source),
     }
 }
@@ -30277,6 +30594,17 @@ fn search_facet_ast_context(
             child_values.extend(search_facet_symbol_values(child));
         }
     }
+    if let Some(markdown) = &ast.markdown {
+        for embedded in &markdown.embedded_symbols {
+            child_values.extend([
+                embedded.handle.clone(),
+                embedded.name.clone(),
+                embedded.kind.clone(),
+                embedded.language.clone(),
+                embedded.node_kind.clone(),
+            ]);
+        }
+    }
     child_values.sort();
     child_values.dedup();
 
@@ -33030,6 +33358,7 @@ fn main() { api::handler(); }
         let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
         let guide = resolve_ast_span_node(&graph, "Guide", "heading");
         let code = resolve_ast_span_node(&graph, "rust", "code_block");
+        let embedded = resolve_ast_span_node(&graph, "demo", "function");
         let list_item = graph
             .nodes
             .values()
@@ -33048,6 +33377,18 @@ fn main() { api::handler(); }
             guide.properties.get("heading_level"),
             Some(&"1".to_string())
         );
+        assert_eq!(
+            embedded.properties.get("embedded"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(
+            embedded.properties.get("language"),
+            Some(&"rust".to_string())
+        );
+        assert_eq!(
+            embedded.properties.get("markdown_block_handle"),
+            Some(&code.handle)
+        );
         assert!(graph.edges.iter().any(|edge| {
             edge.from == guide.handle
                 && edge.to == code.handle
@@ -33063,6 +33404,21 @@ fn main() { api::handler(); }
                 && edge.to == list_item.handle
                 && edge.relation == "contains_markdown_block"
         }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == code.handle
+                && edge.to == embedded.handle
+                && edge.relation == "contains_embedded_symbol"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == embedded.handle
+                && edge.to == code.handle
+                && edge.relation == "embedded_in_fence"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == guide.handle
+                && edge.to == embedded.handle
+                && edge.relation == "contains_embedded_code"
+        }));
 
         let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
         assert!(
@@ -33072,6 +33428,14 @@ fn main() { api::handler(); }
                 .iter()
                 .any(|edge| edge.to_id == code.handle),
             "expected persisted Markdown section/block edge"
+        );
+        assert!(
+            store
+                .outgoing_edges(&code.handle, Some("contains_embedded_symbol"))
+                .unwrap()
+                .iter()
+                .any(|edge| edge.to_id == embedded.handle),
+            "expected persisted Markdown fence/embedded symbol edge"
         );
     }
 
@@ -38125,6 +38489,28 @@ tier = "private"
         assert_eq!(sections.len(), 97);
         assert_eq!(list_items.len(), 96);
         assert_eq!(code_blocks.len(), 96);
+        let first_code = first
+            .nodes
+            .iter()
+            .find(|node| node.kind == "code_block")
+            .expect("expected a Markdown code block");
+        let first_code_node = markdown_ast_node(
+            Path::new("/repo"),
+            "semantic-edit",
+            first_code,
+            content.as_bytes(),
+            &first.nodes,
+            8,
+        );
+        assert_eq!(first_code_node.metadata.embedded_symbols.len(), 1);
+        assert_eq!(
+            first_code_node.metadata.embedded_symbols[0].name,
+            "sample_0"
+        );
+        assert_eq!(
+            first_code_node.metadata.embedded_symbols[0].language,
+            "rust"
+        );
     }
 
     #[test]
@@ -38288,6 +38674,64 @@ tier = "private"
         assert!(ast.expand.symbol_read.contains("symbol-read"));
     }
 
+    #[test]
+    fn search_budget_report_exposes_markdown_embedded_code_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "# Guide\n\n```rust\nfn sample() {}\n```\n";
+        let file = dir.path().join("README.md");
+        fs::write(&file, source).unwrap();
+        let fence_start = source.find("```rust").unwrap();
+        let body_start = source.find("fn sample").unwrap();
+        let body_end = body_start + "fn sample() {}\n".len();
+
+        let response = empty_search_response(dir.path(), "lexical");
+        let symbol_hits = vec![index::SymbolHit {
+            name: "rust".to_string(),
+            kind: "code_block".to_string(),
+            language: "markdown".to_string(),
+            file: file.to_string_lossy().to_string(),
+            line: 2,
+            end_line: Some(4),
+            node_kind: Some("fenced_code_block".to_string()),
+            start_byte: Some(i64::try_from(fence_start).unwrap()),
+            end_byte: Some(i64::try_from(source.len()).unwrap()),
+            body_start_byte: Some(i64::try_from(body_start).unwrap()),
+            body_end_byte: Some(i64::try_from(body_end).unwrap()),
+            tags: Some("rust".to_string()),
+            score: 1.0,
+            match_type: "exact_name".to_string(),
+            tagpath_handle: None,
+        }];
+
+        let report = build_relative_search_budget_report(
+            "rust",
+            "lexical",
+            dir.path(),
+            &response,
+            &symbol_hits,
+            ResponseBudget::new(Some(5), Some(96)),
+            &SearchFacetFilters::default(),
+        );
+
+        let embedded = &report.symbols[0]
+            .ast
+            .as_ref()
+            .unwrap()
+            .span
+            .markdown
+            .as_ref()
+            .unwrap()
+            .embedded_symbols;
+        assert_eq!(embedded.len(), 1);
+        assert_eq!(embedded[0].name, "sample");
+        assert_eq!(embedded[0].kind, "function");
+        assert_eq!(embedded[0].language, "rust");
+        assert_eq!(embedded[0].node_kind, "function_item");
+        assert!(embedded[0].handle.starts_with("span-"));
+        assert_eq!(embedded[0].start_byte, body_start);
+        assert_eq!(embedded[0].start_line, 4);
+    }
+
     fn markdown_search_facet_fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let source = r#"# Guide
@@ -38428,6 +38872,18 @@ fn sample() {}
         );
         assert_eq!(fence.len(), 1);
         assert_eq!(fence[0].kind, "code_block");
+
+        let embedded_child = apply_search_facet_filters(
+            dir.path(),
+            markdown_search_facet_hits(dir.path(), "rust"),
+            &SearchFacetFilters {
+                children: vec!["sample".to_string()],
+                kinds: vec!["code_block".to_string()],
+                ..SearchFacetFilters::default()
+            },
+        );
+        assert_eq!(embedded_child.len(), 1);
+        assert_eq!(embedded_child[0].name, "rust");
     }
 
     #[test]
