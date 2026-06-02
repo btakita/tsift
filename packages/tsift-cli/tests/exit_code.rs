@@ -629,6 +629,38 @@ def beta(value):
     dir
 }
 
+fn markdown_edit_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("README.md"),
+        r#"# Guide
+
+Intro text.
+
+## Install
+
+- Run setup.
+
+```rust
+fn sample() {}
+```
+"#,
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
+}
+
 fn setup_tokensave_db(dir: &Path) {
     let tokensave_dir = dir.join(".tokensave");
     fs::create_dir_all(&tokensave_dir).unwrap();
@@ -2937,6 +2969,126 @@ fn edit_intents_json_validates_semantic_write_plan_without_mutating() {
             .iter()
             .any(|cmd| cmd.as_str().unwrap().contains("tsift source-read"))
     );
+}
+
+#[test]
+fn edit_intents_markdown_contract_recognizes_heading_intent_without_mutating() {
+    let dir = markdown_edit_fixture();
+    let before = fs::read_to_string(dir.path().join("README.md")).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "rename_heading",
+                "symbol": "Guide",
+                "file": "README.md",
+                "new_name": "Manual"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--budget",
+            "normal",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "markdown edit-intents stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("README.md")).unwrap(),
+        before
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "edit-intents");
+    assert_eq!(json["view"], "dry-run");
+    assert_eq!(json["report"]["mode"], "dry_run");
+    assert_eq!(json["report"]["intents_total"], 1);
+    assert_eq!(json["report"]["planned_total"], 0);
+    assert_eq!(json["report"]["unsupported_total"], 1);
+
+    let plan = &json["report"]["plans"][0];
+    assert_eq!(plan["kind"], "rename_heading");
+    assert_eq!(plan["status"], "unsupported");
+    assert_eq!(plan["apply_supported"], false);
+    assert_eq!(plan["applied"], false);
+    assert_eq!(plan["target_file"], "README.md");
+    assert_eq!(plan["target_symbol"]["name"], "Guide");
+    assert_eq!(plan["target_symbol"]["kind"], "heading");
+    assert_eq!(plan["target_symbol"]["language"], "markdown");
+    assert!(
+        plan["target_symbol"]["span"]["handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("span-")
+    );
+    assert_eq!(plan["target_symbol"]["span"]["node_kind"], "atx_heading");
+    assert!(
+        plan["message"]
+            .as_str()
+            .unwrap()
+            .contains("Markdown semantic edit kind")
+    );
+}
+
+#[test]
+fn edit_intents_markdown_apply_refuses_without_mutating() {
+    let dir = markdown_edit_fixture();
+    let before = fs::read_to_string(dir.path().join("README.md")).unwrap();
+    let input = "{\n  \"intents\": [\n    {\n      \"kind\": \"insert_section\",\n      \"file\": \"README.md\",\n      \"replacement\": \"## Usage\\n\\nRun the command.\\n\"\n    }\n  ]\n}";
+
+    let mut child = tsift_bin()
+        .args([
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success(), "markdown apply should fail");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("README.md")).unwrap(),
+        before
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unsupported"), "stderr was: {stderr}");
 }
 
 #[test]

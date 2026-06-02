@@ -486,7 +486,7 @@ pub(crate) enum EditStatus {
     Skipped,
 }
 
-const SEMANTIC_EDIT_KINDS: &[&str] = &[
+const SEMANTIC_EDIT_RUST_KINDS: &[&str] = &[
     "rename_symbol",
     "replace_function_body",
     "insert_import",
@@ -497,6 +497,30 @@ const SEMANTIC_EDIT_KINDS: &[&str] = &[
 ];
 const SEMANTIC_EDIT_SCRIPT_KINDS: &[&str] =
     &["rename_symbol", "replace_function_body", "insert_import"];
+const SEMANTIC_EDIT_MARKDOWN_KINDS: &[&str] = &[
+    "rename_heading",
+    "replace_section_body",
+    "insert_section",
+    "move_section",
+    "insert_list_item",
+    "rewrite_code_fence",
+];
+const SEMANTIC_EDIT_MARKDOWN_APPLY_KINDS: &[&str] = &[];
+const SEMANTIC_EDIT_KINDS: &[&str] = &[
+    "rename_symbol",
+    "replace_function_body",
+    "insert_import",
+    "add_method",
+    "update_call_signature",
+    "move_declaration",
+    "rewrite_call_sites",
+    "rename_heading",
+    "replace_section_body",
+    "insert_section",
+    "move_section",
+    "insert_list_item",
+    "rewrite_code_fence",
+];
 
 struct PlannedEdit {
     index: usize,
@@ -3911,6 +3935,10 @@ fn semantic_edit_kind_requires_symbol(kind: &str) -> bool {
             | "update_call_signature"
             | "move_declaration"
             | "rewrite_call_sites"
+            | "rename_heading"
+            | "replace_section_body"
+            | "move_section"
+            | "rewrite_code_fence"
     )
 }
 
@@ -3922,15 +3950,27 @@ fn semantic_edit_kind_requires_replacement(kind: &str) -> bool {
             | "add_method"
             | "update_call_signature"
             | "rewrite_call_sites"
+            | "replace_section_body"
+            | "insert_section"
+            | "insert_list_item"
+            | "rewrite_code_fence"
     )
 }
 
 fn semantic_edit_kind_requires_new_name(kind: &str) -> bool {
-    kind == "rename_symbol"
+    matches!(kind, "rename_symbol" | "rename_heading")
 }
 
 fn semantic_edit_kind_requires_file(kind: &str) -> bool {
-    matches!(kind, "insert_import" | "move_declaration")
+    matches!(
+        kind,
+        "insert_import"
+            | "move_declaration"
+            | "insert_section"
+            | "move_section"
+            | "insert_list_item"
+            | "rewrite_code_fence"
+    )
 }
 
 fn validate_semantic_edit_intent(kind: &str, intent: &SemanticEditIntent) -> Result<()> {
@@ -4080,6 +4120,7 @@ enum SemanticEditExecutorLanguage {
     Tsx,
     JavaScript,
     Jsx,
+    Markdown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4087,6 +4128,7 @@ enum SemanticEditLanguageFamily {
     Rust,
     Python,
     JsLike,
+    Markdown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4094,6 +4136,7 @@ enum SemanticEditFormatterContract {
     Rustfmt,
     PythonAuto,
     Prettier,
+    None,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4105,7 +4148,8 @@ struct SemanticEditLanguageContract {
     temp_suffix: &'static str,
     aliases: &'static [&'static str],
     extensions: &'static [&'static str],
-    supported_intents: &'static [&'static str],
+    recognized_intents: &'static [&'static str],
+    apply_supported_intents: &'static [&'static str],
     family: SemanticEditLanguageFamily,
     formatter: SemanticEditFormatterContract,
 }
@@ -4119,7 +4163,8 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         temp_suffix: ".rs",
         aliases: &["rust", "rs"],
         extensions: &["rs"],
-        supported_intents: SEMANTIC_EDIT_KINDS,
+        recognized_intents: SEMANTIC_EDIT_RUST_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_RUST_KINDS,
         family: SemanticEditLanguageFamily::Rust,
         formatter: SemanticEditFormatterContract::Rustfmt,
     },
@@ -4131,7 +4176,8 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         temp_suffix: ".py",
         aliases: &["python", "py", "pyi"],
         extensions: &["py", "pyi"],
-        supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        recognized_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
         family: SemanticEditLanguageFamily::Python,
         formatter: SemanticEditFormatterContract::PythonAuto,
     },
@@ -4143,7 +4189,8 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         temp_suffix: ".ts",
         aliases: &["typescript", "ts"],
         extensions: &["ts"],
-        supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        recognized_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
         family: SemanticEditLanguageFamily::JsLike,
         formatter: SemanticEditFormatterContract::Prettier,
     },
@@ -4155,7 +4202,8 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         temp_suffix: ".tsx",
         aliases: &["tsx"],
         extensions: &["tsx"],
-        supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        recognized_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
         family: SemanticEditLanguageFamily::JsLike,
         formatter: SemanticEditFormatterContract::Prettier,
     },
@@ -4167,7 +4215,8 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         temp_suffix: ".js",
         aliases: &["javascript", "js", "mjs", "cjs"],
         extensions: &["js", "mjs", "cjs"],
-        supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        recognized_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
         family: SemanticEditLanguageFamily::JsLike,
         formatter: SemanticEditFormatterContract::Prettier,
     },
@@ -4179,9 +4228,23 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         temp_suffix: ".jsx",
         aliases: &["jsx"],
         extensions: &["jsx"],
-        supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        recognized_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
         family: SemanticEditLanguageFamily::JsLike,
         formatter: SemanticEditFormatterContract::Prettier,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Markdown,
+        id: "markdown",
+        name: "Markdown",
+        graph_lang: graph::Lang::Markdown,
+        temp_suffix: ".md",
+        aliases: &["markdown", "md", "mdx"],
+        extensions: &["md", "mdx"],
+        recognized_intents: SEMANTIC_EDIT_MARKDOWN_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_MARKDOWN_APPLY_KINDS,
+        family: SemanticEditLanguageFamily::Markdown,
+        formatter: SemanticEditFormatterContract::None,
     },
 ];
 
@@ -4214,8 +4277,12 @@ impl SemanticEditExecutorLanguage {
         self.contract().temp_suffix
     }
 
-    fn supported_intents(self) -> &'static [&'static str] {
-        self.contract().supported_intents
+    fn recognized_intents(self) -> &'static [&'static str] {
+        self.contract().recognized_intents
+    }
+
+    fn apply_supported_intents(self) -> &'static [&'static str] {
+        self.contract().apply_supported_intents
     }
 
     fn formatter(self) -> SemanticEditFormatterContract {
@@ -4223,7 +4290,14 @@ impl SemanticEditExecutorLanguage {
     }
 
     fn is_script(self) -> bool {
-        self.contract().family != SemanticEditLanguageFamily::Rust
+        matches!(
+            self.contract().family,
+            SemanticEditLanguageFamily::Python | SemanticEditLanguageFamily::JsLike
+        )
+    }
+
+    fn is_markdown(self) -> bool {
+        self.contract().family == SemanticEditLanguageFamily::Markdown
     }
 
     fn is_python(self) -> bool {
@@ -4257,7 +4331,10 @@ fn semantic_edit_kind_apply_supported(kind: &str, language: &str, file_abs: &Pat
     let Some(executor) = semantic_edit_executor_language(language, file_abs) else {
         return false;
     };
-    executor.supported_intents().contains(&kind)
+    if !executor.recognized_intents().contains(&kind) {
+        return false;
+    }
+    executor.apply_supported_intents().contains(&kind)
 }
 
 fn semantic_edit_executor_name(language: &str, file_abs: &Path) -> String {
@@ -4275,7 +4352,8 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             "src/lib.rs",
             SemanticEditExecutorLanguage::Rust,
             "rust",
-            SEMANTIC_EDIT_KINDS,
+            SEMANTIC_EDIT_RUST_KINDS,
+            SEMANTIC_EDIT_RUST_KINDS,
             SemanticEditFormatterContract::Rustfmt,
         ),
         (
@@ -4283,6 +4361,7 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             "script.py",
             SemanticEditExecutorLanguage::Python,
             "python",
+            SEMANTIC_EDIT_SCRIPT_KINDS,
             SEMANTIC_EDIT_SCRIPT_KINDS,
             SemanticEditFormatterContract::PythonAuto,
         ),
@@ -4292,6 +4371,7 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             SemanticEditExecutorLanguage::TypeScript,
             "typescript",
             SEMANTIC_EDIT_SCRIPT_KINDS,
+            SEMANTIC_EDIT_SCRIPT_KINDS,
             SemanticEditFormatterContract::Prettier,
         ),
         (
@@ -4299,6 +4379,7 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             "view.tsx",
             SemanticEditExecutorLanguage::Tsx,
             "tsx",
+            SEMANTIC_EDIT_SCRIPT_KINDS,
             SEMANTIC_EDIT_SCRIPT_KINDS,
             SemanticEditFormatterContract::Prettier,
         ),
@@ -4308,6 +4389,7 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             SemanticEditExecutorLanguage::JavaScript,
             "javascript",
             SEMANTIC_EDIT_SCRIPT_KINDS,
+            SEMANTIC_EDIT_SCRIPT_KINDS,
             SemanticEditFormatterContract::Prettier,
         ),
         (
@@ -4316,15 +4398,35 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             SemanticEditExecutorLanguage::Jsx,
             "jsx",
             SEMANTIC_EDIT_SCRIPT_KINDS,
+            SEMANTIC_EDIT_SCRIPT_KINDS,
             SemanticEditFormatterContract::Prettier,
+        ),
+        (
+            "markdown",
+            "README.md",
+            SemanticEditExecutorLanguage::Markdown,
+            "markdown",
+            SEMANTIC_EDIT_MARKDOWN_KINDS,
+            SEMANTIC_EDIT_MARKDOWN_APPLY_KINDS,
+            SemanticEditFormatterContract::None,
+        ),
+        (
+            "mdx",
+            "docs/page.mdx",
+            SemanticEditExecutorLanguage::Markdown,
+            "markdown",
+            SEMANTIC_EDIT_MARKDOWN_KINDS,
+            SEMANTIC_EDIT_MARKDOWN_APPLY_KINDS,
+            SemanticEditFormatterContract::None,
         ),
     ];
 
-    for (language, file, executor, canonical, supported, formatter) in cases {
+    for (language, file, executor, canonical, recognized, apply_supported, formatter) in cases {
         let path = Path::new(file);
         let contract = executor.contract();
         assert_eq!(contract.id, canonical);
         assert_eq!(contract.formatter, formatter);
+        assert_eq!(executor.recognized_intents(), recognized);
         assert!(contract.aliases.contains(&language));
         assert_eq!(semantic_edit_language_for_file(path), canonical);
         assert_eq!(
@@ -4341,7 +4443,7 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
         for &kind in SEMANTIC_EDIT_KINDS {
             assert_eq!(
                 semantic_edit_kind_apply_supported(kind, language, path),
-                supported.contains(&kind),
+                apply_supported.contains(&kind),
                 "{language} support mismatch for {kind}"
             );
         }
@@ -4353,12 +4455,17 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
     );
     assert_eq!(
         semantic_edit_executor_language("markdown", Path::new("README.md")),
-        None
+        Some(SemanticEditExecutorLanguage::Markdown)
     );
     assert!(!semantic_edit_kind_apply_supported(
         "rewrite_call_sites",
         "typescript",
         Path::new("tool.ts")
+    ));
+    assert!(!semantic_edit_kind_apply_supported(
+        "rename_heading",
+        "markdown",
+        Path::new("README.md")
     ));
 }
 
@@ -5476,6 +5583,11 @@ fn preview_semantic_edit_content(
     let Some(executor) = semantic_edit_executor_language(language, file_abs) else {
         bail!("no executor registered for language {language:?}");
     };
+    if executor.is_markdown() {
+        bail!(
+            "Markdown semantic edit kind {kind:?} is recognized by the language contract, but the Markdown executor is not implemented yet"
+        );
+    }
     if executor.is_script() {
         return match kind {
             "rename_symbol" => replace_script_identifier(
