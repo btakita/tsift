@@ -517,6 +517,24 @@ fn indexed_cli_fixture() -> tempfile::TempDir {
     dir
 }
 
+fn git_indexed_cli_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    build_cli_fixture(dir.path());
+    init_git_repo(dir.path());
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
+}
+
 fn structural_edit_fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -2918,6 +2936,199 @@ fn edit_intents_json_validates_semantic_write_plan_without_mutating() {
             .unwrap()
             .iter()
             .any(|cmd| cmd.as_str().unwrap().contains("tsift source-read"))
+    );
+}
+
+#[test]
+fn edit_intents_verify_uses_temp_worktree_without_mutating_source() {
+    let dir = git_indexed_cli_fixture();
+    let before = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "rename_symbol",
+                "symbol": "alpha",
+                "file": "main.rs",
+                "new_name": "alpha_verified"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--verify",
+            "--budget",
+            "normal",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "edit-intents --verify stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+        before
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "edit-intents");
+    assert_eq!(json["view"], "verify");
+    assert_eq!(json["report"]["mode"], "verify");
+    assert_eq!(json["report"]["applied_total"], 0);
+    assert_eq!(json["report"]["verification"]["status"], "passed");
+    assert_eq!(json["report"]["verification"]["temp_applied_total"], 1);
+    assert_eq!(json["report"]["verification"]["reindexed"], true);
+    assert!(
+        json["report"]["verification"]["source_reads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|read| read["file"] == "main.rs" && read["preview_lines"].as_u64().unwrap() > 0)
+    );
+    assert!(
+        json["report"]["verification"]["impact"]["changed_files"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+}
+
+#[test]
+fn edit_intents_verify_apply_runs_command_before_real_mutation() {
+    let dir = git_indexed_cli_fixture();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "rename_symbol",
+                "symbol": "alpha",
+                "file": "main.rs",
+                "new_name": "alpha_verified"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--verify",
+            "--verify-command",
+            "test -f main.rs",
+            "--apply",
+            "--budget",
+            "normal",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "edit-intents --verify --apply stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "edit-intents");
+    assert_eq!(json["view"], "apply");
+    assert_eq!(json["report"]["applied_total"], 1);
+    assert_eq!(json["report"]["verification"]["status"], "passed");
+    assert_eq!(
+        json["report"]["verification"]["command"]["status"],
+        "passed"
+    );
+    let source = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    assert!(source.contains("fn alpha_verified()"), "{source}");
+}
+
+#[test]
+fn edit_intents_verify_command_failure_blocks_real_mutation() {
+    let dir = git_indexed_cli_fixture();
+    let before = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "rename_symbol",
+                "symbol": "alpha",
+                "file": "main.rs",
+                "new_name": "alpha_verified"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--verify",
+            "--verify-command",
+            "exit 7",
+            "--apply",
+            "--budget",
+            "normal",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("semantic edit verification command failed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+        before
     );
 }
 

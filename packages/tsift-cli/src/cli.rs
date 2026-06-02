@@ -159,6 +159,12 @@ pub enum Commands {
         /// Apply supported, conflict-free semantic edit intents
         #[arg(long)]
         apply: bool,
+        /// Verify supported intents in a temporary git worktree before mutating this tree
+        #[arg(long)]
+        verify: bool,
+        /// Shell command to run in the temporary verification worktree after reindexing
+        #[arg(long, requires = "verify")]
+        verify_command: Option<String>,
         /// Preview-mode item cap for planned intents
         #[arg(long)]
         max_items: Option<usize>,

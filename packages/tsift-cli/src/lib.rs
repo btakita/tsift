@@ -58,7 +58,7 @@ use substrate::{
     SqliteGraphStore, SqliteProjectionRefresh,
 };
 use tagpath::{family as tagpath_family, ontology as tagpath_ontology};
-use tempfile::{Builder as TempFileBuilder, NamedTempFile};
+use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
 use tree_sitter::StreamingIterator as _;
 #[cfg(test)]
 use tsift_agent_doc::session_cost;
@@ -383,8 +383,60 @@ struct SemanticEditIntentReport {
     unsupported_total: usize,
     formatted_total: usize,
     plans: Vec<SemanticEditIntentPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<SemanticEditVerificationReport>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SemanticEditVerificationReport {
+    status: String,
+    worktree: String,
+    reindexed: bool,
+    temp_applied_total: usize,
+    temp_formatted_total: usize,
+    source_reads: Vec<SemanticEditVerificationSourceRead>,
+    impact: SemanticEditVerificationImpact,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<SemanticEditVerificationCommand>,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct SemanticEditVerificationSourceRead {
+    file: String,
+    start: usize,
+    lines: usize,
+    preview_lines: usize,
+    symbol_refs: usize,
+    summary_refs: usize,
+    command: String,
+}
+
+#[derive(Serialize)]
+struct SemanticEditVerificationImpact {
+    changed_files: usize,
+    changed_symbols: usize,
+    affected_tests: usize,
+    affected_tests_total: usize,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SemanticEditVerificationCommand {
+    command: String,
+    status: String,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Clone, Copy)]
+struct SemanticEditVerifyOptions<'a> {
+    enabled: bool,
+    command: Option<&'a str>,
 }
 
 struct SemanticEditIntentDraft {
@@ -559,6 +611,8 @@ pub fn run() -> Result<()> {
             file,
             json,
             apply,
+            verify,
+            verify_command,
             max_items,
             max_bytes,
             budget,
@@ -567,6 +621,10 @@ pub fn run() -> Result<()> {
             scope.as_deref(),
             file,
             apply,
+            SemanticEditVerifyOptions {
+                enabled: verify,
+                command: verify_command.as_deref(),
+            },
             OutputFormat {
                 json_output: json || terse || schema || envelope,
                 compact,
@@ -5909,11 +5967,330 @@ fn apply_semantic_edit_drafts(
     Ok(formatted_total)
 }
 
+struct SemanticEditVerificationWorktree {
+    repo_root: PathBuf,
+    worktree_root: PathBuf,
+    _tempdir: TempDir,
+}
+
+impl Drop for SemanticEditVerificationWorktree {
+    fn drop(&mut self) {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.worktree_root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+impl SemanticEditVerificationWorktree {
+    fn verification_root_for(&self, root: &Path) -> Result<PathBuf> {
+        let canonical_root = root
+            .canonicalize()
+            .with_context(|| format!("canonicalizing project root {}", root.display()))?;
+        let rel_root = canonical_root
+            .strip_prefix(&self.repo_root)
+            .with_context(|| {
+                format!(
+                    "project root {} is outside git repository {}",
+                    canonical_root.display(),
+                    self.repo_root.display()
+                )
+            })?;
+        Ok(self.worktree_root.join(rel_root))
+    }
+}
+
+fn create_semantic_edit_verification_worktree(
+    root: &Path,
+) -> Result<SemanticEditVerificationWorktree> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .with_context(|| format!("locating git repository for {}", root.display()))?;
+    if !output.status.success() {
+        bail!(
+            "semantic edit verification requires a git worktree rooted at {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let repo_root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+        .canonicalize()
+        .context("canonicalizing git repository root for semantic edit verification")?;
+    let tempdir = tempfile::Builder::new()
+        .prefix("tsift-semantic-verify-")
+        .tempdir()
+        .context("creating semantic edit verification temp directory")?;
+    let worktree_root = tempdir.path().join("worktree");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&repo_root)
+        .args(["worktree", "add", "--detach"])
+        .arg(&worktree_root)
+        .arg("HEAD")
+        .output()
+        .with_context(|| {
+            format!(
+                "creating semantic edit verification worktree for {}",
+                repo_root.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "failed to create semantic edit verification worktree for {}: {}",
+            repo_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(SemanticEditVerificationWorktree {
+        repo_root,
+        worktree_root,
+        _tempdir: tempdir,
+    })
+}
+
+fn run_semantic_edit_verification_reindex(root: &Path) -> Result<()> {
+    let output = Command::new(env::current_exe().context("resolving current tsift executable")?)
+        .arg("index")
+        .arg(root)
+        .output()
+        .with_context(|| {
+            format!(
+                "reindexing semantic edit verification root {}",
+                root.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "semantic edit verification reindex failed for {}: {}{}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+    Ok(())
+}
+
+fn semantic_edit_verification_source_windows(
+    root: &Path,
+    drafts: &[SemanticEditIntentDraft],
+) -> Vec<(String, usize, usize)> {
+    let mut windows = BTreeMap::<String, (usize, usize)>::new();
+    for draft in drafts {
+        let mut files = vec![draft.plan.target_file.clone()];
+        if let Some(destination) = &draft.plan.destination_file {
+            files.push(destination.clone());
+        }
+        for file in files {
+            let (mut start, mut lines) = draft
+                .plan
+                .target_range
+                .as_ref()
+                .map(|range| {
+                    let line_count = range.end.saturating_sub(range.start).saturating_add(1);
+                    (
+                        range.start.saturating_sub(2).max(1),
+                        line_count.saturating_add(4),
+                    )
+                })
+                .unwrap_or((1, 40));
+            lines = lines.clamp(1, 80);
+            if let Ok(source) = fs::read_to_string(root.join(&file)) {
+                let total_lines = source.lines().count();
+                if total_lines > 0 {
+                    start = start.min(total_lines).max(1);
+                    lines = lines.min(total_lines.saturating_sub(start).saturating_add(1).max(1));
+                }
+            }
+            windows
+                .entry(file)
+                .and_modify(|existing| {
+                    existing.0 = existing.0.min(start);
+                    existing.1 = existing.1.max(lines);
+                })
+                .or_insert((start, lines));
+        }
+    }
+    windows
+        .into_iter()
+        .map(|(file, (start, lines))| (file, start, lines))
+        .collect()
+}
+
+fn run_semantic_edit_verification_source_read(
+    root: &Path,
+    file: &str,
+    start: usize,
+    lines: usize,
+) -> Result<SemanticEditVerificationSourceRead> {
+    let root_display = root.to_string_lossy().to_string();
+    let output = Command::new(env::current_exe().context("resolving current tsift executable")?)
+        .args([
+            "--envelope",
+            "source-read",
+            file,
+            "--path",
+            &root_display,
+            "--start",
+            &start.to_string(),
+            "--lines",
+            &lines.to_string(),
+            "--json",
+            "--budget",
+            "normal",
+        ])
+        .output()
+        .with_context(|| {
+            format!(
+                "running source-read verification for {} in {}",
+                file,
+                root.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "semantic edit verification source-read failed for {}: {}",
+            file,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parsing source-read verification JSON")?;
+    let report = &json["report"];
+    let preview_lines = report["preview"].as_array().map_or(0, |lines| lines.len());
+    let symbol_refs = report["symbols"]
+        .as_array()
+        .map_or(0, |symbols| symbols.len());
+    let summary_refs = report["summaries"]
+        .as_array()
+        .map_or(0, |summaries| summaries.len());
+    Ok(SemanticEditVerificationSourceRead {
+        file: file.to_string(),
+        start,
+        lines,
+        preview_lines,
+        symbol_refs,
+        summary_refs,
+        command: format!(
+            "tsift --envelope source-read {} --path {} --start {} --lines {} --budget normal",
+            shell_quote(file),
+            shell_quote(&root_display),
+            start,
+            lines
+        ),
+    })
+}
+
+fn run_semantic_edit_verification_command(
+    root: &Path,
+    command: &str,
+    budget: ResponseBudget,
+) -> Result<SemanticEditVerificationCommand> {
+    let output = Command::new("sh")
+        .arg("-lc")
+        .arg(command)
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("running semantic edit verification command: {command}"))?;
+    let stdout = truncate_for_budget(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        budget.preview_bytes(),
+    );
+    let stderr = truncate_for_budget(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        budget.preview_bytes(),
+    );
+    if !output.status.success() {
+        bail!(
+            "semantic edit verification command failed ({command}): stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
+    Ok(SemanticEditVerificationCommand {
+        command: command.to_string(),
+        status: "passed".to_string(),
+        stdout,
+        stderr,
+    })
+}
+
+fn verify_semantic_edit_intents(
+    root: &Path,
+    scope: Option<&str>,
+    intents: &[SemanticEditIntent],
+    budget: ResponseBudget,
+    verify_command: Option<&str>,
+) -> Result<SemanticEditVerificationReport> {
+    let worktree = create_semantic_edit_verification_worktree(root)?;
+    let verify_root = worktree.verification_root_for(root)?;
+    run_semantic_edit_verification_reindex(&verify_root)?;
+    let mut drafts = intents
+        .iter()
+        .enumerate()
+        .map(|(idx, intent)| plan_semantic_edit_intent(&verify_root, scope, intent, idx, budget))
+        .collect::<Result<Vec<_>>>()?;
+    let temp_formatted_total = apply_semantic_edit_drafts(&mut drafts, intents, budget)?;
+    let temp_applied_total = drafts.iter().filter(|draft| draft.plan.applied).count();
+    run_semantic_edit_verification_reindex(&verify_root)?;
+
+    let source_reads = semantic_edit_verification_source_windows(&verify_root, &drafts)
+        .into_iter()
+        .map(|(file, start, lines)| {
+            run_semantic_edit_verification_source_read(&verify_root, &file, start, lines)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let impact_report = impact::compute(
+        &verify_root,
+        impact::ImpactOptions {
+            cached: false,
+            revision: None,
+            scope,
+            limit: 10,
+        },
+    )
+    .with_context(|| {
+        format!(
+            "running semantic edit verification impact summary in {}",
+            verify_root.display()
+        )
+    })?;
+    let command = verify_command
+        .map(|command| run_semantic_edit_verification_command(&verify_root, command, budget))
+        .transpose()?;
+
+    Ok(SemanticEditVerificationReport {
+        status: "passed".to_string(),
+        worktree: "temporary git worktree at HEAD".to_string(),
+        reindexed: true,
+        temp_applied_total,
+        temp_formatted_total,
+        source_reads,
+        impact: SemanticEditVerificationImpact {
+            changed_files: impact_report.changed_files.len(),
+            changed_symbols: impact_report.changed_symbols.len(),
+            affected_tests: impact_report.affected_tests.len(),
+            affected_tests_total: impact_report.affected_tests_total,
+            truncated: impact_report.truncated,
+            warnings: impact_report.warnings,
+        },
+        command,
+        message: "verified semantic edit intents in a temporary worktree before source mutation"
+            .to_string(),
+    })
+}
+
 fn cmd_edit_intents(
     path: &Path,
     scope: Option<&str>,
     file: Option<PathBuf>,
     apply: bool,
+    verify: SemanticEditVerifyOptions<'_>,
     format: OutputFormat,
     budget: ResponseBudget,
 ) -> Result<()> {
@@ -5931,7 +6308,7 @@ fn cmd_edit_intents(
     let batch: SemanticEditIntentBatch =
         serde_json::from_str(&input).context("parsing semantic edit intent JSON")?;
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    let max_items = if apply {
+    let max_items = if apply || verify.enabled {
         batch.intents.len()
     } else {
         budget.preview_items()
@@ -5943,6 +6320,17 @@ fn cmd_edit_intents(
         .enumerate()
         .map(|(idx, intent)| plan_semantic_edit_intent(&root, scope, intent, idx, budget))
         .collect::<Result<Vec<_>>>()?;
+    let verification = if verify.enabled {
+        Some(verify_semantic_edit_intents(
+            &root,
+            scope,
+            &batch.intents,
+            budget,
+            verify.command,
+        )?)
+    } else {
+        None
+    };
     let mut formatted_total = 0usize;
     if apply {
         formatted_total = apply_semantic_edit_drafts(&mut drafts, &batch.intents, budget)?;
@@ -5967,7 +6355,14 @@ fn cmd_edit_intents(
         .collect::<Vec<_>>();
     let report = SemanticEditIntentReport {
         root: root.to_string_lossy().to_string(),
-        mode: if apply { "apply" } else { "dry_run" }.to_string(),
+        mode: if apply {
+            "apply"
+        } else if verify.enabled {
+            "verify"
+        } else {
+            "dry_run"
+        }
+        .to_string(),
         intents_total: batch.intents.len(),
         planned_total,
         applied_total,
@@ -5975,6 +6370,7 @@ fn cmd_edit_intents(
         unsupported_total,
         formatted_total,
         plans,
+        verification,
         warnings: (batch.intents.len() > max_items)
             .then(|| {
                 format!(
@@ -6006,7 +6402,13 @@ fn cmd_edit_intents(
             &report,
             &format,
             "edit-intents",
-            if apply { "apply" } else { "dry-run" },
+            if apply {
+                "apply"
+            } else if verify.enabled {
+                "verify"
+            } else {
+                "dry-run"
+            },
             ToolEnvelopeSummary {
                 text: format!(
                     "semantic edit intents planned={} applied={} conflicts={} unsupported={}",
@@ -6052,6 +6454,19 @@ fn cmd_edit_intents(
                 println!("    formatter: {formatter}");
             }
             println!("    {}", plan.message);
+        }
+        if let Some(verification) = &report.verification {
+            println!(
+                "  verification: {} temp_applied={} source_reads={} affected_tests={}/{}",
+                verification.status,
+                verification.temp_applied_total,
+                verification.source_reads.len(),
+                verification.impact.affected_tests,
+                verification.impact.affected_tests_total
+            );
+            if let Some(command) = &verification.command {
+                println!("    command: {} {}", command.status, command.command);
+            }
         }
         for warning in &report.warnings {
             eprintln!("warning: {warning}");
