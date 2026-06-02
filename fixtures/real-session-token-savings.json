@@ -193,6 +193,27 @@
             "raw_excerpt": "Agent-doc runtime cycle with preflight, plan, repo work, full suite verification, write-back commit, and post-commit session-check status."
           }
         ]
+      },
+      "markdown_projection_inputs": {
+        "documents": [
+          {
+            "command": "context-pack raw session markdown body",
+            "file": "tasks/software/tsift.md",
+            "raw_markdown": "# Queue Context\n\nThe raw context-pack handoff repeated the active agent-doc session document, including the exchange summary, queue, backlog, review gates, completed archive marker, and several paragraphs of verification notes. The next worker only needed the ordered Markdown outline and one selected node expansion handle for the active backlog item.\n\n## Exchange\n\nThe exchange contained prior compacted responses, user prompt presets, status text, and closeout instructions. Replaying the full markdown body made context-pack outputs large even when only the queue head and related backlog lines were actionable.\n\n## Queue\n\n- [#mdastapi] Promote Markdown AST to first-class JSON and envelope API.\n- [#mdparsecache] Cache and reuse per-file Markdown parse results across edit-intents and source-read enrichment.\n- [#mdtokens] Add token-budgeted Markdown projections for session-review and context-pack.\n\n## Backlog\n\nThe backlog repeated complete task descriptions, review gates, and archived done markers. A compact projection keeps node handles, names, line spans, and expansion commands, then lets the worker request the selected node body only when needed.\n\n## Verification\n\nRaw transcript replay included build, install, push, CI, and session-check lines. The compact projection keeps those as section handles plus markdown-ast and source-read commands instead of inline markdown body replay.",
+            "outline_nodes": [
+              "Queue Context",
+              "Exchange",
+              "Queue",
+              "Backlog",
+              "Verification"
+            ],
+            "selected_nodes": [
+              "mdast-mdtokens",
+              "span-mdtokens"
+            ],
+            "expand": "tsift --envelope markdown-ast tasks/software/tsift.md --node mdast-mdtokens --budget normal"
+          }
+        ]
       }
     },
     {

@@ -2935,6 +2935,22 @@ fn source_read_json_reports_markdown_section_list_and_code_spans() {
             .iter()
             .any(|cmd| cmd.as_str().unwrap().contains("markdown-ast"))
     );
+    assert_eq!(json["report"]["markdown"]["mode"], "window_outline");
+    assert!(
+        json["report"]["markdown"]["visible_nodes"]
+            .as_u64()
+            .unwrap()
+            >= 3,
+        "expected visible Markdown AST nodes in source-read projection: {json}"
+    );
+    assert!(
+        json["report"]["markdown"]["outline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["name"] == "Install" && node["kind"] == "heading"),
+        "expected outline-first Markdown projection in source-read report: {json}"
+    );
 }
 
 #[test]
@@ -2969,6 +2985,28 @@ fn markdown_ast_json_reports_handles_hierarchy_metadata_and_expansions() {
             .as_str()
             .unwrap()
             .starts_with("mdastrep-")
+    );
+    assert_eq!(json["report"]["projection"]["mode"], "outline_first");
+    assert!(
+        json["report"]["projection"]["cache"]["source_hash"]
+            .as_str()
+            .unwrap()
+            .len()
+            >= 32
+    );
+    assert!(
+        json["report"]["projection"]["phase_timings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|phase| phase["name"] == "parse_extract")
+    );
+    assert!(
+        json["report"]["projection"]["outline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["kind"] == "heading" && node["name"] == "Guide")
     );
     assert!(
         json["report"]["expand"]["source_read"]
@@ -3077,6 +3115,75 @@ fn markdown_ast_json_reports_handles_hierarchy_metadata_and_expansions() {
             .unwrap()
             .iter()
             .any(|cmd| cmd.as_str().unwrap().contains("source-read"))
+    );
+}
+
+#[test]
+fn markdown_ast_json_reports_selected_node_projection_mode() {
+    let dir = markdown_edit_fixture();
+
+    let all_output = tsift_bin()
+        .args([
+            "--envelope",
+            "markdown-ast",
+            "README.md",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--budget",
+            "deep",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        all_output.status.success(),
+        "markdown-ast all stderr: {}",
+        String::from_utf8_lossy(&all_output.stderr)
+    );
+    let all_json: serde_json::Value = serde_json::from_slice(&all_output.stdout).unwrap();
+    let install_handle = all_json["report"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["kind"] == "heading" && node["name"] == "Install")
+        .and_then(|node| node["handle"].as_str())
+        .unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "--envelope",
+            "markdown-ast",
+            "README.md",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--node",
+            install_handle,
+            "--json",
+            "--budget",
+            "small",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "markdown-ast selected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["report"]["projection"]["mode"], "selected_node");
+    assert_eq!(
+        json["report"]["projection"]["selected_node"],
+        install_handle
+    );
+    let nodes = json["report"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["handle"], install_handle);
+    assert!(
+        nodes[0]["expand"]["source_body"]
+            .as_str()
+            .unwrap()
+            .contains("source-read")
     );
 }
 
@@ -3616,7 +3723,12 @@ fn edit_intents_markdown_block_dry_run_reports_source_windows_without_mutating()
         list_plan["target_symbol"]["span"]["markdown"]["list_depth"],
         1
     );
-    assert!(list_plan["diff"].as_str().unwrap().contains("Verify setup."));
+    assert!(
+        list_plan["diff"]
+            .as_str()
+            .unwrap()
+            .contains("Verify setup.")
+    );
 
     let code_plan = &plans[1];
     assert_eq!(code_plan["kind"], "rewrite_code_fence");
@@ -3635,16 +3747,10 @@ fn edit_intents_markdown_block_dry_run_reports_source_windows_without_mutating()
             .unwrap()
             .contains("println!(\"ok\")")
     );
-    assert!(
-        json["follow_up"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|cmd| {
-                let cmd = cmd.as_str().unwrap();
-                cmd.contains("source-read") && cmd.contains("README.md")
-            })
-    );
+    assert!(json["follow_up"].as_array().unwrap().iter().any(|cmd| {
+        let cmd = cmd.as_str().unwrap();
+        cmd.contains("source-read") && cmd.contains("README.md")
+    }));
 }
 
 #[test]
@@ -3831,12 +3937,7 @@ fn edit_intents_markdown_verify_reports_temp_worktree_source_read_and_impact() {
                     && read["command"].as_str().unwrap().contains("README.md")
             })
     );
-    assert!(
-        verification["impact"]["changed_files"]
-            .as_u64()
-            .unwrap()
-            >= 1
-    );
+    assert!(verification["impact"]["changed_files"].as_u64().unwrap() >= 1);
 }
 
 #[test]
@@ -9177,6 +9278,17 @@ fn token_savings_accepts_real_session_fixture() {
             .map(|case| case["surface"].as_str().unwrap())
             .collect::<Vec<_>>(),
         vec!["session-review", "context-pack", "source-read"]
+    );
+    let context_pack = json["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["surface"] == "context-pack")
+        .expect("context-pack fixture case should be present");
+    assert_eq!(context_pack["status"], "pass");
+    assert!(
+        context_pack["estimated_token_delta"].as_u64().unwrap() > 0,
+        "context-pack fixture should prove markdown projection savings"
     );
     let source_read = json["cases"]
         .as_array()

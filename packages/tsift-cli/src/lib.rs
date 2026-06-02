@@ -1823,6 +1823,8 @@ struct TokenSavingsFixtureCase {
     context_pack_inputs: Option<TokenSavingsContextPackInputs>,
     #[serde(default)]
     source_read_inputs: Option<TokenSavingsSourceReadInputs>,
+    #[serde(default)]
+    markdown_projection_inputs: Option<TokenSavingsMarkdownProjectionInputs>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1878,6 +1880,21 @@ struct TokenSavingsSourceReadInput {
     required_line_anchors: Vec<u64>,
 }
 
+#[derive(Deserialize, Serialize)]
+struct TokenSavingsMarkdownProjectionInputs {
+    documents: Vec<TokenSavingsMarkdownProjectionInput>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct TokenSavingsMarkdownProjectionInput {
+    command: String,
+    file: String,
+    raw_markdown: String,
+    outline_nodes: Vec<String>,
+    selected_nodes: Vec<String>,
+    expand: String,
+}
+
 #[derive(Serialize)]
 struct TokenSavingsEnvelopeFamily {
     handle: String,
@@ -1909,6 +1926,15 @@ struct TokenSavingsSourceReadEnvelope {
     start: u64,
     lines: u64,
     required_line_anchors: Vec<u64>,
+    expand: String,
+}
+
+#[derive(Serialize)]
+struct TokenSavingsMarkdownProjectionEnvelope {
+    handle: String,
+    file: String,
+    outline_nodes: usize,
+    selected_nodes: Vec<String>,
     expand: String,
 }
 
@@ -2010,6 +2036,12 @@ fn token_savings_session_review_raw_bytes(
 
 fn token_savings_source_read_raw_bytes(inputs: &TokenSavingsSourceReadInputs) -> Result<usize> {
     Ok(serde_json::to_vec(&inputs.reads)?.len())
+}
+
+fn token_savings_markdown_projection_raw_bytes(
+    inputs: &TokenSavingsMarkdownProjectionInputs,
+) -> Result<usize> {
+    Ok(serde_json::to_vec(&inputs.documents)?.len())
 }
 
 fn token_savings_session_review_envelope(
@@ -2152,6 +2184,39 @@ fn token_savings_source_read_envelope(
         .collect()
 }
 
+fn token_savings_markdown_projection_envelope(
+    case: &TokenSavingsFixtureCase,
+    inputs: &TokenSavingsMarkdownProjectionInputs,
+) -> Result<Vec<TokenSavingsMarkdownProjectionEnvelope>> {
+    inputs
+        .documents
+        .iter()
+        .map(|doc| {
+            if doc.outline_nodes.is_empty() {
+                bail!(
+                    "markdown projection fixture {} has no outline nodes for {}",
+                    case.name,
+                    doc.command
+                );
+            }
+            if doc.selected_nodes.is_empty() {
+                bail!(
+                    "markdown projection fixture {} has no selected-node expansion handles for {}",
+                    case.name,
+                    doc.command
+                );
+            }
+            Ok(TokenSavingsMarkdownProjectionEnvelope {
+                handle: stable_handle("tmd", &format!("{}:{}", case.name, doc.command)),
+                file: doc.file.clone(),
+                outline_nodes: doc.outline_nodes.len(),
+                selected_nodes: doc.selected_nodes.clone(),
+                expand: doc.expand.clone(),
+            })
+        })
+        .collect()
+}
+
 fn build_token_savings_report(fixture: &TokenSavingsFixture) -> Result<TokenSavingsReport> {
     let mut cases = Vec::new();
     let mut total_raw_bytes = 0;
@@ -2175,6 +2240,12 @@ fn build_token_savings_report(fixture: &TokenSavingsFixture) -> Result<TokenSavi
             raw_bytes += token_savings_source_read_raw_bytes(inputs)?;
             envelope_bytes +=
                 serde_json::to_vec(&token_savings_source_read_envelope(case, inputs)?)?.len();
+        }
+        if let Some(inputs) = &case.markdown_projection_inputs {
+            raw_bytes += token_savings_markdown_projection_raw_bytes(inputs)?;
+            envelope_bytes +=
+                serde_json::to_vec(&token_savings_markdown_projection_envelope(case, inputs)?)?
+                    .len();
         }
         let byte_delta = raw_bytes.saturating_sub(envelope_bytes);
         let raw_estimated_tokens = estimated_tokens_from_bytes(raw_bytes);
@@ -5749,9 +5820,10 @@ fn markdown_section_spans(content: &str) -> Result<Vec<MarkdownSectionEditSpan>>
         SemanticEditExecutorLanguage::Markdown,
         "markdown edit input",
     )?;
-    let mut sections = graph::Lang::Markdown
-        .extract_symbols(content.as_bytes())
-        .context("extracting Markdown heading spans")?
+    let projection = markdown_ast_projection("semantic-edit", content.as_bytes())
+        .context("extracting Markdown heading spans")?;
+    let mut sections = projection
+        .nodes
         .into_iter()
         .filter(|symbol| symbol.kind == "heading")
         .map(|symbol| {
@@ -5786,9 +5858,10 @@ fn markdown_block_spans(content: &str, kind: &str) -> Result<Vec<MarkdownBlockEd
         SemanticEditExecutorLanguage::Markdown,
         "markdown edit input",
     )?;
-    let mut blocks = graph::Lang::Markdown
-        .extract_symbols(content.as_bytes())
-        .context("extracting Markdown block spans")?
+    let projection = markdown_ast_projection("semantic-edit", content.as_bytes())
+        .context("extracting Markdown block spans")?;
+    let mut blocks = projection
+        .nodes
         .into_iter()
         .filter(|symbol| symbol.kind == kind)
         .map(|symbol| -> Result<MarkdownBlockEditSpan> {
@@ -19249,6 +19322,8 @@ struct SourceReadReport {
     preview: Vec<SourceLinePreview>,
     symbols: Vec<SourceSymbolRef>,
     summaries: Vec<SourceSummaryRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    markdown: Option<SourceReadMarkdownProjection>,
     expand: SourceExpandCommands,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     warnings: Vec<String>,
@@ -19314,6 +19389,24 @@ struct MarkdownAstRawNode {
     body_end_byte: Option<usize>,
 }
 
+#[derive(Clone)]
+struct MarkdownAstProjection {
+    source_hash: String,
+    nodes: Vec<MarkdownAstRawNode>,
+    parse_duration_micros: u128,
+    cache_hit: bool,
+}
+
+#[derive(Clone)]
+struct MarkdownAstCacheEntry {
+    source_hash: String,
+    nodes: Vec<MarkdownAstRawNode>,
+    parse_duration_micros: u128,
+}
+
+static MARKDOWN_AST_CACHE: OnceLock<Mutex<HashMap<String, MarkdownAstCacheEntry>>> =
+    OnceLock::new();
+
 #[derive(Serialize, Clone)]
 struct MarkdownAstNodeMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19340,6 +19433,61 @@ struct MarkdownAstNodeExpand {
     source_body: String,
     symbol_read: String,
     edit_intents: String,
+}
+
+#[derive(Serialize, Clone)]
+struct MarkdownAstCacheReport {
+    source_hash: String,
+    cache_hit: bool,
+    parse_duration_micros: u128,
+    node_count: usize,
+    section_count: usize,
+    list_item_count: usize,
+    code_block_count: usize,
+}
+
+#[derive(Serialize, Clone)]
+struct MarkdownAstPhaseTiming {
+    name: String,
+    duration_micros: u128,
+    detail: String,
+}
+
+#[derive(Serialize, Clone)]
+struct MarkdownAstOutlineEntry {
+    handle: String,
+    span_handle: String,
+    name: String,
+    kind: String,
+    block_kind: String,
+    line: usize,
+    end_line: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    section_path: Vec<String>,
+    child_count: usize,
+    expand: String,
+}
+
+#[derive(Serialize, Clone)]
+struct MarkdownAstProjectionPreview {
+    mode: String,
+    total_nodes: usize,
+    returned_nodes: usize,
+    omitted_nodes: usize,
+    selected_node: Option<String>,
+    cache: MarkdownAstCacheReport,
+    outline: Vec<MarkdownAstOutlineEntry>,
+    phase_timings: Vec<MarkdownAstPhaseTiming>,
+}
+
+#[derive(Serialize)]
+struct SourceReadMarkdownProjection {
+    handle: String,
+    mode: String,
+    total_nodes: usize,
+    visible_nodes: usize,
+    outline: Vec<MarkdownAstOutlineEntry>,
+    expand: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -19381,6 +19529,7 @@ struct MarkdownAstReport {
     root: String,
     file: String,
     range: SourceRangePreview,
+    projection: MarkdownAstProjectionPreview,
     nodes: Vec<MarkdownAstNode>,
     expand: MarkdownAstExpandCommands,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -19801,7 +19950,7 @@ fn markdown_fence_marker(source: &[u8], start_byte: usize) -> Option<String> {
         .map(str::to_string)
 }
 
-fn markdown_ast_raw_nodes(file: &str, source: &[u8]) -> Result<Vec<MarkdownAstRawNode>> {
+fn markdown_ast_extract_raw_nodes(file: &str, source: &[u8]) -> Result<Vec<MarkdownAstRawNode>> {
     let mut nodes = graph::Lang::Markdown
         .extract_symbols(source)
         .context("extracting Markdown AST nodes")?
@@ -19844,6 +19993,189 @@ fn markdown_ast_raw_nodes(file: &str, source: &[u8]) -> Result<Vec<MarkdownAstRa
             .then(left.name.cmp(&right.name))
     });
     Ok(nodes)
+}
+
+fn markdown_ast_projection(file: &str, source: &[u8]) -> Result<MarkdownAstProjection> {
+    let source_hash = blake3::hash(source).to_hex().to_string();
+    let cache_key = format!("{file}:{source_hash}");
+    let cache = MARKDOWN_AST_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(entry) = cache
+        .lock()
+        .expect("markdown ast cache poisoned")
+        .get(&cache_key)
+    {
+        return Ok(MarkdownAstProjection {
+            source_hash: entry.source_hash.clone(),
+            nodes: entry.nodes.clone(),
+            parse_duration_micros: entry.parse_duration_micros,
+            cache_hit: true,
+        });
+    }
+
+    let started = Instant::now();
+    let nodes = markdown_ast_extract_raw_nodes(file, source)?;
+    let parse_duration_micros = started.elapsed().as_micros();
+    cache.lock().expect("markdown ast cache poisoned").insert(
+        cache_key,
+        MarkdownAstCacheEntry {
+            source_hash: source_hash.clone(),
+            nodes: nodes.clone(),
+            parse_duration_micros,
+        },
+    );
+    Ok(MarkdownAstProjection {
+        source_hash,
+        nodes,
+        parse_duration_micros,
+        cache_hit: false,
+    })
+}
+
+fn markdown_ast_cache_report(projection: &MarkdownAstProjection) -> MarkdownAstCacheReport {
+    MarkdownAstCacheReport {
+        source_hash: projection.source_hash.clone(),
+        cache_hit: projection.cache_hit,
+        parse_duration_micros: projection.parse_duration_micros,
+        node_count: projection.nodes.len(),
+        section_count: projection
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "heading")
+            .count(),
+        list_item_count: projection
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "list_item")
+            .count(),
+        code_block_count: projection
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "code_block")
+            .count(),
+    }
+}
+
+fn markdown_ast_node_direct_child_count(
+    node: &MarkdownAstRawNode,
+    nodes: &[MarkdownAstRawNode],
+) -> usize {
+    nodes
+        .iter()
+        .filter(|candidate| {
+            markdown_ast_parent_handle(candidate, nodes).as_deref() == Some(&node.handle)
+        })
+        .count()
+}
+
+fn markdown_ast_outline_entry(
+    root: &Path,
+    file: &str,
+    source: &[u8],
+    nodes: &[MarkdownAstRawNode],
+    node: &MarkdownAstRawNode,
+    max_bytes: usize,
+) -> MarkdownAstOutlineEntry {
+    let line = source_line_for_byte(source, node.start_byte);
+    let end_line = source_line_for_end_byte(source, node.end_byte).max(line);
+    MarkdownAstOutlineEntry {
+        handle: node.handle.clone(),
+        span_handle: node.span_handle.clone(),
+        name: truncate_for_budget(&node.name, max_bytes),
+        kind: node.kind.clone(),
+        block_kind: node.block_kind.clone(),
+        line,
+        end_line,
+        section_path: markdown_ast_node_metadata(node, source, nodes).section_path,
+        child_count: markdown_ast_node_direct_child_count(node, nodes),
+        expand: markdown_ast_command(root, file, Some(&node.handle)),
+    }
+}
+
+fn markdown_ast_outline_entries(
+    root: &Path,
+    file: &str,
+    source: &[u8],
+    nodes: &[MarkdownAstRawNode],
+    limit: usize,
+    max_bytes: usize,
+) -> Vec<MarkdownAstOutlineEntry> {
+    let mut headings = nodes
+        .iter()
+        .filter(|node| node.kind == "heading")
+        .collect::<Vec<_>>();
+    let mut blocks = nodes
+        .iter()
+        .filter(|node| node.kind != "heading")
+        .collect::<Vec<_>>();
+    headings.sort_by_key(|node| (node.start_byte, node.end_byte));
+    blocks.sort_by_key(|node| (node.start_byte, node.end_byte));
+    headings
+        .into_iter()
+        .chain(blocks)
+        .take(limit)
+        .map(|node| markdown_ast_outline_entry(root, file, source, nodes, node, max_bytes))
+        .collect()
+}
+
+fn markdown_ast_node_intersects_lines(
+    source: &[u8],
+    node: &MarkdownAstRawNode,
+    start: usize,
+    end: usize,
+) -> bool {
+    let line = source_line_for_byte(source, node.start_byte);
+    let end_line = source_line_for_end_byte(source, node.end_byte).max(line);
+    line <= end && end_line >= start
+}
+
+fn source_read_markdown_projection(
+    root: &Path,
+    file: &str,
+    source: &[u8],
+    start: usize,
+    end: usize,
+    budget: ResponseBudget,
+) -> Result<SourceReadMarkdownProjection> {
+    let projection = markdown_ast_projection(file, source)?;
+    let visible_nodes = projection
+        .nodes
+        .iter()
+        .filter(|node| markdown_ast_node_intersects_lines(source, node, start, end))
+        .collect::<Vec<_>>();
+    let mut outline_nodes = visible_nodes.clone();
+    outline_nodes.sort_by_key(|node| {
+        (
+            node.kind != "heading",
+            node.start_byte,
+            node.end_byte,
+            node.name.as_str(),
+        )
+    });
+    let outline = outline_nodes
+        .into_iter()
+        .take(budget.preview_items())
+        .map(|node| {
+            markdown_ast_outline_entry(
+                root,
+                file,
+                source,
+                &projection.nodes,
+                node,
+                budget.preview_bytes(),
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(SourceReadMarkdownProjection {
+        handle: stable_handle(
+            "mdproj",
+            &format!("{file}:{start}:{end}:{}", projection.source_hash),
+        ),
+        mode: "window_outline".to_string(),
+        total_nodes: projection.nodes.len(),
+        visible_nodes: visible_nodes.len(),
+        outline,
+        expand: markdown_ast_command(root, file, None),
+    })
 }
 
 fn markdown_ast_contains(parent: &MarkdownAstRawNode, child: &MarkdownAstRawNode) -> bool {
@@ -20233,7 +20565,8 @@ fn cmd_markdown_ast(
     let source = fs::read(&file_abs).with_context(|| format!("reading {}", file_abs.display()))?;
     let text = String::from_utf8_lossy(&source);
     let total_lines = text.lines().count();
-    let raw_nodes = markdown_ast_raw_nodes(&file_display, &source)?;
+    let projection = markdown_ast_projection(&file_display, &source)?;
+    let raw_nodes = &projection.nodes;
     let max_items = budget.preview_items();
     let max_bytes = budget.preview_bytes();
 
@@ -20253,11 +20586,50 @@ fn cmd_markdown_ast(
         .into_iter()
         .map(|raw| {
             let mut node =
-                markdown_ast_node(&root, &file_display, raw, &source, &raw_nodes, max_items);
+                markdown_ast_node(&root, &file_display, raw, &source, raw_nodes, max_items);
             node.name = truncate_for_budget(&node.name, max_bytes);
             node
         })
         .collect::<Vec<_>>();
+    let outline_started = Instant::now();
+    let outline = markdown_ast_outline_entries(
+        &root,
+        &file_display,
+        &source,
+        raw_nodes,
+        max_items,
+        max_bytes,
+    );
+    let outline_duration_micros = outline_started.elapsed().as_micros();
+    let projection_preview = MarkdownAstProjectionPreview {
+        mode: if node.is_some() {
+            "selected_node".to_string()
+        } else {
+            "outline_first".to_string()
+        },
+        total_nodes: raw_nodes.len(),
+        returned_nodes: nodes.len(),
+        omitted_nodes: raw_nodes.len().saturating_sub(nodes.len()),
+        selected_node: node.map(str::to_string),
+        cache: markdown_ast_cache_report(&projection),
+        outline,
+        phase_timings: vec![
+            MarkdownAstPhaseTiming {
+                name: "parse_extract".to_string(),
+                duration_micros: projection.parse_duration_micros,
+                detail: if projection.cache_hit {
+                    "reused cached tree-sitter Markdown symbol extraction".to_string()
+                } else {
+                    "tree-sitter Markdown symbol extraction".to_string()
+                },
+            },
+            MarkdownAstPhaseTiming {
+                name: "outline_projection".to_string(),
+                duration_micros: outline_duration_micros,
+                detail: "outline-first section/block preview construction".to_string(),
+            },
+        ],
+    };
     let report = MarkdownAstReport {
         handle: stable_handle("mdastrep", &file_display),
         root: root.to_string_lossy().to_string(),
@@ -20269,6 +20641,7 @@ fn cmd_markdown_ast(
             truncated_before: false,
             truncated_after: false,
         },
+        projection: projection_preview,
         nodes,
         expand: MarkdownAstExpandCommands {
             file: markdown_ast_command(&root, &file_display, None),
@@ -20300,6 +20673,11 @@ fn cmd_markdown_ast(
                 text: format!("markdown ast {} nodes:{}", report.file, report.nodes.len()),
                 metrics: vec![
                     envelope_metric("nodes", report.nodes.len()),
+                    envelope_metric("total_nodes", report.projection.total_nodes),
+                    envelope_metric(
+                        "parse_duration_micros",
+                        report.projection.cache.parse_duration_micros,
+                    ),
                     envelope_metric("total_lines", report.range.total_lines),
                 ],
             },
@@ -20429,6 +20807,24 @@ fn cmd_source_read(
     );
     let summaries =
         load_source_summaries(&root, &file_display, max_items, max_bytes, &mut warnings);
+    let markdown = if is_markdown_path(&file_abs) {
+        match source_read_markdown_projection(
+            &root,
+            &file_display,
+            &source,
+            start,
+            end_line,
+            budget,
+        ) {
+            Ok(markdown) => Some(markdown),
+            Err(err) => {
+                warnings.push(format!("markdown projection unavailable: {err:#}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let effective_lines = end_line.saturating_sub(start).saturating_add(1).max(1);
     let expand = SourceExpandCommands {
@@ -20457,6 +20853,7 @@ fn cmd_source_read(
         preview,
         symbols,
         summaries,
+        markdown,
         expand,
         warnings,
     };
@@ -20486,6 +20883,13 @@ fn cmd_source_read(
                     envelope_metric("lines", report.preview.len()),
                     envelope_metric("symbols", report.symbols.len()),
                     envelope_metric("summaries", report.summaries.len()),
+                    envelope_metric(
+                        "markdown_nodes",
+                        report
+                            .markdown
+                            .as_ref()
+                            .map_or(0, |markdown| markdown.visible_nodes),
+                    ),
                 ],
             },
             truncated,
@@ -36540,6 +36944,7 @@ tier = "private"
                 context_pack_inputs: None,
                 session_review_inputs: None,
                 source_read_inputs: None,
+                markdown_projection_inputs: None,
             }],
         };
 
@@ -36580,6 +36985,7 @@ tier = "private"
                         required_line_anchors: vec![40, 120, 160],
                     }],
                 }),
+                markdown_projection_inputs: None,
             }],
         };
 
@@ -36616,6 +37022,7 @@ tier = "private"
                         required_line_anchors: vec![120],
                     }],
                 }),
+                markdown_projection_inputs: None,
             }],
         };
 
@@ -36625,6 +37032,68 @@ tier = "private"
         };
 
         assert!(err.to_string().contains("hides required line anchor 120"));
+    }
+
+    #[test]
+    fn token_savings_markdown_projection_inputs_require_outline_and_selected_nodes() {
+        let fixture = TokenSavingsFixture {
+            schema_version: 1,
+            description: "fixture".to_string(),
+            token_estimate: "ceil(utf8_bytes / 4)".to_string(),
+            cases: vec![TokenSavingsFixtureCase {
+                name: "markdown-projection".to_string(),
+                surface: "context-pack".to_string(),
+                minimum_savings_percent: 40.0,
+                raw_symbols: Vec::new(),
+                tagpath_families: Vec::new(),
+                context_pack_inputs: None,
+                session_review_inputs: None,
+                source_read_inputs: None,
+                markdown_projection_inputs: Some(TokenSavingsMarkdownProjectionInputs {
+                    documents: vec![TokenSavingsMarkdownProjectionInput {
+                        command: "context-pack markdown body".to_string(),
+                        file: "tasks/software/tsift.md".to_string(),
+                        raw_markdown: "# Heading\n\n".repeat(120),
+                        outline_nodes: vec!["Heading".to_string(), "Details".to_string()],
+                        selected_nodes: vec!["mdast-selected".to_string()],
+                        expand:
+                            "tsift --envelope markdown-ast tasks/software/tsift.md --node mdast-selected --budget normal"
+                                .to_string(),
+                    }],
+                }),
+            }],
+        };
+
+        let report = build_token_savings_report(&fixture).unwrap();
+
+        assert!(report.pass);
+        assert_eq!(report.cases[0].surface, "context-pack");
+        assert!(report.cases[0].savings_percent >= 40.0);
+    }
+
+    #[test]
+    fn markdown_ast_projection_cache_reuses_large_document_section_and_block_lookups() {
+        let mut content = String::from("# Cache Root\n\n");
+        for idx in 0..96 {
+            content.push_str(&format!(
+                "## Section {idx}\n\n- Item {idx}\n\n```rust\nfn sample_{idx}() {{}}\n```\n\n"
+            ));
+        }
+
+        let first = markdown_ast_projection("semantic-edit", content.as_bytes()).unwrap();
+        assert!(!first.cache_hit);
+        assert!(first.nodes.len() > 200);
+
+        let sections = markdown_section_spans(&content).unwrap();
+        let list_items = markdown_block_spans(&content, "list_item").unwrap();
+        let code_blocks = markdown_block_spans(&content, "code_block").unwrap();
+        let second = markdown_ast_projection("semantic-edit", content.as_bytes()).unwrap();
+
+        assert!(second.cache_hit);
+        assert_eq!(second.nodes.len(), first.nodes.len());
+        assert_eq!(sections.len(), 97);
+        assert_eq!(list_items.len(), 96);
+        assert_eq!(code_blocks.len(), 96);
     }
 
     #[test]
