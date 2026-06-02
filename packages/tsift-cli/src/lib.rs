@@ -8124,6 +8124,22 @@ struct TraversalRouteIndexEntry {
 }
 
 #[derive(Clone)]
+struct TraversalAstSpanIndexEntry {
+    handle: String,
+    symbol_handle: String,
+    file_handle: Option<String>,
+    file: String,
+    name: String,
+    kind: String,
+    language: String,
+    node_kind: String,
+    start_byte: usize,
+    end_byte: usize,
+    parent_module: Option<String>,
+    markdown: Option<MarkdownSpanMetadata>,
+}
+
+#[derive(Clone)]
 struct TraversalMultiplicityIndexEntry {
     handle: String,
     node: TraversalNode,
@@ -16604,6 +16620,115 @@ fn traversal_symbol_node(root: &Path, symbol: &index::StoredSymbol) -> Traversal
     }
 }
 
+fn traversal_ast_span_expand_command(
+    root: &Path,
+    file: &str,
+    symbol: &index::StoredSymbol,
+    span: &AstSpanPreview,
+) -> String {
+    if symbol.language == "markdown" {
+        markdown_ast_command(root, file, Some(&span.handle))
+    } else {
+        let line_count = span
+            .end_line
+            .saturating_sub(span.start_line)
+            .saturating_add(1)
+            .max(1);
+        source_read_command(root, file, span.start_line, line_count)
+    }
+}
+
+fn traversal_ast_span_node(
+    root: &Path,
+    symbol: &index::StoredSymbol,
+    source: &[u8],
+    symbols: &[index::StoredSymbol],
+) -> Option<(TraversalNode, TraversalAstSpanIndexEntry)> {
+    let span = stored_symbol_ast_span(symbol, source, symbols, usize::MAX)?;
+    let file = relativize(&symbol.file, root);
+    let mut properties = BTreeMap::new();
+    properties.insert("layer".to_string(), "ast_navigation".to_string());
+    properties.insert("language".to_string(), symbol.language.clone());
+    properties.insert("symbol_kind".to_string(), symbol.kind.clone());
+    properties.insert("node_kind".to_string(), span.node_kind.clone());
+    properties.insert("start_byte".to_string(), span.start_byte.to_string());
+    properties.insert("end_byte".to_string(), span.end_byte.to_string());
+    properties.insert("end_line".to_string(), span.end_line.to_string());
+    if let Some(body_start_byte) = span.body_start_byte {
+        properties.insert("body_start_byte".to_string(), body_start_byte.to_string());
+    }
+    if let Some(body_end_byte) = span.body_end_byte {
+        properties.insert("body_end_byte".to_string(), body_end_byte.to_string());
+    }
+    if let Some(body_start_line) = span.body_start_line {
+        properties.insert("body_start_line".to_string(), body_start_line.to_string());
+    }
+    if let Some(body_end_line) = span.body_end_line {
+        properties.insert("body_end_line".to_string(), body_end_line.to_string());
+    }
+    if let Some(parent_handle) = &span.parent_handle {
+        properties.insert("parent_handle".to_string(), parent_handle.clone());
+    }
+    if !span.child_handles.is_empty() {
+        properties.insert("child_handles".to_string(), span.child_handles.join(","));
+    }
+    if let Some(parent_module) = &symbol.parent_module {
+        properties.insert("parent_module".to_string(), parent_module.clone());
+    }
+    if let Some(markdown) = &span.markdown {
+        properties.insert(
+            "markdown_block_kind".to_string(),
+            markdown_ast_block_kind(&symbol.kind),
+        );
+        if let Some(heading_level) = markdown.heading_level {
+            properties.insert("heading_level".to_string(), heading_level.to_string());
+        }
+        if !markdown.section_path.is_empty() {
+            properties.insert(
+                "section_path".to_string(),
+                markdown.section_path.join(" > "),
+            );
+        }
+        if let Some(section_handle) = &markdown.section_handle {
+            properties.insert("section_handle".to_string(), section_handle.clone());
+        }
+        if let Some(list_depth) = markdown.list_depth {
+            properties.insert("list_depth".to_string(), list_depth.to_string());
+        }
+        if let Some(fence_language) = &markdown.fence_language {
+            properties.insert("fence_language".to_string(), fence_language.clone());
+        }
+    }
+
+    let line = i64::try_from(span.start_line).unwrap_or(i64::MAX);
+    let node = TraversalNode {
+        handle: span.handle.clone(),
+        kind: "ast_span".to_string(),
+        label: symbol.name.clone(),
+        ref_id: Some(symbol.name.clone()),
+        path: Some(file.clone()),
+        line: Some(line),
+        detail: Some(format!("{} {} AST span", symbol.language, symbol.kind)),
+        properties,
+        expand: traversal_ast_span_expand_command(root, &file, symbol, &span),
+    };
+    let entry = TraversalAstSpanIndexEntry {
+        handle: span.handle,
+        symbol_handle: String::new(),
+        file_handle: None,
+        file,
+        name: symbol.name.clone(),
+        kind: symbol.kind.clone(),
+        language: symbol.language.clone(),
+        node_kind: span.node_kind,
+        start_byte: span.start_byte,
+        end_byte: span.end_byte,
+        parent_module: symbol.parent_module.clone(),
+        markdown: span.markdown,
+    };
+    Some((node, entry))
+}
+
 fn traversal_unresolved_symbol_node(root: &Path, name: &str) -> TraversalNode {
     let handle = stable_handle("gsym", &format!("symbol:{name}"));
     TraversalNode {
@@ -16865,6 +16990,191 @@ fn traversal_tokens(input: &str) -> BTreeSet<String> {
         .filter(|part| part.len() >= 3)
         .map(|part| part.to_ascii_lowercase())
         .collect()
+}
+
+fn traversal_ast_span_contains(
+    parent: &TraversalAstSpanIndexEntry,
+    child: &TraversalAstSpanIndexEntry,
+) -> bool {
+    parent.handle != child.handle
+        && parent.file == child.file
+        && parent.start_byte <= child.start_byte
+        && parent.end_byte >= child.end_byte
+}
+
+fn traversal_ast_parent_handle<'a>(
+    entry: &TraversalAstSpanIndexEntry,
+    entries: &'a [TraversalAstSpanIndexEntry],
+) -> Option<&'a str> {
+    entries
+        .iter()
+        .filter(|candidate| traversal_ast_span_contains(candidate, entry))
+        .min_by_key(|candidate| {
+            (
+                candidate.end_byte.saturating_sub(candidate.start_byte),
+                candidate.start_byte,
+                candidate.end_byte,
+                candidate.kind.as_str(),
+                candidate.name.as_str(),
+                candidate.node_kind.as_str(),
+            )
+        })
+        .map(|candidate| candidate.handle.as_str())
+}
+
+fn traversal_ast_enclosing_module_handle<'a>(
+    entry: &TraversalAstSpanIndexEntry,
+    entries_by_handle: &'a BTreeMap<String, TraversalAstSpanIndexEntry>,
+    parent_by_handle: &BTreeMap<String, String>,
+) -> Option<&'a str> {
+    let mut current = parent_by_handle.get(&entry.handle);
+    while let Some(handle) = current {
+        let Some(parent) = entries_by_handle.get(handle) else {
+            break;
+        };
+        if matches!(parent.kind.as_str(), "module" | "mod")
+            || entry
+                .parent_module
+                .as_deref()
+                .is_some_and(|module| module == parent.name)
+        {
+            return Some(parent.handle.as_str());
+        }
+        current = parent_by_handle.get(&parent.handle);
+    }
+    None
+}
+
+fn link_ast_navigation_edges(
+    graph: &mut TraversalGraphBuild,
+    entries: &[TraversalAstSpanIndexEntry],
+) {
+    let mut entries_by_file = BTreeMap::<String, Vec<TraversalAstSpanIndexEntry>>::new();
+    let entries_by_handle = entries
+        .iter()
+        .map(|entry| (entry.handle.clone(), entry.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut parent_by_handle = BTreeMap::<String, String>::new();
+    let mut children_by_parent = BTreeMap::<Option<String>, Vec<TraversalAstSpanIndexEntry>>::new();
+
+    for entry in entries {
+        entries_by_file
+            .entry(entry.file.clone())
+            .or_default()
+            .push(entry.clone());
+    }
+
+    for file_entries in entries_by_file.values() {
+        for entry in file_entries {
+            let parent = traversal_ast_parent_handle(entry, file_entries).map(str::to_string);
+            if let Some(parent) = &parent {
+                parent_by_handle.insert(entry.handle.clone(), parent.clone());
+            }
+            let sibling_key = parent.clone().or_else(|| entry.file_handle.clone());
+            children_by_parent
+                .entry(sibling_key)
+                .or_default()
+                .push(entry.clone());
+        }
+    }
+
+    for entry in entries {
+        let parent = parent_by_handle.get(&entry.handle);
+        if let Some(parent) = parent {
+            graph.add_edge(
+                parent,
+                &entry.handle,
+                "contains",
+                Some("AST parent contains child span".to_string()),
+                1,
+            );
+            graph.add_edge(
+                parent,
+                &entry.handle,
+                "child",
+                Some("AST child span".to_string()),
+                1,
+            );
+            graph.add_edge(
+                &entry.handle,
+                parent,
+                "parent",
+                Some("AST parent span".to_string()),
+                1,
+            );
+        } else if let Some(file_handle) = &entry.file_handle {
+            graph.add_edge(
+                file_handle,
+                &entry.handle,
+                "contains",
+                Some("file contains top-level AST span".to_string()),
+                1,
+            );
+        }
+
+        if let Some(module_handle) =
+            traversal_ast_enclosing_module_handle(entry, &entries_by_handle, &parent_by_handle)
+        {
+            graph.add_edge(
+                &entry.handle,
+                module_handle,
+                "enclosing_module",
+                Some("nearest enclosing module AST span".to_string()),
+                1,
+            );
+        }
+
+        if entry.language == "markdown"
+            && let Some(markdown) = &entry.markdown
+            && let Some(section_handle) = &markdown.section_handle
+            && section_handle != &entry.handle
+        {
+            graph.add_edge(
+                section_handle,
+                &entry.handle,
+                "contains_markdown_block",
+                Some("Markdown section contains block".to_string()),
+                1,
+            );
+            graph.add_edge(
+                &entry.handle,
+                section_handle,
+                "enclosing_section",
+                Some("Markdown enclosing section".to_string()),
+                1,
+            );
+        }
+    }
+
+    for siblings in children_by_parent.values_mut() {
+        siblings.sort_by(|left, right| {
+            left.start_byte
+                .cmp(&right.start_byte)
+                .then(left.end_byte.cmp(&right.end_byte))
+                .then(left.kind.cmp(&right.kind))
+                .then(left.name.cmp(&right.name))
+                .then(left.node_kind.cmp(&right.node_kind))
+                .then(left.handle.cmp(&right.handle))
+        });
+        for pair in siblings.windows(2) {
+            let previous = &pair[0];
+            let next = &pair[1];
+            graph.add_edge(
+                &previous.handle,
+                &next.handle,
+                "next_sibling",
+                Some("next AST sibling span".to_string()),
+                1,
+            );
+            graph.add_edge(
+                &next.handle,
+                &previous.handle,
+                "previous_sibling",
+                Some("previous AST sibling span".to_string()),
+                1,
+            );
+        }
+    }
 }
 
 fn traversal_node_tokens(node: &TraversalNode) -> BTreeSet<String> {
@@ -17862,6 +18172,19 @@ fn relative_path_inside_scope(path: &str, scope_root: &str) -> bool {
     path == scope_root || path.starts_with(&format!("{scope_root}/"))
 }
 
+fn traversal_symbol_source_path(root: &Path, source_root: &Path, file: &str) -> PathBuf {
+    let path = Path::new(file);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let source_candidate = source_root.join(path);
+    if source_candidate.exists() {
+        source_candidate
+    } else {
+        root.join(path)
+    }
+}
+
 fn cargo_import_alias_from_line(line: &str) -> Option<String> {
     let trimmed = line.trim();
     let rest = trimmed
@@ -17981,6 +18304,13 @@ fn load_multiplicity_traversal_nodes(
                     Some("Rust use/extern crate reference".to_string()),
                     1,
                 );
+                graph.add_edge(
+                    &node.handle,
+                    &handles[0],
+                    "imports",
+                    Some("Rust use/extern crate import".to_string()),
+                    1,
+                );
             }
         }
     }
@@ -18034,7 +18364,11 @@ fn build_traversal_graph_source_with_options(
 
                 let symbols = db.all_symbols()?;
                 let mut symbol_by_file_name_line = HashMap::new();
+                let mut span_by_file_name_line = HashMap::new();
                 let mut first_symbol_by_name = BTreeMap::<String, String>::new();
+                let mut first_span_by_name = BTreeMap::<String, String>::new();
+                let mut ast_entries = Vec::<TraversalAstSpanIndexEntry>::new();
+                let mut source_by_file = HashMap::<String, Option<Vec<u8>>>::new();
                 for symbol in symbols.iter().filter(|symbol| {
                     !traversal_path_is_generated_artifact(
                         root,
@@ -18066,8 +18400,44 @@ fn build_traversal_graph_source_with_options(
                             1,
                         );
                     }
+                    if !source_by_file.contains_key(&symbol.file) {
+                        let source_path =
+                            traversal_symbol_source_path(root, &gate_source_root, &symbol.file);
+                        source_by_file.insert(symbol.file.clone(), fs::read(source_path).ok());
+                    }
+                    if let Some(Some(source)) = source_by_file.get(&symbol.file)
+                        && let Some((ast_node, mut ast_entry)) =
+                            traversal_ast_span_node(root, symbol, source, &symbols)
+                    {
+                        ast_entry.symbol_handle = node.handle.clone();
+                        ast_entry.file_handle = file_handle_by_path.get(&file).cloned();
+                        span_by_file_name_line.insert(
+                            format!("{file}:{}:{}", symbol.line, symbol.name),
+                            ast_node.handle.clone(),
+                        );
+                        first_span_by_name
+                            .entry(symbol.name.clone())
+                            .or_insert_with(|| ast_node.handle.clone());
+                        graph.add_node(ast_node.clone());
+                        graph.add_edge(
+                            &node.handle,
+                            &ast_node.handle,
+                            "has_ast_span",
+                            Some("symbol projects to indexed AST span".to_string()),
+                            1,
+                        );
+                        graph.add_edge(
+                            &ast_node.handle,
+                            &node.handle,
+                            "represents_symbol",
+                            Some("AST span represents indexed symbol".to_string()),
+                            1,
+                        );
+                        ast_entries.push(ast_entry);
+                    }
                     symbol_entries.push(entry);
                 }
+                link_ast_navigation_edges(&mut graph, &ast_entries);
 
                 if !bounded_session_projection {
                     for edge in db.all_stored_edges()? {
@@ -18103,6 +18473,20 @@ fn build_traversal_graph_source_with_options(
                             Some(format!("call site {}:{}", caller_file, edge.call_site_line)),
                             1,
                         );
+                        if let Some(caller_span) = span_by_file_name_line.get(&caller_key)
+                            && let Some(callee_span) = first_span_by_name.get(&edge.callee_name)
+                        {
+                            graph.add_edge(
+                                caller_span,
+                                callee_span,
+                                "calls",
+                                Some(format!(
+                                    "AST call site {}:{}",
+                                    caller_file, edge.call_site_line
+                                )),
+                                1,
+                            );
+                        }
                     }
                 }
 
@@ -18148,6 +18532,22 @@ fn build_traversal_graph_source_with_options(
                         Some("route handler reference".to_string()),
                         1,
                     );
+                    if let Some(handler_span) = first_span_by_name.get(&route.handler_name) {
+                        graph.add_edge(
+                            &entry.handle,
+                            handler_span,
+                            "handled_by",
+                            Some("route handler AST span".to_string()),
+                            1,
+                        );
+                        graph.add_edge(
+                            handler_span,
+                            &entry.handle,
+                            "handles_route",
+                            Some("AST span handles route".to_string()),
+                            1,
+                        );
+                    }
                     route_entries.push(entry);
                 }
             }
@@ -18264,14 +18664,15 @@ fn traversal_query_kind_priority(kind: &str) -> usize {
         "job_packet" => 1,
         "worker_result" => 2,
         "symbol" => 3,
-        "file" => 4,
-        "route" => 5,
-        "cargo_package" => 6,
-        "cargo_workspace" => 7,
-        "session" => 8,
-        "semantic_concept" => 9,
-        "semantic_entity" => 10,
-        _ => 11,
+        "ast_span" => 4,
+        "file" => 5,
+        "route" => 6,
+        "cargo_package" => 7,
+        "cargo_workspace" => 8,
+        "session" => 9,
+        "semantic_concept" => 10,
+        "semantic_entity" => 11,
+        _ => 12,
     }
 }
 
@@ -18463,6 +18864,8 @@ fn traversal_relation_score(edge: &TraversalEdge, origin: &str) -> usize {
     let base = match edge.relation.as_str() {
         "mentions" => 100,
         "contains" => 80,
+        "parent" | "child" | "has_ast_span" | "represents_symbol" => 78,
+        "contains_markdown_block" | "enclosing_module" | "enclosing_section" => 76,
         "calls" => {
             if edge.from == origin {
                 70
@@ -18470,8 +18873,10 @@ fn traversal_relation_score(edge: &TraversalEdge, origin: &str) -> usize {
                 65
             }
         }
-        "handled_by" => 68,
+        "handled_by" | "handles_route" => 68,
         "defines_route" => 62,
+        "imports" => 62,
+        "previous_sibling" | "next_sibling" => 54,
         "mentions_concept" | "mentions_entity" => 66,
         "semantic_relation" => 64,
         "tagged_concept" | "related_concept" => 58,
@@ -18491,12 +18896,23 @@ fn traversal_recommendation_reason(edge: &TraversalEdge, origin: &str) -> String
     match edge.relation.as_str() {
         "mentions" => "matched from backlog/session text".to_string(),
         "contains" => "contained in the selected session artifact".to_string(),
+        "has_ast_span" => "indexed AST span for the selected symbol".to_string(),
+        "represents_symbol" => "indexed symbol represented by the selected AST span".to_string(),
+        "parent" => "parent AST span".to_string(),
+        "child" => "child AST span".to_string(),
+        "previous_sibling" => "previous AST sibling".to_string(),
+        "next_sibling" => "next AST sibling".to_string(),
+        "contains_markdown_block" => "Markdown section block".to_string(),
+        "enclosing_module" => "nearest enclosing module".to_string(),
+        "enclosing_section" => "nearest enclosing Markdown section".to_string(),
         "defines" if edge.from == origin => "symbol defined in selected file".to_string(),
         "defines" => "file that defines the selected symbol".to_string(),
         "defines_route" if edge.from == origin => "route declared in selected file".to_string(),
         "defines_route" => "file that declares the selected route".to_string(),
         "handled_by" if edge.from == origin => "handler for the selected route".to_string(),
         "handled_by" => "route handled by the selected symbol".to_string(),
+        "handles_route" => "route handled by the selected AST span".to_string(),
+        "imports" => "import dependency from the selected package".to_string(),
         "mentions_concept" => "cached summary concept for the selected source".to_string(),
         "mentions_entity" => "cached summary entity for the selected source".to_string(),
         "semantic_relation" => "LLM-extracted semantic relationship".to_string(),
@@ -31982,6 +32398,22 @@ dispatch #spec-test-build-install-commit-push
         dir
     }
 
+    fn resolve_ast_span_node<'a>(
+        graph: &'a TraversalGraphBuild,
+        label: &str,
+        symbol_kind: &str,
+    ) -> &'a TraversalNode {
+        graph
+            .nodes
+            .values()
+            .find(|node| {
+                node.kind == "ast_span"
+                    && node.label == label
+                    && node.properties.get("symbol_kind") == Some(&symbol_kind.to_string())
+            })
+            .unwrap_or_else(|| panic!("missing ast_span {symbol_kind} {label}"))
+    }
+
     fn setup_multiplicity_project() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -32512,6 +32944,135 @@ def list_items():
         assert!(graph.edges.iter().any(|edge| {
             edge.from == route.handle && edge.to == handler.handle && edge.relation == "handled_by"
         }));
+    }
+
+    #[test]
+    fn traversal_graph_projects_rust_ast_navigation_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("main.rs"),
+            r#"mod api {
+    pub fn helper() {}
+    pub fn handler() { helper(); }
+}
+
+fn main() { api::handler(); }
+"#,
+        )
+        .unwrap();
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let api = resolve_ast_span_node(&graph, "api", "mod");
+        let helper = resolve_ast_span_node(&graph, "helper", "function");
+        let handler = resolve_ast_span_node(&graph, "handler", "function");
+
+        assert_eq!(helper.kind, "ast_span");
+        assert!(helper.handle.starts_with("span-"));
+        assert_eq!(helper.properties.get("language"), Some(&"rust".to_string()));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == api.handle && edge.to == helper.handle && edge.relation == "contains"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == api.handle && edge.to == helper.handle && edge.relation == "child"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == helper.handle && edge.to == api.handle && edge.relation == "parent"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == helper.handle
+                && edge.to == handler.handle
+                && edge.relation == "next_sibling"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == handler.handle
+                && edge.to == helper.handle
+                && edge.relation == "previous_sibling"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == helper.handle
+                && edge.to == api.handle
+                && edge.relation == "enclosing_module"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == handler.handle && edge.to == helper.handle && edge.relation == "calls"
+        }));
+
+        let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
+        let ast_nodes = store.nodes_by_kind("ast_span").unwrap();
+        assert!(
+            ast_nodes.iter().any(|node| node.id == helper.handle
+                && node.properties.get("symbol_kind") == Some(&"function".to_string())),
+            "expected helper AST span in graph store, got {ast_nodes:?}"
+        );
+        assert!(
+            store
+                .outgoing_edges(&helper.handle, Some("parent"))
+                .unwrap()
+                .iter()
+                .any(|edge| edge.to_id == api.handle),
+            "expected persisted AST parent edge"
+        );
+    }
+
+    #[test]
+    fn traversal_graph_projects_markdown_section_block_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            "# Guide\n\n- Setup\n- Verify\n\n```rust\nfn demo() {}\n```\n",
+        )
+        .unwrap();
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let guide = resolve_ast_span_node(&graph, "Guide", "heading");
+        let code = resolve_ast_span_node(&graph, "rust", "code_block");
+        let list_item = graph
+            .nodes
+            .values()
+            .find(|node| {
+                node.kind == "ast_span"
+                    && node.properties.get("symbol_kind") == Some(&"list_item".to_string())
+                    && node.properties.get("section_handle") == Some(&guide.handle)
+            })
+            .expect("missing Markdown list item AST span");
+
+        assert_eq!(
+            code.properties.get("markdown_block_kind"),
+            Some(&"fenced_code_block".to_string())
+        );
+        assert_eq!(
+            guide.properties.get("heading_level"),
+            Some(&"1".to_string())
+        );
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == guide.handle
+                && edge.to == code.handle
+                && edge.relation == "contains_markdown_block"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == code.handle
+                && edge.to == guide.handle
+                && edge.relation == "enclosing_section"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == guide.handle
+                && edge.to == list_item.handle
+                && edge.relation == "contains_markdown_block"
+        }));
+
+        let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
+        assert!(
+            store
+                .outgoing_edges(&guide.handle, Some("contains_markdown_block"))
+                .unwrap()
+                .iter()
+                .any(|edge| edge.to_id == code.handle),
+            "expected persisted Markdown section/block edge"
+        );
     }
 
     #[test]

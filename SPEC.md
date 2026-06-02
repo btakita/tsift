@@ -148,6 +148,8 @@ SQLite neighborhood paging builds the reachable node page and page-scoped edges 
 
 The `RankedNeighborhoodOptions` struct carries `depth`, `max_nodes`, `scoring`, and an optional `edge_kind` filter. The result includes `pruned_count` and `total_discovered` diagnostics so operators can observe how many nodes were dropped by the budget. This achieves an estimated 30–60% token reduction for `explain` and `neighborhood` previews by avoiding the full unranked traversal + post-hoc scoring path.
 
+Traversal graph projection materializes indexed AST spans as stable `ast_span` graph nodes using the same handles exposed by `symbol-read` / `markdown-ast`. The projection links files, symbols, calls, routes, imports, Markdown sections, and AST spans with `has_ast_span`, `contains`, `parent`, `child`, `previous_sibling`, `next_sibling`, `enclosing_module`, `enclosing_section`, `contains_markdown_block`, `calls`, `handled_by`, `handles_route`, and `imports` edges so graph-db neighborhoods can navigate code structure without rereading source files.
+
 Property-filtered edge scans must drive from `graph_edge_properties(key, value, edge_key)` into `graph_edges(edge_key)` instead of scanning the full edge table first. Backend-eval must choose its edge-property probe through the same indexed property surface rather than preloading all edges. Page diagnostics report the primary materialized-property cardinality before edge-kind/cursor paging so backend-eval and operator traces can prove the selective scan shape.
 
 GraphStore exposes cheap count and sample-edge probes so status and backend-eval path selection can use SQLite `COUNT(*)` / indexed `LIMIT 1` queries instead of loading all graph rows before the measured operation.

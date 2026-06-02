@@ -1404,7 +1404,7 @@ fn graph_db_cli_covers_agent_loop_workspace_fixture_rows() {
             "--depth".to_string(),
             "3".to_string(),
             "--limit".to_string(),
-            "50".to_string(),
+            "80".to_string(),
         ],
     );
     let neighborhood_ids = node_ids(&neighborhood);
