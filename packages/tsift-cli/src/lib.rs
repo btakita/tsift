@@ -30249,6 +30249,10 @@ struct SearchBudgetSymbolPreview {
     match_count: usize,
     surface_count: usize,
     file_count: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    summary_refs: usize,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    graph_neighbors: usize,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     surface_examples: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -30281,6 +30285,35 @@ struct SearchBudgetHitPreview {
     confidence: String,
     score: f64,
     preview: String,
+    expand: String,
+}
+
+#[derive(Serialize)]
+struct SearchBudgetRankingProfile {
+    mode: String,
+    symbol_span_weight: f64,
+    lexical_file_weight: f64,
+    summary_boost: f64,
+    graph_boost: f64,
+}
+
+#[derive(Serialize)]
+struct SearchBudgetRankedPreview {
+    handle: String,
+    rank: usize,
+    source: String,
+    score: f64,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+    preview: String,
+    reasons: Vec<String>,
     expand: String,
 }
 
@@ -30323,6 +30356,8 @@ struct SearchBudgetReport {
     scale_guard: Option<SearchScaleGuard>,
     symbols: Vec<SearchBudgetSymbolPreview>,
     hits: Vec<SearchBudgetHitPreview>,
+    ranking: SearchBudgetRankingProfile,
+    ranked: Vec<SearchBudgetRankedPreview>,
 }
 
 pub(crate) struct SearchBudgetReportInput<'a> {
@@ -30337,6 +30372,10 @@ pub(crate) struct SearchBudgetReportInput<'a> {
 }
 
 const SEARCH_BUDGET_SURFACE_PREVIEW_LIMIT: usize = 3;
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
 
 struct SearchBudgetSymbolFamily {
     canonical_family: Option<String>,
@@ -30484,6 +30523,198 @@ fn search_budget_ast_artifact(
         span,
         expand,
     })
+}
+
+fn search_budget_summary_db(root: &Path) -> Option<summarize::SummaryDb> {
+    let db_path = root.join(".tsift/summaries.db");
+    if !db_path.exists() {
+        return None;
+    }
+    summarize::SummaryDb::open_read_only_resilient(&db_path).ok()
+}
+
+fn search_budget_summary_path_candidates(root: &Path, file: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    candidates.push(file.to_string());
+    let relative = relativize(file, root);
+    candidates.push(relative);
+    let path = Path::new(file);
+    if let Ok(stripped) = path.strip_prefix(root) {
+        candidates.push(stripped.to_string_lossy().to_string());
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn search_budget_summary_ref_count(
+    summary_db: Option<&summarize::SummaryDb>,
+    root: &Path,
+    symbol: &index::SymbolHit,
+) -> usize {
+    let Some(summary_db) = summary_db else {
+        return 0;
+    };
+    let mut ids = BTreeSet::new();
+    if let Ok(summaries) = summary_db.get_by_symbol(&symbol.name) {
+        for summary in summaries {
+            ids.insert(summary.id);
+        }
+    }
+    for path in search_budget_summary_path_candidates(root, &symbol.file) {
+        if let Ok(summaries) = summary_db.get_by_file(&path) {
+            for summary in summaries {
+                if summary.symbol_name == symbol.name
+                    || summary.symbol_name == path
+                    || summary.symbol_name
+                        == Path::new(&path)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or_default()
+                {
+                    ids.insert(summary.id);
+                }
+            }
+        }
+    }
+    ids.len()
+}
+
+fn search_budget_graph_neighbor_count(ast: Option<&SearchBudgetAstArtifact>) -> usize {
+    let Some(ast) = ast else {
+        return 0;
+    };
+    let mut count = ast.span.child_handles.len();
+    if ast.span.parent_handle.is_some() {
+        count += 1;
+    }
+    if let Some(markdown) = &ast.span.markdown {
+        count += markdown.embedded_symbols.len();
+    }
+    count
+}
+
+fn search_budget_ranking_profile() -> SearchBudgetRankingProfile {
+    SearchBudgetRankingProfile {
+        mode: "ast_aware_merged".to_string(),
+        symbol_span_weight: 1.0,
+        lexical_file_weight: 0.45,
+        summary_boost: 10.0,
+        graph_boost: 12.0,
+    }
+}
+
+fn search_budget_clamped_score(value: f64, min: f64, max: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        min
+    }
+}
+
+fn search_budget_symbol_rank_score(symbol: &SearchBudgetSymbolPreview) -> (f64, Vec<String>) {
+    let mut score = 40.0 + (search_budget_clamped_score(symbol.score, 0.0, 1.0) * 50.0);
+    let mut reasons = vec![format!("symbol:{}:{:.2}", symbol.match_type, symbol.score)];
+    if symbol.match_type == "exact_name" {
+        score += 10.0;
+        reasons.push("exact_symbol_name".to_string());
+    }
+    if symbol.ast.is_some() {
+        score += 20.0;
+        reasons.push("ast_span".to_string());
+    }
+    if symbol.summary_refs > 0 {
+        let boost = (symbol.summary_refs as f64 * 5.0).min(10.0);
+        score += boost;
+        reasons.push(format!("summary_refs:{}", symbol.summary_refs));
+    }
+    if symbol.graph_neighbors > 0 {
+        let boost = (symbol.graph_neighbors as f64 * 4.0).min(12.0);
+        score += boost;
+        reasons.push(format!("graph_neighbors:{}", symbol.graph_neighbors));
+    }
+    (score, reasons)
+}
+
+fn search_budget_lexical_rank_score(hit: &SearchBudgetHitPreview) -> (f64, Vec<String>) {
+    let capped = search_budget_clamped_score(hit.score, 0.0, 100.0);
+    let mut score = (capped * 0.45).min(45.0);
+    let mut reasons = vec![format!("lexical_file:{:.2}", hit.score)];
+    if hit.confidence.eq_ignore_ascii_case("High") {
+        score += 3.0;
+        reasons.push("high_confidence_lexical".to_string());
+    }
+    (score, reasons)
+}
+
+fn build_search_budget_ranked_previews(
+    query: &str,
+    max_items: usize,
+    max_bytes: usize,
+    symbols: &[SearchBudgetSymbolPreview],
+    hits: &[SearchBudgetHitPreview],
+) -> Vec<SearchBudgetRankedPreview> {
+    let mut ranked = Vec::new();
+    for symbol in symbols {
+        let (score, reasons) = search_budget_symbol_rank_score(symbol);
+        let key = format!(
+            "symbol:{}:{}:{}:{}:{}",
+            symbol.handle, symbol.file, symbol.line, score, query
+        );
+        ranked.push(SearchBudgetRankedPreview {
+            handle: stable_handle("srnk", &key),
+            rank: 0,
+            source: if symbol.ast.is_some() {
+                "symbol_span".to_string()
+            } else {
+                "symbol".to_string()
+            },
+            score,
+            path: symbol.file.clone(),
+            line: Some(symbol.line),
+            name: Some(symbol.name.clone()),
+            kind: Some(symbol.kind.clone()),
+            language: Some(symbol.language.clone()),
+            preview: truncate_for_budget(
+                &format!("{} {}", symbol.match_type, symbol.kind),
+                max_bytes,
+            ),
+            reasons,
+            expand: symbol.expand.clone(),
+        });
+    }
+    for hit in hits {
+        let (score, reasons) = search_budget_lexical_rank_score(hit);
+        let key = format!("lexical:{}:{}:{}:{}", hit.handle, hit.path, score, query);
+        ranked.push(SearchBudgetRankedPreview {
+            handle: stable_handle("srnk", &key),
+            rank: 0,
+            source: "lexical_file".to_string(),
+            score,
+            path: hit.path.clone(),
+            line: None,
+            name: None,
+            kind: None,
+            language: None,
+            preview: truncate_for_budget(&hit.preview, max_bytes),
+            reasons,
+            expand: hit.expand.clone(),
+        });
+    }
+    ranked.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    ranked.truncate(max_items);
+    for (idx, item) in ranked.iter_mut().enumerate() {
+        item.rank = idx + 1;
+    }
+    ranked
 }
 
 struct SearchFacetAstContext {
@@ -30761,6 +30992,7 @@ pub(crate) fn build_search_budget_report(input: SearchBudgetReportInput<'_>) -> 
     let hit_total = response.hits.len();
     let mut family_positions = HashMap::new();
     let mut families = Vec::new();
+    let summary_db = search_budget_summary_db(root);
 
     for hit in symbol_hits {
         let display_file = if absolute {
@@ -30832,6 +31064,12 @@ pub(crate) fn build_search_budget_report(input: SearchBudgetReportInput<'_>) -> 
                 strategy
             );
             let ast = search_budget_ast_artifact(root, &family.representative_hit);
+            let summary_refs = search_budget_summary_ref_count(
+                summary_db.as_ref(),
+                root,
+                &family.representative_hit,
+            );
+            let graph_neighbors = search_budget_graph_neighbor_count(ast.as_ref());
             SearchBudgetSymbolPreview {
                 handle: stable_handle("sfam", &key),
                 tag_alias: family
@@ -30857,6 +31095,8 @@ pub(crate) fn build_search_budget_report(input: SearchBudgetReportInput<'_>) -> 
                 match_count: family.match_count,
                 surface_count,
                 file_count,
+                summary_refs,
+                graph_neighbors,
                 surface_examples: family.surface_examples,
                 ast,
                 expand: build_search_budget_family_expand(
@@ -30895,6 +31135,8 @@ pub(crate) fn build_search_budget_report(input: SearchBudgetReportInput<'_>) -> 
         })
         .collect();
 
+    let ranking = search_budget_ranking_profile();
+    let ranked = build_search_budget_ranked_previews(query, max_items, max_bytes, &symbols, &hits);
     let scale_guard = build_search_scale_guard(
         query,
         strategy,
@@ -30924,6 +31166,8 @@ pub(crate) fn build_search_budget_report(input: SearchBudgetReportInput<'_>) -> 
         scale_guard,
         symbols,
         hits,
+        ranking,
+        ranked,
     }
 }
 
@@ -30976,6 +31220,41 @@ pub(crate) fn print_search_budget_human(report: &SearchBudgetReport) {
     if !report.filters.is_empty() {
         println!("filters: {}", search_facet_filters_summary(&report.filters));
     }
+    if !report.ranked.is_empty() {
+        println!(
+            "ranking: {} symbol-span-weight:{} lexical-file-weight:{} summary-boost:{} graph-boost:{}",
+            report.ranking.mode,
+            format_score(report.ranking.symbol_span_weight, true),
+            format_score(report.ranking.lexical_file_weight, true),
+            format_score(report.ranking.summary_boost, true),
+            format_score(report.ranking.graph_boost, true)
+        );
+    }
+    for item in &report.ranked {
+        let label = item
+            .name
+            .as_deref()
+            .map(|name| format!(" {name}"))
+            .unwrap_or_default();
+        let line = item.line.map(|line| format!(":{line}")).unwrap_or_default();
+        let reasons = if item.reasons.is_empty() {
+            String::new()
+        } else {
+            format!(" reasons:{}", item.reasons.join(","))
+        };
+        println!(
+            "rank {} #{} [{} {}] {}{}{}{} expand:{}",
+            item.handle,
+            item.rank,
+            item.source,
+            format_score(item.score, true),
+            item.path,
+            line,
+            label,
+            reasons,
+            item.expand
+        );
+    }
     for symbol in &report.symbols {
         let variants = if symbol.surface_examples.is_empty() {
             String::new()
@@ -30995,6 +31274,12 @@ pub(crate) fn print_search_budget_human(report: &SearchBudgetReport) {
             variants,
             symbol.expand
         );
+        if symbol.summary_refs > 0 || symbol.graph_neighbors > 0 {
+            println!(
+                "  evidence summary_refs:{} graph_neighbors:{}",
+                symbol.summary_refs, symbol.graph_neighbors
+            );
+        }
         if let Some(ast) = &symbol.ast {
             let markdown_ast = ast
                 .expand
@@ -38730,6 +39015,172 @@ tier = "private"
         assert!(embedded[0].handle.starts_with("span-"));
         assert_eq!(embedded[0].start_byte, body_start);
         assert_eq!(embedded[0].start_line, 4);
+    }
+
+    fn test_lexical_search_hit(
+        path: &Path,
+        rank: usize,
+        score: f64,
+        snippet: &str,
+    ) -> sift::SearchHit {
+        sift::SearchHit {
+            artifact_id: format!("hit-{rank}"),
+            artifact_kind: sift::ContextArtifactKind::File,
+            budget: sift::ArtifactBudget::from_text(snippet, 1),
+            confidence: sift::ScoreConfidence::High,
+            freshness: sift::ArtifactFreshness {
+                modified_unix_secs: None,
+                observed_unix_secs: 0,
+            },
+            location: Some("line 1".to_string()),
+            path: path.to_string_lossy().to_string(),
+            provenance: sift::ArtifactProvenance {
+                adapter: sift::AcquisitionAdapterKind::FileSystem,
+                source: "test lexical hit".to_string(),
+                synthetic: false,
+            },
+            rank,
+            score,
+            snippet: snippet.to_string(),
+        }
+    }
+
+    fn test_summary(symbol_name: &str, file_path: &str, summary: &str) -> summarize::Summary {
+        summarize::Summary {
+            id: 0,
+            symbol_name: symbol_name.to_string(),
+            file_path: file_path.to_string(),
+            content_hash: "hash".to_string(),
+            summary: summary.to_string(),
+            entities: None,
+            relationships: None,
+            concept_labels: None,
+            extracted_at: "2026-06-02T00:00:00Z".to_string(),
+            model: "test".to_string(),
+            tokens_input: None,
+            tokens_output: None,
+        }
+    }
+
+    #[test]
+    fn search_budget_ranked_preview_prioritizes_precise_ast_span_over_broad_file_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let source = "fn alpha_helper() {}\n";
+        let file = src_dir.join("lib.rs");
+        let broad_file = dir.path().join("README.md");
+        fs::write(&file, source).unwrap();
+        fs::write(
+            &broad_file,
+            "alpha helper alpha helper alpha helper in prose\n",
+        )
+        .unwrap();
+
+        let mut response = empty_search_response(dir.path(), "lexical");
+        response.hits.push(test_lexical_search_hit(
+            &broad_file,
+            1,
+            240.0,
+            "alpha helper alpha helper alpha helper in prose",
+        ));
+        let symbol_hits = vec![index::SymbolHit {
+            name: "alpha_helper".to_string(),
+            kind: "function".to_string(),
+            language: "rust".to_string(),
+            file: file.to_string_lossy().to_string(),
+            line: 0,
+            end_line: Some(0),
+            node_kind: Some("function_item".to_string()),
+            start_byte: Some(0),
+            end_byte: Some(i64::try_from(source.len()).unwrap()),
+            body_start_byte: Some(i64::try_from(source.find("{}").unwrap() + 1).unwrap()),
+            body_end_byte: Some(i64::try_from(source.find("{}").unwrap() + 1).unwrap()),
+            tags: Some("alpha,helper".to_string()),
+            score: 0.8,
+            match_type: "all_tags".to_string(),
+            tagpath_handle: None,
+        }];
+
+        let report = build_relative_search_budget_report(
+            "alpha helper",
+            "lexical",
+            dir.path(),
+            &response,
+            &symbol_hits,
+            ResponseBudget::new(Some(5), Some(128)),
+            &SearchFacetFilters::default(),
+        );
+
+        assert_eq!(report.ranked[0].source, "symbol_span");
+        assert_eq!(report.ranked[0].name.as_deref(), Some("alpha_helper"));
+        assert!(report.ranked[0].score > report.ranked[1].score);
+        assert_eq!(report.ranked[1].source, "lexical_file");
+    }
+
+    #[test]
+    fn search_budget_ranked_preview_includes_summary_and_graph_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "# Guide\n\n```rust\nfn sample() {}\n```\n";
+        let file = dir.path().join("README.md");
+        fs::write(&file, source).unwrap();
+        let summary_db =
+            summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+        summary_db
+            .insert(&test_summary(
+                "rust",
+                "README.md",
+                "Rust fence contains a sample function.",
+            ))
+            .unwrap();
+
+        let fence_start = source.find("```rust").unwrap();
+        let body_start = source.find("fn sample").unwrap();
+        let body_end = body_start + "fn sample() {}\n".len();
+        let response = empty_search_response(dir.path(), "lexical");
+        let symbol_hits = vec![index::SymbolHit {
+            name: "rust".to_string(),
+            kind: "code_block".to_string(),
+            language: "markdown".to_string(),
+            file: file.to_string_lossy().to_string(),
+            line: 2,
+            end_line: Some(4),
+            node_kind: Some("fenced_code_block".to_string()),
+            start_byte: Some(i64::try_from(fence_start).unwrap()),
+            end_byte: Some(i64::try_from(source.len()).unwrap()),
+            body_start_byte: Some(i64::try_from(body_start).unwrap()),
+            body_end_byte: Some(i64::try_from(body_end).unwrap()),
+            tags: Some("rust".to_string()),
+            score: 1.0,
+            match_type: "exact_name".to_string(),
+            tagpath_handle: None,
+        }];
+
+        let report = build_relative_search_budget_report(
+            "rust",
+            "lexical",
+            dir.path(),
+            &response,
+            &symbol_hits,
+            ResponseBudget::new(Some(5), Some(128)),
+            &SearchFacetFilters::default(),
+        );
+
+        let symbol = &report.symbols[0];
+        assert_eq!(symbol.summary_refs, 1);
+        assert_eq!(symbol.graph_neighbors, 1);
+        assert!(
+            report.ranked[0]
+                .reasons
+                .iter()
+                .any(|reason| reason == "summary_refs:1")
+        );
+        assert!(
+            report.ranked[0]
+                .reasons
+                .iter()
+                .any(|reason| reason == "graph_neighbors:1")
+        );
     }
 
     fn markdown_search_facet_fixture() -> tempfile::TempDir {
