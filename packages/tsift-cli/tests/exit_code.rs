@@ -12,6 +12,26 @@ fn tsift_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tsift-cli"))
 }
 
+fn run_tsift_stdin(args: &[&str], input: &str) -> std::process::Output {
+    let mut child = tsift_bin()
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    child.wait_with_output().unwrap()
+}
+
 fn hold_rollback_journal_lock(db_path: &std::path::Path) -> Connection {
     let conn = Connection::open(db_path).unwrap();
     conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
@@ -629,10 +649,9 @@ def beta(value):
     dir
 }
 
-fn markdown_edit_fixture() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+fn write_markdown_edit_fixture(path: &Path) {
     fs::write(
-        dir.path().join("README.md"),
+        path.join("README.md"),
         r#"# Guide
 
 Intro text.
@@ -656,6 +675,29 @@ Done.
 "#,
     )
     .unwrap();
+}
+
+fn markdown_edit_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write_markdown_edit_fixture(dir.path());
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
+}
+
+fn git_markdown_edit_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write_markdown_edit_fixture(dir.path());
+    init_git_repo(dir.path());
 
     let output = tsift_bin()
         .args(["index", dir.path().to_str().unwrap()])
@@ -3315,6 +3357,99 @@ fn edit_intents_apply_mutates_markdown_block_intents() {
 }
 
 #[test]
+fn edit_intents_markdown_block_dry_run_reports_source_windows_without_mutating() {
+    let dir = markdown_edit_fixture();
+    let readme = dir.path().join("README.md");
+    let before = fs::read_to_string(&readme).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "insert_list_item",
+                "symbol": "Confirm setup.",
+                "file": "README.md",
+                "position": "after",
+                "replacement": "Verify setup."
+            },
+            {
+                "kind": "rewrite_code_fence",
+                "symbol": "rust",
+                "file": "README.md",
+                "replacement": "fn sample() {\n    println!(\"ok\");\n}\n"
+            }
+        ]
+    }"#;
+
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--budget",
+            "normal",
+        ],
+        input,
+    );
+    assert!(
+        output.status.success(),
+        "markdown block dry-run stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(&readme).unwrap(), before);
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "edit-intents");
+    assert_eq!(json["view"], "dry-run");
+    assert_eq!(json["report"]["mode"], "dry_run");
+    assert_eq!(json["report"]["planned_total"], 2);
+    assert_eq!(json["report"]["applied_total"], 0);
+    assert_eq!(json["report"]["unsupported_total"], 0);
+
+    let plans = json["report"]["plans"].as_array().unwrap();
+    let list_plan = &plans[0];
+    assert_eq!(list_plan["kind"], "insert_list_item");
+    assert_eq!(list_plan["status"], "planned");
+    assert_eq!(list_plan["apply_supported"], true);
+    assert_eq!(list_plan["applied"], false);
+    assert_eq!(list_plan["target_symbol"]["kind"], "list_item");
+    assert_eq!(list_plan["target_symbol"]["language"], "markdown");
+    assert_eq!(
+        list_plan["target_symbol"]["span"]["markdown"]["list_depth"],
+        1
+    );
+    assert!(list_plan["diff"].as_str().unwrap().contains("Verify setup."));
+
+    let code_plan = &plans[1];
+    assert_eq!(code_plan["kind"], "rewrite_code_fence");
+    assert_eq!(code_plan["status"], "planned");
+    assert_eq!(code_plan["apply_supported"], true);
+    assert_eq!(code_plan["applied"], false);
+    assert_eq!(code_plan["target_symbol"]["kind"], "code_block");
+    assert_eq!(code_plan["target_symbol"]["language"], "markdown");
+    assert_eq!(
+        code_plan["target_symbol"]["span"]["markdown"]["fence_language"],
+        "rust"
+    );
+    assert!(
+        code_plan["diff"]
+            .as_str()
+            .unwrap()
+            .contains("println!(\"ok\")")
+    );
+    assert!(
+        json["follow_up"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cmd| {
+                let cmd = cmd.as_str().unwrap();
+                cmd.contains("source-read") && cmd.contains("README.md")
+            })
+    );
+}
+
+#[test]
 fn edit_intents_markdown_block_apply_refuses_ambiguous_targets_without_mutating() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -3384,6 +3519,172 @@ fn edit_intents_markdown_block_apply_refuses_ambiguous_targets_without_mutating(
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unsupported"), "stderr was: {stderr}");
     assert!(stderr.contains("ambiguous"), "stderr was: {stderr}");
+}
+
+#[test]
+fn edit_intents_markdown_block_apply_refuses_fence_marker_replacement_without_mutating() {
+    let dir = markdown_edit_fixture();
+    let readme = dir.path().join("README.md");
+    let before = fs::read_to_string(&readme).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "rewrite_code_fence",
+                "symbol": "rust",
+                "file": "README.md",
+                "replacement": "```rust\nfn sample() {}\n```\n"
+            }
+        ]
+    }"#;
+
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ],
+        input,
+    );
+    assert!(
+        !output.status.success(),
+        "fence-marker replacement should fail"
+    );
+    assert_eq!(fs::read_to_string(&readme).unwrap(), before);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unsupported"), "stderr was: {stderr}");
+    assert!(stderr.contains("fence markers"), "stderr was: {stderr}");
+}
+
+#[test]
+fn edit_intents_markdown_verify_reports_temp_worktree_source_read_and_impact() {
+    let dir = git_markdown_edit_fixture();
+    let readme = dir.path().join("README.md");
+    let before = fs::read_to_string(&readme).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "insert_list_item",
+                "symbol": "Confirm setup.",
+                "file": "README.md",
+                "position": "after",
+                "replacement": "Verify setup."
+            },
+            {
+                "kind": "rewrite_code_fence",
+                "symbol": "rust",
+                "file": "README.md",
+                "replacement": "fn sample() {\n    println!(\"ok\");\n}\n"
+            }
+        ]
+    }"#;
+
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--verify",
+            "--budget",
+            "normal",
+        ],
+        input,
+    );
+    assert!(
+        output.status.success(),
+        "markdown verify stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(&readme).unwrap(), before);
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "edit-intents");
+    assert_eq!(json["view"], "verify");
+    assert_eq!(json["report"]["mode"], "verify");
+    assert_eq!(json["report"]["planned_total"], 2);
+    assert_eq!(json["report"]["applied_total"], 0);
+    assert_eq!(json["report"]["unsupported_total"], 0);
+
+    let verification = &json["report"]["verification"];
+    assert_eq!(verification["status"], "passed");
+    assert_eq!(verification["worktree"], "temporary git worktree at HEAD");
+    assert_eq!(verification["reindexed"], true);
+    assert_eq!(verification["temp_applied_total"], 2);
+    assert_eq!(verification["temp_formatted_total"], 0);
+    assert!(
+        verification["message"]
+            .as_str()
+            .unwrap()
+            .contains("temporary worktree")
+    );
+    assert!(
+        verification["source_reads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|read| {
+                read["file"] == "README.md"
+                    && read["preview_lines"].as_u64().unwrap() > 0
+                    && read["command"].as_str().unwrap().contains("source-read")
+                    && read["command"].as_str().unwrap().contains("README.md")
+            })
+    );
+    assert!(
+        verification["impact"]["changed_files"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+}
+
+#[test]
+fn edit_intents_markdown_verify_command_failure_blocks_real_mutation() {
+    let dir = git_markdown_edit_fixture();
+    let readme = dir.path().join("README.md");
+    let before = fs::read_to_string(&readme).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "insert_list_item",
+                "symbol": "Confirm setup.",
+                "file": "README.md",
+                "position": "after",
+                "replacement": "Verify setup."
+            }
+        ]
+    }"#;
+
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--verify",
+            "--verify-command",
+            "exit 7",
+            "--apply",
+            "--budget",
+            "normal",
+        ],
+        input,
+    );
+    assert!(
+        !output.status.success(),
+        "failing Markdown verify command should block apply"
+    );
+    assert_eq!(fs::read_to_string(&readme).unwrap(), before);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("semantic edit verification command failed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
