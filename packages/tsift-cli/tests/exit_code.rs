@@ -557,6 +557,60 @@ fn caller() -> i32 {
     dir
 }
 
+fn script_edit_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("tool.ts"),
+        r#"import { base } from "./base";
+
+function alpha(value: number): number {
+  return beta(value);
+}
+
+function beta(value: number): number {
+  return value + 1;
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("app.js"),
+        r#"function alpha(value) {
+  return beta(value);
+}
+
+function beta(value) {
+  return value + 1;
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("script.py"),
+        r#"import os
+
+def alpha(value):
+    return beta(value)
+
+def beta(value):
+    return value + 1
+"#,
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
+}
+
 fn setup_tokensave_db(dir: &Path) {
     let tokensave_dir = dir.join(".tokensave");
     fs::create_dir_all(&tokensave_dir).unwrap();
@@ -3317,6 +3371,261 @@ fn edit_intents_apply_refuses_move_declaration_without_mutating() {
     assert_eq!(
         fs::read_to_string(dir.path().join("widget.rs")).unwrap(),
         before_destination
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unsupported"), "stderr was: {stderr}");
+}
+
+#[test]
+fn edit_intents_apply_mutates_typescript_executor_intents() {
+    let dir = script_edit_fixture();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "insert_import",
+                "file": "tool.ts",
+                "replacement": "{ extra } from \"./extra\""
+            },
+            {
+                "kind": "replace_function_body",
+                "symbol": "alpha",
+                "file": "tool.ts",
+                "replacement": "return value * 2;"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "typescript executor stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["report"]["planned_total"], 2);
+    assert_eq!(json["report"]["applied_total"], 2);
+    assert_eq!(
+        json["report"]["plans"][1]["target_symbol"]["language"],
+        "typescript"
+    );
+    assert!(
+        json["report"]["plans"][1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("TypeScript semantic edit executor")
+    );
+
+    let source = fs::read_to_string(dir.path().join("tool.ts")).unwrap();
+    assert!(
+        source.contains("import { extra } from \"./extra\";"),
+        "{source}"
+    );
+    assert!(source.contains("return value * 2;"), "{source}");
+    assert!(!source.contains("return beta(value);"), "{source}");
+}
+
+#[test]
+fn edit_intents_apply_mutates_javascript_executor_intents() {
+    let dir = script_edit_fixture();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "rename_symbol",
+                "symbol": "beta",
+                "file": "app.js",
+                "new_name": "betaRenamed"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "javascript executor stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["report"]["planned_total"], 1);
+    assert_eq!(json["report"]["applied_total"], 1);
+    assert_eq!(
+        json["report"]["plans"][0]["target_symbol"]["language"],
+        "javascript"
+    );
+    assert!(
+        json["report"]["plans"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("JavaScript semantic edit executor")
+    );
+
+    let source = fs::read_to_string(dir.path().join("app.js")).unwrap();
+    assert!(source.contains("function betaRenamed(value)"), "{source}");
+    assert!(source.contains("return betaRenamed(value);"), "{source}");
+    assert!(!source.contains("function beta(value)"), "{source}");
+}
+
+#[test]
+fn edit_intents_apply_mutates_python_executor_intents() {
+    let dir = script_edit_fixture();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "insert_import",
+                "file": "script.py",
+                "replacement": "from math import sqrt"
+            },
+            {
+                "kind": "replace_function_body",
+                "symbol": "alpha",
+                "file": "script.py",
+                "replacement": "return value * 3"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "python executor stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["report"]["planned_total"], 2);
+    assert_eq!(json["report"]["applied_total"], 2);
+    assert_eq!(
+        json["report"]["plans"][1]["target_symbol"]["language"],
+        "python"
+    );
+    assert!(
+        json["report"]["plans"][1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Python semantic edit executor")
+    );
+
+    let source = fs::read_to_string(dir.path().join("script.py")).unwrap();
+    assert!(source.contains("from math import sqrt"), "{source}");
+    assert!(source.contains("return value * 3"), "{source}");
+    assert!(!source.contains("return beta(value)"), "{source}");
+}
+
+#[test]
+fn edit_intents_apply_refuses_typescript_call_rewrite_without_mutating() {
+    let dir = script_edit_fixture();
+    let before = fs::read_to_string(dir.path().join("tool.ts")).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "rewrite_call_sites",
+                "symbol": "beta",
+                "file": "tool.ts",
+                "replacement": "betaRenamed(value)"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "typescript call rewrite should fail"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("tool.ts")).unwrap(),
+        before
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unsupported"), "stderr was: {stderr}");

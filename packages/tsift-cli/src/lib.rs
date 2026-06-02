@@ -3997,8 +3997,11 @@ fn semantic_edit_content_hash(bytes: &[u8]) -> String {
 fn semantic_edit_language_for_file(file_abs: &Path) -> String {
     match file_abs.extension().and_then(|value| value.to_str()) {
         Some("rs") => "rust".to_string(),
-        Some("ts") | Some("tsx") => "typescript".to_string(),
-        Some("js") | Some("jsx") => "javascript".to_string(),
+        Some("py") | Some("pyi") => "python".to_string(),
+        Some("ts") => "typescript".to_string(),
+        Some("tsx") => "tsx".to_string(),
+        Some("js") | Some("mjs") | Some("cjs") => "javascript".to_string(),
+        Some("jsx") => "jsx".to_string(),
         Some(ext) => ext.to_string(),
         None => "unknown".to_string(),
     }
@@ -4013,8 +4016,112 @@ fn semantic_edit_target_language(
         .unwrap_or_else(|| semantic_edit_language_for_file(file_abs))
 }
 
-fn semantic_edit_is_rust(language: &str, file_abs: &Path) -> bool {
-    language.eq_ignore_ascii_case("rust") || file_abs.extension().is_some_and(|ext| ext == "rs")
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SemanticEditExecutorLanguage {
+    Rust,
+    Python,
+    TypeScript,
+    Tsx,
+    JavaScript,
+    Jsx,
+}
+
+impl SemanticEditExecutorLanguage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Rust => "Rust",
+            Self::Python => "Python",
+            Self::TypeScript => "TypeScript",
+            Self::Tsx => "TSX",
+            Self::JavaScript => "JavaScript",
+            Self::Jsx => "JSX",
+        }
+    }
+
+    fn graph_lang(self) -> graph::Lang {
+        match self {
+            Self::Rust => graph::Lang::Rust,
+            Self::Python => graph::Lang::Python,
+            Self::TypeScript => graph::Lang::TypeScript,
+            Self::Tsx => graph::Lang::Tsx,
+            Self::JavaScript => graph::Lang::JavaScript,
+            Self::Jsx => graph::Lang::Jsx,
+        }
+    }
+
+    fn temp_suffix(self) -> &'static str {
+        match self {
+            Self::Rust => ".rs",
+            Self::Python => ".py",
+            Self::TypeScript => ".ts",
+            Self::Tsx => ".tsx",
+            Self::JavaScript => ".js",
+            Self::Jsx => ".jsx",
+        }
+    }
+
+    fn is_script(self) -> bool {
+        matches!(
+            self,
+            Self::Python | Self::TypeScript | Self::Tsx | Self::JavaScript | Self::Jsx
+        )
+    }
+
+    fn is_python(self) -> bool {
+        self == Self::Python
+    }
+
+    fn is_js_like(self) -> bool {
+        matches!(
+            self,
+            Self::TypeScript | Self::Tsx | Self::JavaScript | Self::Jsx
+        )
+    }
+}
+
+fn semantic_edit_executor_language(
+    language: &str,
+    file_abs: &Path,
+) -> Option<SemanticEditExecutorLanguage> {
+    let normalized = language.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "rust" | "rs" => Some(SemanticEditExecutorLanguage::Rust),
+        "python" | "py" | "pyi" => Some(SemanticEditExecutorLanguage::Python),
+        "typescript" | "ts" => Some(SemanticEditExecutorLanguage::TypeScript),
+        "tsx" => Some(SemanticEditExecutorLanguage::Tsx),
+        "javascript" | "js" | "mjs" | "cjs" => Some(SemanticEditExecutorLanguage::JavaScript),
+        "jsx" => Some(SemanticEditExecutorLanguage::Jsx),
+        _ => match file_abs.extension().and_then(|value| value.to_str()) {
+            Some("rs") => Some(SemanticEditExecutorLanguage::Rust),
+            Some("py") | Some("pyi") => Some(SemanticEditExecutorLanguage::Python),
+            Some("ts") => Some(SemanticEditExecutorLanguage::TypeScript),
+            Some("tsx") => Some(SemanticEditExecutorLanguage::Tsx),
+            Some("js") | Some("mjs") | Some("cjs") => {
+                Some(SemanticEditExecutorLanguage::JavaScript)
+            }
+            Some("jsx") => Some(SemanticEditExecutorLanguage::Jsx),
+            _ => None,
+        },
+    }
+}
+
+fn semantic_edit_kind_apply_supported(kind: &str, language: &str, file_abs: &Path) -> bool {
+    let Some(executor) = semantic_edit_executor_language(language, file_abs) else {
+        return false;
+    };
+    if executor == SemanticEditExecutorLanguage::Rust {
+        return true;
+    }
+    matches!(
+        kind,
+        "rename_symbol" | "replace_function_body" | "insert_import"
+    )
+}
+
+fn semantic_edit_executor_name(language: &str, file_abs: &Path) -> String {
+    semantic_edit_executor_language(language, file_abs)
+        .map(|executor| executor.name().to_string())
+        .unwrap_or_else(|| language.to_string())
 }
 
 fn rust_ident_char(ch: char) -> bool {
@@ -4073,6 +4180,300 @@ fn line_indent_at(content: &str, idx: usize) -> String {
         .chars()
         .take_while(|ch| matches!(ch, ' ' | '\t'))
         .collect()
+}
+
+fn parse_semantic_edit_source(
+    content: &str,
+    executor: SemanticEditExecutorLanguage,
+    context: &str,
+) -> Result<tree_sitter::Tree> {
+    let mut parser = tree_sitter::Parser::new();
+    let language = executor.graph_lang().tree_sitter_language();
+    parser.set_language(&language)?;
+    let tree = parser
+        .parse(content.as_bytes(), None)
+        .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
+    if tree.root_node().has_error() {
+        bail!(
+            "{context} produced {} source with parse errors",
+            executor.name()
+        );
+    }
+    Ok(tree)
+}
+
+fn script_ident_char(ch: char, executor: SemanticEditExecutorLanguage) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric() || (executor.is_js_like() && ch == '$')
+}
+
+fn validate_script_identifier(
+    name: &str,
+    field: &str,
+    executor: SemanticEditExecutorLanguage,
+) -> Result<()> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        bail!("{field} must not be empty");
+    };
+    let first_ok =
+        first == '_' || first.is_ascii_alphabetic() || (executor.is_js_like() && first == '$');
+    if !first_ok || !chars.all(|ch| script_ident_char(ch, executor)) {
+        bail!(
+            "{field} {name:?} is not a supported {} identifier",
+            executor.name()
+        );
+    }
+    Ok(())
+}
+
+fn replace_script_identifier(
+    content: &str,
+    old: &str,
+    new: &str,
+    executor: SemanticEditExecutorLanguage,
+) -> Result<(String, usize)> {
+    validate_script_identifier(old, "symbol", executor)?;
+    validate_script_identifier(new, "new_name", executor)?;
+    if old == new {
+        bail!("old and new identifiers are identical");
+    }
+    parse_semantic_edit_source(content, executor, "rename_symbol input")?;
+
+    let mut out = String::with_capacity(content.len());
+    let mut last = 0usize;
+    let mut replacements = 0usize;
+    for (idx, _) in content.match_indices(old) {
+        let before_is_ident = content[..idx]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| script_ident_char(ch, executor));
+        let after_idx = idx + old.len();
+        let after_is_ident = content[after_idx..]
+            .chars()
+            .next()
+            .is_some_and(|ch| script_ident_char(ch, executor));
+        if before_is_ident || after_is_ident {
+            continue;
+        }
+        out.push_str(&content[last..idx]);
+        out.push_str(new);
+        last = after_idx;
+        replacements += 1;
+    }
+    if replacements == 0 {
+        bail!(
+            "identifier {old:?} was not found as a whole {} identifier",
+            executor.name()
+        );
+    }
+    out.push_str(&content[last..]);
+    parse_semantic_edit_source(&out, executor, "rename_symbol")?;
+    Ok((out, replacements))
+}
+
+fn normalize_script_import(
+    replacement: &str,
+    executor: SemanticEditExecutorLanguage,
+) -> Result<String> {
+    let trimmed = replacement.trim();
+    if trimmed.is_empty() {
+        bail!("insert_import requires a non-empty replacement");
+    }
+    if executor.is_python() {
+        if trimmed.starts_with("import ") || trimmed.starts_with("from ") {
+            return Ok(trimmed.to_string());
+        }
+        return Ok(format!("import {trimmed}"));
+    }
+
+    let mut import = if trimmed.starts_with("import ") || trimmed.starts_with("export ") {
+        trimmed.to_string()
+    } else {
+        format!("import {trimmed}")
+    };
+    if !import.ends_with(';') {
+        import.push(';');
+    }
+    Ok(import)
+}
+
+fn script_import_insert_offset(content: &str, executor: SemanticEditExecutorLanguage) -> usize {
+    let mut offset = 0usize;
+    let mut insert_at = 0usize;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim();
+        let is_prelude = if executor.is_python() {
+            trimmed.is_empty()
+                || trimmed.starts_with("#!")
+                || trimmed.starts_with("# -*-")
+                || trimmed.starts_with("import ")
+                || trimmed.starts_with("from ")
+        } else {
+            trimmed.is_empty()
+                || trimmed.starts_with("#!")
+                || trimmed.starts_with("import ")
+                || (trimmed.starts_with("export ") && trimmed.contains(" from "))
+        };
+        if is_prelude {
+            insert_at = offset + line.len();
+            offset += line.len();
+            continue;
+        }
+        break;
+    }
+    insert_at
+}
+
+fn insert_script_import(
+    content: &str,
+    replacement: &str,
+    executor: SemanticEditExecutorLanguage,
+) -> Result<(String, usize)> {
+    parse_semantic_edit_source(content, executor, "insert_import input")?;
+    let import = normalize_script_import(replacement, executor)?;
+    if content.lines().any(|line| line.trim() == import) {
+        return Ok((content.to_string(), 0));
+    }
+    let insert_at = script_import_insert_offset(content, executor);
+    let mut out = String::with_capacity(content.len() + import.len() + 1);
+    out.push_str(&content[..insert_at]);
+    out.push_str(&import);
+    out.push('\n');
+    out.push_str(&content[insert_at..]);
+    parse_semantic_edit_source(&out, executor, "insert_import")?;
+    Ok((out, 1))
+}
+
+fn script_function_body_query(executor: SemanticEditExecutorLanguage) -> &'static str {
+    if executor.is_python() {
+        r#"
+        (function_definition name: (identifier) @decl.name body: (block) @decl.body) @decl.item
+        "#
+    } else {
+        r#"
+        (function_declaration name: (identifier) @decl.name body: (statement_block) @decl.body) @decl.item
+        (lexical_declaration (variable_declarator name: (identifier) @decl.name value: (arrow_function body: (statement_block) @decl.body))) @decl.item
+        (variable_declaration (variable_declarator name: (identifier) @decl.name value: (arrow_function body: (statement_block) @decl.body))) @decl.item
+        "#
+    }
+}
+
+fn find_script_function_body_range(
+    content: &str,
+    symbol: &str,
+    executor: SemanticEditExecutorLanguage,
+) -> Result<(usize, usize, String)> {
+    validate_script_identifier(symbol, "symbol", executor)?;
+    let source = content.as_bytes();
+    let language = executor.graph_lang().tree_sitter_language();
+    let tree = parse_semantic_edit_source(content, executor, "replace_function_body input")?;
+    let query = tree_sitter::Query::new(&language, script_function_body_query(executor))?;
+    let capture_names = query.capture_names();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source);
+    while let Some(m) = matches.next() {
+        let mut name_node = None;
+        let mut body_node = None;
+        for capture in m.captures {
+            match capture_names[capture.index as usize] {
+                "decl.name" => name_node = Some(capture.node),
+                "decl.body" => body_node = Some(capture.node),
+                _ => {}
+            }
+        }
+        let (Some(name_node), Some(body_node)) = (name_node, body_node) else {
+            continue;
+        };
+        if name_node.utf8_text(source)? != symbol {
+            continue;
+        }
+        if executor.is_python() {
+            return Ok((
+                body_node.start_byte(),
+                body_node.end_byte(),
+                line_indent_at(content, body_node.start_byte()),
+            ));
+        }
+        let start = body_node.start_byte();
+        let end = body_node.end_byte();
+        if source.get(start).copied() != Some(b'{')
+            || source.get(end.saturating_sub(1)).copied() != Some(b'}')
+        {
+            bail!(
+                "{} function {symbol:?} does not have a supported statement block body",
+                executor.name()
+            );
+        }
+        return Ok((
+            start + 1,
+            end.saturating_sub(1),
+            line_indent_at(content, start),
+        ));
+    }
+    bail!(
+        "could not find {} function {symbol:?} with a supported body",
+        executor.name()
+    )
+}
+
+fn script_body_replacement(
+    replacement: &str,
+    base_indent: &str,
+    executor: SemanticEditExecutorLanguage,
+) -> String {
+    let trimmed = replacement.trim_matches('\n');
+    if executor.is_python() {
+        let replacement = if trimmed.trim().is_empty() {
+            "pass"
+        } else {
+            trimmed
+        };
+        return replacement
+            .lines()
+            .map(|line| {
+                if line.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("{base_indent}{}", line.trim())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    let body_indent = format!("{base_indent}  ");
+    if trimmed.trim().is_empty() {
+        return format!("\n{base_indent}");
+    }
+    let mut body = String::new();
+    body.push('\n');
+    for line in trimmed.lines() {
+        if line.trim().is_empty() {
+            body.push('\n');
+        } else {
+            body.push_str(&body_indent);
+            body.push_str(line.trim());
+            body.push('\n');
+        }
+    }
+    body.push_str(base_indent);
+    body
+}
+
+fn replace_script_function_body(
+    content: &str,
+    symbol: &str,
+    replacement: &str,
+    executor: SemanticEditExecutorLanguage,
+) -> Result<(String, usize)> {
+    let (start, end, base_indent) = find_script_function_body_range(content, symbol, executor)?;
+    let replacement = script_body_replacement(replacement, &base_indent, executor);
+    let mut out = String::with_capacity(content.len() + replacement.len());
+    out.push_str(&content[..start]);
+    out.push_str(&replacement);
+    out.push_str(&content[end..]);
+    parse_semantic_edit_source(&out, executor, "replace_function_body")?;
+    Ok((out, 1))
 }
 
 fn find_matching_rust_brace(content: &str, open_idx: usize) -> Result<usize> {
@@ -4834,8 +5235,42 @@ fn preview_semantic_edit_content(
     target_symbol: Option<&SemanticEditSymbolTarget>,
     call_ref_context: SemanticEditCallRefContext<'_>,
 ) -> Result<(String, usize)> {
-    if !semantic_edit_is_rust(language, file_abs) {
+    let Some(executor) = semantic_edit_executor_language(language, file_abs) else {
         bail!("no executor registered for language {language:?}");
+    };
+    if executor.is_script() {
+        return match kind {
+            "rename_symbol" => replace_script_identifier(
+                content,
+                target_symbol_name(target_symbol, kind)?,
+                intent
+                    .new_name
+                    .as_deref()
+                    .context("rename_symbol requires new_name")?,
+                executor,
+            ),
+            "replace_function_body" => replace_script_function_body(
+                content,
+                target_symbol_name(target_symbol, kind)?,
+                intent
+                    .replacement
+                    .as_deref()
+                    .context("replace_function_body requires replacement")?,
+                executor,
+            ),
+            "insert_import" => insert_script_import(
+                content,
+                intent
+                    .replacement
+                    .as_deref()
+                    .context("insert_import requires replacement")?,
+                executor,
+            ),
+            _ => bail!(
+                "semantic edit kind {kind:?} is not supported by the {} executor yet",
+                executor.name()
+            ),
+        };
     }
     if call_ref_context.cross_file_total > 0
         && matches!(kind, "rewrite_call_sites" | "update_call_signature")
@@ -4968,19 +5403,24 @@ fn semantic_edit_diff_preview(before: &str, after: &str, budget: ResponseBudget)
     ))
 }
 
-fn format_semantic_edit_content(
-    file_abs: &Path,
-    language: &str,
-    content: &str,
-) -> Result<(String, Option<String>)> {
-    if !semantic_edit_is_rust(language, file_abs) {
-        return Ok((content.to_string(), None));
-    }
+fn command_available(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
 
+fn semantic_formatter_staging_file(
+    file_abs: &Path,
+    executor: SemanticEditExecutorLanguage,
+    content: &str,
+) -> Result<NamedTempFile> {
     let parent = file_abs.parent().unwrap_or_else(|| Path::new("."));
     let mut staged = TempFileBuilder::new()
         .prefix(".tsift-semantic-format-")
-        .suffix(".rs")
+        .suffix(executor.temp_suffix())
         .tempfile_in(parent)
         .with_context(|| {
             format!(
@@ -4995,23 +5435,79 @@ fn format_semantic_edit_content(
         .as_file_mut()
         .sync_all()
         .with_context(|| format!("flushing formatter staging file for {}", file_abs.display()))?;
+    Ok(staged)
+}
 
-    let output = Command::new("rustfmt")
-        .arg("--edition")
-        .arg("2024")
+fn run_semantic_formatter(
+    staged: &NamedTempFile,
+    file_abs: &Path,
+    command: &str,
+    args: &[&str],
+    label: &str,
+) -> Result<String> {
+    let output = Command::new(command)
+        .args(args)
         .arg(staged.path())
         .output()
-        .with_context(|| "running rustfmt for semantic edit intent")?;
+        .with_context(|| format!("running {label} for semantic edit intent"))?;
     if !output.status.success() {
+        let rejected_label = if label.starts_with("rustfmt ") {
+            "rustfmt"
+        } else {
+            label
+        };
         bail!(
-            "rustfmt rejected semantic edit output for {}: {}",
+            "{rejected_label} rejected semantic edit output for {}: {}",
             file_abs.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let formatted = fs::read_to_string(staged.path())
-        .with_context(|| format!("reading formatted staging file for {}", file_abs.display()))?;
-    Ok((formatted, Some("rustfmt --edition 2024".to_string())))
+    fs::read_to_string(staged.path())
+        .with_context(|| format!("reading formatted staging file for {}", file_abs.display()))
+}
+
+fn format_semantic_edit_content(
+    file_abs: &Path,
+    language: &str,
+    content: &str,
+) -> Result<(String, Option<String>)> {
+    let Some(executor) = semantic_edit_executor_language(language, file_abs) else {
+        return Ok((content.to_string(), None));
+    };
+    if executor != SemanticEditExecutorLanguage::Rust {
+        parse_semantic_edit_source(content, executor, "formatter input")?;
+    }
+
+    let formatter = match executor {
+        SemanticEditExecutorLanguage::Rust => Some((
+            "rustfmt",
+            vec!["--edition", "2024"],
+            "rustfmt --edition 2024",
+        )),
+        SemanticEditExecutorLanguage::Python if command_available("ruff") => {
+            Some(("ruff", vec!["format"], "ruff format"))
+        }
+        SemanticEditExecutorLanguage::Python if command_available("black") => {
+            Some(("black", vec!["--quiet"], "black --quiet"))
+        }
+        SemanticEditExecutorLanguage::TypeScript
+        | SemanticEditExecutorLanguage::Tsx
+        | SemanticEditExecutorLanguage::JavaScript
+        | SemanticEditExecutorLanguage::Jsx
+            if command_available("prettier") =>
+        {
+            Some(("prettier", vec!["--write"], "prettier --write"))
+        }
+        _ => None,
+    };
+    let Some((command, args, label)) = formatter else {
+        return Ok((content.to_string(), None));
+    };
+
+    let staged = semantic_formatter_staging_file(file_abs, executor, content)?;
+    let formatted = run_semantic_formatter(&staged, file_abs, command, &args, label)?;
+    parse_semantic_edit_source(&formatted, executor, "formatter output")?;
+    Ok((formatted, Some(label.to_string())))
 }
 
 fn plan_semantic_edit_intent(
@@ -5119,7 +5615,7 @@ fn plan_semantic_edit_intent(
     let (status, apply_supported, diff, message) = if conflict {
         (
             "conflict".to_string(),
-            semantic_edit_is_rust(&language, &file_abs),
+            semantic_edit_kind_apply_supported(&kind, &language, &file_abs),
             None,
             "expected_content_hash does not match current file content; intent was not planned for mutation"
                 .to_string(),
@@ -5202,7 +5698,10 @@ fn plan_semantic_edit_intent(
                             "planned".to_string(),
                             true,
                             semantic_edit_diff_preview(&source_text, &preview, budget),
-                            format!("validated {kind} intent; Rust executor can apply this edit"),
+                            format!(
+                                "validated {kind} intent; {} executor can apply this edit",
+                                semantic_edit_executor_name(&language, &file_abs)
+                            ),
                         ),
                         Err(err) => (
                             "unsupported".to_string(),
@@ -5376,8 +5875,9 @@ fn apply_semantic_edit_drafts(
         draft.plan.applied = true;
         draft.plan.message = truncate_for_budget(
             &format!(
-                "applied {} intent through the Rust semantic edit executor",
-                draft.plan.kind
+                "applied {} intent through the {} semantic edit executor",
+                draft.plan.kind,
+                semantic_edit_executor_name(&draft.language, &draft.file_abs)
             ),
             budget.preview_bytes(),
         );
