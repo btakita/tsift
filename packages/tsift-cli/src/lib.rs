@@ -33027,6 +33027,123 @@ dispatch #spec-test-build-install-commit-push
             .unwrap_or_else(|| panic!("missing ast_span {symbol_kind} {label}"))
     }
 
+    fn setup_multilingual_ast_navigation_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("rust.rs"),
+            r#"mod fixture_nav_rust_mod {
+    pub fn fixture_nav_rust_helper() {}
+    pub fn fixture_nav_rust_entry() {
+        fixture_nav_rust_helper();
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("python.py"),
+            r#"def fixture_nav_python_helper():
+    return 1
+
+def fixture_nav_python_entry():
+    return fixture_nav_python_helper()
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("typescript.ts"),
+            r#"export function fixture_nav_typescript_entry(): number {
+    return fixtureNavTsHelper();
+}
+
+function fixtureNavTsHelper(): number {
+    return 1;
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("javascript.js"),
+            r#"function fixture_nav_javascript_entry() {
+    return fixtureNavJsHelper();
+}
+
+function fixtureNavJsHelper() {
+    return 1;
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("kotlin.kt"),
+            r#"fun fixture_nav_kotlin_entry(): Int {
+    return fixtureNavKotlinHelper()
+}
+
+fun fixtureNavKotlinHelper(): Int = 1
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("zig.zig"),
+            r#"pub fn fixture_nav_zig_entry() i32 {
+    return fixtureNavZigHelper();
+}
+
+fn fixtureNavZigHelper() i32 {
+    return 1;
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("bash.sh"),
+            r#"#!/usr/bin/env bash
+fixture_nav_bash_entry() {
+    fixture_nav_bash_helper
+}
+
+fixture_nav_bash_helper() {
+    echo ok
+}
+
+alias fixture_nav_bash_alias='echo alias'
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            r#"# Fixture Guide
+
+## Fixture Section
+
+- Fixture step
+  - Nested fixture step
+
+```python
+def fixture_nav_markdown_embedded():
+    return 1
+```
+"#,
+        )
+        .unwrap();
+
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+        dir
+    }
+
+    fn assert_cli_expand_command_parses(command: &str) {
+        let args = shell_split(command)
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            try_parse_cli(args).is_ok(),
+            "expand command should parse as a tsift CLI command: {command}"
+        );
+    }
+
     fn setup_multiplicity_project() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -33721,6 +33838,203 @@ fn main() { api::handler(); }
                 .iter()
                 .any(|edge| edge.to_id == embedded.handle),
             "expected persisted Markdown fence/embedded symbol edge"
+        );
+    }
+
+    #[test]
+    fn multilingual_ast_navigation_fixture_locks_recall_handles_expands_and_budget() {
+        let dir = setup_multilingual_ast_navigation_project();
+        let db =
+            index::IndexDb::open_read_only_resilient(&dir.path().join(".tsift/index.db")).unwrap();
+        let symbols = db.all_symbols().unwrap();
+        let expected_symbols = [
+            ("rust", "fixture_nav_rust_entry", "function", "rust.rs"),
+            (
+                "python",
+                "fixture_nav_python_entry",
+                "function",
+                "python.py",
+            ),
+            (
+                "typescript",
+                "fixture_nav_typescript_entry",
+                "function",
+                "typescript.ts",
+            ),
+            (
+                "javascript",
+                "fixture_nav_javascript_entry",
+                "function",
+                "javascript.js",
+            ),
+            (
+                "kotlin",
+                "fixture_nav_kotlin_entry",
+                "function",
+                "kotlin.kt",
+            ),
+            ("zig", "fixture_nav_zig_entry", "function", "zig.zig"),
+            ("bash", "fixture_nav_bash_entry", "function", "bash.sh"),
+            ("markdown", "Fixture Section", "heading", "README.md"),
+            ("markdown", "Fixture step", "list_item", "README.md"),
+            ("markdown", "python", "code_block", "README.md"),
+        ];
+
+        for (language, name, kind, file) in expected_symbols {
+            let symbol = symbols
+                .iter()
+                .find(|symbol| {
+                    symbol.language == language
+                        && symbol.name == name
+                        && symbol.kind == kind
+                        && symbol.file.ends_with(file)
+                })
+                .unwrap_or_else(|| panic!("missing indexed {language} {kind} {name}"));
+            assert!(
+                symbol.start_byte.is_some() && symbol.end_byte.is_some(),
+                "{language} {name} should carry AST byte spans"
+            );
+        }
+
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let graph_again = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+        let expected_ast_nodes = [
+            ("fixture_nav_rust_entry", "function", "rust"),
+            ("fixture_nav_python_entry", "function", "python"),
+            ("fixture_nav_typescript_entry", "function", "typescript"),
+            ("fixture_nav_javascript_entry", "function", "javascript"),
+            ("fixture_nav_kotlin_entry", "function", "kotlin"),
+            ("fixture_nav_zig_entry", "function", "zig"),
+            ("fixture_nav_bash_entry", "function", "bash"),
+            ("Fixture Section", "heading", "markdown"),
+            ("Fixture step", "list_item", "markdown"),
+            ("python", "code_block", "markdown"),
+            ("fixture_nav_markdown_embedded", "function", "python"),
+        ];
+
+        for (name, kind, language) in expected_ast_nodes {
+            let node = resolve_ast_span_node(&graph, name, kind);
+            let repeated = resolve_ast_span_node(&graph_again, name, kind);
+            assert!(
+                node.handle.starts_with("span-"),
+                "{name} handle: {}",
+                node.handle
+            );
+            assert_eq!(
+                node.handle, repeated.handle,
+                "{language} {name} handle drifted"
+            );
+            assert_eq!(
+                node.properties.get("language"),
+                Some(&language.to_string()),
+                "{name} should keep its language label"
+            );
+        }
+
+        let markdown_section = resolve_ast_span_node(&graph, "Fixture Section", "heading");
+        let markdown_code = resolve_ast_span_node(&graph, "python", "code_block");
+        let embedded = resolve_ast_span_node(&graph, "fixture_nav_markdown_embedded", "function");
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == markdown_section.handle
+                && edge.to == markdown_code.handle
+                && edge.relation == "contains_markdown_block"
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == markdown_code.handle
+                && edge.to == embedded.handle
+                && edge.relation == "contains_embedded_symbol"
+        }));
+        assert!(
+            graph.nodes.len() <= 80,
+            "multilingual AST fixture should stay bounded, got {} nodes",
+            graph.nodes.len()
+        );
+        assert!(
+            graph.edges.len() <= 180,
+            "multilingual AST fixture should stay bounded, got {} edges",
+            graph.edges.len()
+        );
+
+        let response = empty_search_response(dir.path(), "lexical");
+        let symbol_hits = db.symbol_search("fixture_nav_python_entry", 20).unwrap();
+        let report = build_relative_search_budget_report(
+            "fixture_nav_python_entry",
+            "lexical",
+            dir.path(),
+            &response,
+            &symbol_hits,
+            ResponseBudget::new(Some(8), Some(120)),
+            &SearchFacetFilters::default(),
+        );
+        let report_again = build_relative_search_budget_report(
+            "fixture_nav_python_entry",
+            "lexical",
+            dir.path(),
+            &response,
+            &symbol_hits,
+            ResponseBudget::new(Some(8), Some(120)),
+            &SearchFacetFilters::default(),
+        );
+
+        let top = report
+            .ranked
+            .first()
+            .expect("ranked preview should not be empty");
+        assert_eq!(top.source, "symbol_span");
+        assert_eq!(top.name.as_deref(), Some("fixture_nav_python_entry"));
+        assert!(top.handle.starts_with("srnk-"));
+        assert_eq!(top.handle, report_again.ranked[0].handle);
+        assert!(
+            top.reasons.iter().any(|reason| reason == "ast_span"),
+            "expected AST span ranking reason, got {:?}",
+            top.reasons
+        );
+        assert!(report.ranked.len() <= 8);
+        assert!(report.symbols.len() <= 8);
+
+        let symbol = report
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "fixture_nav_python_entry")
+            .expect("missing search preview symbol");
+        assert_cli_expand_command_parses(&symbol.expand);
+        let ast = symbol
+            .ast
+            .as_ref()
+            .expect("search symbol should expose AST");
+        assert_cli_expand_command_parses(&ast.expand.source_window);
+        assert_cli_expand_command_parses(ast.expand.source_body.as_ref().unwrap());
+        assert_cli_expand_command_parses(&ast.expand.symbol_read);
+
+        let markdown_hits = db.symbol_search("python", 20).unwrap();
+        let markdown_report = build_relative_search_budget_report(
+            "python",
+            "lexical",
+            dir.path(),
+            &response,
+            &markdown_hits,
+            ResponseBudget::new(Some(8), Some(120)),
+            &SearchFacetFilters::default(),
+        );
+        let markdown_symbol = markdown_report
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == "code_block" && symbol.language == "markdown")
+            .expect("missing Markdown code-block symbol");
+        let markdown_ast = markdown_symbol
+            .ast
+            .as_ref()
+            .expect("Markdown code block should expose AST");
+        assert_cli_expand_command_parses(markdown_ast.expand.markdown_ast.as_ref().unwrap());
+        assert_eq!(
+            markdown_ast
+                .span
+                .markdown
+                .as_ref()
+                .unwrap()
+                .embedded_symbols[0]
+                .name,
+            "fixture_nav_markdown_embedded"
         );
     }
 
