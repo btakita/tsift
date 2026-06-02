@@ -29441,16 +29441,38 @@ struct SearchBudgetSymbolPreview {
     tag_alias: Option<String>,
     match_type: String,
     kind: String,
+    language: String,
     name: String,
     file: String,
     line: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_line: Option<i64>,
     score: f64,
     match_count: usize,
     surface_count: usize,
     file_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     surface_examples: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ast: Option<SearchBudgetAstArtifact>,
     expand: String,
+}
+
+#[derive(Serialize)]
+struct SearchBudgetAstArtifact {
+    artifact_kind: String,
+    span: AstSpanPreview,
+    expand: SearchBudgetAstExpandCommands,
+}
+
+#[derive(Serialize)]
+struct SearchBudgetAstExpandCommands {
+    source_window: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_body: Option<String>,
+    symbol_read: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    markdown_ast: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -29511,6 +29533,7 @@ struct SearchBudgetSymbolFamily {
     representative_name: String,
     representative_kind: String,
     representative_match_type: String,
+    representative_hit: index::SymbolHit,
     representative_file: String,
     representative_line: i64,
     representative_score: f64,
@@ -29603,6 +29626,55 @@ fn build_search_path_narrow_command(query: &str, strategy: &str, path: &str) -> 
     command
 }
 
+fn search_budget_symbol_source_path(root: &Path, file: &str) -> PathBuf {
+    let path = Path::new(file);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+fn search_budget_ast_expand_commands(
+    root: &Path,
+    symbol: &index::SymbolHit,
+    span: &AstSpanPreview,
+) -> SearchBudgetAstExpandCommands {
+    let source_line_count = span
+        .end_line
+        .saturating_sub(span.start_line)
+        .saturating_add(1)
+        .max(1);
+    let source_body = span
+        .body_start_line
+        .zip(span.body_end_line)
+        .map(|(start, end)| {
+            let line_count = end.saturating_sub(start).saturating_add(1).max(1);
+            source_read_command(root, &symbol.file, start, line_count)
+        });
+    SearchBudgetAstExpandCommands {
+        source_window: source_read_command(root, &symbol.file, span.start_line, source_line_count),
+        source_body,
+        symbol_read: source_symbol_read_command(root, &symbol.name, &symbol.file),
+        markdown_ast: (symbol.language == "markdown")
+            .then(|| markdown_ast_command(root, &symbol.file, Some(&span.handle))),
+    }
+}
+
+fn search_budget_ast_artifact(
+    root: &Path,
+    symbol: &index::SymbolHit,
+) -> Option<SearchBudgetAstArtifact> {
+    let source = fs::read(search_budget_symbol_source_path(root, &symbol.file)).ok()?;
+    let span = symbol_hit_ast_span(symbol, &source)?;
+    let expand = search_budget_ast_expand_commands(root, symbol, &span);
+    Some(SearchBudgetAstArtifact {
+        artifact_kind: "ast_span".to_string(),
+        span,
+        expand,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_search_scale_guard(
     query: &str,
@@ -29691,6 +29763,8 @@ pub(crate) fn build_search_budget_report(
         } else {
             relativize(&hit.file, root)
         };
+        let mut representative_hit = hit.clone();
+        representative_hit.file = display_file.clone();
         let canonical_family = canonical_tag_family_from_symbol(&hit.name, hit.tags.as_deref());
         let family_key = canonical_family
             .as_ref()
@@ -29707,6 +29781,7 @@ pub(crate) fn build_search_budget_report(
                 representative_name: hit.name.clone(),
                 representative_kind: hit.kind.clone(),
                 representative_match_type: hit.match_type.clone(),
+                representative_hit,
                 representative_file: display_file.clone(),
                 representative_line: hit.line,
                 representative_score: hit.score,
@@ -29751,6 +29826,7 @@ pub(crate) fn build_search_budget_report(
                 query,
                 strategy
             );
+            let ast = search_budget_ast_artifact(root, &family.representative_hit);
             SearchBudgetSymbolPreview {
                 handle: stable_handle("sfam", &key),
                 tag_alias: family
@@ -29759,6 +29835,7 @@ pub(crate) fn build_search_budget_report(
                     .map(|alias| truncate_for_budget(alias, max_bytes)),
                 match_type: family.representative_match_type,
                 kind: family.representative_kind,
+                language: family.representative_hit.language,
                 name: format_search_budget_symbol_name(
                     &family.representative_name,
                     surface_count,
@@ -29770,11 +29847,13 @@ pub(crate) fn build_search_budget_report(
                     max_bytes,
                 ),
                 line: family.representative_line,
+                end_line: family.representative_hit.end_line,
                 score: family.representative_score,
                 match_count: family.match_count,
                 surface_count,
                 file_count,
                 surface_examples: family.surface_examples,
+                ast,
                 expand: build_search_budget_family_expand(
                     strategy,
                     root.to_string_lossy().as_ref(),
@@ -29874,6 +29953,26 @@ pub(crate) fn print_search_budget_human(report: &SearchBudgetReport) {
             variants,
             symbol.expand
         );
+        if let Some(ast) = &symbol.ast {
+            let markdown_ast = ast
+                .expand
+                .markdown_ast
+                .as_ref()
+                .map(|command| format!(" markdown-ast:{command}"))
+                .unwrap_or_default();
+            println!(
+                "  ast {} {}:{}-{} bytes:{}-{} source:{} symbol:{}{}",
+                ast.span.handle,
+                ast.span.node_kind,
+                ast.span.start_line,
+                ast.span.end_line,
+                ast.span.start_byte,
+                ast.span.end_byte,
+                ast.expand.source_window,
+                ast.expand.symbol_read,
+                markdown_ast
+            );
+        }
     }
     for hit in &report.hits {
         if hit.preview.is_empty() {
@@ -37133,6 +37232,128 @@ tier = "private"
         assert_eq!(report.symbols[0].name, "alpha_hel...");
         assert_eq!(report.symbols[0].file, "src/lib.rs");
         assert!(report.symbols[0].expand.contains("tsift search"));
+    }
+
+    #[test]
+    fn search_budget_report_promotes_ast_span_artifacts_for_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let source = "fn alpha_helper() {\n    beta();\n}\n";
+        let file = src_dir.join("lib.rs");
+        fs::write(&file, source).unwrap();
+        let body_start = source.find("{\n").unwrap() + 1;
+        let body_end = source.rfind("\n}").unwrap() + 1;
+
+        let response = empty_search_response(dir.path(), "lexical");
+        let symbol_hits = vec![index::SymbolHit {
+            name: "alpha_helper".to_string(),
+            kind: "function".to_string(),
+            language: "rust".to_string(),
+            file: file.to_string_lossy().to_string(),
+            line: 0,
+            end_line: Some(2),
+            node_kind: Some("function_item".to_string()),
+            start_byte: Some(0),
+            end_byte: Some(i64::try_from(source.len()).unwrap()),
+            body_start_byte: Some(i64::try_from(body_start).unwrap()),
+            body_end_byte: Some(i64::try_from(body_end).unwrap()),
+            tags: Some("alpha,helper".to_string()),
+            score: 0.98,
+            match_type: "exact_name".to_string(),
+            tagpath_handle: None,
+        }];
+
+        let report = build_search_budget_report(
+            "alpha helper",
+            "lexical",
+            dir.path(),
+            &response,
+            &symbol_hits,
+            false,
+            ResponseBudget::new(Some(5), Some(96)),
+        );
+
+        let symbol = &report.symbols[0];
+        assert_eq!(symbol.language, "rust");
+        assert_eq!(symbol.end_line, Some(2));
+        let ast = symbol
+            .ast
+            .as_ref()
+            .expect("search symbol preview should expose an AST span artifact");
+        assert_eq!(ast.artifact_kind, "ast_span");
+        assert!(ast.span.handle.starts_with("span-"));
+        assert_eq!(ast.span.node_kind, "function_item");
+        assert_eq!(ast.span.start_byte, 0);
+        assert_eq!(ast.span.end_byte, source.len());
+        assert_eq!(ast.span.body_start_byte, Some(body_start));
+        assert_eq!(ast.span.body_end_byte, Some(body_end));
+        assert!(ast.expand.source_window.contains("source-read"));
+        assert!(
+            ast.expand
+                .source_body
+                .as_ref()
+                .unwrap()
+                .contains("source-read")
+        );
+        assert!(ast.expand.symbol_read.contains("symbol-read"));
+        assert!(ast.expand.markdown_ast.is_none());
+    }
+
+    #[test]
+    fn search_budget_report_links_markdown_spans_to_markdown_ast_expansion() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "# Guide\n\n## Install\n\n- Run setup.\n";
+        let file = dir.path().join("README.md");
+        fs::write(&file, source).unwrap();
+        let heading_start = source.find("## Install").unwrap();
+        let heading_end = source.len();
+
+        let response = empty_search_response(dir.path(), "lexical");
+        let symbol_hits = vec![index::SymbolHit {
+            name: "Install".to_string(),
+            kind: "heading".to_string(),
+            language: "markdown".to_string(),
+            file: file.to_string_lossy().to_string(),
+            line: 2,
+            end_line: Some(4),
+            node_kind: Some("atx_heading".to_string()),
+            start_byte: Some(i64::try_from(heading_start).unwrap()),
+            end_byte: Some(i64::try_from(heading_end).unwrap()),
+            body_start_byte: Some(i64::try_from(source.find("- Run setup.").unwrap()).unwrap()),
+            body_end_byte: Some(i64::try_from(heading_end).unwrap()),
+            tags: Some("install".to_string()),
+            score: 1.0,
+            match_type: "exact_name".to_string(),
+            tagpath_handle: None,
+        }];
+
+        let report = build_search_budget_report(
+            "Install",
+            "lexical",
+            dir.path(),
+            &response,
+            &symbol_hits,
+            false,
+            ResponseBudget::new(Some(5), Some(96)),
+        );
+
+        let ast = report.symbols[0]
+            .ast
+            .as_ref()
+            .expect("Markdown search symbol should expose an AST span artifact");
+        assert_eq!(ast.span.node_kind, "atx_heading");
+        assert_eq!(ast.span.markdown.as_ref().unwrap().heading_level, Some(2));
+        let markdown_ast = ast
+            .expand
+            .markdown_ast
+            .as_ref()
+            .expect("Markdown symbols should include markdown-ast expansion");
+        assert!(markdown_ast.contains("markdown-ast"), "{markdown_ast}");
+        assert!(markdown_ast.contains("--node"), "{markdown_ast}");
+        assert!(markdown_ast.contains(&ast.span.handle), "{markdown_ast}");
+        assert!(ast.expand.source_window.contains("source-read"));
+        assert!(ast.expand.symbol_read.contains("symbol-read"));
     }
 
     #[test]
