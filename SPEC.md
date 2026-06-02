@@ -362,6 +362,7 @@ tsift memory status . --json # reports claude_mem_retirement=hold until full imp
 tsift memory capture-agent-doc-closeout . --session-path tasks/software/tsift.md --prompt-target 'do [#id]' --response-summary '<summary>' --commit-hash <sha> --session-check-status clean --json # capture agent-doc closeout events into tsift-memory
 tsift --envelope explain <symbol> --budget normal # bounded agent preview
 tsift --envelope source-read src/main.rs --start 1 --lines 80 --budget normal # bounded source-file preview with expansion handles
+tsift --envelope markdown-ast README.md --path . --budget normal # Markdown AST nodes with stable handles, hierarchy, spans, and edit/source expansions
 tsift --envelope symbol-read <symbol> --file src/main.rs --budget normal # bounded symbol body packet with child refs and graph/source expansion commands
 tsift edit < edits.json         # staged multi-file search/replace batch
 tsift --envelope edit-intents --path . --budget normal < intents.json # validate semantic AST edit intents and emit dry-run execution plans
@@ -459,9 +460,18 @@ The JSON and envelope forms (`tsift --envelope source-read src/main.rs --start 4
 - line-numbered preview rows capped by the response budget
 - `ssym-*` symbol refs for indexed symbols intersecting the window, each with a `symbol-read` expansion command and optional AST `span` metadata (`span-*` handle, node kind, byte range, body range, parent handle, and child handles). Markdown refs include full heading section ranges, `markdown.heading_level`, `markdown.section_path`, `markdown.section_handle`, `markdown.list_depth`, and `markdown.fence_language` where applicable.
 - cached `sum-*` summary refs for the file when `.tsift/summaries.db` is present, each with a `summarize` expansion command
-- explicit `before`, `after`, and full-file expansion commands so the next read can expand incrementally instead of falling back to `cat`/large `sed` windows
+- explicit `before`, `after`, full-file, and Markdown AST expansion commands so the next read can expand incrementally instead of falling back to `cat`/large `sed` windows
 
 The command still returns the source preview when index or summary stores are missing; those enrichment failures are reported as warnings. `--scope` restricts index refs for workspace submodule indexes, and nested paths infer the matching workspace scope when possible.
+
+`tsift markdown-ast <file>` is the first-class Markdown projection surface. It parses the current `.md`/`.mdx` buffer directly with tree-sitter Markdown and emits bounded block-level nodes for headings, list items, and fenced code blocks. Each node carries:
+
+- a stable `mdast-*` node handle plus the corresponding `span-*` byte-span handle used by source-read, symbol-read, and edit-intents target metadata
+- 1-based line range, byte span, optional body byte span, parent handle, child handles, and heading-derived `section_path`
+- block metadata: `block_kind`, heading level, section handle, list depth/marker/order, and code-fence language/marker
+- expansion commands for the node source window, body window, `symbol-read`, and `edit-intents`
+
+`--node <mdast-*|span-*>` focuses the projection on one known node handle. This lets `symbol-read` hand a Markdown target span directly to `markdown-ast --node` without requiring consumers to re-scan the whole document, while edit-intents dry-run plans keep using the same stable `span-*` handle for conflict-aware write planning.
 
 `tsift symbol-read <symbol>` is the symbol-centered read replacement surface. It resolves the query through the indexed symbols table, optionally scoped by `--file` and `--scope`, then emits:
 
@@ -469,9 +479,9 @@ The command still returns the source preview when index or summary stores are mi
 - the symbol signature/range metadata, optional AST `span` metadata, and a token-budgeted body preview
 - child `ssym-*` refs discovered inside the selected symbol's AST byte span when available, falling back to indexed lines for older indexes
 - cached summary refs for the owning file when available
-- expansion commands for the selected source window, whole file, `explain`, caller graph, and callee graph
+- expansion commands for the selected source window, whole file, `explain`, caller graph, callee graph, and `markdown-ast --node` when the selected symbol is Markdown
 
-`source-read` symbol refs now expand to `symbol-read`, while `symbol-read` preserves `explain` and graph commands as secondary expansion links. This makes whole-file `Read` fallback unnecessary for the normal search -> source window -> symbol body navigation path.
+`source-read` symbol refs now expand to `symbol-read`, while `symbol-read` preserves `explain`, graph, and Markdown AST commands as secondary expansion links. This makes whole-file `Read` fallback unnecessary for the normal search -> source window -> symbol body/navigation path.
 
 `tsift edit-intents` is the semantic write-planning and guarded write-executor surface. It accepts JSON `{ "intents": [...] }` batches with normalized code intent kinds `rename_symbol`, `replace_function_body`, `insert_import`, `add_method`, `update_call_signature`, `move_declaration`, and `rewrite_call_sites`, plus Markdown intent kinds `rename_heading`, `replace_section_body`, `insert_section`, `move_section`, `insert_list_item`, and `rewrite_code_fence`. The command resolves symbol/file targets against the current index, reports the current content hash, target line range, and target symbol `span` when the index has AST spans, detects optional `expected_content_hash` conflicts, and emits dry-run plans with bounded diff previews by default. For call-site intents, plans include same-file indexed `call_refs`; Rust rewrites currently fail closed when indexed refs cross the target file. Markdown heading targets resolve to full section spans, list/code-fence targets carry stable byte/body ranges, and Markdown span metadata carries hierarchy, section path, list depth, and fence language. Markdown section intents `rename_heading`, `replace_section_body`, `insert_section`, and `move_section` are apply-capable: the executor re-parses current Markdown buffers for each intent, validates output with tree-sitter Markdown, supports `destination_symbol` plus `position=before|after` for section moves, and writes through the same atomic edit/rollback path as code intents. Markdown block intents `insert_list_item` and `rewrite_code_fence` are also apply-capable: `insert_list_item` requires a unique list-item target, preserves marker and indentation, and supports `position=before|after`; `rewrite_code_fence` requires a unique code-fence target, replaces only the fence body, refuses replacement text with fence markers, and preserves the existing fence syntax. With `--verify`, Markdown section/block intents use the same detached temp-worktree gate as code intents: temp apply, reindex, source-read windows, impact summaries, optional `--verify-command`, and fail-closed no-mutation behavior before any real `--apply`.
 

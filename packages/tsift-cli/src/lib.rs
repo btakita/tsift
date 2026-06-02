@@ -993,6 +993,30 @@ pub fn run() -> Result<()> {
             absolute,
             ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
         ),
+        Some(Commands::MarkdownAst {
+            file,
+            path,
+            node,
+            json,
+            max_items,
+            max_bytes,
+            budget,
+        }) => cmd_markdown_ast(
+            &file,
+            &path,
+            node.as_deref(),
+            OutputFormat {
+                json_output: json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                ultra_terse,
+                schema,
+                envelope,
+            },
+            absolute,
+            ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
+        ),
         Some(Commands::SymbolRead {
             symbol,
             file,
@@ -19186,6 +19210,8 @@ struct SourceExpandCommands {
     #[serde(skip_serializing_if = "Option::is_none")]
     after: Option<String>,
     file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    markdown_ast: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -19255,6 +19281,8 @@ struct SymbolReadExpandCommands {
     explain: String,
     callers: String,
     callees: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    markdown_ast: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -19268,6 +19296,93 @@ struct SymbolReadReport {
     child_symbols: Vec<SourceSymbolRef>,
     summaries: Vec<SourceSummaryRef>,
     expand: SymbolReadExpandCommands,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Clone)]
+struct MarkdownAstRawNode {
+    handle: String,
+    span_handle: String,
+    name: String,
+    kind: String,
+    block_kind: String,
+    node_kind: String,
+    start_byte: usize,
+    end_byte: usize,
+    body_start_byte: Option<usize>,
+    body_end_byte: Option<usize>,
+}
+
+#[derive(Serialize, Clone)]
+struct MarkdownAstNodeMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heading_level: Option<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    section_path: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    section_handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    list_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    list_marker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    list_order: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fence_language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fence_marker: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct MarkdownAstNodeExpand {
+    source_window: String,
+    source_body: String,
+    symbol_read: String,
+    edit_intents: String,
+}
+
+#[derive(Serialize, Clone)]
+struct SourceByteRangePreview {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Serialize, Clone)]
+struct MarkdownAstNode {
+    handle: String,
+    span_handle: String,
+    name: String,
+    kind: String,
+    block_kind: String,
+    node_kind: String,
+    line: usize,
+    end_line: usize,
+    byte_span: SourceByteRangePreview,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_byte_span: Option<SourceByteRangePreview>,
+    parent_handle: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    child_handles: Vec<String>,
+    metadata: MarkdownAstNodeMetadata,
+    expand: MarkdownAstNodeExpand,
+}
+
+#[derive(Serialize)]
+struct MarkdownAstExpandCommands {
+    file: String,
+    source_read: String,
+    edit_intents: String,
+}
+
+#[derive(Serialize)]
+struct MarkdownAstReport {
+    handle: String,
+    root: String,
+    file: String,
+    range: SourceRangePreview,
+    nodes: Vec<MarkdownAstNode>,
+    expand: MarkdownAstExpandCommands,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     warnings: Vec<String>,
 }
@@ -19337,6 +19452,26 @@ fn source_summary_expand_command(root: &Path, symbol: &str) -> String {
     format!(
         "tsift summarize {} --path {} --json",
         shell_quote(symbol),
+        shell_quote(&root.to_string_lossy())
+    )
+}
+
+fn markdown_ast_command(root: &Path, file: &str, node: Option<&str>) -> String {
+    let mut command = format!(
+        "tsift --envelope markdown-ast {} --path {} --budget normal",
+        shell_quote(file),
+        shell_quote(&root.to_string_lossy())
+    );
+    if let Some(node) = node {
+        command.push_str(" --node ");
+        command.push_str(&shell_quote(node));
+    }
+    command
+}
+
+fn markdown_edit_intents_command(root: &Path) -> String {
+    format!(
+        "tsift --envelope edit-intents --path {} --budget normal",
         shell_quote(&root.to_string_lossy())
     )
 }
@@ -19591,6 +19726,283 @@ fn markdown_symbol_hit_metadata(
     )
 }
 
+fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "mdx"))
+        .unwrap_or(false)
+}
+
+fn markdown_ast_block_kind(kind: &str) -> String {
+    match kind {
+        "heading" => "section",
+        "code_block" => "fenced_code_block",
+        "list_item" => "list_item",
+        other => other,
+    }
+    .to_string()
+}
+
+fn markdown_source_line(source: &[u8], start_byte: usize) -> &str {
+    let start = start_byte.min(source.len());
+    let line_start = source[..start]
+        .iter()
+        .rposition(|value| *value == b'\n')
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    let line_end = source[start..]
+        .iter()
+        .position(|value| *value == b'\n')
+        .map(|pos| start + pos)
+        .unwrap_or(source.len());
+    std::str::from_utf8(&source[line_start..line_end]).unwrap_or("")
+}
+
+fn markdown_list_attributes(source: &[u8], start_byte: usize) -> (Option<String>, Option<usize>) {
+    let line = markdown_source_line(source, start_byte);
+    let trimmed = line.trim_start();
+    for marker in ["-", "*", "+"] {
+        if trimmed
+            .strip_prefix(marker)
+            .and_then(|rest| rest.strip_prefix(' '))
+            .is_some()
+        {
+            return (Some(marker.to_string()), None);
+        }
+    }
+
+    let digit_end = trimmed
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, rest) = trimmed.split_at(digit_end);
+    if !digits.is_empty() {
+        for marker in [".", ")"] {
+            if rest
+                .strip_prefix(marker)
+                .and_then(|value| value.strip_prefix(' '))
+                .is_some()
+            {
+                return (
+                    Some(format!("{digits}{marker}")),
+                    digits.parse::<usize>().ok(),
+                );
+            }
+        }
+    }
+    (None, None)
+}
+
+fn markdown_fence_marker(source: &[u8], start_byte: usize) -> Option<String> {
+    let line = markdown_source_line(source, start_byte);
+    let trimmed = line.trim_start();
+    ["```", "~~~"]
+        .into_iter()
+        .find(|marker| trimmed.starts_with(marker))
+        .map(str::to_string)
+}
+
+fn markdown_ast_raw_nodes(file: &str, source: &[u8]) -> Result<Vec<MarkdownAstRawNode>> {
+    let mut nodes = graph::Lang::Markdown
+        .extract_symbols(source)
+        .context("extracting Markdown AST nodes")?
+        .into_iter()
+        .map(|symbol| {
+            let body_start_byte = symbol.body_start_byte;
+            let body_end_byte = symbol.body_end_byte;
+            let span_handle = ast_span_handle(
+                file,
+                &symbol.name,
+                &symbol.kind,
+                symbol.start_byte,
+                symbol.end_byte,
+            );
+            MarkdownAstRawNode {
+                handle: stable_handle(
+                    "mdast",
+                    &format!(
+                        "{}:{}:{}:{}:{}",
+                        file, symbol.kind, symbol.name, symbol.start_byte, symbol.end_byte
+                    ),
+                ),
+                span_handle,
+                name: symbol.name,
+                kind: symbol.kind.clone(),
+                block_kind: markdown_ast_block_kind(&symbol.kind),
+                node_kind: symbol.node_kind,
+                start_byte: symbol.start_byte,
+                end_byte: symbol.end_byte,
+                body_start_byte,
+                body_end_byte,
+            }
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| {
+        left.start_byte
+            .cmp(&right.start_byte)
+            .then(left.end_byte.cmp(&right.end_byte))
+            .then(left.kind.cmp(&right.kind))
+            .then(left.name.cmp(&right.name))
+    });
+    Ok(nodes)
+}
+
+fn markdown_ast_contains(parent: &MarkdownAstRawNode, child: &MarkdownAstRawNode) -> bool {
+    if parent.handle == child.handle {
+        return false;
+    }
+    parent.start_byte <= child.start_byte && parent.end_byte >= child.end_byte
+}
+
+fn markdown_ast_parent_handle(
+    node: &MarkdownAstRawNode,
+    nodes: &[MarkdownAstRawNode],
+) -> Option<String> {
+    nodes
+        .iter()
+        .filter(|candidate| markdown_ast_contains(candidate, node))
+        .min_by_key(|candidate| {
+            (
+                candidate.end_byte.saturating_sub(candidate.start_byte),
+                candidate.start_byte,
+            )
+        })
+        .map(|candidate| candidate.handle.clone())
+}
+
+fn markdown_ast_child_handles(
+    node: &MarkdownAstRawNode,
+    nodes: &[MarkdownAstRawNode],
+    limit: usize,
+) -> Vec<String> {
+    nodes
+        .iter()
+        .filter(|candidate| {
+            markdown_ast_parent_handle(candidate, nodes).as_deref() == Some(&node.handle)
+        })
+        .take(limit)
+        .map(|candidate| candidate.handle.clone())
+        .collect()
+}
+
+fn markdown_ast_section_nodes<'a>(
+    node: &MarkdownAstRawNode,
+    nodes: &'a [MarkdownAstRawNode],
+) -> Vec<&'a MarkdownAstRawNode> {
+    let mut headings = nodes
+        .iter()
+        .filter(|candidate| candidate.kind == "heading")
+        .filter(|candidate| {
+            candidate.start_byte <= node.start_byte && candidate.end_byte >= node.end_byte
+        })
+        .collect::<Vec<_>>();
+    headings.sort_by(|left, right| {
+        left.start_byte
+            .cmp(&right.start_byte)
+            .then(left.end_byte.cmp(&right.end_byte))
+            .then(left.name.cmp(&right.name))
+    });
+    headings
+}
+
+fn markdown_ast_node_metadata(
+    node: &MarkdownAstRawNode,
+    source: &[u8],
+    nodes: &[MarkdownAstRawNode],
+) -> MarkdownAstNodeMetadata {
+    let section_nodes = markdown_ast_section_nodes(node, nodes);
+    let section_path = section_nodes
+        .iter()
+        .map(|heading| heading.name.clone())
+        .collect::<Vec<_>>();
+    let section_handle = section_nodes.last().map(|heading| heading.handle.clone());
+    let heading_level = (node.kind == "heading")
+        .then(|| markdown_heading_level(source, node.start_byte))
+        .flatten();
+    let (list_marker, list_order) = if node.kind == "list_item" {
+        markdown_list_attributes(source, node.start_byte)
+    } else {
+        (None, None)
+    };
+    MarkdownAstNodeMetadata {
+        heading_level,
+        section_path,
+        section_handle,
+        list_depth: (node.kind == "list_item")
+            .then(|| markdown_list_depth(source, node.start_byte)),
+        list_marker,
+        list_order,
+        fence_language: (node.kind == "code_block").then(|| node.name.clone()),
+        fence_marker: (node.kind == "code_block")
+            .then(|| markdown_fence_marker(source, node.start_byte))
+            .flatten(),
+    }
+}
+
+fn markdown_ast_node_expand(
+    root: &Path,
+    file: &str,
+    node: &MarkdownAstRawNode,
+    source: &[u8],
+) -> MarkdownAstNodeExpand {
+    let start_line = source_line_for_byte(source, node.start_byte);
+    let end_line = source_line_for_end_byte(source, node.end_byte).max(start_line);
+    let line_count = end_line.saturating_sub(start_line).saturating_add(1).max(1);
+    let body_start_line = node
+        .body_start_byte
+        .map(|byte| source_line_for_byte(source, byte))
+        .unwrap_or(start_line);
+    let body_end_line = node
+        .body_end_byte
+        .map(|byte| source_line_for_end_byte(source, byte))
+        .unwrap_or(end_line)
+        .max(body_start_line);
+    let body_line_count = body_end_line
+        .saturating_sub(body_start_line)
+        .saturating_add(1)
+        .max(1);
+    MarkdownAstNodeExpand {
+        source_window: source_read_command(root, file, start_line, line_count),
+        source_body: source_read_command(root, file, body_start_line, body_line_count),
+        symbol_read: source_symbol_read_command(root, &node.name, file),
+        edit_intents: markdown_edit_intents_command(root),
+    }
+}
+
+fn markdown_ast_node(
+    root: &Path,
+    file: &str,
+    node: &MarkdownAstRawNode,
+    source: &[u8],
+    nodes: &[MarkdownAstRawNode],
+    child_limit: usize,
+) -> MarkdownAstNode {
+    let line = source_line_for_byte(source, node.start_byte);
+    let end_line = source_line_for_end_byte(source, node.end_byte).max(line);
+    let body_byte_span = node
+        .body_start_byte
+        .zip(node.body_end_byte)
+        .map(|(start, end)| SourceByteRangePreview { start, end });
+    MarkdownAstNode {
+        handle: node.handle.clone(),
+        span_handle: node.span_handle.clone(),
+        name: node.name.clone(),
+        kind: node.kind.clone(),
+        block_kind: node.block_kind.clone(),
+        node_kind: node.node_kind.clone(),
+        line,
+        end_line,
+        byte_span: SourceByteRangePreview {
+            start: node.start_byte,
+            end: node.end_byte,
+        },
+        body_byte_span,
+        parent_handle: markdown_ast_parent_handle(node, nodes),
+        child_handles: markdown_ast_child_handles(node, nodes, child_limit),
+        metadata: markdown_ast_node_metadata(node, source, nodes),
+        expand: markdown_ast_node_expand(root, file, node, source),
+    }
+}
+
 fn stored_symbol_ast_span(
     symbol: &index::StoredSymbol,
     source: &[u8],
@@ -19795,6 +20207,150 @@ fn load_source_summaries(
         .collect()
 }
 
+fn cmd_markdown_ast(
+    file: &Path,
+    path: &Path,
+    node: Option<&str>,
+    format: OutputFormat,
+    absolute: bool,
+    budget: ResponseBudget,
+) -> Result<()> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let file_abs = resolve_source_file(&root, file)?;
+    if !is_markdown_path(&file_abs) {
+        bail!(
+            "markdown-ast only supports Markdown files (.md/.mdx): {}",
+            file_abs.display()
+        );
+    }
+    let file_display = if absolute {
+        file_abs.to_string_lossy().to_string()
+    } else {
+        relativize_pathbuf(&file_abs, &root)
+            .to_string_lossy()
+            .to_string()
+    };
+    let source = fs::read(&file_abs).with_context(|| format!("reading {}", file_abs.display()))?;
+    let text = String::from_utf8_lossy(&source);
+    let total_lines = text.lines().count();
+    let raw_nodes = markdown_ast_raw_nodes(&file_display, &source)?;
+    let max_items = budget.preview_items();
+    let max_bytes = budget.preview_bytes();
+
+    let selected_nodes = if let Some(handle) = node {
+        let matches = raw_nodes
+            .iter()
+            .filter(|candidate| candidate.handle == handle || candidate.span_handle == handle)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            bail!("Markdown AST node handle {handle:?} was not found in {file_display}");
+        }
+        matches
+    } else {
+        raw_nodes.iter().take(max_items).collect::<Vec<_>>()
+    };
+    let nodes = selected_nodes
+        .into_iter()
+        .map(|raw| {
+            let mut node =
+                markdown_ast_node(&root, &file_display, raw, &source, &raw_nodes, max_items);
+            node.name = truncate_for_budget(&node.name, max_bytes);
+            node
+        })
+        .collect::<Vec<_>>();
+    let report = MarkdownAstReport {
+        handle: stable_handle("mdastrep", &file_display),
+        root: root.to_string_lossy().to_string(),
+        file: file_display.clone(),
+        range: SourceRangePreview {
+            start: 1,
+            end: total_lines,
+            total_lines,
+            truncated_before: false,
+            truncated_after: false,
+        },
+        nodes,
+        expand: MarkdownAstExpandCommands {
+            file: markdown_ast_command(&root, &file_display, None),
+            source_read: source_read_command(&root, &file_display, 1, total_lines.max(1)),
+            edit_intents: markdown_edit_intents_command(&root),
+        },
+        warnings: Vec::new(),
+    };
+
+    if format.json_output {
+        let truncated = node.is_none() && raw_nodes.len() > report.nodes.len();
+        let mut follow_up = vec![
+            report.expand.file.clone(),
+            report.expand.source_read.clone(),
+            report.expand.edit_intents.clone(),
+        ];
+        follow_up.extend(
+            report
+                .nodes
+                .iter()
+                .map(|node| node.expand.source_window.clone()),
+        );
+        print_json_or_envelope(
+            &report,
+            &format,
+            "markdown-ast",
+            "ast",
+            ToolEnvelopeSummary {
+                text: format!("markdown ast {} nodes:{}", report.file, report.nodes.len()),
+                metrics: vec![
+                    envelope_metric("nodes", report.nodes.len()),
+                    envelope_metric("total_lines", report.range.total_lines),
+                ],
+            },
+            truncated,
+            follow_up,
+        )?;
+    } else if format.compact {
+        println!(
+            "markdown-ast {} nodes:{} handle:{}",
+            report.file,
+            report.nodes.len(),
+            report.handle
+        );
+        for node in &report.nodes {
+            println!(
+                "  {} {} {}:{}-{}",
+                node.handle, node.kind, node.name, node.line, node.end_line
+            );
+        }
+        if node.is_none() && raw_nodes.len() > report.nodes.len() {
+            println!("expand: {}", report.expand.file);
+        }
+    } else {
+        println!(
+            "Markdown AST `{}` nodes {} of {} ({})",
+            report.file,
+            report.nodes.len(),
+            raw_nodes.len(),
+            report.handle
+        );
+        for node in &report.nodes {
+            println!(
+                "  {} `{}` {}:{}-{} — {}",
+                node.handle,
+                node.name,
+                node.kind,
+                node.line,
+                node.end_line,
+                node.expand.source_window
+            );
+        }
+        if node.is_none() && raw_nodes.len() > report.nodes.len() {
+            println!();
+            println!("Expand:");
+            println!("  file: {}", report.expand.file);
+        }
+    }
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_source_read(
     file: &Path,
@@ -19883,6 +20439,8 @@ fn cmd_source_read(
         after: (end_line < total_lines)
             .then(|| source_read_command(&root, &file_display, end_line + 1, lines)),
         file: source_read_command(&root, &file_display, 1, total_lines.max(effective_lines)),
+        markdown_ast: is_markdown_path(&file_abs)
+            .then(|| markdown_ast_command(&root, &file_display, None)),
     };
 
     let report = SourceReadReport {
@@ -19909,6 +20467,7 @@ fn cmd_source_read(
             report.expand.before.clone(),
             report.expand.after.clone(),
             Some(report.expand.file.clone()),
+            report.expand.markdown_ast.clone(),
         ]
         .into_iter()
         .flatten()
@@ -20170,6 +20729,13 @@ fn cmd_symbol_read(
         explain: source_symbol_expand_command(&root, &selected.name),
         callers: source_symbol_graph_command(&root, &selected.name, "callers"),
         callees: source_symbol_graph_command(&root, &selected.name, "callees"),
+        markdown_ast: (selected.language == "markdown").then(|| {
+            markdown_ast_command(
+                &root,
+                &file_display,
+                target_span.as_ref().map(|span| span.handle.as_str()),
+            )
+        }),
     };
     let report = SymbolReadReport {
         handle: symbol_handle.clone(),
@@ -20215,6 +20781,10 @@ fn cmd_symbol_read(
             report.expand.callers.clone(),
             report.expand.callees.clone(),
         ];
+        let follow_up = follow_up
+            .into_iter()
+            .chain(report.expand.markdown_ast.clone())
+            .collect::<Vec<_>>();
         print_json_or_envelope(
             &report,
             &format,

@@ -2922,6 +2922,204 @@ fn source_read_json_reports_markdown_section_list_and_code_spans() {
         code_block["span"]["body_end_byte"].as_u64().unwrap()
             > code_block["span"]["body_start_byte"].as_u64().unwrap()
     );
+    assert!(
+        json["report"]["expand"]["markdown_ast"]
+            .as_str()
+            .unwrap()
+            .contains("markdown-ast")
+    );
+    assert!(
+        json["follow_up"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cmd| cmd.as_str().unwrap().contains("markdown-ast"))
+    );
+}
+
+#[test]
+fn markdown_ast_json_reports_handles_hierarchy_metadata_and_expansions() {
+    let dir = markdown_edit_fixture();
+
+    let output = tsift_bin()
+        .args([
+            "--envelope",
+            "markdown-ast",
+            "README.md",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--budget",
+            "deep",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "markdown-ast stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "markdown-ast");
+    assert_eq!(json["view"], "ast");
+    assert_eq!(json["report"]["file"], "README.md");
+    assert!(
+        json["report"]["handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("mdastrep-")
+    );
+    assert!(
+        json["report"]["expand"]["source_read"]
+            .as_str()
+            .unwrap()
+            .contains("source-read")
+    );
+    assert!(
+        json["report"]["expand"]["edit_intents"]
+            .as_str()
+            .unwrap()
+            .contains("edit-intents")
+    );
+
+    let nodes = json["report"]["nodes"].as_array().unwrap();
+    assert!(
+        nodes.len() >= 7,
+        "expected heading/list/code Markdown nodes, got {json}"
+    );
+    let guide = nodes
+        .iter()
+        .find(|node| node["kind"] == "heading" && node["name"] == "Guide")
+        .unwrap_or_else(|| panic!("expected Guide heading node: {json}"));
+    assert!(guide["handle"].as_str().unwrap().starts_with("mdast-"));
+    assert!(guide["span_handle"].as_str().unwrap().starts_with("span-"));
+    assert_eq!(guide["block_kind"], "section");
+    assert_eq!(guide["metadata"]["heading_level"], 1);
+    assert_eq!(
+        guide["metadata"]["section_path"],
+        serde_json::json!(["Guide"])
+    );
+    assert!(
+        guide["child_handles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|handle| handle.as_str().unwrap().starts_with("mdast-"))
+    );
+
+    let install = nodes
+        .iter()
+        .find(|node| node["kind"] == "heading" && node["name"] == "Install")
+        .unwrap_or_else(|| panic!("expected Install heading node: {json}"));
+    assert_eq!(
+        install["metadata"]["section_path"],
+        serde_json::json!(["Guide", "Install"])
+    );
+    assert_eq!(
+        install["parent_handle"].as_str().unwrap(),
+        guide["handle"].as_str().unwrap()
+    );
+
+    let list_item = nodes
+        .iter()
+        .find(|node| node["kind"] == "list_item" && node["name"] == "Run setup.")
+        .unwrap_or_else(|| panic!("expected top-level list item node: {json}"));
+    assert_eq!(list_item["metadata"]["list_depth"], 0);
+    assert_eq!(list_item["metadata"]["list_marker"], "-");
+    assert_eq!(
+        list_item["metadata"]["section_path"],
+        serde_json::json!(["Guide", "Install"])
+    );
+
+    let nested_item = nodes
+        .iter()
+        .find(|node| node["kind"] == "list_item" && node["name"] == "Confirm setup.")
+        .unwrap_or_else(|| panic!("expected nested list item node: {json}"));
+    assert_eq!(nested_item["metadata"]["list_depth"], 1);
+    assert_eq!(
+        nested_item["parent_handle"].as_str().unwrap(),
+        list_item["handle"].as_str().unwrap()
+    );
+
+    let code_block = nodes
+        .iter()
+        .find(|node| node["kind"] == "code_block" && node["name"] == "rust")
+        .unwrap_or_else(|| panic!("expected rust code fence node: {json}"));
+    assert_eq!(code_block["block_kind"], "fenced_code_block");
+    assert_eq!(code_block["metadata"]["fence_language"], "rust");
+    assert_eq!(code_block["metadata"]["fence_marker"], "```");
+    assert!(
+        code_block["body_byte_span"]["end"].as_u64().unwrap()
+            > code_block["body_byte_span"]["start"].as_u64().unwrap()
+    );
+    assert!(
+        code_block["expand"]["source_window"]
+            .as_str()
+            .unwrap()
+            .contains("source-read")
+    );
+    assert!(
+        code_block["expand"]["symbol_read"]
+            .as_str()
+            .unwrap()
+            .contains("symbol-read")
+    );
+    assert!(
+        code_block["expand"]["edit_intents"]
+            .as_str()
+            .unwrap()
+            .contains("edit-intents")
+    );
+    assert!(
+        json["follow_up"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cmd| cmd.as_str().unwrap().contains("source-read"))
+    );
+}
+
+#[test]
+fn symbol_read_markdown_reports_markdown_ast_span_expansion() {
+    let dir = markdown_edit_fixture();
+
+    let output = tsift_bin()
+        .args([
+            "--envelope",
+            "symbol-read",
+            "Install",
+            "--file",
+            "README.md",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--budget",
+            "normal",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "symbol-read markdown stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "symbol-read");
+    assert_eq!(json["report"]["symbol"]["language"], "markdown");
+    let span_handle = json["report"]["symbol"]["span"]["handle"].as_str().unwrap();
+    let markdown_ast = json["report"]["expand"]["markdown_ast"].as_str().unwrap();
+    assert!(markdown_ast.contains("markdown-ast"), "{markdown_ast}");
+    assert!(markdown_ast.contains("--node"), "{markdown_ast}");
+    assert!(markdown_ast.contains(span_handle), "{markdown_ast}");
+    assert!(
+        json["follow_up"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cmd| cmd.as_str().unwrap().contains("markdown-ast"))
+    );
 }
 
 #[test]

@@ -479,6 +479,29 @@ pub enum Commands {
         #[arg(long, value_enum)]
         budget: Option<ResponseBudgetPreset>,
     },
+    /// Project a Markdown file into stable AST node handles and expansion commands
+    MarkdownAst {
+        /// Markdown file to project (relative to --path/root unless absolute)
+        file: PathBuf,
+        /// Path to the codebase (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Restrict output to one stable node handle (`mdast-*`/`span-*`)
+        #[arg(long)]
+        node: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Preview-mode item cap for AST nodes
+        #[arg(long)]
+        max_items: Option<usize>,
+        /// Preview-mode per-field byte cap for node names
+        #[arg(long)]
+        max_bytes: Option<usize>,
+        /// Named preview budget preset (auto adapts from context-window env vars)
+        #[arg(long, value_enum)]
+        budget: Option<ResponseBudgetPreset>,
+    },
     /// Read a token-budgeted symbol packet with body, child symbols, and expansion handles
     SymbolRead {
         /// Symbol name or tag-style query to inspect
