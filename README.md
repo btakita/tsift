@@ -1,10 +1,9 @@
 # tsift
 
 `tsift` is a token-conscious code search and session digest CLI for coding agents.
-It builds a local index, returns compact search and source-read envelopes, and
-turns noisy logs, tests, diffs, and agent-doc session documents into bounded
-evidence that smaller models can use without replaying an entire repository or
-transcript.
+It builds a local index, returns compact search/source/symbol envelopes, and turns
+noisy logs, tests, diffs, and agent-doc session documents into bounded evidence
+that smaller models can use without replaying an entire repository or transcript.
 
 ## Install
 
@@ -32,6 +31,8 @@ tsift status --fix
 tsift init --opencode
 tsift --envelope search "route dispatch" --budget normal
 tsift --envelope source-read src/main.rs --start 1 --lines 120 --budget normal
+tsift --envelope symbol-read main --file src/main.rs --budget normal
+tsift --envelope edit-intents --path . --budget normal < intents.json
 tsift diff-digest .
 tsift --envelope session-review tasks/software/tsift.md --next-context --budget normal
 tsift graph-db --path . --json refresh

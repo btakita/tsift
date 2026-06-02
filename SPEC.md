@@ -362,7 +362,9 @@ tsift memory status . --json # reports claude_mem_retirement=hold until full imp
 tsift memory capture-agent-doc-closeout . --session-path tasks/software/tsift.md --prompt-target 'do [#id]' --response-summary '<summary>' --commit-hash <sha> --session-check-status clean --json # capture agent-doc closeout events into tsift-memory
 tsift --envelope explain <symbol> --budget normal # bounded agent preview
 tsift --envelope source-read src/main.rs --start 1 --lines 80 --budget normal # bounded source-file preview with expansion handles
+tsift --envelope symbol-read <symbol> --file src/main.rs --budget normal # bounded symbol body packet with child refs and graph/source expansion commands
 tsift edit < edits.json         # staged multi-file search/replace batch
+tsift --envelope edit-intents --path . --budget normal < intents.json # validate semantic AST edit intents and emit dry-run execution plans
 tsift audit                     # scan installed skills, check health
 tsift audit --manifest <file>   # compare against expected skill list
 tsift summarize <symbol>        # cached LLM summary for a symbol
@@ -453,11 +455,23 @@ The JSON and envelope forms (`tsift --envelope source-read src/main.rs --start 4
 
 - a stable `swin-*` window handle for the file/range
 - line-numbered preview rows capped by the response budget
-- `ssym-*` symbol refs for indexed symbols intersecting the window, each with an `explain` expansion command
+- `ssym-*` symbol refs for indexed symbols intersecting the window, each with a `symbol-read` expansion command
 - cached `sum-*` summary refs for the file when `.tsift/summaries.db` is present, each with a `summarize` expansion command
 - explicit `before`, `after`, and full-file expansion commands so the next read can expand incrementally instead of falling back to `cat`/large `sed` windows
 
 The command still returns the source preview when index or summary stores are missing; those enrichment failures are reported as warnings. `--scope` restricts index refs for workspace submodule indexes, and nested paths infer the matching workspace scope when possible.
+
+`tsift symbol-read <symbol>` is the symbol-centered read replacement surface. It resolves the query through the indexed symbols table, optionally scoped by `--file` and `--scope`, then emits:
+
+- a stable `sread-*` handle for the selected symbol
+- the symbol signature/range metadata and a token-budgeted body preview
+- child `ssym-*` refs discovered inside the selected symbol's indexed line range
+- cached summary refs for the owning file when available
+- expansion commands for the selected source window, whole file, `explain`, caller graph, and callee graph
+
+`source-read` symbol refs now expand to `symbol-read`, while `symbol-read` preserves `explain` and graph commands as secondary expansion links. This makes whole-file `Read` fallback unnecessary for the normal search -> source window -> symbol body navigation path.
+
+`tsift edit-intents` is the semantic write-planning surface. It accepts JSON `{ "intents": [...] }` batches with normalized intent kinds `rename_symbol`, `replace_function_body`, `insert_import`, `add_method`, `update_call_signature`, `move_declaration`, and `rewrite_call_sites`. The command resolves symbol/file targets against the current index, reports the current content hash and target line range, detects optional `expected_content_hash` conflicts, and emits dry-run plans without mutating files. Actual AST mutation remains disabled until per-language executors can prove formatting, conflict detection, rollback, and conformance coverage.
 
 ## Handle-Preserving Search Workflow
 
@@ -1200,6 +1214,7 @@ Run `tsift status` at session start from the owning repo root. If the task or fi
 
 Use the commands listed in its `use:` output:
 - `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)
+- `tsift --envelope symbol-read <symbol> --budget normal` — token-budgeted symbol body, child refs, and graph/source expansion commands
 - `tsift --envelope explain <symbol> --budget normal` — callers, callees, community preview
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)

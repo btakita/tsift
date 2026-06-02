@@ -278,6 +278,64 @@ pub(crate) struct EditBatch {
 }
 
 #[derive(Deserialize)]
+struct SemanticEditIntentBatch {
+    intents: Vec<SemanticEditIntent>,
+}
+
+#[derive(Deserialize)]
+struct SemanticEditIntent {
+    kind: String,
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(default)]
+    file: Option<PathBuf>,
+    #[serde(default)]
+    replacement: Option<String>,
+    #[serde(default)]
+    new_name: Option<String>,
+    #[serde(default)]
+    expected_content_hash: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SemanticEditIntentPlan {
+    handle: String,
+    kind: String,
+    status: String,
+    apply_supported: bool,
+    target_symbol: Option<SemanticEditSymbolTarget>,
+    target_file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_range: Option<SourceRangePreview>,
+    content_hash: String,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct SemanticEditSymbolTarget {
+    name: String,
+    kind: String,
+    language: String,
+    file: String,
+    line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_line: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct SemanticEditIntentReport {
+    root: String,
+    mode: String,
+    intents_total: usize,
+    planned_total: usize,
+    conflict_total: usize,
+    unsupported_total: usize,
+    plans: Vec<SemanticEditIntentPlan>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct EditOp {
     /// File path to edit
     file: PathBuf,
@@ -316,6 +374,16 @@ pub(crate) enum EditStatus {
     Ok,
     Skipped,
 }
+
+const SEMANTIC_EDIT_KINDS: &[&str] = &[
+    "rename_symbol",
+    "replace_function_body",
+    "insert_import",
+    "add_method",
+    "update_call_signature",
+    "move_declaration",
+    "rewrite_call_sites",
+];
 
 struct PlannedEdit {
     index: usize,
@@ -426,6 +494,29 @@ pub fn run() -> Result<()> {
         Some(Commands::Edit { dry_run, file }) => {
             cmd_edit(dry_run, file, compact, pretty, terse, schema)
         }
+        Some(Commands::EditIntents {
+            path,
+            scope,
+            file,
+            json,
+            max_items,
+            max_bytes,
+            budget,
+        }) => cmd_edit_intents(
+            &path,
+            scope.as_deref(),
+            file,
+            OutputFormat {
+                json_output: json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                ultra_terse,
+                schema,
+                envelope,
+            },
+            ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
+        ),
         Some(Commands::Index {
             path,
             rebuild,
@@ -717,6 +808,32 @@ pub fn run() -> Result<()> {
             start,
             lines,
             end,
+            scope.as_deref(),
+            OutputFormat {
+                json_output: json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                ultra_terse,
+                schema,
+                envelope,
+            },
+            absolute,
+            ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
+        ),
+        Some(Commands::SymbolRead {
+            symbol,
+            file,
+            path,
+            scope,
+            json,
+            max_items,
+            max_bytes,
+            budget,
+        }) => cmd_symbol_read(
+            &symbol,
+            file.as_deref(),
+            &path,
             scope.as_deref(),
             OutputFormat {
                 json_output: json || terse || schema || envelope,
@@ -3643,6 +3760,303 @@ pub(crate) fn should_collapse_edge_groups(edges: &[index::StoredEdge]) -> bool {
     }
     let max_hits_per_file = grouped.values().copied().max().unwrap_or(0);
     max_hits_per_file >= 3 || (edges.len() >= 6 && grouped.len() < edges.len())
+}
+
+fn normalize_semantic_edit_kind(kind: &str) -> String {
+    kind.trim().replace('-', "_")
+}
+
+fn semantic_edit_kind_requires_symbol(kind: &str) -> bool {
+    matches!(
+        kind,
+        "rename_symbol"
+            | "replace_function_body"
+            | "update_call_signature"
+            | "move_declaration"
+            | "rewrite_call_sites"
+    )
+}
+
+fn semantic_edit_kind_requires_replacement(kind: &str) -> bool {
+    matches!(
+        kind,
+        "replace_function_body" | "insert_import" | "add_method" | "update_call_signature"
+    )
+}
+
+fn semantic_edit_kind_requires_new_name(kind: &str) -> bool {
+    kind == "rename_symbol"
+}
+
+fn semantic_edit_kind_requires_file(kind: &str) -> bool {
+    matches!(kind, "insert_import" | "move_declaration")
+}
+
+fn validate_semantic_edit_intent(kind: &str, intent: &SemanticEditIntent) -> Result<()> {
+    if !SEMANTIC_EDIT_KINDS.contains(&kind) {
+        bail!(
+            "unknown semantic edit kind {kind:?}; expected one of {}",
+            SEMANTIC_EDIT_KINDS.join(", ")
+        );
+    }
+    if semantic_edit_kind_requires_symbol(kind)
+        && intent.symbol.as_deref().is_none_or(str::is_empty)
+    {
+        bail!("semantic edit kind {kind:?} requires `symbol`");
+    }
+    if semantic_edit_kind_requires_file(kind) && intent.file.is_none() {
+        bail!("semantic edit kind {kind:?} requires `file`");
+    }
+    if semantic_edit_kind_requires_replacement(kind)
+        && intent.replacement.as_deref().is_none_or(str::is_empty)
+    {
+        bail!("semantic edit kind {kind:?} requires `replacement`");
+    }
+    if semantic_edit_kind_requires_new_name(kind)
+        && intent.new_name.as_deref().is_none_or(str::is_empty)
+    {
+        bail!("semantic edit kind {kind:?} requires `new_name`");
+    }
+    Ok(())
+}
+
+fn resolve_semantic_edit_symbol(
+    root: &Path,
+    scope: Option<&str>,
+    symbol: &str,
+    file_hint: Option<&Path>,
+    budget: ResponseBudget,
+) -> Result<(index::SymbolHit, PathBuf)> {
+    let hinted_file_abs = file_hint
+        .map(|file| resolve_source_file(root, file))
+        .transpose()?;
+    let path_hint = hinted_file_abs.as_deref().unwrap_or(root);
+    let db_path = resolve_query_db_path(root, path_hint, scope)?;
+    if !db_path.exists() {
+        bail!(
+            "index refs unavailable: no index found at {}",
+            db_path.display()
+        );
+    }
+    let db = index::IndexDb::open_read_only_resilient(&db_path)
+        .with_context(|| format!("opening symbol index {}", db_path.display()))?;
+    let hits = db
+        .symbol_search(symbol, budget.follow_up_items().max(10))
+        .with_context(|| format!("searching symbols for {symbol:?}"))?;
+    let hit = hits
+        .into_iter()
+        .find(|hit| {
+            let Some(hinted_file_abs) = &hinted_file_abs else {
+                return true;
+            };
+            resolve_source_file(root, Path::new(&hit.file))
+                .map(|hit_file| hit_file == *hinted_file_abs)
+                .unwrap_or(false)
+        })
+        .with_context(|| format!("no indexed symbol matched {symbol:?}"))?;
+    let file_abs = resolve_source_file(root, Path::new(&hit.file))?;
+    Ok((hit, file_abs))
+}
+
+fn semantic_edit_file_display(root: &Path, file_abs: &Path) -> String {
+    relativize_pathbuf(file_abs, root)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn semantic_edit_content_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+fn plan_semantic_edit_intent(
+    root: &Path,
+    scope: Option<&str>,
+    intent: &SemanticEditIntent,
+    index: usize,
+    budget: ResponseBudget,
+) -> Result<SemanticEditIntentPlan> {
+    let kind = normalize_semantic_edit_kind(&intent.kind);
+    validate_semantic_edit_intent(&kind, intent)?;
+
+    let (target_symbol, file_abs, target_range) = if let Some(symbol) = intent.symbol.as_deref() {
+        let (hit, file_abs) =
+            resolve_semantic_edit_symbol(root, scope, symbol, intent.file.as_deref(), budget)?;
+        let start = symbol_hit_line(&hit);
+        let end = symbol_hit_end_line(&hit).unwrap_or(start).max(start);
+        let file_display = semantic_edit_file_display(root, &file_abs);
+        (
+            Some(SemanticEditSymbolTarget {
+                name: hit.name,
+                kind: hit.kind,
+                language: hit.language,
+                file: file_display,
+                line: start,
+                end_line: Some(end),
+            }),
+            file_abs,
+            Some(SourceRangePreview {
+                start,
+                end,
+                total_lines: 0,
+                truncated_before: false,
+                truncated_after: false,
+            }),
+        )
+    } else {
+        let file = intent
+            .file
+            .as_deref()
+            .context("semantic edit intent requires `file` when `symbol` is omitted")?;
+        (None, resolve_source_file(root, file)?, None)
+    };
+
+    let source = fs::read(&file_abs).with_context(|| format!("reading {}", file_abs.display()))?;
+    let total_lines = String::from_utf8_lossy(&source).lines().count();
+    let content_hash = semantic_edit_content_hash(&source);
+    let mut target_range = target_range;
+    if let Some(range) = &mut target_range {
+        range.total_lines = total_lines;
+    }
+    let target_file = semantic_edit_file_display(root, &file_abs);
+    let conflict = intent
+        .expected_content_hash
+        .as_deref()
+        .is_some_and(|expected| expected != content_hash);
+    let status = if conflict { "conflict" } else { "planned" }.to_string();
+    let message = if conflict {
+        "expected_content_hash does not match current file content; intent was not planned for mutation"
+            .to_string()
+    } else {
+        format!(
+            "validated {kind} intent; AST mutation is dry-run only until per-language executor support is enabled"
+        )
+    };
+
+    Ok(SemanticEditIntentPlan {
+        handle: stable_handle(
+            "eintent",
+            &format!("{index}:{kind}:{target_file}:{content_hash}"),
+        ),
+        kind,
+        status,
+        apply_supported: false,
+        target_symbol,
+        target_file,
+        target_range,
+        content_hash,
+        message: truncate_for_budget(&message, budget.preview_bytes()),
+    })
+}
+
+fn cmd_edit_intents(
+    path: &Path,
+    scope: Option<&str>,
+    file: Option<PathBuf>,
+    format: OutputFormat,
+    budget: ResponseBudget,
+) -> Result<()> {
+    let input = match file {
+        Some(path) => fs::read_to_string(&path)
+            .with_context(|| format!("reading semantic edit intent file: {}", path.display()))?,
+        None => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("reading semantic edit intents from stdin")?;
+            buf
+        }
+    };
+    let batch: SemanticEditIntentBatch =
+        serde_json::from_str(&input).context("parsing semantic edit intent JSON")?;
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let max_items = budget.preview_items();
+    let plans = batch
+        .intents
+        .iter()
+        .take(max_items)
+        .enumerate()
+        .map(|(idx, intent)| plan_semantic_edit_intent(&root, scope, intent, idx, budget))
+        .collect::<Result<Vec<_>>>()?;
+    let planned_total = plans.iter().filter(|plan| plan.status == "planned").count();
+    let conflict_total = plans
+        .iter()
+        .filter(|plan| plan.status == "conflict")
+        .count();
+    let report = SemanticEditIntentReport {
+        root: root.to_string_lossy().to_string(),
+        mode: "dry_run".to_string(),
+        intents_total: batch.intents.len(),
+        planned_total,
+        conflict_total,
+        unsupported_total: 0,
+        plans,
+        warnings: (batch.intents.len() > max_items)
+            .then(|| {
+                format!(
+                    "truncated semantic edit plans from {} to {} items by response budget",
+                    batch.intents.len(),
+                    max_items
+                )
+            })
+            .into_iter()
+            .collect(),
+    };
+
+    if format.json_output {
+        let follow_up = report
+            .plans
+            .iter()
+            .filter_map(|plan| {
+                plan.target_range.as_ref().map(|range| {
+                    source_read_command(
+                        &root,
+                        &plan.target_file,
+                        range.start,
+                        range.end.saturating_sub(range.start).saturating_add(1),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        print_json_or_envelope(
+            &report,
+            &format,
+            "edit-intents",
+            "dry-run",
+            ToolEnvelopeSummary {
+                text: format!(
+                    "semantic edit intents planned={} conflicts={}",
+                    report.planned_total, report.conflict_total
+                ),
+                metrics: vec![
+                    envelope_metric("intents", report.intents_total),
+                    envelope_metric("planned", report.planned_total),
+                    envelope_metric("conflicts", report.conflict_total),
+                ],
+            },
+            report.intents_total > max_items || report.conflict_total > 0,
+            follow_up,
+        )?;
+    } else {
+        println!(
+            "Semantic edit intents: planned={} conflicts={} mode={}",
+            report.planned_total, report.conflict_total, report.mode
+        );
+        for plan in &report.plans {
+            println!(
+                "  {} {} {} apply_supported={} {}",
+                plan.handle, plan.status, plan.kind, plan.apply_supported, plan.target_file
+            );
+            if let Some(range) = &plan.target_range {
+                println!("    range: {}-{}", range.start, range.end);
+            }
+            println!("    {}", plan.message);
+        }
+        for warning in &report.warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
+
+    Ok(())
 }
 
 /// Apply a single edit operation to file contents. Returns new content.
@@ -15390,6 +15804,48 @@ struct SourceReadReport {
     warnings: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct SymbolReadTarget {
+    handle: String,
+    name: String,
+    kind: String,
+    language: String,
+    file: String,
+    line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_module: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visibility: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SymbolReadExpandCommands {
+    source_window: String,
+    file: String,
+    explain: String,
+    callers: String,
+    callees: String,
+}
+
+#[derive(Serialize)]
+struct SymbolReadReport {
+    handle: String,
+    root: String,
+    query: String,
+    symbol: SymbolReadTarget,
+    range: SourceRangePreview,
+    body: Vec<SourceLinePreview>,
+    child_symbols: Vec<SourceSymbolRef>,
+    summaries: Vec<SourceSummaryRef>,
+    expand: SymbolReadExpandCommands,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
 fn resolve_source_file(root: &Path, file: &Path) -> Result<PathBuf> {
     let candidate = if file.is_absolute() {
         file.to_path_buf()
@@ -15425,11 +15881,29 @@ fn source_read_command(root: &Path, file: &str, start: usize, lines: usize) -> S
     )
 }
 
+fn source_symbol_read_command(root: &Path, symbol: &str, file: &str) -> String {
+    format!(
+        "tsift --envelope symbol-read {} --path {} --file {} --budget normal",
+        shell_quote(symbol),
+        shell_quote(&root.to_string_lossy()),
+        shell_quote(file)
+    )
+}
+
 fn source_symbol_expand_command(root: &Path, symbol: &str) -> String {
     format!(
         "tsift --envelope explain {} --path {} --budget normal",
         shell_quote(symbol),
         shell_quote(&root.to_string_lossy())
+    )
+}
+
+fn source_symbol_graph_command(root: &Path, symbol: &str, relation: &str) -> String {
+    format!(
+        "tsift graph {} --path {} --{} --json",
+        shell_quote(symbol),
+        shell_quote(&root.to_string_lossy()),
+        relation
     )
 }
 
@@ -15449,6 +15923,20 @@ fn source_symbol_line(symbol: &index::StoredSymbol) -> usize {
 }
 
 fn source_symbol_end_line(symbol: &index::StoredSymbol) -> Option<usize> {
+    symbol
+        .end_line
+        .and_then(|line| usize::try_from(line).ok())
+        .and_then(|line| line.checked_add(1))
+}
+
+fn symbol_hit_line(symbol: &index::SymbolHit) -> usize {
+    usize::try_from(symbol.line)
+        .ok()
+        .and_then(|line| line.checked_add(1))
+        .unwrap_or(1)
+}
+
+fn symbol_hit_end_line(symbol: &index::SymbolHit) -> Option<usize> {
     symbol
         .end_line
         .and_then(|line| usize::try_from(line).ok())
@@ -15530,7 +16018,7 @@ fn load_source_symbols(
                 signature: symbol
                     .signature
                     .map(|signature| truncate_for_budget(&signature, max_bytes)),
-                expand: source_symbol_expand_command(root, &symbol.name),
+                expand: source_symbol_read_command(root, &symbol.name, file_display),
             }
         })
         .collect()
@@ -15781,6 +16269,263 @@ fn cmd_source_read(
             }
             println!("  file:   {}", report.expand.file);
         }
+        for warning in &report.warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_symbol_read(
+    symbol: &str,
+    file_hint: Option<&Path>,
+    path: &Path,
+    scope: Option<&str>,
+    format: OutputFormat,
+    absolute: bool,
+    budget: ResponseBudget,
+) -> Result<()> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let hinted_file_abs = file_hint
+        .map(|file| resolve_source_file(&root, file))
+        .transpose()?;
+    let path_hint = hinted_file_abs.as_deref().unwrap_or(root.as_path());
+    let db_path = resolve_query_db_path(&root, path_hint, scope)?;
+    if !db_path.exists() {
+        bail!(
+            "index refs unavailable: no index found at {}",
+            db_path.display()
+        );
+    }
+    let db = index::IndexDb::open_read_only_resilient(&db_path)
+        .with_context(|| format!("opening symbol index {}", db_path.display()))?;
+    let search_limit = budget.follow_up_items().max(10);
+    let hits = db
+        .symbol_search(symbol, search_limit)
+        .with_context(|| format!("searching symbols for {symbol:?}"))?;
+    let selected = hits
+        .into_iter()
+        .find(|hit| {
+            let Some(hinted_file_abs) = &hinted_file_abs else {
+                return true;
+            };
+            resolve_source_file(&root, Path::new(&hit.file))
+                .map(|hit_file| hit_file == *hinted_file_abs)
+                .unwrap_or(false)
+        })
+        .with_context(|| {
+            let hint = file_hint
+                .map(|file| format!(" in {}", file.display()))
+                .unwrap_or_default();
+            format!("no indexed symbol matched {symbol:?}{hint}")
+        })?;
+
+    let file_abs = resolve_source_file(&root, Path::new(&selected.file))?;
+    let file_display = if absolute {
+        file_abs.to_string_lossy().to_string()
+    } else {
+        relativize_pathbuf(&file_abs, &root)
+            .to_string_lossy()
+            .to_string()
+    };
+    let source = fs::read(&file_abs).with_context(|| format!("reading {}", file_abs.display()))?;
+    let content_hash = blake3::hash(&source).to_hex().to_string();
+    let text = String::from_utf8_lossy(&source);
+    let all_lines: Vec<&str> = text.lines().collect();
+    let total_lines = all_lines.len();
+    let file_symbols = db
+        .symbols_for_file(&file_abs.to_string_lossy())
+        .with_context(|| format!("loading symbols for {}", file_abs.display()))?;
+    let target_start = symbol_hit_line(&selected);
+    let target_end = symbol_hit_end_line(&selected).unwrap_or(target_start);
+    let stored_target = file_symbols.iter().find(|candidate| {
+        candidate.name == selected.name
+            && candidate.kind == selected.kind
+            && source_symbol_line(candidate) == target_start
+    });
+    let target_end = stored_target
+        .and_then(source_symbol_end_line)
+        .unwrap_or(target_end)
+        .max(target_start);
+    let body_line_budget = budget.preview_items().max(1).saturating_mul(16);
+    let preview_end = target_start
+        .saturating_add(body_line_budget)
+        .saturating_sub(1)
+        .min(target_end)
+        .min(total_lines.max(target_start));
+    let body = if total_lines == 0 || target_start > total_lines {
+        Vec::new()
+    } else {
+        all_lines[(target_start - 1)..preview_end]
+            .iter()
+            .enumerate()
+            .map(|(idx, line)| SourceLinePreview {
+                line: target_start + idx,
+                text: truncate_for_budget(line, budget.preview_bytes()),
+            })
+            .collect()
+    };
+    let max_items = budget.preview_items();
+    let max_bytes = budget.preview_bytes();
+    let child_symbols = file_symbols
+        .iter()
+        .filter(|candidate| {
+            let line = source_symbol_line(candidate);
+            line > target_start && line <= target_end
+        })
+        .take(max_items)
+        .map(|symbol| {
+            let line = source_symbol_line(symbol);
+            let end_line = source_symbol_end_line(symbol);
+            SourceSymbolRef {
+                handle: stable_handle(
+                    "ssym",
+                    &format!("{}:{}:{}", file_display, symbol.name, line),
+                ),
+                name: truncate_for_budget(&symbol.name, max_bytes),
+                kind: symbol.kind.clone(),
+                language: symbol.language.clone(),
+                file: file_display.clone(),
+                line,
+                end_line,
+                signature: symbol
+                    .signature
+                    .clone()
+                    .map(|signature| truncate_for_budget(&signature, max_bytes)),
+                expand: source_symbol_read_command(&root, &symbol.name, &file_display),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut warnings = Vec::new();
+    let summaries =
+        load_source_summaries(&root, &file_display, max_items, max_bytes, &mut warnings);
+    let symbol_handle = stable_handle(
+        "sread",
+        &format!("{}:{}:{}", file_display, selected.name, target_start),
+    );
+    let source_lines = preview_end
+        .saturating_sub(target_start)
+        .saturating_add(1)
+        .max(1);
+    let expand = SymbolReadExpandCommands {
+        source_window: source_read_command(&root, &file_display, target_start, source_lines),
+        file: source_read_command(&root, &file_display, 1, total_lines.max(source_lines)),
+        explain: source_symbol_expand_command(&root, &selected.name),
+        callers: source_symbol_graph_command(&root, &selected.name, "callers"),
+        callees: source_symbol_graph_command(&root, &selected.name, "callees"),
+    };
+    let report = SymbolReadReport {
+        handle: symbol_handle.clone(),
+        root: root.to_string_lossy().to_string(),
+        query: symbol.to_string(),
+        symbol: SymbolReadTarget {
+            handle: symbol_handle,
+            name: selected.name.clone(),
+            kind: selected.kind.clone(),
+            language: selected.language.clone(),
+            file: file_display.clone(),
+            line: target_start,
+            end_line: Some(target_end),
+            signature: stored_target
+                .and_then(|stored| stored.signature.clone())
+                .map(|signature| truncate_for_budget(&signature, max_bytes)),
+            parent_module: stored_target.and_then(|stored| stored.parent_module.clone()),
+            visibility: stored_target.and_then(|stored| stored.visibility.clone()),
+        },
+        range: SourceRangePreview {
+            start: target_start,
+            end: preview_end,
+            total_lines,
+            truncated_before: false,
+            truncated_after: preview_end < target_end,
+        },
+        body,
+        child_symbols,
+        summaries,
+        expand,
+        warnings,
+    };
+
+    if format.json_output {
+        let truncated = report.range.truncated_after
+            || report.body.iter().any(|line| line.text.len() >= max_bytes)
+            || report.child_symbols.len() >= max_items;
+        let follow_up = vec![
+            report.expand.source_window.clone(),
+            report.expand.file.clone(),
+            report.expand.explain.clone(),
+            report.expand.callers.clone(),
+            report.expand.callees.clone(),
+        ];
+        print_json_or_envelope(
+            &report,
+            &format,
+            "symbol-read",
+            "symbol",
+            ToolEnvelopeSummary {
+                text: format!(
+                    "symbol {} {}:{}-{}",
+                    report.symbol.name, report.symbol.file, report.range.start, report.range.end
+                ),
+                metrics: vec![
+                    envelope_metric("body_lines", report.body.len()),
+                    envelope_metric("child_symbols", report.child_symbols.len()),
+                    envelope_metric("summaries", report.summaries.len()),
+                ],
+            },
+            truncated,
+            follow_up,
+        )?;
+    } else if format.compact {
+        println!(
+            "symbol {} {}:{}-{} handle:{} hash:{}",
+            report.symbol.name,
+            report.symbol.file,
+            report.range.start,
+            report.range.end,
+            report.handle,
+            content_hash
+        );
+        for line in &report.body {
+            println!("{:>5} {}", line.line, line.text);
+        }
+        if !report.child_symbols.is_empty() {
+            println!("children[{}]:", report.child_symbols.len());
+            for child in &report.child_symbols {
+                println!("  {} {}:{}", child.name, child.file, child.line);
+            }
+        }
+    } else {
+        println!(
+            "Symbol `{}` in `{}` lines {}-{} ({})",
+            report.symbol.name,
+            report.symbol.file,
+            report.range.start,
+            report.range.end,
+            report.handle
+        );
+        for line in &report.body {
+            println!("{:>5} | {}", line.line, line.text);
+        }
+        if !report.child_symbols.is_empty() {
+            println!();
+            println!("Child symbols:");
+            for child in &report.child_symbols {
+                println!(
+                    "  {} `{}` {}:{} — {}",
+                    child.handle, child.name, child.file, child.line, child.expand
+                );
+            }
+        }
+        println!();
+        println!("Expand:");
+        println!("  source:  {}", report.expand.source_window);
+        println!("  file:    {}", report.expand.file);
+        println!("  explain: {}", report.expand.explain);
+        println!("  callers: {}", report.expand.callers);
+        println!("  callees: {}", report.expand.callees);
         for warning in &report.warnings {
             eprintln!("warning: {warning}");
         }

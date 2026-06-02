@@ -2628,9 +2628,151 @@ fn source_read_json_reports_bounded_window_handles_and_expansion_commands() {
                 && symbol["expand"]
                     .as_str()
                     .unwrap()
-                    .contains("tsift --envelope explain")
+                    .contains("tsift --envelope symbol-read")
         }),
         "expected main symbol ref: {json}"
+    );
+}
+
+#[test]
+fn symbol_read_json_reports_symbol_body_and_navigation_commands() {
+    let dir = indexed_cli_fixture();
+
+    let output = tsift_bin()
+        .args([
+            "--envelope",
+            "symbol-read",
+            "alpha",
+            "--file",
+            "main.rs",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--budget",
+            "normal",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "symbol-read stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "symbol-read");
+    assert_eq!(json["view"], "symbol");
+    assert!(
+        json["report"]["handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("sread-")
+    );
+    assert_eq!(json["report"]["symbol"]["name"], "alpha");
+    assert_eq!(json["report"]["symbol"]["file"], "main.rs");
+    assert!(
+        json["report"]["body"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line["text"].as_str().unwrap().contains("fn alpha"))
+    );
+    assert!(
+        json["report"]["expand"]["explain"]
+            .as_str()
+            .unwrap()
+            .contains("tsift --envelope explain")
+    );
+    assert!(
+        json["report"]["expand"]["callers"]
+            .as_str()
+            .unwrap()
+            .contains("--callers")
+    );
+    assert!(
+        json["follow_up"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cmd| cmd.as_str().unwrap().contains("tsift source-read"))
+    );
+}
+
+#[test]
+fn edit_intents_json_validates_semantic_write_plan_without_mutating() {
+    let dir = indexed_cli_fixture();
+    let before = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "rename_symbol",
+                "symbol": "alpha",
+                "file": "main.rs",
+                "new_name": "alpha_renamed"
+            },
+            {
+                "kind": "replace_function_body",
+                "symbol": "beta",
+                "file": "main.rs",
+                "replacement": "gamma();"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--budget",
+            "normal",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "edit-intents stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+        before
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "edit-intents");
+    assert_eq!(json["view"], "dry-run");
+    assert_eq!(json["report"]["mode"], "dry_run");
+    assert_eq!(json["report"]["intents_total"], 2);
+    assert_eq!(json["report"]["planned_total"], 2);
+    assert_eq!(json["report"]["plans"].as_array().unwrap().len(), 2);
+    assert!(
+        json["report"]["plans"][0]["handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("eintent-")
+    );
+    assert_eq!(json["report"]["plans"][0]["target_symbol"]["name"], "alpha");
+    assert_eq!(json["report"]["plans"][0]["apply_supported"], false);
+    assert!(
+        json["follow_up"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cmd| cmd.as_str().unwrap().contains("tsift source-read"))
     );
 }
 

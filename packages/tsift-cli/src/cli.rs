@@ -142,6 +142,30 @@ pub enum Commands {
         #[arg(short, long)]
         file: Option<PathBuf>,
     },
+    /// Validate semantic AST edit intents and emit a dry-run execution plan
+    EditIntents {
+        /// Path to the indexed codebase (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Restrict symbol resolution to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Read intents from a file instead of stdin
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Preview-mode item cap for planned intents
+        #[arg(long)]
+        max_items: Option<usize>,
+        /// Preview-mode per-field byte cap for messages
+        #[arg(long)]
+        max_bytes: Option<usize>,
+        /// Named preview budget preset (auto adapts from context-window env vars)
+        #[arg(long, value_enum)]
+        budget: Option<ResponseBudgetPreset>,
+    },
     /// Recommend a Claude model tier for a task (haiku/search, sonnet/edit, opus/architecture)
     Route {
         /// Task description to classify
@@ -437,6 +461,32 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
         /// Preview-mode item cap for symbol/summary refs
+        #[arg(long)]
+        max_items: Option<usize>,
+        /// Preview-mode per-field byte cap for snippets and summaries
+        #[arg(long)]
+        max_bytes: Option<usize>,
+        /// Named preview budget preset (auto adapts from context-window env vars)
+        #[arg(long, value_enum)]
+        budget: Option<ResponseBudgetPreset>,
+    },
+    /// Read a token-budgeted symbol packet with body, child symbols, and expansion handles
+    SymbolRead {
+        /// Symbol name or tag-style query to inspect
+        symbol: String,
+        /// Optional source file hint to disambiguate duplicate symbols
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Path to the indexed codebase (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Restrict index refs to a specific submodule
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Preview-mode item cap for child symbol/summary refs
         #[arg(long)]
         max_items: Option<usize>,
         /// Preview-mode per-field byte cap for snippets and summaries
