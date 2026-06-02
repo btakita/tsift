@@ -2621,16 +2621,28 @@ fn source_read_json_reports_bounded_window_handles_and_expansion_commands() {
     );
 
     let symbols = json["report"]["symbols"].as_array().unwrap();
+    let main_symbol = symbols
+        .iter()
+        .find(|symbol| symbol["name"] == "main")
+        .unwrap_or_else(|| panic!("expected main symbol ref: {json}"));
+    assert!(main_symbol["handle"].as_str().unwrap().starts_with("ssym-"));
     assert!(
-        symbols.iter().any(|symbol| {
-            symbol["handle"].as_str().unwrap().starts_with("ssym-")
-                && symbol["name"] == "main"
-                && symbol["expand"]
-                    .as_str()
-                    .unwrap()
-                    .contains("tsift --envelope symbol-read")
-        }),
-        "expected main symbol ref: {json}"
+        main_symbol["expand"]
+            .as_str()
+            .unwrap()
+            .contains("tsift --envelope symbol-read")
+    );
+    assert!(
+        main_symbol["span"]["handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("span-")
+    );
+    assert_eq!(main_symbol["span"]["node_kind"], "function_item");
+    assert_eq!(main_symbol["span"]["start_byte"], 0);
+    assert!(
+        main_symbol["span"]["body_end_byte"].as_u64().unwrap()
+            > main_symbol["span"]["body_start_byte"].as_u64().unwrap()
     );
 }
 
@@ -2669,6 +2681,26 @@ fn symbol_read_json_reports_symbol_body_and_navigation_commands() {
     );
     assert_eq!(json["report"]["symbol"]["name"], "alpha");
     assert_eq!(json["report"]["symbol"]["file"], "main.rs");
+    assert!(
+        json["report"]["symbol"]["span"]["handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("span-")
+    );
+    assert_eq!(
+        json["report"]["symbol"]["span"]["node_kind"],
+        "function_item"
+    );
+    assert_eq!(json["report"]["symbol"]["span"]["start_line"], 6);
+    assert_eq!(json["report"]["symbol"]["span"]["end_line"], 9);
+    assert!(
+        json["report"]["symbol"]["span"]["body_end_byte"]
+            .as_u64()
+            .unwrap()
+            > json["report"]["symbol"]["span"]["body_start_byte"]
+                .as_u64()
+                .unwrap()
+    );
     assert!(
         json["report"]["body"]
             .as_array()
@@ -2766,11 +2798,26 @@ fn edit_intents_json_validates_semantic_write_plan_without_mutating() {
             .starts_with("eintent-")
     );
     assert_eq!(json["report"]["plans"][0]["target_symbol"]["name"], "alpha");
+    assert!(
+        json["report"]["plans"][0]["target_symbol"]["span"]["handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("span-")
+    );
+    assert_eq!(
+        json["report"]["plans"][0]["target_symbol"]["span"]["node_kind"],
+        "function_item"
+    );
     assert_eq!(json["report"]["applied_total"], 0);
     assert_eq!(json["report"]["formatted_total"], 0);
     assert_eq!(json["report"]["plans"][0]["apply_supported"], true);
     assert_eq!(json["report"]["plans"][0]["applied"], false);
-    assert!(json["report"]["plans"][0]["diff"].as_str().unwrap().contains("alpha_renamed"));
+    assert!(
+        json["report"]["plans"][0]["diff"]
+            .as_str()
+            .unwrap()
+            .contains("alpha_renamed")
+    );
     assert!(
         json["follow_up"]
             .as_array()
@@ -2844,11 +2891,17 @@ fn edit_intents_apply_formats_and_mutates_supported_rust_intents() {
     assert_eq!(json["report"]["planned_total"], 3);
     assert_eq!(json["report"]["applied_total"], 3);
     assert_eq!(json["report"]["formatted_total"], 1);
-    assert!(json["report"]["plans"].as_array().unwrap().iter().all(|plan| {
-        plan["status"] == "applied"
-            && plan["applied"] == true
-            && plan["formatter"] == "rustfmt --edition 2024"
-    }));
+    assert!(
+        json["report"]["plans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|plan| {
+                plan["status"] == "applied"
+                    && plan["applied"] == true
+                    && plan["formatter"] == "rustfmt --edition 2024"
+            })
+    );
 
     let source = fs::read_to_string(dir.path().join("main.rs")).unwrap();
     assert!(source.contains("use std::fmt;"), "{source}");

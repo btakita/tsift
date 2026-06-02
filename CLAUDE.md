@@ -15,8 +15,8 @@ Single-binary Rust CLI (`src/main.rs`). All commands are subcommands via clap de
 | `tsift route` | Classify task → model tier (haiku/sonnet/opus) |
 | `tsift rewrite` | Shell command → tsift equivalent. Default mode prints the rewrite for hook integration; `--run` executes the bounded tsift equivalent directly so Codex and other harnesses can reuse the same envelope-first path without Claude `PreToolUse` hooks. Coverage includes exact-search envelope previews, digest-routing for `git diff`, `git diff --cached`, `git show`, simple patch-style `git log -p -1 ...`, long session transcript reads (`cat` / `head` / `tail` / `sed -n` over agent-doc markdown, Claude JSONL, Codex JSONL, or agent-doc runtime logs), and artifact-backed digest-runner envelopes for `cargo test` / `pytest` plus verbose cargo build/check/install flows. When RTK is installed, digest-runner probes `rtk rewrite` and records delegated compact filters under `report.filter`. |
 | `tsift sql` | SQLite introspection: schema overview, table detail, read-only query |
-| `tsift symbol-read` | Symbol-centered read packet: resolves an indexed symbol, emits a token-budgeted body preview, child symbol refs, cached summary refs, and expansion commands for source windows, `explain`, callers, and callees. |
-| `tsift edit-intents` | Semantic write-intent validator/executor: accepts JSON intent batches (`rename_symbol`, `replace_function_body`, `insert_import`, `add_method`, `update_call_signature`, `move_declaration`, `rewrite_call_sites`), emits dry-run target ranges/content hashes/diff previews, and applies supported Rust intents with `--apply`. |
+| `tsift symbol-read` | Symbol-centered read packet: resolves an indexed symbol, emits AST span metadata, a token-budgeted body preview, child symbol refs, cached summary refs, and expansion commands for source windows, `explain`, callers, and callees. |
+| `tsift edit-intents` | Semantic write-intent validator/executor: accepts JSON intent batches (`rename_symbol`, `replace_function_body`, `insert_import`, `add_method`, `update_call_signature`, `move_declaration`, `rewrite_call_sites`), emits dry-run target ranges/spans/content hashes/diff previews, and applies supported Rust intents with `--apply`. |
 | `tsift communities` | Louvain community detection over call graph. `--min-size N` / `--limit N` (default 10, 0=unlimited) / `--scope <name>` / `--json`. Workspace roots with scoped-only indexes require an explicit scope. |
 | `tsift path` | BFS shortest path between two symbols. `--scope <name>` / `--json`. Workspace roots with scoped-only indexes require an explicit scope. |
 | `tsift explain` | Full symbol context: definitions, callers, callees, community. `--limit N` (default 15, 0=unlimited) / `--scope <name>` / `--json`. Workspace roots with scoped-only indexes require an explicit scope, and dense same-file caller/callee sets collapse in the default human output. |
@@ -102,7 +102,7 @@ If copied skill instructions lag behind the installed binary, treat this file, `
 - **Bounded symbol ranking**: `symbol_search()` only asks SQLite for exact-name rows and overlapping-tag candidates, ordered by match strength and capped to the requested limit, instead of loading the full `symbols` table into memory.
 - **Graph CLI stays integration-tested**: `tests/exit_code.rs` drives the compiled binary against an indexed temp project for `search`, `graph`, `communities`, `path`, and `explain`, so graph/query regressions fail above the unit-test layer.
 - **Atomic batch edits**: `cmd_edit` validates ALL edits before writing ANY (two-phase).
-- **Semantic edit intents fail closed**: `edit-intents` validates AST edit intent packets, resolves file/symbol targets, detects content-hash conflicts, and supports `--apply` for Rust `rename_symbol`, `replace_function_body`, and `insert_import` intents. Apply mode formats staged content before writing and uses the atomic edit backup/rollback path; unsupported kinds/languages and formatter failures do not mutate files.
+- **Semantic edit intents fail closed**: `edit-intents` validates AST edit intent packets, resolves file/symbol targets with stable span handles when indexed spans are available, detects content-hash conflicts, and supports `--apply` for Rust `rename_symbol`, `replace_function_body`, and `insert_import` intents. Apply mode formats staged content before writing and uses the atomic edit backup/rollback path; unsupported kinds/languages and formatter failures do not mutate files.
 - **Rewrite protocol**: exit 0 + stdout = rewrite, exit 1 = pass through (matches rtk convention).
 - **Search strategy default**: `lexical` for instant results. `hybrid`/`vector` require model download on first run.
 - **All public logic tested**: `classify_task`, `apply_edit_op`, `rewrite_command`, SQL helpers all have unit tests.
@@ -134,7 +134,7 @@ Run `tsift status` at session start from the owning repo root. If the task or fi
 
 Use the commands listed in its `use:` output:
 - `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)
-- `tsift --envelope symbol-read <symbol> --budget normal` — token-budgeted symbol body, child refs, and graph/source expansion commands
+- `tsift --envelope symbol-read <symbol> --budget normal` — token-budgeted symbol body, AST span metadata, child refs, and graph/source expansion commands
 - `tsift --envelope explain <symbol> --budget normal` — callers, callees, community preview
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)

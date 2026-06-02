@@ -7,6 +7,11 @@ pub struct Symbol {
     pub kind: String,
     pub line: usize,
     pub end_line: usize,
+    pub node_kind: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub body_start_byte: Option<usize>,
+    pub body_end_byte: Option<usize>,
 }
 
 #[allow(dead_code)]
@@ -266,16 +271,18 @@ impl Lang {
                         .utf8_text(source)
                         .unwrap_or("<invalid utf8>")
                         .to_string();
-                    let parent_end = capture
-                        .node
-                        .parent()
-                        .map(|p| p.end_position().row)
-                        .unwrap_or(capture.node.end_position().row);
+                    let node = symbol_node_for_capture(kind_str, capture.node);
+                    let body_span = symbol_body_span(node);
                     symbols.push(Symbol {
                         name,
                         kind: kind_str.to_string(),
-                        line: capture.node.start_position().row,
-                        end_line: parent_end,
+                        line: node.start_position().row,
+                        end_line: node.end_position().row,
+                        node_kind: node.kind().to_string(),
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
+                        body_start_byte: body_span.map(|(start, _)| start),
+                        body_end_byte: body_span.map(|(_, end)| end),
                     });
                 }
             }
@@ -332,6 +339,11 @@ impl Lang {
                                     kind: "alias".to_string(),
                                     line: arg.start_position().row,
                                     end_line: node.end_position().row,
+                                    node_kind: node.kind().to_string(),
+                                    start_byte: arg.start_byte(),
+                                    end_byte: node.end_byte(),
+                                    body_start_byte: None,
+                                    body_end_byte: None,
                                 });
                             }
                         }
@@ -368,6 +380,46 @@ impl Lang {
             Self::Markdown,
         ]
     }
+}
+
+fn symbol_node_for_capture<'tree>(
+    kind: &str,
+    name_node: tree_sitter::Node<'tree>,
+) -> tree_sitter::Node<'tree> {
+    let mut node = name_node.parent().unwrap_or(name_node);
+    if kind == "code_block" {
+        while let Some(parent) = node.parent() {
+            node = parent;
+            if node.kind() == "fenced_code_block" {
+                break;
+            }
+        }
+    }
+    node
+}
+
+fn symbol_body_span(node: tree_sitter::Node<'_>) -> Option<(usize, usize)> {
+    if let Some(body) = node.child_by_field_name("body") {
+        return Some((body.start_byte(), body.end_byte()));
+    }
+    for idx in 0..node.named_child_count() {
+        let Some(child) = node.named_child(idx as u32) else {
+            continue;
+        };
+        if matches!(
+            child.kind(),
+            "block"
+                | "declaration_list"
+                | "field_declaration_list"
+                | "enum_variant_list"
+                | "match_block"
+                | "statement_block"
+                | "suite"
+        ) {
+            return Some((child.start_byte(), child.end_byte()));
+        }
+    }
+    None
 }
 
 #[cfg(test)]

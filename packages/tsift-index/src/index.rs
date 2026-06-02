@@ -339,6 +339,16 @@ pub struct StoredSymbol {
     pub file: String,
     pub line: i64,
     pub end_line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub node_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub start_byte: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub end_byte: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub body_start_byte: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub body_end_byte: Option<i64>,
     pub parent_module: Option<String>,
     pub visibility: Option<String>,
     pub tags: Option<String>,
@@ -382,6 +392,16 @@ pub struct SymbolHit {
     pub file: String,
     pub line: i64,
     pub end_line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub node_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub start_byte: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub end_byte: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub body_start_byte: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub body_end_byte: Option<i64>,
     pub tags: Option<String>,
     pub score: f64,
     pub match_type: String,
@@ -476,6 +496,11 @@ impl IndexDb {
                 file TEXT NOT NULL,
                 line INTEGER NOT NULL,
                 end_line INTEGER,
+                node_kind TEXT,
+                start_byte INTEGER,
+                end_byte INTEGER,
+                body_start_byte INTEGER,
+                body_end_byte INTEGER,
                 parent_module TEXT,
                 visibility TEXT,
                 tags TEXT
@@ -514,6 +539,11 @@ impl IndexDb {
             );",
         )?;
         let _ = conn.execute("ALTER TABLE symbols ADD COLUMN tags TEXT", []);
+        let _ = conn.execute("ALTER TABLE symbols ADD COLUMN node_kind TEXT", []);
+        let _ = conn.execute("ALTER TABLE symbols ADD COLUMN start_byte INTEGER", []);
+        let _ = conn.execute("ALTER TABLE symbols ADD COLUMN end_byte INTEGER", []);
+        let _ = conn.execute("ALTER TABLE symbols ADD COLUMN body_start_byte INTEGER", []);
+        let _ = conn.execute("ALTER TABLE symbols ADD COLUMN body_end_byte INTEGER", []);
         Ok(Self {
             conn,
             _write_lock: Some(write_lock),
@@ -896,7 +926,7 @@ impl IndexDb {
                 .prepare("DELETE FROM file_state WHERE path = ?1")?;
             let mut delete_symbols = self.conn.prepare("DELETE FROM symbols WHERE file = ?1")?;
             let mut insert_symbol = self.conn.prepare(
-                "INSERT INTO symbols (name, kind, language, signature, file, line, end_line, parent_module, visibility, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+                "INSERT INTO symbols (name, kind, language, signature, file, line, end_line, node_kind, start_byte, end_byte, body_start_byte, body_end_byte, parent_module, visibility, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
             )?;
             let mut delete_edges = self
                 .conn
@@ -966,6 +996,11 @@ impl IndexDb {
                                         &path_str,
                                         sym.line as i64,
                                         sym.end_line as i64,
+                                        &sym.node_kind,
+                                        sym.start_byte as i64,
+                                        sym.end_byte as i64,
+                                        sym.body_start_byte.map(|byte| byte as i64),
+                                        sym.body_end_byte.map(|byte| byte as i64),
                                         Option::<String>::None,
                                         Option::<String>::None,
                                         tags,
@@ -1139,10 +1174,40 @@ impl IndexDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    fn symbols_have_ast_span_columns(&self) -> Result<bool> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(symbols)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut columns = HashSet::new();
+        for row in rows {
+            columns.insert(row?);
+        }
+        Ok([
+            "node_kind",
+            "start_byte",
+            "end_byte",
+            "body_start_byte",
+            "body_end_byte",
+        ]
+        .iter()
+        .all(|column| columns.contains(*column)))
+    }
+
+    fn ast_span_select_columns(&self) -> Result<&'static str> {
+        if self.symbols_have_ast_span_columns()? {
+            Ok("node_kind, start_byte, end_byte, body_start_byte, body_end_byte")
+        } else {
+            Ok(
+                "NULL AS node_kind, NULL AS start_byte, NULL AS end_byte, NULL AS body_start_byte, NULL AS body_end_byte",
+            )
+        }
+    }
+
     pub fn symbols_for_file(&self, file: &str) -> Result<Vec<StoredSymbol>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT name, kind, language, signature, file, line, end_line, parent_module, visibility, tags FROM symbols WHERE file = ?1 ORDER BY line"
-        )?;
+        let ast_columns = self.ast_span_select_columns()?;
+        let sql = format!(
+            "SELECT name, kind, language, signature, file, line, end_line, {ast_columns}, parent_module, visibility, tags FROM symbols WHERE file = ?1 ORDER BY line"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params![file], |row| {
             Ok(StoredSymbol {
                 name: row.get(0)?,
@@ -1152,9 +1217,14 @@ impl IndexDb {
                 file: row.get(4)?,
                 line: row.get(5)?,
                 end_line: row.get(6)?,
-                parent_module: row.get(7)?,
-                visibility: row.get(8)?,
-                tags: row.get(9)?,
+                node_kind: row.get(7)?,
+                start_byte: row.get(8)?,
+                end_byte: row.get(9)?,
+                body_start_byte: row.get(10)?,
+                body_end_byte: row.get(11)?,
+                parent_module: row.get(12)?,
+                visibility: row.get(13)?,
+                tags: row.get(14)?,
                 tagpath_handle: None,
             })
         })?;
@@ -1179,10 +1249,12 @@ impl IndexDb {
     }
 
     pub fn all_symbols(&self) -> Result<Vec<StoredSymbol>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT name, kind, language, signature, file, line, end_line, parent_module, visibility, tags \
-             FROM symbols ORDER BY file, line, name",
-        )?;
+        let ast_columns = self.ast_span_select_columns()?;
+        let sql = format!(
+            "SELECT name, kind, language, signature, file, line, end_line, {ast_columns}, parent_module, visibility, tags \
+             FROM symbols ORDER BY file, line, name"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| {
             Ok(StoredSymbol {
                 name: row.get(0)?,
@@ -1192,9 +1264,14 @@ impl IndexDb {
                 file: row.get(4)?,
                 line: row.get(5)?,
                 end_line: row.get(6)?,
-                parent_module: row.get(7)?,
-                visibility: row.get(8)?,
-                tags: row.get(9)?,
+                node_kind: row.get(7)?,
+                start_byte: row.get(8)?,
+                end_byte: row.get(9)?,
+                body_start_byte: row.get(10)?,
+                body_end_byte: row.get(11)?,
+                parent_module: row.get(12)?,
+                visibility: row.get(13)?,
+                tags: row.get(14)?,
                 tagpath_handle: None,
             })
         })?;
@@ -1239,9 +1316,11 @@ impl IndexDb {
     }
 
     pub fn symbol_info(&self, name: &str) -> Result<Vec<StoredSymbol>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT name, kind, language, signature, file, line, end_line, parent_module, visibility, tags FROM symbols WHERE name = ?1 ORDER BY file, line"
-        )?;
+        let ast_columns = self.ast_span_select_columns()?;
+        let sql = format!(
+            "SELECT name, kind, language, signature, file, line, end_line, {ast_columns}, parent_module, visibility, tags FROM symbols WHERE name = ?1 ORDER BY file, line"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params![name], |row| {
             Ok(StoredSymbol {
                 name: row.get(0)?,
@@ -1251,9 +1330,14 @@ impl IndexDb {
                 file: row.get(4)?,
                 line: row.get(5)?,
                 end_line: row.get(6)?,
-                parent_module: row.get(7)?,
-                visibility: row.get(8)?,
-                tags: row.get(9)?,
+                node_kind: row.get(7)?,
+                start_byte: row.get(8)?,
+                end_byte: row.get(9)?,
+                body_start_byte: row.get(10)?,
+                body_end_byte: row.get(11)?,
+                parent_module: row.get(12)?,
+                visibility: row.get(13)?,
+                tags: row.get(14)?,
                 tagpath_handle: None,
             })
         })?;
@@ -1331,9 +1415,10 @@ impl IndexDb {
             match_count_terms.join(" + ")
         };
         let tag_count_expr = "CASE WHEN tags IS NULL OR tags = '' THEN 0 ELSE LENGTH(tags) - LENGTH(REPLACE(tags, ',', '')) + 1 END";
+        let ast_columns = self.ast_span_select_columns()?;
         let limit_param_idx = params.len() + 1;
         let sql = format!(
-            "SELECT name, kind, language, file, line, end_line, tags, {match_count_expr} AS match_count, {tag_count_expr} AS tag_count \
+            "SELECT name, kind, language, file, line, end_line, {ast_columns}, tags, {match_count_expr} AS match_count, {tag_count_expr} AS tag_count \
              FROM symbols \
              WHERE {} \
              ORDER BY \
@@ -1360,12 +1445,30 @@ impl IndexDb {
                 row.get::<_, i64>(4)?,
                 row.get::<_, Option<i64>>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+                row.get::<_, Option<String>>(11)?,
             ))
         })?;
 
         let mut hits: Vec<SymbolHit> = Vec::new();
         for row in rows {
-            let (name, kind, language, file, line, end_line, tags) = row?;
+            let (
+                name,
+                kind,
+                language,
+                file,
+                line,
+                end_line,
+                node_kind,
+                start_byte,
+                end_byte,
+                body_start_byte,
+                body_end_byte,
+                tags,
+            ) = row?;
             let name_lower = name.to_lowercase();
 
             if name_lower == query_lower {
@@ -1376,6 +1479,11 @@ impl IndexDb {
                     file,
                     line,
                     end_line,
+                    node_kind,
+                    start_byte,
+                    end_byte,
+                    body_start_byte,
+                    body_end_byte,
                     tags,
                     score: 1.0,
                     match_type: "exact_name".to_string(),
@@ -1416,6 +1524,11 @@ impl IndexDb {
                     file,
                     line,
                     end_line,
+                    node_kind,
+                    start_byte,
+                    end_byte,
+                    body_start_byte,
+                    body_end_byte,
                     tags,
                     score: f1,
                     match_type: match_type.to_string(),

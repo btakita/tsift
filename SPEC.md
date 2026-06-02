@@ -456,7 +456,7 @@ The JSON and envelope forms (`tsift --envelope source-read src/main.rs --start 4
 
 - a stable `swin-*` window handle for the file/range
 - line-numbered preview rows capped by the response budget
-- `ssym-*` symbol refs for indexed symbols intersecting the window, each with a `symbol-read` expansion command
+- `ssym-*` symbol refs for indexed symbols intersecting the window, each with a `symbol-read` expansion command and optional AST `span` metadata (`span-*` handle, node kind, byte range, body range, parent handle, and child handles)
 - cached `sum-*` summary refs for the file when `.tsift/summaries.db` is present, each with a `summarize` expansion command
 - explicit `before`, `after`, and full-file expansion commands so the next read can expand incrementally instead of falling back to `cat`/large `sed` windows
 
@@ -465,14 +465,14 @@ The command still returns the source preview when index or summary stores are mi
 `tsift symbol-read <symbol>` is the symbol-centered read replacement surface. It resolves the query through the indexed symbols table, optionally scoped by `--file` and `--scope`, then emits:
 
 - a stable `sread-*` handle for the selected symbol
-- the symbol signature/range metadata and a token-budgeted body preview
-- child `ssym-*` refs discovered inside the selected symbol's indexed line range
+- the symbol signature/range metadata, optional AST `span` metadata, and a token-budgeted body preview
+- child `ssym-*` refs discovered inside the selected symbol's AST byte span when available, falling back to indexed lines for older indexes
 - cached summary refs for the owning file when available
 - expansion commands for the selected source window, whole file, `explain`, caller graph, and callee graph
 
 `source-read` symbol refs now expand to `symbol-read`, while `symbol-read` preserves `explain` and graph commands as secondary expansion links. This makes whole-file `Read` fallback unnecessary for the normal search -> source window -> symbol body navigation path.
 
-`tsift edit-intents` is the semantic write-planning and guarded write-executor surface. It accepts JSON `{ "intents": [...] }` batches with normalized intent kinds `rename_symbol`, `replace_function_body`, `insert_import`, `add_method`, `update_call_signature`, `move_declaration`, and `rewrite_call_sites`. The command resolves symbol/file targets against the current index, reports the current content hash and target line range, detects optional `expected_content_hash` conflicts, and emits dry-run plans with bounded diff previews by default. With `--apply`, supported Rust intents (`rename_symbol`, `replace_function_body`, `insert_import`) are composed per file, formatted through `rustfmt --edition 2024` before any source file is swapped, and committed through the same backup/rollback atomic edit path as `tsift edit`. Conflicts, unsupported intent kinds, unsupported languages, and formatter failures fail closed before mutation.
+`tsift edit-intents` is the semantic write-planning and guarded write-executor surface. It accepts JSON `{ "intents": [...] }` batches with normalized intent kinds `rename_symbol`, `replace_function_body`, `insert_import`, `add_method`, `update_call_signature`, `move_declaration`, and `rewrite_call_sites`. The command resolves symbol/file targets against the current index, reports the current content hash, target line range, and target symbol `span` when the index has AST spans, detects optional `expected_content_hash` conflicts, and emits dry-run plans with bounded diff previews by default. With `--apply`, supported Rust intents (`rename_symbol`, `replace_function_body`, `insert_import`) are composed per file, formatted through `rustfmt --edition 2024` before any source file is swapped, and committed through the same backup/rollback atomic edit path as `tsift edit`. Conflicts, unsupported intent kinds, unsupported languages, and formatter failures fail closed before mutation.
 
 ## Handle-Preserving Search Workflow
 

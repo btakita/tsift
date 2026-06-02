@@ -20,8 +20,8 @@ use commands::graph::{
 use commands::index_search::cmd_search;
 use commands::index_search::{cmd_index, cmd_search_with_budget, cmd_search_worker};
 use commands::infra::{
-    cmd_convex_sync, cmd_edit, cmd_graph_db, cmd_init, cmd_locks, cmd_rewrite, cmd_route, cmd_sql,
-    cmd_status, StatusCommandOptions,
+    StatusCommandOptions, cmd_convex_sync, cmd_edit, cmd_graph_db, cmd_init, cmd_locks,
+    cmd_rewrite, cmd_route, cmd_sql, cmd_status,
 };
 use commands::memory::cmd_memory;
 use commands::quality::{cmd_audit, cmd_audit_tagpath, cmd_lint};
@@ -297,6 +297,28 @@ struct SemanticEditIntent {
     expected_content_hash: Option<String>,
 }
 
+#[derive(Serialize, Clone)]
+struct AstSpanPreview {
+    handle: String,
+    node_kind: String,
+    start_byte: usize,
+    end_byte: usize,
+    start_line: usize,
+    end_line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_start_byte: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_end_byte: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_start_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_end_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_handle: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    child_handles: Vec<String>,
+}
+
 #[derive(Serialize)]
 struct SemanticEditIntentPlan {
     handle: String,
@@ -325,6 +347,8 @@ struct SemanticEditSymbolTarget {
     line: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     end_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<AstSpanPreview>,
 }
 
 #[derive(Serialize)]
@@ -1259,7 +1283,12 @@ pub fn run() -> Result<()> {
             },
             ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
         ),
-        Some(Commands::Status { path, fix, no_fix, json }) => cmd_status(
+        Some(Commands::Status {
+            path,
+            fix,
+            no_fix,
+            json,
+        }) => cmd_status(
             &path,
             StatusCommandOptions {
                 fix,
@@ -1439,12 +1468,24 @@ pub(crate) fn print_json_or_envelope<T: Serialize>(
         };
         println!(
             "{}",
-            to_json_schema(&envelope, format.pretty, format.terse, format.ultra_terse, format.schema)?
+            to_json_schema(
+                &envelope,
+                format.pretty,
+                format.terse,
+                format.ultra_terse,
+                format.schema
+            )?
         );
     } else {
         println!(
             "{}",
-            to_json_schema(report, format.pretty, format.terse, format.ultra_terse, format.schema)?
+            to_json_schema(
+                report,
+                format.pretty,
+                format.terse,
+                format.ultra_terse,
+                format.schema
+            )?
         );
     }
     Ok(())
@@ -2298,12 +2339,10 @@ fn terse_transform(val: serde_json::Value) -> serde_json::Value {
 fn ultra_terse_transform(val: serde_json::Value) -> serde_json::Value {
     match val {
         serde_json::Value::Object(mut map) => {
-            let is_graph_node = map.contains_key("id")
-                && map.contains_key("k")
-                && map.contains_key("n");
-            let is_graph_edge = map.contains_key("from_id")
-                && map.contains_key("to_id")
-                && map.contains_key("k");
+            let is_graph_node =
+                map.contains_key("id") && map.contains_key("k") && map.contains_key("n");
+            let is_graph_edge =
+                map.contains_key("from_id") && map.contains_key("to_id") && map.contains_key("k");
             if is_graph_node || is_graph_edge {
                 map.remove("properties");
             }
@@ -4249,43 +4288,57 @@ fn plan_semantic_edit_intent(
     let kind = normalize_semantic_edit_kind(&intent.kind);
     validate_semantic_edit_intent(&kind, intent)?;
 
-    let (target_symbol, file_abs, target_range) = if let Some(symbol) = intent.symbol.as_deref() {
-        let (hit, file_abs) =
-            resolve_semantic_edit_symbol(root, scope, symbol, intent.file.as_deref(), budget)?;
-        let start = symbol_hit_line(&hit);
-        let end = symbol_hit_end_line(&hit).unwrap_or(start).max(start);
-        let file_display = semantic_edit_file_display(root, &file_abs);
-        (
-            Some(SemanticEditSymbolTarget {
-                name: hit.name,
-                kind: hit.kind,
-                language: hit.language,
-                file: file_display,
-                line: start,
-                end_line: Some(end),
-            }),
-            file_abs,
-            Some(SourceRangePreview {
-                start,
-                end,
-                total_lines: 0,
-                truncated_before: false,
-                truncated_after: false,
-            }),
-        )
-    } else {
-        let file = intent
-            .file
-            .as_deref()
-            .context("semantic edit intent requires `file` when `symbol` is omitted")?;
-        (None, resolve_source_file(root, file)?, None)
-    };
+    let mut target_hit = None;
+    let (mut target_symbol, file_abs, mut target_range) =
+        if let Some(symbol) = intent.symbol.as_deref() {
+            let (hit, file_abs) =
+                resolve_semantic_edit_symbol(root, scope, symbol, intent.file.as_deref(), budget)?;
+            let start = symbol_hit_line(&hit);
+            let end = symbol_hit_end_line(&hit).unwrap_or(start).max(start);
+            let file_display = semantic_edit_file_display(root, &file_abs);
+            target_hit = Some(hit.clone());
+            (
+                Some(SemanticEditSymbolTarget {
+                    name: hit.name,
+                    kind: hit.kind,
+                    language: hit.language,
+                    file: file_display,
+                    line: start,
+                    end_line: Some(end),
+                    span: None,
+                }),
+                file_abs,
+                Some(SourceRangePreview {
+                    start,
+                    end,
+                    total_lines: 0,
+                    truncated_before: false,
+                    truncated_after: false,
+                }),
+            )
+        } else {
+            let file = intent
+                .file
+                .as_deref()
+                .context("semantic edit intent requires `file` when `symbol` is omitted")?;
+            (None, resolve_source_file(root, file)?, None)
+        };
 
     let source = fs::read(&file_abs).with_context(|| format!("reading {}", file_abs.display()))?;
     let source_text = String::from_utf8(source.clone());
     let total_lines = String::from_utf8_lossy(&source).lines().count();
+    if let (Some(target_symbol), Some(hit)) = (&mut target_symbol, &target_hit)
+        && let Some(span) = symbol_hit_ast_span(hit, &source)
+    {
+        target_symbol.line = span.start_line;
+        target_symbol.end_line = Some(span.end_line);
+        if let Some(range) = &mut target_range {
+            range.start = span.start_line;
+            range.end = span.end_line;
+        }
+        target_symbol.span = Some(span);
+    }
     let content_hash = semantic_edit_content_hash(&source);
-    let mut target_range = target_range;
     if let Some(range) = &mut target_range {
         range.total_lines = total_lines;
     }
@@ -16321,6 +16374,8 @@ struct SourceSymbolRef {
     end_line: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<AstSpanPreview>,
     expand: String,
 }
 
@@ -16363,6 +16418,8 @@ struct SymbolReadTarget {
     parent_module: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     visibility: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<AstSpanPreview>,
 }
 
 #[derive(Serialize)]
@@ -16472,6 +16529,177 @@ fn source_symbol_end_line(symbol: &index::StoredSymbol) -> Option<usize> {
         .and_then(|line| line.checked_add(1))
 }
 
+fn symbol_span_byte(value: Option<i64>) -> Option<usize> {
+    value.and_then(|byte| usize::try_from(byte).ok())
+}
+
+fn source_line_for_byte(source: &[u8], byte: usize) -> usize {
+    let byte = byte.min(source.len());
+    source[..byte]
+        .iter()
+        .filter(|value| **value == b'\n')
+        .count()
+        .saturating_add(1)
+}
+
+fn source_line_for_end_byte(source: &[u8], end_byte: usize) -> usize {
+    source_line_for_byte(source, end_byte.saturating_sub(1))
+}
+
+fn ast_span_handle(
+    file: &str,
+    name: &str,
+    kind: &str,
+    start_byte: usize,
+    end_byte: usize,
+) -> String {
+    stable_handle(
+        "span",
+        &format!("{file}:{kind}:{name}:{start_byte}:{end_byte}"),
+    )
+}
+
+fn stored_symbol_span_bounds(symbol: &index::StoredSymbol) -> Option<(usize, usize)> {
+    Some((
+        symbol_span_byte(symbol.start_byte)?,
+        symbol_span_byte(symbol.end_byte)?,
+    ))
+}
+
+fn symbol_hit_span_bounds(symbol: &index::SymbolHit) -> Option<(usize, usize)> {
+    Some((
+        symbol_span_byte(symbol.start_byte)?,
+        symbol_span_byte(symbol.end_byte)?,
+    ))
+}
+
+fn stored_symbol_span_handle(symbol: &index::StoredSymbol) -> Option<String> {
+    let (start_byte, end_byte) = stored_symbol_span_bounds(symbol)?;
+    Some(ast_span_handle(
+        &symbol.file,
+        &symbol.name,
+        &symbol.kind,
+        start_byte,
+        end_byte,
+    ))
+}
+
+fn same_stored_symbol_span(left: &index::StoredSymbol, right: &index::StoredSymbol) -> bool {
+    left.file == right.file
+        && left.name == right.name
+        && left.kind == right.kind
+        && stored_symbol_span_bounds(left) == stored_symbol_span_bounds(right)
+}
+
+fn stored_symbol_parent_span_handle(
+    symbol: &index::StoredSymbol,
+    symbols: &[index::StoredSymbol],
+) -> Option<String> {
+    let (start_byte, end_byte) = stored_symbol_span_bounds(symbol)?;
+    symbols
+        .iter()
+        .filter(|candidate| {
+            if candidate.file != symbol.file || same_stored_symbol_span(candidate, symbol) {
+                return false;
+            }
+            let Some((candidate_start, candidate_end)) = stored_symbol_span_bounds(candidate)
+            else {
+                return false;
+            };
+            candidate_start <= start_byte && candidate_end >= end_byte
+        })
+        .min_by_key(|candidate| {
+            stored_symbol_span_bounds(candidate)
+                .map(|(start, end)| end.saturating_sub(start))
+                .unwrap_or(usize::MAX)
+        })
+        .and_then(stored_symbol_span_handle)
+}
+
+fn stored_symbol_child_span_handles(
+    symbol: &index::StoredSymbol,
+    symbols: &[index::StoredSymbol],
+    limit: usize,
+) -> Vec<String> {
+    let Some((start_byte, end_byte)) = stored_symbol_span_bounds(symbol) else {
+        return Vec::new();
+    };
+    symbols
+        .iter()
+        .filter(|candidate| {
+            if candidate.file != symbol.file || same_stored_symbol_span(candidate, symbol) {
+                return false;
+            }
+            let Some((candidate_start, candidate_end)) = stored_symbol_span_bounds(candidate)
+            else {
+                return false;
+            };
+            candidate_start >= start_byte && candidate_end <= end_byte
+        })
+        .take(limit)
+        .filter_map(stored_symbol_span_handle)
+        .collect()
+}
+
+fn stored_symbol_ast_span(
+    symbol: &index::StoredSymbol,
+    source: &[u8],
+    symbols: &[index::StoredSymbol],
+    child_limit: usize,
+) -> Option<AstSpanPreview> {
+    let (start_byte, end_byte) = stored_symbol_span_bounds(symbol)?;
+    let node_kind = symbol.node_kind.clone()?;
+    let body_start_byte = symbol_span_byte(symbol.body_start_byte);
+    let body_end_byte = symbol_span_byte(symbol.body_end_byte);
+    Some(AstSpanPreview {
+        handle: ast_span_handle(
+            &symbol.file,
+            &symbol.name,
+            &symbol.kind,
+            start_byte,
+            end_byte,
+        ),
+        node_kind,
+        start_byte,
+        end_byte,
+        start_line: source_line_for_byte(source, start_byte),
+        end_line: source_line_for_end_byte(source, end_byte),
+        body_start_byte,
+        body_end_byte,
+        body_start_line: body_start_byte.map(|byte| source_line_for_byte(source, byte)),
+        body_end_line: body_end_byte.map(|byte| source_line_for_end_byte(source, byte)),
+        parent_handle: stored_symbol_parent_span_handle(symbol, symbols),
+        child_handles: stored_symbol_child_span_handles(symbol, symbols, child_limit),
+    })
+}
+
+fn symbol_hit_ast_span(symbol: &index::SymbolHit, source: &[u8]) -> Option<AstSpanPreview> {
+    let (start_byte, end_byte) = symbol_hit_span_bounds(symbol)?;
+    let node_kind = symbol.node_kind.clone()?;
+    let body_start_byte = symbol_span_byte(symbol.body_start_byte);
+    let body_end_byte = symbol_span_byte(symbol.body_end_byte);
+    Some(AstSpanPreview {
+        handle: ast_span_handle(
+            &symbol.file,
+            &symbol.name,
+            &symbol.kind,
+            start_byte,
+            end_byte,
+        ),
+        node_kind,
+        start_byte,
+        end_byte,
+        start_line: source_line_for_byte(source, start_byte),
+        end_line: source_line_for_end_byte(source, end_byte),
+        body_start_byte,
+        body_end_byte,
+        body_start_line: body_start_byte.map(|byte| source_line_for_byte(source, byte)),
+        body_end_line: body_end_byte.map(|byte| source_line_for_end_byte(source, byte)),
+        parent_handle: None,
+        child_handles: Vec::new(),
+    })
+}
+
 fn symbol_hit_line(symbol: &index::SymbolHit) -> usize {
     usize::try_from(symbol.line)
         .ok()
@@ -16500,6 +16728,7 @@ fn load_source_symbols(
     root: &Path,
     file_abs: &Path,
     file_display: &str,
+    source: &[u8],
     scope: Option<&str>,
     start: usize,
     end: usize,
@@ -16540,12 +16769,12 @@ fn load_source_symbols(
     };
 
     symbols
-        .into_iter()
+        .iter()
         .filter(|symbol| source_symbol_intersects(symbol, start, end))
         .take(limit)
         .map(|symbol| {
-            let line = source_symbol_line(&symbol);
-            let end_line = source_symbol_end_line(&symbol);
+            let line = source_symbol_line(symbol);
+            let end_line = source_symbol_end_line(symbol);
             let handle = stable_handle(
                 "ssym",
                 &format!("{}:{}:{}", file_display, symbol.name, line),
@@ -16553,14 +16782,16 @@ fn load_source_symbols(
             SourceSymbolRef {
                 handle,
                 name: truncate_for_budget(&symbol.name, max_bytes),
-                kind: symbol.kind,
-                language: symbol.language,
+                kind: symbol.kind.clone(),
+                language: symbol.language.clone(),
                 file: file_display.to_string(),
                 line,
                 end_line,
                 signature: symbol
                     .signature
+                    .clone()
                     .map(|signature| truncate_for_budget(&signature, max_bytes)),
+                span: stored_symbol_ast_span(symbol, source, &symbols, limit),
                 expand: source_symbol_read_command(root, &symbol.name, file_display),
             }
         })
@@ -16680,6 +16911,7 @@ fn cmd_source_read(
         &root,
         &file_abs,
         &file_display,
+        &source,
         scope,
         start,
         end_line,
@@ -16881,13 +17113,33 @@ fn cmd_symbol_read(
     let file_symbols = db
         .symbols_for_file(&file_abs.to_string_lossy())
         .with_context(|| format!("loading symbols for {}", file_abs.display()))?;
-    let target_start = symbol_hit_line(&selected);
-    let target_end = symbol_hit_end_line(&selected).unwrap_or(target_start);
+    let max_items = budget.preview_items();
+    let max_bytes = budget.preview_bytes();
+    let selected_start = symbol_hit_line(&selected);
+    let selected_end = symbol_hit_end_line(&selected)
+        .unwrap_or(selected_start)
+        .max(selected_start);
     let stored_target = file_symbols.iter().find(|candidate| {
         candidate.name == selected.name
             && candidate.kind == selected.kind
-            && source_symbol_line(candidate) == target_start
+            && source_symbol_line(candidate) == selected_start
     });
+    let target_span = stored_target
+        .and_then(|stored| stored_symbol_ast_span(stored, &source, &file_symbols, max_items))
+        .or_else(|| symbol_hit_ast_span(&selected, &source));
+    let target_start = target_span
+        .as_ref()
+        .map(|span| span.start_line)
+        .unwrap_or(selected_start);
+    let target_end = target_span
+        .as_ref()
+        .map(|span| span.end_line)
+        .or_else(|| stored_target.and_then(source_symbol_end_line))
+        .unwrap_or(selected_end)
+        .max(target_start);
+    let target_bounds = stored_target
+        .and_then(stored_symbol_span_bounds)
+        .or_else(|| symbol_hit_span_bounds(&selected));
     let target_end = stored_target
         .and_then(source_symbol_end_line)
         .unwrap_or(target_end)
@@ -16910,11 +17162,18 @@ fn cmd_symbol_read(
             })
             .collect()
     };
-    let max_items = budget.preview_items();
-    let max_bytes = budget.preview_bytes();
     let child_symbols = file_symbols
         .iter()
         .filter(|candidate| {
+            if let Some((target_start_byte, target_end_byte)) = target_bounds {
+                let Some((candidate_start, candidate_end)) = stored_symbol_span_bounds(candidate)
+                else {
+                    return false;
+                };
+                return candidate_start >= target_start_byte
+                    && candidate_end <= target_end_byte
+                    && (candidate_start, candidate_end) != (target_start_byte, target_end_byte);
+            }
             let line = source_symbol_line(candidate);
             line > target_start && line <= target_end
         })
@@ -16937,6 +17196,7 @@ fn cmd_symbol_read(
                     .signature
                     .clone()
                     .map(|signature| truncate_for_budget(&signature, max_bytes)),
+                span: stored_symbol_ast_span(symbol, &source, &file_symbols, max_items),
                 expand: source_symbol_read_command(&root, &symbol.name, &file_display),
             }
         })
@@ -16976,6 +17236,7 @@ fn cmd_symbol_read(
                 .map(|signature| truncate_for_budget(&signature, max_bytes)),
             parent_module: stored_target.and_then(|stored| stored.parent_module.clone()),
             visibility: stored_target.and_then(|stored| stored.visibility.clone()),
+            span: target_span,
         },
         range: SourceRangePreview {
             start: target_start,
@@ -17490,7 +17751,13 @@ fn cmd_impact(
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
+            to_json_schema(
+                &report,
+                format.pretty,
+                format.terse,
+                format.ultra_terse,
+                format.schema
+            )?
         );
         return Ok(());
     }
@@ -17555,7 +17822,13 @@ pub(crate) fn render_test_digest_from_input(
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
+            to_json_schema(
+                &report,
+                format.pretty,
+                format.terse,
+                format.ultra_terse,
+                format.schema
+            )?
         );
         return Ok(());
     }
@@ -21616,7 +21889,13 @@ pub(crate) fn render_log_digest_from_input(
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
+            to_json_schema(
+                &report,
+                format.pretty,
+                format.terse,
+                format.ultra_terse,
+                format.schema
+            )?
         );
         return Ok(());
     }
@@ -21809,7 +22088,13 @@ fn cmd_dci_benchmark(fixture_path: &Path, format: OutputFormat) -> Result<()> {
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
+            to_json_schema(
+                &report,
+                format.pretty,
+                format.terse,
+                format.ultra_terse,
+                format.schema
+            )?
         );
         return Ok(());
     }
@@ -32833,6 +33118,11 @@ tier = "private"
             file: "/repo/src/lib.rs".to_string(),
             line: 12,
             end_line: None,
+            node_kind: None,
+            start_byte: None,
+            end_byte: None,
+            body_start_byte: None,
+            body_end_byte: None,
             tags: None,
             score: 0.98,
             match_type: "exact_name".to_string(),
@@ -32868,6 +33158,11 @@ tier = "private"
                 file: "/repo/src/lib.rs".to_string(),
                 line: 12,
                 end_line: None,
+                node_kind: None,
+                start_byte: None,
+                end_byte: None,
+                body_start_byte: None,
+                body_end_byte: None,
                 tags: Some("alpha,helper".to_string()),
                 score: 0.98,
                 match_type: "exact_name".to_string(),
@@ -32880,6 +33175,11 @@ tier = "private"
                 file: "/repo/src/main.rs".to_string(),
                 line: 34,
                 end_line: None,
+                node_kind: None,
+                start_byte: None,
+                end_byte: None,
+                body_start_byte: None,
+                body_end_byte: None,
                 tags: Some("alpha,helper".to_string()),
                 score: 0.93,
                 match_type: "tag_overlap".to_string(),
@@ -32892,6 +33192,11 @@ tier = "private"
                 file: "/repo/src/worker.rs".to_string(),
                 line: 56,
                 end_line: None,
+                node_kind: None,
+                start_byte: None,
+                end_byte: None,
+                body_start_byte: None,
+                body_end_byte: None,
                 tags: Some("alpha,helper".to_string()),
                 score: 0.91,
                 match_type: "tag_overlap".to_string(),
@@ -32938,6 +33243,11 @@ tier = "private"
                 file: "/repo/src/lib.rs".to_string(),
                 line: 12,
                 end_line: None,
+                node_kind: None,
+                start_byte: None,
+                end_byte: None,
+                body_start_byte: None,
+                body_end_byte: None,
                 tags: Some("alpha,helper".to_string()),
                 score: 0.98,
                 match_type: "exact_name".to_string(),
@@ -32950,6 +33260,11 @@ tier = "private"
                 file: "/repo/src/beta.rs".to_string(),
                 line: 21,
                 end_line: None,
+                node_kind: None,
+                start_byte: None,
+                end_byte: None,
+                body_start_byte: None,
+                body_end_byte: None,
                 tags: Some("beta,helper".to_string()),
                 score: 0.92,
                 match_type: "tag_overlap".to_string(),
@@ -33005,6 +33320,11 @@ tier = "private"
             file: "src/lib.rs".to_string(),
             line: 10,
             end_line: None,
+            node_kind: None,
+            start_byte: None,
+            end_byte: None,
+            body_start_byte: None,
+            body_end_byte: None,
             parent_module: None,
             visibility: None,
             tags: None,

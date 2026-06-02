@@ -803,8 +803,7 @@ impl LouvainGraph {
                 let ki = self.degree[i];
 
                 let ki_in_cur = ki_in[i].get(&cur_c).copied().unwrap_or(0.0);
-                let cur_gain =
-                    ki_in_cur / m - ki * (comm_degree[cur_c] - ki) / (2.0 * m * m);
+                let cur_gain = ki_in_cur / m - ki * (comm_degree[cur_c] - ki) / (2.0 * m * m);
 
                 let mut best_delta = 0.0f64;
                 let mut best_c = cur_c;
@@ -825,10 +824,7 @@ impl LouvainGraph {
                     comm_degree[cur_c] -= ki;
                     comm_degree[best_c] += ki;
                     for (&nb, &w) in &self.adj[i] {
-                        ki_in[nb]
-                            .entry(cur_c)
-                            .and_modify(|v| *v -= w)
-                            .or_insert(-w);
+                        ki_in[nb].entry(cur_c).and_modify(|v| *v -= w).or_insert(-w);
                         *ki_in[nb].entry(best_c).or_insert(0.0) += w;
                     }
                     community[i] = best_c;
@@ -1284,22 +1280,24 @@ function createUser() {}
     }
 
     #[cfg(feature = "lang-rust")]
+    fn test_symbol(name: &str, line: usize, end_line: usize) -> Symbol {
+        Symbol {
+            name: name.into(),
+            kind: "function".into(),
+            line,
+            end_line,
+            node_kind: "function_item".into(),
+            start_byte: line,
+            end_byte: end_line,
+            body_start_byte: None,
+            body_end_byte: None,
+        }
+    }
+
+    #[cfg(feature = "lang-rust")]
     #[test]
     fn resolve_edges_basic() {
-        let symbols = vec![
-            Symbol {
-                name: "main".into(),
-                kind: "function".into(),
-                line: 1,
-                end_line: 3,
-            },
-            Symbol {
-                name: "helper".into(),
-                kind: "function".into(),
-                line: 5,
-                end_line: 7,
-            },
-        ];
+        let symbols = vec![test_symbol("main", 1, 3), test_symbol("helper", 5, 7)];
         let sites = vec![
             CallSite {
                 callee: "helper".into(),
@@ -1321,20 +1319,7 @@ function createUser() {}
     #[cfg(feature = "lang-rust")]
     #[test]
     fn resolve_edges_nested_picks_innermost() {
-        let symbols = vec![
-            Symbol {
-                name: "outer".into(),
-                kind: "function".into(),
-                line: 0,
-                end_line: 10,
-            },
-            Symbol {
-                name: "inner".into(),
-                kind: "function".into(),
-                line: 2,
-                end_line: 5,
-            },
-        ];
+        let symbols = vec![test_symbol("outer", 0, 10), test_symbol("inner", 2, 5)];
         let sites = vec![CallSite {
             callee: "foo".into(),
             line: 3,
@@ -1347,12 +1332,7 @@ function createUser() {}
     #[cfg(feature = "lang-rust")]
     #[test]
     fn resolve_edges_top_level_call_excluded() {
-        let symbols = vec![Symbol {
-            name: "main".into(),
-            kind: "function".into(),
-            line: 5,
-            end_line: 10,
-        }];
+        let symbols = vec![test_symbol("main", 5, 10)];
         let sites = vec![CallSite {
             callee: "foo".into(),
             line: 2,
@@ -1365,12 +1345,7 @@ function createUser() {}
     fn resolve_edges_cache_reuses_slots_until_mtime_or_hash_changes() {
         let cache = ResolveEdgesCache::new();
         let file = std::path::Path::new("src/lib.rs");
-        let symbols = vec![Symbol {
-            name: "main".into(),
-            kind: "function".into(),
-            line: 1,
-            end_line: 3,
-        }];
+        let symbols = vec![test_symbol("main", 1, 3)];
         let sites = vec![CallSite {
             callee: "helper".into(),
             line: 2,
@@ -1579,7 +1554,10 @@ function createUser() {}
             let base = cluster * 6;
             for i in 0..6 {
                 for j in (i + 1)..6 {
-                    edges.push((format!("c{}n{}", cluster, base + i), format!("c{}n{}", cluster, base + j)));
+                    edges.push((
+                        format!("c{}n{}", cluster, base + i),
+                        format!("c{}n{}", cluster, base + j),
+                    ));
                 }
             }
         }
