@@ -3067,7 +3067,7 @@ fn edit_intents_json_validates_semantic_write_plan_without_mutating() {
 fn edit_intents_markdown_contract_recognizes_heading_intent_without_mutating() {
     let dir = markdown_edit_fixture();
     let before = fs::read_to_string(dir.path().join("README.md")).unwrap();
-    let input = r#"{
+    let input = r###"{
         "intents": [
             {
                 "kind": "rename_heading",
@@ -3076,7 +3076,7 @@ fn edit_intents_markdown_contract_recognizes_heading_intent_without_mutating() {
                 "new_name": "Manual"
             }
         ]
-    }"#;
+    }"###;
 
     let mut child = tsift_bin()
         .args([
@@ -3118,13 +3118,13 @@ fn edit_intents_markdown_contract_recognizes_heading_intent_without_mutating() {
     assert_eq!(json["view"], "dry-run");
     assert_eq!(json["report"]["mode"], "dry_run");
     assert_eq!(json["report"]["intents_total"], 1);
-    assert_eq!(json["report"]["planned_total"], 0);
-    assert_eq!(json["report"]["unsupported_total"], 1);
+    assert_eq!(json["report"]["planned_total"], 1);
+    assert_eq!(json["report"]["unsupported_total"], 0);
 
     let plan = &json["report"]["plans"][0];
     assert_eq!(plan["kind"], "rename_heading");
-    assert_eq!(plan["status"], "unsupported");
-    assert_eq!(plan["apply_supported"], false);
+    assert_eq!(plan["status"], "planned");
+    assert_eq!(plan["apply_supported"], true);
     assert_eq!(plan["applied"], false);
     assert_eq!(plan["target_file"], "README.md");
     assert_eq!(plan["target_symbol"]["name"], "Guide");
@@ -3145,22 +3145,110 @@ fn edit_intents_markdown_contract_recognizes_heading_intent_without_mutating() {
     );
     assert_eq!(plan["target_range"]["start"], 1);
     assert_eq!(plan["target_range"]["end"], 20);
+    assert!(plan["diff"].as_str().unwrap().contains("# Manual"));
     assert!(
         plan["message"]
             .as_str()
             .unwrap()
-            .contains("Markdown semantic edit kind")
+            .contains("validated rename_heading")
     );
 }
 
 #[test]
-fn edit_intents_markdown_apply_refuses_without_mutating() {
+fn edit_intents_apply_mutates_markdown_section_intents() {
     let dir = markdown_edit_fixture();
-    let before = fs::read_to_string(dir.path().join("README.md")).unwrap();
-    let input = "{\n  \"intents\": [\n    {\n      \"kind\": \"insert_section\",\n      \"file\": \"README.md\",\n      \"replacement\": \"## Usage\\n\\nRun the command.\\n\"\n    }\n  ]\n}";
+    let input = r###"{
+        "intents": [
+            {
+                "kind": "rename_heading",
+                "symbol": "Guide",
+                "file": "README.md",
+                "new_name": "Manual"
+            },
+            {
+                "kind": "move_section",
+                "symbol": "Troubleshooting",
+                "file": "README.md",
+                "destination_symbol": "Reference",
+                "position": "after"
+            },
+            {
+                "kind": "replace_section_body",
+                "symbol": "Install",
+                "file": "README.md",
+                "replacement": "Install with cargo.\n"
+            },
+            {
+                "kind": "insert_section",
+                "symbol": "Reference",
+                "file": "README.md",
+                "position": "after",
+                "replacement": "## Appendix\n\nExtra.\n"
+            }
+        ]
+    }"###;
 
     let mut child = tsift_bin()
         .args([
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--apply",
+            "--budget",
+            "normal",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "markdown apply stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "edit-intents");
+    assert_eq!(json["report"]["mode"], "apply");
+    assert_eq!(json["report"]["planned_total"], 4);
+    assert_eq!(json["report"]["applied_total"], 4);
+    assert_eq!(json["report"]["unsupported_total"], 0);
+    assert_eq!(json["report"]["formatted_total"], 0);
+    for plan in json["report"]["plans"].as_array().unwrap() {
+        assert_eq!(plan["status"], "applied");
+        assert_eq!(plan["apply_supported"], true);
+        assert_eq!(plan["applied"], true);
+    }
+
+    let after = fs::read_to_string(dir.path().join("README.md")).unwrap();
+    assert!(after.starts_with("# Manual\n\nIntro text."));
+    assert!(after.contains("## Install\n\nInstall with cargo.\n\n## Reference"));
+    assert!(after.contains("## Reference\n\nDone.\n\n### Troubleshooting\n\nCheck logs."));
+    assert!(after.contains("## Appendix\n\nExtra."));
+}
+
+#[test]
+fn edit_intents_markdown_block_apply_refuses_without_mutating() {
+    let dir = markdown_edit_fixture();
+    let before = fs::read_to_string(dir.path().join("README.md")).unwrap();
+    let input = "{\n  \"intents\": [\n    {\n      \"kind\": \"insert_list_item\",\n      \"file\": \"README.md\",\n      \"replacement\": \"- Added\\n\"\n    }\n  ]\n}";
+
+    let mut child = tsift_bin()
+        .args([
+            "--envelope",
             "edit-intents",
             "--path",
             dir.path().to_str().unwrap(),

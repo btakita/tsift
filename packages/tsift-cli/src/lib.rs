@@ -291,6 +291,10 @@ struct SemanticEditIntent {
     #[serde(default)]
     file: Option<PathBuf>,
     #[serde(default)]
+    destination_symbol: Option<String>,
+    #[serde(default)]
+    position: Option<String>,
+    #[serde(default)]
     replacement: Option<String>,
     #[serde(default)]
     call_replacement: Option<String>,
@@ -521,7 +525,12 @@ const SEMANTIC_EDIT_MARKDOWN_KINDS: &[&str] = &[
     "insert_list_item",
     "rewrite_code_fence",
 ];
-const SEMANTIC_EDIT_MARKDOWN_APPLY_KINDS: &[&str] = &[];
+const SEMANTIC_EDIT_MARKDOWN_APPLY_KINDS: &[&str] = &[
+    "rename_heading",
+    "replace_section_body",
+    "insert_section",
+    "move_section",
+];
 const SEMANTIC_EDIT_KINDS: &[&str] = &[
     "rename_symbol",
     "replace_function_body",
@@ -3977,6 +3986,10 @@ fn semantic_edit_kind_requires_new_name(kind: &str) -> bool {
     matches!(kind, "rename_symbol" | "rename_heading")
 }
 
+fn semantic_edit_kind_requires_destination_symbol(kind: &str) -> bool {
+    matches!(kind, "move_section")
+}
+
 fn semantic_edit_kind_requires_file(kind: &str) -> bool {
     matches!(
         kind,
@@ -4013,6 +4026,22 @@ fn validate_semantic_edit_intent(kind: &str, intent: &SemanticEditIntent) -> Res
         && intent.new_name.as_deref().is_none_or(str::is_empty)
     {
         bail!("semantic edit kind {kind:?} requires `new_name`");
+    }
+    if semantic_edit_kind_requires_destination_symbol(kind)
+        && intent
+            .destination_symbol
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        bail!("semantic edit kind {kind:?} requires `destination_symbol`");
+    }
+    if let Some(position) = intent.position.as_deref() {
+        if !matches!(position, "before" | "after") {
+            bail!("semantic edit `position` must be either \"before\" or \"after\"");
+        }
+        if !matches!(kind, "insert_section" | "move_section") {
+            bail!("semantic edit kind {kind:?} does not support `position`");
+        }
     }
     Ok(())
 }
@@ -4478,8 +4507,13 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
         "typescript",
         Path::new("tool.ts")
     ));
-    assert!(!semantic_edit_kind_apply_supported(
+    assert!(semantic_edit_kind_apply_supported(
         "rename_heading",
+        "markdown",
+        Path::new("README.md")
+    ));
+    assert!(!semantic_edit_kind_apply_supported(
+        "insert_list_item",
         "markdown",
         Path::new("README.md")
     ));
@@ -5587,6 +5621,331 @@ fn target_symbol_name<'a>(
         .with_context(|| format!("semantic edit kind {kind:?} requires a resolved target symbol"))
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MarkdownSectionPosition {
+    Before,
+    After,
+}
+
+#[derive(Clone)]
+struct MarkdownSectionEditSpan {
+    name: String,
+    level: usize,
+    start_byte: usize,
+    end_byte: usize,
+    body_start_byte: usize,
+    body_end_byte: usize,
+}
+
+fn markdown_section_position(intent: &SemanticEditIntent) -> Result<MarkdownSectionPosition> {
+    match intent.position.as_deref().unwrap_or("after").trim() {
+        "before" => Ok(MarkdownSectionPosition::Before),
+        "after" => Ok(MarkdownSectionPosition::After),
+        value => {
+            bail!("Markdown section position {value:?} is unsupported; expected before or after")
+        }
+    }
+}
+
+fn markdown_line_end(content: &str, start: usize) -> usize {
+    let start = start.min(content.len());
+    content.as_bytes()[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|offset| start + offset)
+        .unwrap_or(content.len())
+}
+
+fn markdown_heading_line_level(line: &str) -> Option<usize> {
+    let marker = line.trim_start();
+    let level = marker.chars().take_while(|ch| *ch == '#').count();
+    (1..=6).contains(&level).then_some(level)
+}
+
+fn markdown_section_spans(content: &str) -> Result<Vec<MarkdownSectionEditSpan>> {
+    parse_semantic_edit_source(
+        content,
+        SemanticEditExecutorLanguage::Markdown,
+        "markdown edit input",
+    )?;
+    let mut sections = graph::Lang::Markdown
+        .extract_symbols(content.as_bytes())
+        .context("extracting Markdown heading spans")?
+        .into_iter()
+        .filter(|symbol| symbol.kind == "heading")
+        .map(|symbol| {
+            let line_end = markdown_line_end(content, symbol.start_byte);
+            let heading_line = content
+                .get(symbol.start_byte..line_end)
+                .context("indexed Markdown heading span is not on a UTF-8 boundary")?;
+            let level = markdown_heading_line_level(heading_line)
+                .context("indexed Markdown heading did not have an ATX marker")?;
+            Ok(MarkdownSectionEditSpan {
+                name: symbol.name,
+                level,
+                start_byte: symbol.start_byte,
+                end_byte: symbol.end_byte,
+                body_start_byte: symbol.body_start_byte.unwrap_or(symbol.end_byte),
+                body_end_byte: symbol.body_end_byte.unwrap_or(symbol.end_byte),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    sections.sort_by(|left, right| {
+        left.start_byte
+            .cmp(&right.start_byte)
+            .then(left.level.cmp(&right.level))
+            .then(left.name.cmp(&right.name))
+    });
+    Ok(sections)
+}
+
+fn markdown_unique_section(content: &str, name: &str) -> Result<MarkdownSectionEditSpan> {
+    let matches = markdown_section_spans(content)?
+        .into_iter()
+        .filter(|section| section.name == name)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [section] => Ok(section.clone()),
+        [] => bail!("Markdown heading {name:?} was not found"),
+        _ => bail!("Markdown heading {name:?} is ambiguous; supply a unique heading"),
+    }
+}
+
+fn markdown_target_heading_name<'a>(
+    target_symbol: Option<&'a SemanticEditSymbolTarget>,
+    kind: &str,
+) -> Result<&'a str> {
+    let target = target_symbol.with_context(|| {
+        format!("semantic edit kind {kind:?} requires a target Markdown heading")
+    })?;
+    if target.language != "markdown" || target.kind != "heading" {
+        bail!("semantic edit kind {kind:?} requires a Markdown heading target");
+    }
+    Ok(&target.name)
+}
+
+fn markdown_normalize_heading_name(name: &str, field: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        bail!("{field} must not be empty");
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        bail!("{field} must be a single Markdown heading line");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn markdown_normalize_block(replacement: &str, field: &str) -> Result<String> {
+    let trimmed = replacement.trim_matches('\n');
+    if trimmed.trim().is_empty() {
+        bail!("{field} must not be empty");
+    }
+    let mut block = trimmed.to_string();
+    if !block.ends_with('\n') {
+        block.push('\n');
+    }
+    Ok(block)
+}
+
+fn markdown_normalize_section_block(replacement: &str) -> Result<String> {
+    let block = markdown_normalize_block(replacement, "insert_section replacement")?;
+    let first = block
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .context("insert_section replacement must contain a Markdown heading")?;
+    if markdown_heading_line_level(first).is_none() {
+        bail!("insert_section replacement must start with an ATX heading");
+    }
+    parse_semantic_edit_source(
+        &block,
+        SemanticEditExecutorLanguage::Markdown,
+        "insert_section replacement",
+    )?;
+    Ok(block)
+}
+
+fn markdown_join_section_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut out = String::new();
+    for part in parts {
+        let trimmed = part.trim_matches('\n');
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(trimmed);
+    }
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn markdown_insert_section_at(content: &str, offset: usize, section: &str) -> String {
+    let offset = offset.min(content.len());
+    markdown_join_section_parts([&content[..offset], section, &content[offset..]])
+}
+
+fn markdown_replace_heading(
+    content: &str,
+    section: &MarkdownSectionEditSpan,
+    new_name: &str,
+) -> Result<String> {
+    let new_name = markdown_normalize_heading_name(new_name, "new_name")?;
+    let line_end = markdown_line_end(content, section.start_byte);
+    let heading_line = content
+        .get(section.start_byte..line_end)
+        .context("Markdown heading span is not on a UTF-8 boundary")?;
+    let marker_start = heading_line
+        .find('#')
+        .context("Markdown heading line did not contain an ATX marker")?;
+    let prefix = &heading_line[..marker_start];
+    let replacement = format!("{prefix}{} {new_name}", "#".repeat(section.level));
+    let mut out = String::with_capacity(content.len() + replacement.len());
+    out.push_str(&content[..section.start_byte]);
+    out.push_str(&replacement);
+    out.push_str(&content[line_end..]);
+    parse_semantic_edit_source(
+        &out,
+        SemanticEditExecutorLanguage::Markdown,
+        "rename_heading",
+    )?;
+    Ok(out)
+}
+
+fn markdown_replace_section_body(
+    content: &str,
+    section: &MarkdownSectionEditSpan,
+    replacement: &str,
+) -> Result<String> {
+    let body = markdown_normalize_block(replacement, "replace_section_body replacement")?;
+    let out = markdown_join_section_parts([
+        &content[..section.body_start_byte],
+        &body,
+        &content[section.body_end_byte..],
+    ]);
+    parse_semantic_edit_source(
+        &out,
+        SemanticEditExecutorLanguage::Markdown,
+        "replace_section_body",
+    )?;
+    Ok(out)
+}
+
+fn markdown_insert_section(
+    content: &str,
+    target_symbol: Option<&SemanticEditSymbolTarget>,
+    intent: &SemanticEditIntent,
+) -> Result<String> {
+    let block = markdown_normalize_section_block(
+        intent
+            .replacement
+            .as_deref()
+            .context("insert_section requires replacement")?,
+    )?;
+    let offset = if let Some(target_symbol) = target_symbol {
+        let target_name = markdown_target_heading_name(Some(target_symbol), "insert_section")?;
+        let target = markdown_unique_section(content, target_name)?;
+        match markdown_section_position(intent)? {
+            MarkdownSectionPosition::Before => target.start_byte,
+            MarkdownSectionPosition::After => target.end_byte,
+        }
+    } else {
+        content.len()
+    };
+    let out = markdown_insert_section_at(content, offset, &block);
+    parse_semantic_edit_source(
+        &out,
+        SemanticEditExecutorLanguage::Markdown,
+        "insert_section",
+    )?;
+    Ok(out)
+}
+
+fn markdown_move_section(
+    content: &str,
+    target_symbol: Option<&SemanticEditSymbolTarget>,
+    intent: &SemanticEditIntent,
+) -> Result<String> {
+    let target_name = markdown_target_heading_name(target_symbol, "move_section")?;
+    let destination_name = intent
+        .destination_symbol
+        .as_deref()
+        .context("move_section requires destination_symbol")?;
+    let target = markdown_unique_section(content, target_name)?;
+    let destination = markdown_unique_section(content, destination_name)?;
+    if target.start_byte == destination.start_byte {
+        bail!("move_section destination must differ from the target section");
+    }
+    if destination.start_byte >= target.start_byte && destination.start_byte < target.end_byte {
+        bail!("move_section destination cannot be inside the target section");
+    }
+
+    let moved = content
+        .get(target.start_byte..target.end_byte)
+        .context("Markdown section span is not on a UTF-8 boundary")?
+        .to_string();
+    let insert_at = match markdown_section_position(intent)? {
+        MarkdownSectionPosition::Before => destination.start_byte,
+        MarkdownSectionPosition::After => destination.end_byte,
+    };
+    let mut without = String::with_capacity(content.len() - (target.end_byte - target.start_byte));
+    without.push_str(&content[..target.start_byte]);
+    without.push_str(&content[target.end_byte..]);
+    let adjusted_insert_at = if insert_at > target.end_byte {
+        insert_at - (target.end_byte - target.start_byte)
+    } else {
+        insert_at
+    };
+    let out = markdown_insert_section_at(&without, adjusted_insert_at, &moved);
+    parse_semantic_edit_source(&out, SemanticEditExecutorLanguage::Markdown, "move_section")?;
+    Ok(out)
+}
+
+fn preview_markdown_edit_content(
+    content: &str,
+    kind: &str,
+    intent: &SemanticEditIntent,
+    target_symbol: Option<&SemanticEditSymbolTarget>,
+) -> Result<(String, usize)> {
+    match kind {
+        "rename_heading" => {
+            let target_name = markdown_target_heading_name(target_symbol, kind)?;
+            let target = markdown_unique_section(content, target_name)?;
+            Ok((
+                markdown_replace_heading(
+                    content,
+                    &target,
+                    intent
+                        .new_name
+                        .as_deref()
+                        .context("rename_heading requires new_name")?,
+                )?,
+                1,
+            ))
+        }
+        "replace_section_body" => {
+            let target_name = markdown_target_heading_name(target_symbol, kind)?;
+            let target = markdown_unique_section(content, target_name)?;
+            Ok((
+                markdown_replace_section_body(
+                    content,
+                    &target,
+                    intent
+                        .replacement
+                        .as_deref()
+                        .context("replace_section_body requires replacement")?,
+                )?,
+                1,
+            ))
+        }
+        "insert_section" => Ok((markdown_insert_section(content, target_symbol, intent)?, 1)),
+        "move_section" => Ok((markdown_move_section(content, target_symbol, intent)?, 1)),
+        _ => bail!("semantic edit kind {kind:?} is not supported by the Markdown executor yet"),
+    }
+}
+
 fn preview_semantic_edit_content(
     content: &str,
     file_abs: &Path,
@@ -5600,9 +5959,7 @@ fn preview_semantic_edit_content(
         bail!("no executor registered for language {language:?}");
     };
     if executor.is_markdown() {
-        bail!(
-            "Markdown semantic edit kind {kind:?} is recognized by the language contract, but the Markdown executor is not implemented yet"
-        );
+        return preview_markdown_edit_content(content, kind, intent, target_symbol);
     }
     if executor.is_script() {
         return match kind {
