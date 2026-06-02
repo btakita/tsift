@@ -59,6 +59,7 @@ use substrate::{
 };
 use tagpath::{family as tagpath_family, ontology as tagpath_ontology};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
+use tree_sitter::StreamingIterator as _;
 #[cfg(test)]
 use tsift_agent_doc::session_cost;
 use tsift_agent_doc::{session_digest, session_review};
@@ -292,6 +293,8 @@ struct SemanticEditIntent {
     #[serde(default)]
     replacement: Option<String>,
     #[serde(default)]
+    call_replacement: Option<String>,
+    #[serde(default)]
     new_name: Option<String>,
     #[serde(default)]
     expected_content_hash: Option<String>,
@@ -327,6 +330,10 @@ struct SemanticEditIntentPlan {
     apply_supported: bool,
     applied: bool,
     target_symbol: Option<SemanticEditSymbolTarget>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    call_refs: Vec<SemanticEditCallRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cross_file_call_ref_total: Option<usize>,
     target_file: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_range: Option<SourceRangePreview>,
@@ -336,6 +343,18 @@ struct SemanticEditIntentPlan {
     #[serde(skip_serializing_if = "Option::is_none")]
     formatter: Option<String>,
     message: String,
+}
+
+#[derive(Serialize, Clone)]
+struct SemanticEditCallRef {
+    file: String,
+    caller: String,
+    line: usize,
+}
+
+struct SemanticEditCallRefContext<'a> {
+    refs: &'a [SemanticEditCallRef],
+    cross_file_total: usize,
 }
 
 #[derive(Serialize)]
@@ -3916,6 +3935,51 @@ fn resolve_semantic_edit_symbol(
     Ok((hit, file_abs))
 }
 
+fn resolve_semantic_edit_call_refs(
+    root: &Path,
+    scope: Option<&str>,
+    symbol: &str,
+    target_file_abs: &Path,
+) -> Result<(Vec<SemanticEditCallRef>, usize)> {
+    let db_path = resolve_query_db_path(root, target_file_abs, scope)?;
+    if !db_path.exists() {
+        bail!(
+            "index refs unavailable: no index found at {}",
+            db_path.display()
+        );
+    }
+    let db = index::IndexDb::open_read_only_resilient(&db_path)
+        .with_context(|| format!("opening symbol index {}", db_path.display()))?;
+    let edges = db
+        .callers_of(symbol)
+        .with_context(|| format!("loading indexed call refs for {symbol:?}"))?;
+    let mut refs = Vec::new();
+    let mut cross_file = 0usize;
+    for edge in edges {
+        let caller_file_abs = resolve_source_file(root, Path::new(&edge.caller_file))
+            .with_context(|| format!("resolving indexed caller file {}", edge.caller_file))?;
+        let line = usize::try_from(edge.call_site_line)
+            .ok()
+            .and_then(|line| line.checked_add(1))
+            .unwrap_or(1);
+        if caller_file_abs == target_file_abs {
+            refs.push(SemanticEditCallRef {
+                file: semantic_edit_file_display(root, &caller_file_abs),
+                caller: edge.caller_name,
+                line,
+            });
+        } else {
+            cross_file += 1;
+        }
+    }
+    refs.sort_by(|left, right| {
+        left.line
+            .cmp(&right.line)
+            .then(left.caller.cmp(&right.caller))
+    });
+    Ok((refs, cross_file))
+}
+
 fn semantic_edit_file_display(root: &Path, file_abs: &Path) -> String {
     relativize_pathbuf(file_abs, root)
         .to_string_lossy()
@@ -4129,6 +4193,232 @@ fn insert_rust_import(content: &str, replacement: &str) -> Result<(String, usize
     Ok((out, 1))
 }
 
+fn validate_rust_expression_replacement(replacement: &str, field: &str) -> Result<String> {
+    let trimmed = replacement.trim();
+    if trimmed.is_empty() {
+        bail!("{field} requires a non-empty Rust expression replacement");
+    }
+    let probe = format!("fn __tsift_probe() {{ let _ = {trimmed}; }}");
+    let mut parser = tree_sitter::Parser::new();
+    let language = graph::Lang::Rust.tree_sitter_language();
+    parser.set_language(&language)?;
+    let tree = parser
+        .parse(probe.as_bytes(), None)
+        .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
+    if tree.root_node().has_error() {
+        bail!("{field} {trimmed:?} is not a valid Rust expression replacement");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn rust_signature_replacement_name(replacement: &str) -> Result<String> {
+    let trimmed = replacement.trim();
+    if trimmed.is_empty() {
+        bail!("update_call_signature requires a non-empty Rust function signature replacement");
+    }
+    if trimmed.contains('{') || trimmed.contains('}') {
+        bail!("update_call_signature replacement must be a function signature without a body");
+    }
+    let probe = format!("{trimmed} {{}}\n");
+    let mut parser = tree_sitter::Parser::new();
+    let language = graph::Lang::Rust.tree_sitter_language();
+    parser.set_language(&language)?;
+    let tree = parser
+        .parse(probe.as_bytes(), None)
+        .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
+    if tree.root_node().has_error() {
+        bail!(
+            "update_call_signature replacement {trimmed:?} is not a valid Rust function signature"
+        );
+    }
+    let query = tree_sitter::Query::new(
+        &language,
+        "(function_item name: (identifier) @function.name)",
+    )?;
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let capture_names = query.capture_names();
+    let mut matches = cursor.matches(&query, tree.root_node(), probe.as_bytes());
+    while let Some(m) = matches.next() {
+        for capture in m.captures {
+            if capture_names[capture.index as usize] == "function.name" {
+                return Ok(capture.node.utf8_text(probe.as_bytes())?.to_string());
+            }
+        }
+    }
+    bail!("update_call_signature replacement did not parse to a Rust function signature")
+}
+
+fn find_rust_function_signature_range(content: &str, name: &str) -> Result<(usize, usize)> {
+    validate_rust_identifier(name, "symbol")?;
+    let source = content.as_bytes();
+    let mut parser = tree_sitter::Parser::new();
+    let language = graph::Lang::Rust.tree_sitter_language();
+    parser.set_language(&language)?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
+    let query = tree_sitter::Query::new(
+        &language,
+        "(function_item name: (identifier) @function.name)",
+    )?;
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let capture_names = query.capture_names();
+    let mut matches = cursor.matches(&query, tree.root_node(), source);
+    while let Some(m) = matches.next() {
+        for capture in m.captures {
+            if capture_names[capture.index as usize] != "function.name" {
+                continue;
+            }
+            if capture.node.utf8_text(source)? != name {
+                continue;
+            }
+            let Some(function_node) = capture.node.parent() else {
+                continue;
+            };
+            let Some(body) = function_node.child_by_field_name("body") else {
+                bail!("Rust function {name:?} has no body node for signature replacement");
+            };
+            return Ok((function_node.start_byte(), body.start_byte()));
+        }
+    }
+    bail!("could not find Rust function {name:?} for signature replacement")
+}
+
+fn update_rust_function_signature(
+    content: &str,
+    name: &str,
+    replacement: &str,
+) -> Result<(String, usize)> {
+    let replacement = replacement.trim();
+    let replacement_name = rust_signature_replacement_name(replacement)?;
+    if replacement_name != name {
+        bail!(
+            "update_call_signature replacement targets function {replacement_name:?}, expected {name:?}"
+        );
+    }
+    let (start, end) = find_rust_function_signature_range(content, name)?;
+    let mut out = String::with_capacity(content.len() + replacement.len());
+    out.push_str(&content[..start]);
+    out.push_str(replacement);
+    out.push_str(&content[end..]);
+    Ok((out, 1))
+}
+
+fn rust_call_expression_ranges(
+    content: &str,
+    symbol: &str,
+    indexed_lines: &[usize],
+) -> Result<Vec<(usize, usize)>> {
+    validate_rust_identifier(symbol, "symbol")?;
+    if indexed_lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    let source = content.as_bytes();
+    let mut parser = tree_sitter::Parser::new();
+    let language = graph::Lang::Rust.tree_sitter_language();
+    parser.set_language(&language)?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
+    if tree.root_node().has_error() {
+        bail!("Rust source has parse errors; refusing call-site rewrite");
+    }
+    let query = tree_sitter::Query::new(
+        &language,
+        r#"
+        (call_expression function: (identifier) @call.name) @call.expr
+        (call_expression function: (scoped_identifier name: (identifier) @call.name)) @call.expr
+        (call_expression function: (field_expression field: (field_identifier) @call.name)) @call.expr
+        "#,
+    )?;
+    let capture_names = query.capture_names();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut candidates = Vec::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source);
+    while let Some(m) = matches.next() {
+        let mut name_node = None;
+        let mut expr_node = None;
+        for capture in m.captures {
+            match capture_names[capture.index as usize] {
+                "call.name" => name_node = Some(capture.node),
+                "call.expr" => expr_node = Some(capture.node),
+                _ => {}
+            }
+        }
+        let (Some(name_node), Some(expr_node)) = (name_node, expr_node) else {
+            continue;
+        };
+        if name_node.utf8_text(source)? != symbol {
+            continue;
+        }
+        candidates.push((
+            name_node.start_position().row.saturating_add(1),
+            expr_node.start_byte(),
+            expr_node.end_byte(),
+        ));
+    }
+
+    let mut used = vec![false; candidates.len()];
+    let mut ranges = Vec::with_capacity(indexed_lines.len());
+    for line in indexed_lines {
+        let Some((idx, (_, start, end))) = candidates
+            .iter()
+            .enumerate()
+            .find(|(idx, (candidate_line, _, _))| !used[*idx] && candidate_line == line)
+        else {
+            bail!(
+                "indexed call ref for {symbol:?} at line {line} did not match a Rust AST call expression"
+            );
+        };
+        used[idx] = true;
+        ranges.push((*start, *end));
+    }
+    Ok(ranges)
+}
+
+fn rewrite_rust_call_sites(
+    content: &str,
+    symbol: &str,
+    indexed_lines: &[usize],
+    replacement: &str,
+) -> Result<(String, usize)> {
+    if indexed_lines.is_empty() {
+        bail!("no same-file indexed call refs found for Rust symbol {symbol:?}");
+    }
+    let replacement = validate_rust_expression_replacement(replacement, "rewrite_call_sites")?;
+    let mut ranges = rust_call_expression_ranges(content, symbol, indexed_lines)?;
+    ranges.sort_by_key(|(start, _)| *start);
+    ranges.dedup();
+    let mut out = content.to_string();
+    for (start, end) in ranges.iter().rev() {
+        out.replace_range(*start..*end, &replacement);
+    }
+    Ok((out, ranges.len()))
+}
+
+fn update_rust_call_signature(
+    content: &str,
+    symbol: &str,
+    indexed_lines: &[usize],
+    signature_replacement: &str,
+    call_replacement: Option<&str>,
+) -> Result<(String, usize)> {
+    let (mut updated, mut replacements) =
+        update_rust_function_signature(content, symbol, signature_replacement)?;
+    if !indexed_lines.is_empty() {
+        let call_replacement = call_replacement.with_context(|| {
+            format!(
+                "update_call_signature for {symbol:?} has indexed call refs and requires `call_replacement`"
+            )
+        })?;
+        let (rewritten, call_replacements) =
+            rewrite_rust_call_sites(&updated, symbol, indexed_lines, call_replacement)?;
+        updated = rewritten;
+        replacements += call_replacements;
+    }
+    Ok((updated, replacements))
+}
+
 fn target_symbol_name<'a>(
     target_symbol: Option<&'a SemanticEditSymbolTarget>,
     kind: &str,
@@ -4145,10 +4435,24 @@ fn preview_semantic_edit_content(
     kind: &str,
     intent: &SemanticEditIntent,
     target_symbol: Option<&SemanticEditSymbolTarget>,
+    call_ref_context: SemanticEditCallRefContext<'_>,
 ) -> Result<(String, usize)> {
     if !semantic_edit_is_rust(language, file_abs) {
         bail!("no executor registered for language {language:?}");
     }
+    if call_ref_context.cross_file_total > 0
+        && matches!(kind, "rewrite_call_sites" | "update_call_signature")
+    {
+        bail!(
+            "{kind} found {} indexed call ref(s) outside the target file; cross-file Rust rewrites are not supported yet",
+            call_ref_context.cross_file_total
+        );
+    }
+    let indexed_lines = call_ref_context
+        .refs
+        .iter()
+        .map(|call| call.line)
+        .collect::<Vec<_>>();
 
     match kind {
         "rename_symbol" => replace_rust_identifier(
@@ -4173,6 +4477,25 @@ fn preview_semantic_edit_content(
                 .replacement
                 .as_deref()
                 .context("insert_import requires replacement")?,
+        ),
+        "rewrite_call_sites" => rewrite_rust_call_sites(
+            content,
+            target_symbol_name(target_symbol, kind)?,
+            &indexed_lines,
+            intent
+                .replacement
+                .as_deref()
+                .context("rewrite_call_sites requires replacement")?,
+        ),
+        "update_call_signature" => update_rust_call_signature(
+            content,
+            target_symbol_name(target_symbol, kind)?,
+            &indexed_lines,
+            intent
+                .replacement
+                .as_deref()
+                .context("update_call_signature requires replacement")?,
+            intent.call_replacement.as_deref(),
         ),
         _ => bail!("semantic edit kind {kind:?} is not supported by the Rust executor yet"),
     }
@@ -4343,6 +4666,18 @@ fn plan_semantic_edit_intent(
         range.total_lines = total_lines;
     }
     let target_file = semantic_edit_file_display(root, &file_abs);
+    let (call_refs, cross_file_call_ref_total) = if matches!(
+        kind.as_str(),
+        "rewrite_call_sites" | "update_call_signature"
+    ) {
+        let target_name = target_symbol
+            .as_ref()
+            .map(|symbol| symbol.name.as_str())
+            .context("call-site rewrite intent requires a resolved target symbol")?;
+        resolve_semantic_edit_call_refs(root, scope, target_name, &file_abs)?
+    } else {
+        (Vec::new(), 0)
+    };
     let conflict = intent
         .expected_content_hash
         .as_deref()
@@ -4366,6 +4701,10 @@ fn plan_semantic_edit_intent(
                 &kind,
                 intent,
                 target_symbol.as_ref(),
+                SemanticEditCallRefContext {
+                    refs: &call_refs,
+                    cross_file_total: cross_file_call_ref_total,
+                },
             ) {
                 Ok((preview, _)) => (
                     "planned".to_string(),
@@ -4400,6 +4739,9 @@ fn plan_semantic_edit_intent(
             apply_supported,
             applied: false,
             target_symbol,
+            call_refs,
+            cross_file_call_ref_total: (cross_file_call_ref_total > 0)
+                .then_some(cross_file_call_ref_total),
             target_file,
             target_range,
             content_hash,
@@ -4462,6 +4804,10 @@ fn apply_semantic_edit_drafts(
             &draft.plan.kind,
             &intents[idx],
             draft.plan.target_symbol.as_ref(),
+            SemanticEditCallRefContext {
+                refs: &draft.plan.call_refs,
+                cross_file_total: draft.plan.cross_file_call_ref_total.unwrap_or(0),
+            },
         )
         .with_context(|| format!("applying {}", draft.plan.handle))?;
         buffer.current = updated;

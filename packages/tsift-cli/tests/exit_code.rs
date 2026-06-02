@@ -2911,6 +2911,195 @@ fn edit_intents_apply_formats_and_mutates_supported_rust_intents() {
 }
 
 #[test]
+fn edit_intents_apply_rewrites_indexed_rust_call_sites() {
+    let dir = indexed_cli_fixture();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "rewrite_call_sites",
+                "symbol": "gamma",
+                "file": "main.rs",
+                "replacement": "gamma_twice()"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "rewrite_call_sites stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = &json["report"]["plans"][0];
+    assert_eq!(plan["kind"], "rewrite_call_sites");
+    assert_eq!(plan["status"], "applied");
+    assert_eq!(plan["applied"], true);
+    assert_eq!(plan["apply_supported"], true);
+    let call_lines = plan["call_refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|call| call["line"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(call_lines, vec![8, 13]);
+
+    let source = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    assert!(source.contains("fn gamma()"), "{source}");
+    assert!(
+        source.contains("fn alpha() {\n    beta();\n    gamma_twice();\n}"),
+        "{source}"
+    );
+    assert!(
+        source.contains("fn beta() {\n    alpha();\n    gamma_twice();\n}"),
+        "{source}"
+    );
+}
+
+#[test]
+fn edit_intents_apply_updates_rust_signature_and_call_sites() {
+    let dir = indexed_cli_fixture();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "update_call_signature",
+                "symbol": "beta",
+                "file": "main.rs",
+                "replacement": "fn beta(value: i32)",
+                "call_replacement": "beta(7)"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "update_call_signature stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = &json["report"]["plans"][0];
+    assert_eq!(plan["kind"], "update_call_signature");
+    assert_eq!(plan["status"], "applied");
+    let call_lines = plan["call_refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|call| call["line"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(call_lines, vec![7, 18]);
+
+    let source = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    assert!(source.contains("fn beta(value: i32)"), "{source}");
+    assert!(
+        source.contains("fn alpha() {\n    beta(7);\n    gamma();\n}"),
+        "{source}"
+    );
+    assert!(
+        source.contains("fn gamma() {\n    alpha();\n    beta(7);\n}"),
+        "{source}"
+    );
+}
+
+#[test]
+fn edit_intents_apply_refuses_signature_update_without_call_replacement() {
+    let dir = indexed_cli_fixture();
+    let before = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "update_call_signature",
+                "symbol": "beta",
+                "file": "main.rs",
+                "replacement": "fn beta(value: i32)"
+            }
+        ]
+    }"#;
+
+    let mut child = tsift_bin()
+        .args([
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "missing call_replacement should fail"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+        before
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unsupported"), "stderr was: {stderr}");
+}
+
+#[test]
 fn edit_intents_apply_refuses_stale_hash_without_mutating() {
     let dir = indexed_cli_fixture();
     let before = fs::read_to_string(dir.path().join("main.rs")).unwrap();
