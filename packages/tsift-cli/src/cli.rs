@@ -71,6 +71,33 @@ pub enum Commands {
         /// Search all federated submodule indexes
         #[arg(long)]
         federated: bool,
+        /// Restrict indexed symbol results to one or more languages (repeatable)
+        #[arg(long = "lang")]
+        lang: Vec<String>,
+        /// Restrict indexed symbol results to one or more symbol kinds (repeatable)
+        #[arg(long = "kind")]
+        kind: Vec<String>,
+        /// Restrict indexed symbol results to one or more tree-sitter node kinds (repeatable)
+        #[arg(long = "node-kind")]
+        node_kind: Vec<String>,
+        /// Restrict Markdown/indexed AST results to an enclosing section path element or handle (repeatable)
+        #[arg(long = "section")]
+        section: Vec<String>,
+        /// Restrict indexed AST results to symbols with a matching parent name or span handle (repeatable)
+        #[arg(long = "parent")]
+        parent: Vec<String>,
+        /// Restrict indexed AST results to symbols with a matching direct child name or span handle (repeatable)
+        #[arg(long = "child")]
+        child: Vec<String>,
+        /// Restrict Markdown code-block results by fenced-code language (repeatable)
+        #[arg(long = "fence-language")]
+        fence_language: Vec<String>,
+        /// Restrict Markdown list-item results by list depth (repeatable)
+        #[arg(long = "list-depth")]
+        list_depth: Vec<usize>,
+        /// Restrict Markdown heading results by heading level (repeatable)
+        #[arg(long = "heading-level")]
+        heading_level: Vec<usize>,
         /// Output as JSON
         #[arg(long)]
         json: bool,

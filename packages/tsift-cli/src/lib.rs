@@ -86,6 +86,51 @@ pub(crate) enum GraphDbExperimentalBackend {
     Surrealdb,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct SearchFacetFilters {
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) languages: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) kinds: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) node_kinds: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) sections: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) parents: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) children: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) fence_languages: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) list_depths: Vec<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) heading_levels: Vec<usize>,
+}
+
+impl SearchFacetFilters {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.languages.is_empty()
+            && self.kinds.is_empty()
+            && self.node_kinds.is_empty()
+            && self.sections.is_empty()
+            && self.parents.is_empty()
+            && self.children.is_empty()
+            && self.fence_languages.is_empty()
+            && self.list_depths.is_empty()
+            && self.heading_levels.is_empty()
+    }
+
+    fn needs_ast_context(&self) -> bool {
+        !self.sections.is_empty()
+            || !self.parents.is_empty()
+            || !self.children.is_empty()
+            || !self.fence_languages.is_empty()
+            || !self.list_depths.is_empty()
+            || !self.heading_levels.is_empty()
+    }
+}
+
 #[derive(Serialize)]
 struct GraphDbBackendPromotionGate {
     status: String,
@@ -589,6 +634,15 @@ pub fn run() -> Result<()> {
             exact,
             scope,
             federated,
+            lang,
+            kind,
+            node_kind,
+            section,
+            parent,
+            child,
+            fence_language,
+            list_depth,
+            heading_level,
             json,
             autoindex,
             no_autoindex,
@@ -624,6 +678,17 @@ pub fn run() -> Result<()> {
             TagpathSearchOpts {
                 no_tagpath,
                 strict: tagpath_strict,
+            },
+            SearchFacetFilters {
+                languages: lang,
+                kinds: kind,
+                node_kinds: node_kind,
+                sections: section,
+                parents: parent,
+                children: child,
+                fence_languages: fence_language,
+                list_depths: list_depth,
+                heading_levels: heading_level,
             },
         ),
         Some(Commands::SearchWorker {
@@ -29511,6 +29576,8 @@ struct SearchScaleGuard {
 struct SearchBudgetReport {
     query: String,
     strategy: String,
+    #[serde(skip_serializing_if = "SearchFacetFilters::is_empty", default)]
+    filters: SearchFacetFilters,
     indexed_artifacts: usize,
     skipped_artifacts: usize,
     max_items: usize,
@@ -29523,6 +29590,17 @@ struct SearchBudgetReport {
     scale_guard: Option<SearchScaleGuard>,
     symbols: Vec<SearchBudgetSymbolPreview>,
     hits: Vec<SearchBudgetHitPreview>,
+}
+
+pub(crate) struct SearchBudgetReportInput<'a> {
+    pub(crate) query: &'a str,
+    pub(crate) strategy: &'a str,
+    pub(crate) root: &'a Path,
+    pub(crate) response: &'a sift::SearchResponse,
+    pub(crate) symbol_hits: &'a [index::SymbolHit],
+    pub(crate) absolute: bool,
+    pub(crate) budget: ResponseBudget,
+    pub(crate) filters: &'a SearchFacetFilters,
 }
 
 const SEARCH_BUDGET_SURFACE_PREVIEW_LIMIT: usize = 3;
@@ -29675,6 +29753,187 @@ fn search_budget_ast_artifact(
     })
 }
 
+struct SearchFacetAstContext {
+    ast: AstSpanPreview,
+    parent_values: Vec<String>,
+    child_values: Vec<String>,
+}
+
+fn normalized_facet_value(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn text_filter_matches_value(filter: &str, value: &str) -> bool {
+    normalized_facet_value(filter) == normalized_facet_value(value)
+}
+
+fn text_filters_match_value(filters: &[String], value: Option<&str>) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    value.is_some_and(|value| {
+        filters
+            .iter()
+            .any(|filter| text_filter_matches_value(filter, value))
+    })
+}
+
+fn text_filters_match_any_value(filters: &[String], values: &[String]) -> bool {
+    filters.is_empty()
+        || filters.iter().any(|filter| {
+            values
+                .iter()
+                .any(|value| text_filter_matches_value(filter, value))
+        })
+}
+
+fn symbol_hit_matches_scalar_facets(
+    symbol: &index::SymbolHit,
+    filters: &SearchFacetFilters,
+) -> bool {
+    text_filters_match_value(&filters.languages, Some(&symbol.language))
+        && text_filters_match_value(&filters.kinds, Some(&symbol.kind))
+        && text_filters_match_value(&filters.node_kinds, symbol.node_kind.as_deref())
+}
+
+fn search_facet_matching_stored_symbol<'a>(
+    symbols: &'a [index::StoredSymbol],
+    hit: &index::SymbolHit,
+) -> Option<&'a index::StoredSymbol> {
+    let hit_span = symbol_hit_span_bounds(hit);
+    let hit_line = symbol_hit_line(hit);
+    symbols.iter().find(|symbol| {
+        if symbol.name != hit.name || symbol.kind != hit.kind {
+            return false;
+        }
+        if let Some(hit_span) = hit_span {
+            return stored_symbol_span_bounds(symbol) == Some(hit_span);
+        }
+        source_symbol_line(symbol) == hit_line
+    })
+}
+
+fn search_facet_symbol_values(symbol: &index::StoredSymbol) -> Vec<String> {
+    let mut values = vec![
+        symbol.name.clone(),
+        symbol.kind.clone(),
+        symbol.language.clone(),
+    ];
+    if let Some(node_kind) = &symbol.node_kind {
+        values.push(node_kind.clone());
+    }
+    if let Some(handle) = stored_symbol_span_handle(symbol) {
+        values.push(handle);
+    }
+    values
+}
+
+fn search_facet_ast_context(
+    root: &Path,
+    symbol: &index::SymbolHit,
+) -> Option<SearchFacetAstContext> {
+    let file_path = search_budget_symbol_source_path(root, &symbol.file);
+    let source = fs::read(&file_path).ok()?;
+    let db_path = resolve_query_db_path(root, &file_path, None).ok()?;
+    let db = index::IndexDb::open_read_only_resilient(&db_path).ok()?;
+    let symbols = db.symbols_for_file(&file_path.to_string_lossy()).ok()?;
+    let selected = search_facet_matching_stored_symbol(&symbols, symbol)?;
+    let ast = stored_symbol_ast_span(selected, &source, &symbols, 64)?;
+
+    let parent_values = ast
+        .parent_handle
+        .as_ref()
+        .and_then(|parent_handle| {
+            symbols.iter().find(|candidate| {
+                stored_symbol_span_handle(candidate).as_ref() == Some(parent_handle)
+            })
+        })
+        .map(search_facet_symbol_values)
+        .unwrap_or_else(|| ast.parent_handle.clone().into_iter().collect());
+
+    let mut child_values = Vec::new();
+    for child_handle in &ast.child_handles {
+        child_values.push(child_handle.clone());
+        if let Some(child) = symbols
+            .iter()
+            .find(|candidate| stored_symbol_span_handle(candidate).as_ref() == Some(child_handle))
+        {
+            child_values.extend(search_facet_symbol_values(child));
+        }
+    }
+    child_values.sort();
+    child_values.dedup();
+
+    Some(SearchFacetAstContext {
+        ast,
+        parent_values,
+        child_values,
+    })
+}
+
+fn search_facet_context_matches(
+    filters: &SearchFacetFilters,
+    context: &SearchFacetAstContext,
+) -> bool {
+    let markdown = context.ast.markdown.as_ref();
+    let mut section_values = Vec::new();
+    if let Some(markdown) = markdown {
+        section_values.extend(markdown.section_path.clone());
+        if !markdown.section_path.is_empty() {
+            section_values.push(markdown.section_path.join("/"));
+            section_values.push(markdown.section_path.join(" > "));
+        }
+        if let Some(section_handle) = &markdown.section_handle {
+            section_values.push(section_handle.clone());
+        }
+    }
+
+    text_filters_match_any_value(&filters.sections, &section_values)
+        && text_filters_match_any_value(&filters.parents, &context.parent_values)
+        && text_filters_match_any_value(&filters.children, &context.child_values)
+        && text_filters_match_value(
+            &filters.fence_languages,
+            markdown.and_then(|metadata| metadata.fence_language.as_deref()),
+        )
+        && (filters.list_depths.is_empty()
+            || markdown
+                .and_then(|metadata| metadata.list_depth)
+                .is_some_and(|depth| filters.list_depths.contains(&depth)))
+        && (filters.heading_levels.is_empty()
+            || markdown
+                .and_then(|metadata| metadata.heading_level)
+                .is_some_and(|level| filters.heading_levels.contains(&level)))
+}
+
+fn symbol_hit_matches_search_facets(
+    root: &Path,
+    symbol: &index::SymbolHit,
+    filters: &SearchFacetFilters,
+) -> bool {
+    if !symbol_hit_matches_scalar_facets(symbol, filters) {
+        return false;
+    }
+    if !filters.needs_ast_context() {
+        return true;
+    }
+    search_facet_ast_context(root, symbol)
+        .as_ref()
+        .is_some_and(|context| search_facet_context_matches(filters, context))
+}
+
+pub(crate) fn apply_search_facet_filters(
+    root: &Path,
+    hits: Vec<index::SymbolHit>,
+    filters: &SearchFacetFilters,
+) -> Vec<index::SymbolHit> {
+    if filters.is_empty() {
+        return hits;
+    }
+    hits.into_iter()
+        .filter(|hit| symbol_hit_matches_search_facets(root, hit, filters))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_search_scale_guard(
     query: &str,
@@ -29741,15 +30000,17 @@ fn build_search_scale_guard(
     })
 }
 
-pub(crate) fn build_search_budget_report(
-    query: &str,
-    strategy: &str,
-    root: &Path,
-    response: &sift::SearchResponse,
-    symbol_hits: &[index::SymbolHit],
-    absolute: bool,
-    budget: ResponseBudget,
-) -> SearchBudgetReport {
+pub(crate) fn build_search_budget_report(input: SearchBudgetReportInput<'_>) -> SearchBudgetReport {
+    let SearchBudgetReportInput {
+        query,
+        strategy,
+        root,
+        response,
+        symbol_hits,
+        absolute,
+        budget,
+        filters,
+    } = input;
     let max_items = budget.preview_items();
     let max_bytes = budget.preview_bytes();
     let raw_symbol_total = symbol_hits.len();
@@ -29907,6 +30168,7 @@ pub(crate) fn build_search_budget_report(
     SearchBudgetReport {
         query: query.to_string(),
         strategy: strategy.to_string(),
+        filters: filters.clone(),
         indexed_artifacts: response.indexed_artifacts,
         skipped_artifacts: response.skipped_artifacts,
         max_items,
@@ -29919,6 +30181,39 @@ pub(crate) fn build_search_budget_report(
         symbols,
         hits,
     }
+}
+
+fn append_search_facet_filter_summary(parts: &mut Vec<String>, name: &str, values: &[String]) {
+    if !values.is_empty() {
+        parts.push(format!("{name}={}", values.join("|")));
+    }
+}
+
+fn append_search_facet_usize_filter_summary(parts: &mut Vec<String>, name: &str, values: &[usize]) {
+    if !values.is_empty() {
+        parts.push(format!(
+            "{name}={}",
+            values
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join("|")
+        ));
+    }
+}
+
+fn search_facet_filters_summary(filters: &SearchFacetFilters) -> String {
+    let mut parts = Vec::new();
+    append_search_facet_filter_summary(&mut parts, "lang", &filters.languages);
+    append_search_facet_filter_summary(&mut parts, "kind", &filters.kinds);
+    append_search_facet_filter_summary(&mut parts, "node-kind", &filters.node_kinds);
+    append_search_facet_filter_summary(&mut parts, "section", &filters.sections);
+    append_search_facet_filter_summary(&mut parts, "parent", &filters.parents);
+    append_search_facet_filter_summary(&mut parts, "child", &filters.children);
+    append_search_facet_filter_summary(&mut parts, "fence-language", &filters.fence_languages);
+    append_search_facet_usize_filter_summary(&mut parts, "list-depth", &filters.list_depths);
+    append_search_facet_usize_filter_summary(&mut parts, "heading-level", &filters.heading_levels);
+    parts.join(" ")
 }
 
 pub(crate) fn print_search_budget_human(report: &SearchBudgetReport) {
@@ -29934,6 +30229,9 @@ pub(crate) fn print_search_budget_human(report: &SearchBudgetReport) {
         report.indexed_artifacts,
         report.skipped_artifacts
     );
+    if !report.filters.is_empty() {
+        println!("filters: {}", search_facet_filters_summary(&report.filters));
+    }
     for symbol in &report.symbols {
         let variants = if symbol.surface_examples.is_empty() {
             String::new()
@@ -30095,6 +30393,27 @@ mod tests {
             .unwrap()
             .join()
             .unwrap()
+    }
+
+    fn build_relative_search_budget_report(
+        query: &str,
+        strategy: &str,
+        root: &Path,
+        response: &sift::SearchResponse,
+        symbol_hits: &[index::SymbolHit],
+        budget: ResponseBudget,
+        filters: &SearchFacetFilters,
+    ) -> SearchBudgetReport {
+        build_search_budget_report(SearchBudgetReportInput {
+            query,
+            strategy,
+            root,
+            response,
+            symbol_hits,
+            absolute: false,
+            budget,
+            filters,
+        })
     }
 
     #[derive(Default)]
@@ -36862,6 +37181,58 @@ tier = "private"
     }
 
     #[test]
+    fn cli_search_accepts_ast_facet_filters() {
+        let cli = parse_cli([
+            "tsift",
+            "search",
+            "setup",
+            "--lang",
+            "markdown",
+            "--kind",
+            "list_item",
+            "--node-kind",
+            "list_item",
+            "--section",
+            "Install",
+            "--parent",
+            "Run setup.",
+            "--child",
+            "Confirm setup.",
+            "--fence-language",
+            "rust",
+            "--list-depth",
+            "1",
+            "--heading-level",
+            "2",
+        ]);
+        match cli.command {
+            Some(Commands::Search {
+                lang,
+                kind,
+                node_kind,
+                section,
+                parent,
+                child,
+                fence_language,
+                list_depth,
+                heading_level,
+                ..
+            }) => {
+                assert_eq!(lang, vec!["markdown"]);
+                assert_eq!(kind, vec!["list_item"]);
+                assert_eq!(node_kind, vec!["list_item"]);
+                assert_eq!(section, vec!["Install"]);
+                assert_eq!(parent, vec!["Run setup."]);
+                assert_eq!(child, vec!["Confirm setup."]);
+                assert_eq!(fence_language, vec!["rust"]);
+                assert_eq!(list_depth, vec![1]);
+                assert_eq!(heading_level, vec![2]);
+            }
+            _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
     fn response_budget_presets_fill_defaults_and_preserve_explicit_caps() {
         let small = ResponseBudget::from_cli(None, None, Some(ResponseBudgetPreset::Small), false);
         assert_eq!(small.preview_items(), 3);
@@ -37216,14 +37587,14 @@ tier = "private"
             tagpath_handle: None,
         }];
 
-        let report = build_search_budget_report(
+        let report = build_relative_search_budget_report(
             "alpha_helper_with_a_long_name",
             "lexical",
             Path::new("/repo"),
             &response,
             &symbol_hits,
-            false,
             ResponseBudget::new(Some(1), Some(12)),
+            &SearchFacetFilters::default(),
         );
 
         assert_eq!(report.symbols.len(), 1);
@@ -37264,14 +37635,14 @@ tier = "private"
             tagpath_handle: None,
         }];
 
-        let report = build_search_budget_report(
+        let report = build_relative_search_budget_report(
             "alpha helper",
             "lexical",
             dir.path(),
             &response,
             &symbol_hits,
-            false,
             ResponseBudget::new(Some(5), Some(96)),
+            &SearchFacetFilters::default(),
         );
 
         let symbol = &report.symbols[0];
@@ -37328,14 +37699,14 @@ tier = "private"
             tagpath_handle: None,
         }];
 
-        let report = build_search_budget_report(
+        let report = build_relative_search_budget_report(
             "Install",
             "lexical",
             dir.path(),
             &response,
             &symbol_hits,
-            false,
             ResponseBudget::new(Some(5), Some(96)),
+            &SearchFacetFilters::default(),
         );
 
         let ast = report.symbols[0]
@@ -37354,6 +37725,148 @@ tier = "private"
         assert!(markdown_ast.contains(&ast.span.handle), "{markdown_ast}");
         assert!(ast.expand.source_window.contains("source-read"));
         assert!(ast.expand.symbol_read.contains("symbol-read"));
+    }
+
+    fn markdown_search_facet_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let source = r#"# Guide
+
+## Install
+
+- Run setup.
+  - Confirm setup.
+
+```rust
+fn sample() {}
+```
+"#;
+        fs::write(dir.path().join("README.md"), source).unwrap();
+        let index_dir = dir.path().join(".tsift");
+        fs::create_dir_all(&index_dir).unwrap();
+        run_index_update(
+            &index_dir.join("index.db"),
+            dir.path(),
+            "indexing markdown search facet fixture".to_string(),
+            dir.path(),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        dir
+    }
+
+    fn markdown_search_facet_hits(root: &Path, query: &str) -> Vec<index::SymbolHit> {
+        let db = index::IndexDb::open_read_only_resilient(&root.join(".tsift/index.db")).unwrap();
+        db.symbol_search(query, 20).unwrap()
+    }
+
+    #[test]
+    fn search_facet_filters_match_scalar_symbol_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let hits = vec![
+            index::SymbolHit {
+                name: "alpha_helper".to_string(),
+                kind: "function".to_string(),
+                language: "rust".to_string(),
+                file: dir.path().join("src/lib.rs").to_string_lossy().to_string(),
+                line: 0,
+                end_line: None,
+                node_kind: Some("function_item".to_string()),
+                start_byte: None,
+                end_byte: None,
+                body_start_byte: None,
+                body_end_byte: None,
+                tags: None,
+                score: 1.0,
+                match_type: "exact_name".to_string(),
+                tagpath_handle: None,
+            },
+            index::SymbolHit {
+                name: "Install".to_string(),
+                kind: "heading".to_string(),
+                language: "markdown".to_string(),
+                file: dir.path().join("README.md").to_string_lossy().to_string(),
+                line: 0,
+                end_line: None,
+                node_kind: Some("atx_heading".to_string()),
+                start_byte: None,
+                end_byte: None,
+                body_start_byte: None,
+                body_end_byte: None,
+                tags: None,
+                score: 0.9,
+                match_type: "exact_name".to_string(),
+                tagpath_handle: None,
+            },
+        ];
+
+        let filtered = apply_search_facet_filters(
+            dir.path(),
+            hits,
+            &SearchFacetFilters {
+                languages: vec!["rust".to_string()],
+                kinds: vec!["function".to_string()],
+                node_kinds: vec!["function_item".to_string()],
+                ..SearchFacetFilters::default()
+            },
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "alpha_helper");
+    }
+
+    #[test]
+    fn search_facet_filters_match_markdown_sections_and_block_metadata() {
+        let dir = markdown_search_facet_fixture();
+
+        let nested_list = apply_search_facet_filters(
+            dir.path(),
+            markdown_search_facet_hits(dir.path(), "setup"),
+            &SearchFacetFilters {
+                sections: vec!["Install".to_string()],
+                parents: vec!["Run setup.".to_string()],
+                list_depths: vec![1],
+                ..SearchFacetFilters::default()
+            },
+        );
+        assert_eq!(nested_list.len(), 1);
+        assert_eq!(nested_list[0].name, "Confirm setup.");
+
+        let parent_list = apply_search_facet_filters(
+            dir.path(),
+            markdown_search_facet_hits(dir.path(), "setup"),
+            &SearchFacetFilters {
+                children: vec!["Confirm setup.".to_string()],
+                ..SearchFacetFilters::default()
+            },
+        );
+        assert_eq!(parent_list.len(), 1);
+        assert_eq!(parent_list[0].name, "Run setup.");
+
+        let heading = apply_search_facet_filters(
+            dir.path(),
+            markdown_search_facet_hits(dir.path(), "Install"),
+            &SearchFacetFilters {
+                heading_levels: vec![2],
+                node_kinds: vec!["atx_heading".to_string()],
+                ..SearchFacetFilters::default()
+            },
+        );
+        assert_eq!(heading.len(), 1);
+        assert_eq!(heading[0].name, "Install");
+
+        let fence = apply_search_facet_filters(
+            dir.path(),
+            markdown_search_facet_hits(dir.path(), "rust"),
+            &SearchFacetFilters {
+                fence_languages: vec!["rust".to_string()],
+                kinds: vec!["code_block".to_string()],
+                ..SearchFacetFilters::default()
+            },
+        );
+        assert_eq!(fence.len(), 1);
+        assert_eq!(fence[0].kind, "code_block");
     }
 
     #[test]
@@ -37413,14 +37926,14 @@ tier = "private"
             },
         ];
 
-        let report = build_search_budget_report(
+        let report = build_relative_search_budget_report(
             "alpha helper",
             "lexical",
             Path::new("/repo"),
             &response,
             &symbol_hits,
-            false,
             ResponseBudget::new(Some(5), Some(48)),
+            &SearchFacetFilters::default(),
         );
 
         assert_eq!(report.symbol_total, 1);
@@ -37438,6 +37951,50 @@ tier = "private"
         assert!(report.symbols[0].file.contains("(+2 files)"));
         assert!(report.symbols[0].expand.contains("tsift search"));
         assert!(report.symbols[0].expand.contains("alpha helper"));
+    }
+
+    #[test]
+    fn search_budget_report_carries_active_filters() {
+        let response = empty_search_response(Path::new("/repo"), "lexical");
+        let symbol_hits = vec![index::SymbolHit {
+            name: "alpha_helper".to_string(),
+            kind: "function".to_string(),
+            language: "rust".to_string(),
+            file: "/repo/src/lib.rs".to_string(),
+            line: 12,
+            end_line: None,
+            node_kind: Some("function_item".to_string()),
+            start_byte: None,
+            end_byte: None,
+            body_start_byte: None,
+            body_end_byte: None,
+            tags: Some("alpha,helper".to_string()),
+            score: 0.98,
+            match_type: "exact_name".to_string(),
+            tagpath_handle: None,
+        }];
+        let filters = SearchFacetFilters {
+            languages: vec!["rust".to_string()],
+            kinds: vec!["function".to_string()],
+            node_kinds: vec!["function_item".to_string()],
+            ..SearchFacetFilters::default()
+        };
+
+        let report = build_relative_search_budget_report(
+            "alpha helper",
+            "lexical",
+            Path::new("/repo"),
+            &response,
+            &symbol_hits,
+            ResponseBudget::new(Some(5), Some(48)),
+            &filters,
+        );
+
+        assert_eq!(report.filters, filters);
+        assert_eq!(
+            search_facet_filters_summary(&report.filters),
+            "lang=rust kind=function node-kind=function_item"
+        );
     }
 
     #[test]
@@ -37481,14 +38038,14 @@ tier = "private"
             },
         ];
 
-        let report = build_search_budget_report(
+        let report = build_relative_search_budget_report(
             "helper",
             "lexical",
             Path::new("/repo"),
             &response,
             &symbol_hits,
-            false,
             ResponseBudget::new(Some(1), Some(64)),
+            &SearchFacetFilters::default(),
         );
 
         let guard = report

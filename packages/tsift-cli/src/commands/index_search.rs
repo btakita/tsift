@@ -9,11 +9,12 @@ use tsift_quality::lint;
 
 use crate::output::{OutputFormat, ResponseBudget, ToolEnvelopeSummary};
 use crate::{
-    DegradedSearchMode, TagpathSearchOpts, abbreviate_kind, abbreviate_match_type,
-    annotate_hits_with_tagpath, build_search_budget_follow_up, build_search_budget_report,
-    compact_snippet, degraded_search_mode, emit_degraded_search_note, envelope_metric,
-    federated_exact_search, federated_sift_search, federated_symbol_search, format_score,
-    group_search_hits, inject_tagpath_stale_into_json, maybe_apply_search_post_precheck_test_hooks,
+    DegradedSearchMode, SearchBudgetReportInput, SearchFacetFilters, TagpathSearchOpts,
+    abbreviate_kind, abbreviate_match_type, annotate_hits_with_tagpath, apply_search_facet_filters,
+    build_search_budget_follow_up, build_search_budget_report, compact_snippet,
+    degraded_search_mode, emit_degraded_search_note, envelope_metric, federated_exact_search,
+    federated_sift_search, federated_symbol_search, format_score, group_search_hits,
+    inject_tagpath_stale_into_json, maybe_apply_search_post_precheck_test_hooks,
     maybe_apply_search_worker_test_hooks, precheck_search_indexes, print_json_or_envelope,
     print_search_budget_human, relativize, relativize_index_summary, relativize_json_paths,
     relativize_symbol_hits, resolve_search_strategy, run_exact_search_with_timeout,
@@ -275,7 +276,10 @@ pub(crate) fn cmd_index(
             });
             println!("{}", serde_json::to_string(&compact)?);
         } else {
-            println!("{}", to_json_schema(&summary, pretty, terse, false, schema)?);
+            println!(
+                "{}",
+                to_json_schema(&summary, pretty, terse, false, schema)?
+            );
         }
     } else if compact {
         let mode = if rebuild {
@@ -383,6 +387,7 @@ pub(crate) fn cmd_search(
         false,
         ResponseBudget::default(),
         TagpathSearchOpts::default(),
+        SearchFacetFilters::default(),
     )
 }
 
@@ -407,6 +412,7 @@ pub(crate) fn cmd_search_with_budget(
     envelope: bool,
     budget: ResponseBudget,
     tagpath_opts: TagpathSearchOpts,
+    facet_filters: SearchFacetFilters,
 ) -> Result<()> {
     let base_path = path.unwrap_or_else(|| PathBuf::from("."));
     let format = OutputFormat {
@@ -464,13 +470,19 @@ pub(crate) fn cmd_search_with_budget(
         None
     };
 
+    let symbol_search_limit = if facet_filters.is_empty() || limit == 0 {
+        limit
+    } else {
+        limit.saturating_mul(20).max(limit).max(100)
+    };
+
     let (symbol_hits, sift_path, federated_tagpath_diag) =
         if let Some(scope) = inferred_scope.as_ref() {
             let cfg = config::Config::load(&root)?;
             let db_path = cfg.db_path_for(&root, &scope.id);
             let hits = if db_path.exists() {
                 let db = index::IndexDb::open_read_only_resilient(&db_path)?;
-                db.symbol_search(&query, limit)?
+                db.symbol_search(&query, symbol_search_limit)?
             } else {
                 Vec::new()
             };
@@ -481,19 +493,20 @@ pub(crate) fn cmd_search_with_budget(
             let db_path = cfg.db_path_for(&root, &scope.id);
             let hits = if db_path.exists() {
                 let db = index::IndexDb::open_read_only_resilient(&db_path)?;
-                db.symbol_search(&query, limit)?
+                db.symbol_search(&query, symbol_search_limit)?
             } else {
                 Vec::new()
             };
             (hits, scope.source_root, None)
         } else if federated {
-            let (hits, diag) = federated_symbol_search(&root, &query, limit, &tagpath_opts)?;
+            let (hits, diag) =
+                federated_symbol_search(&root, &query, symbol_search_limit, &tagpath_opts)?;
             (hits, root.clone(), Some(diag))
         } else {
             let db_path = root.join(".tsift/index.db");
             let hits = if db_path.exists() {
                 let db = index::IndexDb::open_read_only_resilient(&db_path)?;
-                db.symbol_search(&query, limit)?
+                db.symbol_search(&query, symbol_search_limit)?
             } else {
                 Vec::new()
             };
@@ -522,6 +535,8 @@ pub(crate) fn cmd_search_with_budget(
             tagpath_diag.reason.as_deref().unwrap_or("unknown"),
         );
     }
+    symbol_hits = apply_search_facet_filters(&root, symbol_hits, &facet_filters);
+    symbol_hits.truncate(limit);
 
     let response = if exact_search {
         if federated && scope.is_none() {
@@ -556,15 +571,16 @@ pub(crate) fn cmd_search_with_budget(
     };
 
     if budget.is_active() {
-        let report = build_search_budget_report(
-            &query,
-            &effective_strategy,
-            &root,
-            &response,
-            &symbol_hits,
+        let report = build_search_budget_report(SearchBudgetReportInput {
+            query: &query,
+            strategy: &effective_strategy,
+            root: &root,
+            response: &response,
+            symbol_hits: &symbol_hits,
             absolute,
             budget,
-        );
+            filters: &facet_filters,
+        });
         if format.json_output {
             let mut follow_up = report
                 .scale_guard
