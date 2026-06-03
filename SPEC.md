@@ -202,6 +202,39 @@ The fixture is append-only; gate evaluation is read-only. Sibling agents may ext
 
 Normal `graph-db refresh`, `conflict-matrix`, and `dispatch-trace` use the same source watermark as backend-eval to reuse the existing projection when the code-index snapshot, agent-doc markdown metadata, and summary cache metadata are unchanged; conflict-matrix preparation additionally keys its reusable packet by source, document, and staged-diff watermarks.
 
+### Cross-Surface Token Gate
+
+The cross-surface token gate (`#tokegate`) records and gates token efficiency across the five tsift agent-facing surfaces. It is implemented in `tsift_quality::token_gate` and exercised by `tests/token_gate.rs`.
+
+**Required surfaces.** Every gate evaluation covers five surfaces:
+
+| Surface name                  | CLI command                                               |
+|-------------------------------|-----------------------------------------------------------|
+| `context_pack`                | `tsift context-pack <path>`                               |
+| `session_review_next_context` | `tsift session-review --next-context <path>`              |
+| `graph_db_evidence`           | `tsift graph-db --path . evidence <target> --depth 3`     |
+| `conflict_matrix`             | `tsift conflict-matrix --path <path> <targets> --json`    |
+| `dispatch_trace`              | `tsift dispatch-trace --path <path> <targets> --json`     |
+
+A surface that is absent from history is treated as `missing` and blocks the gate. A surface with fewer than three samples is treated as `insufficient_samples` and also blocks. The minimum sample count is `token_gate::MIN_TOKEN_GATE_SAMPLES = 3`.
+
+**Required metrics per surface.** Each surface sample must record six metrics:
+
+| Metric                    | Direction        | Description                                                                 |
+|---------------------------|------------------|-----------------------------------------------------------------------------|
+| `prompt_tokens`           | lower is better  | Tokens emitted in the envelope output                                       |
+| `envelope_bytes`          | lower is better  | JSON envelope byte size                                                     |
+| `runtime_micros`          | lower is better  | Wall-clock runtime in microseconds                                          |
+| `cache_hit_rate_percent`  | higher is better | Percentage of data served from cache vs fresh computation                   |
+| `raw_read_avoidance`      | higher is better | Number of full file reads avoided by using tsift surfaces                   |
+| `useful_hit_density`      | higher is better | Ratio of useful results to total output tokens (0.0–1.0)                    |
+
+**Regression gate.** `evaluate_token_regression` compares a candidate sample set against a baseline. For each metric, the candidate median must stay within `allowed_regression_percent` of the baseline median (lower-is-better metrics: candidate ≤ baseline × (1 + regression); higher-is-better metrics: candidate ≥ baseline × (1 − regression)). Any single metric regression on any surface returns `Block`.
+
+**Presence gate.** `evaluate_token_gate` checks that every surface has at least three samples and every recorded metric is non-zero and non-negative. It does not compare against a baseline; it simply validates that the surface is producing measurable signal.
+
+**Storage contract.** Each entry in `fixtures/token-gate-history.json` carries `label`, `id`, `timestamp`, `surface`, and `metrics`. The fixture is append-only; gate evaluation is read-only.
+
 Convex support is a projection backend for the same substrate contract. `GraphProjection::upsert_into` writes nodes before edges, so stores can fail closed when an edge references a missing node. The Convex adapter maps records onto two application tables:
 
 - `nodes`: `externalId`, `kind`, `label`, `properties`, `provenance`, and `freshness`
