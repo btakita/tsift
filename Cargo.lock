@@ -5420,6 +5420,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "serde",
+ "serde_json",
  "surrealdb",
  "tempfile",
  "tokio",

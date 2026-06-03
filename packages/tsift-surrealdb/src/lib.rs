@@ -16,9 +16,27 @@ const NAMESPACE: &str = "tsift";
 const DATABASE: &str = "graph";
 const NODE_TABLE: &str = "graph_node";
 const EDGE_TABLE: &str = "graph_edge";
+const METADATA_TABLE: &str = "metadata";
+const ROW_HASH_KEY: &str = "row_hash";
 
 fn block_on<F: std::future::Future>(rt: &tokio::runtime::Runtime, f: F) -> F::Output {
     rt.block_on(f)
+}
+
+fn row_hash<T: Serialize>(value: &T) -> Result<String> {
+    let payload = serde_json::to_vec(value)?;
+    Ok(blake3::hash(&payload).to_hex().to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WarmStartOutcome {
+    CacheHit,
+    Refreshed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MetadataRecord {
+    value: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -594,6 +612,46 @@ impl SurrealdbGraphStore {
         Ok(store)
     }
 
+    pub fn open_or_refresh(
+        path: &Path,
+        rows: &ConvexProjectionRows,
+    ) -> Result<(Self, WarmStartOutcome)> {
+        let store = Self::open(path)?;
+        let incoming_hash = row_hash(rows)?;
+        let stored = store.stored_row_hash()?;
+        if stored.as_deref() == Some(incoming_hash.as_str()) {
+            return Ok((store, WarmStartOutcome::CacheHit));
+        }
+        store.replace_projection_rows(rows)?;
+        store.set_stored_row_hash(&incoming_hash)?;
+        Ok((store, WarmStartOutcome::Refreshed))
+    }
+
+    fn stored_row_hash(&self) -> Result<Option<String>> {
+        block_on(&self.rt, async {
+            let record: Option<MetadataRecord> = self
+                .db
+                .select((METADATA_TABLE, ROW_HASH_KEY))
+                .await
+                .context("reading SurrealDB stored row hash")?;
+            Ok(record.map(|r| r.value))
+        })
+    }
+
+    fn set_stored_row_hash(&self, hash: &str) -> Result<()> {
+        block_on(&self.rt, async {
+            let _: Option<MetadataRecord> = self
+                .db
+                .upsert((METADATA_TABLE, ROW_HASH_KEY))
+                .content(MetadataRecord {
+                    value: hash.to_string(),
+                })
+                .await
+                .context("storing SurrealDB row hash")?;
+            Ok(())
+        })
+    }
+
     pub fn clear(&self) -> Result<()> {
         block_on(&self.rt, async {
             self.db
@@ -930,7 +988,7 @@ impl GraphStore for SurrealdbGraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tsift_core::{GraphEdge, GraphNode, GraphPropertyFilter, GraphQueryOptions};
+    use tsift_core::{ConvexNodeRow, GraphEdge, GraphNode, GraphPropertyFilter, GraphQueryOptions};
 
     fn sample_rows() -> ConvexProjectionRows {
         let node_a = GraphNode::new("node:a", "symbol", "alpha").with_property("path", "a.rs");
@@ -979,6 +1037,57 @@ mod tests {
             1
         );
         assert_eq!(reopened.graph_counts().unwrap(), (2, 0));
+    }
+
+    #[test]
+    fn surrealdb_store_open_or_refresh_cache_hit_skips_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("surrealdb");
+
+        let (store1, outcome1) =
+            SurrealdbGraphStore::open_or_refresh(&store_path, &sample_rows()).unwrap();
+        assert_eq!(outcome1, WarmStartOutcome::Refreshed);
+        assert_eq!(store1.graph_counts().unwrap(), (2, 1));
+        drop(store1);
+
+        let (store2, outcome2) =
+            SurrealdbGraphStore::open_or_refresh(&store_path, &sample_rows()).unwrap();
+        assert_eq!(outcome2, WarmStartOutcome::CacheHit);
+        assert_eq!(store2.graph_counts().unwrap(), (2, 1));
+
+        assert_eq!(
+            store2
+                .edge(&stable_graph_edge_id("node:a", "node:b", "calls"))
+                .unwrap()
+                .unwrap()
+                .to_id,
+            "node:b"
+        );
+    }
+
+    #[test]
+    fn surrealdb_store_open_or_refresh_detects_changed_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("surrealdb");
+
+        let (store1, outcome1) =
+            SurrealdbGraphStore::open_or_refresh(&store_path, &sample_rows()).unwrap();
+        assert_eq!(outcome1, WarmStartOutcome::Refreshed);
+        drop(store1);
+
+        let changed_rows = ConvexProjectionRows {
+            nodes: vec![ConvexNodeRow::from(&GraphNode::new(
+                "node:x",
+                "file",
+                "new.rs",
+            ))],
+            edges: vec![],
+        };
+        let (store2, outcome2) =
+            SurrealdbGraphStore::open_or_refresh(&store_path, &changed_rows).unwrap();
+        assert_eq!(outcome2, WarmStartOutcome::Refreshed);
+        assert_eq!(store2.graph_counts().unwrap(), (1, 0));
+        assert_eq!(store2.nodes_by_kind("file").unwrap().len(), 1);
     }
 
     #[test]

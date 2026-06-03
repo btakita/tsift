@@ -11280,16 +11280,21 @@ pub(crate) fn graph_db_backend_eval_dataset(
         if *candidate == GraphDbExperimentalBackend::Surrealdb {
             let started = Instant::now();
             let store_path = graph_db_backend_eval_surrealdb_store_path(root, scope, name);
-            let store = SurrealdbGraphStore::from_rows_file_backed(&store_path, &sqlite_rows)?;
+            let (store, warm_start) =
+                SurrealdbGraphStore::open_or_refresh(&store_path, &sqlite_rows)?;
             let (candidate_nodes, candidate_edges) = store.graph_counts()?;
             let rows = candidate_nodes + candidate_edges;
+            let mut refresh_meta = serde_json::json!({
+                "nodes": candidate_nodes,
+                "edges": candidate_edges,
+            });
+            if warm_start == tsift_surrealdb::WarmStartOutcome::CacheHit {
+                refresh_meta["warm_start"] = serde_json::json!("cache_hit");
+            }
             let refresh = graph_db_backend_eval_refresh_operation(
                 started.elapsed().as_micros(),
                 rows,
-                serde_json::json!({
-                    "nodes": candidate_nodes,
-                    "edges": candidate_edges,
-                }),
+                refresh_meta,
             );
             let freshness = sqlite_graph_freshness(sqlite_store, scope.unwrap_or("root"))?;
             let (candidate_report, _signatures) = graph_db_backend_eval_report_for_store(
@@ -11310,7 +11315,7 @@ pub(crate) fn graph_db_backend_eval_dataset(
                 Some(&sqlite_signatures),
                 extra_warnings.clone(),
                 prepared,
-                "provider-neutral rows written into an embedded/file-backed SurrealDB SurrealKV store through the optional tsift-surrealdb adapter",
+                "provider-neutral rows written into an embedded/file-backed SurrealDB SurrealKV store through the optional tsift-surrealdb adapter; warm-start reuses existing store when row hash matches",
                 "embedded/file-backed writer through SurrealDB SurrealKV rewrites backend-eval rows before read-only measurements; promotion still requires multi-process/read-only contention samples",
                 "feature-gated optional tsift-surrealdb crate; default cargo build/install does not pull SurrealDB into the dependency graph",
             );
