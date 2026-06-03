@@ -10,15 +10,21 @@ Extend tsift with tree-sitter AST parsing, dependency graph tracking, and per-su
 tsift (root crate — public package shim: lib.rs + graph/lang/resolution/substrate/libsql_backend
 │        modules only `pub use` sibling crates; the package binary delegates to tsift-cli)
 ├── tsift-core crate (packages/tsift-core — provider-neutral graph types)
-│   ├── GraphNode, GraphEdge, GraphProjection, GraphPath, GraphSubgraph
-│   ├── GraphProvenance, GraphFreshness, GraphPropertyFilter
-│   ├── GraphQueryOptions, GraphQueryPage, GraphPagedSubgraph
-│   ├── NeighborhoodScoring, RankedNeighborhoodOptions, RankedNeighborhoodResult
-│   ├── GraphStore trait (CRUD/query contract — lookup, kind scans, neighborhoods, ranked neighborhoods, shortest paths)
-│   ├── ConvexGraphClient trait, ConvexRowsGraphClient, ConvexGraphStore
-│   ├── ConvexProjectionRows, ConvexNodeRow, ConvexEdgeRow
-│   ├── SQLITE_GRAPH_SCHEMA_VERSION (shared schema version constant)
-│   └── shortest_path_using_outgoing, apply_graph_query_page helpers
+│   ├── types module — GraphNode, GraphEdge, GraphProjection, GraphPath, GraphSubgraph
+│   │   ├── GraphProvenance, GraphFreshness, GraphPropertyFilter
+│   │   ├── GraphQueryOptions, GraphQueryPage, GraphPagedSubgraph
+│   │   ├── NeighborhoodScoring, RankedNeighborhoodOptions, RankedNeighborhoodResult
+│   │   ├── TerseGraphNode, TerseGraphEdge, TerseGraphSubgraph, TerseSearchHit, TerseHealthScore
+│   │   ├── SQLITE_GRAPH_SCHEMA_VERSION (shared schema version constant)
+│   │   └── stable_graph_edge_id, graph_edge_id helpers
+│   ├── store module — GraphStore trait (CRUD/query contract — lookup, kind scans, neighborhoods, ranked neighborhoods, shortest paths)
+│   │   ├── default implementations for edge, paged_edges, neighborhood, ranked_neighborhood, reachable_nodes, resolve_evidence_target
+│   │   ├── apply_graph_query_page, apply_graph_edge_query_page paging helpers
+│   │   └── shortest_path_using_outgoing path helper
+│   ├── convex module — ConvexGraphClient trait, ConvexRowsGraphClient, ConvexGraphStore
+│   │   ├── ConvexProjectionRows, ConvexNodeRow, ConvexEdgeRow
+│   │   └── GraphProjection::upsert_into, to_convex_rows methods (on lib.rs)
+│   └── lib.rs re-exports all public types at crate root for backward compatibility
 ├── tsift-sqlite crate (packages/tsift-sqlite — SQLite graph store backend)
 │   ├── re-exports all tsift-core types for backward compatibility
 │   ├── SqliteGraphStore (graph_nodes, graph_edges, graph_node_properties, projection versions, tombstones)
