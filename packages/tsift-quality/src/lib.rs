@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod cycle_packet_cache;
 pub mod dci_benchmark;
 pub mod lint;
 pub mod perf_gate;

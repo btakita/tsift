@@ -235,6 +235,31 @@ A surface that is absent from history is treated as `missing` and blocks the gat
 
 **Storage contract.** Each entry in `fixtures/token-gate-history.json` carries `label`, `id`, `timestamp`, `surface`, and `metrics`. The fixture is append-only; gate evaluation is read-only.
 
+### Cycle Packet Cache
+
+The cycle packet cache (`#gpackreuse`) reuses graph/context packets across repeated tsift CLI invocations within a single agent-doc cycle. It is implemented in `tsift_quality::cycle_packet_cache` and exercised by `tests/cycle_packet_cache.rs` plus unit tests in `packages/tsift-quality/src/cycle_packet_cache.rs`.
+
+**Problem.** Within one agent-doc cycle, the harness calls `tsift context-pack`, `tsift graph-db evidence`, `tsift conflict-matrix`, and `tsift dispatch-trace` in sequence. Each invocation starts a new process, so the existing in-memory `CONFLICT_MATRIX_PREPARATION_CACHE` (static `OnceLock<Mutex<BTreeMap>>`) does not persist between calls. The conflict-matrix preparation cache and graph-prepared cache persist to disk under `.tsift/conflict-matrix-cache/`, but evidence packets and dispatch-trace results do not, causing redundant graph traversals and conflict-matrix pipeline rebuilds.
+
+**Cache locations.** The cycle packet cache stores entries under `.tsift/cycle-packet-cache/`:
+
+| Kind | Directory | Key |
+|------|-----------|-----|
+| `evidence` | `.tsift/cycle-packet-cache/evidence/` | `blake3(version + "evidence" + packet_id)` |
+| `context-pack` | `.tsift/cycle-packet-cache/context-pack/` | `blake3(version + source + document + staged_diff)` |
+| `impact` | `.tsift/cycle-packet-cache/impact/` | `blake3(version + source + document + staged_diff)` |
+| `conflict-matrix` | `.tsift/cycle-packet-cache/conflict-matrix/` | `blake3(version + source + document + staged_diff + targets + depth + limit)` |
+
+**Evidence packet reuse.** `collect_conflict_matrix_evidence_packets` checks the disk cache before calling `graph_db_evidence_report_from_store`. On a cache hit, the evidence report and summary are returned without re-traversing the graph store. The cache key is derived from the deterministic `packet_id` (which already encodes `contract_version + target + target_node.id + freshness.content_hash`), so a cache hit proves the same graph projection produced the same evidence.
+
+**Dispatch-trace reuse.** `build_dispatch_trace_report` checks the disk cache after preparing conflict-matrix inputs. On a cache hit, the full `DispatchTraceReport` is returned without rebuilding the conflict-matrix pipeline. The cache key includes the source/document/staged-diff watermarks plus targets, depth, and limit, ensuring the trace is reused only when all inputs match.
+
+**Skipped phase proof.** Cache hits report `0us` timing for the skipped phase and include the watermark guard in the phase detail, matching the existing `conflict_matrix_prepared_inputs_cache_hit` pattern.
+
+**Stable packet ID proof.** Evidence packet IDs are deterministic: `graph_db_evidence_packet_id` returns `stable_handle("gevd", version:target:node_id:content_hash)`. The cycle packet cache stores entries keyed by this packet ID, so a cache hit proves the same packet ID was produced for the same inputs. Integration tests verify that `packet_id` survives the cache roundtrip unchanged.
+
+**Cache version.** `CYCLE_PACKET_CACHE_VERSION = "cycle-packet-cache-v1"`. A version bump invalidates all existing cache entries.
+
 Convex support is a projection backend for the same substrate contract. `GraphProjection::upsert_into` writes nodes before edges, so stores can fail closed when an edge references a missing node. The Convex adapter maps records onto two application tables:
 
 - `nodes`: `externalId`, `kind`, `label`, `properties`, `provenance`, and `freshness`

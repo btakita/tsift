@@ -67,7 +67,7 @@ use tsift_digest::{diff_digest, log_digest, metric_digest, test_digest};
 use tsift_graph as graph;
 use tsift_index::{config, index, init, multiplicity, walk};
 use tsift_memory::{MemoryEvent, default_memory_db_path, read_memory_events};
-use tsift_quality::{dci_benchmark, lint, perf_gate};
+use tsift_quality::{cycle_packet_cache, dci_benchmark, lint, perf_gate};
 use tsift_resolution as resolution;
 use tsift_search::{impact, sift, tagpath_adapter};
 use tsift_sqlite as substrate;
@@ -22639,7 +22639,7 @@ pub(crate) fn render_test_digest_from_input(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ConflictMatrixRisk {
     Low,
@@ -22648,7 +22648,7 @@ enum ConflictMatrixRisk {
     FailClosed,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ConflictMatrixOverlap {
     files: Vec<String>,
     symbols: Vec<String>,
@@ -22656,7 +22656,7 @@ struct ConflictMatrixOverlap {
     config_files: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ConflictMatrixSourceHandle {
     handle: String,
     file: String,
@@ -22666,7 +22666,7 @@ struct ConflictMatrixSourceHandle {
     expand: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ConflictMatrixSemanticRef {
     handle: String,
     kind: String,
@@ -22678,7 +22678,7 @@ struct ConflictMatrixSemanticRef {
     expand: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ConflictMatrixTokenBudget {
     prompt_estimated_tokens: usize,
     max_prompt_tokens: usize,
@@ -22687,7 +22687,7 @@ struct ConflictMatrixTokenBudget {
     max_context_bytes: usize,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ConflictMatrixRequiredContext {
     read_only_files: Vec<String>,
     source_handles: Vec<String>,
@@ -22696,7 +22696,7 @@ struct ConflictMatrixRequiredContext {
     expansion_commands: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ConflictMatrixGraphHandles {
     target_node_id: String,
     evidence_packet_id: String,
@@ -22708,7 +22708,7 @@ struct ConflictMatrixGraphHandles {
     semantic_handles: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ConflictMatrixWorkerFeedback {
     total: usize,
     completed: usize,
@@ -22726,9 +22726,9 @@ struct ConflictMatrixWorkerFeedback {
     warnings: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ConflictMatrixOwnershipBlock {
-    contract_version: &'static str,
+    contract_version: String,
     title: String,
     owned_files: Vec<String>,
     owned_symbols: Vec<String>,
@@ -22741,9 +22741,9 @@ struct ConflictMatrixOwnershipBlock {
     prompt: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ConflictMatrixWorkerPromptPacket {
-    contract_version: &'static str,
+    contract_version: String,
     packet_id: String,
     target: String,
     rank: usize,
@@ -22770,7 +22770,7 @@ struct ConflictMatrixWorkerPromptPacket {
     prompt: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ConflictMatrixCandidate {
     rank: usize,
     target: String,
@@ -22804,7 +22804,7 @@ struct ConflictMatrixCandidate {
     ownership: ConflictMatrixOwnershipBlock,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ConflictMatrixPair {
     left: String,
     right: String,
@@ -22817,7 +22817,7 @@ struct ConflictMatrixPair {
     verdict: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ConflictMatrixInputSummary {
     graph_db_evidence_targets: Vec<String>,
     evidence_packets: Vec<ConflictMatrixEvidencePacketSummary>,
@@ -22913,7 +22913,7 @@ struct ConflictMatrixPreparationCacheSummary {
     staged_diff_watermark: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ConflictMatrixContextSummary {
     target: String,
     target_kind: String,
@@ -22926,7 +22926,7 @@ struct ConflictMatrixContextSummary {
     status_reminders: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ConflictMatrixPerTargetFailClosed {
     target: String,
     previously_completed: bool,
@@ -22935,9 +22935,9 @@ struct ConflictMatrixPerTargetFailClosed {
     source_handle_count: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ConflictMatrixOrchestrationObservability {
-    contract_version: &'static str,
+    contract_version: String,
     projection_freshness: GraphDbFreshnessReport,
     projection_hashes: Vec<String>,
     evidence_packet_ids: Vec<String>,
@@ -22946,9 +22946,9 @@ struct ConflictMatrixOrchestrationObservability {
     follow_up_commands: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ConflictMatrixReport {
-    contract_version: &'static str,
+    contract_version: String,
     root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     scope: Option<String>,
@@ -23440,8 +23440,8 @@ fn apply_conflict_matrix_worker_feedback_controls(candidates: &mut [ConflictMatr
 }
 
 fn empty_conflict_matrix_ownership(target: &str) -> ConflictMatrixOwnershipBlock {
-    ConflictMatrixOwnershipBlock {
-        contract_version: WORKER_PROMPT_PACKET_CONTRACT_VERSION,
+     ConflictMatrixOwnershipBlock {
+         contract_version: WORKER_PROMPT_PACKET_CONTRACT_VERSION.to_string(),
         title: format!("Worker ownership for {target}"),
         owned_files: Vec::new(),
         owned_symbols: Vec::new(),
@@ -23916,7 +23916,7 @@ fn apply_conflict_matrix_ownership_blocks(candidates: &mut [ConflictMatrixCandid
             token_budget.max_context_bytes,
         );
         candidate.ownership = ConflictMatrixOwnershipBlock {
-            contract_version: WORKER_PROMPT_PACKET_CONTRACT_VERSION,
+            contract_version: WORKER_PROMPT_PACKET_CONTRACT_VERSION.to_string(),
             title,
             owned_files: candidate.owned_files.clone(),
             owned_symbols: candidate.owned_symbols.clone(),
@@ -24016,7 +24016,7 @@ fn conflict_matrix_worker_prompt_packets(
     candidates
         .iter()
         .map(|candidate| ConflictMatrixWorkerPromptPacket {
-            contract_version: WORKER_PROMPT_PACKET_CONTRACT_VERSION,
+            contract_version: WORKER_PROMPT_PACKET_CONTRACT_VERSION.to_string(),
             packet_id: conflict_matrix_worker_prompt_packet_id(candidate),
             target: candidate.target.clone(),
             rank: candidate.rank,
@@ -24090,7 +24090,7 @@ fn conflict_matrix_orchestration_observability(
         .map(|candidate| candidate.ownership.title.clone())
         .collect::<Vec<_>>();
     ConflictMatrixOrchestrationObservability {
-        contract_version: CONFLICT_MATRIX_CONTRACT_VERSION,
+        contract_version: CONFLICT_MATRIX_CONTRACT_VERSION.to_string(),
         projection_freshness: freshness.clone(),
         projection_hashes,
         evidence_packet_ids,
@@ -24874,6 +24874,14 @@ fn collect_conflict_matrix_evidence_packets<S: GraphStore>(
 ) -> Result<Vec<ConflictMatrixPreparedEvidence>> {
     let mut evidence = Vec::new();
     for target in targets {
+        let cache_key = cycle_packet_cache::cycle_packet_evidence_key(target);
+        if let Some(cached) = cycle_packet_cache::cycle_packet_read_cache::<
+            ConflictMatrixPreparedEvidence,
+        >(root, cycle_packet_cache::CyclePacketKind::Evidence, &cache_key)
+        {
+            evidence.push(cached);
+            continue;
+        }
         let report = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
             root,
             scope,
@@ -24888,7 +24896,17 @@ fn collect_conflict_matrix_evidence_packets<S: GraphStore>(
         .with_context(|| format!("collecting graph-db evidence for {target}"))?;
         let summary =
             conflict_matrix_evidence_packet_summary(root, scope, target, depth, limit, &report);
-        evidence.push(ConflictMatrixPreparedEvidence { report, summary });
+        let prepared = ConflictMatrixPreparedEvidence {
+            report,
+            summary: summary.clone(),
+        };
+        cycle_packet_cache::cycle_packet_write_cache(
+            root,
+            cycle_packet_cache::CyclePacketKind::Evidence,
+            &cache_key,
+            &prepared,
+        );
+        evidence.push(prepared);
     }
     Ok(evidence)
 }
@@ -25103,7 +25121,7 @@ fn build_conflict_matrix_report_from_prepared_graph(
     };
     let context_summary = conflict_matrix_context_summary(context_pack);
     Ok(ConflictMatrixReport {
-        contract_version: CONFLICT_MATRIX_CONTRACT_VERSION,
+        contract_version: CONFLICT_MATRIX_CONTRACT_VERSION.to_string(),
         root: root.to_string_lossy().to_string(),
         scope: scope.map(str::to_string),
         targets,
@@ -25279,7 +25297,7 @@ fn cmd_conflict_matrix(
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct DispatchTraceSummary {
     backlog: usize,
     job_packet: usize,
@@ -25289,9 +25307,9 @@ struct DispatchTraceSummary {
     semantic_rows: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct DispatchTraceReport {
-    contract_version: &'static str,
+    contract_version: String,
     root: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     scope: Option<String>,
@@ -25541,7 +25559,7 @@ fn build_dispatch_trace_report_from_conflict_snapshot(
     warnings.extend(extra_warnings);
 
     Ok(DispatchTraceReport {
-        contract_version: DISPATCH_TRACE_CONTRACT_VERSION,
+        contract_version: DISPATCH_TRACE_CONTRACT_VERSION.to_string(),
         root: conflict.root,
         scope: conflict.scope,
         targets: conflict.targets,
@@ -25601,6 +25619,23 @@ fn build_dispatch_trace_report(
         &store,
         freshness.clone(),
     )?;
+    let dt_cache_key = cycle_packet_cache::cycle_packet_watermark_key(
+        &prepared.preparation_cache.source_watermark,
+        &prepared.preparation_cache.document_watermark,
+        &prepared.preparation_cache.staged_diff_watermark,
+        &[
+            &format!("targets:{}", raw_targets.join(",")),
+            &format!("depth:{depth}"),
+            &format!("limit:{limit}"),
+        ],
+    );
+    if let Some(cached_report) = cycle_packet_cache::cycle_packet_read_cache::<DispatchTraceReport>(
+        &root,
+        cycle_packet_cache::CyclePacketKind::ConflictMatrix,
+        &dt_cache_key,
+    ) {
+        return Ok(cached_report);
+    }
     let conflict = build_conflict_matrix_report_from_prepared_graph(
         &root,
         path,
@@ -25613,7 +25648,7 @@ fn build_dispatch_trace_report(
         &prepared,
         &graph_prepared,
     )?;
-    build_dispatch_trace_report_from_conflict_snapshot(
+    let report = build_dispatch_trace_report_from_conflict_snapshot(
         &root,
         scope,
         conflict,
@@ -25622,7 +25657,14 @@ fn build_dispatch_trace_report(
         depth,
         limit,
         extra_warnings,
-    )
+    )?;
+    cycle_packet_cache::cycle_packet_write_cache(
+        &root,
+        cycle_packet_cache::CyclePacketKind::ConflictMatrix,
+        &dt_cache_key,
+        &report,
+    );
+    Ok(report)
 }
 
 fn dispatch_trace_html(report: &DispatchTraceReport) -> Result<String> {
@@ -25645,7 +25687,7 @@ fn dispatch_trace_html(report: &DispatchTraceReport) -> Result<String> {
         report.evidence_packet_ids.len(),
         report.nodes.len(),
         report.worker_prompt_packets.len(),
-        html_escape(report.contract_version)
+        html_escape(&report.contract_version)
     ));
     html.push_str(
         r#"<main class="layout"><section class="panel"><svg id="graph-canvas" role="img" aria-label="Dispatch trace graph"></svg></section><aside class="side"><h2>Worker Prompt Packets</h2><div id="packets" class="list"></div><h2>Worker Feedback</h2><div id="feedback" class="list"></div><h2>Nodes</h2><div id="nodes" class="list"></div></aside></main>"#,
