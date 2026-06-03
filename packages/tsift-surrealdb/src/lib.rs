@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use surrealdb::RecordId;
 use surrealdb::Surreal;
 use surrealdb::engine::local::{Db, Mem, SurrealKv};
@@ -559,15 +559,27 @@ impl SurrealEdgeIndexes {
 
 pub struct SurrealdbGraphStore {
     db: Surreal<Db>,
-    rt: tokio::runtime::Runtime,
+    rt: Arc<tokio::runtime::Runtime>,
     nodes: RwLock<BTreeMap<String, GraphNode>>,
     edges: RwLock<SurrealEdgeIndexes>,
     node_row_hashes: RwLock<BTreeMap<String, String>>,
     edge_row_hashes: RwLock<BTreeMap<String, String>>,
 }
 
+fn create_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("creating tokio runtime for SurrealDB")
+}
+
 impl SurrealdbGraphStore {
     pub fn open(path: &Path) -> Result<Self> {
+        let rt = Arc::new(create_runtime()?);
+        Self::open_with_runtime(path, rt)
+    }
+
+    pub fn open_with_runtime(path: &Path, rt: Arc<tokio::runtime::Runtime>) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -576,10 +588,6 @@ impl SurrealdbGraphStore {
                 )
             })?;
         }
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("creating tokio runtime for SurrealDB")?;
         let db = block_on(&rt, async {
             let db = Surreal::new::<SurrealKv>(path).await.with_context(|| {
                 format!("opening SurrealDB SurrealKV store: {}", path.display())
@@ -603,10 +611,11 @@ impl SurrealdbGraphStore {
     }
 
     pub fn in_memory() -> Result<Self> {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("creating tokio runtime for in-memory SurrealDB")?;
+        let rt = Arc::new(create_runtime()?);
+        Self::in_memory_with_runtime(rt)
+    }
+
+    pub fn in_memory_with_runtime(rt: Arc<tokio::runtime::Runtime>) -> Result<Self> {
         let db = block_on(&rt, async {
             let db = Surreal::new::<Mem>(())
                 .await
@@ -1731,5 +1740,29 @@ mod tests {
         let (nodes, edges) = store.graph_counts().unwrap();
         assert_eq!(nodes, 3);
         assert_eq!(edges, 1);
+    }
+
+    #[test]
+    fn surrealdb_store_shared_runtime_across_stores() {
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let store1 = SurrealdbGraphStore::in_memory_with_runtime(rt.clone()).unwrap();
+        let store2 = SurrealdbGraphStore::in_memory_with_runtime(rt).unwrap();
+
+        store1
+            .upsert_node(&GraphNode::new("node:a", "symbol", "alpha"))
+            .unwrap();
+        store2
+            .upsert_node(&GraphNode::new("node:b", "symbol", "beta"))
+            .unwrap();
+
+        assert_eq!(store1.graph_counts().unwrap().0, 1);
+        assert_eq!(store2.graph_counts().unwrap().0, 1);
+        assert!(store1.node("node:a").unwrap().is_some());
+        assert!(store2.node("node:b").unwrap().is_some());
     }
 }
