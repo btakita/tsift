@@ -57,6 +57,7 @@ use substrate::{
     GraphProvenance, GraphQueryOptions, GraphQueryPage, GraphStore, SQLITE_GRAPH_SCHEMA_VERSION,
     SqliteGraphStore, SqliteProjectionRefresh,
 };
+use tsift_core::{NeighborhoodScoring, RankedNeighborhoodOptions};
 use tagpath::{family as tagpath_family, ontology as tagpath_ontology};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
 use tree_sitter::StreamingIterator as _;
@@ -10272,6 +10273,23 @@ struct GraphDbPageReport {
 
 type GraphDbRankedNeighbor = resolution::RankedNeighbor;
 
+#[derive(Clone, Debug, Serialize)]
+struct GraphDbRankedNeighborhoodComparison {
+    traversal_nodes: usize,
+    traversal_edges: usize,
+    pruned_count: usize,
+    total_discovered: usize,
+    latency_micros: u128,
+    overlap_with_unranked_pct: f64,
+    useful_hit_density_ranked: f64,
+    useful_hit_density_unranked: f64,
+    duplicate_name_count_ranked: usize,
+    duplicate_name_count_unranked: usize,
+    handle_coverage_ranked_pct: f64,
+    handle_coverage_unranked_pct: f64,
+    diagnostics: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct GraphDbDroppedByBudget {
     item: String,
@@ -10345,6 +10363,8 @@ struct GraphDbReport {
     semantic_related: Vec<SemanticRelatedItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     neighborhood_ranking_gate: Option<GraphDbNeighborhoodRankingGate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ranked_neighborhood_comparison: Option<GraphDbRankedNeighborhoodComparison>,
     #[serde(skip_serializing_if = "Option::is_none")]
     knowledge_retrieval: Option<GraphDbKnowledgeRetrieval>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12785,6 +12805,18 @@ fn graph_db_semantic_readiness(
         }
         status::SummaryStatus::None { .. } => {
             let summarize = graph_db_status_summarize_command(&report);
+            let index_command = report
+                .recommendations
+                .run
+                .as_deref()
+                .filter(|cmd| cmd.contains("index"))
+                .map(str::to_string);
+            let mut repair = Vec::new();
+            if let Some(cmd) = index_command {
+                repair.push(cmd);
+            }
+            repair.push(summarize.clone());
+            repair.push(graph_db_refresh_command(root, scope));
             graph_effectiveness_blocked(
                 "summary_cache_empty",
                 vec![format!(
@@ -12793,22 +12825,27 @@ fn graph_db_semantic_readiness(
                     root.display(),
                     graph_db_refresh_command(root, scope)
                 )],
-                vec![summarize, graph_db_refresh_command(root, scope)],
+                repair,
             )
         }
-        status::SummaryStatus::Unavailable => graph_effectiveness_blocked(
-            "summary_cache_unavailable",
-            vec![
-                "summary cache unavailable because the source index is missing; build the index before relying on semantic graph evidence".to_string(),
-            ],
-            report
+        status::SummaryStatus::Unavailable => {
+            let mut repair: Vec<String> = report
                 .recommendations
                 .run
                 .clone()
                 .into_iter()
-                .chain(std::iter::once(graph_db_refresh_command(root, scope)))
-                .collect(),
-        ),
+                .collect();
+            let summarize = "tsift summarize --extract .".to_string();
+            repair.push(summarize);
+            repair.push(graph_db_refresh_command(root, scope));
+            graph_effectiveness_blocked(
+                "summary_cache_unavailable",
+                vec![
+                    "summary cache unavailable because the source index is missing; build the index, extract summaries, and refresh the graph before relying on semantic graph evidence".to_string(),
+                ],
+                repair,
+            )
+        }
     }
 }
 
@@ -12979,6 +13016,114 @@ fn graph_db_ranked_neighbors(
     cap: usize,
 ) -> Vec<GraphDbRankedNeighbor> {
     resolution::ranked_neighbors_capped(center_id, nodes, edges, cap)
+}
+
+fn graph_db_ranked_neighborhood_comparison<S: GraphStore>(
+    center_id: &str,
+    depth: usize,
+    edge_kind: Option<&str>,
+    limit: Option<usize>,
+    unranked_nodes: &[SubstrateGraphNode],
+    unranked_edges: &[SubstrateGraphEdge],
+    store: &S,
+) -> Result<Option<GraphDbRankedNeighborhoodComparison>> {
+    use std::time::Instant;
+    let max_nodes = match limit {
+        Some(0) | None => 200,
+        Some(n) => n.clamp(10, 500),
+    };
+    let mut options = RankedNeighborhoodOptions::new(depth, max_nodes)
+        .with_scoring(NeighborhoodScoring::EdgeKindWeighted);
+    if let Some(kind) = edge_kind {
+        options = options.with_edge_kind(kind);
+    }
+    let start = Instant::now();
+    let result = store.ranked_neighborhood(center_id, &options)?;
+    let latency = start.elapsed().as_micros();
+    let Some(ranked) = result else {
+        return Ok(None);
+    };
+    let unranked_ids: BTreeSet<_> = unranked_nodes.iter().map(|n| n.id.as_str()).collect();
+    let ranked_ids: BTreeSet<_> = ranked.nodes.iter().map(|n| n.id.as_str()).collect();
+    let overlap_count = ranked_ids.intersection(&unranked_ids).count();
+    let overlap_pct = if unranked_ids.is_empty() || ranked_ids.is_empty() {
+        0.0
+    } else {
+        (overlap_count as f64 / unranked_ids.len().max(ranked_ids.len()) as f64) * 100.0
+    };
+    let count_duplicates = |nodes: &[SubstrateGraphNode]| -> usize {
+        let mut name_count = BTreeMap::<&str, usize>::new();
+        for n in nodes {
+            *name_count.entry(&n.label).or_default() += 1;
+        }
+        name_count.values().filter(|&&c| c > 1).count()
+    };
+    let count_handle_coverage = |nodes: &[SubstrateGraphNode]| -> f64 {
+        if nodes.is_empty() {
+            return 100.0;
+        }
+        let with_handle = nodes
+            .iter()
+            .filter(|n| n.properties.contains_key("handle") || n.properties.contains_key("ref_id"))
+            .count();
+        (with_handle as f64 / nodes.len() as f64) * 100.0
+    };
+    let useful_density = |nodes: &[SubstrateGraphNode], edges: &[SubstrateGraphEdge]| -> f64 {
+        if nodes.is_empty() {
+            return 0.0;
+        }
+        let semantic_kinds = [
+            "semantic_concept",
+            "semantic_entity",
+            "symbol",
+            "file",
+            "source_handle",
+        ];
+        let useful = nodes
+            .iter()
+            .filter(|n| semantic_kinds.contains(&n.kind.as_str()))
+            .count();
+        let edge_diversity = edges.iter().map(|e| &e.kind).collect::<BTreeSet<_>>().len();
+        let kind_diversity = nodes.iter().map(|n| &n.kind).collect::<BTreeSet<_>>().len();
+        (useful as f64 * 0.5 + kind_diversity as f64 * 0.3 + edge_diversity as f64 * 0.2)
+            / nodes.len() as f64
+    };
+    Ok(Some(GraphDbRankedNeighborhoodComparison {
+        traversal_nodes: ranked.nodes.len(),
+        traversal_edges: ranked.edges.len(),
+        pruned_count: ranked.pruned_count,
+        total_discovered: ranked.total_discovered,
+        latency_micros: latency,
+        overlap_with_unranked_pct: (overlap_pct * 100.0).round() / 100.0,
+        useful_hit_density_ranked: (useful_density(&ranked.nodes, &ranked.edges) * 1000.0).round()
+            / 1000.0,
+        useful_hit_density_unranked: (useful_density(unranked_nodes, unranked_edges) * 1000.0)
+            .round()
+            / 1000.0,
+        duplicate_name_count_ranked: count_duplicates(&ranked.nodes),
+        duplicate_name_count_unranked: count_duplicates(unranked_nodes),
+        handle_coverage_ranked_pct: (count_handle_coverage(&ranked.nodes) * 100.0).round() / 100.0,
+        handle_coverage_unranked_pct: (count_handle_coverage(unranked_nodes) * 100.0).round()
+            / 100.0,
+        diagnostics: vec![
+            format!(
+                "ranked_neighborhood traversed {} node(s), {} edge(s) with {} pruned of {} discovered in {}µs",
+                ranked.nodes.len(),
+                ranked.edges.len(),
+                ranked.pruned_count,
+                ranked.total_discovered,
+                latency
+            ),
+            format!(
+                "overlap with unranked BFS: {:.1}% ({} shared of {} unranked, {} ranked)",
+                overlap_pct,
+                overlap_count,
+                unranked_ids.len(),
+                ranked_ids.len()
+            ),
+            "comparison is diagnostic; promotion requires community-search quality gate to pass for every required workload".to_string(),
+        ],
+    }))
 }
 
 struct GraphDbBudgetedSubgraph {
@@ -13973,6 +14118,22 @@ pub(crate) fn graph_db_evidence_report_from_store<S: GraphStore>(
             repair_commands.join("; ")
         );
     }
+    let semantic_readiness = graph_db_semantic_readiness(
+        root,
+        scope,
+        graph_store_semantic_node_count(store).ok(),
+    );
+    if semantic_readiness.fail_closed {
+        warnings.push(format!(
+            "graph evidence semantic readiness blocked: {} — {}",
+            semantic_readiness.reason,
+            semantic_readiness.diagnostics.join("; ")
+        ));
+        warnings.push(format!(
+            "repair: {}",
+            semantic_readiness.next_commands.join("; then ")
+        ));
+    }
     let target_node = graph_db_resolve_evidence_target(store, target)?
         .with_context(|| format!("graph-db evidence target not found: {target}"))?;
     let max_rows = if limit == 0 { usize::MAX } else { limit };
@@ -14230,6 +14391,7 @@ pub(crate) fn graph_db_report_from_store(
         ranked_neighbors: Vec::new(),
         semantic_related: Vec::new(),
         neighborhood_ranking_gate: None,
+        ranked_neighborhood_comparison: None,
         knowledge_retrieval: None,
         output_budget: None,
         path: None,
@@ -14442,6 +14604,17 @@ pub(crate) fn graph_db_report_from_store(
                 page.diagnostics.extend(budget_report.diagnostics.clone());
                 report.page = Some(page);
                 report.output_budget = Some(budget_report);
+                if let Some(comparison) = graph_db_ranked_neighborhood_comparison(
+                    &id,
+                    depth,
+                    edge_kind.as_deref(),
+                    options.limit,
+                    &report.nodes,
+                    &report.edges,
+                    store,
+                )? {
+                    report.ranked_neighborhood_comparison = Some(comparison);
+                }
             }
         }
         GraphDbQuery::Path {
@@ -28687,36 +28860,61 @@ fn context_pack_graph_orchestration(
     if readiness.fail_closed {
         warnings.extend(readiness.diagnostics.clone());
     }
-    let mut targets = next_context
-        .prompt_targets
-        .iter()
-        .flat_map(|prompt| extract_conflict_target_refs(prompt))
-        .collect::<Vec<_>>();
-    if targets.is_empty() {
-        targets.extend(
-            exploration
-                .worker_context
-                .iter()
-                .flat_map(|worker| extract_conflict_target_refs(&worker.summary)),
-        );
-    }
-    targets = dedupe_preserve_order(targets);
 
-    let mut evidence_packet_ids = Vec::new();
-    let mut resolvable_targets = Vec::new();
-    for target in &targets {
-        match graph_db_resolve_evidence_target(&store, target)? {
-            Some(node) => {
-                evidence_packet_ids.push(graph_db_evidence_packet_id(
-                    target,
-                    &node,
-                    &projection_freshness,
-                ));
-                resolvable_targets.push(target.clone());
+    let (evidence_packet_ids, resolvable_targets, conflict_matrix_decisions) =
+        if readiness.fail_closed {
+            (
+                Vec::new(),
+                Vec::new(),
+                vec![format!(
+                    "graph readiness blocked ({}); resolve readiness warnings before running conflict-matrix",
+                    readiness.reason,
+                )],
+            )
+        } else {
+            let mut targets = next_context
+                .prompt_targets
+                .iter()
+                .flat_map(|prompt| extract_conflict_target_refs(prompt))
+                .collect::<Vec<_>>();
+            if targets.is_empty() {
+                targets.extend(
+                    exploration
+                        .worker_context
+                        .iter()
+                        .flat_map(|worker| extract_conflict_target_refs(&worker.summary)),
+                );
             }
-            None => warnings.push(format!("graph evidence target not found: {target}")),
-        }
-    }
+            targets = dedupe_preserve_order(targets);
+
+            let mut ev_ids = Vec::new();
+            let mut resolved = Vec::new();
+            for target in &targets {
+                match graph_db_resolve_evidence_target(&store, target)? {
+                    Some(node) => {
+                        ev_ids.push(graph_db_evidence_packet_id(
+                            target,
+                            &node,
+                            &projection_freshness,
+                        ));
+                        resolved.push(target.clone());
+                    }
+                    None => warnings.push(format!("graph evidence target not found: {target}")),
+                }
+            }
+
+            let decisions = if resolved.is_empty() {
+                vec![
+                    "no resolvable backlog/job targets found for conflict-matrix".to_string(),
+                ]
+            } else {
+                vec![format!(
+                    "run conflict-matrix before parallel dispatch for {} target(s)",
+                    resolved.len()
+                )]
+            };
+            (ev_ids, resolved, decisions)
+        };
 
     let mut follow_up_commands = vec![format!(
         "tsift graph-db --path {} status --json",
@@ -28741,15 +28939,6 @@ fn context_pack_graph_orchestration(
                 .join(" ")
         ));
     }
-
-    let conflict_matrix_decisions = if resolvable_targets.is_empty() {
-        vec!["no resolvable backlog/job targets found for conflict-matrix".to_string()]
-    } else {
-        vec![format!(
-            "run conflict-matrix before parallel dispatch for {} target(s)",
-            resolvable_targets.len()
-        )]
-    };
     let worker_ownership_blocks = exploration
         .worker_context
         .iter()
@@ -40480,8 +40669,8 @@ fn sample() {}
                 .graph_orchestration
                 .evidence_packet_ids
                 .iter()
-                .any(|id| id.starts_with("gevd-")),
-            "{:?}",
+                .all(|id| !id.starts_with("gevd-")),
+            "evidence packet ids should be empty when readiness is blocked: {:?}",
             report.graph_orchestration.evidence_packet_ids
         );
         assert!(
@@ -40489,17 +40678,17 @@ fn sample() {}
                 .graph_orchestration
                 .conflict_matrix_decisions
                 .iter()
-                .any(|decision| decision.contains("run conflict-matrix")),
-            "{:?}",
+                .any(|decision| decision.contains("readiness blocked")),
+            "conflict-matrix decisions should reference readiness block: {:?}",
             report.graph_orchestration.conflict_matrix_decisions
         );
         assert!(
-            report
+            !report
                 .graph_orchestration
                 .follow_up_commands
                 .iter()
                 .any(|command| command.contains("conflict-matrix")),
-            "{:?}",
+            "conflict-matrix command should not appear when readiness is blocked: {:?}",
             report.graph_orchestration.follow_up_commands
         );
         assert!(

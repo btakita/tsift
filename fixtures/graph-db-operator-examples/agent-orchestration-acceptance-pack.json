@@ -601,7 +601,7 @@
       "projection_freshness_status": "current",
       "evidence_packet_count": 0,
       "conflict_matrix_decisions": [
-        "no resolvable backlog/job targets found for conflict-matrix"
+        "graph readiness blocked (summary_cache_empty); resolve readiness warnings before running conflict-matrix"
       ],
       "follow_up_mentions_conflict_matrix": false,
       "worker_ownership_block_count": 4
