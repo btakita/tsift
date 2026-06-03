@@ -1637,4 +1637,99 @@ mod tests {
         assert_eq!(store.delete_edge("node:a", "node:b", "calls").unwrap(), 1);
         assert_eq!(store.graph_counts().unwrap(), (2, 0));
     }
+
+    #[test]
+    fn surrealdb_store_multi_process_reader_writer_lock() {
+        if std::env::var("TSIFT_SURREALDB_MULTI_PROC_ROLE").is_ok() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("surrealdb");
+
+        let rows = sample_rows();
+        let store = SurrealdbGraphStore::from_rows_file_backed(&store_path, &rows).unwrap();
+        assert_eq!(store.graph_counts().unwrap(), (2, 1));
+        drop(store);
+
+        let test_exe = std::env::current_exe().unwrap();
+        let mut readers = Vec::new();
+        for _ in 0..3 {
+            let store_path_arg = store_path.to_str().unwrap().to_string();
+            let child = std::process::Command::new(&test_exe)
+                .env("TSIFT_SURREALDB_MULTI_PROC_ROLE", "reader")
+                .env("TSIFT_SURREALDB_STORE_PATH", &store_path_arg)
+                .args(["--test-threads=1", "surrealdb_store_multiproc_reader"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn reader process");
+            readers.push(child);
+        }
+
+        let writer_path = store_path.to_str().unwrap().to_string();
+        let writer = std::process::Command::new(&test_exe)
+            .env("TSIFT_SURREALDB_MULTI_PROC_ROLE", "writer")
+            .env("TSIFT_SURREALDB_STORE_PATH", &writer_path)
+            .args(["--test-threads=1", "surrealdb_store_multiproc_writer"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn writer process");
+
+        let writer_output = writer.wait_with_output().expect("writer wait");
+        assert!(
+            writer_output.status.success(),
+            "writer process failed: {}",
+            String::from_utf8_lossy(&writer_output.stderr)
+        );
+
+        for reader in readers {
+            let output = reader.wait_with_output().expect("reader wait");
+            assert!(
+                output.status.success(),
+                "reader process failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let verify = SurrealdbGraphStore::open(&store_path).unwrap();
+        let (nodes, edges) = verify.graph_counts().unwrap();
+        assert_eq!(nodes, 3);
+        assert_eq!(edges, 1);
+        assert!(verify.node("node:c").unwrap().is_some());
+    }
+
+    #[test]
+    fn surrealdb_store_multiproc_reader() {
+        if std::env::var("TSIFT_SURREALDB_MULTI_PROC_ROLE").as_deref() != Ok("reader") {
+            return;
+        }
+        let store_path = std::env::var("TSIFT_SURREALDB_STORE_PATH").unwrap();
+        let store = SurrealdbGraphStore::open(Path::new(&store_path)).unwrap();
+        let (nodes, edges) = store.graph_counts().unwrap();
+        assert!(nodes >= 2);
+        assert!(edges >= 1);
+        let edge = store
+            .edge(&stable_graph_edge_id("node:a", "node:b", "calls"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(edge.from_id, "node:a");
+        assert_eq!(edge.to_id, "node:b");
+    }
+
+    #[test]
+    fn surrealdb_store_multiproc_writer() {
+        if std::env::var("TSIFT_SURREALDB_MULTI_PROC_ROLE").as_deref() != Ok("writer") {
+            return;
+        }
+        let store_path = std::env::var("TSIFT_SURREALDB_STORE_PATH").unwrap();
+        let store = SurrealdbGraphStore::open(Path::new(&store_path)).unwrap();
+        store
+            .upsert_node(&GraphNode::new("node:c", "symbol", "gamma"))
+            .unwrap();
+        let (nodes, edges) = store.graph_counts().unwrap();
+        assert_eq!(nodes, 3);
+        assert_eq!(edges, 1);
+    }
 }
