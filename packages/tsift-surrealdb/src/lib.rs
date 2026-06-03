@@ -34,6 +34,16 @@ pub enum WarmStartOutcome {
     Refreshed,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaRefreshStats {
+    pub unchanged_nodes: usize,
+    pub unchanged_edges: usize,
+    pub changed_nodes: usize,
+    pub changed_edges: usize,
+    pub tombstoned_nodes: usize,
+    pub tombstoned_edges: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct MetadataRecord {
     value: String,
@@ -47,6 +57,8 @@ struct SurrealNodeRecord {
     properties: std::collections::BTreeMap<String, String>,
     provenance: Vec<tsift_core::GraphProvenance>,
     freshness: Option<tsift_core::GraphFreshness>,
+    #[serde(default)]
+    row_hash: Option<String>,
 }
 
 impl From<&GraphNode> for SurrealNodeRecord {
@@ -58,6 +70,7 @@ impl From<&GraphNode> for SurrealNodeRecord {
             properties: node.properties.clone(),
             provenance: node.provenance.clone(),
             freshness: node.freshness.clone(),
+            row_hash: None,
         }
     }
 }
@@ -78,6 +91,7 @@ impl From<SurrealNodeRecord> for GraphNode {
 #[derive(Clone, Debug, Serialize)]
 struct SurrealNodeInsertRecord {
     id: RecordId,
+    row_hash: String,
     #[serde(flatten)]
     record: SurrealNodeRecord,
 }
@@ -86,6 +100,7 @@ impl From<&GraphNode> for SurrealNodeInsertRecord {
     fn from(node: &GraphNode) -> Self {
         Self {
             id: RecordId::from_table_key(NODE_TABLE, record_key("node", &node.id)),
+            row_hash: row_hash(node).unwrap_or_default(),
             record: SurrealNodeRecord::from(node),
         }
     }
@@ -100,6 +115,8 @@ struct SurrealEdgeRecord {
     properties: std::collections::BTreeMap<String, String>,
     provenance: Vec<tsift_core::GraphProvenance>,
     freshness: Option<tsift_core::GraphFreshness>,
+    #[serde(default)]
+    row_hash: Option<String>,
 }
 
 impl From<&GraphEdge> for SurrealEdgeRecord {
@@ -112,6 +129,7 @@ impl From<&GraphEdge> for SurrealEdgeRecord {
             properties: edge.properties.clone(),
             provenance: edge.provenance.clone(),
             freshness: edge.freshness.clone(),
+            row_hash: None,
         }
     }
 }
@@ -133,6 +151,7 @@ impl From<SurrealEdgeRecord> for GraphEdge {
 #[derive(Clone, Debug, Serialize)]
 struct SurrealEdgeInsertRecord {
     id: RecordId,
+    row_hash: String,
     #[serde(flatten)]
     record: SurrealEdgeRecord,
 }
@@ -142,6 +161,7 @@ impl From<&GraphEdge> for SurrealEdgeInsertRecord {
         let edge_id = graph_edge_id(edge);
         Self {
             id: RecordId::from_table_key(EDGE_TABLE, record_key("edge", &edge_id)),
+            row_hash: row_hash(edge).unwrap_or_default(),
             record: SurrealEdgeRecord::from(edge),
         }
     }
@@ -221,6 +241,11 @@ impl SurrealEdgeIndexes {
         self.by_id.get(edge_id).cloned()
     }
 
+    fn all_edge_keys(&self) -> BTreeSet<String> {
+        self.by_id.keys().cloned().collect()
+    }
+
+    #[allow(dead_code)]
     fn ordered_edges(&self) -> Vec<GraphEdge> {
         self.ordered
             .values()
@@ -537,6 +562,8 @@ pub struct SurrealdbGraphStore {
     rt: tokio::runtime::Runtime,
     nodes: RwLock<BTreeMap<String, GraphNode>>,
     edges: RwLock<SurrealEdgeIndexes>,
+    node_row_hashes: RwLock<BTreeMap<String, String>>,
+    edge_row_hashes: RwLock<BTreeMap<String, String>>,
 }
 
 impl SurrealdbGraphStore {
@@ -568,6 +595,8 @@ impl SurrealdbGraphStore {
             rt,
             nodes: RwLock::new(BTreeMap::new()),
             edges: RwLock::new(SurrealEdgeIndexes::default()),
+            node_row_hashes: RwLock::new(BTreeMap::new()),
+            edge_row_hashes: RwLock::new(BTreeMap::new()),
         };
         store.load_indexes()?;
         Ok(store)
@@ -593,6 +622,8 @@ impl SurrealdbGraphStore {
             rt,
             nodes: RwLock::new(BTreeMap::new()),
             edges: RwLock::new(SurrealEdgeIndexes::default()),
+            node_row_hashes: RwLock::new(BTreeMap::new()),
+            edge_row_hashes: RwLock::new(BTreeMap::new()),
         };
         store.load_indexes()?;
         Ok(store)
@@ -602,8 +633,116 @@ impl SurrealdbGraphStore {
         let nodes = rows.nodes.iter().map(node_from_row).collect::<Vec<_>>();
         let edges = rows.edges.iter().map(edge_from_row).collect::<Vec<_>>();
         self.replace_surreal_records(&nodes, &edges)?;
+        let node_hashes: BTreeMap<String, String> = nodes
+            .iter()
+            .map(|n| (n.id.clone(), row_hash(n).unwrap_or_default()))
+            .collect();
+        let edge_hashes: BTreeMap<String, String> = edges
+            .iter()
+            .map(|e| (graph_edge_id(e), row_hash(e).unwrap_or_default()))
+            .collect();
         self.replace_memory_indexes(nodes, edges)?;
+        self.update_row_hashes(&node_hashes, &edge_hashes)?;
         Ok(rows.nodes.len() + rows.edges.len())
+    }
+
+    pub fn replace_projection_rows_delta(
+        &self,
+        rows: &ConvexProjectionRows,
+    ) -> Result<DeltaRefreshStats> {
+        let new_nodes: Vec<GraphNode> = rows.nodes.iter().map(node_from_row).collect();
+        let new_edges: Vec<GraphEdge> = rows.edges.iter().map(edge_from_row).collect();
+
+        let new_node_hashes: BTreeMap<String, String> = new_nodes
+            .iter()
+            .map(|n| (n.id.clone(), row_hash(n).unwrap_or_default()))
+            .collect();
+        let new_edge_hashes: BTreeMap<String, String> = new_edges
+            .iter()
+            .map(|e| (graph_edge_id(e), row_hash(e).unwrap_or_default()))
+            .collect();
+
+        let existing_node_ids: BTreeSet<String> =
+            self.nodes_read()?.keys().cloned().collect();
+        let existing_edge_keys: BTreeSet<String> = {
+            let edges = self.edges_read()?;
+            edges.all_edge_keys()
+        };
+
+        let stored_node_hashes = self.node_row_hashes.read().map_err(|_| anyhow!("lock"))?;
+        let stored_edge_hashes = self.edge_row_hashes.read().map_err(|_| anyhow!("lock"))?;
+
+        let changed_node_ids: Vec<String> = new_node_hashes
+            .iter()
+            .filter(|(id, hash)| {
+                !existing_node_ids.contains(*id)
+                    || (stored_node_hashes.get(*id) != Some(*hash))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let changed_edge_keys: Vec<String> = new_edge_hashes
+            .iter()
+            .filter(|(key, hash)| {
+                !existing_edge_keys.contains(*key)
+                    || (stored_edge_hashes.get(*key) != Some(*hash))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        drop(stored_node_hashes);
+        drop(stored_edge_hashes);
+
+        let tombstoned_node_ids: Vec<String> = existing_node_ids
+            .iter()
+            .filter(|id| !new_node_hashes.contains_key(*id))
+            .cloned()
+            .collect();
+        let tombstoned_edge_keys: Vec<String> = existing_edge_keys
+            .iter()
+            .filter(|key| !new_edge_hashes.contains_key(*key))
+            .cloned()
+            .collect();
+
+        let unchanged_nodes = new_node_hashes.len() - changed_node_ids.len();
+        let unchanged_edges = new_edge_hashes.len() - changed_edge_keys.len();
+
+        let changed_nodes: Vec<&GraphNode> = new_nodes
+            .iter()
+            .filter(|n| changed_node_ids.contains(&n.id))
+            .collect();
+        let changed_edges: Vec<&GraphEdge> = new_edges
+            .iter()
+            .filter(|e| changed_edge_keys.contains(&graph_edge_id(e)))
+            .collect();
+
+        if !changed_nodes.is_empty()
+            || !changed_edges.is_empty()
+            || !tombstoned_node_ids.is_empty()
+            || !tombstoned_edge_keys.is_empty()
+        {
+            self.delta_surreal_records(
+                &changed_nodes,
+                &changed_edges,
+                &tombstoned_node_ids,
+                &tombstoned_edge_keys,
+            )?;
+            self.delta_memory_indexes(
+                &new_nodes,
+                &new_edges,
+                &tombstoned_node_ids,
+                &tombstoned_edge_keys,
+            )?;
+            self.update_row_hashes(&new_node_hashes, &new_edge_hashes)?;
+        }
+
+        Ok(DeltaRefreshStats {
+            unchanged_nodes,
+            unchanged_edges,
+            changed_nodes: changed_node_ids.len(),
+            changed_edges: changed_edge_keys.len(),
+            tombstoned_nodes: tombstoned_node_ids.len(),
+            tombstoned_edges: tombstoned_edge_keys.len(),
+        })
     }
 
     pub fn from_rows_file_backed(path: &Path, rows: &ConvexProjectionRows) -> Result<Self> {
@@ -622,7 +761,7 @@ impl SurrealdbGraphStore {
         if stored.as_deref() == Some(incoming_hash.as_str()) {
             return Ok((store, WarmStartOutcome::CacheHit));
         }
-        store.replace_projection_rows(rows)?;
+        store.replace_projection_rows_delta(rows)?;
         store.set_stored_row_hash(&incoming_hash)?;
         Ok((store, WarmStartOutcome::Refreshed))
     }
@@ -685,16 +824,28 @@ impl SurrealdbGraphStore {
         })?;
         let mut node_index = self.nodes_write()?;
         node_index.clear();
-        for record in nodes {
-            let node = GraphNode::from(record);
+        let mut node_hashes = self.node_row_hashes.write().map_err(|_| anyhow!("lock"))?;
+        node_hashes.clear();
+        for record in &nodes {
+            let node = GraphNode::from(record.clone());
+            if let Some(ref hash) = record.row_hash {
+                node_hashes.insert(node.id.clone(), hash.clone());
+            }
             node_index.insert(node.id.clone(), node);
         }
         drop(node_index);
+        drop(node_hashes);
 
         let mut edge_index = self.edges_write()?;
         edge_index.clear();
-        for record in edges {
-            let edge = GraphEdge::from(record);
+        let mut edge_hashes = self.edge_row_hashes.write().map_err(|_| anyhow!("lock"))?;
+        edge_hashes.clear();
+        for record in &edges {
+            let edge = GraphEdge::from(record.clone());
+            let key = graph_edge_id(&edge);
+            if let Some(ref hash) = record.row_hash {
+                edge_hashes.insert(key.clone(), hash.clone());
+            }
             edge_index.insert(edge);
         }
         Ok(())
@@ -742,6 +893,93 @@ impl SurrealdbGraphStore {
         }
         *self.nodes_write()? = next_nodes;
         *self.edges_write()? = next_edges;
+        Ok(())
+    }
+
+    fn delta_surreal_records(
+        &self,
+        changed_nodes: &[&GraphNode],
+        changed_edges: &[&GraphEdge],
+        tombstoned_node_ids: &[String],
+        tombstoned_edge_keys: &[String],
+    ) -> Result<()> {
+        let node_records: Vec<SurrealNodeInsertRecord> = changed_nodes
+            .iter()
+            .map(|n| SurrealNodeInsertRecord::from(*n))
+            .collect();
+        let edge_records: Vec<SurrealEdgeInsertRecord> = changed_edges
+            .iter()
+            .map(|e| SurrealEdgeInsertRecord::from(*e))
+            .collect();
+        let delete_node_ids: Vec<String> = tombstoned_node_ids
+            .iter()
+            .cloned()
+            .chain(changed_nodes.iter().map(|n| n.id.clone()))
+            .collect();
+        let delete_edge_keys: Vec<String> = tombstoned_edge_keys
+            .iter()
+            .cloned()
+            .chain(changed_edges.iter().map(|e| graph_edge_id(e)))
+            .collect();
+        block_on(&self.rt, async move {
+            self.db
+                .query(format!(
+                    r#"
+                    BEGIN TRANSACTION;
+                    DELETE {NODE_TABLE} WHERE external_id IN $delete_node_ids;
+                    DELETE {EDGE_TABLE} WHERE edge_key IN $delete_edge_keys;
+                    INSERT $nodes;
+                    INSERT $edges;
+                    COMMIT TRANSACTION;
+                    "#
+                ))
+                .bind(("delete_node_ids", delete_node_ids))
+                .bind(("delete_edge_keys", delete_edge_keys))
+                .bind(("nodes", node_records))
+                .bind(("edges", edge_records))
+                .await
+                .context("delta replacing SurrealDB graph projection rows")?
+                .check()
+                .context("checking SurrealDB graph projection delta replace")?;
+            Ok::<(), anyhow::Error>(())
+        })
+    }
+
+    fn delta_memory_indexes(
+        &self,
+        new_nodes: &[GraphNode],
+        new_edges: &[GraphEdge],
+        tombstoned_node_ids: &[String],
+        tombstoned_edge_keys: &[String],
+    ) -> Result<()> {
+        {
+            let mut node_index = self.nodes_write()?;
+            for id in tombstoned_node_ids {
+                node_index.remove(id);
+            }
+            for node in new_nodes {
+                node_index.insert(node.id.clone(), node.clone());
+            }
+        }
+        {
+            let mut edge_index = self.edges_write()?;
+            for key in tombstoned_edge_keys {
+                edge_index.remove(key);
+            }
+            for edge in new_edges {
+                edge_index.insert(edge.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn update_row_hashes(
+        &self,
+        node_hashes: &BTreeMap<String, String>,
+        edge_hashes: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        *self.node_row_hashes.write().map_err(|_| anyhow!("lock"))? = node_hashes.clone();
+        *self.edge_row_hashes.write().map_err(|_| anyhow!("lock"))? = edge_hashes.clone();
         Ok(())
     }
 
@@ -1088,6 +1326,75 @@ mod tests {
         assert_eq!(outcome2, WarmStartOutcome::Refreshed);
         assert_eq!(store2.graph_counts().unwrap(), (1, 0));
         assert_eq!(store2.nodes_by_kind("file").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn surrealdb_store_delta_refresh_skips_unchanged_rows() {
+        let store = SurrealdbGraphStore::in_memory().unwrap();
+        let rows = sample_rows();
+        let full = store.replace_projection_rows(&rows).unwrap();
+        assert_eq!(full, 3);
+
+        let stats = store.replace_projection_rows_delta(&rows).unwrap();
+        assert_eq!(stats.unchanged_nodes, 2);
+        assert_eq!(stats.unchanged_edges, 1);
+        assert_eq!(stats.changed_nodes, 0);
+        assert_eq!(stats.changed_edges, 0);
+        assert_eq!(stats.tombstoned_nodes, 0);
+        assert_eq!(stats.tombstoned_edges, 0);
+        assert_eq!(store.graph_counts().unwrap(), (2, 1));
+    }
+
+    #[test]
+    fn surrealdb_store_delta_refresh_detects_modified_rows() {
+        let store = SurrealdbGraphStore::in_memory().unwrap();
+        store.replace_projection_rows(&sample_rows()).unwrap();
+
+        let modified_rows = ConvexProjectionRows {
+            nodes: vec![
+                ConvexNodeRow::from(&GraphNode::new("node:a", "symbol", "alpha").with_property("path", "a.rs")),
+                ConvexNodeRow::from(
+                    &GraphNode::new("node:b", "symbol", "beta-modified").with_property("path", "b-mod.rs"),
+                ),
+            ],
+            edges: vec![ConvexEdgeRow::from(
+                &GraphEdge::new("node:a", "node:b", "calls").with_property("kind", "indirect"),
+            )],
+        };
+        let stats = store.replace_projection_rows_delta(&modified_rows).unwrap();
+        assert_eq!(stats.unchanged_nodes, 1);
+        assert_eq!(stats.changed_nodes, 1);
+        assert_eq!(stats.changed_edges, 1);
+        assert_eq!(stats.tombstoned_nodes, 0);
+        assert_eq!(stats.tombstoned_edges, 0);
+
+        let node_b = store.node("node:b").unwrap().unwrap();
+        assert_eq!(node_b.label, "beta-modified");
+        let edge = store
+            .edge(&stable_graph_edge_id("node:a", "node:b", "calls"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(edge.properties.get("kind").unwrap(), "indirect");
+    }
+
+    #[test]
+    fn surrealdb_store_delta_refresh_tombstones_removed_rows() {
+        let store = SurrealdbGraphStore::in_memory().unwrap();
+        store.replace_projection_rows(&sample_rows()).unwrap();
+
+        let shrunk_rows = ConvexProjectionRows {
+            nodes: vec![ConvexNodeRow::from(
+                &GraphNode::new("node:a", "symbol", "alpha").with_property("path", "a.rs"),
+            )],
+            edges: vec![],
+        };
+        let stats = store.replace_projection_rows_delta(&shrunk_rows).unwrap();
+        assert_eq!(stats.unchanged_nodes, 1);
+        assert_eq!(stats.changed_nodes, 0);
+        assert_eq!(stats.changed_edges, 0);
+        assert_eq!(stats.tombstoned_nodes, 1);
+        assert_eq!(stats.tombstoned_edges, 1);
+        assert_eq!(store.graph_counts().unwrap(), (1, 0));
     }
 
     #[test]
