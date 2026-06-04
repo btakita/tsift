@@ -1330,4 +1330,19 @@ pub enum GraphDbQuery {
         #[arg(long)]
         max_hops: Option<usize>,
     },
+    /// Produce a two-tier graph map: overview (communities, top hubs, edge-kind histogram, module tree) plus optional focus tier
+    Map {
+        /// Symbol name for the optional focus tier (reuses explain envelope for a single deep-dive)
+        #[arg(long)]
+        focus: Option<String>,
+        /// Max top-degree hubs to include in the overview (0 = unlimited)
+        #[arg(long, default_value = "10")]
+        top_hubs: usize,
+        /// Max communities to include in the overview (0 = unlimited)
+        #[arg(long, default_value = "20")]
+        community_limit: usize,
+        /// Maximum directed hops for focus-tier neighborhood expansion
+        #[arg(long, default_value = "2")]
+        focus_depth: usize,
+    },
 }

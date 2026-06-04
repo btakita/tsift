@@ -9818,6 +9818,9 @@ pub(crate) fn graph_db_report_from_store(
                 ));
             }
         }
+        GraphDbQuery::Map { .. } => {
+            bail!("graph-db map must be handled by the map command path");
+        }
     }
     Ok(report)
 }

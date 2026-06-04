@@ -1,13 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use substrate::{
     ConvexGraphStore as SubstrateConvexGraphStore, ConvexProjectionRows, ConvexRowsGraphClient,
-    SqliteGraphStore,
+    GraphStore, SqliteGraphStore,
 };
 use tsift_index::init;
 use tsift_quality::lint;
@@ -993,6 +994,379 @@ pub(crate) fn cmd_graph_db_backend_eval(
     }
 }
 
+#[derive(Serialize)]
+struct GraphDbMapCommunitySummary {
+    id: usize,
+    size: usize,
+    top_members: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GraphDbMapHub {
+    id: String,
+    kind: String,
+    label: String,
+    degree: usize,
+}
+
+#[derive(Serialize, Clone)]
+struct GraphDbMapModuleEntry {
+    module: String,
+    node_count: usize,
+    kinds: BTreeMap<String, usize>,
+}
+
+#[derive(Serialize)]
+struct GraphDbMapOverview {
+    node_count: usize,
+    edge_count: usize,
+    community_count: usize,
+    communities: Vec<GraphDbMapCommunitySummary>,
+    top_hubs: Vec<GraphDbMapHub>,
+    edge_kind_histogram: BTreeMap<String, usize>,
+    modules: Vec<GraphDbMapModuleEntry>,
+}
+
+#[derive(Serialize)]
+struct GraphDbMapReport {
+    root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    backend: String,
+    overview: GraphDbMapOverview,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus: Option<GraphDbMapFocusReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GraphDbMapFocusReport {
+    symbol: String,
+    node_id: String,
+    node_kind: String,
+    node_label: String,
+    degree: usize,
+    community_id: Option<usize>,
+    neighbor_count: usize,
+    neighbor_kinds: BTreeMap<String, usize>,
+}
+
+pub(crate) fn cmd_graph_db_map(
+    root: &Path,
+    scope: Option<&str>,
+    backend: &str,
+    store: &impl GraphStore,
+    focus: Option<&str>,
+    top_hubs_limit: usize,
+    community_limit: usize,
+    _focus_depth: usize,
+    format: OutputFormat,
+    warnings: Vec<String>,
+) -> Result<()> {
+    let nodes = store.all_nodes()?;
+    let edges = store.all_edges()?;
+
+    let mut degree: HashMap<&str, usize> = HashMap::new();
+    let mut edge_kind_histogram: BTreeMap<String, usize> = BTreeMap::new();
+    for edge in &edges {
+        *degree.entry(&edge.from_id).or_default() += 1;
+        *degree.entry(&edge.to_id).or_default() += 1;
+        *edge_kind_histogram.entry(edge.kind.clone()).or_default() += 1;
+    }
+
+    let node_by_id: HashMap<&str, &substrate::GraphNode> =
+        nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+
+    let mut hubs: Vec<GraphDbMapHub> = degree
+        .iter()
+        .filter_map(|(&id, &deg)| {
+            node_by_id.get(id).map(|node| GraphDbMapHub {
+                id: id.to_string(),
+                kind: node.kind.clone(),
+                label: node.label.clone(),
+                degree: deg,
+            })
+        })
+        .collect();
+    hubs.sort_by(|a, b| b.degree.cmp(&a.degree));
+    if top_hubs_limit > 0 && hubs.len() > top_hubs_limit {
+        hubs.truncate(top_hubs_limit);
+    }
+
+    let mut modules: BTreeMap<String, GraphDbMapModuleEntry> = BTreeMap::new();
+    for node in &nodes {
+        let module = match node.properties.get("file") {
+            Some(f) => {
+                let path = Path::new(f);
+                path.parent()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            }
+            None => "unknown".to_string(),
+        };
+        let module_name = module.clone();
+        let entry = modules.entry(module).or_insert_with(|| GraphDbMapModuleEntry {
+            module: module_name,
+            node_count: 0,
+            kinds: BTreeMap::new(),
+        });
+        entry.node_count += 1;
+        *entry.kinds.entry(node.kind.clone()).or_default() += 1;
+    }
+    let modules: Vec<GraphDbMapModuleEntry> = modules.into_values().collect();
+
+    let mut communities: Vec<GraphDbMapCommunitySummary> = Vec::new();
+    {
+        let mut from_map: HashMap<&str, Vec<&str>> = HashMap::new();
+        for edge in &edges {
+            from_map
+                .entry(&edge.from_id)
+                .or_default()
+                .push(&edge.to_id);
+        }
+        let edge_pairs: Vec<(String, String)> = edges
+            .iter()
+            .map(|e| (e.from_id.clone(), e.to_id.clone()))
+            .collect();
+        let comm_result = tsift_graph::detect_communities(&edge_pairs);
+        let mut comm_list: Vec<(usize, usize, Vec<String>)> = comm_result
+            .communities
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.members.len() >= 2)
+            .map(|(i, c)| {
+                let mut names: Vec<String> =
+                    c.members.iter().map(|m| m.name.clone()).collect();
+                names.sort();
+                (i, c.members.len(), names)
+            })
+            .collect();
+        comm_list.sort_by(|a, b| b.1.cmp(&a.1));
+        if community_limit > 0 && comm_list.len() > community_limit {
+            comm_list.truncate(community_limit);
+        }
+        for (i, size, members) in comm_list {
+            let top_members: Vec<String> = members.into_iter().take(10).collect();
+            communities.push(GraphDbMapCommunitySummary {
+                id: i + 1,
+                size,
+                top_members,
+            });
+        }
+    }
+
+    let overview = GraphDbMapOverview {
+        node_count: nodes.len(),
+        edge_count: edges.len(),
+        community_count: communities.len(),
+        communities,
+        top_hubs: hubs,
+        edge_kind_histogram,
+        modules,
+    };
+
+    let focus_report = if let Some(symbol) = focus {
+        let matches: Vec<&substrate::GraphNode> = nodes
+            .iter()
+            .filter(|n| n.label == symbol || n.id.contains(symbol))
+            .collect();
+        match matches.first() {
+            Some(focus_node) => {
+                let node_deg = degree.get(focus_node.id.as_str()).copied().unwrap_or(0);
+                let incident = store.incident_edges(&focus_node.id, None)?;
+                let mut neighbor_kinds: BTreeMap<String, usize> = BTreeMap::new();
+                for edge in &incident {
+                    let neighbor_id = if edge.from_id == focus_node.id {
+                        &edge.to_id
+                    } else {
+                        &edge.from_id
+                    };
+                    if let Some(neighbor) = node_by_id.get(neighbor_id.as_str()) {
+                        *neighbor_kinds
+                            .entry(neighbor.kind.clone())
+                            .or_default() += 1;
+                    }
+                }
+                let comm_id = {
+                    let edge_pairs: Vec<(String, String)> = edges
+                        .iter()
+                        .map(|e| (e.from_id.clone(), e.to_id.clone()))
+                        .collect();
+                    let comm_result = tsift_graph::detect_communities(&edge_pairs);
+                    comm_result
+                        .communities
+                        .iter()
+                        .position(|c| c.members.iter().any(|m| m.name == symbol))
+                };
+                Some(GraphDbMapFocusReport {
+                    symbol: symbol.to_string(),
+                    node_id: focus_node.id.clone(),
+                    node_kind: focus_node.kind.clone(),
+                    node_label: focus_node.label.clone(),
+                    degree: node_deg,
+                    community_id: comm_id.map(|i| i + 1),
+                    neighbor_count: incident.len(),
+                    neighbor_kinds,
+                })
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let report = GraphDbMapReport {
+        root: root.to_string_lossy().to_string(),
+        scope: scope.map(str::to_string),
+        backend: backend.to_string(),
+        overview,
+        focus: focus_report,
+        warnings,
+    };
+
+    if format.json_output {
+        print_json_or_envelope(
+            &report,
+            &format,
+            "graph-db",
+            "map",
+            ToolEnvelopeSummary {
+                text: format!(
+                    "Graph map: {} nodes, {} edges, {} communities, {} hubs",
+                    report.overview.node_count,
+                    report.overview.edge_count,
+                    report.overview.community_count,
+                    report.overview.top_hubs.len(),
+                ),
+                metrics: vec![
+                    envelope_metric("nodes", report.overview.node_count),
+                    envelope_metric("edges", report.overview.edge_count),
+                    envelope_metric("communities", report.overview.community_count),
+                    envelope_metric("hubs", report.overview.top_hubs.len()),
+                    envelope_metric("modules", report.overview.modules.len()),
+                    envelope_metric("edge_kinds", report.overview.edge_kind_histogram.len()),
+                ],
+            },
+            false,
+            if report.focus.is_some() {
+                vec![]
+            } else {
+                vec![
+                    "Use --focus <symbol> to add a focused deep-dive tier".to_string(),
+                ]
+            },
+        )
+    } else {
+        print_graph_db_map_human(&report, format.compact);
+        Ok(())
+    }
+}
+
+fn print_graph_db_map_human(report: &GraphDbMapReport, compact: bool) {
+    let ov = &report.overview;
+    if compact {
+        println!(
+            "map n:{} e:{} com:{} hubs:{} mods:{} ek:{}",
+            ov.node_count,
+            ov.edge_count,
+            ov.community_count,
+            ov.top_hubs.len(),
+            ov.modules.len(),
+            ov.edge_kind_histogram.len(),
+        );
+        for hub in &ov.top_hubs {
+            println!("  hub {} [{}] deg:{}", hub.label, hub.kind, hub.degree);
+        }
+        return;
+    }
+
+    println!("Graph Map ({}, {})", report.backend, report.root);
+    if let Some(scope) = &report.scope {
+        println!("scope: {}", scope);
+    }
+    println!(
+        "Overview: {} nodes, {} edges, {} communities",
+        ov.node_count, ov.edge_count, ov.community_count
+    );
+
+    if !ov.edge_kind_histogram.is_empty() {
+        println!();
+        println!("Edge kinds:");
+        let mut kinds: Vec<_> = ov.edge_kind_histogram.iter().collect();
+        kinds.sort_by(|a, b| b.1.cmp(a.1));
+        for (kind, count) in kinds {
+            println!("  {}: {}", kind, count);
+        }
+    }
+
+    if !ov.top_hubs.is_empty() {
+        println!();
+        println!("Top hubs by degree:");
+        for hub in &ov.top_hubs {
+            println!("  {} [{}] degree={}", hub.label, hub.kind, hub.degree);
+        }
+    }
+
+    if !ov.communities.is_empty() {
+        println!();
+        println!("Communities:");
+        for comm in &ov.communities {
+            let members_display = if comm.top_members.len() < comm.size {
+                format!(
+                    "{} ... (+{} more)",
+                    comm.top_members.join(", "),
+                    comm.size - comm.top_members.len()
+                )
+            } else {
+                comm.top_members.join(", ")
+            };
+            println!(
+                "  [{}] {} members: {}",
+                comm.id, comm.size, members_display
+            );
+        }
+    }
+
+    if !ov.modules.is_empty() {
+        println!();
+        let mut modules = ov.modules.clone();
+        modules.sort_by(|a, b| b.node_count.cmp(&a.node_count));
+        let display_modules: Vec<_> = if modules.len() > 15 {
+            modules[..15].to_vec()
+        } else {
+            modules.clone()
+        };
+        println!("Modules (top {}):", display_modules.len());
+        for module in display_modules {
+            println!("  {}: {} nodes", module.module, module.node_count);
+        }
+    }
+
+    if let Some(focus) = &report.focus {
+        println!();
+        println!("Focus: {} [{}]", focus.node_label, focus.node_kind);
+        println!("  id: {}", focus.node_id);
+        println!("  degree: {}", focus.degree);
+        if let Some(comm_id) = focus.community_id {
+            println!("  community: {}", comm_id);
+        }
+        println!("  neighbors: {}", focus.neighbor_count);
+        if !focus.neighbor_kinds.is_empty() {
+            print!("  neighbor kinds:");
+            for (kind, count) in &focus.neighbor_kinds {
+                print!(" {}={}", kind, count);
+            }
+            println!();
+        }
+    }
+
+    for warning in &report.warnings {
+        println!("warning: {}", warning);
+    }
+}
+
 pub(crate) fn cmd_graph_db(
     path: &Path,
     scope: Option<&str>,
@@ -1095,6 +1469,26 @@ pub(crate) fn cmd_graph_db(
                 })?;
                 return print_graph_db_evidence_report(&report, format);
             }
+            if let GraphDbQuery::Map {
+                focus,
+                top_hubs,
+                community_limit,
+                focus_depth,
+            } = &query
+            {
+                return cmd_graph_db_map(
+                    &root,
+                    scope,
+                    "sqlite",
+                    &store,
+                    focus.as_deref(),
+                    *top_hubs,
+                    *community_limit,
+                    *focus_depth,
+                    format,
+                    warnings,
+                );
+            }
             graph_db_report_from_store(&root, scope, "sqlite", query, &store, freshness, warnings)?
         }
         GraphDbBackend::ConvexSnapshot => {
@@ -1130,6 +1524,26 @@ pub(crate) fn cmd_graph_db(
                     warnings,
                 })?;
                 return print_graph_db_evidence_report(&report, format);
+            }
+            if let GraphDbQuery::Map {
+                focus,
+                top_hubs,
+                community_limit,
+                focus_depth,
+            } = &query
+            {
+                return cmd_graph_db_map(
+                    &root,
+                    scope,
+                    "convex-snapshot",
+                    &store,
+                    focus.as_deref(),
+                    *top_hubs,
+                    *community_limit,
+                    *focus_depth,
+                    format,
+                    warnings,
+                );
             }
             graph_db_report_from_store(
                 &root,
