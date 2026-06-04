@@ -198,7 +198,7 @@ type DirectionEdgeIndex = BTreeMap<String, BTreeMap<String, BTreeMap<(String, St
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 struct SurrealEdgeIndexes {
-    by_id: BTreeMap<String, GraphEdge>,
+    by_id: BTreeMap<String, Arc<GraphEdge>>,
     ordered: BTreeMap<(String, String, String, String), String>,
     by_kind: BTreeMap<String, BTreeMap<String, String>>,
     by_kind_order: BTreeMap<String, BTreeMap<(String, String, String), String>>,
@@ -228,16 +228,16 @@ impl SurrealEdgeIndexes {
             self.remove_index_entries(&edge_id, &previous);
         }
         self.insert_index_entries(&edge_id, &edge);
-        self.by_id.insert(edge_id, edge);
+        self.by_id.insert(edge_id, Arc::new(edge));
     }
 
-    fn remove(&mut self, edge_id: &str) -> Option<GraphEdge> {
+    fn remove(&mut self, edge_id: &str) -> Option<Arc<GraphEdge>> {
         let edge = self.by_id.remove(edge_id)?;
         self.remove_index_entries(edge_id, &edge);
         Some(edge)
     }
 
-    fn edge(&self, edge_id: &str) -> Option<GraphEdge> {
+    fn edge(&self, edge_id: &str) -> Option<Arc<GraphEdge>> {
         self.by_id.get(edge_id).cloned()
     }
 
@@ -250,7 +250,7 @@ impl SurrealEdgeIndexes {
         self.ordered
             .values()
             .filter_map(|edge_id| self.by_id.get(edge_id))
-            .cloned()
+            .map(|arc| (**arc).clone())
             .collect()
     }
 
@@ -263,7 +263,7 @@ impl SurrealEdgeIndexes {
                         continue;
                     };
                     if edge.from_id != edge.to_id {
-                        return Some(edge.clone());
+                        return Some((**edge).clone());
                     }
                 }
             }
@@ -273,7 +273,7 @@ impl SurrealEdgeIndexes {
                         continue;
                     };
                     if edge.from_id != edge.to_id {
-                        return Some(edge.clone());
+                        return Some((**edge).clone());
                     }
                 }
             }
@@ -291,7 +291,7 @@ impl SurrealEdgeIndexes {
                     continue;
                 }
                 return Some((
-                    edge.clone(),
+                    (**edge).clone(),
                     GraphPropertyFilter {
                         key: key.clone(),
                         value: value.clone(),
@@ -312,7 +312,7 @@ impl SurrealEdgeIndexes {
                 if let Some(ids) = kind_edges.get(kind) {
                     edges.extend(
                         ids.values()
-                            .filter_map(|edge_id| self.by_id.get(edge_id).cloned()),
+                            .filter_map(|edge_id| self.by_id.get(edge_id).map(|arc| (**arc).clone())),
                     );
                 }
             }
@@ -320,7 +320,7 @@ impl SurrealEdgeIndexes {
                 for ids in kind_edges.values() {
                     edges.extend(
                         ids.values()
-                            .filter_map(|edge_id| self.by_id.get(edge_id).cloned()),
+                            .filter_map(|edge_id| self.by_id.get(edge_id).map(|arc| (**arc).clone())),
                     );
                 }
                 edges.sort_by(|left, right| {
@@ -344,7 +344,7 @@ impl SurrealEdgeIndexes {
         }
         edge_ids
             .into_iter()
-            .filter_map(|edge_id| self.by_id.get(&edge_id).cloned())
+            .filter_map(|edge_id| self.by_id.get(&edge_id).map(|arc| (**arc).clone()))
             .collect()
     }
 
@@ -371,7 +371,7 @@ impl SurrealEdgeIndexes {
             .into_iter()
             .filter_map(|edge_id| self.by_id.get(&edge_id))
             .filter(|edge| kind.is_none_or(|kind| edge.kind == kind))
-            .cloned()
+            .map(|arc| (**arc).clone())
             .collect()
     }
 
@@ -579,7 +579,7 @@ pub struct SurrealdbGraphStore {
     db: Surreal<Db>,
     rt: Arc<tokio::runtime::Runtime>,
     path: Option<PathBuf>,
-    nodes: RwLock<BTreeMap<String, GraphNode>>,
+    nodes: RwLock<BTreeMap<String, Arc<GraphNode>>>,
     edges: RwLock<SurrealEdgeIndexes>,
     node_row_hashes: RwLock<BTreeMap<String, String>>,
     edge_row_hashes: RwLock<BTreeMap<String, String>>,
@@ -866,7 +866,7 @@ impl SurrealdbGraphStore {
         if sidecar.stored_row_hash != stored {
             return Ok(false);
         }
-        *self.nodes_write()? = sidecar.nodes;
+        *self.nodes_write()? = sidecar.nodes.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
         let mut edge_index = SurrealEdgeIndexes::default();
         for edge in sidecar.edges {
             edge_index.insert(edge);
@@ -888,7 +888,7 @@ impl SurrealdbGraphStore {
         let sidecar = SidecarData {
             version: SIDECAR_VERSION,
             stored_row_hash: Some(hash.clone()),
-            nodes: nodes.clone(),
+            nodes: nodes.iter().map(|(k, v)| (k.clone(), (**v).clone())).collect(),
             edges: edges.ordered_edges(),
             node_row_hashes: node_hashes.clone(),
             edge_row_hashes: edge_hashes.clone(),
@@ -923,7 +923,7 @@ impl SurrealdbGraphStore {
             if let Some(ref hash) = record.row_hash {
                 node_hashes.insert(node.id.clone(), hash.clone());
             }
-            node_index.insert(node.id.clone(), node);
+            node_index.insert(node.id.clone(), Arc::new(node));
         }
         drop(node_index);
         drop(node_hashes);
@@ -977,7 +977,7 @@ impl SurrealdbGraphStore {
     fn replace_memory_indexes(&self, nodes: Vec<GraphNode>, edges: Vec<GraphEdge>) -> Result<()> {
         let mut next_nodes = BTreeMap::new();
         for node in nodes {
-            next_nodes.insert(node.id.clone(), node);
+            next_nodes.insert(node.id.clone(), Arc::new(node));
         }
         let mut next_edges = SurrealEdgeIndexes::default();
         for edge in edges {
@@ -1050,7 +1050,7 @@ impl SurrealdbGraphStore {
                 node_index.remove(id);
             }
             for node in new_nodes {
-                node_index.insert(node.id.clone(), node.clone());
+                node_index.insert(node.id.clone(), Arc::new(node.clone()));
             }
         }
         {
@@ -1075,13 +1075,13 @@ impl SurrealdbGraphStore {
         Ok(())
     }
 
-    fn nodes_read(&self) -> Result<std::sync::RwLockReadGuard<'_, BTreeMap<String, GraphNode>>> {
+    fn nodes_read(&self) -> Result<std::sync::RwLockReadGuard<'_, BTreeMap<String, Arc<GraphNode>>>> {
         self.nodes
             .read()
             .map_err(|_| anyhow!("SurrealDB graph node index lock poisoned"))
     }
 
-    fn nodes_write(&self) -> Result<std::sync::RwLockWriteGuard<'_, BTreeMap<String, GraphNode>>> {
+    fn nodes_write(&self) -> Result<std::sync::RwLockWriteGuard<'_, BTreeMap<String, Arc<GraphNode>>>> {
         self.nodes
             .write()
             .map_err(|_| anyhow!("SurrealDB graph node index lock poisoned"))
@@ -1112,7 +1112,7 @@ impl GraphStore for SurrealdbGraphStore {
                 .context("upserting SurrealDB graph node")?;
             Ok::<(), anyhow::Error>(())
         })?;
-        self.nodes_write()?.insert(node.id.clone(), node.clone());
+        self.nodes_write()?.insert(node.id.clone(), Arc::new(node.clone()));
         Ok(())
     }
 
@@ -1183,11 +1183,11 @@ impl GraphStore for SurrealdbGraphStore {
     }
 
     fn node(&self, id: &str) -> Result<Option<GraphNode>> {
-        Ok(self.nodes_read()?.get(id).cloned())
+        Ok(self.nodes_read()?.get(id).map(|arc| (**arc).clone()))
     }
 
     fn all_nodes(&self) -> Result<Vec<GraphNode>> {
-        let mut nodes = self.nodes_read()?.values().cloned().collect::<Vec<_>>();
+        let mut nodes = self.nodes_read()?.values().map(|arc| (**arc).clone()).collect::<Vec<_>>();
         nodes.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(nodes)
     }
@@ -1197,7 +1197,7 @@ impl GraphStore for SurrealdbGraphStore {
     }
 
     fn edge(&self, edge_id: &str) -> Result<Option<GraphEdge>> {
-        Ok(self.edges_read()?.edge(edge_id))
+        Ok(self.edges_read()?.edge(edge_id).map(|arc| (*arc).clone()))
     }
 
     fn graph_counts(&self) -> Result<(usize, usize)> {
