@@ -128,12 +128,34 @@ fn snapshot_copy_path(db_path: &Path, default_stem: &str) -> PathBuf {
 const SQLITE_GRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 4096;
 const SQLITE_GRAPH_STAGING_CHUNK_ROWS: usize = 500;
 
+/// SQLite-backed graph store.
+///
+/// # Temp-table invariant
+///
+/// Several methods — `replace_projection_with_version`, `upsert_projection`,
+/// `edges_between_nodes`, and `breadth_first_search` — create connection-scoped
+/// `TEMP TABLE` staging areas inside the underlying SQLite connection. Two
+/// concurrent calls on the same `SqliteGraphStore` (or sharing the same
+/// connection through `SqliteReadOnlyConnection`) would collide on those temp
+/// table names and produce incorrect results or errors.
+///
+/// **Only one temp-table-using method may be active at a time per connection.**
 pub struct SqliteGraphStore {
     conn: Connection,
     _snapshot_copy: Option<SnapshotCopyGuard>,
     read_only_recovery: Option<ReadOnlyRecovery>,
 }
 
+/// Read-only handle to a SQLite graph database connection.
+///
+/// # Temp-table invariant
+///
+/// When this connection is unwrapped into a `SqliteGraphStore` via
+/// `SqliteGraphStore::from_read_only_connection`, the same temp-table
+/// concurrency rules apply: only one temp-table-using method
+/// (`replace_projection_with_version`, `upsert_projection`,
+/// `edges_between_nodes`, `breadth_first_search`) may be active at a time
+/// per connection.
 pub struct SqliteReadOnlyConnection {
     conn: Connection,
     _snapshot_copy: Option<SnapshotCopyGuard>,
