@@ -13,7 +13,8 @@ pub use tsift_core::{
     ConvexEdgeRow, ConvexGraphClient, ConvexGraphStore, ConvexNodeRow, ConvexProjectionRows,
     ConvexRowsGraphClient, GraphEdge, GraphFreshness, GraphNode, GraphPagedSubgraph, GraphPath,
     GraphProjection, GraphPropertyFilter, GraphProvenance, GraphQueryOptions, GraphQueryPage,
-    GraphStore, GraphSubgraph, SQLITE_GRAPH_SCHEMA_VERSION, apply_graph_edge_query_page,
+    GraphStore, GraphSubgraph, RankedNeighborhoodOptions, RankedNeighborhoodResult,
+    SQLITE_GRAPH_SCHEMA_VERSION, apply_graph_edge_query_page,
     apply_graph_query_page, graph_edge_id, shortest_path_using_outgoing, stable_graph_edge_id,
 };
 
@@ -2269,6 +2270,171 @@ impl GraphStore for SqliteGraphStore {
         Ok(edges)
     }
 
+    fn ranked_neighborhood(
+        &self,
+        center_id: &str,
+        options: &RankedNeighborhoodOptions,
+    ) -> Result<Option<RankedNeighborhoodResult>> {
+        if self.node(center_id)?.is_none() {
+            return Ok(None);
+        }
+        let center = self.node(center_id)?.unwrap();
+
+        let score_expr = match options.scoring {
+            tsift_core::NeighborhoodScoring::BreadthFirst => {
+                "MAX(0, 120 - (walk.depth * 18))".to_string()
+            }
+            tsift_core::NeighborhoodScoring::EdgeKindWeighted => {
+                format!(
+                    "MAX(0, 120 - (walk.depth * 18)) + CASE walk.edge_kind \
+                     WHEN 'semantic_relation' THEN 34 \
+                     WHEN 'mentions_entity' THEN 28 \
+                     WHEN 'mentions_concept' THEN 28 \
+                     WHEN 'tagged_entity' THEN 28 \
+                     WHEN 'tagged_concept' THEN 28 \
+                     WHEN 'related_concept' THEN 28 \
+                     WHEN 'mentions' THEN 22 \
+                     WHEN 'calls' THEN 20 \
+                     WHEN 'requests_context' THEN 18 \
+                     WHEN 'scopes_context' THEN 18 \
+                     WHEN 'scopes_source' THEN 18 \
+                     WHEN 'explains_result' THEN 18 \
+                     WHEN 'defines' THEN 12 \
+                     WHEN 'contains' THEN 12 \
+                     WHEN 'belongs_to' THEN 12 \
+                     ELSE 8 END"
+                )
+            }
+            tsift_core::NeighborhoodScoring::DegreeWeighted => {
+                "MAX(0, 120 - (walk.depth * 18)) + CASE \
+                 WHEN (SELECT COUNT(*) FROM graph_edges e2 WHERE e2.from_id = walk.id OR e2.to_id = walk.id) <= 3 THEN 20 \
+                 WHEN (SELECT COUNT(*) FROM graph_edges e2 WHERE e2.from_id = walk.id OR e2.to_id = walk.id) <= 10 THEN 10 \
+                 ELSE 0 END"
+                    .to_string()
+            }
+        };
+
+        let mut sql = String::from(
+            r#"
+            WITH RECURSIVE walk(id, depth, edge_kind, score) AS (
+                SELECT ?, 0, '', ?
+                UNION
+                SELECT e.to_id, walk.depth + 1, e.kind,
+            "#,
+        );
+        sql.push_str(&format!("    {}\n", score_expr));
+        sql.push_str(
+            r#"
+                FROM walk
+                JOIN graph_edges e INDEXED BY idx_graph_edges_from_kind
+                    ON e.from_id = walk.id
+                WHERE walk.depth < ?
+            "#,
+        );
+        let mut values = vec![
+            Value::Text(center_id.to_string()),
+            Value::Integer(i64::MAX),
+            Value::Integer(options.depth as i64),
+        ];
+        if let Some(kind) = &options.edge_kind {
+            sql.push_str(" AND e.kind = ?");
+            values.push(Value::Text(kind.clone()));
+        }
+        sql.push_str(
+            r#"
+            ),
+            scored_nodes AS (
+                SELECT walk.id, walk.score,
+                    n.kind AS node_kind, n.label, n.properties_json, n.provenance_json, n.freshness_json
+                FROM walk
+                JOIN graph_nodes n ON n.id = walk.id
+                GROUP BY walk.id
+            ),
+            ranked AS (
+                SELECT id, score, node_kind, label, properties_json, provenance_json, freshness_json
+                FROM scored_nodes
+                ORDER BY score DESC, id ASC
+            ),
+            kept AS (
+                SELECT id, score, node_kind, label, properties_json, provenance_json, freshness_json
+                FROM ranked
+                LIMIT ?
+            ),
+            total AS (
+                SELECT COUNT(*) AS cnt FROM scored_nodes
+            )
+            SELECT
+                'meta' AS row_type,
+                (SELECT cnt FROM total) AS total_discovered,
+                0 AS node_id, '' AS node_kind, '' AS node_label,
+                '' AS node_props, '' AS node_prov, '' AS node_fresh,
+                '' AS edge_key, '' AS edge_from, '' AS edge_to, '' AS edge_kind_col,
+                '' AS edge_props, '' AS edge_prov, '' AS edge_fresh
+            UNION ALL
+            SELECT
+                'node' AS row_type,
+                0 AS total_discovered,
+                k.id, k.node_kind, k.label, k.properties_json, k.provenance_json, k.freshness_json,
+                '' AS edge_key, '' AS edge_from, '' AS edge_to, '' AS edge_kind_col,
+                '' AS edge_props, '' AS edge_prov, '' AS edge_fresh
+            FROM kept k
+            UNION ALL
+            SELECT
+                'edge' AS row_type,
+                0 AS total_discovered,
+                '' AS node_id, '' AS node_kind, '' AS node_label,
+                '' AS node_props, '' AS node_prov, '' AS node_fresh,
+                e.edge_key, e.from_id, e.to_id, e.kind, e.properties_json, e.provenance_json, e.freshness_json
+            FROM graph_edges e
+            WHERE EXISTS (SELECT 1 FROM kept k WHERE k.id = e.from_id)
+              AND EXISTS (SELECT 1 FROM kept k2 WHERE k2.id = e.to_id)
+            "#,
+        );
+        values.push(Value::Integer(options.max_nodes as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut nodes = vec![center.clone()];
+        let mut edges = Vec::new();
+        let mut total_discovered = 0usize;
+
+        let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
+            let row_type: String = row.get(0)?;
+            match row_type.as_str() {
+                "meta" => Ok(QueryResult::Meta {
+                    total: row.get::<_, i64>(1)? as usize,
+                }),
+                "node" => Ok(QueryResult::Node(node_from_row_at(row, 2)?)),
+                "edge" => Ok(QueryResult::Edge(edge_from_row_at(row, 8)?)),
+                _ => Err(rusqlite::Error::InvalidQuery),
+            }
+        })?;
+        for row_result in rows {
+            match row_result? {
+                QueryResult::Meta { total } => {
+                    total_discovered = total;
+                }
+                QueryResult::Node(node) => {
+                    if node.id != center_id {
+                        nodes.push(node);
+                    }
+                }
+                QueryResult::Edge(edge) => {
+                    edges.push(edge);
+                }
+            }
+        }
+
+        let total_discovered = total_discovered.max(nodes.len());
+        let pruned_count = total_discovered.saturating_sub(nodes.len());
+
+        Ok(Some(RankedNeighborhoodResult {
+            nodes,
+            edges,
+            pruned_count,
+            total_discovered,
+        }))
+    }
+
     fn neighborhood(
         &self,
         center_id: &str,
@@ -2784,6 +2950,12 @@ fn collect_rows<T>(
 ) -> Result<Vec<T>> {
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+enum QueryResult {
+    Meta { total: usize },
+    Node(GraphNode),
+    Edge(GraphEdge),
 }
 
 fn node_from_row_at(row: &Row<'_>, offset: usize) -> rusqlite::Result<GraphNode> {
