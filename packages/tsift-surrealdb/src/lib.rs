@@ -580,6 +580,7 @@ pub struct SurrealdbGraphStore {
     rt: Arc<tokio::runtime::Runtime>,
     path: Option<PathBuf>,
     nodes: RwLock<BTreeMap<String, Arc<GraphNode>>>,
+    nodes_by_kind: RwLock<BTreeMap<String, BTreeSet<String>>>,
     edges: RwLock<SurrealEdgeIndexes>,
     node_row_hashes: RwLock<BTreeMap<String, String>>,
     edge_row_hashes: RwLock<BTreeMap<String, String>>,
@@ -622,6 +623,7 @@ impl SurrealdbGraphStore {
             rt,
             path: Some(path.to_path_buf()),
             nodes: RwLock::new(BTreeMap::new()),
+            nodes_by_kind: RwLock::new(BTreeMap::new()),
             edges: RwLock::new(SurrealEdgeIndexes::default()),
             node_row_hashes: RwLock::new(BTreeMap::new()),
             edge_row_hashes: RwLock::new(BTreeMap::new()),
@@ -654,6 +656,7 @@ impl SurrealdbGraphStore {
             rt,
             path: None,
             nodes: RwLock::new(BTreeMap::new()),
+            nodes_by_kind: RwLock::new(BTreeMap::new()),
             edges: RwLock::new(SurrealEdgeIndexes::default()),
             node_row_hashes: RwLock::new(BTreeMap::new()),
             edge_row_hashes: RwLock::new(BTreeMap::new()),
@@ -838,6 +841,7 @@ impl SurrealdbGraphStore {
             Ok::<(), anyhow::Error>(())
         })?;
         self.nodes_write()?.clear();
+        self.nodes_by_kind.write().map_err(|_| anyhow!("lock"))?.clear();
         self.edges_write()?.clear();
         if let Some(ref store_path) = self.path {
             let _ = std::fs::remove_file(sidecar_path(store_path));
@@ -867,6 +871,7 @@ impl SurrealdbGraphStore {
             return Ok(false);
         }
         *self.nodes_write()? = sidecar.nodes.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
+        self.rebuild_nodes_by_kind_index()?;
         let mut edge_index = SurrealEdgeIndexes::default();
         for edge in sidecar.edges {
             edge_index.insert(edge);
@@ -927,6 +932,17 @@ impl SurrealdbGraphStore {
         }
         drop(node_index);
         drop(node_hashes);
+        {
+            let nodes = self.nodes_read()?;
+            let mut by_kind: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for (id, node) in nodes.iter() {
+                by_kind
+                    .entry(node.kind.clone())
+                    .or_default()
+                    .insert(id.clone());
+            }
+            *self.nodes_by_kind.write().map_err(|_| anyhow!("lock"))? = by_kind;
+        }
 
         let mut edge_index = self.edges_write()?;
         edge_index.clear();
@@ -984,6 +1000,7 @@ impl SurrealdbGraphStore {
             next_edges.insert(edge);
         }
         *self.nodes_write()? = next_nodes;
+        self.rebuild_nodes_by_kind_index()?;
         *self.edges_write()? = next_edges;
         Ok(())
     }
@@ -1045,12 +1062,39 @@ impl SurrealdbGraphStore {
         tombstoned_edge_keys: &[String],
     ) -> Result<()> {
         {
-            let mut node_index = self.nodes_write()?;
-            for id in tombstoned_node_ids {
-                node_index.remove(id);
+            let tombstoned_kinds: Vec<(String, String)> = {
+                let nodes = self.nodes_read()?;
+                tombstoned_node_ids
+                    .iter()
+                    .filter_map(|id| {
+                        nodes.get(id).map(|n| (id.clone(), n.kind.clone()))
+                    })
+                    .collect()
+            };
+            for (id, kind) in &tombstoned_kinds {
+                self.nodes_by_kind
+                    .write()
+                    .map_err(|_| anyhow!("lock"))?
+                    .entry(kind.clone())
+                    .or_default()
+                    .remove(id);
+            }
+            {
+                let mut node_index = self.nodes_write()?;
+                for id in tombstoned_node_ids {
+                    node_index.remove(id);
+                }
+                for node in new_nodes {
+                    node_index.insert(node.id.clone(), Arc::new(node.clone()));
+                }
             }
             for node in new_nodes {
-                node_index.insert(node.id.clone(), Arc::new(node.clone()));
+                self.nodes_by_kind
+                    .write()
+                    .map_err(|_| anyhow!("lock"))?
+                    .entry(node.kind.clone())
+                    .or_default()
+                    .insert(node.id.clone());
             }
         }
         {
@@ -1087,6 +1131,32 @@ impl SurrealdbGraphStore {
             .map_err(|_| anyhow!("SurrealDB graph node index lock poisoned"))
     }
 
+    fn nodes_by_kind_read(&self) -> Result<std::sync::RwLockReadGuard<'_, BTreeMap<String, BTreeSet<String>>>> {
+        self.nodes_by_kind
+            .read()
+            .map_err(|_| anyhow!("SurrealDB graph node by_kind index lock poisoned"))
+    }
+
+    fn unindex_node_kind(&self, kind: &str, id: &str) -> Result<()> {
+        if let Some(ids) = self.nodes_by_kind.write().map_err(|_| anyhow!("lock"))?.get_mut(kind) {
+            ids.remove(id);
+        }
+        Ok(())
+    }
+
+    fn rebuild_nodes_by_kind_index(&self) -> Result<()> {
+        let nodes = self.nodes_read()?;
+        let mut by_kind = BTreeMap::new();
+        for (id, node) in nodes.iter() {
+            by_kind
+                .entry(node.kind.clone())
+                .or_insert_with(BTreeSet::new)
+                .insert(id.clone());
+        }
+        *self.nodes_by_kind.write().map_err(|_| anyhow!("lock"))? = by_kind;
+        Ok(())
+    }
+
     fn edges_read(&self) -> Result<std::sync::RwLockReadGuard<'_, SurrealEdgeIndexes>> {
         self.edges
             .read()
@@ -1112,7 +1182,29 @@ impl GraphStore for SurrealdbGraphStore {
                 .context("upserting SurrealDB graph node")?;
             Ok::<(), anyhow::Error>(())
         })?;
-        self.nodes_write()?.insert(node.id.clone(), Arc::new(node.clone()));
+        {
+            let old_kind = {
+                let nodes = self.nodes_read()?;
+                nodes.get(&node.id).map(|n| n.kind.clone())
+            };
+            if let Some(ref old_kind) = old_kind
+                && old_kind != &node.kind
+            {
+                self.nodes_by_kind
+                    .write()
+                    .map_err(|_| anyhow!("lock"))?
+                    .entry(old_kind.clone())
+                    .or_default()
+                    .remove(&node.id);
+            }
+            self.nodes_by_kind
+                .write()
+                .map_err(|_| anyhow!("lock"))?
+                .entry(node.kind.clone())
+                .or_default()
+                .insert(node.id.clone());
+            self.nodes_write()?.insert(node.id.clone(), Arc::new(node.clone()));
+        }
         Ok(())
     }
 
@@ -1163,7 +1255,13 @@ impl GraphStore for SurrealdbGraphStore {
                 .with_context(|| format!("deleting SurrealDB graph node {id}"))
         })?;
         if deleted.is_some() {
-            self.nodes_write()?.remove(id);
+            let removed = {
+                let mut nodes = self.nodes_write()?;
+                nodes.remove(id)
+            };
+            if let Some(node) = removed {
+                let _ = self.unindex_node_kind(&node.kind, &node.id);
+            }
         }
         Ok(usize::from(deleted.is_some()))
     }
@@ -1213,13 +1311,17 @@ impl GraphStore for SurrealdbGraphStore {
     }
 
     fn nodes_by_kind(&self, kind: &str) -> Result<Vec<GraphNode>> {
-        let mut nodes = self
-            .all_nodes()?
-            .into_iter()
-            .filter(|node| node.kind == kind)
-            .collect::<Vec<_>>();
-        nodes.sort_by(|left, right| left.id.cmp(&right.id));
-        Ok(nodes)
+        let by_kind = self.nodes_by_kind_read()?;
+        let nodes = self.nodes_read()?;
+        let Some(ids) = by_kind.get(kind) else {
+            return Ok(Vec::new());
+        };
+        let mut result: Vec<GraphNode> = ids
+            .iter()
+            .filter_map(|id| nodes.get(id).map(|arc| (**arc).clone()))
+            .collect();
+        result.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(result)
     }
 
     fn outgoing_edges(&self, from_id: &str, kind: Option<&str>) -> Result<Vec<GraphEdge>> {
@@ -1497,6 +1599,24 @@ mod tests {
         assert_eq!(store.node("node:a").unwrap().unwrap().label, "alpha");
         assert_eq!(store.delete_node("node:a").unwrap(), 1);
         assert!(store.node("node:a").unwrap().is_none());
+    }
+
+    #[test]
+    fn surrealdb_store_nodes_by_kind_uses_index() {
+        let store = SurrealdbGraphStore::in_memory().unwrap();
+        for (id, kind) in [("n:a", "function"), ("n:b", "function"), ("n:c", "struct")] {
+            store.upsert_node(&GraphNode::new(id, kind, id)).unwrap();
+        }
+        let fns = store.nodes_by_kind("function").unwrap();
+        assert_eq!(fns.len(), 2);
+        assert_eq!(fns[0].id, "n:a");
+        assert_eq!(fns[1].id, "n:b");
+        let structs = store.nodes_by_kind("struct").unwrap();
+        assert_eq!(structs.len(), 1);
+        assert_eq!(structs[0].id, "n:c");
+        assert!(store.nodes_by_kind("module").unwrap().is_empty());
+        store.delete_node("n:b").unwrap();
+        assert_eq!(store.nodes_by_kind("function").unwrap().len(), 1);
     }
 
     #[test]
