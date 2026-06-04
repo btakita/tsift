@@ -5,6 +5,7 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -144,6 +145,7 @@ pub struct SqliteGraphStore {
     conn: Connection,
     _snapshot_copy: Option<SnapshotCopyGuard>,
     read_only_recovery: Option<ReadOnlyRecovery>,
+    temp_table_active: Cell<bool>,
 }
 
 /// Read-only handle to a SQLite graph database connection.
@@ -616,6 +618,12 @@ fn sqlite_stage_projection_edges(
 }
 
 impl SqliteGraphStore {
+    fn assert_not_in_temp_table_section(&self) {
+        if self.temp_table_active.get() {
+            panic!("SqliteGraphStore: re-entrant temp-table call detected — only one temp-table-using method may be active at a time per connection");
+        }
+    }
+
     pub fn open(db_path: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
@@ -755,6 +763,7 @@ impl SqliteGraphStore {
             conn,
             _snapshot_copy: None,
             read_only_recovery: None,
+            temp_table_active: Cell::new(false),
         })
     }
 
@@ -778,6 +787,7 @@ impl SqliteGraphStore {
             conn: connection.conn,
             _snapshot_copy: connection._snapshot_copy,
             read_only_recovery: connection.recovery,
+            temp_table_active: Cell::new(false),
         })
     }
 
@@ -793,7 +803,21 @@ impl SqliteGraphStore {
         projection_version: Option<&str>,
         source_watermark: Option<String>,
     ) -> Result<SqliteProjectionRefresh> {
+        self.assert_not_in_temp_table_section();
+        self.temp_table_active.set(true);
         let scope = scope.into();
+        let result = self.replace_projection_with_version_fallible(scope, projection, projection_version, source_watermark);
+        self.temp_table_active.set(false);
+        result
+    }
+
+    fn replace_projection_with_version_fallible(
+        &mut self,
+        scope: String,
+        projection: &GraphProjection,
+        projection_version: Option<&str>,
+        source_watermark: Option<String>,
+    ) -> Result<SqliteProjectionRefresh> {
         let projection_version = projection_version
             .map(str::to_string)
             .or_else(|| projection_version_from_nodes(&projection.nodes))
@@ -2262,37 +2286,43 @@ impl GraphStore for SqliteGraphStore {
         if node_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute_batch(
-            r#"
-            CREATE TEMP TABLE IF NOT EXISTS _edges_between_ids (id TEXT PRIMARY KEY);
-            DELETE FROM _edges_between_ids;
-            "#,
-        )?;
-        for chunk in node_ids.iter().collect::<Vec<_>>().chunks(450) {
-            let row_placeholders: Vec<String> =
-                chunk.iter().map(|_| "(?)".to_string()).collect();
-            let placeholders = row_placeholders.join(", ");
-            let sql = format!(
-                "INSERT OR IGNORE INTO _edges_between_ids (id) VALUES {placeholders}"
-            );
-            let values: Vec<Value> = chunk.iter().map(|id| Value::Text((*id).clone())).collect();
-            tx.execute(&sql, params_from_iter(values.iter()))?;
-        }
-        let edges = {
-            let mut stmt = tx.prepare(
+        self.assert_not_in_temp_table_section();
+        self.temp_table_active.set(true);
+        let result = (|| -> Result<Vec<GraphEdge>> {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 r#"
-                SELECT e.edge_key, e.from_id, e.to_id, e.kind, e.properties_json, e.provenance_json, e.freshness_json
-                FROM graph_edges e
-                WHERE EXISTS (SELECT 1 FROM _edges_between_ids f WHERE f.id = e.from_id)
-                  AND EXISTS (SELECT 1 FROM _edges_between_ids t WHERE t.id = e.to_id)
-                ORDER BY e.from_id, e.kind, e.to_id
+                CREATE TEMP TABLE IF NOT EXISTS _edges_between_ids (id TEXT PRIMARY KEY);
+                DELETE FROM _edges_between_ids;
                 "#,
             )?;
-            collect_rows(stmt.query_map([], edge_from_row)?)?
-        };
-        tx.finish()?;
-        Ok(edges)
+            for chunk in node_ids.iter().collect::<Vec<_>>().chunks(450) {
+                let row_placeholders: Vec<String> =
+                    chunk.iter().map(|_| "(?)".to_string()).collect();
+                let placeholders = row_placeholders.join(", ");
+                let sql = format!(
+                    "INSERT OR IGNORE INTO _edges_between_ids (id) VALUES {placeholders}"
+                );
+                let values: Vec<Value> = chunk.iter().map(|id| Value::Text((*id).clone())).collect();
+                tx.execute(&sql, params_from_iter(values.iter()))?;
+            }
+            let edges = {
+                let mut stmt = tx.prepare(
+                    r#"
+                    SELECT e.edge_key, e.from_id, e.to_id, e.kind, e.properties_json, e.provenance_json, e.freshness_json
+                    FROM graph_edges e
+                    WHERE EXISTS (SELECT 1 FROM _edges_between_ids f WHERE f.id = e.from_id)
+                      AND EXISTS (SELECT 1 FROM _edges_between_ids t WHERE t.id = e.to_id)
+                    ORDER BY e.from_id, e.kind, e.to_id
+                    "#,
+                )?;
+                collect_rows(stmt.query_map([], edge_from_row)?)?
+            };
+            tx.finish()?;
+            Ok(edges)
+        })();
+        self.temp_table_active.set(false);
+        result
     }
 
     fn ranked_neighborhood(
@@ -2440,8 +2470,7 @@ impl GraphStore for SqliteGraphStore {
                     if node.id != center_id {
                         nodes.push(node);
                     }
-                }
-                QueryResult::Edge(edge) => {
+                }QueryResult::Edge(edge) => {
                     edges.push(edge);
                 }
             }
@@ -2685,7 +2714,10 @@ impl GraphStore for SqliteGraphStore {
             return Ok(None);
         }
 
-        let call_id = BFS_CALL_ID.fetch_add(1, Ordering::Relaxed);
+        self.assert_not_in_temp_table_section();
+        self.temp_table_active.set(true);
+        let result = (|| -> Result<Option<GraphPath>> {
+            let call_id = BFS_CALL_ID.fetch_add(1, Ordering::Relaxed);
         let tbl = format!("_tsift_frontier_{call_id}");
 
         let mut visited = BTreeSet::from([from_id.to_string()]);
@@ -2768,6 +2800,9 @@ impl GraphStore for SqliteGraphStore {
         }
         let _ = self.conn.execute_batch(&drop_sql);
         Ok(found_path)
+        })();
+        self.temp_table_active.set(false);
+        result
     }
 
     fn reachable_nodes_by_kind(
@@ -3916,5 +3951,26 @@ mod tests {
                 .as_deref(),
             Some("commit-b")
         );
+    }
+
+    #[test]
+    fn sqlite_reentrant_temp_table_guard_panics() {
+        let store = SqliteGraphStore::in_memory().unwrap();
+        store.temp_table_active.set(true);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.assert_not_in_temp_table_section();
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sqlite_temp_table_guard_clears_after_method() {
+        let mut store = SqliteGraphStore::in_memory().unwrap();
+        let projection = GraphProjection {
+            nodes: vec![],
+            edges: vec![],
+        };
+        store.replace_projection(&projection).unwrap();
+        assert!(!store.temp_table_active.get());
     }
 }
