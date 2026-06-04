@@ -367,6 +367,20 @@ pub enum NeighborhoodScoring {
     DegreeWeighted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropertyMode {
+    Full,
+    Sample,
+    Omit,
+}
+
+impl Default for PropertyMode {
+    fn default() -> Self {
+        Self::Full
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RankedNeighborhoodOptions {
     pub depth: usize,
@@ -374,6 +388,8 @@ pub struct RankedNeighborhoodOptions {
     pub scoring: NeighborhoodScoring,
     #[serde(default)]
     pub edge_kind: Option<String>,
+    #[serde(default)]
+    pub property_mode: PropertyMode,
 }
 
 impl RankedNeighborhoodOptions {
@@ -383,6 +399,7 @@ impl RankedNeighborhoodOptions {
             max_nodes,
             scoring: NeighborhoodScoring::BreadthFirst,
             edge_kind: None,
+            property_mode: PropertyMode::Full,
         }
     }
 
@@ -393,6 +410,11 @@ impl RankedNeighborhoodOptions {
 
     pub fn with_edge_kind(mut self, kind: impl Into<String>) -> Self {
         self.edge_kind = Some(kind.into());
+        self
+    }
+
+    pub fn with_property_mode(mut self, mode: PropertyMode) -> Self {
+        self.property_mode = mode;
         self
     }
 }

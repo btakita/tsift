@@ -12,7 +12,7 @@ pub use store::{
 pub use types::{
     GraphEdge, GraphFreshness, GraphNode, GraphPagedSubgraph, GraphPath, GraphProjection,
     GraphPropertyFilter, GraphProvenance, GraphQueryOptions, GraphQueryPage, GraphSubgraph,
-    NeighborhoodScoring, RankedNeighborhoodOptions, RankedNeighborhoodResult,
+    NeighborhoodScoring, PropertyMode, RankedNeighborhoodOptions, RankedNeighborhoodResult,
     SQLITE_GRAPH_SCHEMA_VERSION, TerseGraphEdge, TerseGraphNode, TerseGraphSubgraph,
     TerseHealthScore, TerseSearchHit, graph_edge_id, stable_graph_edge_id,
 };

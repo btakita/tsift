@@ -15,7 +15,7 @@ pub use tsift_core::{
     ConvexEdgeRow, ConvexGraphClient, ConvexGraphStore, ConvexNodeRow, ConvexProjectionRows,
     ConvexRowsGraphClient, GraphEdge, GraphFreshness, GraphNode, GraphPagedSubgraph, GraphPath,
     GraphProjection, GraphPropertyFilter, GraphProvenance, GraphQueryOptions, GraphQueryPage,
-    GraphStore, GraphSubgraph, RankedNeighborhoodOptions, RankedNeighborhoodResult,
+    GraphStore, GraphSubgraph, PropertyMode, RankedNeighborhoodOptions, RankedNeighborhoodResult,
     SQLITE_GRAPH_SCHEMA_VERSION, TerseGraphEdge, TerseGraphNode,
     apply_graph_edge_query_page,
     apply_graph_query_page, graph_edge_id, shortest_path_using_outgoing, stable_graph_edge_id,
@@ -2616,6 +2616,31 @@ impl GraphStore for SqliteGraphStore {
 
         let total_discovered = total_discovered.max(nodes.len());
         let pruned_count = total_discovered.saturating_sub(nodes.len());
+
+        match options.property_mode {
+            PropertyMode::Full => {}
+            PropertyMode::Omit => {
+                for n in &mut nodes {
+                    n.properties.clear();
+                }
+                for e in &mut edges {
+                    e.properties.clear();
+                }
+            }
+            PropertyMode::Sample => {
+                let mut seen_kinds = std::collections::BTreeSet::new();
+                for n in &mut nodes {
+                    if !seen_kinds.contains(&n.kind) {
+                        seen_kinds.insert(n.kind.clone());
+                    } else {
+                        n.properties.clear();
+                    }
+                }
+                for e in &mut edges {
+                    e.properties.clear();
+                }
+            }
+        }
 
         Ok(Some(RankedNeighborhoodResult {
             nodes,
