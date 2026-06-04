@@ -6029,6 +6029,10 @@ struct GraphDbEvidenceReport {
     shortest_paths: Vec<GraphDbEvidencePath>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_budget: Option<GraphDbOutputBudgetReport>,
+    #[serde(default)]
+    truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
     next_commands: Vec<String>,
     replay_commands: Vec<String>,
     repair_commands: Vec<String>,
@@ -6044,6 +6048,7 @@ pub(crate) struct GraphDbEvidenceInput<'a, S: GraphStore> {
     target: &'a str,
     depth: usize,
     limit: usize,
+    cursor: Option<&'a str>,
     store: &'a S,
     freshness: GraphDbFreshnessReport,
     warnings: Vec<String>,
@@ -8077,6 +8082,8 @@ struct GraphDbBudgetedSubgraph {
     nodes: Vec<SubstrateGraphNode>,
     edges: Vec<SubstrateGraphEdge>,
     report: GraphDbOutputBudgetReport,
+    truncated: bool,
+    next_cursor: Option<String>,
 }
 
 const GRAPH_DB_OUTPUT_DEFAULT_TOKEN_CAP: usize = 6_000;
@@ -8372,16 +8379,25 @@ fn graph_db_apply_output_budget(
     edges: Vec<SubstrateGraphEdge>,
     limit: Option<usize>,
 ) -> GraphDbBudgetedSubgraph {
-    graph_db_apply_output_budget_with_depths(origin_ids, semantic_scores, nodes, edges, limit, None)
+    graph_db_apply_output_budget_with_depths_and_cursor(
+        origin_ids,
+        semantic_scores,
+        nodes,
+        edges,
+        limit,
+        None,
+        None,
+    )
 }
 
-fn graph_db_apply_output_budget_with_depths(
+fn graph_db_apply_output_budget_with_depths_and_cursor(
     origin_ids: &[String],
     semantic_scores: &BTreeMap<String, f64>,
     nodes: Vec<SubstrateGraphNode>,
     edges: Vec<SubstrateGraphEdge>,
     limit: Option<usize>,
     depth_overrides: Option<&BTreeMap<String, usize>>,
+    cursor: Option<&str>,
 ) -> GraphDbBudgetedSubgraph {
     let max_tokens = graph_db_output_token_cap(limit);
     let candidate_nodes = nodes.len();
@@ -8422,11 +8438,24 @@ fn graph_db_apply_output_budget_with_depths(
             .then_with(|| left.id.cmp(&right.id))
     });
 
+    let cursor_skip = if let Some(cursor) = cursor {
+        node_candidates
+            .iter()
+            .position(|node| node.id == cursor)
+            .map(|pos| pos.saturating_add(1))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    if cursor_skip > 0 {
+        node_candidates = node_candidates.into_iter().skip(cursor_skip).collect();
+    }
+
     let mut selected_node_ids = BTreeSet::new();
     let mut selected_node_counts = BTreeMap::<String, usize>::new();
     let mut estimated_tokens = 0usize;
     let mut drops = BTreeMap::<(String, String, String), usize>::new();
-    for node in node_candidates {
+    for node in &node_candidates {
         let kind_count = selected_node_counts
             .get(&node.kind)
             .copied()
@@ -8448,6 +8477,10 @@ fn graph_db_apply_output_budget_with_depths(
         *selected_node_counts.entry(node.kind.clone()).or_default() += 1;
         estimated_tokens = estimated_tokens.saturating_add(tokens);
     }
+
+    let has_remaining_candidates = node_candidates
+        .iter()
+        .any(|node| !selected_node_ids.contains(&node.id));
 
     let mut selected_nodes = nodes
         .into_iter()
@@ -8521,7 +8554,13 @@ fn graph_db_apply_output_budget_with_depths(
         .filter(|edge| selected_edge_ids.contains(&graph_db_edge_key(edge)))
         .collect::<Vec<_>>();
     let dropped_by_budget = graph_db_budget_drop_report(drops);
-    let diagnostics = vec![
+    let truncated = has_remaining_candidates;
+    let next_cursor = if truncated {
+        selected_nodes.last().map(|node| node.id.clone())
+    } else {
+        None
+    };
+    let mut diagnostics = vec![
         "budget ranking signals: semantic_match, edge_kind, depth, recency, source_handle_coverage"
             .to_string(),
         format!(
@@ -8533,6 +8572,17 @@ fn graph_db_apply_output_budget_with_depths(
             max_tokens
         ),
     ];
+    if cursor.is_some() {
+        diagnostics.push(format!(
+            "cursor skipped {} previously returned candidate(s)",
+            cursor_skip
+        ));
+    }
+    if next_cursor.is_some() {
+        diagnostics.push(
+            "result was truncated; pass next_cursor as --cursor for the next page".to_string(),
+        );
+    }
     selected_nodes.shrink_to_fit();
 
     GraphDbBudgetedSubgraph {
@@ -8548,6 +8598,8 @@ fn graph_db_apply_output_budget_with_depths(
             dropped_by_budget,
             diagnostics,
         },
+        truncated,
+        next_cursor,
     }
 }
 
@@ -9052,6 +9104,7 @@ pub(crate) fn graph_db_evidence_report_from_store<S: GraphStore>(
         target,
         depth,
         limit,
+        cursor,
         store,
         freshness,
         mut warnings,
@@ -9129,15 +9182,18 @@ pub(crate) fn graph_db_evidence_report_from_store<S: GraphStore>(
         .collect::<BTreeMap<_, _>>();
     let target_query = graph_db_node_search_text(&target_node);
     let semantic_scores = graph_db_semantic_scores_for_query(Some(&target_query), &evidence_nodes);
-    let budgeted = graph_db_apply_output_budget_with_depths(
+    let budgeted = graph_db_apply_output_budget_with_depths_and_cursor(
         std::slice::from_ref(&target_node.id),
         &semantic_scores,
         evidence_nodes,
         Vec::new(),
         Some(limit),
         Some(&evidence_depth_by_id),
+        cursor,
     );
     let output_budget = budgeted.report;
+    let truncated = budgeted.truncated;
+    let next_cursor = budgeted.next_cursor;
     let retained_evidence_ids = budgeted
         .nodes
         .iter()
@@ -9221,6 +9277,8 @@ pub(crate) fn graph_db_evidence_report_from_store<S: GraphStore>(
         semantic_related,
         shortest_paths,
         output_budget: Some(output_budget),
+        truncated,
+        next_cursor,
         next_commands,
         replay_commands,
         repair_commands,
@@ -9244,8 +9302,14 @@ fn print_graph_db_evidence_human(report: &GraphDbEvidenceReport) {
         "graph-db evidence backend: {} target: {} [{}] packet:{}",
         report.backend, report.target_node.id, report.target_node.kind, report.packet_id
     );
+    let page_info = if report.truncated {
+        let cursor = report.next_cursor.as_deref().unwrap_or("?");
+        format!(" (truncated, next_cursor: {cursor})")
+    } else {
+        String::new()
+    };
     println!(
-        "evidence: {} worker_context row(s), {} source_handle row(s), {} worker_result row(s), {} semantic row(s), {} path(s)",
+        "evidence: {} worker_context row(s), {} source_handle row(s), {} worker_result row(s), {} semantic row(s), {} path(s){page_info}",
         report.worker_context.len(),
         report.source_handles.len(),
         report.worker_results.len(),
@@ -9274,6 +9338,12 @@ pub(crate) fn print_graph_db_evidence_report(
     format: OutputFormat,
 ) -> Result<()> {
     if format.json_output {
+        let page_info = if report.truncated {
+            let cursor = report.next_cursor.as_deref().unwrap_or("?");
+            format!(" (truncated, next_cursor: {cursor})")
+        } else {
+            String::new()
+        };
         print_json_or_envelope(
             report,
             &format,
@@ -9281,7 +9351,7 @@ pub(crate) fn print_graph_db_evidence_report(
             "evidence",
             ToolEnvelopeSummary {
                 text: format!(
-                    "Graph DB evidence for {} returned {} worker context row(s), {} source handle(s), {} worker result row(s), {} semantic row(s), and {} shortest path(s)",
+                    "Graph DB evidence for {} returned {} worker context row(s), {} source handle(s), {} worker result row(s), {} semantic row(s), and {} shortest path(s){page_info}",
                     report.target,
                     report.worker_context.len(),
                     report.source_handles.len(),
@@ -9298,7 +9368,7 @@ pub(crate) fn print_graph_db_evidence_report(
                     envelope_metric("paths", report.shortest_paths.len()),
                 ],
             },
-            false,
+            report.truncated,
             report.next_commands.clone(),
         )
     } else {
@@ -23876,6 +23946,7 @@ fn main() { api::handler(); }
             target: "kgnv",
             depth: 4,
             limit: 8,
+            cursor: None,
             store: &store,
             freshness,
             warnings: Vec::new(),
@@ -24320,13 +24391,14 @@ fn main() { api::handler(); }
         }
 
         let origin_ids = vec!["target".to_string()];
-        let budgeted = graph_db_apply_output_budget_with_depths(
+        let budgeted = graph_db_apply_output_budget_with_depths_and_cursor(
             &origin_ids,
             &BTreeMap::new(),
             nodes,
             Vec::new(),
             Some(3),
             Some(&depth_by_id),
+            None,
         );
 
         assert!(
@@ -24353,6 +24425,145 @@ fn main() { api::handler(); }
                 .any(|diagnostic| diagnostic.contains("depth")),
             "{:?}",
             budgeted.report.diagnostics
+        );
+    }
+
+    #[test]
+    fn evidence_pagination_returns_next_cursor_when_truncated() {
+        let mut nodes = vec![SubstrateGraphNode::new(
+            "target".to_string(),
+            "backlog_item",
+            "target item".to_string(),
+        )];
+        let mut depth_by_id = BTreeMap::new();
+        depth_by_id.insert("target".to_string(), 0);
+        for idx in 0..20 {
+            let id = format!("ev-{idx}");
+            nodes.push(SubstrateGraphNode::new(
+                id.clone(),
+                "source_handle",
+                format!("evidence row {idx}"),
+            ).with_property("detail", "x".repeat(400)));
+            depth_by_id.insert(id, 1);
+        }
+        let origin_ids = vec!["target".to_string()];
+        let first_page = graph_db_apply_output_budget_with_depths_and_cursor(
+            &origin_ids,
+            &BTreeMap::new(),
+            nodes.clone(),
+            Vec::new(),
+            Some(3),
+            Some(&depth_by_id),
+            None,
+        );
+        assert!(
+            first_page.truncated,
+            "expected first page to be truncated with 20 candidates and low limit, got {} selected of {} candidates",
+            first_page.nodes.len(),
+            first_page.report.candidate_nodes
+        );
+        assert!(
+            first_page.next_cursor.is_some(),
+            "expected next_cursor when truncated"
+        );
+        let cursor = first_page.next_cursor.unwrap();
+        assert!(
+            !cursor.is_empty(),
+            "cursor should be a non-empty node id"
+        );
+        let first_ids: BTreeSet<_> = first_page.nodes.iter().map(|n| n.id.clone()).collect();
+        let second_page = graph_db_apply_output_budget_with_depths_and_cursor(
+            &origin_ids,
+            &BTreeMap::new(),
+            nodes.clone(),
+            Vec::new(),
+            Some(3),
+            Some(&depth_by_id),
+            Some(&cursor),
+        );
+        let second_ids: BTreeSet<_> = second_page.nodes.iter().map(|n| n.id.clone()).collect();
+        let overlap: BTreeSet<_> = first_ids.intersection(&second_ids).cloned().collect();
+        assert!(
+            overlap.is_empty(),
+            "pages should not overlap, but found shared ids: {overlap:?}"
+        );
+        assert!(
+            second_page.report.diagnostics.iter().any(|d| d.contains("cursor skipped")),
+            "expected cursor skip diagnostic, got {:?}",
+            second_page.report.diagnostics
+        );
+    }
+
+    #[test]
+    fn evidence_pagination_no_cursor_returns_all_when_within_budget() {
+        let mut nodes = vec![SubstrateGraphNode::new(
+            "target".to_string(),
+            "backlog_item",
+            "target item".to_string(),
+        )];
+        let mut depth_by_id = BTreeMap::new();
+        depth_by_id.insert("target".to_string(), 0);
+        for idx in 0..3 {
+            let id = format!("ev-{idx}");
+            nodes.push(SubstrateGraphNode::new(
+                id.clone(),
+                "source_handle",
+                format!("evidence row {idx}"),
+            ));
+            depth_by_id.insert(id, 1);
+        }
+        let origin_ids = vec!["target".to_string()];
+        let result = graph_db_apply_output_budget_with_depths_and_cursor(
+            &origin_ids,
+            &BTreeMap::new(),
+            nodes,
+            Vec::new(),
+            None,
+            Some(&depth_by_id),
+            None,
+        );
+        assert!(
+            !result.truncated,
+            "expected no truncation with small candidate set and default budget"
+        );
+        assert!(
+            result.next_cursor.is_none(),
+            "expected no next_cursor when not truncated"
+        );
+    }
+
+    #[test]
+    fn evidence_pagination_invalid_cursor_returns_first_page() {
+        let mut nodes = vec![SubstrateGraphNode::new(
+            "target".to_string(),
+            "backlog_item",
+            "target item".to_string(),
+        )];
+        let mut depth_by_id = BTreeMap::new();
+        depth_by_id.insert("target".to_string(), 0);
+        for idx in 0..5 {
+            let id = format!("ev-{idx}");
+            nodes.push(SubstrateGraphNode::new(
+                id.clone(),
+                "source_handle",
+                format!("evidence row {idx}"),
+            ));
+            depth_by_id.insert(id, 1);
+        }
+        let origin_ids = vec!["target".to_string()];
+        let result = graph_db_apply_output_budget_with_depths_and_cursor(
+            &origin_ids,
+            &BTreeMap::new(),
+            nodes.clone(),
+            Vec::new(),
+            None,
+            Some(&depth_by_id),
+            Some("nonexistent-id"),
+        );
+        assert!(
+            result.report.diagnostics.iter().any(|d| d.contains("cursor skipped 0")),
+            "invalid cursor should skip 0 candidates, got {:?}",
+            result.report.diagnostics
         );
     }
 
@@ -24425,6 +24636,7 @@ fn main() { api::handler(); }
                 target: "kgnv".to_string(),
                 depth: 3,
                 limit: 8,
+                cursor: None,
             },
             OutputFormat {
                 json_output: false,
@@ -24472,6 +24684,7 @@ fn main() { api::handler(); }
             target: "kgnv",
             depth: 3,
             limit: 8,
+            cursor: None,
             store: &store,
             freshness: stale,
             warnings: Vec::new(),

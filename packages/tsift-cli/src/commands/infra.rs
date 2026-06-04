@@ -1078,6 +1078,7 @@ pub(crate) fn cmd_graph_db(
                 target,
                 depth,
                 limit,
+                cursor,
             } = &query
             {
                 let report = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
@@ -1087,6 +1088,7 @@ pub(crate) fn cmd_graph_db(
                     target,
                     depth: *depth,
                     limit: *limit,
+                    cursor: cursor.as_deref(),
                     store: &store,
                     freshness,
                     warnings,
@@ -1112,6 +1114,7 @@ pub(crate) fn cmd_graph_db(
                 target,
                 depth,
                 limit,
+                cursor,
             } = &query
             {
                 let report = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
@@ -1121,6 +1124,7 @@ pub(crate) fn cmd_graph_db(
                     target,
                     depth: *depth,
                     limit: *limit,
+                    cursor: cursor.as_deref(),
                     store: &store,
                     freshness,
                     warnings,

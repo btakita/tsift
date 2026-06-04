@@ -266,6 +266,8 @@ The cycle packet cache (`#gpackreuse`) reuses graph/context packets across repea
 
 **Stable packet ID proof.** Evidence packet IDs are deterministic: `graph_db_evidence_packet_id` returns `stable_handle("gevd", version:target:node_id:content_hash)`. The cycle packet cache stores entries keyed by this packet ID, so a cache hit proves the same packet ID was produced for the same inputs. Integration tests verify that `packet_id` survives the cache roundtrip unchanged.
 
+**Evidence pagination.** When the budget system drops candidate nodes due to per-kind quotas or the estimated token cap, the evidence report sets `truncated: true` and includes `next_cursor: "<node_id>"`. Pass `--cursor <next_cursor>` to retrieve the next page of ranked evidence items. Each page applies a fresh budget (token cap and per-kind quotas reset), so agents can expand evidence incrementally without being flooded by a single large packet. The cursor is the node id of the last selected candidate in the score-sorted order; an invalid or stale cursor returns the first page with a diagnostic noting zero skipped candidates. Pages are disjoint: no node appears in more than one page for the same projection state. When all candidates fit within the budget, `truncated` is `false` and `next_cursor` is absent.
+
 **Cache version.** `CYCLE_PACKET_CACHE_VERSION = "cycle-packet-cache-v1"`. A version bump invalidates all existing cache entries.
 
 Convex support is a projection backend for the same substrate contract. `GraphProjection::upsert_into` writes nodes before edges, so stores can fail closed when an edge references a missing node. The Convex adapter maps records onto two application tables:
@@ -428,6 +430,7 @@ tsift graph-db --path . --json backend-eval | tsift metric-digest --baseline fix
 tsift graph-db --path . --json node <id> # SQLite graph node lookup
 tsift graph-db --path . --json kind backlog --property ref_id=cvxa --limit 5 # paged SQLite graph kind scan
 tsift graph-db --path . --json evidence cvxa --depth 3 --limit 8 # backlog/job handoff evidence packet
+tsift graph-db --path . --json evidence cvxa --depth 3 --limit 8 --cursor <next_cursor> # paginated evidence (next page)
 tsift conflict-matrix --path tasks/software/tsift.md pwcm g6kf --json # parallel worker ownership/conflict report
 tsift dispatch-trace --path tasks/software/tsift.md pwcm g6kf --format html # graph-backed dispatch trace
 tsift dependency-dag --path tasks/software/tsift.md pwcm g6kf --json # graph-backed dependency DAG and topo batches

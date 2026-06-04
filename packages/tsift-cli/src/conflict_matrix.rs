@@ -2286,6 +2286,7 @@ pub(crate) fn collect_conflict_matrix_evidence_packets<S: GraphStore>(
             target,
             depth,
             limit,
+            cursor: None,
             store,
             freshness: freshness.clone(),
             warnings: Vec::new(),

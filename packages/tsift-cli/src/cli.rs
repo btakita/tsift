@@ -1218,6 +1218,9 @@ pub enum GraphDbQuery {
         /// Maximum worker/source evidence records to return (0 = unlimited)
         #[arg(long, default_value = "8")]
         limit: usize,
+        /// Return evidence after this cursor (node id from a previous page)
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Resolve a natural-language phrase to semantic seeds, then expand graph neighborhoods around them
     Related {
