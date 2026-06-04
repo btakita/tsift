@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use surrealdb::RecordId;
 use surrealdb::Surreal;
@@ -196,7 +196,7 @@ fn edge_from_row(row: &ConvexEdgeRow) -> GraphEdge {
 
 type DirectionEdgeIndex = BTreeMap<String, BTreeMap<String, BTreeMap<(String, String), String>>>;
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize, Clone)]
 struct SurrealEdgeIndexes {
     by_id: BTreeMap<String, GraphEdge>,
     ordered: BTreeMap<(String, String, String, String), String>,
@@ -557,9 +557,28 @@ impl SurrealEdgeIndexes {
     }
 }
 
+const SIDECAR_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct SidecarData {
+    version: u32,
+    stored_row_hash: Option<String>,
+    nodes: BTreeMap<String, GraphNode>,
+    edges: Vec<GraphEdge>,
+    node_row_hashes: BTreeMap<String, String>,
+    edge_row_hashes: BTreeMap<String, String>,
+}
+
+fn sidecar_path(store_path: &Path) -> PathBuf {
+    let mut sidecar = store_path.as_os_str().to_os_string();
+    sidecar.push(".index-sidecar");
+    PathBuf::from(sidecar)
+}
+
 pub struct SurrealdbGraphStore {
     db: Surreal<Db>,
     rt: Arc<tokio::runtime::Runtime>,
+    path: Option<PathBuf>,
     nodes: RwLock<BTreeMap<String, GraphNode>>,
     edges: RwLock<SurrealEdgeIndexes>,
     node_row_hashes: RwLock<BTreeMap<String, String>>,
@@ -601,12 +620,16 @@ impl SurrealdbGraphStore {
         let store = Self {
             db,
             rt,
+            path: Some(path.to_path_buf()),
             nodes: RwLock::new(BTreeMap::new()),
             edges: RwLock::new(SurrealEdgeIndexes::default()),
             node_row_hashes: RwLock::new(BTreeMap::new()),
             edge_row_hashes: RwLock::new(BTreeMap::new()),
         };
-        store.load_indexes()?;
+        if !store.try_load_sidecar()? {
+            store.load_indexes()?;
+            let _ = store.write_sidecar();
+        }
         Ok(store)
     }
 
@@ -629,6 +652,7 @@ impl SurrealdbGraphStore {
         let store = Self {
             db,
             rt,
+            path: None,
             nodes: RwLock::new(BTreeMap::new()),
             edges: RwLock::new(SurrealEdgeIndexes::default()),
             node_row_hashes: RwLock::new(BTreeMap::new()),
@@ -772,6 +796,7 @@ impl SurrealdbGraphStore {
         }
         store.replace_projection_rows_delta(rows)?;
         store.set_stored_row_hash(&incoming_hash)?;
+        store.write_sidecar()?;
         Ok((store, WarmStartOutcome::Refreshed))
     }
 
@@ -814,6 +839,64 @@ impl SurrealdbGraphStore {
         })?;
         self.nodes_write()?.clear();
         self.edges_write()?.clear();
+        if let Some(ref store_path) = self.path {
+            let _ = std::fs::remove_file(sidecar_path(store_path));
+        }
+        Ok(())
+    }
+
+    fn try_load_sidecar(&self) -> Result<bool> {
+        let Some(ref store_path) = self.path else { return Ok(false) };
+        let path = sidecar_path(store_path);
+        if !path.exists() {
+            return Ok(false);
+        }
+        let data = match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(_) => return Ok(false),
+        };
+        let sidecar: SidecarData = match serde_json::from_slice(&data) {
+            Ok(sidecar) => sidecar,
+            Err(_) => return Ok(false),
+        };
+        if sidecar.version != SIDECAR_VERSION {
+            return Ok(false);
+        }
+        let stored = self.stored_row_hash()?;
+        if sidecar.stored_row_hash != stored {
+            return Ok(false);
+        }
+        *self.nodes_write()? = sidecar.nodes;
+        let mut edge_index = SurrealEdgeIndexes::default();
+        for edge in sidecar.edges {
+            edge_index.insert(edge);
+        }
+        *self.edges_write()? = edge_index;
+        *self.node_row_hashes.write().map_err(|_| anyhow!("lock"))? = sidecar.node_row_hashes;
+        *self.edge_row_hashes.write().map_err(|_| anyhow!("lock"))? = sidecar.edge_row_hashes;
+        Ok(true)
+    }
+
+    fn write_sidecar(&self) -> Result<()> {
+        let Some(ref store_path) = self.path else { return Ok(()) };
+        let stored_hash = self.stored_row_hash()?;
+        let Some(ref hash) = stored_hash else { return Ok(()) };
+        let nodes = self.nodes_read()?;
+        let edges = self.edges_read()?;
+        let node_hashes = self.node_row_hashes.read().map_err(|_| anyhow!("lock"))?;
+        let edge_hashes = self.edge_row_hashes.read().map_err(|_| anyhow!("lock"))?;
+        let sidecar = SidecarData {
+            version: SIDECAR_VERSION,
+            stored_row_hash: Some(hash.clone()),
+            nodes: nodes.clone(),
+            edges: edges.ordered_edges(),
+            node_row_hashes: node_hashes.clone(),
+            edge_row_hashes: edge_hashes.clone(),
+        };
+        let data = serde_json::to_vec(&sidecar)?;
+        let path = sidecar_path(store_path);
+        std::fs::write(&path, data)
+            .with_context(|| format!("writing SurrealDB sidecar {}", path.display()))?;
         Ok(())
     }
 
@@ -1764,5 +1847,91 @@ mod tests {
         assert_eq!(store2.graph_counts().unwrap().0, 1);
         assert!(store1.node("node:a").unwrap().is_some());
         assert!(store2.node("node:b").unwrap().is_some());
+    }
+
+    #[test]
+    fn surrealdb_store_sidecar_skips_load_on_cache_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("surrealdb");
+
+        let (store1, outcome1) =
+            SurrealdbGraphStore::open_or_refresh(&store_path, &sample_rows()).unwrap();
+        assert_eq!(outcome1, WarmStartOutcome::Refreshed);
+        assert_eq!(store1.graph_counts().unwrap(), (2, 1));
+        assert!(sidecar_path(&store_path).exists());
+        drop(store1);
+
+        let (store2, outcome2) =
+            SurrealdbGraphStore::open_or_refresh(&store_path, &sample_rows()).unwrap();
+        assert_eq!(outcome2, WarmStartOutcome::CacheHit);
+        assert_eq!(store2.graph_counts().unwrap(), (2, 1));
+        assert_eq!(
+            store2
+                .edge(&stable_graph_edge_id("node:a", "node:b", "calls"))
+                .unwrap()
+                .unwrap()
+                .to_id,
+            "node:b"
+        );
+    }
+
+    #[test]
+    fn surrealdb_store_sidecar_invalidated_on_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("surrealdb");
+
+        let (store1, _) =
+            SurrealdbGraphStore::open_or_refresh(&store_path, &sample_rows()).unwrap();
+        drop(store1);
+
+        let changed_rows = ConvexProjectionRows {
+            nodes: vec![
+                ConvexNodeRow::from(&GraphNode::new("node:x", "file", "new.rs")),
+                ConvexNodeRow::from(&GraphNode::new("node:y", "file", "other.rs")),
+            ],
+            edges: vec![ConvexEdgeRow::from(
+                &GraphEdge::new("node:x", "node:y", "imports"),
+            )],
+        };
+        let (store2, outcome2) =
+            SurrealdbGraphStore::open_or_refresh(&store_path, &changed_rows).unwrap();
+        assert_eq!(outcome2, WarmStartOutcome::Refreshed);
+        assert_eq!(store2.graph_counts().unwrap(), (2, 1));
+        assert_eq!(store2.nodes_by_kind("file").unwrap().len(), 2);
+        drop(store2);
+
+        let (store3, outcome3) =
+            SurrealdbGraphStore::open_or_refresh(&store_path, &changed_rows).unwrap();
+        assert_eq!(outcome3, WarmStartOutcome::CacheHit);
+        assert_eq!(store3.graph_counts().unwrap(), (2, 1));
+    }
+
+    #[test]
+    fn surrealdb_store_sidecar_corrupted_falls_back_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("surrealdb");
+
+        let (store1, _) =
+            SurrealdbGraphStore::open_or_refresh(&store_path, &sample_rows()).unwrap();
+        drop(store1);
+
+        let sidecar = sidecar_path(&store_path);
+        assert!(sidecar.exists());
+        std::fs::write(&sidecar, b"corrupted data").unwrap();
+
+        let (store2, outcome2) =
+            SurrealdbGraphStore::open_or_refresh(&store_path, &sample_rows()).unwrap();
+        assert_eq!(outcome2, WarmStartOutcome::CacheHit);
+        assert_eq!(store2.graph_counts().unwrap(), (2, 1));
+    }
+
+    #[test]
+    fn surrealdb_store_sidecar_no_file_for_in_memory() {
+        let store = SurrealdbGraphStore::in_memory().unwrap();
+        store
+            .upsert_node(&GraphNode::new("node:a", "symbol", "alpha"))
+            .unwrap();
+        assert!(store.path.is_none());
+        assert!(store.write_sidecar().is_ok());
     }
 }
