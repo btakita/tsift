@@ -1957,6 +1957,13 @@ fn ultra_terse_transform(val: serde_json::Value) -> serde_json::Value {
                 map.contains_key("from_id") && map.contains_key("to_id") && map.contains_key("k");
             if is_graph_node || is_graph_edge {
                 map.remove("properties");
+                map.remove("provenance");
+                map.remove("freshness");
+            }
+            if is_graph_edge {
+                if let Some(serde_json::Value::String(s)) = map.get_mut("k") {
+                    *s = abbreviate_edge_kind(s).to_string();
+                }
             }
             let is_coverage = map.contains_key("mode")
                 && (map.contains_key("total_sector_count")
@@ -2666,6 +2673,53 @@ pub(crate) fn abbreviate_kind(kind: &str) -> &str {
         "heading" => "h",
         "code_block" => "code",
         "alias" => "alias",
+        other => other,
+    }
+}
+
+pub(crate) fn abbreviate_edge_kind(kind: &str) -> &str {
+    match kind {
+        "calls" => "c",
+        "defines" => "d",
+        "contains" => "ct",
+        "imports" => "i",
+        "mentions" => "m",
+        "mentions_concept" => "mc",
+        "mentions_entity" => "me",
+        "semantic_relation" => "sr",
+        "belongs_to" => "bt",
+        "scopes_context" => "sctx",
+        "scopes_source" => "ssrc",
+        "requests_context" => "rctx",
+        "explains_result" => "er",
+        "tagged_concept" => "tc",
+        "tagged_entity" => "te",
+        "related_concept" => "relc",
+        "handled_by" => "hb",
+        "defines_route" => "dr",
+        "handles_route" => "hr",
+        "targets" => "tgt",
+        "has_vector_handle" => "hv",
+        "parent" => "p",
+        "child" => "ch",
+        "uses" => "u",
+        "projects_source" => "psrc",
+        "records_memory_source" => "rms",
+        "records_memory_event" => "rme",
+        "has_ast_span" => "ha",
+        "represents_symbol" => "rs",
+        "contains_embedded_symbol" => "ces",
+        "embedded_in_fence" => "ef",
+        "contains_markdown_block" => "cmb",
+        "contains_embedded_code" => "cec",
+        "enclosing_module" => "em",
+        "enclosing_section" => "es",
+        "previous_sibling" => "psib",
+        "next_sibling" => "nsib",
+        "explicit_depends_on" => "edo",
+        "worker_result_follow_up" => "wrf",
+        "shared_resource" => "shr",
+        "community_member" => "cm",
         other => other,
     }
 }
@@ -27703,8 +27757,52 @@ tier = "private"
         let edge = &parsed["d"]["edges"][0];
         assert_eq!(edge["from_id"], "a");
         assert_eq!(edge["to_id"], "b");
-        assert_eq!(edge["k"], "calls");
+        assert_eq!(edge["k"], "c");
         assert!(edge.get("properties").is_none());
+    }
+
+    #[test]
+    fn ultra_terse_abbreviates_edge_kinds() {
+        let val = serde_json::json!({
+            "edges": [
+                {"from_id": "a", "to_id": "b", "kind": "defines"},
+                {"from_id": "a", "to_id": "c", "kind": "contains"},
+                {"from_id": "a", "to_id": "d", "kind": "imports"},
+                {"from_id": "a", "to_id": "e", "kind": "mentions"},
+                {"from_id": "a", "to_id": "f", "kind": "semantic_relation"},
+                {"from_id": "a", "to_id": "g", "kind": "belongs_to"},
+                {"from_id": "a", "to_id": "h", "kind": "scopes_context"},
+                {"from_id": "a", "to_id": "i", "kind": "uses"},
+                {"from_id": "a", "to_id": "j", "kind": "parent"},
+                {"from_id": "a", "to_id": "k", "kind": "unknown_edge"},
+            ]
+        });
+        let result = to_json_schema(&val, false, true, true, false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let edges = &parsed["d"]["edges"].as_array().unwrap();
+        assert_eq!(edges[0]["k"], "d");
+        assert_eq!(edges[1]["k"], "ct");
+        assert_eq!(edges[2]["k"], "i");
+        assert_eq!(edges[3]["k"], "m");
+        assert_eq!(edges[4]["k"], "sr");
+        assert_eq!(edges[5]["k"], "bt");
+        assert_eq!(edges[6]["k"], "sctx");
+        assert_eq!(edges[7]["k"], "u");
+        assert_eq!(edges[8]["k"], "p");
+        assert_eq!(edges[9]["k"], "unknown_edge");
+    }
+
+    #[test]
+    fn ultra_terse_strips_provenance_freshness_from_edges() {
+        let val = serde_json::json!({
+            "edges": [{"from_id": "a", "to_id": "b", "kind": "calls", "provenance": [{"source": "tsift"}], "freshness": {"observed_at_unix": 1234567890}}]
+        });
+        let result = to_json_schema(&val, false, true, true, false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let edge = &parsed["d"]["edges"][0];
+        assert!(edge.get("provenance").is_none());
+        assert!(edge.get("freshness").is_none());
+        assert_eq!(edge["k"], "c");
     }
 
     #[test]

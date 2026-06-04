@@ -818,13 +818,15 @@ Unknown keys pass through unchanged.
 
 **Transforms applied (on top of terse key abbreviation):**
 
-1. **Graph node/edge property stripping** — removes the `properties` field from objects detected as graph nodes (have `id` + `kind` + `label`) or graph edges (have `from_id` + `to_id` + `kind`), keeping only `id`, `kind`, `label` for nodes and `id`, `from_id`, `to_id`, `kind` for edges.
+1. **Graph node/edge property stripping** — removes the `properties` field from objects detected as graph nodes (have `id` + `kind` + `label`) or graph edges (have `from_id` + `to_id` + `kind`), keeping only `id`, `kind`, `label` for nodes and `id`, `from_id`, `to_id`, `kind` for edges. Also strips `provenance` and `freshness` from graph edges.
 
-2. **Snippet truncation** — `snippet`/`sn` string values are truncated to 80 characters with a `...` ellipsis suffix when the original exceeds 80 chars.
+2. **Edge kind abbreviation** — maps edge kind values (`k` field in graph edges) to short codes: `calls→c`, `defines→d`, `contains→ct`, `imports→i`, `mentions→m`, `mentions_concept→mc`, `mentions_entity→me`, `semantic_relation→sr`, `belongs_to→bt`, `scopes_context→sctx`, `scopes_source→ssrc`, `requests_context→rctx`, `explains_result→er`, `tagged_concept→tc`, `tagged_entity→te`, `related_concept→relc`, `handled_by→hb`, `defines_route→dr`, `handles_route→hr`, `targets→tgt`, `uses→u`, `parent→p`, `child→ch`, `enclosing_module→em`, `enclosing_section→es`, and more. Unknown kinds pass through unchanged.
 
-3. **Coverage snapshot compaction** — `SearchCoverageSnapshot` objects retain only `mode`, `total_sector_count`, and `dirty_sector_count`. Removes `active_rebuild`, `completed_dirty_sector_count`, `mounted_sector_count`, `rebuilding_sector_count`, `resumed_sector_count`, `reused_sector_count`.
+3. **Snippet truncation** — `snippet`/`sn` string values are truncated to 80 characters with a `...` ellipsis suffix when the original exceeds 80 chars.
 
-**Expected savings:** ~25-40% token reduction over terse mode for graph-heavy and search-heavy responses.
+4. **Coverage snapshot compaction** — `SearchCoverageSnapshot` objects retain only `mode`, `total_sector_count`, and `dirty_sector_count`. Removes `active_rebuild`, `completed_dirty_sector_count`, `mounted_sector_count`, `rebuilding_sector_count`, `resumed_sector_count`, `reused_sector_count`.
+
+**Expected savings:** ~30-50% token reduction over terse mode for graph-heavy and search-heavy responses.
 
 ```bash
 tsift --ultra-terse search "main"          # ultra-terse JSON (implies --terse --json)
