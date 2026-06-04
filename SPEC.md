@@ -539,11 +539,11 @@ Because that auto-exact routing closes the main literal-lookup gap after the sta
 The JSON and envelope forms (`tsift --envelope source-read src/main.rs --start 40 --lines 80 --budget normal`) emit:
 
 - a stable `swin-*` window handle for the file/range
-- line-numbered preview rows capped by the response budget
+- line-numbered preview rows capped by the response budget and a body token cap (default 1500 tokens for Normal, 500 for Small, 3000 for Deep); when the preview exceeds the token cap it is truncated and an `expand.body` command is emitted for the remaining lines
 - `ssym-*` symbol refs for indexed symbols intersecting the window, each with a `symbol-read` expansion command and optional AST `span` metadata (`span-*` handle, node kind, byte range, body range, parent handle, and child handles). Markdown refs include full heading section ranges, `markdown.heading_level`, `markdown.section_path`, `markdown.section_handle`, `markdown.list_depth`, and `markdown.fence_language` where applicable.
 - cached `sum-*` summary refs for the file when `.tsift/summaries.db` is present, each with a `summarize` expansion command
 - Markdown files include a bounded `markdown` projection with an outline-first section/block preview, stable `mdast-*`/`span-*` handles for visible nodes, and selected-node expansion commands
-- explicit `before`, `after`, full-file, and Markdown AST expansion commands so the next read can expand incrementally instead of falling back to `cat`/large `sed` windows
+- explicit `before`, `after`, `body`, full-file, and Markdown AST expansion commands so the next read can expand incrementally instead of falling back to `cat`/large `sed` windows
 
 The command still returns the source preview when index or summary stores are missing; those enrichment failures are reported as warnings. `--scope` restricts index refs for workspace submodule indexes, and nested paths infer the matching workspace scope when possible.
 
@@ -559,10 +559,10 @@ The default projection is outline-first: headings are surfaced before bounded li
 `tsift symbol-read <symbol>` is the symbol-centered read replacement surface. It resolves the query through the indexed symbols table, optionally scoped by `--file` and `--scope`, then emits:
 
 - a stable `sread-*` handle for the selected symbol
-- the symbol signature/range metadata, optional AST `span` metadata, and a token-budgeted body preview
+- the symbol signature/range metadata, optional AST `span` metadata, and a token-budgeted body preview capped by both a line-count budget (`preview_items × 16` lines) and a body token cap (default 1500 tokens for Normal, 500 for Small, 3000 for Deep); when the body exceeds the token cap it is truncated and an `expand.body` command is emitted for the remaining body lines
 - child `ssym-*` refs discovered inside the selected symbol's AST byte span when available, falling back to indexed lines for older indexes
 - cached summary refs for the owning file when available
-- expansion commands for the selected source window, whole file, `explain`, caller graph, callee graph, and `markdown-ast --node` when the selected symbol is Markdown
+- expansion commands for the selected source window, remaining body, whole file, `explain`, caller graph, callee graph, and `markdown-ast --node` when the selected symbol is Markdown
 
 `source-read` symbol refs now expand to `symbol-read`, while `symbol-read` preserves `explain`, graph, and Markdown AST commands as secondary expansion links. This makes whole-file `Read` fallback unnecessary for the normal search -> source window -> symbol body/navigation path.
 

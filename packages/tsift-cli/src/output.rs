@@ -21,6 +21,7 @@ use serde::Serialize;
 pub(crate) const DEFAULT_BUDGET_ITEMS: usize = 5;
 pub(crate) const DEFAULT_BUDGET_BYTES: usize = 160;
 pub(crate) const DEFAULT_FOLLOW_UP_ITEMS: usize = 4;
+pub(crate) const DEFAULT_BODY_TOKEN_CAP: usize = 1500;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct OutputFormat {
@@ -37,6 +38,7 @@ pub(crate) struct OutputFormat {
 pub(crate) struct ResponseBudget {
     pub max_items: Option<usize>,
     pub max_bytes: Option<usize>,
+    pub body_token_cap: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -52,7 +54,13 @@ impl ResponseBudget {
         Self {
             max_items,
             max_bytes,
+            body_token_cap: None,
         }
+    }
+
+    pub fn with_body_token_cap(mut self, cap: usize) -> Self {
+        self.body_token_cap = Some(cap);
+        self
     }
 
     pub fn from_cli(
@@ -71,6 +79,7 @@ impl ResponseBudget {
             max_items.or(defaults.max_items),
             max_bytes.or(defaults.max_bytes),
         )
+        .with_body_token_cap(defaults.body_token_cap.unwrap_or(DEFAULT_BODY_TOKEN_CAP))
     }
 
     pub fn is_active(self) -> bool {
@@ -88,16 +97,23 @@ impl ResponseBudget {
     pub fn follow_up_items(self) -> usize {
         self.preview_items().max(DEFAULT_FOLLOW_UP_ITEMS)
     }
+
+    pub fn body_token_cap(self) -> usize {
+        self.body_token_cap.unwrap_or(DEFAULT_BODY_TOKEN_CAP)
+    }
 }
 
 impl ResponseBudgetPreset {
     pub fn resolve(self) -> ResponseBudget {
         match self {
-            ResponseBudgetPreset::Small => ResponseBudget::new(Some(3), Some(120)),
-            ResponseBudgetPreset::Normal => {
-                ResponseBudget::new(Some(DEFAULT_BUDGET_ITEMS), Some(DEFAULT_BUDGET_BYTES))
+            ResponseBudgetPreset::Small => {
+                ResponseBudget::new(Some(3), Some(120)).with_body_token_cap(500)
             }
-            ResponseBudgetPreset::Deep => ResponseBudget::new(Some(10), Some(240)),
+            ResponseBudgetPreset::Normal => ResponseBudget::new(Some(DEFAULT_BUDGET_ITEMS), Some(DEFAULT_BUDGET_BYTES))
+                .with_body_token_cap(DEFAULT_BODY_TOKEN_CAP),
+            ResponseBudgetPreset::Deep => {
+                ResponseBudget::new(Some(10), Some(240)).with_body_token_cap(3000)
+            }
             ResponseBudgetPreset::Auto => adaptive_response_budget(),
         }
     }

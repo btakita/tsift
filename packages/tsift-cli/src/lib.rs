@@ -2605,6 +2605,46 @@ pub(crate) fn truncate_for_budget(input: &str, max_bytes: usize) -> String {
     }
 }
 
+struct TokenCappedPreview {
+    preview: Vec<SourceLinePreview>,
+    capped_end: usize,
+    was_capped: bool,
+}
+
+fn build_token_capped_preview(
+    all_lines: &[&str],
+    start: usize,
+    end: usize,
+    max_bytes: usize,
+    token_cap: usize,
+) -> TokenCappedPreview {
+    let mut preview = Vec::new();
+    let mut accumulated_tokens = 0usize;
+    let mut capped_end = end;
+    let mut was_capped = false;
+
+    for (idx, line) in all_lines[(start - 1)..end].iter().enumerate() {
+        let truncated = truncate_for_budget(line, max_bytes);
+        let line_tokens = estimated_tokens_from_bytes(truncated.len());
+        if accumulated_tokens + line_tokens > token_cap && !preview.is_empty() {
+            capped_end = start + idx - 1;
+            was_capped = true;
+            break;
+        }
+        accumulated_tokens += line_tokens;
+        preview.push(SourceLinePreview {
+            line: start + idx,
+            text: truncated,
+        });
+    }
+
+    TokenCappedPreview {
+        preview,
+        capped_end,
+        was_capped,
+    }
+}
+
 pub(crate) fn abbreviate_kind(kind: &str) -> &str {
     match kind {
         "function" => "fn",
@@ -15011,6 +15051,8 @@ struct SourceExpandCommands {
     before: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     after: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
     file: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     markdown_ast: Option<String>,
@@ -15081,6 +15123,8 @@ struct SymbolReadTarget {
 #[derive(Serialize)]
 struct SymbolReadExpandCommands {
     source_window: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
     file: String,
     explain: String,
     callers: String,
@@ -16659,20 +16703,21 @@ fn cmd_source_read(
     let requested_end = end.unwrap_or_else(|| start.saturating_add(lines).saturating_sub(1));
     let end_line = requested_end.min(total_lines);
     let max_bytes = budget.preview_bytes();
-    let preview = if total_lines == 0 {
-        Vec::new()
+    let token_cap = budget.body_token_cap();
+    let (preview, preview_end, body_truncated) = if total_lines == 0 {
+        (Vec::new(), end_line, false)
     } else {
-        all_lines[(start - 1)..end_line]
-            .iter()
-            .enumerate()
-            .map(|(idx, line)| SourceLinePreview {
-                line: start + idx,
-                text: truncate_for_budget(line, max_bytes),
-            })
-            .collect()
+        let capped = build_token_capped_preview(&all_lines, start, end_line, max_bytes, token_cap);
+        (capped.preview, capped.capped_end, capped.was_capped)
     };
+    let effective_end = if body_truncated { preview_end } else { end_line };
 
     let mut warnings = Vec::new();
+    if body_truncated {
+        warnings.push(format!(
+            "body preview capped at ~{token_cap} tokens at line {preview_end} of {end_line}"
+        ));
+    }
     let max_items = budget.preview_items();
     let symbols = load_source_symbols(
         &root,
@@ -16681,7 +16726,7 @@ fn cmd_source_read(
         &source,
         scope,
         start,
-        end_line,
+        effective_end,
         max_items,
         max_bytes,
         &mut warnings,
@@ -16694,7 +16739,7 @@ fn cmd_source_read(
             &file_display,
             &source,
             start,
-            end_line,
+            effective_end,
             budget,
         ) {
             Ok(markdown) => Some(markdown),
@@ -16707,29 +16752,33 @@ fn cmd_source_read(
         None
     };
 
-    let effective_lines = end_line.saturating_sub(start).saturating_add(1).max(1);
+    let effective_lines = effective_end.saturating_sub(start).saturating_add(1).max(1);
     let expand = SourceExpandCommands {
         before: (start > 1).then(|| {
             let before_start = start.saturating_sub(lines).max(1);
             source_read_command(&root, &file_display, before_start, start - before_start)
         }),
-        after: (end_line < total_lines)
-            .then(|| source_read_command(&root, &file_display, end_line + 1, lines)),
+        after: (effective_end < total_lines)
+            .then(|| source_read_command(&root, &file_display, effective_end + 1, lines)),
+        body: body_truncated.then(|| {
+            let remaining = end_line.saturating_sub(effective_end);
+            source_read_command(&root, &file_display, effective_end + 1, remaining)
+        }),
         file: source_read_command(&root, &file_display, 1, total_lines.max(effective_lines)),
         markdown_ast: is_markdown_path(&file_abs)
             .then(|| markdown_ast_command(&root, &file_display, None)),
     };
 
     let report = SourceReadReport {
-        handle: stable_handle("swin", &format!("{file_display}:{start}:{end_line}")),
+        handle: stable_handle("swin", &format!("{file_display}:{start}:{effective_end}")),
         root: root.to_string_lossy().to_string(),
         file: file_display,
         range: SourceRangePreview {
             start,
-            end: end_line,
+            end: effective_end,
             total_lines,
             truncated_before: start > 1,
-            truncated_after: end_line < total_lines,
+            truncated_after: effective_end < total_lines,
         },
         preview,
         symbols,
@@ -16744,6 +16793,7 @@ fn cmd_source_read(
         let follow_up = [
             report.expand.before.clone(),
             report.expand.after.clone(),
+            report.expand.body.clone(),
             Some(report.expand.file.clone()),
             report.expand.markdown_ast.clone(),
         ]
@@ -16941,23 +16991,19 @@ fn cmd_symbol_read(
         .unwrap_or(target_end)
         .max(target_start);
     let body_line_budget = budget.preview_items().max(1).saturating_mul(16);
-    let preview_end = target_start
+    let line_capped_end = target_start
         .saturating_add(body_line_budget)
         .saturating_sub(1)
         .min(target_end)
         .min(total_lines.max(target_start));
-    let body = if total_lines == 0 || target_start > total_lines {
-        Vec::new()
+    let token_cap = budget.body_token_cap();
+    let (body, effective_preview_end, body_truncated) = if total_lines == 0 || target_start > total_lines {
+        (Vec::new(), line_capped_end, false)
     } else {
-        all_lines[(target_start - 1)..preview_end]
-            .iter()
-            .enumerate()
-            .map(|(idx, line)| SourceLinePreview {
-                line: target_start + idx,
-                text: truncate_for_budget(line, budget.preview_bytes()),
-            })
-            .collect()
+        let capped = build_token_capped_preview(&all_lines, target_start, line_capped_end, max_bytes, token_cap);
+        (capped.preview, capped.capped_end, capped.was_capped)
     };
+    let preview_end = if body_truncated { effective_preview_end } else { line_capped_end };
     let child_symbols = file_symbols
         .iter()
         .filter(|candidate| {
@@ -16998,6 +17044,11 @@ fn cmd_symbol_read(
         })
         .collect::<Vec<_>>();
     let mut warnings = Vec::new();
+    if body_truncated {
+        warnings.push(format!(
+            "body preview capped at ~{token_cap} tokens at line {preview_end} of {target_end}"
+        ));
+    }
     let summaries =
         load_source_summaries(&root, &file_display, max_items, max_bytes, &mut warnings);
     let symbol_handle = stable_handle(
@@ -17010,6 +17061,10 @@ fn cmd_symbol_read(
         .max(1);
     let expand = SymbolReadExpandCommands {
         source_window: source_read_command(&root, &file_display, target_start, source_lines),
+        body: body_truncated.then(|| {
+            let remaining = target_end.saturating_sub(preview_end);
+            source_read_command(&root, &file_display, preview_end + 1, remaining)
+        }),
         file: source_read_command(&root, &file_display, 1, total_lines.max(source_lines)),
         explain: source_symbol_expand_command(&root, &selected.name),
         callers: source_symbol_graph_command(&root, &selected.name, "callers"),
@@ -17059,17 +17114,18 @@ fn cmd_symbol_read(
         let truncated = report.range.truncated_after
             || report.body.iter().any(|line| line.text.len() >= max_bytes)
             || report.child_symbols.len() >= max_items;
-        let follow_up = vec![
-            report.expand.source_window.clone(),
-            report.expand.file.clone(),
-            report.expand.explain.clone(),
-            report.expand.callers.clone(),
-            report.expand.callees.clone(),
-        ];
-        let follow_up = follow_up
-            .into_iter()
-            .chain(report.expand.markdown_ast.clone())
-            .collect::<Vec<_>>();
+        let follow_up = [
+            Some(report.expand.source_window.clone()),
+            report.expand.body.clone(),
+            Some(report.expand.file.clone()),
+            Some(report.expand.explain.clone()),
+            Some(report.expand.callers.clone()),
+            Some(report.expand.callees.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(report.expand.markdown_ast.clone())
+        .collect::<Vec<_>>();
         print_json_or_envelope(
             &report,
             &format,
@@ -20766,6 +20822,71 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
             .join("\n");
         fs::write(path, format!("{body}\n")).unwrap();
         path.to_path_buf()
+    }
+
+    // --- build_token_capped_preview ---
+
+    #[test]
+    fn token_capped_preview_returns_all_lines_when_under_cap() {
+        let lines: Vec<&str> = vec!["fn foo() {", "    1 + 1", "}"];
+        let result = build_token_capped_preview(&lines, 1, 3, 160, 1000);
+        assert!(!result.was_capped);
+        assert_eq!(result.preview.len(), 3);
+        assert_eq!(result.capped_end, 3);
+    }
+
+    #[test]
+    fn token_capped_preview_truncates_when_over_cap() {
+        let lines: Vec<&str> = (0..200).map(|_| "    let x = some_very_long_expression_here();").collect();
+        let result = build_token_capped_preview(&lines, 1, 200, 160, 100);
+        assert!(result.was_capped);
+        assert!(result.preview.len() < 200);
+        assert!(result.capped_end < 200);
+    }
+
+    #[test]
+    fn token_capped_preview_keeps_at_least_one_line() {
+        let long_line: String = "x".repeat(8000);
+        let lines: Vec<&str> = vec![&long_line];
+        let result = build_token_capped_preview(&lines, 1, 1, 160, 10);
+        assert!(!result.was_capped);
+        assert_eq!(result.preview.len(), 1);
+    }
+
+    #[test]
+    fn token_capped_preview_cap_at_boundary() {
+        let lines: Vec<&str> = vec!["aaaa", "bbbb", "cccc", "dddd"];
+        let result = build_token_capped_preview(&lines, 1, 4, 160, 4);
+        assert!(!result.was_capped);
+        assert_eq!(result.preview.len(), 4);
+    }
+
+    #[test]
+    fn token_capped_preview_cap_just_over_boundary() {
+        let lines: Vec<&str> = vec!["aaaa", "bbbb", "cccc", "dddd"];
+        let result = build_token_capped_preview(&lines, 1, 4, 160, 3);
+        assert!(result.was_capped);
+        assert_eq!(result.preview.len(), 3);
+        assert_eq!(result.capped_end, 3);
+    }
+
+    #[test]
+    fn token_capped_preview_empty_lines() {
+        let lines: Vec<&str> = vec![];
+        let result = build_token_capped_preview(&lines, 1, 0, 160, 100);
+        assert!(!result.was_capped);
+        assert!(result.preview.is_empty());
+    }
+
+    #[test]
+    fn token_capped_preview_per_line_truncation_applied() {
+        let long_line = "x".repeat(500);
+        let lines: Vec<&str> = vec![&long_line, "short"];
+        let result = build_token_capped_preview(&lines, 1, 2, 20, 10000);
+        assert!(!result.was_capped);
+        assert_eq!(result.preview.len(), 2);
+        assert!(result.preview[0].text.len() <= 23);
+        assert!(result.preview[0].text.ends_with("..."));
     }
 
     // --- classify_task ---
@@ -31194,6 +31315,66 @@ fn sample() {}
             .expect("cache hit must report projection_rows");
         assert_eq!(source_graph_build.duration_micros, 0);
         assert_eq!(projection_rows.duration_micros, 0);
+    }
+
+    #[test]
+    fn build_token_capped_preview_within_cap() {
+        let lines: Vec<&str> = vec!["fn foo() {", "    1 + 2", "}"];
+        let capped = build_token_capped_preview(&lines, 1, 3, 160, 1000);
+        assert!(!capped.was_capped);
+        assert_eq!(capped.preview.len(), 3);
+        assert_eq!(capped.capped_end, 3);
+    }
+
+    #[test]
+    fn build_token_capped_preview_truncates_long_body() {
+        let owned: Vec<String> = (0..200).map(|i| format!("    let line_{i} = {i};")).collect();
+        let lines: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let capped = build_token_capped_preview(&lines, 1, 200, 160, 100);
+        assert!(capped.was_capped);
+        assert!(capped.preview.len() < 200);
+        assert!(capped.capped_end < 200);
+        assert!(capped.preview.len() > 0);
+    }
+
+    #[test]
+    fn build_token_capped_preview_respects_start_offset() {
+        let owned: Vec<String> = (0..100).map(|i| format!("line {i}")).collect();
+        let lines: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let capped = build_token_capped_preview(&lines, 50, 100, 160, 50);
+        assert!(capped.was_capped);
+        assert!(capped.capped_end >= 50);
+        assert!(capped.capped_end < 100);
+        assert_eq!(capped.preview[0].line, 50);
+    }
+
+    #[test]
+    fn response_budget_body_token_cap_defaults() {
+        let budget = ResponseBudget::from_cli(None, None, Some(ResponseBudgetPreset::Normal), true);
+        assert_eq!(budget.body_token_cap(), 1500);
+
+        let budget = ResponseBudget::from_cli(None, None, Some(ResponseBudgetPreset::Small), true);
+        assert_eq!(budget.body_token_cap(), 500);
+
+        let budget = ResponseBudget::from_cli(None, None, Some(ResponseBudgetPreset::Deep), true);
+        assert_eq!(budget.body_token_cap(), 3000);
+    }
+
+    #[test]
+    fn build_token_capped_preview_empty_input() {
+        let lines: Vec<&str> = vec![];
+        let capped = build_token_capped_preview(&lines, 1, 0, 160, 1000);
+        assert!(!capped.was_capped);
+        assert!(capped.preview.is_empty());
+    }
+
+    #[test]
+    fn build_token_capped_preview_single_long_line_fits() {
+        let lines: Vec<&str> = vec!["short"];
+        let capped = build_token_capped_preview(&lines, 1, 1, 160, 100);
+        assert!(!capped.was_capped);
+        assert_eq!(capped.preview.len(), 1);
+        assert_eq!(capped.capped_end, 1);
     }
 }
 
