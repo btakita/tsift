@@ -540,9 +540,29 @@ fn sqlite_graph_staging_placeholders(column_count: usize, row_count: usize) -> S
         .join(", ")
 }
 
-fn sqlite_stage_projection_nodes(
+fn sqlite_stage_all_ids(
     tx: &rusqlite::Transaction<'_>,
     nodes: &[GraphNode],
+    edges: &[GraphEdge],
+) -> Result<()> {
+    for chunk in nodes.iter().map(|n| &n.id).collect::<Vec<_>>().chunks(SQLITE_GRAPH_STAGING_CHUNK_ROWS) {
+        let placeholders: Vec<&str> = chunk.iter().map(|_| "(?)").collect();
+        let sql = format!("INSERT OR IGNORE INTO next_graph_all_node_ids (id) VALUES {}", placeholders.join(", "));
+        let values: Vec<Value> = chunk.iter().map(|id| Value::Text((*id).clone())).collect();
+        tx.execute(&sql, params_from_iter(values.iter()))?;
+    }
+    for chunk in edges.iter().map(graph_edge_id).collect::<Vec<_>>().chunks(SQLITE_GRAPH_STAGING_CHUNK_ROWS) {
+        let placeholders: Vec<&str> = chunk.iter().map(|_| "(?)").collect();
+        let sql = format!("INSERT OR IGNORE INTO next_graph_all_edge_keys (edge_key) VALUES {}", placeholders.join(", "));
+        let values: Vec<Value> = chunk.iter().map(|ek| Value::Text(ek.to_string())).collect();
+        tx.execute(&sql, params_from_iter(values.iter()))?;
+    }
+    Ok(())
+}
+
+fn sqlite_stage_projection_nodes(
+    tx: &rusqlite::Transaction<'_>,
+    nodes: &[&GraphNode],
     source_watermark: Option<&str>,
 ) -> Result<()> {
     for chunk in nodes.chunks(SQLITE_GRAPH_STAGING_CHUNK_ROWS) {
@@ -580,7 +600,7 @@ fn sqlite_stage_projection_nodes(
 
 fn sqlite_stage_projection_edges(
     tx: &rusqlite::Transaction<'_>,
-    edges: &[GraphEdge],
+    edges: &[&GraphEdge],
     source_watermark: Option<&str>,
 ) -> Result<()> {
     for chunk in edges.chunks(SQLITE_GRAPH_STAGING_CHUNK_ROWS) {
@@ -873,12 +893,20 @@ impl SqliteGraphStore {
             CREATE TEMP TABLE IF NOT EXISTS next_graph_changed_edges (
                 edge_key TEXT PRIMARY KEY
             );
+            CREATE TEMP TABLE IF NOT EXISTS next_graph_all_node_ids (
+                id TEXT PRIMARY KEY
+            );
+            CREATE TEMP TABLE IF NOT EXISTS next_graph_all_edge_keys (
+                edge_key TEXT PRIMARY KEY
+            );
             DELETE FROM next_graph_nodes;
             DELETE FROM next_graph_edges;
             DELETE FROM next_graph_node_properties;
             DELETE FROM next_graph_edge_properties;
             DELETE FROM next_graph_changed_nodes;
             DELETE FROM next_graph_changed_edges;
+            DELETE FROM next_graph_all_node_ids;
+            DELETE FROM next_graph_all_edge_keys;
             "#,
         )?;
         phase_timings.push(sqlite_refresh_phase_timing(
@@ -886,28 +914,41 @@ impl SqliteGraphStore {
             started,
             "create and clear refresh staging tables before row loading",
         ));
+        let existing_node_hashes: BTreeMap<String, String> = {
+            let mut stmt = tx.prepare("SELECT id, row_hash FROM graph_nodes WHERE row_hash IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            collect_rows(rows)?.into_iter().collect()
+        };
+        let existing_edge_hashes: BTreeMap<String, String> = {
+            let mut stmt = tx.prepare("SELECT edge_key, row_hash FROM graph_edges WHERE row_hash IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            collect_rows(rows)?.into_iter().collect()
+        };
+        let changed_nodes: Vec<&GraphNode> = projection.nodes.iter().filter(|n| {
+            let hash = row_hash(*n).ok();
+            hash.as_ref().map_or(true, |h| existing_node_hashes.get(&n.id).map_or(true, |eh| eh != h))
+        }).collect();
+        let changed_edges: Vec<&GraphEdge> = projection.edges.iter().filter(|e| {
+            let hash = row_hash(*e).ok();
+            let ek = graph_edge_id(*e);
+            hash.as_ref().map_or(true, |h| existing_edge_hashes.get(&ek).map_or(true, |eh| eh != h))
+        }).collect();
+        let skipped_nodes = projection.nodes.len() - changed_nodes.len();
+        let skipped_edges = projection.edges.len() - changed_edges.len();
         {
             let started = Instant::now();
-            sqlite_stage_projection_nodes(&tx, &projection.nodes, source_watermark.as_deref())?;
+            sqlite_stage_all_ids(&tx, &projection.nodes, &projection.edges)?;
+            sqlite_stage_projection_nodes(&tx, &changed_nodes, source_watermark.as_deref())?;
+            sqlite_stage_projection_edges(&tx, &changed_edges, source_watermark.as_deref())?;
             phase_timings.push(sqlite_refresh_phase_timing(
                 "sqlite_node_staging",
                 started,
                 &format!(
-                    "bulk stage {} graph_nodes rows into temp table using multi-row chunks up to {} rows before delta comparison",
-                    projection.nodes.len(),
-                    SQLITE_GRAPH_STAGING_CHUNK_ROWS
-                ),
-            ));
-        }
-        {
-            let started = Instant::now();
-            sqlite_stage_projection_edges(&tx, &projection.edges, source_watermark.as_deref())?;
-            phase_timings.push(sqlite_refresh_phase_timing(
-                "sqlite_edge_staging",
-                started,
-                &format!(
-                    "bulk stage {} graph_edges rows into temp table using multi-row chunks up to {} rows before delta comparison",
-                    projection.edges.len(),
+                    "pre-filtered staging: {} nodes ({} unchanged skipped), {} edges ({} unchanged skipped) into temp tables using multi-row chunks up to {} rows",
+                    changed_nodes.len(),
+                    skipped_nodes,
+                    changed_edges.len(),
+                    skipped_edges,
                     SQLITE_GRAPH_STAGING_CHUNK_ROWS
                 ),
             ));
@@ -989,7 +1030,7 @@ impl SqliteGraphStore {
                 r#"
                 SELECT g.id
                 FROM graph_nodes g
-                LEFT JOIN next_graph_nodes n ON n.id = g.id
+                LEFT JOIN next_graph_all_node_ids n ON n.id = g.id
                 WHERE n.id IS NULL
                 ORDER BY g.id
                 "#,
@@ -1001,7 +1042,7 @@ impl SqliteGraphStore {
                 r#"
                 SELECT g.edge_key
                 FROM graph_edges g
-                LEFT JOIN next_graph_edges n
+                LEFT JOIN next_graph_all_edge_keys n
                     ON n.edge_key = g.edge_key
                 WHERE n.edge_key IS NULL
                 ORDER BY g.edge_key
@@ -1009,33 +1050,14 @@ impl SqliteGraphStore {
             )?;
             collect_rows(stmt.query_map([], |row| row.get::<_, String>(0))?)?
         };
-        let unchanged_nodes: usize = tx.query_row(
-            r#"
-            SELECT COUNT(*)
-            FROM next_graph_nodes n
-            JOIN graph_nodes g ON g.id = n.id
-            WHERE g.row_hash = n.row_hash
-            "#,
-            [],
-            |row| row.get(0),
-        )?;
-        let unchanged_edges: usize = tx.query_row(
-            r#"
-            SELECT COUNT(*)
-            FROM next_graph_edges n
-            JOIN graph_edges g
-                ON g.edge_key = n.edge_key
-            WHERE g.row_hash = n.row_hash
-            "#,
-            [],
-            |row| row.get(0),
-        )?;
+        let unchanged_nodes: usize = skipped_nodes;
+        let unchanged_edges: usize = skipped_edges;
         let reused_owner_node_properties: usize = tx.query_row(
             r#"
             SELECT COUNT(*)
             FROM graph_node_properties g
-            JOIN next_graph_nodes n ON n.id = g.node_id
-            LEFT JOIN next_graph_changed_nodes c ON c.id = n.id
+            JOIN next_graph_all_node_ids a ON a.id = g.node_id
+            LEFT JOIN next_graph_changed_nodes c ON c.id = a.id
             WHERE c.id IS NULL
             "#,
             [],
@@ -1045,8 +1067,8 @@ impl SqliteGraphStore {
             r#"
             SELECT COUNT(*)
             FROM graph_edge_properties g
-            JOIN next_graph_edges n ON n.edge_key = g.edge_key
-            LEFT JOIN next_graph_changed_edges c ON c.edge_key = n.edge_key
+            JOIN next_graph_all_edge_keys a ON a.edge_key = g.edge_key
+            LEFT JOIN next_graph_changed_edges c ON c.edge_key = a.edge_key
             WHERE c.edge_key IS NULL
             "#,
             [],
@@ -1084,7 +1106,7 @@ impl SqliteGraphStore {
             DELETE FROM graph_edges
             WHERE NOT EXISTS (
                 SELECT 1
-                FROM next_graph_edges n
+                FROM next_graph_all_edge_keys n
                 WHERE n.edge_key = graph_edges.edge_key
             )
             "#,
@@ -1095,7 +1117,7 @@ impl SqliteGraphStore {
             DELETE FROM graph_nodes
             WHERE NOT EXISTS (
                 SELECT 1
-                FROM next_graph_nodes n
+                FROM next_graph_all_node_ids n
                 WHERE n.id = graph_nodes.id
             )
             "#,
@@ -3891,7 +3913,7 @@ mod tests {
                 .phase_timings
                 .iter()
                 .any(|phase| phase.name == "sqlite_node_staging"
-                    && phase.detail.contains("bulk stage 126 graph_nodes rows")
+                    && phase.detail.contains("126 unchanged skipped")
                     && phase.detail.contains("multi-row chunks up to 500 rows")),
             "{:?}",
             refresh.phase_timings
@@ -3900,9 +3922,8 @@ mod tests {
             refresh
                 .phase_timings
                 .iter()
-                .any(|phase| phase.name == "sqlite_edge_staging"
-                    && phase.detail.contains("bulk stage 124 graph_edges rows")
-                    && phase.detail.contains("multi-row chunks up to 500 rows")),
+                .any(|phase| phase.name == "sqlite_node_staging"
+                    && phase.detail.contains("124 unchanged skipped")),
             "{:?}",
             refresh.phase_timings
         );
