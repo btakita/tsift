@@ -1693,6 +1693,25 @@ impl SqliteGraphStore {
         )?;
         Ok(pruned_tombstones)
     }
+
+    fn edges_between_nodes_inline(&self, node_ids: &BTreeSet<String>) -> Result<Vec<GraphEdge>> {
+        let placeholders: Vec<&str> = node_ids.iter().map(|_| "?").collect();
+        let in_clause = placeholders.join(", ");
+        let sql = format!(
+            "SELECT e.edge_key, e.from_id, e.to_id, e.kind, e.properties_json, e.provenance_json, e.freshness_json \
+             FROM graph_edges e \
+             WHERE e.from_id IN ({in_clause}) \
+               AND e.to_id IN ({in_clause}) \
+             ORDER BY e.from_id, e.kind, e.to_id"
+        );
+        let values: Vec<Value> = node_ids
+            .iter()
+            .chain(node_ids.iter())
+            .map(|id| Value::Text(id.clone()))
+            .collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        collect_rows(stmt.query_map(params_from_iter(values.iter()), edge_from_row)?)
+    }
 }
 
 fn sqlite_query_plan(conn: &Connection, sql: &str, values: &[Value]) -> Result<Vec<String>> {
@@ -2415,6 +2434,9 @@ impl GraphStore for SqliteGraphStore {
     fn edges_between_nodes(&self, node_ids: &BTreeSet<String>) -> Result<Vec<GraphEdge>> {
         if node_ids.is_empty() {
             return Ok(Vec::new());
+        }
+        if node_ids.len() <= 20 {
+            return self.edges_between_nodes_inline(node_ids);
         }
         self.assert_not_in_temp_table_section();
         self.temp_table_active.set(true);
