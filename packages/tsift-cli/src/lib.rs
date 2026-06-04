@@ -5327,6 +5327,16 @@ struct GraphDbPageReport {
 type GraphDbRankedNeighbor = resolution::RankedNeighbor;
 
 #[derive(Clone, Debug, Serialize)]
+struct CommunityTruncationSummary {
+    total_communities: usize,
+    fully_kept: usize,
+    partially_pruned: usize,
+    fully_pruned: usize,
+    pruned_community_kinds: Vec<String>,
+    pruned_community_top_labels: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct GraphDbRankedNeighborhoodComparison {
     traversal_nodes: usize,
     traversal_edges: usize,
@@ -5340,6 +5350,8 @@ struct GraphDbRankedNeighborhoodComparison {
     duplicate_name_count_unranked: usize,
     handle_coverage_ranked_pct: f64,
     handle_coverage_unranked_pct: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    community_truncation_summary: Option<CommunityTruncationSummary>,
     diagnostics: Vec<String>,
 }
 
@@ -8146,6 +8158,52 @@ fn graph_db_ranked_neighborhood_comparison<S: GraphStore>(
         (useful as f64 * 0.5 + kind_diversity as f64 * 0.3 + edge_diversity as f64 * 0.2)
             / nodes.len() as f64
     };
+    let community_truncation_summary = if ranked.pruned_count > 0 && !ranked.edges.is_empty() {
+        let edge_pairs: Vec<(String, String)> = ranked
+            .edges
+            .iter()
+            .map(|e| (e.from_id.clone(), e.to_id.clone()))
+            .collect();
+        let cr = tsift_graph::detect_communities(&edge_pairs);
+        let kept_labels: BTreeSet<&str> = ranked.nodes.iter().map(|n| n.label.as_str()).collect();
+        let mut fully_kept = 0usize;
+        let mut partially_pruned = 0usize;
+        let mut fully_pruned = 0usize;
+        let mut pruned_kinds = BTreeSet::new();
+        let mut pruned_labels = Vec::new();
+        for comm in &cr.communities {
+            let kept_in_comm: Vec<&str> = comm
+                .members
+                .iter()
+                .filter(|m| kept_labels.contains(m.name.as_str()))
+                .map(|m| m.name.as_str())
+                .collect();
+            if kept_in_comm.len() == comm.members.len() {
+                fully_kept += 1;
+            } else if kept_in_comm.is_empty() {
+                fully_pruned += 1;
+                for m in &comm.members {
+                    if let Some(n) = ranked.nodes.iter().find(|n| n.label == m.name) {
+                        pruned_kinds.insert(n.kind.clone());
+                    }
+                    pruned_labels.push(m.name.clone());
+                }
+            } else {
+                partially_pruned += 1;
+            }
+        }
+        pruned_labels.truncate(5);
+        Some(CommunityTruncationSummary {
+            total_communities: cr.communities.len(),
+            fully_kept,
+            partially_pruned,
+            fully_pruned,
+            pruned_community_kinds: pruned_kinds.into_iter().collect(),
+            pruned_community_top_labels: pruned_labels,
+        })
+    } else {
+        None
+    };
     Ok(Some(GraphDbRankedNeighborhoodComparison {
         traversal_nodes: ranked.nodes.len(),
         traversal_edges: ranked.edges.len(),
@@ -8163,6 +8221,7 @@ fn graph_db_ranked_neighborhood_comparison<S: GraphStore>(
         handle_coverage_ranked_pct: (count_handle_coverage(&ranked.nodes) * 100.0).round() / 100.0,
         handle_coverage_unranked_pct: (count_handle_coverage(unranked_nodes) * 100.0).round()
             / 100.0,
+        community_truncation_summary,
         diagnostics: vec![
             format!(
                 "ranked_neighborhood traversed {} node(s), {} edge(s) with {} pruned of {} discovered in {}µs",
