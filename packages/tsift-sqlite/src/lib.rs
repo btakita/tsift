@@ -829,6 +829,18 @@ impl SqliteGraphStore {
         let scope = scope.into();
         let result = self.replace_projection_with_version_fallible(scope, projection, projection_version, source_watermark);
         self.temp_table_active.set(false);
+        if let Ok(ref refresh) = result {
+            let total_rows = refresh.upserted_nodes + refresh.upserted_edges;
+            let autocheckpoint = if total_rows > 10000 {
+                8192
+            } else if total_rows > 1000 {
+                4096
+            } else {
+                2048
+            };
+            let _ = self.conn.pragma_update(None, "wal_autocheckpoint", autocheckpoint);
+            let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        }
         result
     }
 
