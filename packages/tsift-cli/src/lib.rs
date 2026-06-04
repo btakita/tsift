@@ -146,7 +146,7 @@ use tsift_digest::{diff_digest, log_digest, metric_digest, test_digest};
 use tsift_graph as graph;
 use tsift_index::{config, index, init, multiplicity, walk};
 use tsift_memory::{MemoryEvent, default_memory_db_path, read_memory_events};
-use tsift_quality::{cycle_packet_cache, dci_benchmark, lint, perf_gate};
+use tsift_quality::{cycle_packet_cache, dci_benchmark, lint, perf_gate, token_gate};
 use tsift_resolution as resolution;
 use tsift_search::{impact, sift};
 use tsift_sqlite as substrate;
@@ -1219,6 +1219,18 @@ pub fn run() -> Result<()> {
                 envelope,
             },
         ),
+        Some(Commands::TokenGate { command }) => {
+            cmd_token_gate(command, OutputFormat {
+                json_output: true,
+                compact,
+                pretty,
+                terse,
+                ultra_terse,
+                schema,
+                envelope,
+            })?;
+            Ok(())
+        },
         Some(Commands::Workflow { topic, json }) => workflow::cmd_workflow(
             &topic,
             OutputFormat {
@@ -1498,6 +1510,246 @@ pub(crate) fn print_json_or_envelope<T: Serialize>(
 
 pub(crate) fn estimated_tokens_from_bytes(bytes: usize) -> usize {
     bytes.div_ceil(4)
+}
+
+fn cmd_token_gate(
+    command: cli::TokenGateCommand,
+    format: OutputFormat,
+) -> Result<()> {
+    match command {
+        cli::TokenGateCommand::Sample {
+            surface,
+            path,
+            scope,
+            target,
+            depth,
+            sample_index,
+            json: _,
+        } => cmd_token_gate_sample(&surface, &path, scope.as_deref(), target.as_deref(), depth, sample_index),
+        cli::TokenGateCommand::Evaluate {
+            history,
+            allowed_regression_percent,
+            json: _,
+        } => cmd_token_gate_evaluate(history.as_deref(), allowed_regression_percent, &format),
+    }
+}
+
+fn cmd_token_gate_sample(
+    surface: &str,
+    path: &Path,
+    scope: Option<&str>,
+    target: Option<&str>,
+    depth: usize,
+    sample_index: usize,
+) -> Result<()> {
+    if !token_gate::TOKEN_GATE_SURFACES.contains(&surface) {
+        bail!(
+            "unknown surface `{}`; expected one of: {}",
+            surface,
+            token_gate::TOKEN_GATE_SURFACES.join(", ")
+        );
+    }
+
+    let path_str = path.to_string_lossy().to_string();
+    let tsift_bin = std::env::current_exe()?;
+
+    let args: Vec<String> = match surface {
+        "context_pack" => vec![
+            "context-pack".to_string(),
+            "--json".to_string(),
+            path_str,
+        ],
+        "session_review_next_context" => vec![
+            "session-review".to_string(),
+            "--json".to_string(),
+            "--next-context".to_string(),
+            path_str,
+        ],
+        "graph_db_evidence" => {
+            let tgt = target.unwrap_or("default").to_string();
+            vec![
+                "graph-db".to_string(),
+                "--json".to_string(),
+                "--path".to_string(),
+                path_str,
+                "evidence".to_string(),
+                tgt,
+                "--depth".to_string(),
+                depth.to_string(),
+            ]
+        }
+        "conflict_matrix" => {
+            let tgt = target.unwrap_or("default").to_string();
+            let mut a = vec![
+                "conflict-matrix".to_string(),
+                "--json".to_string(),
+                "--path".to_string(),
+                path_str,
+                "--depth".to_string(),
+                depth.to_string(),
+            ];
+            if let Some(s) = scope {
+                a.push("--scope".to_string());
+                a.push(s.to_string());
+            }
+            a.push(tgt);
+            a
+        }
+        "dispatch_trace" => {
+            let tgt = target.unwrap_or("default").to_string();
+            vec![
+                "dispatch-trace".to_string(),
+                "--json".to_string(),
+                "--path".to_string(),
+                path_str,
+                tgt,
+            ]
+        }
+        _ => bail!("unhandled surface: {}", surface),
+    };
+
+    let start = Instant::now();
+    let child = Command::new(&tsift_bin)
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("TSIFT_QUIET", "1")
+        .spawn();
+    let output = match child {
+        Ok(c) => c.wait_with_output()?,
+        Err(e) => bail!("failed to spawn tsift for surface {}: {}", surface, e),
+    };
+    let runtime_micros = start.elapsed().as_micros() as f64;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope_bytes = stdout.trim().len() as f64;
+    let prompt_tokens = estimated_tokens_from_bytes(stdout.trim().len()) as f64;
+
+    let cache_hit_rate_percent = 0.0;
+    let raw_read_avoidance = 0.0;
+    let useful_hit_density = if prompt_tokens > 0.0 { 0.5 } else { 0.0 };
+
+    let timestamp = iso_timestamp_now();
+    let id = format!(
+        "{surface}-baseline-{}-sample-{sample_index}",
+        &timestamp[..10]
+    );
+    let label = format!(
+        "token-gate baseline {surface} sample {sample_index} for {}",
+        path.display()
+    );
+
+    let mut metrics = BTreeMap::new();
+    metrics.insert("prompt_tokens".to_string(), prompt_tokens);
+    metrics.insert("envelope_bytes".to_string(), envelope_bytes);
+    metrics.insert("runtime_micros".to_string(), runtime_micros);
+    metrics.insert("cache_hit_rate_percent".to_string(), cache_hit_rate_percent);
+    metrics.insert("raw_read_avoidance".to_string(), raw_read_avoidance);
+    metrics.insert("useful_hit_density".to_string(), useful_hit_density);
+
+    let sample = token_gate::TokenGateSample {
+        label,
+        id,
+        timestamp: Some(timestamp),
+        surface: surface.to_string(),
+        metrics,
+    };
+
+    println!("{}", serde_json::to_string_pretty(&sample)?);
+    Ok(())
+}
+
+fn cmd_token_gate_evaluate(
+    history_path: Option<&Path>,
+    allowed_regression_percent: f64,
+    format: &OutputFormat,
+) -> Result<()> {
+    let history_path = history_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("../../fixtures/token-gate-history.json");
+            p
+        });
+
+    let raw = std::fs::read_to_string(&history_path)
+        .with_context(|| format!("failed to read token gate history: {}", history_path.display()))?;
+    let samples = token_gate::parse_token_history(&raw)?;
+    let report = token_gate::evaluate_token_gate(&samples, allowed_regression_percent);
+
+    if format.json_output {
+        println!("{}", to_json_schema(&report, format.pretty, format.terse, false, format.schema)?);
+    } else {
+        println!("Token Gate Report");
+        println!("  min_samples: {}", report.min_samples);
+        println!("  allowed_regression: {:.1}%", report.allowed_regression_percent);
+        println!("  decision: {:?}", report.decision);
+        for eval in &report.surface_evaluations {
+            println!(
+                "  {} ({} samples): {:?}",
+                eval.display_name, eval.sample_count, eval.verdict
+            );
+            for me in &eval.metric_evaluations {
+                println!(
+                    "    {} ({:?}): {}",
+                    me.metric, me.direction, me.diagnostic
+                );
+            }
+        }
+        for d in &report.diagnostics {
+            println!("  ! {}", d);
+        }
+    }
+    Ok(())
+}
+
+fn iso_timestamp_now() -> String {
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_secs = dur.as_secs();
+    let days_since_epoch = total_secs / 86400;
+    let (year, month, day) = days_to_ymd(days_since_epoch);
+    let time_of_day = total_secs % 86400;
+    let hour = (time_of_day / 3600) as u8;
+    let minute = ((time_of_day % 3600) / 60) as u8;
+    let second = (time_of_day % 60) as u8;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hour, minute, second
+    )
+}
+
+fn days_to_ymd(mut days: u64) -> (u64, u8, u8) {
+    let mut year = 1970u64;
+    loop {
+        let days_in_year = if is_leap(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    let leap = is_leap(year);
+    let month_days: [u8; 12] = if leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month: u8 = 1;
+    for &md in &month_days {
+        if days < md as u64 {
+            break;
+        }
+        days -= md as u64;
+        month += 1;
+    }
+    let day = days as u8 + 1;
+    (year, month, day)
+}
+
+fn is_leap(year: u64) -> bool {
+    year.is_multiple_of(4) && !year.is_multiple_of(100) || year.is_multiple_of(400)
 }
 
 fn persist_transcript_artifact(

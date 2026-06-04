@@ -862,6 +862,11 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Collect and evaluate cross-surface token gate samples
+    TokenGate {
+        #[command(subcommand)]
+        command: TokenGateCommand,
+    },
     /// Compare recorded DCI search workflows across exact, lexical, and hybrid strategies
     DciBenchmark {
         /// Fixture describing multi-hop tasks and recorded strategy metrics
@@ -1116,6 +1121,47 @@ pub enum SemanticRelatedKind {
     Concept,
     Entity,
     All,
+}
+
+#[derive(Subcommand)]
+pub enum TokenGateCommand {
+    /// Run one surface and emit a TokenGateSample entry as JSON
+    Sample {
+        /// Surface to sample: context_pack, session_review_next_context, graph_db_evidence,
+        /// conflict_matrix, dispatch_trace
+        #[arg(long)]
+        surface: String,
+        /// Path to the target document or repo root
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Scope for graph evidence (submodule)
+        #[arg(long)]
+        scope: Option<String>,
+        /// Evidence target (required for graph_db_evidence, conflict_matrix, dispatch_trace)
+        #[arg(long)]
+        target: Option<String>,
+        /// Evidence depth
+        #[arg(long, default_value = "3")]
+        depth: usize,
+        /// Sample index for the id (defaults to 1)
+        #[arg(long, default_value = "1")]
+        sample_index: usize,
+        /// Output as JSON (default true for sample)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Evaluate the token gate against a history file
+    Evaluate {
+        /// Path to token-gate-history.json (defaults to fixtures/token-gate-history.json)
+        #[arg(long)]
+        history: Option<PathBuf>,
+        /// Allowed regression percentage (0-100)
+        #[arg(long, default_value = "20.0")]
+        allowed_regression_percent: f64,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

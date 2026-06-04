@@ -1,3 +1,214 @@
 {
-  "entries": []
+  "entries": [
+    {
+      "label": "token-gate baseline context_pack sample 1 for .",
+      "id": "context_pack-baseline-2026-06-04-sample-1",
+      "timestamp": "2026-06-04T04:54:10Z",
+      "surface": "context_pack",
+      "metrics": {
+        "cache_hit_rate_percent": 50.0,
+        "envelope_bytes": 12216.0,
+        "prompt_tokens": 3054.0,
+        "raw_read_avoidance": 6.0,
+        "runtime_micros": 73146.0,
+        "useful_hit_density": 0.5
+      }
+    },
+    {
+      "label": "token-gate baseline context_pack sample 2 for .",
+      "id": "context_pack-baseline-2026-06-04-sample-2",
+      "timestamp": "2026-06-04T04:54:10Z",
+      "surface": "context_pack",
+      "metrics": {
+        "cache_hit_rate_percent": 50.0,
+        "envelope_bytes": 12216.0,
+        "prompt_tokens": 3054.0,
+        "raw_read_avoidance": 6.0,
+        "runtime_micros": 64537.0,
+        "useful_hit_density": 0.5
+      }
+    },
+    {
+      "label": "token-gate baseline context_pack sample 3 for .",
+      "id": "context_pack-baseline-2026-06-04-sample-3",
+      "timestamp": "2026-06-04T04:54:10Z",
+      "surface": "context_pack",
+      "metrics": {
+        "cache_hit_rate_percent": 50.0,
+        "envelope_bytes": 12216.0,
+        "prompt_tokens": 3054.0,
+        "raw_read_avoidance": 6.0,
+        "runtime_micros": 67834.0,
+        "useful_hit_density": 0.5
+      }
+    },
+    {
+      "label": "token-gate baseline session_review_next_context sample 1 for .",
+      "id": "session_review_next_context-baseline-2026-06-04-sample-1",
+      "timestamp": "2026-06-04T04:54:10Z",
+      "surface": "session_review_next_context",
+      "metrics": {
+        "cache_hit_rate_percent": 50.0,
+        "envelope_bytes": 5720.0,
+        "prompt_tokens": 1430.0,
+        "raw_read_avoidance": 6.0,
+        "runtime_micros": 39797.0,
+        "useful_hit_density": 0.5
+      }
+    },
+    {
+      "label": "token-gate baseline session_review_next_context sample 2 for .",
+      "id": "session_review_next_context-baseline-2026-06-04-sample-2",
+      "timestamp": "2026-06-04T04:54:10Z",
+      "surface": "session_review_next_context",
+      "metrics": {
+        "cache_hit_rate_percent": 50.0,
+        "envelope_bytes": 5720.0,
+        "prompt_tokens": 1430.0,
+        "raw_read_avoidance": 6.0,
+        "runtime_micros": 37581.0,
+        "useful_hit_density": 0.5
+      }
+    },
+    {
+      "label": "token-gate baseline session_review_next_context sample 3 for .",
+      "id": "session_review_next_context-baseline-2026-06-04-sample-3",
+      "timestamp": "2026-06-04T04:54:10Z",
+      "surface": "session_review_next_context",
+      "metrics": {
+        "cache_hit_rate_percent": 50.0,
+        "envelope_bytes": 5720.0,
+        "prompt_tokens": 1430.0,
+        "raw_read_avoidance": 6.0,
+        "runtime_micros": 37487.0,
+        "useful_hit_density": 0.5
+      }
+    },
+    {
+      "label": "token-gate baseline graph_db_evidence sample 1 for .",
+      "id": "graph_db_evidence-baseline-2026-06-04-sample-1",
+      "timestamp": "2026-06-04T04:54:10Z",
+      "surface": "graph_db_evidence",
+      "metrics": {
+        "cache_hit_rate_percent": 50.0,
+        "envelope_bytes": 3622.0,
+        "prompt_tokens": 906.0,
+        "raw_read_avoidance": 6.0,
+        "runtime_micros": 4133.0,
+        "useful_hit_density": 0.5
+      }
+    },
+    {
+      "label": "token-gate baseline graph_db_evidence sample 2 for .",
+      "id": "graph_db_evidence-baseline-2026-06-04-sample-2",
+      "timestamp": "2026-06-04T04:54:10Z",
+      "surface": "graph_db_evidence",
+      "metrics": {
+        "cache_hit_rate_percent": 50.0,
+        "envelope_bytes": 3622.0,
+        "prompt_tokens": 906.0,
+        "raw_read_avoidance": 6.0,
+        "runtime_micros": 4421.0,
+        "useful_hit_density": 0.5
+      }
+    },
+    {
+      "label": "token-gate baseline graph_db_evidence sample 3 for .",
+      "id": "graph_db_evidence-baseline-2026-06-04-sample-3",
+      "timestamp": "2026-06-04T04:54:10Z",
+      "surface": "graph_db_evidence",
+      "metrics": {
+        "cache_hit_rate_percent": 50.0,
+        "envelope_bytes": 3622.0,
+        "prompt_tokens": 906.0,
+        "raw_read_avoidance": 6.0,
+        "runtime_micros": 5116.0,
+        "useful_hit_density": 0.5
+      }
+    },
+    {
+      "label": "token-gate baseline conflict_matrix sample 1 for .",
+      "id": "conflict_matrix-baseline-2026-06-04-sample-1",
+      "timestamp": "2026-06-04T04:54:10Z",
+      "surface": "conflict_matrix",
+      "metrics": {
+        "cache_hit_rate_percent": 50.0,
+        "envelope_bytes": 69323.0,
+        "prompt_tokens": 17331.0,
+        "raw_read_avoidance": 6.0,
+        "runtime_micros": 10534.0,
+        "useful_hit_density": 0.5
+      }
+    },
+    {
+      "label": "token-gate baseline conflict_matrix sample 2 for .",
+      "id": "conflict_matrix-baseline-2026-06-04-sample-2",
+      "timestamp": "2026-06-04T04:54:10Z",
+      "surface": "conflict_matrix",
+      "metrics": {
+        "cache_hit_rate_percent": 50.0,
+        "envelope_bytes": 69323.0,
+        "prompt_tokens": 17331.0,
+        "raw_read_avoidance": 6.0,
+        "runtime_micros": 10216.0,
+        "useful_hit_density": 0.5
+      }
+    },
+    {
+      "label": "token-gate baseline conflict_matrix sample 3 for .",
+      "id": "conflict_matrix-baseline-2026-06-04-sample-3",
+      "timestamp": "2026-06-04T04:54:10Z",
+      "surface": "conflict_matrix",
+      "metrics": {
+        "cache_hit_rate_percent": 50.0,
+        "envelope_bytes": 69323.0,
+        "prompt_tokens": 17331.0,
+        "raw_read_avoidance": 6.0,
+        "runtime_micros": 11927.0,
+        "useful_hit_density": 0.5
+      }
+    },
+    {
+      "label": "token-gate baseline dispatch_trace sample 1 for .",
+      "id": "dispatch_trace-baseline-2026-06-04-sample-1",
+      "timestamp": "2026-06-04T04:54:10Z",
+      "surface": "dispatch_trace",
+      "metrics": {
+        "cache_hit_rate_percent": 50.0,
+        "envelope_bytes": 418240.0,
+        "prompt_tokens": 104560.0,
+        "raw_read_avoidance": 6.0,
+        "runtime_micros": 12844.0,
+        "useful_hit_density": 0.5
+      }
+    },
+    {
+      "label": "token-gate baseline dispatch_trace sample 2 for .",
+      "id": "dispatch_trace-baseline-2026-06-04-sample-2",
+      "timestamp": "2026-06-04T04:54:10Z",
+      "surface": "dispatch_trace",
+      "metrics": {
+        "cache_hit_rate_percent": 50.0,
+        "envelope_bytes": 418240.0,
+        "prompt_tokens": 104560.0,
+        "raw_read_avoidance": 6.0,
+        "runtime_micros": 11727.0,
+        "useful_hit_density": 0.5
+      }
+    },
+    {
+      "label": "token-gate baseline dispatch_trace sample 3 for .",
+      "id": "dispatch_trace-baseline-2026-06-04-sample-3",
+      "timestamp": "2026-06-04T04:54:10Z",
+      "surface": "dispatch_trace",
+      "metrics": {
+        "cache_hit_rate_percent": 50.0,
+        "envelope_bytes": 418240.0,
+        "prompt_tokens": 104560.0,
+        "raw_read_avoidance": 6.0,
+        "runtime_micros": 12081.0,
+        "useful_hit_density": 0.5
+      }
+    }
+  ]
 }

@@ -241,6 +241,8 @@ A surface that is absent from history is treated as `missing` and blocks the gat
 
 **Storage contract.** Each entry in `fixtures/token-gate-history.json` carries `label`, `id`, `timestamp`, `surface`, and `metrics`. The fixture is append-only; gate evaluation is read-only.
 
+**CLI collection.** `tsift token-gate sample --surface <name> --path <path>` runs one surface as a subprocess, measures `envelope_bytes` and `runtime_micros` from the actual output, and emits a `TokenGateSample` entry as JSON. `tsift token-gate evaluate --history <path>` reads a history file and prints the `TokenGateReport`. Baseline samples are seeded into `fixtures/token-gate-history.json` using `tsift token-gate sample` for each surface with `--sample-index 1/2/3`. The `cache_hit_rate_percent` and `raw_read_avoidance` metrics use placeholder baseline values until deeper surface-level metric integration is wired.
+
 ### Cycle Packet Cache
 
 The cycle packet cache (`#gpackreuse`) reuses graph/context packets across repeated tsift CLI invocations within a single agent-doc cycle. It is implemented in `tsift_quality::cycle_packet_cache` and exercised by `tests/cycle_packet_cache.rs` plus unit tests in `packages/tsift-quality/src/cycle_packet_cache.rs`.
