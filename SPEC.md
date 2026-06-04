@@ -826,6 +826,8 @@ Unknown keys pass through unchanged.
 
 4. **Coverage snapshot compaction** — `SearchCoverageSnapshot` objects retain only `mode`, `total_sector_count`, and `dirty_sector_count`. Removes `active_rebuild`, `completed_dirty_sector_count`, `mounted_sector_count`, `rebuilding_sector_count`, `resumed_sector_count`, `reused_sector_count`.
 
+5. **Edge index references** — in ultra-terse mode, `from_id`/`to_id` in edges are replaced with positional indices into the accompanying `nodes` array (`from`/`to` as integers). Edges whose endpoint IDs are not in the nodes array retain the original `from_id`/`to_id` string fields. Estimated 30-50% edge token reduction in graph-heavy envelopes.
+
 **Expected savings:** ~30-50% token reduction over terse mode for graph-heavy and search-heavy responses.
 
 ```bash

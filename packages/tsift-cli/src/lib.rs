@@ -1426,6 +1426,7 @@ pub(crate) fn to_json_schema<T: serde::Serialize>(
         let mut transformed = if terse { terse_transform(value) } else { value };
         if ultra_terse {
             transformed = ultra_terse_transform(transformed);
+            transformed = edge_index_transform(transformed);
         }
         if schema {
             transformed = schema_transform(transformed);
@@ -1991,6 +1992,56 @@ fn ultra_terse_transform(val: serde_json::Value) -> serde_json::Value {
         }
         serde_json::Value::Array(arr) => {
             serde_json::Value::Array(arr.into_iter().map(ultra_terse_transform).collect())
+        }
+        other => other,
+    }
+}
+
+fn edge_index_transform(val: serde_json::Value) -> serde_json::Value {
+    match val {
+        serde_json::Value::Object(mut map) => {
+            let node_ids: Option<Vec<String>> = map.get("nodes").and_then(|nodes| {
+                nodes.as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|n| n.get("id").and_then(|v| v.as_str()).map(String::from))
+                        .collect()
+                })
+            });
+            if let Some(ref ids) = node_ids {
+                let id_map: std::collections::HashMap<&str, usize> = ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| (id.as_str(), i))
+                    .collect();
+                if let Some(serde_json::Value::Array(edges)) = map.get_mut("edges") {
+                    for edge in edges.iter_mut() {
+                        if let serde_json::Value::Object(edge_map) = edge {
+                            if let Some(serde_json::Value::String(fid)) = edge_map.remove("from_id") {
+                                if let Some(&idx) = id_map.get(fid.as_str()) {
+                                    edge_map.insert("from".to_string(), serde_json::Value::Number(idx.into()));
+                                } else {
+                                    edge_map.insert("from_id".to_string(), serde_json::Value::String(fid));
+                                }
+                            }
+                            if let Some(serde_json::Value::String(tid)) = edge_map.remove("to_id") {
+                                if let Some(&idx) = id_map.get(tid.as_str()) {
+                                    edge_map.insert("to".to_string(), serde_json::Value::Number(idx.into()));
+                                } else {
+                                    edge_map.insert("to_id".to_string(), serde_json::Value::String(tid));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let new_map: serde_json::Map<String, serde_json::Value> = map
+                .into_iter()
+                .map(|(k, v)| (k, edge_index_transform(v)))
+                .collect();
+            serde_json::Value::Object(new_map)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(edge_index_transform).collect())
         }
         other => other,
     }
@@ -31711,6 +31762,51 @@ fn sample() {}
         assert!(!capped.was_capped);
         assert_eq!(capped.preview.len(), 1);
         assert_eq!(capped.capped_end, 1);
+    }
+
+    #[test]
+    fn edge_index_replaces_from_id_to_id_with_positions() {
+        let input = serde_json::json!({
+            "nodes": [
+                {"id": "symbol:src/lib.rs:foo"},
+                {"id": "symbol:src/lib.rs:bar"},
+                {"id": "symbol:src/lib.rs:baz"}
+            ],
+            "edges": [
+                {"from_id": "symbol:src/lib.rs:foo", "to_id": "symbol:src/lib.rs:bar", "k": "calls"},
+                {"from_id": "symbol:src/lib.rs:bar", "to_id": "symbol:src/lib.rs:baz", "k": "calls"}
+            ]
+        });
+        let result = edge_index_transform(input);
+        let edges = result.get("edges").unwrap().as_array().unwrap();
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0]["from"], 0);
+        assert_eq!(edges[0]["to"], 1);
+        assert_eq!(edges[1]["from"], 1);
+        assert_eq!(edges[1]["to"], 2);
+        assert!(edges[0].get("from_id").is_none());
+        assert!(edges[0].get("to_id").is_none());
+    }
+
+    #[test]
+    fn edge_index_preserves_unresolved_ids_as_strings() {
+        let input = serde_json::json!({
+            "nodes": [{"id": "symbol:src/lib.rs:foo"}],
+            "edges": [
+                {"from_id": "symbol:src/lib.rs:foo", "to_id": "symbol:other.rs:missing", "k": "ref"}
+            ]
+        });
+        let result = edge_index_transform(input);
+        let edge = &result["edges"][0];
+        assert_eq!(edge["from"], 0);
+        assert_eq!(edge["to_id"], "symbol:other.rs:missing");
+    }
+
+    #[test]
+    fn edge_index_noop_without_nodes_and_edges() {
+        let input = serde_json::json!({"report": {"entries": [{"from_id": "a", "to_id": "b"}]}});
+        let result = edge_index_transform(input);
+        assert_eq!(result["report"]["entries"][0]["from_id"], "a");
     }
 }
 
