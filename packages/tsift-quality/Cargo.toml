@@ -19,5 +19,6 @@ serde_json = "1"
 tsift-index = { path = "../tsift-index", version = "0.1.62" }
 
 [dev-dependencies]
+filetime = "0.2"
 rusqlite = { version = "0.34", features = ["bundled"] }
 tempfile = "3"

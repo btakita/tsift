@@ -270,6 +270,8 @@ The cycle packet cache (`#gpackreuse`) reuses graph/context packets across repea
 
 **Cache version.** `CYCLE_PACKET_CACHE_VERSION = "cycle-packet-cache-v1"`. A version bump invalidates all existing cache entries.
 
+**Cache eviction.** `cycle_packet_cache_evict` scans `.tsift/cycle-packet-cache/` and removes entries older than a configurable TTL (default 24 hours) based on file modification time. After TTL-based eviction, if total cache size exceeds a configurable max (default 50 MB), oldest entries are removed until the budget is satisfied. `apply_status_fixes` runs eviction during `tsift status` auto-fix (the default; `--no-fix` skips it), reporting evicted count and bytes to stderr. `cycle_packet_cache_stats` returns entry count and total bytes for reporting.
+
 Convex support is a projection backend for the same substrate contract. `GraphProjection::upsert_into` writes nodes before edges, so stores can fail closed when an edge references a missing node. The Convex adapter maps records onto two application tables:
 
 - `nodes`: `externalId`, `kind`, `label`, `properties`, `provenance`, and `freshness`

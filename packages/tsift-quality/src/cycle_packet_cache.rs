@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 pub const CYCLE_PACKET_CACHE_VERSION: &str = "cycle-packet-cache-v1";
 
@@ -141,6 +142,137 @@ pub fn build_cache_hit_report(
     }
 }
 
+pub const CYCLE_PACKET_CACHE_DEFAULT_TTL_SECS: u64 = 24 * 60 * 60;
+pub const CYCLE_PACKET_CACHE_DEFAULT_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CyclePacketCacheEvictionReport {
+    pub scanned_entries: usize,
+    pub evicted_entries: usize,
+    pub evicted_bytes: u64,
+    pub remaining_entries: usize,
+    pub remaining_bytes: u64,
+    pub ttl_secs: u64,
+    pub max_bytes: u64,
+}
+
+pub fn cycle_packet_cache_stats(root: &Path) -> (usize, u64) {
+    let cache_dir = cycle_packet_cache_dir(root);
+    if !cache_dir.exists() {
+        return (0, 0);
+    }
+    let mut count = 0usize;
+    let mut total_bytes = 0u64;
+    if let Ok(entries) = fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if let Ok(files) = fs::read_dir(entry.path()) {
+                    for file in files.flatten() {
+                        if file.path().extension().is_some_and(|ext| ext == "json") {
+                            if let Ok(meta) = file.metadata() {
+                                count += 1;
+                                total_bytes += meta.len();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (count, total_bytes)
+}
+
+pub fn cycle_packet_cache_evict(
+    root: &Path,
+    ttl_secs: u64,
+    max_bytes: u64,
+) -> CyclePacketCacheEvictionReport {
+    let cache_dir = cycle_packet_cache_dir(root);
+    if !cache_dir.exists() {
+        return CyclePacketCacheEvictionReport {
+            scanned_entries: 0,
+            evicted_entries: 0,
+            evicted_bytes: 0,
+            remaining_entries: 0,
+            remaining_bytes: 0,
+            ttl_secs,
+            max_bytes,
+        };
+    }
+    let now = SystemTime::now();
+    let cutoff = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(ttl_secs);
+    let mut all_files: Vec<(PathBuf, u64, u64)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if let Ok(files) = fs::read_dir(entry.path()) {
+                    for file in files.flatten() {
+                        let path = file.path();
+                        if path.extension().is_some_and(|ext| ext == "json") {
+                            if let Ok(meta) = file.metadata() {
+                                let size = meta.len();
+                                let mtime_secs = meta
+                                    .modified()
+                                    .ok()
+                                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(u64::MAX);
+                                all_files.push((path, size, mtime_secs));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let scanned = all_files.len();
+    all_files.sort_by_key(|(_, _, mtime)| *mtime);
+    let mut evicted = 0usize;
+    let mut evicted_bytes = 0u64;
+    for (path, size, mtime) in &all_files {
+        if *mtime < cutoff {
+            let _ = fs::remove_file(path);
+            evicted += 1;
+            evicted_bytes += size;
+        }
+    }
+    let remaining: u64 = all_files
+        .iter()
+        .filter(|(_, _, mtime)| *mtime >= cutoff)
+        .map(|(_, size, _)| *size)
+        .sum();
+    if remaining > max_bytes {
+        let expired: Vec<_> = all_files
+            .iter()
+            .filter(|(_, _, mtime)| *mtime >= cutoff)
+            .collect();
+        let mut kept_bytes = 0u64;
+        for (path, size, _) in expired {
+            if kept_bytes.saturating_add(*size) > max_bytes {
+                let _ = fs::remove_file(path);
+                evicted += 1;
+                evicted_bytes += size;
+            } else {
+                kept_bytes = kept_bytes.saturating_add(*size);
+            }
+        }
+    }
+    let (remaining_count, remaining_bytes) = cycle_packet_cache_stats(root);
+    CyclePacketCacheEvictionReport {
+        scanned_entries: scanned,
+        evicted_entries: evicted,
+        evicted_bytes,
+        remaining_entries: remaining_count,
+        remaining_bytes,
+        ttl_secs,
+        max_bytes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +389,106 @@ mod tests {
         assert_eq!(report.hit_status, "disk_hit");
         assert_eq!(report.skipped_phases, vec!["phase_a", "phase_b"]);
         assert_eq!(report.lookup_micros, 500);
+    }
+
+    #[test]
+    fn cache_stats_returns_zero_for_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let (count, bytes) = cycle_packet_cache_stats(dir.path());
+        assert_eq!(count, 0);
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn cache_stats_counts_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        cycle_packet_write_cache(
+            root,
+            CyclePacketKind::Evidence,
+            "key1",
+            &serde_json::json!({"test": 1}),
+        );
+        cycle_packet_write_cache(
+            root,
+            CyclePacketKind::Evidence,
+            "key2",
+            &serde_json::json!({"test": 2}),
+        );
+        cycle_packet_write_cache(
+            root,
+            CyclePacketKind::ContextPack,
+            "key3",
+            &serde_json::json!({"test": 3}),
+        );
+        let (count, bytes) = cycle_packet_cache_stats(root);
+        assert_eq!(count, 3);
+        assert!(bytes > 0);
+    }
+
+    #[test]
+    fn evict_removes_expired_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let old_entry = serde_json::json!({"old": true});
+        cycle_packet_write_cache(root, CyclePacketKind::Evidence, "old-key", &old_entry);
+        let old_path = cycle_packet_cache_path(root, CyclePacketKind::Evidence, "old-key");
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        let file_time = filetime::FileTime::from_system_time(old_time);
+        filetime::set_file_mtime(&old_path, file_time).unwrap();
+
+        let new_entry = serde_json::json!({"new": true});
+        cycle_packet_write_cache(root, CyclePacketKind::Evidence, "new-key", &new_entry);
+
+        let report = cycle_packet_cache_evict(root, 3600, 1024 * 1024 * 1024);
+        assert_eq!(report.evicted_entries, 1);
+        assert_eq!(report.remaining_entries, 1);
+        assert!(
+            cycle_packet_read_cache::<serde_json::Value>(root, CyclePacketKind::Evidence, "old-key")
+                .is_none(),
+            "old entry should be evicted"
+        );
+        assert!(
+            cycle_packet_read_cache::<serde_json::Value>(root, CyclePacketKind::Evidence, "new-key")
+                .is_some(),
+            "new entry should survive"
+        );
+    }
+
+    #[test]
+    fn evict_enforces_max_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for i in 0..5 {
+            let data = serde_json::json!({"payload": "x".repeat(200), "idx": i});
+            cycle_packet_write_cache(
+                root,
+                CyclePacketKind::Evidence,
+                &format!("key-{i}"),
+                &data,
+            );
+        }
+        let (count, bytes) = cycle_packet_cache_stats(root);
+        assert_eq!(count, 5);
+        assert!(bytes > 500);
+        let max_bytes = 500u64;
+        let report = cycle_packet_cache_evict(root, 0, max_bytes);
+        assert!(
+            report.evicted_entries > 0,
+            "expected evictions for max_bytes={max_bytes}, got {report:?}"
+        );
+        let (_, remaining_bytes) = cycle_packet_cache_stats(root);
+        assert!(
+            remaining_bytes <= max_bytes + 300,
+            "remaining bytes should be near max_bytes, got {remaining_bytes}"
+        );
+    }
+
+    #[test]
+    fn evict_noop_on_empty_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = cycle_packet_cache_evict(dir.path(), 3600, 1024);
+        assert_eq!(report.scanned_entries, 0);
+        assert_eq!(report.evicted_entries, 0);
     }
 }

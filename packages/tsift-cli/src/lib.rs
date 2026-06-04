@@ -19851,6 +19851,20 @@ pub(crate) fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> 
         init::init(root, false, false)?;
     }
 
+    let eviction = cycle_packet_cache::cycle_packet_cache_evict(
+        root,
+        cycle_packet_cache::CYCLE_PACKET_CACHE_DEFAULT_TTL_SECS,
+        cycle_packet_cache::CYCLE_PACKET_CACHE_DEFAULT_MAX_BYTES,
+    );
+    if eviction.evicted_entries > 0 {
+        eprintln!(
+            "status fix: evicted {} cycle packet cache entry/entries ({} bytes, {} remaining)",
+            eviction.evicted_entries,
+            eviction.evicted_bytes,
+            eviction.remaining_entries
+        );
+    }
+
     if !status_index_needs_fix(report) {
         return Ok(());
     }
