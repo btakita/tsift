@@ -25,7 +25,7 @@ test("installs marker-owned tsift commands", async () => {
   const project = await tempProject();
   try {
     const updates = await installCommands(project);
-    assert.equal(updates.length, 12);
+    assert.equal(updates.length, 15);
     assert.ok(updates.every((update) => update.action === "created"));
 
     const status = await readFile(

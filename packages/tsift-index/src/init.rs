@@ -473,6 +473,21 @@ const OPENCODE_COMMANDS: &[OpenCodeCommandSpec] = &[
         description: "AST-aware content search via tsift search",
         body: r#"Search code using `tsift --envelope search '<query>' --budget normal`, where `<query>` is `$ARGUMENTS`. Prefer this over grep/rg for content search in indexed projects. The envelope returns ranked search hits with symbol families, file previews, AST-aware scoring, and expansion commands. When the report includes a `scale_guard`, run one of its `narrow_commands` before dispatching parallel agents. Use `tsift workflow search` for the ordered exact/search/explain/summarize/digest recipe that preserves result handles across expansions. Fall back to grep/rg only when the project is not indexed or for non-code file patterns (e.g. glob-only searches)."#,
     },
+    OpenCodeCommandSpec {
+        name: "tsift-explain",
+        description: "Explain a symbol via callers, callees, and community preview",
+        body: r#"Explain the symbol named by `$ARGUMENTS` using `tsift --envelope explain '<symbol>' --budget normal`. Prefer this when you need callers, callees, or community context for a function, struct, or type. The envelope returns ranked caller/callee lists with file locations, community membership, and expansion commands for graph traversal. When the report includes a `scale_guard`, run one of its `narrow_commands` before dispatching parallel agents. Use `tsift graph '<symbol>' --callers` or `--callees` for full call-graph navigation. Fall back to `tsift --envelope search '<symbol>' --budget normal` when the symbol is not found in the index."#,
+    },
+    OpenCodeCommandSpec {
+        name: "tsift-symbol-read",
+        description: "Read symbol body with AST metadata via tsift symbol-read",
+        body: r#"Read the symbol named by `$ARGUMENTS` using `tsift --envelope symbol-read '<symbol>' --budget normal`. Prefer this over reading entire source files when you need a specific function, struct, or type definition. The envelope returns the symbol body, AST span metadata, child references, and expansion commands for graph/source navigation. When `$ARGUMENTS` includes a file hint, pass it as `--file '<path>'` to disambiguate duplicate names. Use the returned `expand` commands to inspect callers, callees, or the full source file. Fall back to `tsift --envelope source-read '<file>' --start <n> --lines <n> --budget normal` when the symbol is not found or when you need raw source without AST context."#,
+    },
+    OpenCodeCommandSpec {
+        name: "tsift-graph",
+        description: "Call graph navigation via tsift graph",
+        body: r#"Navigate the call graph for the symbol named by `$ARGUMENTS` using `tsift graph '<symbol>' --callers` or `tsift graph '<symbol>' --callees`. Use `--callers` to find who calls the symbol, `--callees` to find what the symbol calls. The output lists edges with file locations, edge kinds, and navigation hints. Adjust `--limit` (default 20) to cap edges per direction. For a broader overview including community membership, prefer `tsift --envelope explain '<symbol>' --budget normal`. Fall back to `tsift --envelope search '<symbol>' --budget normal` when the symbol is not found in the index."#,
+    },
 ];
 
 fn ensure_opencode_commands(dir: &Path) -> Result<Vec<OpenCodeCommandUpdate>> {
