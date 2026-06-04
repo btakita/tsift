@@ -1306,6 +1306,8 @@ The OpenCode command shortcut set is intentionally prompt-template based rather 
 
 `packages/opencode-tsift` is the npm distribution for those same templates. The plugin writes the marker-owned command files into the active project's `.opencode/commands/` directory on load and refuses unmanaged same-name conflicts, matching `tsift init --opencode`. Its `opencode-tsift` CLI entrypoint can also refresh the files directly. The package version follows `Cargo.toml`, and release verification checks that the packaged command files exactly match the Rust `tsift init --opencode` output before an npm publish can run.
 
+On plugin load and on the `installation.updated` lifecycle hook, the plugin runs an automatic freshness check: it calls `tsift status --json` to read the index state and, if the index is stale or missing, runs `tsift status --fix` to reindex. This mirrors the Codex `UserPromptSubmit` auto-reindex hook but triggers at plugin load time since OpenCode does not expose a prompt-time hook system. Reindex errors are logged but never block plugin load.
+
 ### Injected Section
 
 ```markdown

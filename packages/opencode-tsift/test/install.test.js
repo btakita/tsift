@@ -5,9 +5,10 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import test from "node:test";
+import test, { mock } from "node:test";
 
 import { installCommands } from "../src/install.js";
+import { TsiftOpenCodePlugin } from "../src/index.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -160,6 +161,70 @@ test("npm package is idempotent after tsift init --opencode", async () => {
       updates.every((update) => update.action === "already present"),
       "npm install should detect tsift-init files as already present",
     );
+  } finally {
+    await rm(project, { recursive: true, force: true });
+  }
+});
+
+test("ensureIndexFresh skips when index is fresh", async () => {
+  const logs = [];
+  const ctx = {
+    directory: await tempProject(),
+    client: {
+      app: {
+        log: async (entry) => logs.push(entry),
+      },
+    },
+  };
+
+  try {
+    const hooks = await TsiftOpenCodePlugin(ctx);
+    const reindexLog = logs.find(
+      (l) => l.body.service === "opencode-tsift" && l.body.message.includes("auto-reindex"),
+    );
+    assert.equal(reindexLog, undefined, "should not reindex when tsift is unavailable or fresh");
+  } finally {
+    await rm(ctx.directory, { recursive: true, force: true });
+  }
+});
+
+test("ensureIndexFresh does not throw when tsift is not installed", async () => {
+  const project = await tempProject();
+  try {
+    const logs = [];
+    const ctx = {
+      directory: project,
+      client: {
+        app: {
+          log: async (entry) => logs.push(entry),
+        },
+      },
+    };
+
+    const hooks = await TsiftOpenCodePlugin(ctx);
+    assert.equal(typeof hooks["installation.updated"], "function");
+  } finally {
+    await rm(project, { recursive: true, force: true });
+  }
+});
+
+test("ensureIndexFresh returns installation.updated hook", async () => {
+  const project = await tempProject();
+  try {
+    const logs = [];
+    const ctx = {
+      directory: project,
+      client: {
+        app: {
+          log: async (entry) => logs.push(entry),
+        },
+      },
+    };
+
+    const hooks = await TsiftOpenCodePlugin(ctx);
+    assert.equal(typeof hooks["installation.updated"], "function");
+
+    await hooks["installation.updated"]();
   } finally {
     await rm(project, { recursive: true, force: true });
   }
