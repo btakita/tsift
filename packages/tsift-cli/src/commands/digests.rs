@@ -24,14 +24,20 @@ pub(crate) fn cmd_diff_digest(
     path: &Path,
     cached: bool,
     revision: Option<&str>,
+    max_parsed_files: usize,
     format: OutputFormat,
 ) -> Result<()> {
+    let parsed_files_cap = if max_parsed_files == 0 {
+        None
+    } else {
+        Some(max_parsed_files)
+    };
     let report = diff_digest::compute(
         path,
         diff_digest::DiffDigestOptions {
             cached,
             revision,
-            max_parsed_files: None,
+            max_parsed_files: parsed_files_cap,
         },
     )?;
     if format.json_output {

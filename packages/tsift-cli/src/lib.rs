@@ -983,11 +983,13 @@ pub fn run() -> Result<()> {
             path,
             cached,
             revision,
+            max_parsed_files,
             json,
         }) => cmd_diff_digest(
             &path,
             cached,
             revision.as_deref(),
+            max_parsed_files,
             OutputFormat {
                 json_output: json || terse || schema || envelope,
                 compact,
@@ -27777,11 +27779,13 @@ tier = "private"
                 path,
                 cached,
                 revision,
+                max_parsed_files,
             }) => {
                 assert!(json);
                 assert_eq!(path, PathBuf::from("."));
                 assert!(!cached);
                 assert!(revision.is_none());
+                assert_eq!(max_parsed_files, 25);
             }
             _ => panic!("expected DiffDigest command"),
         }

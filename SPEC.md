@@ -1559,12 +1559,13 @@ tsift diff-digest .        # current repo root
 tsift diff-digest --cached . # staged index against HEAD
 tsift diff-digest --revision HEAD . # HEAD commit against its first parent
 tsift diff-digest --json . # structured output
+tsift diff-digest --max-parsed-files 0 . # unlimited tree-sitter parsing
 ```
 
 Behavior:
 
 1. In default mode, collect tracked changes from `HEAD` plus untracked files and compare `HEAD` to the working tree. With `--cached`, compare the staged index to `HEAD`. With `--revision <rev>`, compare that single revision to its first parent (or to the empty tree for a root commit).
-2. Parse both snapshots directly with tree-sitter when the file language is supported.
+2. Parse both snapshots directly with tree-sitter when the file language is supported. By default, only the first 25 changed files (in sort order) receive full tree-sitter parsing; remaining files get cheap path-only entries. `--max-parsed-files N` adjusts the cap; `--max-parsed-files 0` disables it.
 3. Emit changed-file status, touched symbols, up to two current cached summary snippets when `summaries.db` matches the compared snapshot, and added/removed call edges.
 
 `diff-digest` intentionally does not require a fresh `index.db`. It reads the compared snapshots directly so unindexed working-tree edits, staged-only content, and historical commit review all stay bounded without mutating the index. Summary lookups stay read-only and degrade to `missing`, `stale`, or `unavailable` instead of mutating the cache.

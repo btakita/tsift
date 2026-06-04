@@ -672,6 +672,9 @@ pub enum Commands {
         /// Compare a single revision against its first parent instead of the working tree
         #[arg(long)]
         revision: Option<String>,
+        /// Maximum changed files to parse with tree-sitter (0 = unlimited)
+        #[arg(long, default_value = "25")]
+        max_parsed_files: usize,
         /// Output as JSON
         #[arg(long)]
         json: bool,
