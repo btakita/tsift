@@ -16,6 +16,8 @@ fn versioned_section() -> String {
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead. Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`; OpenCode projects can install per-project tsift command shortcuts with `tsift init --opencode`.
 
 Use the commands listed in its `use:` output:
+- `tsift --envelope source-read <file> --start <n> --lines <n> --budget normal` — AST-aware bounded source window with symbol metadata and expansion commands (prefer over cat/head for source code files)
+- `tsift --envelope symbol-read <symbol> --budget normal` — token-budgeted symbol body, AST span metadata, child refs, and graph/source expansion commands
 - `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)
 - `tsift --envelope explain <symbol> --budget normal` — callers, callees, community preview
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
@@ -460,6 +462,16 @@ const OPENCODE_COMMANDS: &[OpenCodeCommandSpec] = &[
         name: "tsift-rewrite-run",
         description: "Run a shell command through tsift rewrite",
         body: r#"Run the shell command named by `$ARGUMENTS` through `tsift rewrite --run '<command>'`. Use this for broad `rg`/recursive `grep`, raw transcript/session/log reads, `git diff`/`git show`/single-patch `git log`, `cargo test`/`pytest`, and cargo build/check/clippy/install commands so Codex/OpenCode get the same bounded search, session-digest, diff-digest, and digest-runner path as the Claude hook. If tsift reports no rewrite, do not retry automatically; summarize the reason and run the original command only when the user still needs exact raw output."#,
+    },
+    OpenCodeCommandSpec {
+        name: "tsift-source-read",
+        description: "AST-aware source code reading via tsift source-read",
+        body: r#"Read source code using `tsift --envelope source-read <file> --start <n> --lines <n> --budget normal`, where `<file>` is `$ARGUMENTS` or the file the user wants to inspect. Prefer this over the raw Read tool for source code files (Rust, TypeScript, JavaScript, Python, Markdown, and other indexed languages). The envelope returns a bounded source window with AST symbol metadata, line previews, and expansion commands for before/after/full-file ranges. When `$ARGUMENTS` includes a line range, parse `start` and `lines` from it; otherwise default to `--start 1 --lines 80`. Use the returned `expand` commands to read adjacent ranges instead of re-reading the entire file. Fall back to the raw Read tool only for non-indexed files or binary assets."#,
+    },
+    OpenCodeCommandSpec {
+        name: "tsift-search",
+        description: "AST-aware content search via tsift search",
+        body: r#"Search code using `tsift --envelope search '<query>' --budget normal`, where `<query>` is `$ARGUMENTS`. Prefer this over grep/rg for content search in indexed projects. The envelope returns ranked search hits with symbol families, file previews, AST-aware scoring, and expansion commands. When the report includes a `scale_guard`, run one of its `narrow_commands` before dispatching parallel agents. Use `tsift workflow search` for the ordered exact/search/explain/summarize/digest recipe that preserves result handles across expansions. Fall back to grep/rg only when the project is not indexed or for non-code file patterns (e.g. glob-only searches)."#,
     },
 ];
 
