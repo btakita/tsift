@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use surrealdb::RecordId;
@@ -198,7 +198,7 @@ type DirectionEdgeIndex = BTreeMap<String, BTreeMap<String, BTreeMap<(String, St
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 struct SurrealEdgeIndexes {
-    by_id: BTreeMap<String, Arc<GraphEdge>>,
+    by_id: HashMap<String, Arc<GraphEdge>>,
     ordered: BTreeMap<(String, String, String, String), String>,
     by_kind: BTreeMap<String, BTreeMap<String, String>>,
     by_kind_order: BTreeMap<String, BTreeMap<(String, String, String), String>>,
