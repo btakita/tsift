@@ -1778,7 +1778,7 @@ The hook resolves the git root first, then runs `tsift index --check --exit-code
 
 ### Search Rewrite (`PreToolUse`)
 
-The existing `tsift-rewrite.sh` hook intercepts high-token shell commands and silently rewrites them to lower-context tsift flows:
+The `tsift-rewrite.sh` hook (`examples/hooks/tsift-rewrite.sh`) intercepts high-token shell commands and silently rewrites them to lower-context tsift flows:
 
 - `rg ...` / `grep -r ...` → `tsift --envelope search ... --exact --budget normal`
 - `git diff`, `git diff --cached`, `git show`, and simple `git log -p -1 ...` history review → `tsift diff-digest ...`
@@ -1790,7 +1790,21 @@ File-listing commands are not search rewrites. `rg --files ...`, `rg --type-list
 
 Unsupported shell forms are explicit too. Commands with shell metacharacters such as pipes, redirection, or background operators are not rewritten; the no-rewrite response keeps stdout empty, exits 1, and writes a bounded stderr explanation instead of silently failing. In `--run` mode, no-rewrite exits still do not execute the original command; stderr tells the caller to run the original command directly if intended.
 
-The digest-runner path preserves the wrapped command's original exit status while replacing raw stdout/stderr with a summary-first envelope, bounded digest, and persisted transcript artifact, so failing tests/builds still fail closed and green runs do not inline raw logs. When RTK is installed, digest-runner probes `rtk rewrite <command>` and delegates supported generic command families to RTK's compact filters before wrapping the filtered output in tsift's envelope/artifact metadata. See `~/.claude/hooks/tsift-rewrite.sh`.
+The digest-runner path preserves the wrapped command's original exit status while replacing raw stdout/stderr with a summary-first envelope, bounded digest, and persisted transcript artifact, so failing tests/builds still fail closed and green runs do not inline raw logs. When RTK is installed, digest-runner probes `rtk rewrite <command>` and delegates supported generic command families to RTK's compact filters before wrapping the filtered output in tsift's envelope/artifact metadata.
+
+**Claude Code hook** (`.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "command": "examples/hooks/tsift-rewrite.sh" }
+    ]
+  }
+}
+```
+
+**Harness-equivalent for Codex/OpenCode:** These harnesses do not support PreToolUse hooks. Instead, use `tsift rewrite --run '<command>'` which executes the rewritten command directly, preserving exit status and emitting the same envelope output. OpenCode users can install the `/tsift-rewrite-run` command shortcut via `tsift init --opencode`.
 
 Harnesses that do not expose Claude-style `PreToolUse` hooks can still reuse the same rewrite path manually via `tsift rewrite --run '<command>'`. This is the explicit low-token path for Codex/OpenCode broad search, raw session/transcript/log reads, git diff/show/log patch review, cargo/pytest tests, and cargo build/check/clippy/install output. In `--run` mode, tsift executes the rewritten command directly instead of only printing it, preserves the rewritten command's exit status, and emits the same envelope search previews and digest-runner artifact envelopes by default.
 
@@ -1804,7 +1818,7 @@ Those commands emit the same `digest-runner` JSON envelope that `tsift --envelop
 
 ### RTK Output Filtering (`PreToolUse`)
 
-The `tsift-rewrite.sh` hook (phase 2) routes verbose tsift commands through RTK for output capping when RTK is installed. Commands routed: `communities`, `explain`, `graph`, `index`, `search`. Non-verbose commands (`status`, `init`, `route`, `sql`) pass through unchanged.
+The `tsift-rewrite.sh` hook (`examples/hooks/tsift-rewrite.sh`, phase 2) routes verbose tsift commands through RTK for output capping when RTK is installed. Commands routed: `communities`, `explain`, `graph`, `index`, `search`. Non-verbose commands (`status`, `init`, `route`, `sql`) pass through unchanged.
 
 RTK TOML filters at `~/.config/rtk/filters.toml` define per-command caps:
 
