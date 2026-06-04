@@ -2490,16 +2490,24 @@ impl GraphStore for SqliteGraphStore {
             }
             tsift_core::NeighborhoodScoring::DegreeWeighted => {
                 "MAX(0, 120 - (walk.depth * 18)) + CASE \
-                 WHEN (SELECT COUNT(*) FROM graph_edges e2 WHERE e2.from_id = walk.id OR e2.to_id = walk.id) <= 3 THEN 20 \
-                 WHEN (SELECT COUNT(*) FROM graph_edges e2 WHERE e2.from_id = walk.id OR e2.to_id = walk.id) <= 10 THEN 10 \
+                 WHEN COALESCE((SELECT degree FROM degree_cache dc WHERE dc.id = walk.id), 0) <= 3 THEN 20 \
+                 WHEN COALESCE((SELECT degree FROM degree_cache dc WHERE dc.id = walk.id), 0) <= 10 THEN 10 \
                  ELSE 0 END"
                     .to_string()
             }
         };
 
-        let mut sql = String::from(
+        let use_degree_cache = matches!(options.scoring, tsift_core::NeighborhoodScoring::DegreeWeighted);
+        let degree_cte = if use_degree_cache {
+            "degree_cache AS ( \
+             SELECT id, (SELECT COUNT(*) FROM graph_edges e WHERE e.from_id = n.id OR e.to_id = n.id) AS degree \
+             FROM graph_nodes n), "
+        } else {
+            ""
+        };
+        let mut sql = format!(
             r#"
-            WITH RECURSIVE walk(id, depth, edge_kind, score) AS (
+            WITH {degree_cte}RECURSIVE walk(id, depth, edge_kind, score) AS (
                 SELECT ?, 0, '', ?
                 UNION
                 SELECT e.to_id, walk.depth + 1, e.kind,
