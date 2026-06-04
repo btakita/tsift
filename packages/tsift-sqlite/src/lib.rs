@@ -16,7 +16,8 @@ pub use tsift_core::{
     ConvexRowsGraphClient, GraphEdge, GraphFreshness, GraphNode, GraphPagedSubgraph, GraphPath,
     GraphProjection, GraphPropertyFilter, GraphProvenance, GraphQueryOptions, GraphQueryPage,
     GraphStore, GraphSubgraph, RankedNeighborhoodOptions, RankedNeighborhoodResult,
-    SQLITE_GRAPH_SCHEMA_VERSION, apply_graph_edge_query_page,
+    SQLITE_GRAPH_SCHEMA_VERSION, TerseGraphEdge, TerseGraphNode,
+    apply_graph_edge_query_page,
     apply_graph_query_page, graph_edge_id, shortest_path_using_outgoing, stable_graph_edge_id,
 };
 
@@ -914,27 +915,32 @@ impl SqliteGraphStore {
             started,
             "create and clear refresh staging tables before row loading",
         ));
-        let existing_node_hashes: BTreeMap<String, String> = {
-            let mut stmt = tx.prepare("SELECT id, row_hash FROM graph_nodes WHERE row_hash IS NOT NULL")?;
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-            collect_rows(rows)?.into_iter().collect()
+        let (changed_nodes, changed_edges, skipped_nodes, skipped_edges) = if force_refresh_writes {
+            (projection.nodes.iter().collect(), projection.edges.iter().collect(), 0usize, 0usize)
+        } else {
+            let existing_node_hashes: BTreeMap<String, String> = {
+                let mut stmt = tx.prepare("SELECT id, row_hash FROM graph_nodes WHERE row_hash IS NOT NULL")?;
+                let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+                collect_rows(rows)?.into_iter().collect()
+            };
+            let existing_edge_hashes: BTreeMap<String, String> = {
+                let mut stmt = tx.prepare("SELECT edge_key, row_hash FROM graph_edges WHERE row_hash IS NOT NULL")?;
+                let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+                collect_rows(rows)?.into_iter().collect()
+            };
+            let cn: Vec<&GraphNode> = projection.nodes.iter().filter(|n| {
+                let hash = row_hash(*n).ok();
+                hash.as_ref().map_or(true, |h| existing_node_hashes.get(&n.id).map_or(true, |eh| eh != h))
+            }).collect();
+            let ce: Vec<&GraphEdge> = projection.edges.iter().filter(|e| {
+                let hash = row_hash(*e).ok();
+                let ek = graph_edge_id(*e);
+                hash.as_ref().map_or(true, |h| existing_edge_hashes.get(&ek).map_or(true, |eh| eh != h))
+            }).collect();
+            let sn = projection.nodes.len() - cn.len();
+            let se = projection.edges.len() - ce.len();
+            (cn, ce, sn, se)
         };
-        let existing_edge_hashes: BTreeMap<String, String> = {
-            let mut stmt = tx.prepare("SELECT edge_key, row_hash FROM graph_edges WHERE row_hash IS NOT NULL")?;
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-            collect_rows(rows)?.into_iter().collect()
-        };
-        let changed_nodes: Vec<&GraphNode> = projection.nodes.iter().filter(|n| {
-            let hash = row_hash(*n).ok();
-            hash.as_ref().map_or(true, |h| existing_node_hashes.get(&n.id).map_or(true, |eh| eh != h))
-        }).collect();
-        let changed_edges: Vec<&GraphEdge> = projection.edges.iter().filter(|e| {
-            let hash = row_hash(*e).ok();
-            let ek = graph_edge_id(*e);
-            hash.as_ref().map_or(true, |h| existing_edge_hashes.get(&ek).map_or(true, |eh| eh != h))
-        }).collect();
-        let skipped_nodes = projection.nodes.len() - changed_nodes.len();
-        let skipped_edges = projection.edges.len() - changed_edges.len();
         {
             let started = Instant::now();
             sqlite_stage_all_ids(&tx, &projection.nodes, &projection.edges)?;
@@ -1026,19 +1032,37 @@ impl SqliteGraphStore {
 
         let delta_started = Instant::now();
         let tombstoned_nodes = {
-            let mut stmt = tx.prepare(
+            let sql = if force_refresh_writes {
+                r#"
+                SELECT g.id
+                FROM graph_nodes g
+                LEFT JOIN next_graph_nodes n ON n.id = g.id
+                WHERE n.id IS NULL
+                ORDER BY g.id
+                "#
+            } else {
                 r#"
                 SELECT g.id
                 FROM graph_nodes g
                 LEFT JOIN next_graph_all_node_ids n ON n.id = g.id
                 WHERE n.id IS NULL
                 ORDER BY g.id
-                "#,
-            )?;
+                "#
+            };
+            let mut stmt = tx.prepare(sql)?;
             collect_rows(stmt.query_map([], |row| row.get::<_, String>(0))?)?
         };
         let tombstoned_edges = {
-            let mut stmt = tx.prepare(
+            let sql = if force_refresh_writes {
+                r#"
+                SELECT g.edge_key
+                FROM graph_edges g
+                LEFT JOIN next_graph_edges n
+                    ON n.edge_key = g.edge_key
+                WHERE n.edge_key IS NULL
+                ORDER BY g.edge_key
+                "#
+            } else {
                 r#"
                 SELECT g.edge_key
                 FROM graph_edges g
@@ -1046,34 +1070,90 @@ impl SqliteGraphStore {
                     ON n.edge_key = g.edge_key
                 WHERE n.edge_key IS NULL
                 ORDER BY g.edge_key
-                "#,
-            )?;
+                "#
+            };
+            let mut stmt = tx.prepare(sql)?;
             collect_rows(stmt.query_map([], |row| row.get::<_, String>(0))?)?
         };
-        let unchanged_nodes: usize = skipped_nodes;
-        let unchanged_edges: usize = skipped_edges;
-        let reused_owner_node_properties: usize = tx.query_row(
-            r#"
-            SELECT COUNT(*)
-            FROM graph_node_properties g
-            JOIN next_graph_all_node_ids a ON a.id = g.node_id
-            LEFT JOIN next_graph_changed_nodes c ON c.id = a.id
-            WHERE c.id IS NULL
-            "#,
-            [],
-            |row| row.get(0),
-        )?;
-        let reused_owner_edge_properties: usize = tx.query_row(
-            r#"
-            SELECT COUNT(*)
-            FROM graph_edge_properties g
-            JOIN next_graph_all_edge_keys a ON a.edge_key = g.edge_key
-            LEFT JOIN next_graph_changed_edges c ON c.edge_key = a.edge_key
-            WHERE c.edge_key IS NULL
-            "#,
-            [],
-            |row| row.get(0),
-        )?;
+        let unchanged_nodes: usize = if force_refresh_writes {
+            tx.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM next_graph_nodes n
+                JOIN graph_nodes g ON g.id = n.id
+                WHERE g.row_hash = n.row_hash
+                "#,
+                [],
+                |row| row.get(0),
+            )?
+        } else {
+            skipped_nodes
+        };
+        let unchanged_edges: usize = if force_refresh_writes {
+            tx.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM next_graph_edges n
+                JOIN graph_edges g
+                    ON g.edge_key = n.edge_key
+                WHERE g.row_hash = n.row_hash
+                "#,
+                [],
+                |row| row.get(0),
+            )?
+        } else {
+            skipped_edges
+        };
+        let reused_owner_node_properties: usize = if force_refresh_writes {
+            tx.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM graph_node_properties g
+                JOIN next_graph_nodes n ON n.id = g.node_id
+                LEFT JOIN next_graph_changed_nodes c ON c.id = n.id
+                WHERE c.id IS NULL
+                "#,
+                [],
+                |row| row.get(0),
+            )?
+        } else {
+            tx.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM graph_node_properties g
+                JOIN next_graph_all_node_ids a ON a.id = g.node_id
+                LEFT JOIN next_graph_changed_nodes c ON c.id = a.id
+                WHERE c.id IS NULL
+                "#,
+                [],
+                |row| row.get(0),
+            )?
+        };
+        let reused_owner_edge_properties: usize = if force_refresh_writes {
+            tx.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM graph_edge_properties g
+                JOIN next_graph_edges n ON n.edge_key = g.edge_key
+                LEFT JOIN next_graph_changed_edges c ON c.edge_key = n.edge_key
+                WHERE c.edge_key IS NULL
+                "#,
+                [],
+                |row| row.get(0),
+            )?
+        } else {
+            tx.query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM graph_edge_properties g
+                JOIN next_graph_all_edge_keys a ON a.edge_key = g.edge_key
+                LEFT JOIN next_graph_changed_edges c ON c.edge_key = a.edge_key
+                WHERE c.edge_key IS NULL
+                "#,
+                [],
+                |row| row.get(0),
+            )?
+        };
         let unchanged_changed_node_properties: usize = tx.query_row(
             r#"
             SELECT COUNT(*)
@@ -1101,28 +1181,56 @@ impl SqliteGraphStore {
             + unchanged_changed_node_properties
             + unchanged_changed_edge_properties;
 
-        let deleted_edges = tx.execute(
-            r#"
-            DELETE FROM graph_edges
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM next_graph_all_edge_keys n
-                WHERE n.edge_key = graph_edges.edge_key
-            )
-            "#,
-            [],
-        )?;
-        let deleted_nodes = tx.execute(
-            r#"
-            DELETE FROM graph_nodes
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM next_graph_all_node_ids n
-                WHERE n.id = graph_nodes.id
-            )
-            "#,
-            [],
-        )?;
+        let deleted_edges = if force_refresh_writes {
+            tx.execute(
+                r#"
+                DELETE FROM graph_edges
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM next_graph_edges n
+                    WHERE n.edge_key = graph_edges.edge_key
+                )
+                "#,
+                [],
+            )?
+        } else {
+            tx.execute(
+                r#"
+                DELETE FROM graph_edges
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM next_graph_all_edge_keys n
+                    WHERE n.edge_key = graph_edges.edge_key
+                )
+                "#,
+                [],
+            )?
+        };
+        let deleted_nodes = if force_refresh_writes {
+            tx.execute(
+                r#"
+                DELETE FROM graph_nodes
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM next_graph_nodes n
+                    WHERE n.id = graph_nodes.id
+                )
+                "#,
+                [],
+            )?
+        } else {
+            tx.execute(
+                r#"
+                DELETE FROM graph_nodes
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM next_graph_all_node_ids n
+                    WHERE n.id = graph_nodes.id
+                )
+                "#,
+                [],
+            )?
+        };
 
         let upsert_nodes_sql = r#"
             INSERT INTO graph_nodes

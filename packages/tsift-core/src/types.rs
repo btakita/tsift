@@ -170,6 +170,32 @@ impl From<&GraphNode> for TerseGraphNode {
     }
 }
 
+impl From<TerseGraphNode> for GraphNode {
+    fn from(node: TerseGraphNode) -> Self {
+        Self {
+            id: node.id,
+            kind: node.kind,
+            label: node.label,
+            properties: node.properties,
+            provenance: Vec::new(),
+            freshness: None,
+        }
+    }
+}
+
+impl From<&TerseGraphNode> for GraphNode {
+    fn from(node: &TerseGraphNode) -> Self {
+        Self {
+            id: node.id.clone(),
+            kind: node.kind.clone(),
+            label: node.label.clone(),
+            properties: node.properties.clone(),
+            provenance: Vec::new(),
+            freshness: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerseGraphEdge {
     #[serde(default)]
@@ -201,6 +227,34 @@ impl From<&GraphEdge> for TerseGraphEdge {
             to_id: edge.to_id.clone(),
             kind: edge.kind.clone(),
             properties: edge.properties.clone(),
+        }
+    }
+}
+
+impl From<TerseGraphEdge> for GraphEdge {
+    fn from(edge: TerseGraphEdge) -> Self {
+        Self {
+            id: edge.id,
+            from_id: edge.from_id,
+            to_id: edge.to_id,
+            kind: edge.kind,
+            properties: edge.properties,
+            provenance: Vec::new(),
+            freshness: None,
+        }
+    }
+}
+
+impl From<&TerseGraphEdge> for GraphEdge {
+    fn from(edge: &TerseGraphEdge) -> Self {
+        Self {
+            id: edge.id.clone(),
+            from_id: edge.from_id.clone(),
+            to_id: edge.to_id.clone(),
+            kind: edge.kind.clone(),
+            properties: edge.properties.clone(),
+            provenance: Vec::new(),
+            freshness: None,
         }
     }
 }

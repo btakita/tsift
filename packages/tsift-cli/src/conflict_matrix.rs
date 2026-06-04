@@ -11,6 +11,7 @@ use tsift_sqlite as substrate;
 use substrate::{
     GraphEdge as SubstrateGraphEdge, GraphNode as SubstrateGraphNode,
     GraphPropertyFilter, GraphQueryOptions, GraphStore, SqliteGraphStore,
+    TerseGraphNode as SubstrateTerseGraphNode,
 };
 use tsift_digest::diff_digest;
 use tsift_quality::{cycle_packet_cache, lint};
@@ -468,7 +469,7 @@ pub(crate) fn is_planner_config_path(path: &str) -> bool {
     resolution::is_planner_config_path(path)
 }
 
-pub(crate) fn conflict_matrix_source_handle(node: &SubstrateGraphNode) -> Option<ConflictMatrixSourceHandle> {
+pub(crate) fn conflict_matrix_source_handle(node: &SubstrateTerseGraphNode) -> Option<ConflictMatrixSourceHandle> {
     let file = node.properties.get("file")?.clone();
     let start = node
         .properties
@@ -496,7 +497,7 @@ pub(crate) fn conflict_matrix_source_handle(node: &SubstrateGraphNode) -> Option
 
 pub(crate) fn conflict_matrix_semantic_ref(
     root: &Path,
-    node: &SubstrateGraphNode,
+    node: &SubstrateTerseGraphNode,
 ) -> ConflictMatrixSemanticRef {
     ConflictMatrixSemanticRef {
         handle: node
@@ -548,7 +549,7 @@ pub(crate) fn conflict_matrix_graph_index(graph_nodes: &[SubstrateGraphNode]) ->
 fn conflict_matrix_symbols_for_files(
     graph_index: &ConflictMatrixGraphIndex,
     files: &BTreeSet<String>,
-    target_node: &SubstrateGraphNode,
+    target_node: &SubstrateTerseGraphNode,
 ) -> BTreeSet<String> {
     let mut symbols = BTreeSet::new();
     if target_node.kind == "symbol" {
@@ -664,7 +665,7 @@ fn conflict_matrix_staged_overlap(
     }
 }
 
-fn graph_node_list_property(node: &SubstrateGraphNode, key: &str) -> Vec<String> {
+fn graph_node_list_property(node: &SubstrateTerseGraphNode, key: &str) -> Vec<String> {
     node.properties
         .get(key)
         .map(|value| {
@@ -680,7 +681,7 @@ fn graph_node_list_property(node: &SubstrateGraphNode, key: &str) -> Vec<String>
 }
 
 pub(crate) fn conflict_matrix_worker_feedback(
-    worker_results: &[SubstrateGraphNode],
+    worker_results: &[SubstrateTerseGraphNode],
 ) -> ConflictMatrixWorkerFeedback {
     let mut touched_files = BTreeSet::new();
     let mut expected_tests = BTreeSet::new();
@@ -2143,7 +2144,7 @@ fn conflict_matrix_add_file_symbol_nodes<S: GraphStore>(
 fn conflict_matrix_add_target_ref_nodes<S: GraphStore>(
     store: &S,
     nodes: &mut BTreeMap<String, SubstrateGraphNode>,
-    target_node: &SubstrateGraphNode,
+    target_node: &SubstrateTerseGraphNode,
 ) -> Result<()> {
     let Some(ref_id) = target_node.properties.get("ref_id") else {
         return Ok(());
@@ -2170,7 +2171,7 @@ fn conflict_matrix_add_target_neighborhood<S: GraphStore>(
     store: &S,
     nodes: &mut BTreeMap<String, SubstrateGraphNode>,
     edges: &mut BTreeMap<(String, String, String), SubstrateGraphEdge>,
-    target_node: &SubstrateGraphNode,
+    target_node: &SubstrateTerseGraphNode,
     depth: usize,
     limit: usize,
 ) -> Result<()> {
@@ -2222,7 +2223,7 @@ pub(crate) fn conflict_matrix_target_scoped_graph_snapshot<S: GraphStore>(
 
     for prepared in evidence {
         let report = &prepared.report;
-        insert_conflict_graph_node(&mut nodes, report.target_node.clone());
+        insert_conflict_graph_node(&mut nodes, report.target_node.clone().into());
         for node in report
             .worker_context
             .iter()
@@ -2230,7 +2231,7 @@ pub(crate) fn conflict_matrix_target_scoped_graph_snapshot<S: GraphStore>(
             .chain(report.worker_results.iter())
             .chain(report.semantic_related.iter())
         {
-            insert_conflict_graph_node(&mut nodes, node.clone());
+            insert_conflict_graph_node(&mut nodes, node.clone().into());
         }
         files.extend(conflict_matrix_files_from_evidence(report));
         conflict_matrix_add_target_ref_nodes(store, &mut nodes, &report.target_node)?;
@@ -2258,6 +2259,51 @@ pub(crate) fn conflict_matrix_target_scoped_graph_snapshot<S: GraphStore>(
     })
 }
 
+fn collect_evidence_for_target<S: GraphStore>(
+    root: &Path,
+    scope: Option<&str>,
+    backend: &str,
+    target: &str,
+    depth: usize,
+    limit: usize,
+    store: &S,
+    freshness: GraphDbFreshnessReport,
+) -> Result<ConflictMatrixPreparedEvidence> {
+    let cache_key = cycle_packet_cache::cycle_packet_evidence_key(target);
+    if let Some(cached) = cycle_packet_cache::cycle_packet_read_cache::<
+        ConflictMatrixPreparedEvidence,
+    >(root, cycle_packet_cache::CyclePacketKind::Evidence, &cache_key)
+    {
+        return Ok(cached);
+    }
+    let report = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
+        root,
+        scope,
+        backend,
+        target,
+        depth,
+        limit,
+        cursor: None,
+        store,
+        freshness,
+        warnings: Vec::new(),
+    })
+    .with_context(|| format!("collecting graph-db evidence for {target}"))?;
+    let summary =
+        conflict_matrix_evidence_packet_summary(root, scope, target, depth, limit, &report);
+    let prepared = ConflictMatrixPreparedEvidence {
+        report,
+        summary: summary.clone(),
+    };
+    cycle_packet_cache::cycle_packet_write_cache(
+        root,
+        cycle_packet_cache::CyclePacketKind::Evidence,
+        &cache_key,
+        &prepared,
+    );
+    Ok(prepared)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_conflict_matrix_evidence_packets<S: GraphStore>(
     root: &Path,
@@ -2269,44 +2315,78 @@ pub(crate) fn collect_conflict_matrix_evidence_packets<S: GraphStore>(
     store: &S,
     freshness: GraphDbFreshnessReport,
 ) -> Result<Vec<ConflictMatrixPreparedEvidence>> {
-    let mut evidence = Vec::new();
-    for target in targets {
+    let db_path = graph_substrate_db_path(root, scope);
+    let db_path_exists = db_path.exists();
+    let mut evidence: Vec<Option<ConflictMatrixPreparedEvidence>> =
+        vec![None; targets.len()];
+    let mut miss_indices: Vec<usize> = Vec::new();
+    for (i, target) in targets.iter().enumerate() {
         let cache_key = cycle_packet_cache::cycle_packet_evidence_key(target);
         if let Some(cached) = cycle_packet_cache::cycle_packet_read_cache::<
             ConflictMatrixPreparedEvidence,
         >(root, cycle_packet_cache::CyclePacketKind::Evidence, &cache_key)
         {
-            evidence.push(cached);
-            continue;
+            evidence[i] = Some(cached);
+        } else {
+            miss_indices.push(i);
         }
-        let report = graph_db_evidence_report_from_store(GraphDbEvidenceInput {
-            root,
-            scope,
-            backend,
-            target,
-            depth,
-            limit,
-            cursor: None,
-            store,
-            freshness: freshness.clone(),
-            warnings: Vec::new(),
-        })
-        .with_context(|| format!("collecting graph-db evidence for {target}"))?;
-        let summary =
-            conflict_matrix_evidence_packet_summary(root, scope, target, depth, limit, &report);
-        let prepared = ConflictMatrixPreparedEvidence {
-            report,
-            summary: summary.clone(),
-        };
-        cycle_packet_cache::cycle_packet_write_cache(
-            root,
-            cycle_packet_cache::CyclePacketKind::Evidence,
-            &cache_key,
-            &prepared,
-        );
-        evidence.push(prepared);
     }
-    Ok(evidence)
+    if miss_indices.is_empty() {
+        return Ok(evidence.into_iter().map(|e| e.unwrap()).collect());
+    }
+    if db_path_exists && miss_indices.len() > 1 {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = miss_indices
+                .iter()
+                .map(|&i| {
+                    let target = targets[i].clone();
+                    let root_owned = root.to_path_buf();
+                    let scope_owned = scope.map(String::from);
+                    let backend_owned = backend.to_string();
+                    let freshness_clone = freshness.clone();
+                    let db_path_clone = db_path.clone();
+                    s.spawn(move || {
+                        let ro_store = SqliteGraphStore::open_read_only(&db_path_clone)?;
+                        collect_evidence_for_target(
+                            &root_owned,
+                            scope_owned.as_deref(),
+                            &backend_owned,
+                            &target,
+                            depth,
+                            limit,
+                            &ro_store,
+                            freshness_clone,
+                        )
+                        .map(|e| (i, e))
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let (i, prepared) = handle
+                    .join()
+                    .expect("evidence collection thread panicked")
+                    .with_context(|| "parallel evidence collection failed")?;
+                evidence[i] = Some(prepared);
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
+    } else {
+        for i in &miss_indices {
+            let target = &targets[*i];
+            let prepared = collect_evidence_for_target(
+                root,
+                scope,
+                backend,
+                target,
+                depth,
+                limit,
+                store,
+                freshness.clone(),
+            )?;
+            evidence[*i] = Some(prepared);
+        }
+    }
+    Ok(evidence.into_iter().map(|e| e.unwrap()).collect())
 }
 
 fn conflict_matrix_graph_preparation_cache_key(

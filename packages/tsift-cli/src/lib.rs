@@ -135,6 +135,7 @@ use substrate::{
     GraphFreshness, GraphNode as SubstrateGraphNode, GraphProjection, GraphPropertyFilter,
     GraphProvenance, GraphQueryOptions, GraphQueryPage, GraphStore, SQLITE_GRAPH_SCHEMA_VERSION,
     SqliteGraphStore, SqliteProjectionRefresh,
+    TerseGraphNode as SubstrateTerseGraphNode, TerseGraphEdge as SubstrateTerseGraphEdge,
 };
 use tsift_core::{NeighborhoodScoring, RankedNeighborhoodOptions};
 use tagpath::{family as tagpath_family, ontology as tagpath_ontology};
@@ -5351,13 +5352,13 @@ struct GraphDbReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     schema: Option<GraphDbSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    node: Option<SubstrateGraphNode>,
+    node: Option<SubstrateTerseGraphNode>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    edge: Option<SubstrateGraphEdge>,
+    edge: Option<SubstrateTerseGraphEdge>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    nodes: Vec<SubstrateGraphNode>,
+    nodes: Vec<SubstrateTerseGraphNode>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    edges: Vec<SubstrateGraphEdge>,
+    edges: Vec<SubstrateTerseGraphEdge>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     ranked_neighbors: Vec<GraphDbRankedNeighbor>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -6075,11 +6076,11 @@ struct GraphDbEvidenceReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     projection_hash: Option<String>,
     freshness: GraphDbFreshnessReport,
-    target_node: SubstrateGraphNode,
-    worker_context: Vec<SubstrateGraphNode>,
-    source_handles: Vec<SubstrateGraphNode>,
-    worker_results: Vec<SubstrateGraphNode>,
-    semantic_related: Vec<SubstrateGraphNode>,
+    target_node: SubstrateTerseGraphNode,
+    worker_context: Vec<SubstrateTerseGraphNode>,
+    source_handles: Vec<SubstrateTerseGraphNode>,
+    worker_results: Vec<SubstrateTerseGraphNode>,
+    semantic_related: Vec<SubstrateTerseGraphNode>,
     shortest_paths: Vec<GraphDbEvidencePath>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_budget: Option<GraphDbOutputBudgetReport>,
@@ -9324,11 +9325,11 @@ pub(crate) fn graph_db_evidence_report_from_store<S: GraphStore>(
         packet_id,
         projection_hash,
         freshness,
-        target_node,
-        worker_context,
-        source_handles,
-        worker_results,
-        semantic_related,
+        target_node: target_node.into(),
+        worker_context: worker_context.into_iter().map(Into::into).collect(),
+        source_handles: source_handles.into_iter().map(Into::into).collect(),
+        worker_results: worker_results.into_iter().map(Into::into).collect(),
+        semantic_related: semantic_related.into_iter().map(Into::into).collect(),
         shortest_paths,
         output_budget: Some(output_budget),
         truncated,
@@ -9537,19 +9538,19 @@ pub(crate) fn graph_db_report_from_store(
 
             report.readiness = Some(readiness);
             report.semantic_related = items;
-            report.nodes = budgeted.nodes;
-            report.edges = budgeted.edges;
             if let Some(seed_id) = seed_ids.first() {
                 let ranked_neighbor_cap = graph_db_ranked_neighbor_cap(Some(limit));
                 report.ranked_neighbors = graph_db_ranked_neighbors(
                     seed_id,
-                    &report.nodes,
-                    &report.edges,
+                    &budgeted.nodes,
+                    &budgeted.edges,
                     ranked_neighbor_cap,
                 );
                 report.neighborhood_ranking_gate =
                     Some(graph_db_neighborhood_ranking_gate(ranked_neighbor_cap));
             }
+            report.nodes = budgeted.nodes.into_iter().map(Into::into).collect();
+            report.edges = budgeted.edges.into_iter().map(Into::into).collect();
             report.knowledge_retrieval = Some(GraphDbKnowledgeRetrieval {
                 mode: "semantic_seeded_neighborhood".to_string(),
                 query,
@@ -9576,10 +9577,10 @@ pub(crate) fn graph_db_report_from_store(
             report.schema = Some(graph_db_schema());
         }
         GraphDbQuery::Node { id } => {
-            report.node = store.node(&id)?;
+            report.node = store.node(&id)?.map(Into::into);
         }
         GraphDbQuery::Edge { id } => {
-            report.edge = store.edge(&id)?;
+            report.edge = store.edge(&id)?.map(Into::into);
         }
         GraphDbQuery::Edges {
             edge_kind,
@@ -9592,7 +9593,7 @@ pub(crate) fn graph_db_report_from_store(
                 edge_kind.as_deref(),
                 graph_db_query_options_for_store(&options),
             )?;
-            report.edges = paged.edges;
+            report.edges = paged.edges.into_iter().map(Into::into).collect();
             report.page = Some(graph_db_page_report_from_store(
                 paged.page,
                 options.property_filters,
@@ -9611,7 +9612,7 @@ pub(crate) fn graph_db_report_from_store(
                 edge_kind.as_deref(),
                 graph_db_query_options_for_store(&options),
             )?;
-            report.edges = paged.edges;
+            report.edges = paged.edges.into_iter().map(Into::into).collect();
             report.page = Some(graph_db_page_report_from_store(
                 paged.page,
                 options.property_filters,
@@ -9626,8 +9627,8 @@ pub(crate) fn graph_db_report_from_store(
             let options = graph_db_query_options(cursor, limit, &property_filters)?;
             let paged =
                 store.paged_nodes_by_kind(&kind, graph_db_query_options_for_store(&options))?;
-            report.nodes = paged.nodes;
-            report.edges = paged.edges;
+            report.nodes = paged.nodes.into_iter().map(Into::into).collect();
+            report.edges = paged.edges.into_iter().map(Into::into).collect();
             report.page = Some(graph_db_page_report_from_store(
                 paged.page,
                 options.property_filters,
@@ -9656,15 +9657,25 @@ pub(crate) fn graph_db_report_from_store(
                     options.limit,
                 );
                 let budget_report = budgeted.report;
-                report.nodes = budgeted.nodes;
-                report.edges = budgeted.edges;
                 let ranked_neighbor_cap = graph_db_ranked_neighbor_cap(options.limit);
-                report.ranked_neighbors = graph_db_ranked_neighbors(
+                let ranked_neighbors = graph_db_ranked_neighbors(
                     &id,
-                    &report.nodes,
-                    &report.edges,
+                    &budgeted.nodes,
+                    &budgeted.edges,
                     ranked_neighbor_cap,
                 );
+                let comparison = graph_db_ranked_neighborhood_comparison(
+                    &id,
+                    depth,
+                    edge_kind.as_deref(),
+                    options.limit,
+                    &budgeted.nodes,
+                    &budgeted.edges,
+                    store,
+                )?;
+                report.nodes = budgeted.nodes.into_iter().map(Into::into).collect();
+                report.edges = budgeted.edges.into_iter().map(Into::into).collect();
+                report.ranked_neighbors = ranked_neighbors;
                 report.neighborhood_ranking_gate =
                     Some(graph_db_neighborhood_ranking_gate(ranked_neighbor_cap));
                 let mut page =
@@ -9675,15 +9686,7 @@ pub(crate) fn graph_db_report_from_store(
                 page.diagnostics.extend(budget_report.diagnostics.clone());
                 report.page = Some(page);
                 report.output_budget = Some(budget_report);
-                if let Some(comparison) = graph_db_ranked_neighborhood_comparison(
-                    &id,
-                    depth,
-                    edge_kind.as_deref(),
-                    options.limit,
-                    &report.nodes,
-                    &report.edges,
-                    store,
-                )? {
+                if let Some(comparison) = comparison {
                     report.ranked_neighborhood_comparison = Some(comparison);
                 }
             }
@@ -9747,9 +9750,10 @@ pub(crate) fn print_graph_db_human(report: &GraphDbReport, compact: bool) {
         println!("node: {} [{}] {}", node.id, node.kind, node.label);
     }
     if let Some(edge) = &report.edge {
+        let edge_full: SubstrateGraphEdge = edge.into();
         println!(
             "edge: {} {} -{}-> {}",
-            graph_db_edge_key(edge),
+            graph_db_edge_key(&edge_full),
             edge.from_id,
             edge.kind,
             edge.to_id
@@ -9771,9 +9775,10 @@ pub(crate) fn print_graph_db_human(report: &GraphDbReport, compact: bool) {
         println!("node: {} [{}] {}", node.id, node.kind, node.label);
     }
     for edge in &report.edges {
+        let edge_full: SubstrateGraphEdge = edge.into();
         println!(
             "edge: {} {} -{}-> {}",
-            graph_db_edge_key(edge),
+            graph_db_edge_key(&edge_full),
             edge.from_id,
             edge.kind,
             edge.to_id
@@ -10791,7 +10796,7 @@ fn graph_db_backend_eval_dispatch_signature(report: &DispatchTraceReport) -> ser
     serde_json::json!({
         "targets": report.targets,
         "node_ids": report.nodes.iter().map(|node| &node.id).collect::<Vec<_>>(),
-        "edge_keys": report.edges.iter().map(graph_db_edge_key).collect::<Vec<_>>(),
+        "edge_keys": report.edges.iter().map(|e| graph_db_edge_key(&SubstrateGraphEdge::from(e))).collect::<Vec<_>>(),
         "evidence_packet_ids": report.evidence_packet_ids,
         "worker_prompt_targets": report.worker_prompt_packets.iter().map(|packet| &packet.target).collect::<Vec<_>>(),
         "truncated": report.truncated,
@@ -17928,8 +17933,8 @@ struct DispatchTraceReport {
     worker_prompt_packets: Vec<ConflictMatrixWorkerPromptPacket>,
     worker_feedback: Vec<ConflictMatrixWorkerFeedback>,
     summary: DispatchTraceSummary,
-    nodes: Vec<SubstrateGraphNode>,
-    edges: Vec<SubstrateGraphEdge>,
+    nodes: Vec<SubstrateTerseGraphNode>,
+    edges: Vec<SubstrateTerseGraphEdge>,
     conflict_matrix_decisions: Vec<String>,
     replay_commands: Vec<String>,
     repair_commands: Vec<String>,
@@ -18181,8 +18186,8 @@ fn build_dispatch_trace_report_from_conflict_snapshot(
             .map(|candidate| candidate.worker_feedback.clone())
             .collect(),
         summary: dispatch_trace_summary(&nodes),
-        nodes,
-        edges,
+        nodes: nodes.into_iter().map(Into::into).collect(),
+        edges: edges.into_iter().map(Into::into).collect(),
         conflict_matrix_decisions: conflict.orchestration.conflict_matrix_decisions,
         replay_commands: conflict.next_commands,
         repair_commands: graph_db_repair_commands(root, scope),
@@ -18684,7 +18689,8 @@ fn dependency_dag_node_profile(
     for (source, _) in
         graph_db_reachable_nodes_by_kind(store, &node.id, "source_handle", depth, max_rows)?
     {
-        if let Some(handle) = conflict_matrix_source_handle(&source) {
+        let terse: SubstrateTerseGraphNode = (&source).into();
+        if let Some(handle) = conflict_matrix_source_handle(&terse) {
             source_files.insert(handle.file);
         }
     }
@@ -18695,7 +18701,7 @@ fn dependency_dag_node_profile(
             candidate.kind == "worker_result"
                 && candidate.properties.get("ref_id").map(String::as_str) == Some(id.as_str())
         })
-        .cloned()
+        .map(|n| SubstrateTerseGraphNode::from(n))
         .collect::<Vec<_>>();
     let worker_feedback = conflict_matrix_worker_feedback(&worker_results);
     let expected_tests = worker_feedback.expected_tests.iter().cloned().collect();
@@ -18710,7 +18716,8 @@ fn dependency_dag_node_profile(
         for (semantic, _) in
             graph_db_reachable_nodes_by_kind(store, &node.id, kind, depth, max_rows)?
         {
-            let item = conflict_matrix_semantic_ref(root, &semantic);
+            let terse: SubstrateTerseGraphNode = (&semantic).into();
+            let item = conflict_matrix_semantic_ref(root, &terse);
             semantic_refs
                 .entry(format!("{}:{}", item.kind, item.label))
                 .or_insert(item);
@@ -24330,7 +24337,7 @@ fn main() { api::handler(); }
         )
         .unwrap();
         assert_eq!(
-            edge_report.edge.as_ref().map(graph_db_edge_key),
+            edge_report.edge.as_ref().map(|e| graph_db_edge_key(&SubstrateGraphEdge::from(e))),
             Some(edge_id.clone())
         );
 

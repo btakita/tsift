@@ -1431,7 +1431,7 @@ impl GraphStore for SurrealdbGraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tsift_core::{ConvexNodeRow, GraphEdge, GraphNode, GraphPropertyFilter, GraphQueryOptions};
+    use tsift_core::{ConvexNodeRow, GraphEdge, GraphNode, GraphQueryOptions};
 
     fn sample_rows() -> ConvexProjectionRows {
         let node_a = GraphNode::new("node:a", "symbol", "alpha").with_property("path", "a.rs");
@@ -2071,6 +2071,62 @@ mod tests {
             SurrealdbGraphStore::open_or_refresh(&store_path, &sample_rows()).unwrap();
         assert_eq!(outcome2, WarmStartOutcome::CacheHit);
         assert_eq!(store2.graph_counts().unwrap(), (2, 1));
+    }
+
+    #[test]
+    fn surrealdb_store_deferred_index_load_regression() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("surrealdb");
+        let rows = sample_rows();
+
+        let store = SurrealdbGraphStore::from_rows_file_backed(&store_path, &rows).unwrap();
+
+        assert_eq!(store.graph_counts().unwrap(), (2, 1));
+        assert_eq!(store.nodes_by_kind("symbol").unwrap().len(), 2);
+        assert!(store.node("node:a").unwrap().is_some());
+        assert!(store.node("node:b").unwrap().is_some());
+
+        let edge_id = stable_graph_edge_id("node:a", "node:b", "calls");
+        let edge = store.edge(&edge_id).unwrap().unwrap();
+        assert_eq!(edge.from_id, "node:a");
+        assert_eq!(edge.to_id, "node:b");
+        assert_eq!(edge.kind, "calls");
+
+        let outgoing = store.outgoing_edges("node:a", Some("calls")).unwrap();
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].to_id, "node:b");
+
+        let incident = store
+            .incident_edges("node:b", Some("calls"))
+            .unwrap();
+        assert_eq!(incident.len(), 1);
+        assert_eq!(incident[0].from_id, "node:a");
+
+        let path = store
+            .shortest_path("node:a", "node:b", Some("calls"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(path.nodes, vec!["node:a".to_string(), "node:b".to_string()]);
+
+        let all_edges = store.outgoing_edges("node:a", None).unwrap();
+        assert_eq!(all_edges.len(), 1);
+
+        let stored_hash = store.stored_row_hash().unwrap();
+        assert!(stored_hash.is_some());
+
+        assert!(sidecar_path(&store_path).exists());
+        drop(store);
+
+        let reopened = SurrealdbGraphStore::open(&store_path).unwrap();
+        assert_eq!(reopened.graph_counts().unwrap(), (2, 1));
+        assert_eq!(
+            reopened.edge(&edge_id).unwrap().unwrap().to_id,
+            "node:b"
+        );
+        assert_eq!(
+            reopened.stored_row_hash().unwrap(),
+            stored_hash
+        );
     }
 
     #[test]
