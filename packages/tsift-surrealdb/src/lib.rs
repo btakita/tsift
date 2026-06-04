@@ -600,6 +600,18 @@ impl SurrealdbGraphStore {
     }
 
     pub fn open_with_runtime(path: &Path, rt: Arc<tokio::runtime::Runtime>) -> Result<Self> {
+        let store = Self::connect_file_backed(path, rt)?;
+        if !store.try_load_sidecar()? {
+            store.load_indexes()?;
+            let _ = store.write_sidecar();
+        }
+        Ok(store)
+    }
+
+    fn connect_file_backed(
+        path: &Path,
+        rt: Arc<tokio::runtime::Runtime>,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -618,7 +630,7 @@ impl SurrealdbGraphStore {
                 .context("selecting tsift SurrealDB namespace/database")?;
             Ok::<_, anyhow::Error>(db)
         })?;
-        let store = Self {
+        Ok(Self {
             db,
             rt,
             path: Some(path.to_path_buf()),
@@ -627,12 +639,7 @@ impl SurrealdbGraphStore {
             edges: RwLock::new(SurrealEdgeIndexes::default()),
             node_row_hashes: RwLock::new(BTreeMap::new()),
             edge_row_hashes: RwLock::new(BTreeMap::new()),
-        };
-        if !store.try_load_sidecar()? {
-            store.load_indexes()?;
-            let _ = store.write_sidecar();
-        }
-        Ok(store)
+        })
     }
 
     pub fn in_memory() -> Result<Self> {
@@ -782,8 +789,12 @@ impl SurrealdbGraphStore {
     }
 
     pub fn from_rows_file_backed(path: &Path, rows: &ConvexProjectionRows) -> Result<Self> {
-        let store = Self::open(path)?;
+        let rt = Arc::new(create_runtime()?);
+        let store = Self::connect_file_backed(path, rt)?;
         store.replace_projection_rows(rows)?;
+        let hash = row_hash(rows)?;
+        store.set_stored_row_hash(&hash)?;
+        let _ = store.write_sidecar();
         Ok(store)
     }
 
@@ -1469,6 +1480,23 @@ mod tests {
             1
         );
         assert_eq!(reopened.graph_counts().unwrap(), (2, 0));
+    }
+
+    #[test]
+    fn surrealdb_store_from_rows_skips_load_and_enables_warm_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("surrealdb");
+
+        let store =
+            SurrealdbGraphStore::from_rows_file_backed(&store_path, &sample_rows()).unwrap();
+        assert_eq!(store.graph_counts().unwrap(), (2, 1));
+        assert_eq!(store.nodes_by_kind("symbol").unwrap().len(), 2);
+        drop(store);
+
+        let (reopened, outcome) =
+            SurrealdbGraphStore::open_or_refresh(&store_path, &sample_rows()).unwrap();
+        assert_eq!(outcome, WarmStartOutcome::CacheHit);
+        assert_eq!(reopened.graph_counts().unwrap(), (2, 1));
     }
 
     #[test]
