@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use tsift_core::{
@@ -124,7 +125,7 @@ fn snapshot_copy_path(db_path: &Path, default_stem: &str) -> PathBuf {
     file_name.push(".db");
     std::env::temp_dir().join(file_name)
 }
-const SQLITE_GRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 256;
+const SQLITE_GRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 4096;
 const SQLITE_GRAPH_STAGING_CHUNK_ROWS: usize = 500;
 
 pub struct SqliteGraphStore {
@@ -138,6 +139,8 @@ pub struct SqliteReadOnlyConnection {
     _snapshot_copy: Option<SnapshotCopyGuard>,
     recovery: Option<ReadOnlyRecovery>,
 }
+
+static BFS_CALL_ID: AtomicU64 = AtomicU64::new(0);
 
 impl SqliteReadOnlyConnection {
     pub fn conn(&self) -> &Connection {
@@ -2285,25 +2288,23 @@ impl GraphStore for SqliteGraphStore {
                 "MAX(0, 120 - (walk.depth * 18))".to_string()
             }
             tsift_core::NeighborhoodScoring::EdgeKindWeighted => {
-                format!(
-                    "MAX(0, 120 - (walk.depth * 18)) + CASE walk.edge_kind \
-                     WHEN 'semantic_relation' THEN 34 \
-                     WHEN 'mentions_entity' THEN 28 \
-                     WHEN 'mentions_concept' THEN 28 \
-                     WHEN 'tagged_entity' THEN 28 \
-                     WHEN 'tagged_concept' THEN 28 \
-                     WHEN 'related_concept' THEN 28 \
-                     WHEN 'mentions' THEN 22 \
-                     WHEN 'calls' THEN 20 \
-                     WHEN 'requests_context' THEN 18 \
-                     WHEN 'scopes_context' THEN 18 \
-                     WHEN 'scopes_source' THEN 18 \
-                     WHEN 'explains_result' THEN 18 \
-                     WHEN 'defines' THEN 12 \
-                     WHEN 'contains' THEN 12 \
-                     WHEN 'belongs_to' THEN 12 \
-                     ELSE 8 END"
-                )
+                "MAX(0, 120 - (walk.depth * 18)) + CASE walk.edge_kind \
+                 WHEN 'semantic_relation' THEN 34 \
+                 WHEN 'mentions_entity' THEN 28 \
+                 WHEN 'mentions_concept' THEN 28 \
+                 WHEN 'tagged_entity' THEN 28 \
+                 WHEN 'tagged_concept' THEN 28 \
+                 WHEN 'related_concept' THEN 28 \
+                 WHEN 'mentions' THEN 22 \
+                 WHEN 'calls' THEN 20 \
+                 WHEN 'requests_context' THEN 18 \
+                 WHEN 'scopes_context' THEN 18 \
+                 WHEN 'scopes_source' THEN 18 \
+                 WHEN 'explains_result' THEN 18 \
+                 WHEN 'defines' THEN 12 \
+                 WHEN 'contains' THEN 12 \
+                 WHEN 'belongs_to' THEN 12 \
+                 ELSE 8 END".to_string()
             }
             tsift_core::NeighborhoodScoring::DegreeWeighted => {
                 "MAX(0, 120 - (walk.depth * 18)) + CASE \
@@ -2662,107 +2663,89 @@ impl GraphStore for SqliteGraphStore {
             return Ok(None);
         }
 
+        let call_id = BFS_CALL_ID.fetch_add(1, Ordering::Relaxed);
+        let tbl = format!("_tsift_frontier_{call_id}");
+
         let mut visited = BTreeSet::from([from_id.to_string()]);
         let mut parent = BTreeMap::<String, String>::from([(from_id.to_string(), String::new())]);
         let mut frontier = vec![from_id.to_string()];
-        let mut single_frontier_stmt = if kind.is_none() {
-            Some(self.conn.prepare(
-                r#"
-                SELECT from_id, to_id
-                FROM graph_edges INDEXED BY idx_graph_edges_from_kind
-                WHERE from_id = ?1
-                ORDER BY from_id, to_id, kind
-                "#,
-            )?)
+        self.conn.execute_batch(&format!(
+            r#"CREATE TEMP TABLE IF NOT EXISTS "{tbl}" (id TEXT PRIMARY KEY);
+               DELETE FROM "{tbl}";"#,
+        ))?;
+        let select_sql = if kind.is_some() {
+            format!(
+                r#"SELECT e.from_id, e.to_id
+                   FROM "{tbl}" f
+                   JOIN graph_edges e INDEXED BY idx_graph_edges_from_kind
+                       ON e.from_id = f.id
+                   WHERE e.kind = ?
+                   ORDER BY e.from_id, e.to_id, e.kind"#,
+            )
         } else {
-            None
+            format!(
+                r#"SELECT e.from_id, e.to_id
+                   FROM "{tbl}" f
+                   JOIN graph_edges e INDEXED BY idx_graph_edges_from_kind
+                       ON e.from_id = f.id
+                   ORDER BY e.from_id, e.to_id, e.kind"#,
+            )
         };
-        let mut single_frontier_kind_stmt = if kind.is_some() {
-            Some(self.conn.prepare(
-                r#"
-                SELECT from_id, to_id
-                FROM graph_edges INDEXED BY idx_graph_edges_from_kind
-                WHERE from_id = ?1 AND kind = ?2
-                ORDER BY from_id, to_id, kind
-                "#,
-            )?)
-        } else {
-            None
-        };
+        let insert_sql = format!(r#"INSERT OR IGNORE INTO "{tbl}" (id) VALUES (?)"#);
+        let delete_sql = format!(r#"DELETE FROM "{tbl}""#);
+        let drop_sql = format!(r#"DROP TABLE IF EXISTS "{tbl}""#);
+        let mut frontier_select_stmt = self.conn.prepare(&select_sql)?;
+        let mut frontier_insert_stmt = self.conn.prepare(&insert_sql)?;
+        let mut found_path: Option<GraphPath> = None;
         for _depth in 0..hop_limit {
             if frontier.is_empty() {
                 break;
             }
+            self.conn.execute(&delete_sql, [])?;
+            for id in &frontier {
+                frontier_insert_stmt.execute([id.as_str()])?;
+            }
             let mut next_frontier = BTreeSet::new();
-            for chunk in frontier.chunks(256) {
-                let edges = if chunk.len() == 1 {
-                    match kind {
-                        Some(kind) => {
-                            let stmt = single_frontier_kind_stmt
-                                .as_mut()
-                                .context("single-frontier kind statement missing")?;
-                            collect_rows(stmt.query_map((chunk[0].as_str(), kind), |row| {
-                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                            })?)?
-                        }
-                        None => {
-                            let stmt = single_frontier_stmt
-                                .as_mut()
-                                .context("single-frontier statement missing")?;
-                            collect_rows(stmt.query_map([chunk[0].as_str()], |row| {
-                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                            })?)?
-                        }
-                    }
-                } else {
-                    let placeholders = std::iter::repeat_n("?", chunk.len())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let mut sql = format!(
-                        r#"
-                        SELECT from_id, to_id
-                        FROM graph_edges INDEXED BY idx_graph_edges_from_kind
-                        WHERE from_id IN ({placeholders})
-                        "#
-                    );
-                    let mut values = chunk.iter().cloned().map(Value::Text).collect::<Vec<_>>();
-                    if let Some(kind) = kind {
-                        sql.push_str(" AND kind = ?");
-                        values.push(Value::Text(kind.to_string()));
-                    }
-                    sql.push_str(" ORDER BY from_id, to_id, kind");
-                    let mut stmt = self.conn.prepare(&sql)?;
-                    collect_rows(stmt.query_map(params_from_iter(values.iter()), |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?)?
-                };
-                for (from, next) in edges {
-                    if !visited.insert(next.clone()) {
-                        continue;
-                    }
-                    parent.insert(next.clone(), from);
-                    if next == to_id {
-                        let mut nodes = vec![to_id.to_string()];
-                        let mut cursor = to_id;
-                        while let Some(previous) = parent.get(cursor) {
-                            if previous.is_empty() {
-                                break;
-                            }
-                            nodes.push(previous.clone());
-                            cursor = previous;
-                        }
-                        nodes.reverse();
-                        return Ok(Some(GraphPath {
-                            hops: nodes.len().saturating_sub(1),
-                            nodes,
-                        }));
-                    }
-                    next_frontier.insert(next);
+            let rows = if let Some(kind) = kind {
+                collect_rows(frontier_select_stmt.query_map([kind], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?)?
+            } else {
+                collect_rows(frontier_select_stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?)?
+            };
+            for (from, next) in rows {
+                if !visited.insert(next.clone()) {
+                    continue;
                 }
+                parent.insert(next.clone(), from);
+                if next == to_id {
+                    let mut nodes = vec![to_id.to_string()];
+                    let mut cursor = to_id;
+                    while let Some(previous) = parent.get(cursor) {
+                        if previous.is_empty() {
+                            break;
+                        }
+                        nodes.push(previous.clone());
+                        cursor = previous;
+                    }
+                    nodes.reverse();
+                    found_path = Some(GraphPath {
+                        hops: nodes.len().saturating_sub(1),
+                        nodes,
+                    });
+                    break;
+                }
+                next_frontier.insert(next);
+            }
+            if found_path.is_some() {
+                break;
             }
             frontier = next_frontier.into_iter().collect();
         }
-        Ok(None)
+        let _ = self.conn.execute_batch(&drop_sql);
+        Ok(found_path)
     }
 
     fn reachable_nodes_by_kind(
