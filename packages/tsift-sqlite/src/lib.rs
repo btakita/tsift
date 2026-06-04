@@ -124,7 +124,7 @@ fn snapshot_copy_path(db_path: &Path, default_stem: &str) -> PathBuf {
     std::env::temp_dir().join(file_name)
 }
 const SQLITE_GRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 256;
-const SQLITE_GRAPH_STAGING_CHUNK_ROWS: usize = 50;
+const SQLITE_GRAPH_STAGING_CHUNK_ROWS: usize = 500;
 
 pub struct SqliteGraphStore {
     conn: Connection,
@@ -3680,7 +3680,7 @@ mod tests {
                 .iter()
                 .any(|phase| phase.name == "sqlite_node_staging"
                     && phase.detail.contains("bulk stage 126 graph_nodes rows")
-                    && phase.detail.contains("multi-row chunks up to 50 rows")),
+                    && phase.detail.contains("multi-row chunks up to 500 rows")),
             "{:?}",
             refresh.phase_timings
         );
@@ -3690,7 +3690,7 @@ mod tests {
                 .iter()
                 .any(|phase| phase.name == "sqlite_edge_staging"
                     && phase.detail.contains("bulk stage 124 graph_edges rows")
-                    && phase.detail.contains("multi-row chunks up to 50 rows")),
+                    && phase.detail.contains("multi-row chunks up to 500 rows")),
             "{:?}",
             refresh.phase_timings
         );
