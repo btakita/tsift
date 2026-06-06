@@ -215,6 +215,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: MemoryCommand,
     },
+    /// Capture and query authored findings anchored to code (Findings Graph Layer)
+    Finding {
+        #[command(subcommand)]
+        command: FindingCommand,
+    },
     /// Rewrite a shell command to use tsift, or run the bounded tsift equivalent directly
     Rewrite {
         /// The shell command to potentially rewrite
@@ -957,6 +962,67 @@ pub enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
         /// Inspect a specific submodule index
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum FindingCommand {
+    /// Author a finding/decision/note anchored to a symbol or file
+    Add {
+        /// Project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Node kind: finding | decision | note
+        #[arg(long, default_value = "finding")]
+        kind: String,
+        /// Short title
+        #[arg(long)]
+        title: String,
+        /// Finding body / the "why"
+        #[arg(long)]
+        body: String,
+        /// Symbol name or file path the finding concerns (anchor target)
+        #[arg(long)]
+        about: String,
+        /// Optional confidence in [0.0, 1.0]
+        #[arg(long)]
+        confidence: Option<f64>,
+        /// Trust status: draft | trusted (explicit adds default to trusted)
+        #[arg(long, default_value = "trusted")]
+        status: String,
+        /// Optional id of an existing finding this one relates_to
+        #[arg(long)]
+        relates: Option<String>,
+        /// Restrict anchor resolution to a specific submodule index
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List captured findings, flagging those whose anchor has moved (stale)
+    List {
+        /// Project root (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Filter by the anchored symbol/file
+        #[arg(long)]
+        about: Option<String>,
+        /// Filter by node kind: finding | decision | note
+        #[arg(long)]
+        kind: Option<String>,
+        /// Filter by trust status: draft | trusted
+        #[arg(long)]
+        status: Option<String>,
+        /// Include findings whose anchor moved (stale); hidden by default
+        #[arg(long)]
+        include_stale: bool,
+        /// Restrict anchor re-resolution to a specific submodule index
         #[arg(long)]
         scope: Option<String>,
         /// Output as JSON

@@ -273,12 +273,56 @@ The failure mode being designed against is a graph filling with confident-soundi
 - One canonical, queryable store with cheap human-readable exports, rather than duplicated and divergent docs.
 - Reuses the shipped substrate, `map`, watermark, and summary-adapter machinery, so the incremental surface is small and the staleness story is already proven.
 
-### Implementation phases (proposed)
+### Implementation phases
 
-1. **Schema + anchored capture** — `finding`/`decision`/`note` node kinds, `concerns`/`scopes`/`relates_to` edges, watermark-based staleness, and `tsift finding add`/`list` over `GraphStore`.
-2. **Hot-path injection** — fold trusted, fresh findings into `context-pack` (then `search`/`explain`) for nodes already in the result set.
-3. **Graph menu + exports** — `graph-db map` findings annotation and on-demand md/html projection.
-4. **Passive harvest** — config-gated draft extraction from session archives/summaries with draft→trusted promotion.
+1. **Schema + anchored capture — IMPLEMENTED (`#trt1p1`).** `finding`/`decision`/`note` node kinds, `concerns`/`relates_to` edges, watermark-based staleness, and `tsift finding add`/`list` over `GraphStore`. See [`tsift finding` surface](#tsift-finding-surface-phase-1) below. (`scopes`→community edges are deferred to a later phase since communities live in the rebuildable code graph; `concerns` + `relates_to` are the Phase 1 anchor/threading edges.)
+2. **Hot-path injection (proposed)** — fold trusted, fresh findings into `context-pack` (then `search`/`explain`) for nodes already in the result set.
+3. **Graph menu + exports (proposed)** — `graph-db map` findings annotation and on-demand md/html projection.
+4. **Passive harvest (proposed)** — config-gated draft extraction from session archives/summaries with draft→trusted promotion.
+
+### `tsift finding` surface (Phase 1)
+
+Phase 1 ships authored-knowledge capture and retrieval anchored to code. The
+critical durability decision: findings are stored in a **dedicated
+`.tsift/findings.db`** opened through `SqliteGraphStore`, completely
+independent of the rebuildable code projection at `.tsift/graph.db`. The code
+projection's `replace_projection_with_version` tombstones any non-projected
+rows on every refresh/reindex; storing findings there would silently delete
+them. The dedicated store is the durability guarantee — findings survive
+`graph-db refresh` and code reindex (proven by
+`finding_survives_code_graph_projection_refresh` in
+`packages/tsift-cli/tests/finding.rs`). The store is created lazily on the
+first `add`; `list` fails closed to an empty result when `findings.db` is
+absent.
+
+```
+tsift finding add --kind <finding|decision|note> --title <T> --body <B> --about <SYMBOL_OR_FILE> \
+    [--path <root>] [--confidence <0.0-1.0>] [--status <draft|trusted>] [--relates <FINDING_ID>] \
+    [--scope <submodule>] [--json]
+
+tsift finding list [<path>] [--about <SYMBOL_OR_FILE>] [--kind <K>] [--status <S>] \
+    [--include-stale] [--scope <submodule>] [--json]
+```
+
+- **Node** — kind ∈ {`finding`,`decision`,`note`}; id is content-derived and
+  deterministic (`finding:blake3(kind\u{1f}title\u{1f}about)`) so re-adding the
+  same authored finding is idempotent. Properties: `title`, `body`, `status`
+  (default `trusted` for explicit add), optional `confidence`, `author`,
+  `about`, `anchor_node`, `anchor_kind`, and the freshness `watermark`. Standard
+  substrate `provenance` and `freshness` (watermark + observation time) are
+  stamped at capture.
+- **Anchor** — `--about` resolves against the code index first (a `code_symbol`
+  node, watermark = blake3 of the symbol's body span) and falls back to a `file`
+  node (watermark = blake3 of file contents). Anchoring is by stable handle,
+  never line number. A `concerns` edge links finding → anchor node.
+- **`--relates`** — adds a `relates_to` edge finding → finding; the target must
+  already exist or the add fails closed.
+- **Staleness** — `list` re-resolves the anchor's current content hash and
+  compares it to the captured watermark. A finding is `stale` when the hashes
+  differ, or when the anchor can no longer be resolved. **Default `list` hides
+  stale findings** (you only see fresh, trustworthy authored context);
+  `--include-stale` includes them, each flagged `stale: true` with both
+  `captured_watermark` and `current_watermark` in the JSON output.
 
 ## Graph Traversal Handles
 
