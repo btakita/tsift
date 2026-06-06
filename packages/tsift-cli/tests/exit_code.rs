@@ -95,7 +95,8 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
 fn release_publish_gate_requires_secret_variable_and_dry_run() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflow = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
-    let spec = fs::read_to_string(root.join("SPEC.md")).unwrap();
+    // Release Workflow detail moved to the release sibling spec during the SPEC split.
+    let spec = fs::read_to_string(root.join("../../specs/release-integration.md")).unwrap();
     let readme = fs::read_to_string(root.join("README.md")).unwrap();
 
     assert!(
@@ -171,9 +172,11 @@ fn spec_documents_lazily_rs_cache_contracts() {
     let workspace_spec = fs::read_to_string(root.join("../../SPEC.md")).unwrap();
     assert_eq!(
         packaged_spec, workspace_spec,
-        "packaged CLI spec should stay in sync with the workspace spec"
+        "packaged CLI spec index should stay in sync with the workspace spec index"
     );
 
+    // lazily-rs cache contracts moved to the graph sibling spec during the SPEC split.
+    let spec = fs::read_to_string(root.join("../../specs/graph.md")).unwrap();
     let required = [
         "### lazily-rs Cache Contracts",
         "`SummaryCache` (`packages/tsift-summarize`)",
@@ -195,7 +198,7 @@ fn spec_documents_lazily_rs_cache_contracts() {
     ];
     for needle in required {
         assert!(
-            packaged_spec.contains(needle),
+            spec.contains(needle),
             "lazily-rs cache contract table missing {needle:?}"
         );
     }

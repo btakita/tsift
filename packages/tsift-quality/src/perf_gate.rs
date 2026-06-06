@@ -4,7 +4,7 @@
 //! `fixtures/graph-db-performance-history.json`) into a binding promotion
 //! decision for candidate `GraphStore` backends.
 //!
-//! Spec: see SPEC.md § "Graph DB Performance Release Gate".
+//! Spec: see specs/graph.md § "Graph DB Performance Release Gate".
 //!
 //! Four required workloads (canonical fixture prefix → human gate name):
 //!

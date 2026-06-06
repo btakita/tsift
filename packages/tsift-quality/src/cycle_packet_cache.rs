@@ -10,7 +10,7 @@
 //! - `impact`: impact reports keyed by source watermark + revision
 //! - `conflict_matrix`: conflict-matrix reports keyed by prepared inputs + targets
 //!
-//! Spec: see SPEC.md § "Cycle Packet Cache".
+//! Spec: see specs/graph.md § "Cycle Packet Cache".
 
 use serde::{Deserialize, Serialize};
 use std::fs;

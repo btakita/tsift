@@ -8,7 +8,7 @@
 //! runtime, cache-hit rate, raw-read avoidance, and useful-hit density.
 //! A regression on any required metric across any surface blocks the gate.
 //!
-//! Spec: see SPEC.md § "Cross-Surface Token Gate".
+//! Spec: see specs/graph.md § "Cross-Surface Token Gate".
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
