@@ -994,11 +994,29 @@ pub(crate) fn cmd_graph_db_backend_eval(
     }
 }
 
+/// A trusted, fresh authored finding attached to a map node (community / hub /
+/// focus) because it `concerns` a member of that node (#trt1p3 graph menu). The
+/// graph store is the source of truth; this is the compact projection the map
+/// overview carries so an agent can drill systems-overview → community → the
+/// finding explaining the coupling.
+#[derive(Serialize, Clone)]
+struct GraphDbMapFindingRef {
+    id: String,
+    kind: String,
+    title: String,
+    about: String,
+    anchor_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<f64>,
+}
+
 #[derive(Serialize)]
 struct GraphDbMapCommunitySummary {
     id: usize,
     size: usize,
     top_members: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    findings: Vec<GraphDbMapFindingRef>,
 }
 
 #[derive(Serialize)]
@@ -1007,6 +1025,8 @@ struct GraphDbMapHub {
     kind: String,
     label: String,
     degree: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    findings: Vec<GraphDbMapFindingRef>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1050,6 +1070,60 @@ struct GraphDbMapFocusReport {
     community_id: Option<usize>,
     neighbor_count: usize,
     neighbor_kinds: BTreeMap<String, usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    findings: Vec<GraphDbMapFindingRef>,
+}
+
+/// Collect trusted, fresh findings concerning any of `about_keys`, bucketed by
+/// the `about` anchor, for map annotation (#trt1p3 graph menu). Reuses the
+/// Phase 2 trusted+fresh injection contract (`collect_injectable_findings`).
+/// Fails open to an empty map when the findings store is absent or unreadable.
+fn collect_map_findings_by_about(
+    root: &Path,
+    scope: Option<&str>,
+    about_keys: &BTreeSet<String>,
+) -> BTreeMap<String, Vec<GraphDbMapFindingRef>> {
+    let findings =
+        match crate::commands::finding::collect_injectable_findings(root, about_keys, scope) {
+            Ok(findings) => findings,
+            Err(_) => return BTreeMap::new(),
+        };
+    let mut by_about: BTreeMap<String, Vec<GraphDbMapFindingRef>> = BTreeMap::new();
+    for finding in findings {
+        by_about
+            .entry(finding.about.clone())
+            .or_default()
+            .push(GraphDbMapFindingRef {
+                id: finding.id,
+                kind: finding.kind,
+                title: finding.title,
+                anchor_kind: finding.anchor_kind,
+                confidence: finding.confidence,
+                about: finding.about,
+            });
+    }
+    by_about
+}
+
+/// Gather the distinct findings attached to any of `keys` (dedup by finding id,
+/// ordered by id) for a single map-node annotation.
+fn map_findings_for_keys<'a>(
+    by_about: &BTreeMap<String, Vec<GraphDbMapFindingRef>>,
+    keys: impl Iterator<Item = &'a String>,
+) -> Vec<GraphDbMapFindingRef> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out: Vec<GraphDbMapFindingRef> = Vec::new();
+    for key in keys {
+        if let Some(findings) = by_about.get(key) {
+            for finding in findings {
+                if seen.insert(finding.id.clone()) {
+                    out.push(finding.clone());
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1063,6 +1137,7 @@ pub(crate) fn cmd_graph_db_map(
     community_limit: usize,
     _focus_depth: usize,
     format: OutputFormat,
+    map_format: Option<crate::cli::MapFormat>,
     warnings: Vec<String>,
 ) -> Result<()> {
     let nodes = store.all_nodes()?;
@@ -1087,6 +1162,7 @@ pub(crate) fn cmd_graph_db_map(
                 kind: node.kind.clone(),
                 label: node.label.clone(),
                 degree: deg,
+                findings: Vec::new(),
             })
         })
         .collect();
@@ -1154,7 +1230,37 @@ pub(crate) fn cmd_graph_db_map(
                 id: i + 1,
                 size,
                 top_members,
+                findings: Vec::new(),
             });
+        }
+    }
+
+    // #trt1p3 graph menu: annotate communities and hubs with the trusted, fresh
+    // authored findings that concern their members, so the overview drills
+    // systems → community → the finding explaining the coupling. Anchored by the
+    // displayed member names / hub labels (bounded), reusing the Phase 2
+    // trusted+fresh injection contract. Fails open to no annotations.
+    let mut finding_about_keys: BTreeSet<String> = BTreeSet::new();
+    for community in &communities {
+        for member in &community.top_members {
+            finding_about_keys.insert(member.clone());
+        }
+    }
+    for hub in &hubs {
+        finding_about_keys.insert(hub.label.clone());
+    }
+    if let Some(symbol) = focus {
+        finding_about_keys.insert(symbol.to_string());
+    }
+    let findings_by_about = collect_map_findings_by_about(root, scope, &finding_about_keys);
+    if !findings_by_about.is_empty() {
+        for community in &mut communities {
+            community.findings =
+                map_findings_for_keys(&findings_by_about, community.top_members.iter());
+        }
+        for hub in &mut hubs {
+            hub.findings =
+                map_findings_for_keys(&findings_by_about, std::iter::once(&hub.label));
         }
     }
 
@@ -1201,6 +1307,10 @@ pub(crate) fn cmd_graph_db_map(
                         .iter()
                         .position(|c| c.members.iter().any(|m| m.name == symbol))
                 };
+                let focus_findings = map_findings_for_keys(
+                    &findings_by_about,
+                    [symbol.to_string(), focus_node.label.clone()].iter(),
+                );
                 Some(GraphDbMapFocusReport {
                     symbol: symbol.to_string(),
                     node_id: focus_node.id.clone(),
@@ -1210,6 +1320,7 @@ pub(crate) fn cmd_graph_db_map(
                     community_id: comm_id.map(|i| i + 1),
                     neighbor_count: incident.len(),
                     neighbor_kinds,
+                    findings: focus_findings,
                 })
             }
             None => None,
@@ -1226,6 +1337,18 @@ pub(crate) fn cmd_graph_db_map(
         focus: focus_report,
         warnings,
     };
+
+    // #trt1p3 on-demand projection: md (greppable, commit-friendly) / html
+    // (interactive human view) rendered from the same report the JSON view
+    // serializes — the graph store stays the single source of truth.
+    if let Some(map_format) = map_format {
+        let rendered = match map_format {
+            crate::cli::MapFormat::Md => render_graph_db_map_markdown(&report),
+            crate::cli::MapFormat::Html => render_graph_db_map_html(&report),
+        };
+        println!("{rendered}");
+        return Ok(());
+    }
 
     if format.json_output {
         print_json_or_envelope(
@@ -1307,6 +1430,12 @@ fn print_graph_db_map_human(report: &GraphDbMapReport, compact: bool) {
         println!("Top hubs by degree:");
         for hub in &ov.top_hubs {
             println!("  {} [{}] degree={}", hub.label, hub.kind, hub.degree);
+            for finding in &hub.findings {
+                println!(
+                    "    finding [{}] {} (about {})",
+                    finding.kind, finding.title, finding.about
+                );
+            }
         }
     }
 
@@ -1327,6 +1456,12 @@ fn print_graph_db_map_human(report: &GraphDbMapReport, compact: bool) {
                 "  [{}] {} members: {}",
                 comm.id, comm.size, members_display
             );
+            for finding in &comm.findings {
+                println!(
+                    "    finding [{}] {} (about {})",
+                    finding.kind, finding.title, finding.about
+                );
+            }
         }
     }
 
@@ -1361,11 +1496,270 @@ fn print_graph_db_map_human(report: &GraphDbMapReport, compact: bool) {
             }
             println!();
         }
+        for finding in &focus.findings {
+            println!(
+                "  finding [{}] {} (about {})",
+                finding.kind, finding.title, finding.about
+            );
+        }
     }
 
     for warning in &report.warnings {
         println!("warning: {}", warning);
     }
+}
+
+/// Render the map overview + attached findings as Markdown (#trt1p3). Greppable,
+/// commit-friendly projection; the graph store remains the source of truth.
+fn render_graph_db_map_markdown(report: &GraphDbMapReport) -> String {
+    let ov = &report.overview;
+    let mut out = String::new();
+    out.push_str(&format!("# Graph Map — {}\n\n", report.backend));
+    out.push_str(&format!("Root: `{}`\n", report.root));
+    if let Some(scope) = &report.scope {
+        out.push_str(&format!("Scope: `{scope}`\n"));
+    }
+    out.push_str(&format!(
+        "\n**Overview:** {} nodes, {} edges, {} communities\n",
+        ov.node_count, ov.edge_count, ov.community_count
+    ));
+
+    if !ov.edge_kind_histogram.is_empty() {
+        out.push_str("\n## Edge kinds\n\n");
+        let mut kinds: Vec<_> = ov.edge_kind_histogram.iter().collect();
+        kinds.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        for (kind, count) in kinds {
+            out.push_str(&format!("- `{kind}`: {count}\n"));
+        }
+    }
+
+    if !ov.top_hubs.is_empty() {
+        out.push_str("\n## Top hubs by degree\n\n");
+        for hub in &ov.top_hubs {
+            out.push_str(&format!(
+                "- **{}** [{}] degree={}\n",
+                hub.label, hub.kind, hub.degree
+            ));
+            for finding in &hub.findings {
+                out.push_str(&map_finding_markdown_line(finding));
+            }
+        }
+    }
+
+    if !ov.communities.is_empty() {
+        out.push_str("\n## Communities\n");
+        for comm in &ov.communities {
+            out.push_str(&format!(
+                "\n### Community {} ({} members)\n\n",
+                comm.id, comm.size
+            ));
+            let members = if comm.top_members.len() < comm.size {
+                format!(
+                    "{} … (+{} more)",
+                    comm.top_members.join(", "),
+                    comm.size - comm.top_members.len()
+                )
+            } else {
+                comm.top_members.join(", ")
+            };
+            out.push_str(&format!("{members}\n"));
+            for finding in &comm.findings {
+                out.push_str(&map_finding_markdown_line(finding));
+            }
+        }
+    }
+
+    if !ov.modules.is_empty() {
+        let mut modules = ov.modules.clone();
+        modules.sort_by_key(|b| std::cmp::Reverse(b.node_count));
+        out.push_str("\n## Modules\n\n");
+        for module in modules.iter().take(15) {
+            out.push_str(&format!("- `{}`: {} nodes\n", module.module, module.node_count));
+        }
+    }
+
+    if let Some(focus) = &report.focus {
+        out.push_str(&format!(
+            "\n## Focus: {} [{}]\n\n",
+            focus.node_label, focus.node_kind
+        ));
+        out.push_str(&format!("- id: `{}`\n", focus.node_id));
+        out.push_str(&format!("- degree: {}\n", focus.degree));
+        if let Some(community_id) = focus.community_id {
+            out.push_str(&format!("- community: {community_id}\n"));
+        }
+        out.push_str(&format!("- neighbors: {}\n", focus.neighbor_count));
+        for finding in &focus.findings {
+            out.push_str(&map_finding_markdown_line(finding));
+        }
+    }
+
+    out
+}
+
+fn map_finding_markdown_line(finding: &GraphDbMapFindingRef) -> String {
+    let confidence = finding
+        .confidence
+        .map(|value| format!(", confidence {value}"))
+        .unwrap_or_default();
+    format!(
+        "- 📌 {}: {} (about `{}`{})\n",
+        finding.kind, finding.title, finding.about, confidence
+    )
+}
+
+fn map_html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Render the map overview + attached findings as a self-contained HTML page
+/// (#trt1p3) — an interactive human view of a large graph. Same data as the
+/// JSON/Markdown projections; the graph store remains the source of truth.
+fn render_graph_db_map_html(report: &GraphDbMapReport) -> String {
+    let ov = &report.overview;
+    let mut out = String::new();
+    out.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
+    out.push_str(&format!(
+        "<title>Graph Map — {}</title>\n",
+        map_html_escape(&report.backend)
+    ));
+    out.push_str("<style>body{font-family:system-ui,-apple-system,sans-serif;margin:2rem;max-width:60rem;color:#1a1a1a}h1{margin-bottom:.2rem}h2{margin-top:1.6rem;border-bottom:1px solid #ddd;padding-bottom:.2rem}h3{margin-bottom:.2rem}code{background:#f4f4f4;padding:.1rem .3rem;border-radius:3px}ul{margin-top:.3rem}.finding{color:#7a3e00;background:#fff7ec;border-left:3px solid #d98c2b;padding:.2rem .5rem;margin:.2rem 0;list-style:none}.meta{color:#666;font-size:.9rem}</style>\n");
+    out.push_str("</head>\n<body>\n");
+    out.push_str(&format!(
+        "<h1>Graph Map — {}</h1>\n",
+        map_html_escape(&report.backend)
+    ));
+    out.push_str(&format!(
+        "<p class=\"meta\">Root: <code>{}</code>",
+        map_html_escape(&report.root)
+    ));
+    if let Some(scope) = &report.scope {
+        out.push_str(&format!(" · scope: <code>{}</code>", map_html_escape(scope)));
+    }
+    out.push_str("</p>\n");
+    out.push_str(&format!(
+        "<p><strong>Overview:</strong> {} nodes, {} edges, {} communities</p>\n",
+        ov.node_count, ov.edge_count, ov.community_count
+    ));
+
+    if !ov.edge_kind_histogram.is_empty() {
+        out.push_str("<h2>Edge kinds</h2>\n<ul>\n");
+        let mut kinds: Vec<_> = ov.edge_kind_histogram.iter().collect();
+        kinds.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        for (kind, count) in kinds {
+            out.push_str(&format!(
+                "<li><code>{}</code>: {}</li>\n",
+                map_html_escape(kind),
+                count
+            ));
+        }
+        out.push_str("</ul>\n");
+    }
+
+    if !ov.top_hubs.is_empty() {
+        out.push_str("<h2>Top hubs by degree</h2>\n<ul>\n");
+        for hub in &ov.top_hubs {
+            out.push_str(&format!(
+                "<li><strong>{}</strong> [{}] degree={}",
+                map_html_escape(&hub.label),
+                map_html_escape(&hub.kind),
+                hub.degree
+            ));
+            let findings = map_findings_html_list(&hub.findings);
+            if !findings.is_empty() {
+                out.push_str(&format!("<ul>{findings}</ul>"));
+            }
+            out.push_str("</li>\n");
+        }
+        out.push_str("</ul>\n");
+    }
+
+    if !ov.communities.is_empty() {
+        out.push_str("<h2>Communities</h2>\n");
+        for comm in &ov.communities {
+            out.push_str(&format!(
+                "<h3>Community {} ({} members)</h3>\n",
+                comm.id, comm.size
+            ));
+            let members = if comm.top_members.len() < comm.size {
+                format!(
+                    "{} … (+{} more)",
+                    comm.top_members.join(", "),
+                    comm.size - comm.top_members.len()
+                )
+            } else {
+                comm.top_members.join(", ")
+            };
+            out.push_str(&format!("<p>{}</p>\n", map_html_escape(&members)));
+            let findings = map_findings_html_list(&comm.findings);
+            if !findings.is_empty() {
+                out.push_str(&format!("<ul>{findings}</ul>\n"));
+            }
+        }
+    }
+
+    if !ov.modules.is_empty() {
+        let mut modules = ov.modules.clone();
+        modules.sort_by_key(|b| std::cmp::Reverse(b.node_count));
+        out.push_str("<h2>Modules</h2>\n<ul>\n");
+        for module in modules.iter().take(15) {
+            out.push_str(&format!(
+                "<li><code>{}</code>: {} nodes</li>\n",
+                map_html_escape(&module.module),
+                module.node_count
+            ));
+        }
+        out.push_str("</ul>\n");
+    }
+
+    if let Some(focus) = &report.focus {
+        out.push_str(&format!(
+            "<h2>Focus: {} [{}]</h2>\n<ul>\n",
+            map_html_escape(&focus.node_label),
+            map_html_escape(&focus.node_kind)
+        ));
+        out.push_str(&format!(
+            "<li>id: <code>{}</code></li>\n",
+            map_html_escape(&focus.node_id)
+        ));
+        out.push_str(&format!("<li>degree: {}</li>\n", focus.degree));
+        if let Some(community_id) = focus.community_id {
+            out.push_str(&format!("<li>community: {community_id}</li>\n"));
+        }
+        out.push_str(&format!("<li>neighbors: {}</li>\n", focus.neighbor_count));
+        out.push_str("</ul>\n");
+        let findings = map_findings_html_list(&focus.findings);
+        if !findings.is_empty() {
+            out.push_str(&format!("<ul>{findings}</ul>\n"));
+        }
+    }
+
+    out.push_str("</body>\n</html>\n");
+    out
+}
+
+/// Render attached findings as `<li class="finding">` rows (no wrapping
+/// `<ul>` — the caller wraps so hub/community/focus contexts control nesting).
+fn map_findings_html_list(findings: &[GraphDbMapFindingRef]) -> String {
+    let mut out = String::new();
+    for finding in findings {
+        let confidence = finding
+            .confidence
+            .map(|value| format!(" · confidence {value}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "<li class=\"finding\">📌 {}: {} (about <code>{}</code>{})</li>",
+            map_html_escape(&finding.kind),
+            map_html_escape(&finding.title),
+            map_html_escape(&finding.about),
+            confidence
+        ));
+    }
+    out
 }
 
 pub(crate) fn cmd_graph_db(
@@ -1475,6 +1869,7 @@ pub(crate) fn cmd_graph_db(
                 top_hubs,
                 community_limit,
                 focus_depth,
+                format: map_format,
             } = &query
             {
                 return cmd_graph_db_map(
@@ -1487,6 +1882,7 @@ pub(crate) fn cmd_graph_db(
                     *community_limit,
                     *focus_depth,
                     format,
+                    *map_format,
                     warnings,
                 );
             }
@@ -1531,6 +1927,7 @@ pub(crate) fn cmd_graph_db(
                 top_hubs,
                 community_limit,
                 focus_depth,
+                format: map_format,
             } = &query
             {
                 return cmd_graph_db_map(
@@ -1543,6 +1940,7 @@ pub(crate) fn cmd_graph_db(
                     *community_limit,
                     *focus_depth,
                     format,
+                    *map_format,
                     warnings,
                 );
             }

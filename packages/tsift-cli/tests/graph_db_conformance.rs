@@ -5700,3 +5700,138 @@ fn convex_sync_remote_snapshot_uses_projection_hash_shortcut_when_current() {
     let calls = server.calls();
     assert_eq!(calls, vec!["snapshot_meta"], "unexpected calls: {calls:?}");
 }
+
+// --- #trt1p3: graph-db map findings annotation + md/html projection ----------
+
+fn add_finding(project: &Path, kind: &str, title: &str, about: &str, status: &str) {
+    let output = run_tsift(vec![
+        "finding".to_string(),
+        "add".to_string(),
+        "--path".to_string(),
+        project.to_string_lossy().to_string(),
+        "--kind".to_string(),
+        kind.to_string(),
+        "--title".to_string(),
+        title.to_string(),
+        "--body".to_string(),
+        "the why".to_string(),
+        "--about".to_string(),
+        about.to_string(),
+        "--status".to_string(),
+        status.to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "finding add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn map_projection(project: &Path, format: &str) -> String {
+    let output = run_tsift(vec![
+        "graph-db".to_string(),
+        "--path".to_string(),
+        project.to_string_lossy().to_string(),
+        "map".to_string(),
+        "--format".to_string(),
+        format.to_string(),
+    ]);
+    assert!(
+        output.status.success(),
+        "graph-db map --format {format} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// A hub whose symbol carries a trusted, fresh finding is annotated in the map
+/// JSON overview (#trt1p3 graph menu).
+#[test]
+fn graph_db_map_annotates_hub_with_trusted_finding() {
+    let project = graph_db_project();
+    graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
+    add_finding(
+        project.path(),
+        "decision",
+        "alpha is the orchestrator",
+        "alpha",
+        "trusted",
+    );
+
+    let map = graph_db_json(project.path(), Backend::Sqlite, vec!["map".to_string()]);
+    let annotated = map["overview"]["top_hubs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|hub| {
+            hub["label"] == "alpha"
+                && hub["findings"]
+                    .as_array()
+                    .map(|f| {
+                        f.iter()
+                            .any(|x| x["title"] == "alpha is the orchestrator")
+                    })
+                    .unwrap_or(false)
+        });
+    assert!(
+        annotated,
+        "expected alpha hub annotated with the trusted finding, got {}",
+        map["overview"]["top_hubs"]
+    );
+}
+
+/// The md and html projections render attached findings (#trt1p3 exports).
+#[test]
+fn graph_db_map_md_and_html_projections_render_findings() {
+    let project = graph_db_project();
+    graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
+    add_finding(
+        project.path(),
+        "decision",
+        "alpha is the orchestrator",
+        "alpha",
+        "trusted",
+    );
+
+    let md = map_projection(project.path(), "md");
+    assert!(md.starts_with("# Graph Map"), "md should be markdown: {md:.120}");
+    assert!(
+        md.contains("📌 decision: alpha is the orchestrator (about `alpha`)"),
+        "md should render the finding line: {md}"
+    );
+
+    let html = map_projection(project.path(), "html");
+    assert!(html.starts_with("<!DOCTYPE html>"), "html should be a page");
+    assert!(
+        html.contains("class=\"finding\">📌 decision: alpha is the orchestrator"),
+        "html should render the finding: {html}"
+    );
+}
+
+/// Draft and stale findings never annotate the map — same trusted/fresh guard
+/// as Phase 2 hot-path injection (#trt1p2).
+#[test]
+fn graph_db_map_excludes_draft_findings() {
+    let project = graph_db_project();
+    graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
+    add_finding(
+        project.path(),
+        "note",
+        "draft about alpha",
+        "alpha",
+        "draft",
+    );
+
+    let map = graph_db_json(project.path(), Backend::Sqlite, vec!["map".to_string()]);
+    let leaked = map["overview"]["top_hubs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|hub| {
+            hub["findings"]
+                .as_array()
+                .map(|f| f.iter().any(|x| x["title"] == "draft about alpha"))
+                .unwrap_or(false)
+        });
+    assert!(!leaked, "draft finding must not annotate the map: {}", map["overview"]["top_hubs"]);
+}

@@ -1240,6 +1240,16 @@ pub enum GraphDbBackend {
     Tokensave,
 }
 
+/// On-demand projection format for `graph-db map` (#trt1p3). The graph store is
+/// the source of truth; `md`/`html` are rendered views of the same overview +
+/// attached findings. `md` is greppable / commit-friendly; `html` is an
+/// interactive human view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum MapFormat {
+    Md,
+    Html,
+}
+
 #[derive(Subcommand, Debug, Clone)]
 pub enum GraphDbQuery {
     /// Materialize or refresh the local SQLite graph.db projection for operator workflows
@@ -1410,5 +1420,8 @@ pub enum GraphDbQuery {
         /// Maximum directed hops for focus-tier neighborhood expansion
         #[arg(long, default_value = "2")]
         focus_depth: usize,
+        /// Render an on-demand projection (md|html) of the map + attached findings instead of JSON/text
+        #[arg(long, value_enum)]
+        format: Option<MapFormat>,
     },
 }

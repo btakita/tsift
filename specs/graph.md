@@ -226,7 +226,7 @@ Backend-eval full-projection cache keys use a stable input watermark over indexe
 
 ## Findings Graph Layer
 
-**Status: Phases 1–2 shipped (`#trt1p1`, `#trt1p2`); Phases 3–4 proposed.** This section is the living design for an authored-knowledge layer on top of the existing graph substrate. It is updated as the layer is implemented; subsections tag what already exists versus what is proposed so the spec never overstates shipped behavior.
+**Status: Phases 1–3 shipped (`#trt1p1`, `#trt1p2`, `#trt1p3`); Phase 4 proposed.** This section is the living design for an authored-knowledge layer on top of the existing graph substrate. It is updated as the layer is implemented; subsections tag what already exists versus what is proposed so the spec never overstates shipped behavior.
 
 ### Motivation
 
@@ -277,7 +277,7 @@ The failure mode being designed against is a graph filling with confident-soundi
 
 1. **Schema + anchored capture — IMPLEMENTED (`#trt1p1`).** `finding`/`decision`/`note` node kinds, `concerns`/`relates_to` edges, watermark-based staleness, and `tsift finding add`/`list` over `GraphStore`. See [`tsift finding` surface](#tsift-finding-surface-phase-1) below. (`scopes`→community edges are deferred to a later phase since communities live in the rebuildable code graph; `concerns` + `relates_to` are the Phase 1 anchor/threading edges.)
 2. **Hot-path injection — IMPLEMENTED for `context-pack` (`#trt1p2`).** Trusted, fresh findings are folded into the `context-pack` envelope for symbols/files already in the result set. See [Hot-path injection](#hot-path-injection-phase-2) below. (`search`/`explain` injection is the remaining sub-scope, tracked as `#trt1p2b`.)
-3. **Graph menu + exports (proposed)** — `graph-db map` findings annotation and on-demand md/html projection.
+3. **Graph menu + exports — IMPLEMENTED (`#trt1p3`).** `graph-db map` communities/hubs/focus are annotated with attached trusted, fresh findings, and `graph-db map --format md|html` renders on-demand Markdown/HTML projections of the same overview. See [Graph menu + exports](#graph-menu--exports-phase-3) below.
 4. **Passive harvest (proposed)** — config-gated draft extraction from session archives/summaries with draft→trusted promotion.
 
 ### `tsift finding` surface (Phase 1)
@@ -357,6 +357,35 @@ a `findings` section to that same envelope.
 
 Injection into `search` and `explain` reuses the same trusted/fresh/result-set
 contract and is tracked separately as `#trt1p2b`.
+
+### Graph menu + exports (Phase 3)
+
+Phase 3 surfaces authored findings on the navigation overview and adds
+on-demand greppable/interactive projections, so an agent (or human) can drill
+systems-overview → community/hub → the finding explaining the coupling.
+
+- **Map annotation** — `tsift graph-db map` now attaches trusted, fresh findings
+  to each community, hub, and `--focus` node whose displayed members / label /
+  symbol a finding `concerns`. Annotation reuses the Phase 2 trusted+fresh
+  contract (`collect_injectable_findings`): `draft`, stale (anchor past
+  watermark), and no-watermark findings never appear. Matching is by the
+  displayed member names / hub labels (bounded to what the overview shows, not a
+  full-store scan), deduped by finding id per node. The JSON `overview`
+  communities/hubs and the `focus` report each gain a `findings` array
+  (`id`, `kind`, `title`, `about`, `anchor_kind`, optional `confidence`), omitted
+  when empty. Annotation fails open to none when the findings store is absent.
+- **On-demand projections** — `tsift graph-db map --format md|html` renders the
+  same overview + attached findings. `md` is greppable / commit-friendly (one
+  `📌 <kind>: <title> (about <anchor>)` bullet under each annotated node); `html`
+  is a self-contained, escaped page with the findings styled for an interactive
+  human view of a large graph. Both are pure projections — the graph store
+  (and its JSON serialization) remains the single source of truth, the same
+  pattern session/diff digests use to render compact output from structured
+  state. Without `--format`, the command keeps its existing JSON / text output.
+
+Community annotation is bounded to the displayed `top_members`; a finding on a
+hidden community member surfaces when that member is brought into focus rather
+than in the collapsed overview.
 
 ## Graph Traversal Handles
 
