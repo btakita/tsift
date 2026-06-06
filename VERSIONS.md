@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **`#npm-oidc-trusted-publishing`**: switched the `opencode-tsift` npm publish job to OIDC trusted publishing — no long-lived `NPM_TOKEN` secret. Added `id-token: write` permission, bumped to Node 24 + `npm@latest` (OIDC needs npm CLI ≥ 11.5.1), and dropped `NODE_AUTH_TOKEN`. Requires a one-time manual bootstrap publish (npm has no "pending publisher", so OIDC can't create a brand-new package) plus a Trusted Publisher configured on the package (repo `tsift`, workflow `release.yml`, action `npm publish`).
+
 ## 0.1.63
 
 - **`#release-publish-completeness`**: completed the crates.io publish set. `tsift-memory` (a dependency of `tsift-cli` added since 0.1.62) was missing from the release workflow's publish list, and `tsift-cli`'s optional `tsift-surrealdb` dependency pointed at a workspace-excluded, never-published crate — both blocked `cargo publish -p tsift-cli` with "no matching package found". Brought `tsift-surrealdb` into the workspace (un-excluded; clippy-clean, `tsift-core`-only dep) and added both `tsift-memory` and `tsift-surrealdb` to the release workflow's package-check and publish lists ahead of `tsift-cli`, so the full crate set (sub-crates + `tsift-cli` + root `tsift`) publishes and the `backend-surrealdb` feature resolves on the published crate.
