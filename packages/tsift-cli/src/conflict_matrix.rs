@@ -2259,6 +2259,7 @@ pub(crate) fn conflict_matrix_target_scoped_graph_snapshot<S: GraphStore>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_evidence_for_target<S: GraphStore>(
     root: &Path,
     scope: Option<&str>,

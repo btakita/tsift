@@ -942,12 +942,12 @@ impl SqliteGraphStore {
             };
             let cn: Vec<&GraphNode> = projection.nodes.iter().filter(|n| {
                 let hash = row_hash(*n).ok();
-                hash.as_ref().map_or(true, |h| existing_node_hashes.get(&n.id).map_or(true, |eh| eh != h))
+                hash.as_ref().is_none_or(|h| existing_node_hashes.get(&n.id) != Some(h))
             }).collect();
             let ce: Vec<&GraphEdge> = projection.edges.iter().filter(|e| {
                 let hash = row_hash(*e).ok();
-                let ek = graph_edge_id(*e);
-                hash.as_ref().map_or(true, |h| existing_edge_hashes.get(&ek).map_or(true, |eh| eh != h))
+                let ek = graph_edge_id(e);
+                hash.as_ref().is_none_or(|h| existing_edge_hashes.get(&ek) != Some(h))
             }).collect();
             let sn = projection.nodes.len() - cn.len();
             let se = projection.edges.len() - ce.len();

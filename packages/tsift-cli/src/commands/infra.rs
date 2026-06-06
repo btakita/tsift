@@ -1052,6 +1052,7 @@ struct GraphDbMapFocusReport {
     neighbor_kinds: BTreeMap<String, usize>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_graph_db_map(
     root: &Path,
     scope: Option<&str>,

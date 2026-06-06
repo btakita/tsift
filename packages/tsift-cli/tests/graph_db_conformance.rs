@@ -2881,7 +2881,7 @@ fn graph_db_backend_eval_benchmarks_candidate_stores_against_sqlite() {
         "full_projection.refresh_phase.source_graph_build.duration_micros_per_1k_graph_rows",
         "full_projection.refresh_phase.projection_rows.duration_micros_per_1k_graph_rows",
         "full_projection.sqlite.sqlite_delta_write.duration_micros",
-        "full_projection.sqlite.sqlite_edge_staging.duration_micros",
+        "full_projection.sqlite.sqlite_node_staging.duration_micros",
         "full_projection.sqlite.post_write_reads.duration_micros",
         "full_projection.sqlite.neighborhood.duration_micros",
         "full_projection.sqlite.evidence_target_resolution.duration_micros",

@@ -602,8 +602,15 @@ impl SurrealdbGraphStore {
     pub fn open_with_runtime(path: &Path, rt: Arc<tokio::runtime::Runtime>) -> Result<Self> {
         let store = Self::connect_file_backed(path, rt)?;
         if !store.try_load_sidecar()? {
+            // Do not persist a sidecar from a plain open(): under concurrent
+            // multi-process access a reader could pair a stale snapshot with a
+            // fresh stored_row_hash (write_sidecar re-reads the hash) and mask
+            // another process's mutation on the next open. Only the explicit
+            // refresh paths (from_rows_file_backed / open_or_refresh) write the
+            // sidecar, atomically pairing the rows they wrote with the hash they
+            // set. Incremental mutators drop the sidecar via invalidate_sidecar(),
+            // so later opens rescan the DB until the next refresh re-warms it.
             store.load_indexes()?;
-            let _ = store.write_sidecar();
         }
         Ok(store)
     }
@@ -858,6 +865,16 @@ impl SurrealdbGraphStore {
             let _ = std::fs::remove_file(sidecar_path(store_path));
         }
         Ok(())
+    }
+
+    /// Drop the persisted index sidecar so the next `open()` falls back to a full
+    /// `load_indexes()` DB scan. Incremental mutators must call this: otherwise a
+    /// reopen (including from another process) would load a stale sidecar whose
+    /// `stored_row_hash` still matches DB metadata and silently mask the mutation.
+    fn invalidate_sidecar(&self) {
+        if let Some(ref store_path) = self.path {
+            let _ = std::fs::remove_file(sidecar_path(store_path));
+        }
     }
 
     fn try_load_sidecar(&self) -> Result<bool> {
@@ -1216,6 +1233,7 @@ impl GraphStore for SurrealdbGraphStore {
                 .insert(node.id.clone());
             self.nodes_write()?.insert(node.id.clone(), Arc::new(node.clone()));
         }
+        self.invalidate_sidecar();
         Ok(())
     }
 
@@ -1232,6 +1250,7 @@ impl GraphStore for SurrealdbGraphStore {
             Ok::<(), anyhow::Error>(())
         })?;
         self.edges_write()?.insert(edge.clone());
+        self.invalidate_sidecar();
         Ok(())
     }
 
@@ -1273,6 +1292,7 @@ impl GraphStore for SurrealdbGraphStore {
             if let Some(node) = removed {
                 let _ = self.unindex_node_kind(&node.kind, &node.id);
             }
+            self.invalidate_sidecar();
         }
         Ok(usize::from(deleted.is_some()))
     }
@@ -1287,6 +1307,7 @@ impl GraphStore for SurrealdbGraphStore {
         })?;
         if deleted.is_some() {
             self.edges_write()?.remove(&edge_id);
+            self.invalidate_sidecar();
         }
         Ok(usize::from(deleted.is_some()))
     }

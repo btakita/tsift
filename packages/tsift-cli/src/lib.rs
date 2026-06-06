@@ -1962,11 +1962,10 @@ fn ultra_terse_transform(val: serde_json::Value) -> serde_json::Value {
                 map.remove("provenance");
                 map.remove("freshness");
             }
-            if is_graph_edge {
-                if let Some(serde_json::Value::String(s)) = map.get_mut("k") {
+            if is_graph_edge
+                && let Some(serde_json::Value::String(s)) = map.get_mut("k") {
                     *s = abbreviate_edge_kind(s).to_string();
                 }
-            }
             let is_coverage = map.contains_key("mode")
                 && (map.contains_key("total_sector_count")
                     || map.contains_key("dirty_sector_count"));
@@ -11692,7 +11691,7 @@ pub(crate) fn graph_db_backend_eval_performance_gate(
             "full_projection.refresh_phase.projection_rows.duration_micros_per_1k_graph_rows"
                 .to_string(),
             "full_projection.sqlite.sqlite_delta_write.duration_micros".to_string(),
-            "full_projection.sqlite.sqlite_edge_staging.duration_micros".to_string(),
+            "full_projection.sqlite.sqlite_node_staging.duration_micros".to_string(),
             "full_projection.sqlite.post_write_reads.duration_micros".to_string(),
             "full_projection.sqlite.neighborhood.duration_micros".to_string(),
             "full_projection.sqlite.evidence_target_resolution.duration_micros".to_string(),
@@ -18814,7 +18813,7 @@ fn dependency_dag_node_profile(
             candidate.kind == "worker_result"
                 && candidate.properties.get("ref_id").map(String::as_str) == Some(id.as_str())
         })
-        .map(|n| SubstrateTerseGraphNode::from(n))
+        .map(SubstrateTerseGraphNode::from)
         .collect::<Vec<_>>();
     let worker_feedback = conflict_matrix_worker_feedback(&worker_results);
     let expected_tests = worker_feedback.expected_tests.iter().cloned().collect();
@@ -31783,7 +31782,7 @@ fn sample() {}
         assert!(capped.was_capped);
         assert!(capped.preview.len() < 200);
         assert!(capped.capped_end < 200);
-        assert!(capped.preview.len() > 0);
+        assert!(!capped.preview.is_empty());
     }
 
     #[test]

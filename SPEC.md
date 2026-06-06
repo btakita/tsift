@@ -353,6 +353,62 @@ tsift owns the code adapter on top of this substrate. Code symbols become `code_
 
 Backend-eval full-projection cache keys use a stable input watermark over indexed symbol/call-edge/route rows and semantic summary rows. That full-projection watermark ignores mtime-only `file_state`, path-only index churn, and unrelated agent-doc session markdown edits when those code/summary graph inputs are unchanged; the bounded real dataset remains responsible for current session evidence. Cache-hit samples must continue to report `full_projection.source_graph_build=0us` and `full_projection.projection_rows=0us`, proving the provider-neutral rows were reused instead of rebuilt.
 
+## Findings Graph Layer
+
+**Status: design-stage (`#trt1`).** This section is the living design for an authored-knowledge layer on top of the existing graph substrate. It is updated as the layer is implemented; subsections tag what already exists versus what is proposed so the spec never overstates shipped behavior.
+
+### Motivation
+
+A large codebase carries two kinds of knowledge. **Derived** knowledge — AST spans, call edges, communities, similarity, cached summaries — is recoverable from source and tsift already extracts and caches all of it. **Authored** knowledge — *why* the parts fit together: design decisions, invariants, cross-module coupling, gotchas, and agent/human research conclusions — is **not** recoverable from source. Today that authored knowledge lives only in scattered markdown or in a single agent's context window and is lost between sessions. The findings graph layer makes authored knowledge a first-class, queryable, freshness-tracked layer alongside the code graph so an agent can retrieve the "why" at the moment it is navigating the "what".
+
+### Existing primitives this builds on
+
+The layer is an adapter on the substrate described in [Provider-Neutral Graph Substrate](#provider-neutral-graph-substrate), not a new store. It reuses, without schema changes:
+
+- `GraphStore` typed nodes/edges that already carry `provenance` and `freshness` (content hash + observation timestamp).
+- The source-change watermark discipline (`community_graph_watermark`, projection source watermarks) used to mark rebuildable projections stale.
+- `tsift graph-db --json map`, the two-tier overview (communities, hubs, edge-kind histogram, module tree, optional `--focus`) — the navigation surface findings attach to.
+- The `summaries.db` semantic adapter (`semantic_concept` / `semantic_entity` rows and `mentions_*` edges) — the established precedent for an authored/derived knowledge adapter feeding `graph-db related` and `context-pack`.
+- Stable symbol/AST handles from `symbol-read` / `source-read` and `ast_span` projection nodes — the anchor targets for findings.
+
+### Data model (proposed)
+
+Each finding is a typed node with typed edges to the code it concerns:
+
+- **Node kinds** — `finding`, `decision`, `note`. Properties: `title`, `body`, `status` (`draft` | `trusted`), `confidence`, plus the substrate's standard `provenance` (author kind = agent run / user / passive-harvest, session id, source ref) and `freshness` (watermark stamp at capture time).
+- **Edges** — `concerns` (finding → `code_symbol` / `ast_span` / file node, anchored by stable handle), `scopes` (finding → community), and `relates_to` (finding → finding) for threading related decisions.
+- **Anchoring rule** — findings edge to symbol handles / tagpaths, **never to line numbers**, so a finding survives reformatting and small edits instead of rotting on the first diff.
+- **Staleness rule** — a finding stamped at watermark `W` is reported **stale** (not deleted, not silently trusted) once the symbols it `concerns` advance past `W`. Stale-but-visible is the explicit goal over wrong-and-confident.
+
+### Capture policy (proposed)
+
+Capture is **opt-in by default** so a user who never asks for findings sees zero behavior change:
+
+- **Explicit** — `tsift finding add` (agent- or user-initiated), or capture when the user states a decision directly.
+- **Passive harvest** — tsift already digests agent-doc session archives and summaries; auto-extracted candidates are stored as `draft` (excluded from default injection) and only promoted to `trusted` on confirmation. The whole auto-capture path is gated behind a `.tsift/config.toml` flag.
+
+The failure mode being designed against is a graph filling with confident-sounding, unverified, stale findings — worse than none. `confidence` + `status` (draft vs trusted) + watermark staleness are the guards that keep the layer honest.
+
+### Retrieval and visibility (proposed)
+
+- **Injection on the hot path** — `context-pack`, `search`, and `explain` already fold in cached summaries; a finding that `concerns`/`scopes` a node in the result set rides along in the same envelope. This is the primary win: the agent gets authored context without reading a separate document.
+- **Graph menu** — extend `graph-db map` (or a `--findings` view) so each community/hub in the overview is annotated with attached trusted findings and expansion handles, letting the agent drill systems-overview → community → symbol → the finding explaining the coupling.
+- **Source of truth vs view** — the graph store is canonical (queryable, anchored, dedup-able, staleness-aware). Markdown/HTML are **on-demand projections** (`tsift map --format md|html`-style), the same pattern session/diff digests already use to render compact output from structured state. Markdown for greppable, commit-friendly in-repo/agent consumption; HTML for an interactive human view of a large graph. This avoids two sources of truth drifting apart.
+
+### Benefits
+
+- Cross-session memory of design intent that is anchored to code and invalidated when that code moves, instead of rotting silently in prose.
+- Authored "why" retrieved on the existing agent hot path at near-zero extra navigation cost.
+- One canonical, queryable store with cheap human-readable exports, rather than duplicated and divergent docs.
+- Reuses the shipped substrate, `map`, watermark, and summary-adapter machinery, so the incremental surface is small and the staleness story is already proven.
+
+### Implementation phases (proposed)
+
+1. **Schema + anchored capture** — `finding`/`decision`/`note` node kinds, `concerns`/`scopes`/`relates_to` edges, watermark-based staleness, and `tsift finding add`/`list` over `GraphStore`.
+2. **Hot-path injection** — fold trusted, fresh findings into `context-pack` (then `search`/`explain`) for nodes already in the result set.
+3. **Graph menu + exports** — `graph-db map` findings annotation and on-demand md/html projection.
+4. **Passive harvest** — config-gated draft extraction from session archives/summaries with draft→trusted promotion.
+
 ## Per-Submodule Isolation
 
 Each git submodule gets its own index. Isolation tiers control federation (cross-submodule queries):

@@ -165,18 +165,16 @@ pub fn cycle_packet_cache_stats(root: &Path) -> (usize, u64) {
     let mut total_bytes = 0u64;
     if let Ok(entries) = fs::read_dir(&cache_dir) {
         for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                if let Ok(files) = fs::read_dir(entry.path()) {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && let Ok(files) = fs::read_dir(entry.path()) {
                     for file in files.flatten() {
-                        if file.path().extension().is_some_and(|ext| ext == "json") {
-                            if let Ok(meta) = file.metadata() {
+                        if file.path().extension().is_some_and(|ext| ext == "json")
+                            && let Ok(meta) = file.metadata() {
                                 count += 1;
                                 total_bytes += meta.len();
                             }
-                        }
                     }
                 }
-            }
         }
     }
     (count, total_bytes)
@@ -208,12 +206,12 @@ pub fn cycle_packet_cache_evict(
     let mut all_files: Vec<(PathBuf, u64, u64)> = Vec::new();
     if let Ok(entries) = fs::read_dir(&cache_dir) {
         for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                if let Ok(files) = fs::read_dir(entry.path()) {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && let Ok(files) = fs::read_dir(entry.path()) {
                     for file in files.flatten() {
                         let path = file.path();
-                        if path.extension().is_some_and(|ext| ext == "json") {
-                            if let Ok(meta) = file.metadata() {
+                        if path.extension().is_some_and(|ext| ext == "json")
+                            && let Ok(meta) = file.metadata() {
                                 let size = meta.len();
                                 let mtime_secs = meta
                                     .modified()
@@ -223,10 +221,8 @@ pub fn cycle_packet_cache_evict(
                                     .unwrap_or(u64::MAX);
                                 all_files.push((path, size, mtime_secs));
                             }
-                        }
                     }
                 }
-            }
         }
     }
     let scanned = all_files.len();
