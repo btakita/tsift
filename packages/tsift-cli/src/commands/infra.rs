@@ -1090,7 +1090,7 @@ pub(crate) fn cmd_graph_db_map(
             })
         })
         .collect();
-    hubs.sort_by(|a, b| b.degree.cmp(&a.degree));
+    hubs.sort_by_key(|b| std::cmp::Reverse(b.degree));
     if top_hubs_limit > 0 && hubs.len() > top_hubs_limit {
         hubs.truncate(top_hubs_limit);
     }
@@ -1144,7 +1144,7 @@ pub(crate) fn cmd_graph_db_map(
                 (i, c.members.len(), names)
             })
             .collect();
-        comm_list.sort_by(|a, b| b.1.cmp(&a.1));
+        comm_list.sort_by_key(|b| std::cmp::Reverse(b.1));
         if community_limit > 0 && comm_list.len() > community_limit {
             comm_list.truncate(community_limit);
         }
@@ -1333,7 +1333,7 @@ fn print_graph_db_map_human(report: &GraphDbMapReport, compact: bool) {
     if !ov.modules.is_empty() {
         println!();
         let mut modules = ov.modules.clone();
-        modules.sort_by(|a, b| b.node_count.cmp(&a.node_count));
+        modules.sort_by_key(|b| std::cmp::Reverse(b.node_count));
         let display_modules: Vec<_> = if modules.len() > 15 {
             modules[..15].to_vec()
         } else {
