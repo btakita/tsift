@@ -978,6 +978,26 @@ pub(crate) fn cmd_explain_with_budget(
         );
     }
 
+    // #trt1p2b hot-path injection: fold trusted, fresh findings concerning the
+    // explain result set (focused symbol, displayed callers/callees, community
+    // members) into the envelope, reusing the Phase 2 trusted+fresh contract.
+    let result_set_findings = {
+        let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        keys.insert(symbol.to_string());
+        for edge in &callers {
+            keys.insert(edge.caller_name.clone());
+        }
+        for edge in &callees {
+            keys.insert(edge.callee_name.clone());
+        }
+        if let Some(community) = focused_community.as_ref() {
+            for member in &community.members {
+                keys.insert(member.name.clone());
+            }
+        }
+        crate::commands::finding::collect_result_set_finding_previews(&root, &keys, scope, 10, 240)
+    };
+
     let combined_stale = tagpath_stale && !tagpath_opts.no_tagpath;
     if budget.is_active() {
         let report = build_explain_budget_report(
@@ -1000,6 +1020,12 @@ pub(crate) fn cmd_explain_with_budget(
                     "community_diagnostics".to_string(),
                     serde_json::to_value(&community_diagnostics)?,
                 );
+                if !result_set_findings.is_empty() {
+                    obj.insert(
+                        "findings".to_string(),
+                        serde_json::to_value(&result_set_findings)?,
+                    );
+                }
             }
             inject_tagpath_stale_into_json(
                 &mut value,
@@ -1045,6 +1071,14 @@ pub(crate) fn cmd_explain_with_budget(
             "community": focused_community.as_ref(),
             "community_diagnostics": community_diagnostics,
         });
+        if !result_set_findings.is_empty()
+            && let Some(obj) = out.as_object_mut()
+        {
+            obj.insert(
+                "findings".to_string(),
+                serde_json::to_value(&result_set_findings)?,
+            );
+        }
         inject_tagpath_stale_into_json(&mut out, combined_stale, tagpath_stale_reason.as_deref());
         print_json_or_envelope(
             &out,
@@ -1236,6 +1270,17 @@ pub(crate) fn cmd_explain_with_budget(
                     None => println!("{}{}", marker, m.name),
                 }
             }
+        }
+    }
+    // #trt1p2b: authored findings for the result set, in non-JSON output.
+    if !format.json_output && !result_set_findings.is_empty() {
+        println!();
+        println!("Findings (authored why, anchored to the result set):");
+        for finding in &result_set_findings {
+            println!(
+                "  [{}] {} (about {})",
+                finding.kind, finding.title, finding.about
+            );
         }
     }
     Ok(())

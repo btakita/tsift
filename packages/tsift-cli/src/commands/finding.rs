@@ -503,6 +503,61 @@ pub(crate) fn collect_injectable_findings(
     Ok(items)
 }
 
+/// A trusted, fresh finding folded into `search` / `explain` output because it
+/// concerns a node in the result set (#trt1p2b). Carries an `expand` command
+/// back to the full anchored set, mirroring the context-pack preview shape.
+#[derive(Clone, Serialize)]
+pub(crate) struct ResultSetFindingPreview {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) title: String,
+    pub(crate) about: String,
+    pub(crate) anchor_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) confidence: Option<f64>,
+    pub(crate) body: String,
+    pub(crate) expand: String,
+}
+
+fn truncate_finding_body(body: &str, max_bytes: usize) -> String {
+    if body.len() <= max_bytes {
+        return body.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &body[..end])
+}
+
+/// Collect trusted, fresh findings for nodes in `about_keys` as previews for
+/// `search` / `explain` hot-path injection (#trt1p2b). Reuses the Phase 2
+/// trusted+fresh contract, caps the count, and truncates bodies. Fails open to
+/// an empty vec.
+pub(crate) fn collect_result_set_finding_previews(
+    root: &Path,
+    about_keys: &BTreeSet<String>,
+    scope: Option<&str>,
+    max_items: usize,
+    max_body_bytes: usize,
+) -> Vec<ResultSetFindingPreview> {
+    collect_injectable_findings(root, about_keys, scope)
+        .unwrap_or_default()
+        .into_iter()
+        .take(max_items)
+        .map(|finding| ResultSetFindingPreview {
+            expand: format!("tsift finding list --about '{}' --json", finding.about),
+            id: finding.id,
+            kind: finding.kind,
+            title: finding.title,
+            anchor_kind: finding.anchor_kind,
+            confidence: finding.confidence,
+            body: truncate_finding_body(&finding.body, max_body_bytes),
+            about: finding.about,
+        })
+        .collect()
+}
+
 fn emit_list(
     db_path: &Path,
     items: Vec<FindingListItem>,

@@ -580,3 +580,90 @@ fn finding_promote_unknown_id_fails() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// --- #trt1p2b: search / explain hot-path injection ----------------------------
+
+fn explain_json(root: &Path, symbol: &str) -> serde_json::Value {
+    let out = run_ok(&["explain", symbol, "--json"], root);
+    serde_json::from_str(&out).unwrap()
+}
+
+fn search_json(root: &Path, query: &str) -> serde_json::Value {
+    let out = run_ok(&["search", query, "--json"], root);
+    serde_json::from_str(&out).unwrap()
+}
+
+fn finding_abouts(value: &serde_json::Value) -> Vec<String> {
+    value["findings"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|f| f["about"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `explain` folds a trusted, fresh finding for the focused symbol into its
+/// envelope (#trt1p2b).
+#[test]
+fn explain_injects_trusted_finding_for_result_set() {
+    let dir = indexed_fixture("1");
+    let root = dir.path();
+    add_finding(root, "decision", "alpha returns one by design", "alpha");
+
+    let report = explain_json(root, "alpha");
+    let finding = report["findings"]
+        .as_array()
+        .and_then(|f| f.iter().find(|x| x["about"] == "alpha"))
+        .expect("expected alpha finding injected into explain");
+    assert_eq!(finding["title"], "alpha returns one by design");
+    assert!(
+        finding["expand"]
+            .as_str()
+            .unwrap()
+            .contains("tsift finding list --about"),
+        "expand should resolve the full set"
+    );
+}
+
+/// `search` folds a trusted, fresh finding for a matched symbol into its
+/// envelope (#trt1p2b).
+#[test]
+fn search_injects_trusted_finding_for_result_set() {
+    let dir = indexed_fixture("1");
+    let root = dir.path();
+    add_finding(root, "decision", "alpha returns one by design", "alpha");
+
+    let report = search_json(root, "alpha");
+    assert!(
+        finding_abouts(&report).contains(&"alpha".to_string()),
+        "expected alpha finding injected into search: {}",
+        report["findings"]
+    );
+}
+
+/// Draft and stale findings never ride search/explain — same trusted/fresh guard
+/// as context-pack injection (#trt1p2).
+#[test]
+fn search_and_explain_exclude_draft_findings() {
+    let dir = indexed_fixture("1");
+    let root = dir.path();
+    run_ok(
+        &[
+            "finding", "add", "--path", ".", "--kind", "note", "--title", "alpha draft",
+            "--body", "unverified", "--about", "alpha", "--status", "draft",
+        ],
+        root,
+    );
+
+    assert!(
+        !finding_abouts(&explain_json(root, "alpha")).contains(&"alpha".to_string()),
+        "draft must not inject into explain"
+    );
+    assert!(
+        !finding_abouts(&search_json(root, "alpha")).contains(&"alpha".to_string()),
+        "draft must not inject into search"
+    );
+}

@@ -570,6 +570,23 @@ pub(crate) fn cmd_search_with_budget(
         )?
     };
 
+    // #trt1p2b hot-path injection: fold trusted, fresh findings for the search
+    // result-set nodes (matched symbol names and their files) into the envelope.
+    let result_set_findings = {
+        let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for hit in &symbol_hits {
+            keys.insert(hit.name.clone());
+            keys.insert(hit.file.clone());
+        }
+        crate::commands::finding::collect_result_set_finding_previews(
+            &root,
+            &keys,
+            scope.as_deref(),
+            10,
+            240,
+        )
+    };
+
     if budget.is_active() {
         let report = build_search_budget_report(SearchBudgetReportInput {
             query: &query,
@@ -600,6 +617,14 @@ pub(crate) fn cmd_search_with_budget(
             }
             let report_truncated = report.truncated;
             let mut report_value = serde_json::to_value(&report)?;
+            if !result_set_findings.is_empty()
+                && let Some(obj) = report_value.as_object_mut()
+            {
+                obj.insert(
+                    "findings".to_string(),
+                    serde_json::to_value(&result_set_findings)?,
+                );
+            }
             inject_tagpath_stale_into_json(
                 &mut report_value,
                 tagpath_diag.stale && !tagpath_opts.no_tagpath,
@@ -642,6 +667,14 @@ pub(crate) fn cmd_search_with_budget(
             sift: &sift_value,
         };
         let mut combined_value = serde_json::to_value(&combined)?;
+        if !result_set_findings.is_empty()
+            && let Some(obj) = combined_value.as_object_mut()
+        {
+            obj.insert(
+                "findings".to_string(),
+                serde_json::to_value(&result_set_findings)?,
+            );
+        }
         inject_tagpath_stale_into_json(
             &mut combined_value,
             tagpath_diag.stale && !tagpath_opts.no_tagpath,
@@ -840,6 +873,17 @@ pub(crate) fn cmd_search_with_budget(
         }
         if symbol_hits.is_empty() && response.hits.is_empty() {
             println!("  No results.");
+        }
+    }
+    // #trt1p2b: authored findings for the result set, in non-JSON output.
+    if !format.json_output && !result_set_findings.is_empty() {
+        println!();
+        println!("Findings (authored why, anchored to the result set):");
+        for finding in &result_set_findings {
+            println!(
+                "  [{}] {} (about {})",
+                finding.kind, finding.title, finding.about
+            );
         }
     }
     Ok(())

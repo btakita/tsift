@@ -276,7 +276,7 @@ The failure mode being designed against is a graph filling with confident-soundi
 ### Implementation phases
 
 1. **Schema + anchored capture — IMPLEMENTED (`#trt1p1`).** `finding`/`decision`/`note` node kinds, `concerns`/`relates_to` edges, watermark-based staleness, and `tsift finding add`/`list` over `GraphStore`. See [`tsift finding` surface](#tsift-finding-surface-phase-1) below. (`scopes`→community edges are deferred to a later phase since communities live in the rebuildable code graph; `concerns` + `relates_to` are the Phase 1 anchor/threading edges.)
-2. **Hot-path injection — IMPLEMENTED for `context-pack` (`#trt1p2`).** Trusted, fresh findings are folded into the `context-pack` envelope for symbols/files already in the result set. See [Hot-path injection](#hot-path-injection-phase-2) below. (`search`/`explain` injection is the remaining sub-scope, tracked as `#trt1p2b`.)
+2. **Hot-path injection — IMPLEMENTED (`#trt1p2` context-pack, `#trt1p2b` search/explain).** Trusted, fresh findings are folded into the `context-pack`, `search`, and `explain` envelopes for symbols/files already in the result set. See [Hot-path injection](#hot-path-injection-phase-2) below.
 3. **Graph menu + exports — IMPLEMENTED (`#trt1p3`).** `graph-db map` communities/hubs/focus are annotated with attached trusted, fresh findings, and `graph-db map --format md|html` renders on-demand Markdown/HTML projections of the same overview. See [Graph menu + exports](#graph-menu--exports-phase-3) below.
 4. **Passive harvest — IMPLEMENTED (`#trt1p4`).** `tsift finding harvest` (config-gated, off by default) extracts `draft` candidate findings from agent-doc session archives, and `tsift finding promote <id>` flips a draft to `trusted`. See [Passive harvest](#passive-harvest-phase-4) below.
 
@@ -355,8 +355,15 @@ a `findings` section to that same envelope.
 - **Fail-open** — an absent or unreadable `findings.db` yields an empty section,
   never a context-pack error.
 
-Injection into `search` and `explain` reuses the same trusted/fresh/result-set
-contract and is tracked separately as `#trt1p2b`.
+**Search / explain injection (`#trt1p2b`, implemented)** reuses the same
+trusted/fresh contract. `tsift explain <symbol>` folds in findings concerning
+its result set — the focused symbol, displayed callers/callees, and community
+members — and `tsift search <query>` folds in findings concerning the matched
+symbol names and their files. Both add an omit-when-empty `findings` array to
+the JSON/envelope output (budget and non-budget paths) plus a non-JSON
+`Findings` section; each preview carries `id`, `kind`, `title`, `about`,
+`anchor_kind`, optional `confidence`, a budget-truncated `body`, and an `expand`
+command back to the full anchored set. Capped per call and fail-open to empty.
 
 ### Graph menu + exports (Phase 3)
 
