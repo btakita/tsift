@@ -1034,7 +1034,7 @@ fn build_digest_runner_command(
     shell_command: &str,
 ) -> String {
     let mut result = format!(
-        "tsift --envelope __digest-runner --kind {} --path {} --shell-command {}",
+        "tsift --envelope digest-runner --kind {} --path {} --shell-command {}",
         shell_quote(kind),
         shell_quote(path),
         shell_quote(shell_command)

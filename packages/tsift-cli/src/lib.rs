@@ -22396,7 +22396,7 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
         assert_eq!(
             result,
             Some(
-                "tsift --envelope __digest-runner --kind \"test\" --path \".\" --shell-command \"cargo test --lib\" --runner \"cargo\"".to_string()
+                "tsift --envelope digest-runner --kind \"test\" --path \".\" --shell-command \"cargo test --lib\" --runner \"cargo\"".to_string()
             )
         );
     }
@@ -22407,7 +22407,7 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
         assert_eq!(
             result,
             Some(
-                "tsift --envelope __digest-runner --kind \"test\" --path \".\" --shell-command \"pytest -q tests/test_cli.py\" --runner \"pytest\"".to_string()
+                "tsift --envelope digest-runner --kind \"test\" --path \".\" --shell-command \"pytest -q tests/test_cli.py\" --runner \"pytest\"".to_string()
             )
         );
     }
@@ -22418,7 +22418,7 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
         assert_eq!(
             result,
             Some(
-                "tsift --envelope __digest-runner --kind \"test\" --path \".\" --shell-command \"python -m pytest tests/test_cli.py\" --runner \"pytest\"".to_string()
+                "tsift --envelope digest-runner --kind \"test\" --path \".\" --shell-command \"python -m pytest tests/test_cli.py\" --runner \"pytest\"".to_string()
             )
         );
     }
@@ -22429,7 +22429,7 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
         assert_eq!(
             result,
             Some(
-                "tsift --envelope __digest-runner --kind \"log\" --path \".\" --shell-command \"cargo build --release\"".to_string()
+                "tsift --envelope digest-runner --kind \"log\" --path \".\" --shell-command \"cargo build --release\"".to_string()
             )
         );
     }
@@ -22440,7 +22440,7 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
         assert_eq!(
             result,
             Some(
-                "tsift --envelope __digest-runner --kind \"log\" --path \".\" --shell-command \"cargo install --path . --force\"".to_string()
+                "tsift --envelope digest-runner --kind \"log\" --path \".\" --shell-command \"cargo install --path . --force\"".to_string()
             )
         );
     }
@@ -22482,7 +22482,7 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
         );
         assert_eq!(
             forwarded,
-            "tsift --envelope __digest-runner --kind \"test\" --path \".\" --shell-command \"cargo test --lib\" --runner \"cargo\""
+            "tsift --envelope digest-runner --kind \"test\" --path \".\" --shell-command \"cargo test --lib\" --runner \"cargo\""
         );
     }
 
@@ -22503,7 +22503,7 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
         );
         assert_eq!(
             forwarded,
-            "tsift --pretty --envelope __digest-runner --kind \"log\" --path \".\" --shell-command \"cargo build --release\""
+            "tsift --pretty --envelope digest-runner --kind \"log\" --path \".\" --shell-command \"cargo build --release\""
         );
     }
 

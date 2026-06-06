@@ -142,7 +142,8 @@ pub enum Commands {
         #[arg(long)]
         output: PathBuf,
     },
-    #[command(hide = true, name = "__digest-runner")]
+    /// Run a shell command and emit a bounded, artifact-backed test/log digest envelope
+    #[command(name = "digest-runner", alias = "__digest-runner")]
     DigestRunner {
         /// Digest mode: test or log
         #[arg(long)]

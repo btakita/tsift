@@ -29,7 +29,7 @@ When a search envelope includes `report.scale_guard`, run one of its `narrow_com
 Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
 - `tsift --envelope session-review <path> --next-context --budget normal` or `tsift --envelope context-pack <path> --budget normal` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
 - `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
-- `tsift --envelope __digest-runner --kind test --path . --shell-command '<test command>'` / `tsift --envelope __digest-runner --kind log --path . --shell-command '<build command>'` for noisy test/build/install output, or let the rewrite/hooks create those artifact-backed envelopes for `cargo test`, `pytest`, and verbose cargo commands.
+- `tsift --envelope digest-runner --kind test --path . --shell-command '<test command>'` / `tsift --envelope digest-runner --kind log --path . --shell-command '<build command>'` for noisy test/build/install output, or let the rewrite/hooks create those artifact-backed envelopes for `cargo test`, `pytest`, and verbose cargo commands.
 - If RTK is installed, digest-runner delegates supported generic command families through `rtk rewrite` and records the chosen compact filter in `report.filter` while preserving tsift artifact handles.
 - Codex, OpenCode, and other harnesses without Claude-style `PreToolUse` hooks should run `tsift rewrite --run '<command>'` before broad `rg`/recursive grep, raw transcript/session/log reads, `git diff`/`git show`/single-patch `git log`, `cargo test`/`pytest`, and cargo build/check/clippy/install commands so the same search, session-digest, diff-digest, and digest-runner rewrites apply manually. OpenCode can install this path as `/tsift-rewrite-run` with `tsift init --opencode`.
 
@@ -451,12 +451,12 @@ const OPENCODE_COMMANDS: &[OpenCodeCommandSpec] = &[
     OpenCodeCommandSpec {
         name: "tsift-test-digest",
         description: "Run tests through the bounded digest runner",
-        body: r#"Run a bounded test digest. If `$ARGUMENTS` names a test command, run `tsift --envelope __digest-runner --kind test --path . --shell-command '<command>'`; otherwise choose the project test command from the local instructions and wrap it the same way. Summarize failing tests, failure lines, and artifact handles."#,
+        body: r#"Run a bounded test digest. If `$ARGUMENTS` names a test command, run `tsift --envelope digest-runner --kind test --path . --shell-command '<command>'`; otherwise choose the project test command from the local instructions and wrap it the same way. Summarize failing tests, failure lines, and artifact handles."#,
     },
     OpenCodeCommandSpec {
         name: "tsift-log-digest",
         description: "Run a verbose command through the bounded log digest",
-        body: r#"Run a bounded log digest. If `$ARGUMENTS` names a build, install, or verification command, run `tsift --envelope __digest-runner --kind log --path . --shell-command '<command>'`; otherwise ask for the command before running. Summarize compact output, failures, and artifact handles."#,
+        body: r#"Run a bounded log digest. If `$ARGUMENTS` names a build, install, or verification command, run `tsift --envelope digest-runner --kind log --path . --shell-command '<command>'`; otherwise ask for the command before running. Summarize compact output, failures, and artifact handles."#,
     },
     OpenCodeCommandSpec {
         name: "tsift-rewrite-run",
@@ -1158,7 +1158,8 @@ mod tests {
         let test_digest =
             std::fs::read_to_string(dir.path().join(".opencode/commands/tsift-test-digest.md"))
                 .unwrap();
-        assert!(test_digest.contains("__digest-runner"));
+        assert!(test_digest.contains("digest-runner"));
+        assert!(!test_digest.contains("__digest-runner"));
         assert!(test_digest.contains("--kind test"));
 
         let rewrite_run =
@@ -1261,8 +1262,8 @@ mod tests {
         assert!(content.contains("tsift --envelope session-review <path> --next-context"));
         assert!(content.contains("tsift --envelope context-pack <path>"));
         assert!(content.contains("tsift diff-digest [path]"));
-        assert!(content.contains("tsift --envelope __digest-runner --kind test"));
-        assert!(content.contains("tsift --envelope __digest-runner --kind log"));
+        assert!(content.contains("tsift --envelope digest-runner --kind test"));
+        assert!(content.contains("tsift --envelope digest-runner --kind log"));
     }
 
     #[test]

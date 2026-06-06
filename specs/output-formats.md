@@ -105,7 +105,7 @@ Search preview reports may also include `report.scale_guard`. Clients should sur
 
 ### Command/Test-Run Envelopes
 
-`tsift --envelope __digest-runner ... --json` now wraps command-execution digests in a summary-first envelope for `test` and `log` runs.
+`tsift --envelope digest-runner ... --json` now wraps command-execution digests in a summary-first envelope for `test` and `log` runs.
 
 Behavior:
 

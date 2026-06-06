@@ -54,8 +54,8 @@ shell invocation. The required permissions break down by command:
 | `/tsift-memory-search` | `tsift graph-db --path . --json related` | `.tsift/graph.db`, `.tsift/memory.db` projected rows | — |
 | `/tsift-memory-guard` | `tsift memory budget-guard` | target payload | — |
 | `/tsift-diff-digest` | `tsift diff-digest` | `.tsift/`, git working tree | — |
-| `/tsift-test-digest` | `tsift --envelope __digest-runner --kind test` | `.tsift/`, test output | — |
-| `/tsift-log-digest` | `tsift --envelope __digest-runner --kind log` | `.tsift/`, build output | — |
+| `/tsift-test-digest` | `tsift --envelope digest-runner --kind test` | `.tsift/`, test output | — |
+| `/tsift-log-digest` | `tsift --envelope digest-runner --kind log` | `.tsift/`, build output | — |
 | `/tsift-rewrite-run` | `tsift rewrite --run` | `.tsift/`, command-dependent input | command-dependent |
 
 `/tsift-status` is the only command that writes files (index, instructions).

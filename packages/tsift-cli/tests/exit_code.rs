@@ -10178,7 +10178,7 @@ exit 7"#;
 
     let output = tsift_bin()
         .args([
-            "__digest-runner",
+            "digest-runner",
             "--kind",
             "test",
             "--runner",
@@ -10200,7 +10200,10 @@ exit 7"#;
 }
 
 #[test]
-fn digest_runner_envelope_persists_artifact_for_green_test_runs() {
+fn digest_runner_legacy_underscore_alias_still_resolves() {
+    // `digest-runner` was promoted from the hidden `__digest-runner` helper; the
+    // old name stays a backward-compatible hidden alias for already-emitted
+    // rewrites and installed instruction files.
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "fn helper() {}\n").unwrap();
@@ -10211,6 +10214,41 @@ fn digest_runner_envelope_persists_artifact_for_green_test_runs() {
         .args([
             "--envelope",
             "__digest-runner",
+            "--kind",
+            "test",
+            "--runner",
+            "cargo",
+            "--json",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--shell-command",
+            shell_command,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "legacy __digest-runner alias should still resolve"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "digest-runner");
+    assert_eq!(json["view"], "test-run");
+    assert_eq!(json["report"]["success"], true);
+}
+
+#[test]
+fn digest_runner_envelope_persists_artifact_for_green_test_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/lib.rs"), "fn helper() {}\n").unwrap();
+
+    let shell_command = "printf 'running 1 test\\ntest tests::alpha ... ok\\n\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\\n'";
+
+    let output = tsift_bin()
+        .args([
+            "--envelope",
+            "digest-runner",
             "--kind",
             "test",
             "--runner",
@@ -10253,7 +10291,7 @@ fn digest_runner_captures_stderr_for_log_digest() {
 
     let output = tsift_bin()
         .args([
-            "__digest-runner",
+            "digest-runner",
             "--kind",
             "log",
             "--json",
@@ -10312,7 +10350,7 @@ exit 2
         .env("PATH", path)
         .args([
             "--envelope",
-            "__digest-runner",
+            "digest-runner",
             "--kind",
             "log",
             "--json",

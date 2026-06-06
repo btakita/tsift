@@ -205,7 +205,8 @@ do [#t275]. spec-test-build-install-commit-push
 
     fn rewrite_test_command(&mut self) {
         let rewritten = rewrite_command("cargo test --lib").unwrap();
-        assert!(rewritten.contains("__digest-runner"));
+        assert!(rewritten.contains("digest-runner"));
+        assert!(!rewritten.contains("__digest-runner"));
         assert!(rewritten.contains("--kind \"test\""));
         assert!(rewritten.contains("--runner \"cargo\""));
         self.coverage.mark("rewrite/test_digest");
@@ -213,7 +214,8 @@ do [#t275]. spec-test-build-install-commit-push
 
     fn rewrite_log_command(&mut self) {
         let rewritten = rewrite_command("cargo build --release").unwrap();
-        assert!(rewritten.contains("__digest-runner"));
+        assert!(rewritten.contains("digest-runner"));
+        assert!(!rewritten.contains("__digest-runner"));
         assert!(rewritten.contains("--kind \"log\""));
         self.coverage.mark("rewrite/log_digest");
     }

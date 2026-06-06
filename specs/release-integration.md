@@ -125,8 +125,8 @@ The `tsift-rewrite.sh` hook (`examples/hooks/tsift-rewrite.sh`) intercepts high-
 - `rg ...` / `grep -r ...` → `tsift --envelope search ... --exact --budget normal`
 - `git diff`, `git diff --cached`, `git show`, and simple `git log -p -1 ...` history review → `tsift diff-digest ...`
 - long transcript reads (`cat`, `bat`, `head -n`, `tail -n`, `sed -n`) over recognized agent-doc markdown sessions, Claude JSONL, Codex JSONL, or `agent-doc` runtime logs → `tsift session-digest ...`, anchored to the transcript's owning repo or submodule root when the file lives under one
-- `cargo test ...`, `pytest ...`, `python -m pytest ...` → `tsift --envelope __digest-runner --kind test ...`
-- `cargo build ...`, `cargo check ...`, `cargo clippy ...`, `cargo install ...` → `tsift --envelope __digest-runner --kind log ...`
+- `cargo test ...`, `pytest ...`, `python -m pytest ...` → `tsift --envelope digest-runner --kind test ...`
+- `cargo build ...`, `cargo check ...`, `cargo clippy ...`, `cargo install ...` → `tsift --envelope digest-runner --kind log ...`
 
 File-listing commands are not search rewrites. `rg --files ...`, `rg --type-list`, and `find ...` pass through so multiple roots, glob/predicate semantics, shell safety, ignore rules, and the original listing behavior are preserved instead of treating a root path as an exact search pattern. In hook/manual `tsift rewrite` protocol terms this is a no-rewrite exit: stdout stays empty, exit status is 1, and stderr carries a bounded reason plus guidance to run the original command unchanged.
 
@@ -156,7 +156,7 @@ Global structured-output flags are forwarded into the rewritten tsift command an
 - `tsift --schema rewrite --run 'cargo build --manifest-path Cargo.toml'`
 - `tsift rewrite --run 'cargo install --path . --force'`
 
-Those commands emit the same `digest-runner` JSON envelope that `tsift --envelope __digest-runner ... --json` uses internally, so agent-doc or other harnesses get bounded execution output without depending on shell-hook rewriting. If RTK is available and supports the wrapped command, `report.filter = {tool:"rtk", command:"..."}` identifies the delegated compact filter.
+Those commands emit the same `digest-runner` JSON envelope that `tsift --envelope digest-runner ... --json` uses internally, so agent-doc or other harnesses get bounded execution output without depending on shell-hook rewriting. If RTK is available and supports the wrapped command, `report.filter = {tool:"rtk", command:"..."}` identifies the delegated compact filter.
 
 ### RTK Output Filtering (`PreToolUse`)
 
