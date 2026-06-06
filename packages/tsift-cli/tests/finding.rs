@@ -455,3 +455,128 @@ fn finding_anchors_to_file_when_symbol_unknown() {
     // main.rs exists, so a watermark is captured.
     assert!(added["watermark"].as_str().is_some());
 }
+
+// --- #trt1p4: config-gated passive harvest + draft→trusted promotion ----------
+
+fn enable_passive_harvest(root: &Path) {
+    fs::create_dir_all(root.join(".tsift")).unwrap();
+    fs::write(
+        root.join(".tsift/config.toml"),
+        "[findings]\npassive_harvest = true\n",
+    )
+    .unwrap();
+}
+
+fn write_archive(root: &Path, name: &str, body: &str) {
+    let dir = root.join(".agent-doc/archives");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(name), body).unwrap();
+}
+
+/// Passive harvest is fail-closed: with no `[findings] passive_harvest = true`
+/// it refuses to run.
+#[test]
+fn finding_harvest_fail_closed_without_config() {
+    let dir = indexed_fixture("1");
+    let root = dir.path();
+    write_archive(root, "s.md", "We decided `alpha` is the entrypoint by design.\n");
+
+    let output = run(&["finding", "harvest", "."], root);
+    assert!(!output.status.success(), "harvest must fail without opt-in");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("passive harvest is disabled"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// With the opt-in flag, harvest extracts a `draft` finding from an archive line
+/// that pairs a decision signal with a resolvable code token.
+#[test]
+fn finding_harvest_extracts_draft_anchored_to_symbol() {
+    let dir = indexed_fixture("1");
+    let root = dir.path();
+    enable_passive_harvest(root);
+    write_archive(
+        root,
+        "s.md",
+        "---\ncomponent: exchange\n---\n\nWe decided `alpha` is the cycle entrypoint by design.\nThe `beta` wrapper is unremarkable.\n",
+    );
+
+    let out = run_ok(&["finding", "harvest", ".", "--json"], root);
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["inserted"].as_u64().unwrap(), 1, "report: {report}");
+    let finding = &report["findings"][0];
+    assert_eq!(finding["about"].as_str().unwrap(), "alpha");
+    assert_eq!(finding["kind"].as_str().unwrap(), "decision");
+
+    // Stored as draft (visible with --status draft, status == draft).
+    let drafts = list_json(root, &["--status", "draft"]);
+    assert_eq!(drafts["total"].as_u64().unwrap(), 1);
+    assert_eq!(drafts["findings"][0]["status"].as_str().unwrap(), "draft");
+}
+
+/// Re-harvesting the same archive is idempotent — existing findings are skipped,
+/// never duplicated or overwritten.
+#[test]
+fn finding_harvest_idempotent_skips_existing() {
+    let dir = indexed_fixture("1");
+    let root = dir.path();
+    enable_passive_harvest(root);
+    write_archive(root, "s.md", "We decided `alpha` is the entrypoint by design.\n");
+
+    run_ok(&["finding", "harvest", "."], root);
+    let out = run_ok(&["finding", "harvest", ".", "--json"], root);
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["inserted"].as_u64().unwrap(), 0);
+    assert_eq!(report["skipped_existing"].as_u64().unwrap(), 1);
+}
+
+/// A harvested draft is promoted to trusted (so it becomes injection-eligible),
+/// and promotion is idempotent on an already-trusted finding.
+#[test]
+fn finding_promote_draft_to_trusted() {
+    let dir = indexed_fixture("1");
+    let root = dir.path();
+    enable_passive_harvest(root);
+    write_archive(root, "s.md", "We decided `alpha` is the entrypoint by design.\n");
+    run_ok(&["finding", "harvest", "."], root);
+
+    let drafts = list_json(root, &["--status", "draft"]);
+    let id = drafts["findings"][0]["id"].as_str().unwrap().to_string();
+
+    let out = run_ok(&["finding", "promote", &id, ".", "--json"], root);
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(report["changed"].as_bool().unwrap());
+    assert_eq!(report["from_status"].as_str().unwrap(), "draft");
+    assert_eq!(report["to_status"].as_str().unwrap(), "trusted");
+
+    // Now trusted.
+    let trusted = list_json(root, &["--status", "trusted"]);
+    assert_eq!(trusted["total"].as_u64().unwrap(), 1);
+    assert_eq!(trusted["findings"][0]["id"].as_str().unwrap(), id);
+
+    // Idempotent re-promote.
+    let again = run_ok(&["finding", "promote", &id, ".", "--json"], root);
+    let again: serde_json::Value = serde_json::from_str(&again).unwrap();
+    assert!(!again["changed"].as_bool().unwrap());
+}
+
+/// Promoting an unknown finding fails closed.
+#[test]
+fn finding_promote_unknown_id_fails() {
+    let dir = indexed_fixture("1");
+    let root = dir.path();
+    // findings.db is created lazily; promote with no store should error clearly.
+    enable_passive_harvest(root);
+    write_archive(root, "s.md", "We decided `alpha` is the entrypoint by design.\n");
+    run_ok(&["finding", "harvest", "."], root);
+
+    let output = run(&["finding", "promote", "finding:does-not-exist", "."], root);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("finding not found"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

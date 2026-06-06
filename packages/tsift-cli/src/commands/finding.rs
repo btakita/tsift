@@ -9,10 +9,12 @@
 //! touches `findings.db`, which is the durability guarantee this layer relies
 //! on. See `specs/graph.md` § Findings Graph Layer.
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use serde::Serialize;
+use tsift_index::config::Config as IndexConfig;
 use tsift_index::index;
 use tsift_quality::lint;
 use tsift_sqlite::{
@@ -535,6 +537,382 @@ fn emit_list(
                 println!("    relates_to: {}", item.relates_to.join(", "));
             }
         }
+    }
+    Ok(())
+}
+
+// --- Phase 4 (#trt1p4): config-gated passive harvest + draft→trusted promotion -
+
+/// Decision/insight signal phrases. A line is a harvest candidate only when it
+/// pairs one of these with a code token that resolves to an indexed symbol or
+/// real file, so we capture authored "why" rather than arbitrary prose. Harvest
+/// is deliberately generous (everything lands as `draft`, excluded from
+/// injection until promoted) — precision is the promotion gate's job, not the
+/// extractor's.
+const HARVEST_SIGNALS: &[&str] = &[
+    "decided",
+    "decision",
+    "invariant",
+    "gotcha",
+    "by design",
+    "intentional",
+    "must not",
+    "must always",
+    "the reason",
+    "durability",
+    "fail-closed",
+    "fails open",
+    "fail closed",
+    "source of truth",
+    "never overwrite",
+];
+
+fn harvest_kind_for(line_lower: &str) -> &'static str {
+    if line_lower.contains("decid")
+        || line_lower.contains("decision")
+        || line_lower.contains("by design")
+        || line_lower.contains("intentional")
+    {
+        "decision"
+    } else {
+        "note"
+    }
+}
+
+/// Inline-code (`` `token` ``) spans of a line, in order. Standard markdown
+/// inline-code parse: odd-indexed backtick segments are code.
+fn inline_code_tokens(line: &str) -> Vec<String> {
+    line.split('`')
+        .enumerate()
+        .filter_map(|(index, segment)| {
+            let trimmed = segment.trim();
+            (index % 2 == 1 && !trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .collect()
+}
+
+/// Drop a leading YAML frontmatter block (`---` … `---`) so harvest scans the
+/// authored body, not archive metadata.
+fn strip_frontmatter(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("---\n") else {
+        return text;
+    };
+    match rest.find("\n---\n") {
+        Some(end) => &rest[end + 5..],
+        None => text,
+    }
+}
+
+/// Strip leading markdown list/heading/quote markers and surrounding whitespace.
+fn clean_harvest_line(line: &str) -> String {
+    line.trim()
+        .trim_start_matches(['#', '-', '*', '>', ' '])
+        .trim()
+        .to_string()
+}
+
+/// A concise title from a cleaned line: the first sentence, capped to ~100 chars
+/// on a word boundary.
+fn harvest_title(cleaned: &str) -> String {
+    let first = cleaned
+        .split_once(". ")
+        .map(|(head, _)| head)
+        .unwrap_or(cleaned)
+        .trim();
+    if first.chars().count() <= 100 {
+        return first.to_string();
+    }
+    let mut out = String::new();
+    for word in first.split_whitespace() {
+        if out.chars().count() + word.chars().count() + 1 > 97 {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out.push('…');
+    out
+}
+
+#[derive(Serialize)]
+struct HarvestedFinding {
+    id: String,
+    kind: String,
+    title: String,
+    about: String,
+    anchor_kind: String,
+    source: String,
+}
+
+#[derive(Serialize)]
+struct FindingHarvestReport {
+    db: String,
+    enabled: bool,
+    archives_scanned: usize,
+    candidates: usize,
+    inserted: usize,
+    skipped_existing: usize,
+    findings: Vec<HarvestedFinding>,
+}
+
+/// Upsert a passively-harvested `draft` finding: anchor node, finding node, and
+/// `concerns` edge — mirroring `cmd_finding_add` but stamped as a draft from the
+/// passive-harvest author with the source archive as provenance.
+#[allow(clippy::too_many_arguments)]
+fn upsert_harvested_finding(
+    store: &SqliteGraphStore,
+    id: &str,
+    kind: &str,
+    title: &str,
+    body: &str,
+    about: &str,
+    anchor: &ResolvedAnchor,
+    source: &str,
+    observed: i64,
+) -> Result<()> {
+    let mut anchor_node =
+        SubstrateGraphNode::new(anchor.node_id.clone(), anchor.node_kind, anchor.label.clone());
+    for (key, value) in &anchor.properties {
+        anchor_node = anchor_node.with_property(key.clone(), value.clone());
+    }
+    store.upsert_node(&anchor_node)?;
+
+    let mut node = SubstrateGraphNode::new(id.to_string(), kind, title.to_string())
+        .with_property("title", title.to_string())
+        .with_property("body", body.to_string())
+        .with_property("status", "draft")
+        .with_property("author", "passive-harvest")
+        .with_property("about", about.to_string())
+        .with_property("anchor_node", anchor.node_id.clone())
+        .with_property("anchor_kind", anchor.node_kind)
+        .with_property("source", source.to_string());
+    if let Some(watermark) = &anchor.watermark {
+        node = node.with_property("watermark", watermark.clone());
+    }
+    let mut provenance =
+        GraphProvenance::new("findings", format!("passive-harvest:{source}"));
+    if let Some(watermark) = &anchor.watermark {
+        provenance = provenance.with_content_hash(watermark.clone());
+    }
+    node = node.with_provenance(provenance);
+    node = node.with_freshness(GraphFreshness {
+        content_hash: anchor.watermark.clone(),
+        observed_at_unix: Some(observed),
+    });
+    store.upsert_node(&node)?;
+
+    let mut concerns = SubstrateGraphEdge::new(id.to_string(), anchor.node_id.clone(), "concerns");
+    if let Some(watermark) = &anchor.watermark {
+        concerns = concerns
+            .with_property("watermark", watermark.clone())
+            .with_freshness(GraphFreshness {
+                content_hash: Some(watermark.clone()),
+                observed_at_unix: Some(observed),
+            });
+    }
+    store.upsert_edge(&concerns)?;
+    Ok(())
+}
+
+/// Bound a single harvest run so a large archive set cannot create an unbounded
+/// number of draft nodes in one pass.
+const HARVEST_CAP: usize = 100;
+
+pub(crate) fn cmd_finding_harvest(
+    path: &Path,
+    scope: Option<&str>,
+    json_output: bool,
+    pretty: bool,
+) -> Result<()> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+
+    // Fail-closed config gate: the whole auto-capture path is off until the
+    // user explicitly opts in.
+    let config = IndexConfig::load(&root)?;
+    if !config.findings.passive_harvest {
+        bail!(
+            "passive harvest is disabled (fail-closed). Enable it by adding to {}:\n\n[findings]\npassive_harvest = true",
+            root.join(".tsift/config.toml").display()
+        );
+    }
+
+    let archives_dir = root.join(".agent-doc/archives");
+    let mut archive_files: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&archives_dir) {
+        for entry in entries.flatten() {
+            let candidate = entry.path();
+            if candidate.extension().and_then(|ext| ext.to_str()) == Some("md") {
+                archive_files.push(candidate);
+            }
+        }
+    }
+    archive_files.sort();
+
+    let db_path = findings_db_path(&root);
+    let store = SqliteGraphStore::open(&db_path)?;
+    let observed = now_unix();
+
+    let mut report = FindingHarvestReport {
+        db: db_path.display().to_string(),
+        enabled: true,
+        archives_scanned: archive_files.len(),
+        candidates: 0,
+        inserted: 0,
+        skipped_existing: 0,
+        findings: Vec::new(),
+    };
+    let mut seen_ids: BTreeSet<String> = BTreeSet::new();
+
+    'outer: for archive in &archive_files {
+        let Ok(text) = std::fs::read_to_string(archive) else {
+            continue;
+        };
+        let source = archive
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        for line in strip_frontmatter(&text).lines() {
+            if report.inserted >= HARVEST_CAP {
+                break 'outer;
+            }
+            let cleaned = clean_harvest_line(line);
+            if cleaned.is_empty() {
+                continue;
+            }
+            let lower = cleaned.to_ascii_lowercase();
+            if !HARVEST_SIGNALS.iter().any(|signal| lower.contains(signal)) {
+                continue;
+            }
+            // First inline-code token that resolves to a real anchor (indexed
+            // symbol or readable file — a watermark proves resolution).
+            let resolved = inline_code_tokens(line).into_iter().find_map(|token| {
+                let anchor = resolve_anchor(&root, &token, scope).ok()?;
+                anchor.watermark.as_ref()?;
+                Some((token, anchor))
+            });
+            let Some((about, anchor)) = resolved else {
+                continue;
+            };
+
+            report.candidates += 1;
+            let kind = harvest_kind_for(&lower);
+            let title = harvest_title(&cleaned);
+            let id = finding_id(kind, &title, &about);
+            if !seen_ids.insert(id.clone()) {
+                continue;
+            }
+            // Never overwrite an existing finding (e.g. a trusted one) with a
+            // re-harvested draft.
+            if store.node(&id)?.is_some() {
+                report.skipped_existing += 1;
+                continue;
+            }
+            upsert_harvested_finding(
+                &store, &id, kind, &title, &cleaned, &about, &anchor, &source, observed,
+            )?;
+            report.inserted += 1;
+            report.findings.push(HarvestedFinding {
+                id,
+                kind: kind.to_string(),
+                title,
+                about,
+                anchor_kind: anchor.node_kind.to_string(),
+                source: source.clone(),
+            });
+        }
+    }
+
+    if json_output {
+        let rendered = if pretty {
+            serde_json::to_string_pretty(&report)?
+        } else {
+            serde_json::to_string(&report)?
+        };
+        println!("{rendered}");
+    } else {
+        println!(
+            "harvested {} draft finding(s) from {} archive(s) ({} candidate(s), {} already present)",
+            report.inserted, report.archives_scanned, report.candidates, report.skipped_existing
+        );
+        for finding in &report.findings {
+            println!("  {} [{}] {}", finding.id, finding.kind, finding.title);
+            println!("    about: {} · source: {}", finding.about, finding.source);
+        }
+        println!("  stored in {} (status: draft — promote with `tsift finding promote <id>`)", report.db);
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct FindingPromoteReport {
+    id: String,
+    kind: String,
+    title: String,
+    about: String,
+    from_status: String,
+    to_status: String,
+    changed: bool,
+    db: String,
+}
+
+pub(crate) fn cmd_finding_promote(
+    path: &Path,
+    id: &str,
+    json_output: bool,
+    pretty: bool,
+) -> Result<()> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let db_path = findings_db_path(&root);
+    if !db_path.exists() {
+        bail!("no findings store at {}", db_path.display());
+    }
+    let store = SqliteGraphStore::open(&db_path)?;
+    let Some(node) = store.node(id)? else {
+        bail!("finding not found in {}: {id}", db_path.display());
+    };
+
+    let from_status = node
+        .properties
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| "trusted".to_string());
+    let kind = node.kind.clone();
+    let title = node.properties.get("title").cloned().unwrap_or_default();
+    let about = node.properties.get("about").cloned().unwrap_or_default();
+
+    let changed = from_status != "trusted";
+    if changed {
+        // with_property overwrites the status key; the rest of the node
+        // (anchor, watermark, provenance, freshness) is preserved.
+        let promoted = node.with_property("status", "trusted");
+        store.upsert_node(&promoted)?;
+    }
+
+    let report = FindingPromoteReport {
+        id: id.to_string(),
+        kind,
+        title,
+        about,
+        from_status,
+        to_status: "trusted".to_string(),
+        changed,
+        db: db_path.display().to_string(),
+    };
+
+    if json_output {
+        let rendered = if pretty {
+            serde_json::to_string_pretty(&report)?
+        } else {
+            serde_json::to_string(&report)?
+        };
+        println!("{rendered}");
+    } else if report.changed {
+        println!("promoted {} [{}] {} → trusted", report.id, report.kind, report.title);
+    } else {
+        println!("{} is already trusted (no change)", report.id);
     }
     Ok(())
 }

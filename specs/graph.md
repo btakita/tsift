@@ -226,7 +226,7 @@ Backend-eval full-projection cache keys use a stable input watermark over indexe
 
 ## Findings Graph Layer
 
-**Status: Phases 1–3 shipped (`#trt1p1`, `#trt1p2`, `#trt1p3`); Phase 4 proposed.** This section is the living design for an authored-knowledge layer on top of the existing graph substrate. It is updated as the layer is implemented; subsections tag what already exists versus what is proposed so the spec never overstates shipped behavior.
+**Status: Phases 1–4 shipped (`#trt1p1`–`#trt1p4`).** The Findings Graph Layer is feature-complete: schema + anchored capture, hot-path injection, graph menu + exports, and config-gated passive harvest with draft→trusted promotion. This section is the living design for the authored-knowledge layer on top of the existing graph substrate. It is updated as the layer is implemented; subsections tag what already exists versus what is proposed so the spec never overstates shipped behavior.
 
 ### Motivation
 
@@ -251,12 +251,12 @@ Each finding is a typed node with typed edges to the code it concerns:
 - **Anchoring rule** — findings edge to symbol handles / tagpaths, **never to line numbers**, so a finding survives reformatting and small edits instead of rotting on the first diff.
 - **Staleness rule** — a finding stamped at watermark `W` is reported **stale** (not deleted, not silently trusted) once the symbols it `concerns` advance past `W`. Stale-but-visible is the explicit goal over wrong-and-confident.
 
-### Capture policy (proposed)
+### Capture policy
 
 Capture is **opt-in by default** so a user who never asks for findings sees zero behavior change:
 
 - **Explicit** — `tsift finding add` (agent- or user-initiated), or capture when the user states a decision directly.
-- **Passive harvest** — tsift already digests agent-doc session archives and summaries; auto-extracted candidates are stored as `draft` (excluded from default injection) and only promoted to `trusted` on confirmation. The whole auto-capture path is gated behind a `.tsift/config.toml` flag.
+- **Passive harvest (`#trt1p4`, implemented)** — `tsift finding harvest` extracts candidates from the agent-doc session archives tsift already accumulates; auto-extracted candidates are stored as `draft` (excluded from injection) and only promoted to `trusted` via `tsift finding promote <id>`. The whole auto-capture path is gated behind a `.tsift/config.toml` `[findings] passive_harvest` flag. See [Passive harvest](#passive-harvest-phase-4).
 
 The failure mode being designed against is a graph filling with confident-sounding, unverified, stale findings — worse than none. `confidence` + `status` (draft vs trusted) + watermark staleness are the guards that keep the layer honest.
 
@@ -278,7 +278,7 @@ The failure mode being designed against is a graph filling with confident-soundi
 1. **Schema + anchored capture — IMPLEMENTED (`#trt1p1`).** `finding`/`decision`/`note` node kinds, `concerns`/`relates_to` edges, watermark-based staleness, and `tsift finding add`/`list` over `GraphStore`. See [`tsift finding` surface](#tsift-finding-surface-phase-1) below. (`scopes`→community edges are deferred to a later phase since communities live in the rebuildable code graph; `concerns` + `relates_to` are the Phase 1 anchor/threading edges.)
 2. **Hot-path injection — IMPLEMENTED for `context-pack` (`#trt1p2`).** Trusted, fresh findings are folded into the `context-pack` envelope for symbols/files already in the result set. See [Hot-path injection](#hot-path-injection-phase-2) below. (`search`/`explain` injection is the remaining sub-scope, tracked as `#trt1p2b`.)
 3. **Graph menu + exports — IMPLEMENTED (`#trt1p3`).** `graph-db map` communities/hubs/focus are annotated with attached trusted, fresh findings, and `graph-db map --format md|html` renders on-demand Markdown/HTML projections of the same overview. See [Graph menu + exports](#graph-menu--exports-phase-3) below.
-4. **Passive harvest (proposed)** — config-gated draft extraction from session archives/summaries with draft→trusted promotion.
+4. **Passive harvest — IMPLEMENTED (`#trt1p4`).** `tsift finding harvest` (config-gated, off by default) extracts `draft` candidate findings from agent-doc session archives, and `tsift finding promote <id>` flips a draft to `trusted`. See [Passive harvest](#passive-harvest-phase-4) below.
 
 ### `tsift finding` surface (Phase 1)
 
@@ -386,6 +386,46 @@ systems-overview → community/hub → the finding explaining the coupling.
 Community annotation is bounded to the displayed `top_members`; a finding on a
 hidden community member surfaces when that member is brought into focus rather
 than in the collapsed overview.
+
+### Passive harvest (Phase 4)
+
+Phase 4 closes the capture loop: instead of every finding being explicitly
+authored, tsift can passively extract candidates from the agent-doc session
+archives it already accumulates — but only as `draft` candidates that a human or
+agent must confirm.
+
+- **Fail-closed config gate** — the whole auto-capture path is off until
+  `.tsift/config.toml` opts in:
+
+  ```toml
+  [findings]
+  passive_harvest = true
+  ```
+
+  `tsift finding harvest` bails with that instruction when the flag is absent, so
+  a user who never opts in sees zero behavior change and zero captured rows.
+- **Extraction** — `tsift finding harvest [<path>] [--scope <s>] [--json]` scans
+  `.agent-doc/archives/*.md` (frontmatter stripped) and, for each line that pairs
+  a decision/insight signal (`decided`, `decision`, `invariant`, `gotcha`,
+  `by design`, `intentional`, `must not`, `fail-closed`, `source of truth`, …)
+  with an inline-code token that resolves to an **indexed symbol or real file**
+  (a resolvable watermark proves the anchor), creates a finding anchored to that
+  token. `kind` is `decision` for design-intent signals, else `note`. Capture is
+  deliberately generous — every candidate lands as `draft` (excluded from
+  injection), so the promotion step, not the extractor, is the precision gate.
+  Runs are bounded (`HARVEST_CAP`), idempotent (content-derived ids), and never
+  overwrite an existing finding — a re-harvest reports `skipped_existing` rather
+  than clobbering a promoted/trusted row.
+- **Promotion** — `tsift finding promote <id> [<path>]` flips a `draft` finding
+  to `trusted`, preserving its anchor, watermark, and provenance. Only then does
+  it become eligible for hot-path injection (Phase 2) and map annotation
+  (Phase 3). Promotion is idempotent on an already-trusted finding and fails
+  closed on an unknown id.
+
+The failure mode this design guards against is a graph filling with confident,
+unverified, stale findings. `draft` status + the explicit promotion gate +
+watermark staleness keep the harvested layer honest: nothing auto-captured ever
+reaches the agent hot path without a human/agent confirming it.
 
 ## Graph Traversal Handles
 

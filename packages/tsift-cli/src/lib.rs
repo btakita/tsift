@@ -636,6 +636,22 @@ pub fn run() -> Result<()> {
                 json || terse || schema || envelope,
                 pretty,
             ),
+            cli::FindingCommand::Harvest { path, scope, json } => {
+                commands::finding::cmd_finding_harvest(
+                    &path,
+                    scope.as_deref(),
+                    json || terse || schema || envelope,
+                    pretty,
+                )
+            }
+            cli::FindingCommand::Promote { id, path, json } => {
+                commands::finding::cmd_finding_promote(
+                    &path,
+                    &id,
+                    json || terse || schema || envelope,
+                    pretty,
+                )
+            }
         },
         Some(Commands::Graph {
             symbol,

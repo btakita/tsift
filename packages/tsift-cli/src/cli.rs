@@ -1029,6 +1029,29 @@ pub enum FindingCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Passively harvest `draft` candidate findings from agent-doc session archives (config-gated, #trt1p4)
+    Harvest {
+        /// Project root (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Restrict anchor resolution to a specific submodule index
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Promote a `draft` finding to `trusted` so it becomes eligible for hot-path injection (#trt1p4)
+    Promote {
+        /// Finding id to promote
+        id: String,
+        /// Project root (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

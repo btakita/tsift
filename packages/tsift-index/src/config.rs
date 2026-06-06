@@ -18,6 +18,20 @@ pub struct Config {
     pub defaults: Defaults,
     #[serde(default)]
     pub overrides: HashMap<String, SubmoduleOverride>,
+    #[serde(default)]
+    pub findings: FindingsConfig,
+}
+
+/// Findings Graph Layer configuration (#trt1p4). Currently gates the passive
+/// auto-capture path; off by default so a user who never opts in sees zero
+/// behavior change.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FindingsConfig {
+    /// Enable passive harvest of `draft` candidate findings from agent-doc
+    /// session archives (`tsift finding harvest`). Off by default — the whole
+    /// auto-capture path is fail-closed until explicitly enabled.
+    #[serde(default)]
+    pub passive_harvest: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -359,6 +373,31 @@ federation = false
         let cfg = Config::load(dir.path()).unwrap();
         assert!(!cfg.federation_for("special"));
         assert_eq!(cfg.tier_for("special"), IsolationTier::Shared);
+    }
+
+    #[test]
+    fn findings_passive_harvest_defaults_off() {
+        let cfg = Config::default();
+        assert!(!cfg.findings.passive_harvest);
+        // Absent [findings] section also defaults off.
+        let dir = tempfile::tempdir().unwrap();
+        let tsift_dir = dir.path().join(".tsift");
+        fs::create_dir_all(&tsift_dir).unwrap();
+        fs::write(tsift_dir.join("config.toml"), "[defaults]\nfederation = true\n").unwrap();
+        assert!(!Config::load(dir.path()).unwrap().findings.passive_harvest);
+    }
+
+    #[test]
+    fn findings_passive_harvest_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsift_dir = dir.path().join(".tsift");
+        fs::create_dir_all(&tsift_dir).unwrap();
+        fs::write(
+            tsift_dir.join("config.toml"),
+            "[findings]\npassive_harvest = true\n",
+        )
+        .unwrap();
+        assert!(Config::load(dir.path()).unwrap().findings.passive_harvest);
     }
 
     #[test]
