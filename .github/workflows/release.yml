@@ -78,6 +78,8 @@ jobs:
             tsift-search \
             tsift-status \
             tsift-session \
+            tsift-memory \
+            tsift-surrealdb \
             tsift-cli \
             tsift \
             tsift-sim-world
@@ -266,6 +268,8 @@ jobs:
             tsift-search \
             tsift-status \
             tsift-session \
+            tsift-memory \
+            tsift-surrealdb \
             tsift-cli \
             tsift \
             tsift-sim-world
