@@ -229,6 +229,9 @@ fn release_crate_order() -> &'static [&'static str] {
 
 #[test]
 fn split_crate_manifests_are_publish_ready() {
+    // Workspace crates version in lockstep with tsift-cli; derive from the build
+    // env so a release bump doesn't require editing this test.
+    let expected_version = env!("CARGO_PKG_VERSION");
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
         .parent()
@@ -270,7 +273,7 @@ fn split_crate_manifests_are_publish_ready() {
         );
         assert_eq!(
             package.get("version").and_then(toml::Value::as_str),
-            Some("0.1.62"),
+            Some(expected_version),
             "manifest version drift for {name}"
         );
         assert_eq!(
@@ -313,7 +316,7 @@ fn split_crate_manifests_are_publish_ready() {
                     {
                         assert_eq!(
                             dep_value.get("version").and_then(toml::Value::as_str),
-                            Some("0.1.62"),
+                            Some(expected_version),
                             "{name} {table_name}.{dep_name} path dependency needs matching version"
                         );
                     }

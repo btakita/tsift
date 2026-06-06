@@ -1,6 +1,6 @@
 {
   "name": "opencode-tsift",
-  "version": "0.1.62",
+  "version": "0.1.63",
   "description": "OpenCode command shortcuts for tsift bounded code navigation and session evidence",
   "type": "module",
   "main": "./src/index.js",
