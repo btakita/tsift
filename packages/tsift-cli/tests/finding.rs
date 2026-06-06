@@ -65,6 +65,183 @@ fn list_json(root: &Path, extra: &[&str]) -> serde_json::Value {
     serde_json::from_str(&out).unwrap()
 }
 
+/// Initialize a committed git repo so `context-pack`'s diff digest can run.
+fn init_git(root: &Path) {
+    let run_git = |args: &[&str]| {
+        let status = Command::new("git").args(args).current_dir(root).status().unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    };
+    run_git(&["init"]);
+    run_git(&["add", "."]);
+    run_git(&[
+        "-c", "user.name=tsift-tests", "-c", "user.email=tests@tsift", "commit", "-m", "init",
+    ]);
+}
+
+/// Write a session document whose exchange names `main.rs` as a touched file so
+/// the context-pack result set includes the `main.rs` node (the anchor a
+/// file-scoped finding rides in on for hot-path injection, #trt1p2).
+fn write_session_doc(root: &Path) {
+    let task_dir = root.join("tasks/software");
+    fs::create_dir_all(&task_dir).unwrap();
+    fs::write(
+        task_dir.join("tsift.md"),
+        r#"---
+agent_doc_session: tsift-v0.1
+agent_doc_format: template
+---
+
+## Exchange
+
+<!-- agent:exchange patch=append -->
+❯ do [#kgnv]
+Completed `#kgnv`; touched files `main.rs`; tests `cargo test`; follow-up `#gfix`.
+<!-- /agent:exchange -->
+
+## Backlog
+
+<!-- agent:backlog -->
+- [ ] [#kgnv] Keep the alpha/beta wiring intentional.
+<!-- /agent:backlog -->
+"#,
+    )
+    .unwrap();
+}
+
+fn context_pack_json(root: &Path) -> serde_json::Value {
+    let out = run_ok(
+        &[
+            "context-pack",
+            "tasks/software/tsift.md",
+            "--json",
+            "--budget",
+            "normal",
+        ],
+        root,
+    );
+    serde_json::from_str(&out).unwrap()
+}
+
+fn finding_titles(pack: &serde_json::Value) -> Vec<String> {
+    pack["findings"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| item["title"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Phase 2 (#trt1p2) hot-path injection: a trusted, fresh finding anchored to a
+/// node already in the context-pack result set rides along in the same envelope.
+#[test]
+fn context_pack_injects_trusted_fresh_finding_for_result_set_node() {
+    let dir = indexed_fixture("1");
+    let root = dir.path();
+    init_git(root);
+    write_session_doc(root);
+
+    add_finding(root, "decision", "main.rs owns the entrypoint wiring", "main.rs");
+
+    let pack = context_pack_json(root);
+    let titles = finding_titles(&pack);
+    assert!(
+        titles.contains(&"main.rs owns the entrypoint wiring".to_string()),
+        "expected the trusted fresh finding injected, got findings: {:?}",
+        pack["findings"]
+    );
+    // The injected preview carries the anchor + an expand command back to the
+    // full finding set.
+    let injected = pack["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["about"].as_str() == Some("main.rs"))
+        .unwrap();
+    assert_eq!(injected["anchor_kind"].as_str().unwrap(), "file");
+    assert!(
+        injected["expand"]
+            .as_str()
+            .unwrap()
+            .contains("tsift finding list --about"),
+        "expand should resolve the full finding set: {injected}"
+    );
+}
+
+/// Draft findings (including future passive-harvest drafts) must never ride the
+/// hot path — only `trusted` authored context is injected.
+#[test]
+fn context_pack_excludes_draft_findings() {
+    let dir = indexed_fixture("1");
+    let root = dir.path();
+    init_git(root);
+    write_session_doc(root);
+
+    run_ok(
+        &[
+            "finding", "add", "--path", ".", "--kind", "note", "--title",
+            "draft about main", "--body", "unverified", "--about", "main.rs", "--status",
+            "draft",
+        ],
+        root,
+    );
+
+    let pack = context_pack_json(root);
+    assert!(
+        !finding_titles(&pack).contains(&"draft about main".to_string()),
+        "draft finding must not be injected: {:?}",
+        pack["findings"]
+    );
+}
+
+/// A finding whose anchor has advanced past its captured watermark is stale and
+/// must not be injected — stale-but-hidden over wrong-and-confident on the hot
+/// path.
+#[test]
+fn context_pack_excludes_stale_findings() {
+    let dir = indexed_fixture("1");
+    let root = dir.path();
+    init_git(root);
+    write_session_doc(root);
+
+    add_finding(root, "decision", "main.rs stale candidate", "main.rs");
+
+    // Mutate main.rs so the file watermark advances; the finding goes stale.
+    write_alpha_beta(root, "99");
+    run_ok(&["index", "."], root);
+
+    let pack = context_pack_json(root);
+    assert!(
+        !finding_titles(&pack).contains(&"main.rs stale candidate".to_string()),
+        "stale finding must not be injected: {:?}",
+        pack["findings"]
+    );
+}
+
+/// A trusted, fresh finding about a node that is NOT in the result set must not
+/// be injected — injection rides the existing result set, it does not dump the
+/// whole store.
+#[test]
+fn context_pack_excludes_findings_outside_result_set() {
+    let dir = indexed_fixture("1");
+    let root = dir.path();
+    init_git(root);
+    write_session_doc(root);
+
+    // `beta` is a real symbol but the session exchange only names main.rs, so
+    // beta is not in the result set.
+    add_finding(root, "note", "beta is unrelated here", "beta");
+
+    let pack = context_pack_json(root);
+    assert!(
+        !finding_titles(&pack).contains(&"beta is unrelated here".to_string()),
+        "finding outside the result set must not be injected: {:?}",
+        pack["findings"]
+    );
+}
+
 /// THE durability invariant: an authored finding lives in `.tsift/findings.db`
 /// and MUST survive a code-graph projection refresh of `.tsift/graph.db`
 /// (which tombstones non-projected rows). This is the whole reason findings

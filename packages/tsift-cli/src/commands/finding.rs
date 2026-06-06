@@ -408,6 +408,99 @@ pub(crate) fn cmd_finding_list(
     emit_list(&db_path, items, json_output, pretty)
 }
 
+/// A trusted, fresh finding selected for hot-path injection (#trt1p2). This is
+/// the structured shape consumed by `context-pack` (and, later, `search` /
+/// `explain`) so authored "why" rides the same envelope as the code result set.
+#[derive(Clone, Serialize)]
+pub(crate) struct InjectableFinding {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) about: String,
+    pub(crate) anchor_kind: String,
+    pub(crate) confidence: Option<f64>,
+}
+
+/// Collect trusted, non-stale findings whose `about` anchor is one of
+/// `about_keys`, for hot-path injection (#trt1p2). Only `trusted` + fresh
+/// findings are returned: `draft` findings and findings whose anchor has
+/// advanced past the captured watermark are excluded, so confident-but-wrong or
+/// unverified authored context never rides the agent hot path. This is the
+/// inverse of the failure mode the layer is designed against (a graph filling
+/// with stale, confident findings). Fails open to an empty vec — never an error
+/// — when the dedicated `findings.db` is absent, so callers can inject
+/// unconditionally without a pre-check.
+pub(crate) fn collect_injectable_findings(
+    root: &Path,
+    about_keys: &std::collections::BTreeSet<String>,
+    scope: Option<&str>,
+) -> Result<Vec<InjectableFinding>> {
+    if about_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let db_path = findings_db_path(root);
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let store = SqliteGraphStore::open_read_only_resilient(&db_path)?;
+
+    let mut items = Vec::new();
+    for finding_kind in ["finding", "decision", "note"] {
+        for node in store.nodes_by_kind(finding_kind)? {
+            let about = node.properties.get("about").cloned().unwrap_or_default();
+            if !about_keys.contains(&about) {
+                continue;
+            }
+            // Trusted only: draft findings (including passive-harvest drafts)
+            // are excluded from default injection.
+            let status = node
+                .properties
+                .get("status")
+                .cloned()
+                .unwrap_or_else(|| "trusted".to_string());
+            if status != "trusted" {
+                continue;
+            }
+            // Fresh only: re-resolve the anchor's current content hash and skip
+            // the finding when it differs from the captured watermark or the
+            // anchor can no longer be resolved. A finding with no captured
+            // watermark could not be freshness-verified at capture and is not
+            // injected.
+            let Some(captured) = node.properties.get("watermark").cloned() else {
+                continue;
+            };
+            let current = resolve_anchor(root, &about, scope)
+                .ok()
+                .and_then(|anchor| anchor.watermark);
+            if current.as_deref() != Some(captured.as_str()) {
+                continue;
+            }
+
+            let anchor_kind = node
+                .properties
+                .get("anchor_kind")
+                .cloned()
+                .unwrap_or_else(|| "file".to_string());
+            items.push(InjectableFinding {
+                id: node.id.clone(),
+                kind: finding_kind.to_string(),
+                title: node.properties.get("title").cloned().unwrap_or_default(),
+                body: node.properties.get("body").cloned().unwrap_or_default(),
+                about,
+                anchor_kind,
+                confidence: node
+                    .properties
+                    .get("confidence")
+                    .and_then(|value| value.parse::<f64>().ok()),
+            });
+        }
+    }
+
+    items.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(items)
+}
+
 fn emit_list(
     db_path: &Path,
     items: Vec<FindingListItem>,

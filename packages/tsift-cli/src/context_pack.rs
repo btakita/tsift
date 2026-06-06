@@ -74,8 +74,28 @@ pub(crate) struct ContextPackReport {
     pub(crate) test_digest: ContextPackOptionalSection<ContextPackTestPreview>,
     pub(crate) log_digest: ContextPackOptionalSection<ContextPackLogPreview>,
     pub(crate) exploration: ExplorationPacket,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) findings: Vec<ContextPackFindingPreview>,
     pub(crate) graph_orchestration: ContextPackGraphOrchestration,
     pub(crate) resume_commands: Vec<String>,
+}
+
+/// A trusted, fresh authored finding folded into the context-pack envelope
+/// because it `concerns` a symbol/file already in the result set (#trt1p2
+/// hot-path injection). The agent gets the authored "why" without reading a
+/// separate document; `expand` resolves the full finding set for the anchor.
+#[derive(Clone, Serialize)]
+pub(crate) struct ContextPackFindingPreview {
+    pub(crate) handle: String,
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) title: String,
+    pub(crate) about: String,
+    pub(crate) anchor_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) confidence: Option<f64>,
+    pub(crate) body: String,
+    pub(crate) expand: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -968,6 +988,75 @@ fn collect_context_pack_ontology_refs(
     refs.into_values().collect()
 }
 
+/// Collect the symbol/file identifiers already in the context-pack result set —
+/// touched files/symbols, diff-preview files and their touched symbols, and the
+/// exploration packet's source-window files plus relationship endpoints. These
+/// are the anchors a finding must `concern` to ride the hot path (#trt1p2): the
+/// layer injects authored context for nodes the agent is *already* looking at,
+/// never a blanket dump of every finding in the store.
+fn context_pack_result_set_keys(
+    next_context: &SessionReviewNextContextBudgetReport,
+    diff_digest: &ContextPackDiffPreview,
+    exploration: &ExplorationPacket,
+) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for file in &next_context.touched_files {
+        keys.insert(file.clone());
+    }
+    for symbol in &next_context.touched_symbols {
+        keys.insert(symbol.clone());
+    }
+    for file in &diff_digest.files {
+        keys.insert(file.path.clone());
+        for symbol in &file.touched_symbols {
+            keys.insert(symbol.clone());
+        }
+    }
+    for window in &exploration.source_windows {
+        keys.insert(window.file.clone());
+    }
+    for relation in &exploration.relationship_map {
+        keys.insert(relation.from.clone());
+        keys.insert(relation.to.clone());
+    }
+    keys
+}
+
+/// Build the trusted-fresh findings preview for the context-pack envelope. Fails
+/// open to an empty section when the findings store is absent or unreadable, so
+/// hot-path injection never breaks a context-pack for a project that has no
+/// authored knowledge.
+fn build_context_pack_findings(
+    root: &Path,
+    keys: &BTreeSet<String>,
+    budget: ResponseBudget,
+) -> Vec<ContextPackFindingPreview> {
+    let findings = match crate::commands::finding::collect_injectable_findings(root, keys, None) {
+        Ok(findings) => findings,
+        Err(_) => return Vec::new(),
+    };
+    let max_items = budget.preview_items();
+    let max_bytes = budget.preview_bytes();
+    findings
+        .into_iter()
+        .take(max_items)
+        .map(|finding| ContextPackFindingPreview {
+            handle: stable_handle("cpfind", &format!("{}:{}", finding.about, finding.id)),
+            id: finding.id,
+            kind: finding.kind,
+            title: truncate_for_budget(&finding.title, max_bytes),
+            anchor_kind: finding.anchor_kind,
+            confidence: finding.confidence,
+            body: truncate_for_budget(&finding.body, max_bytes),
+            expand: format!(
+                "tsift finding list --about {} --json",
+                shell_quote(&finding.about)
+            ),
+            about: finding.about,
+        })
+        .collect()
+}
+
 pub(crate) fn build_context_pack_report(
     path: &Path,
     test_input: Option<&Path>,
@@ -1161,6 +1250,18 @@ pub(crate) fn build_context_pack_report_with_profile(
             )
         },
     )?;
+    let findings = graph_db_backend_eval_timed_phase(
+        &mut phases,
+        "findings_injection",
+        "trusted, fresh authored findings folded in for nodes already in the result set (#trt1p2)",
+        || {
+            Ok(build_context_pack_findings(
+                &root,
+                &context_pack_result_set_keys(&next_context, &diff_digest, &exploration),
+                budget,
+            ))
+        },
+    )?;
     let graph_orchestration = graph_db_backend_eval_timed_phase(
         &mut phases,
         "graph_orchestration",
@@ -1182,6 +1283,7 @@ pub(crate) fn build_context_pack_report_with_profile(
             test_digest,
             log_digest,
             exploration,
+            findings,
             graph_orchestration,
             resume_commands: review.next_context.next_digest_commands,
         },
@@ -1396,6 +1498,12 @@ pub(crate) fn print_context_pack_human(report: &ContextPackReport, compact: bool
             report.exploration.relationship_map.len(),
             report.exploration.budget.project_size
         );
+        for finding in &report.findings {
+            println!(
+                "finding {} [{}] about:{} {}",
+                finding.handle, finding.kind, finding.about, finding.title
+            );
+        }
         println!(
             "graph-orchestration freshness:{} readiness:{} evidence:{} ownership:{}",
             report.graph_orchestration.projection_freshness.status,
@@ -1642,6 +1750,22 @@ pub(crate) fn print_context_pack_human(report: &ContextPackReport, compact: bool
             "  - relation {} -{}-> {}",
             relation.from, relation.relation, relation.to
         );
+    }
+
+    if !report.findings.is_empty() {
+        println!();
+        println!("Findings (authored why, anchored to the result set)");
+        for finding in &report.findings {
+            println!(
+                "  - [{}] {} (about {} / {})",
+                finding.kind, finding.title, finding.about, finding.anchor_kind
+            );
+            if let Some(confidence) = finding.confidence {
+                println!("    confidence: {confidence}");
+            }
+            println!("    {}", finding.body);
+            println!("    expand: {}", finding.expand);
+        }
     }
 
     println!();

@@ -226,7 +226,7 @@ Backend-eval full-projection cache keys use a stable input watermark over indexe
 
 ## Findings Graph Layer
 
-**Status: design-stage (`#trt1`).** This section is the living design for an authored-knowledge layer on top of the existing graph substrate. It is updated as the layer is implemented; subsections tag what already exists versus what is proposed so the spec never overstates shipped behavior.
+**Status: Phases 1–2 shipped (`#trt1p1`, `#trt1p2`); Phases 3–4 proposed.** This section is the living design for an authored-knowledge layer on top of the existing graph substrate. It is updated as the layer is implemented; subsections tag what already exists versus what is proposed so the spec never overstates shipped behavior.
 
 ### Motivation
 
@@ -276,7 +276,7 @@ The failure mode being designed against is a graph filling with confident-soundi
 ### Implementation phases
 
 1. **Schema + anchored capture — IMPLEMENTED (`#trt1p1`).** `finding`/`decision`/`note` node kinds, `concerns`/`relates_to` edges, watermark-based staleness, and `tsift finding add`/`list` over `GraphStore`. See [`tsift finding` surface](#tsift-finding-surface-phase-1) below. (`scopes`→community edges are deferred to a later phase since communities live in the rebuildable code graph; `concerns` + `relates_to` are the Phase 1 anchor/threading edges.)
-2. **Hot-path injection (proposed)** — fold trusted, fresh findings into `context-pack` (then `search`/`explain`) for nodes already in the result set.
+2. **Hot-path injection — IMPLEMENTED for `context-pack` (`#trt1p2`).** Trusted, fresh findings are folded into the `context-pack` envelope for symbols/files already in the result set. See [Hot-path injection](#hot-path-injection-phase-2) below. (`search`/`explain` injection is the remaining sub-scope, tracked as `#trt1p2b`.)
 3. **Graph menu + exports (proposed)** — `graph-db map` findings annotation and on-demand md/html projection.
 4. **Passive harvest (proposed)** — config-gated draft extraction from session archives/summaries with draft→trusted promotion.
 
@@ -323,6 +323,40 @@ tsift finding list [<path>] [--about <SYMBOL_OR_FILE>] [--kind <K>] [--status <S
   stale findings** (you only see fresh, trustworthy authored context);
   `--include-stale` includes them, each flagged `stale: true` with both
   `captured_watermark` and `current_watermark` in the JSON output.
+
+### Hot-path injection (Phase 2)
+
+Phase 2 makes authored findings ride the existing agent hot path instead of
+requiring a separate `tsift finding list` call. `context-pack` already folds in
+cached summaries, diff/test/log digests, and an exploration packet; Phase 2 adds
+a `findings` section to that same envelope.
+
+- **Result-set scoping** — injection is anchored to the nodes the agent is
+  *already* looking at, never a blanket dump of the store. The injected set is
+  the union of the context-pack result set: `next_context` touched files and
+  symbols, `diff_digest` preview file paths and their touched symbols, and the
+  exploration packet's `source_windows` files plus `relationship_map` endpoints.
+  A finding is injected only when its `about` anchor matches one of those
+  identifiers.
+- **Trusted + fresh only** — `draft` findings (including future passive-harvest
+  drafts) and findings whose anchor has advanced past the captured watermark
+  (stale) are excluded. This is the inverse of the failure mode the layer is
+  designed against: confident-but-wrong or unverified authored context must
+  never ride the hot path. A finding with no captured watermark (anchor was
+  unresolvable at capture) is also excluded, since its freshness cannot be
+  verified.
+- **Envelope shape** — each injected finding is a compact preview: stable
+  `handle`, `id`, `kind`, `title`, `about`, `anchor_kind`, optional `confidence`,
+  budget-truncated `body`, and an `expand` command
+  (`tsift finding list --about <anchor> --json`) back to the full anchored set.
+  The section is capped at the preview-item budget and omitted entirely
+  (`skip_serializing_if`) when no finding matches, so projects with no authored
+  knowledge see zero envelope change.
+- **Fail-open** — an absent or unreadable `findings.db` yields an empty section,
+  never a context-pack error.
+
+Injection into `search` and `explain` reuses the same trusted/fresh/result-set
+contract and is tracked separately as `#trt1p2b`.
 
 ## Graph Traversal Handles
 
