@@ -170,6 +170,23 @@ pub(crate) fn cmd_memory(command: MemoryCommand, format: OutputFormat) -> Result
         MemoryCommand::OntologyGraph {
             path, graph_db, ..
         } => cmd_memory_ontology_graph(&path, graph_db.as_deref(), format),
+        MemoryCommand::Findings {
+            path,
+            kind,
+            anchor,
+            query,
+            limit,
+            graph_db,
+            ..
+        } => cmd_memory_findings(
+            &path,
+            &kind,
+            anchor.as_deref(),
+            query.as_deref(),
+            limit,
+            graph_db.as_deref(),
+            format,
+        ),
         MemoryCommand::FindingAdd {
             path,
             kind,
@@ -789,6 +806,134 @@ fn cmd_memory_ontology_graph(
 }
 
 #[derive(Serialize)]
+struct FindingRecord {
+    id: String,
+    kind: String,
+    text: String,
+    anchor_handle: String,
+    confidence: f64,
+    observed_at_unix: i64,
+}
+
+#[derive(Serialize)]
+struct MemoryFindingsReport {
+    contract_version: String,
+    graph_db: String,
+    count: usize,
+    findings: Vec<FindingRecord>,
+    next_commands: Vec<String>,
+}
+
+/// Query authored finding/decision/note nodes from the graph (#trt1 retrieval),
+/// newest first by `observed_at_unix`, with optional kind/anchor/lexical filters.
+fn query_findings(
+    graph_db: &Path,
+    kind: &str,
+    anchor: Option<&str>,
+    query: Option<&str>,
+    limit: usize,
+) -> Result<Vec<FindingRecord>> {
+    let kinds: Vec<&str> = match kind {
+        "all" => vec!["finding", "decision", "note"],
+        "finding" | "decision" | "note" => vec![kind],
+        other => bail!("unsupported finding kind `{other}` (expected finding|decision|note|all)"),
+    };
+    if !graph_db.exists() {
+        return Ok(Vec::new());
+    }
+    let store = SqliteGraphStore::open(graph_db)
+        .with_context(|| format!("open graph store {}", graph_db.display()))?;
+    let query_lower = query.map(|q| q.to_lowercase());
+    let mut records = Vec::new();
+    for kind in kinds {
+        for node in store.nodes_by_kind(kind)? {
+            let anchor_handle = node
+                .properties
+                .get("anchor_handle")
+                .cloned()
+                .unwrap_or_default();
+            if let Some(want) = anchor
+                && anchor_handle != want
+            {
+                continue;
+            }
+            let text = node
+                .properties
+                .get("text")
+                .cloned()
+                .unwrap_or_else(|| node.label.clone());
+            if let Some(needle) = &query_lower
+                && !text.to_lowercase().contains(needle.as_str())
+            {
+                continue;
+            }
+            let confidence = node
+                .properties
+                .get("confidence")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(1.0);
+            let observed_at_unix = node
+                .properties
+                .get("observed_at_unix")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            records.push(FindingRecord {
+                id: node.id,
+                kind: kind.to_string(),
+                text,
+                anchor_handle,
+                confidence,
+                observed_at_unix,
+            });
+        }
+    }
+    records.sort_by(|a, b| {
+        b.observed_at_unix
+            .cmp(&a.observed_at_unix)
+            .then(a.id.cmp(&b.id))
+    });
+    records.truncate(limit);
+    Ok(records)
+}
+
+fn cmd_memory_findings(
+    path: &Path,
+    kind: &str,
+    anchor: Option<&str>,
+    query: Option<&str>,
+    limit: usize,
+    graph_db_override: Option<&Path>,
+    format: OutputFormat,
+) -> Result<()> {
+    let graph_db = graph_db_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| crate::graph_substrate_db_path(path, None));
+    let findings = query_findings(&graph_db, kind, anchor, query, limit)?;
+    let count = findings.len();
+    let next_commands = vec![
+        "tsift memory finding-add --text '<finding>' --anchor '<symbol-handle>'".to_string(),
+        "tsift memory ontology-graph . --json".to_string(),
+    ];
+    let report = MemoryFindingsReport {
+        contract_version: tsift_memory::MEMORY_CONTRACT_VERSION.to_string(),
+        graph_db: graph_db.display().to_string(),
+        count,
+        findings,
+        next_commands: next_commands.clone(),
+    };
+    print_memory_report(
+        &report,
+        &format,
+        "findings",
+        ToolEnvelopeSummary {
+            text: format!("{count} authored finding(s)"),
+            metrics: vec![envelope_metric("count", count)],
+        },
+        next_commands,
+    )
+}
+
+#[derive(Serialize)]
 struct MemoryFindingReport {
     contract_version: String,
     graph_db: String,
@@ -1058,5 +1203,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(annotates2, 1, "edge materializes once anchor exists");
+    }
+
+    #[test]
+    fn query_findings_filters_and_orders_newest_first() {
+        let dir = TempDir::new().unwrap();
+        let graph_db = dir.path().join("graph.db");
+        add_authored_node_to_graph(
+            &graph_db,
+            AuthoredNodeKind::Finding,
+            "decay ranking is shipped",
+            "symbol:a",
+            0.9,
+            1_000,
+            None,
+        )
+        .unwrap();
+        add_authored_node_to_graph(
+            &graph_db,
+            AuthoredNodeKind::Decision,
+            "ontology source is NodeKind enums",
+            "symbol:b",
+            0.8,
+            2_000,
+            None,
+        )
+        .unwrap();
+        add_authored_node_to_graph(
+            &graph_db,
+            AuthoredNodeKind::Note,
+            "decay note for symbol a",
+            "symbol:a",
+            0.5,
+            3_000,
+            None,
+        )
+        .unwrap();
+
+        // All kinds, newest first.
+        let all = query_findings(&graph_db, "all", None, None, 20).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].observed_at_unix, 3_000);
+        assert_eq!(all[2].observed_at_unix, 1_000);
+
+        // Kind filter.
+        let decisions = query_findings(&graph_db, "decision", None, None, 20).unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].kind, "decision");
+
+        // Anchor filter.
+        let anchored = query_findings(&graph_db, "all", Some("symbol:a"), None, 20).unwrap();
+        assert_eq!(anchored.len(), 2);
+        assert!(anchored.iter().all(|f| f.anchor_handle == "symbol:a"));
+
+        // Lexical filter + limit.
+        let decay = query_findings(&graph_db, "all", None, Some("decay"), 1).unwrap();
+        assert_eq!(decay.len(), 1);
+        assert!(decay[0].text.to_lowercase().contains("decay"));
+
+        // Missing graph db -> empty, no error.
+        assert!(
+            query_findings(dir.path().join("missing.db").as_path(), "all", None, None, 5)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

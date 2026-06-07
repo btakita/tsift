@@ -1210,6 +1210,30 @@ pub enum MemoryCommand {
         #[arg(long)]
         json: bool,
     },
+    /// List/query authored finding/decision/note nodes from the shared graph, newest first (#trt1 retrieval)
+    Findings {
+        /// Project root whose .tsift/graph.db is queried
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Filter by kind: finding | decision | note | all
+        #[arg(long, default_value = "all")]
+        kind: String,
+        /// Only findings anchored to this symbol handle
+        #[arg(long)]
+        anchor: Option<String>,
+        /// Lexical filter on finding text (case-insensitive substring/term overlap)
+        #[arg(long)]
+        query: Option<String>,
+        /// Maximum findings to return
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        /// Override the graph DB path (defaults to .tsift/graph.db)
+        #[arg(long)]
+        graph_db: Option<PathBuf>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Add an authored finding/decision/note node anchored to a symbol handle (#trt1)
     FindingAdd {
         /// Project root whose .tsift/graph.db receives the authored node
@@ -1251,6 +1275,7 @@ impl MemoryCommand {
             | Self::QueryPlan { json, .. }
             | Self::ProjectGraph { json, .. }
             | Self::OntologyGraph { json, .. }
+            | Self::Findings { json, .. }
             | Self::FindingAdd { json, .. } => *json,
         }
     }
