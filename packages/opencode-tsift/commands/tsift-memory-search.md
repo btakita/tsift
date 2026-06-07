@@ -1,4 +1,4 @@
-<!-- tsift:opencode-command v=0.1.63 name=tsift-memory-search -->
+<!-- tsift:opencode-command v=0.1.64 name=tsift-memory-search -->
 ---
 description: Search first-party tsift memory graph
 ---
