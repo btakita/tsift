@@ -64,6 +64,7 @@ jobs:
         run: |
           for package in \
             tsift-core \
+            tsift-md-ast \
             tsift-graph \
             tsift-sqlite \
             tsift-algorithms \
@@ -254,6 +255,7 @@ jobs:
 
           for package in \
             tsift-core \
+            tsift-md-ast \
             tsift-graph \
             tsift-sqlite \
             tsift-algorithms \

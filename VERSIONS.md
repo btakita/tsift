@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **`#release-publish-md-ast`**: added `tsift-md-ast` to the dependency-ordered crates.io package-check and publish lists, and tightened the release guard test so every split crate in the publish order is checked in both workflow steps.
+
 ## 0.1.64
 
 - **`#md-ast-incremental-reparse`**: `tsift-md-ast` now exposes `MdTextEdit`, `reparse_incremental()`, and `reparse_incremental_with_input_edit()` so CRDT/live-editor consumers can update a prior `tree-sitter-md` tree instead of reparsing each keystroke from scratch.

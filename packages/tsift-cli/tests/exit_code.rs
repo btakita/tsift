@@ -147,22 +147,8 @@ fn release_publish_gate_requires_secret_variable_and_dry_run() {
         "README should document the repo variable and secret"
     );
 
-    let publish_job = workflow
-        .split("      - name: Publish crate")
-        .nth(1)
-        .expect("release workflow should include the crate publish step");
-    let mut previous = 0;
-    for package in release_crate_order() {
-        let line_with_continuation = format!("            {package} \\");
-        let line_last = format!("            {package}\n");
-        let next = publish_job[previous..]
-            .find(&line_with_continuation)
-            .or_else(|| publish_job[previous..].find(&line_last));
-        let Some(index) = next.map(|idx| previous + idx) else {
-            panic!("release workflow missing dependency-ordered package {package}");
-        };
-        previous = index;
-    }
+    assert_release_package_order(&workflow, "      - name: Crate package file check");
+    assert_release_package_order(&workflow, "      - name: Publish crate");
 }
 
 #[test]
@@ -207,6 +193,7 @@ fn spec_documents_lazily_rs_cache_contracts() {
 fn release_crate_order() -> &'static [&'static str] {
     &[
         "tsift-core",
+        "tsift-md-ast",
         "tsift-graph",
         "tsift-sqlite",
         "tsift-algorithms",
@@ -221,10 +208,31 @@ fn release_crate_order() -> &'static [&'static str] {
         "tsift-search",
         "tsift-status",
         "tsift-session",
+        "tsift-memory",
+        "tsift-surrealdb",
         "tsift-cli",
         "tsift",
         "tsift-sim-world",
     ]
+}
+
+fn assert_release_package_order(workflow: &str, step_name: &str) {
+    let step = workflow
+        .split(step_name)
+        .nth(1)
+        .unwrap_or_else(|| panic!("release workflow should include {step_name}"));
+    let mut previous = 0;
+    for package in release_crate_order() {
+        let line_with_continuation = format!("            {package} \\");
+        let line_last = format!("            {package}\n");
+        let next = step[previous..]
+            .find(&line_with_continuation)
+            .or_else(|| step[previous..].find(&line_last));
+        let Some(index) = next.map(|idx| previous + idx) else {
+            panic!("release workflow missing dependency-ordered package {package} in {step_name}");
+        };
+        previous = index;
+    }
 }
 
 #[test]
@@ -248,6 +256,8 @@ fn split_crate_manifests_are_publish_ready() {
         ("tsift-graph", "packages/tsift-graph/Cargo.toml"),
         ("tsift-index", "packages/tsift-index/Cargo.toml"),
         ("tsift-libsql", "packages/tsift-libsql/Cargo.toml"),
+        ("tsift-md-ast", "packages/tsift-md-ast/Cargo.toml"),
+        ("tsift-memory", "packages/tsift-memory/Cargo.toml"),
         ("tsift-quality", "packages/tsift-quality/Cargo.toml"),
         ("tsift-resolution", "packages/tsift-resolution/Cargo.toml"),
         ("tsift-search", "packages/tsift-search/Cargo.toml"),
@@ -256,6 +266,7 @@ fn split_crate_manifests_are_publish_ready() {
         ("tsift-sqlite", "packages/tsift-sqlite/Cargo.toml"),
         ("tsift-status", "packages/tsift-status/Cargo.toml"),
         ("tsift-summarize", "packages/tsift-summarize/Cargo.toml"),
+        ("tsift-surrealdb", "packages/tsift-surrealdb/Cargo.toml"),
         ("tsift-tokensave", "packages/tsift-tokensave/Cargo.toml"),
     ] {
         let manifest_path = workspace_root.join(rel_manifest);
