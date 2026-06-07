@@ -14,4 +14,4 @@ clippy:
 
 opencode-plugin-test:
 	cd packages/opencode-tsift && npm test
-	cd packages/opencode-tsift && npm run publish:check
+	cd packages/opencode-tsift && npm run pack:check

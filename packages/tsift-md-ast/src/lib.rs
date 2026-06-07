@@ -10,6 +10,60 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A byte-range text replacement suitable for CRDT/live-editor edit events.
+///
+/// The byte offsets describe one edit from the old source into the new source:
+/// `start_byte..old_end_byte` in the old source became
+/// `start_byte..new_end_byte` in the new source. Line/column points are derived
+/// from the old and new source snapshots before calling tree-sitter. Conversion
+/// fails unless the unchanged old/new prefix and suffix bytes match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MdTextEdit {
+    pub start_byte: usize,
+    pub old_end_byte: usize,
+    pub new_end_byte: usize,
+}
+
+impl MdTextEdit {
+    /// Construct an edit from absolute old/new byte range endpoints.
+    pub fn replace(start_byte: usize, old_end_byte: usize, new_end_byte: usize) -> Self {
+        Self {
+            start_byte,
+            old_end_byte,
+            new_end_byte,
+        }
+    }
+
+    /// Convert this edit into the tree-sitter edit shape.
+    pub fn to_input_edit(
+        self,
+        old_source: &[u8],
+        new_source: &[u8],
+    ) -> Option<tree_sitter::InputEdit> {
+        if self.start_byte > self.old_end_byte
+            || self.old_end_byte > old_source.len()
+            || self.start_byte > self.new_end_byte
+            || self.new_end_byte > new_source.len()
+        {
+            return None;
+        }
+        if old_source.get(..self.start_byte)? != new_source.get(..self.start_byte)? {
+            return None;
+        }
+        if old_source.get(self.old_end_byte..)? != new_source.get(self.new_end_byte..)? {
+            return None;
+        }
+        Some(tree_sitter::InputEdit {
+            start_byte: self.start_byte,
+            old_end_byte: self.old_end_byte,
+            new_end_byte: self.new_end_byte,
+            start_position: markdown_point_for_byte(old_source, self.start_byte)?,
+            old_end_position: markdown_point_for_byte(old_source, self.old_end_byte)?,
+            new_end_position: markdown_point_for_byte(new_source, self.new_end_byte)?,
+        })
+    }
+}
+
 /// A markdown symbol: a heading-anchored section, a fenced code block, or a list
 /// item. Byte spans and zero-based line numbers map directly onto the source.
 /// This mirrors the shape tsift's graph layer consumes, but is owned here so the
@@ -38,9 +92,42 @@ pub fn markdown_language() -> tree_sitter::Language {
 
 /// Parse markdown source into a tree-sitter tree.
 pub fn parse(source: &[u8]) -> Option<tree_sitter::Tree> {
+    parse_with_old_tree(source, None)
+}
+
+/// Incrementally reparse markdown after a text edit.
+///
+/// This clones and edits `previous_tree`, so callers can keep their existing
+/// tree snapshot if needed. Use [`reparse_incremental_with_input_edit`] when the
+/// caller already has a tree-sitter `InputEdit`.
+pub fn reparse_incremental(
+    previous_tree: &tree_sitter::Tree,
+    old_source: &[u8],
+    new_source: &[u8],
+    edit: MdTextEdit,
+) -> Option<tree_sitter::Tree> {
+    let input_edit = edit.to_input_edit(old_source, new_source)?;
+    reparse_incremental_with_input_edit(previous_tree, new_source, &input_edit)
+}
+
+/// Incrementally reparse markdown with a precomputed tree-sitter edit.
+pub fn reparse_incremental_with_input_edit(
+    previous_tree: &tree_sitter::Tree,
+    new_source: &[u8],
+    edit: &tree_sitter::InputEdit,
+) -> Option<tree_sitter::Tree> {
+    let mut edited_tree = previous_tree.clone();
+    edited_tree.edit(edit);
+    parse_with_old_tree(new_source, Some(&edited_tree))
+}
+
+fn parse_with_old_tree(
+    source: &[u8],
+    old_tree: Option<&tree_sitter::Tree>,
+) -> Option<tree_sitter::Tree> {
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&markdown_language()).ok()?;
-    parser.parse(source, None)
+    parser.parse(source, old_tree)
 }
 
 /// Parse `source` and extract its markdown symbols. Convenience for standalone
@@ -213,7 +300,10 @@ fn markdown_fenced_code_language(node: tree_sitter::Node<'_>, source: &[u8]) -> 
     None
 }
 
-fn markdown_fenced_code_body_span(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<(usize, usize)> {
+fn markdown_fenced_code_body_span(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<(usize, usize)> {
     let text = node.utf8_text(source).ok()?;
     let first_newline = text.find('\n')?;
     let body_start = node.start_byte().saturating_add(first_newline + 1);
@@ -268,6 +358,21 @@ fn markdown_zero_based_end_line(source: &[u8], end_byte: usize) -> usize {
         .count()
 }
 
+fn markdown_point_for_byte(source: &[u8], byte: usize) -> Option<tree_sitter::Point> {
+    if byte > source.len() {
+        return None;
+    }
+    let mut row = 0;
+    let mut line_start = 0;
+    for (idx, value) in source.iter().enumerate().take(byte) {
+        if *value == b'\n' {
+            row += 1;
+            line_start = idx + 1;
+        }
+    }
+    Some(tree_sitter::Point::new(row, byte - line_start))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +413,44 @@ mod tests {
     fn from_tree_matches_convenience() {
         let src = b"# A\n\nx\n\n# B\n\ny\n";
         let tree = parse(src).unwrap();
-        assert_eq!(markdown_symbols_from_tree(&tree, src), markdown_symbols(src));
+        assert_eq!(
+            markdown_symbols_from_tree(&tree, src),
+            markdown_symbols(src)
+        );
+    }
+
+    #[test]
+    fn incremental_reparse_matches_full_parse_after_insert() {
+        let old_src = b"# A\n\nbody\n";
+        let new_src = b"# A\n\n## B\n\nbody\n";
+        let old_tree = parse(old_src).unwrap();
+        let edit = MdTextEdit::replace(5, 5, 11);
+
+        let incremental_tree = reparse_incremental(&old_tree, old_src, new_src, edit).unwrap();
+        let full_tree = parse(new_src).unwrap();
+
+        assert_eq!(
+            incremental_tree.root_node().to_sexp(),
+            full_tree.root_node().to_sexp()
+        );
+        assert_eq!(
+            markdown_symbols_from_tree(&incremental_tree, new_src),
+            markdown_symbols(new_src)
+        );
+        assert!(
+            markdown_symbols_from_tree(&old_tree, old_src)
+                .iter()
+                .all(|symbol| symbol.name != "B")
+        );
+    }
+
+    #[test]
+    fn incremental_reparse_rejects_mismatched_edit_sources() {
+        let old_src = b"# A\n";
+        let new_src = b"# B\n";
+        let old_tree = parse(old_src).unwrap();
+        let edit = MdTextEdit::replace(0, 0, 0);
+
+        assert!(reparse_incremental(&old_tree, old_src, new_src, edit).is_none());
     }
 }

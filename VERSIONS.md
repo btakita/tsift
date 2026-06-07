@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **`#md-ast-incremental-reparse`**: `tsift-md-ast` now exposes `MdTextEdit`, `reparse_incremental()`, and `reparse_incremental_with_input_edit()` so CRDT/live-editor consumers can update a prior `tree-sitter-md` tree instead of reparsing each keystroke from scratch.
+- **`#opencode-pack-check`**: local `make check` now validates `opencode-tsift` package contents with `npm pack --dry-run` instead of `npm publish --dry-run`, keeping CI green after the current package version already exists on npm. The release workflow still owns the publish dry-run before tagged npm publishes.
 - **`#npm-oidc-trusted-publishing`**: switched the `opencode-tsift` npm publish job to OIDC trusted publishing — no long-lived `NPM_TOKEN` secret. Added `id-token: write` permission, bumped to Node 24 + `npm@latest` (OIDC needs npm CLI ≥ 11.5.1), and dropped `NODE_AUTH_TOKEN`. Requires a one-time manual bootstrap publish (npm has no "pending publisher", so OIDC can't create a brand-new package) plus a Trusted Publisher configured on the package (repo `tsift`, workflow `release.yml`, action `npm publish`).
 
 ## 0.1.63

@@ -1,6 +1,6 @@
 # Shared markdown-AST (+ optional MemGraphRag) library
 
-**Status:** plan / proposal
+**Status:** tsift-side phases 1-2 shipped; agent-doc integration remains separate
 **Backlog:** `#tsift-shared-md-ast-and-memgraphrag-lib`
 **Context:** `agent-doc-bugs2.md` (#md-ast-document-model) wants `tree-sitter-md` AST + CRDT for the live document, MemGraphRag optional, via "a focused `tree-sitter-md` crate shared by both [agent-doc and tsift], no hard tsift dep."
 
@@ -24,7 +24,7 @@ Both `tsift-graph` (depends down onto it for `Lang::Markdown`) and `agent-doc` (
 ## Phases
 
 1. **Extract** `tsift-md-ast` leaf crate from `tsift-graph/src/lang.rs` markdown logic; `tsift-graph` depends on it; behavior/tests preserved (move the markdown extraction tests).
-2. **Stabilize** a serializable section/heading AST view + incremental reparse entry point (tree-sitter-md is incremental + error-tolerant) suitable for a CRDT-backed live document.
+2. **Shipped**: stable serializable section/list/code-block symbols plus `MdTextEdit`, `reparse_incremental()`, and `reparse_incremental_with_input_edit()` for CRDT-backed live-document reparses.
 3. **agent-doc integration** (agent-doc-side, separate session): agent-doc depends on `tsift-md-ast` for its document model; CRDT for the live doc; **MemGraphRag optional** (only when a project opts into the graph substrate).
 
 ## Notes

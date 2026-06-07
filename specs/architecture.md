@@ -221,6 +221,8 @@ all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript
 | Bash | `tree-sitter-bash` | 0.25.1 | `LANGUAGE` | `.sh`, `.bash`, `.zsh` |
 | Markdown | `tree-sitter-md` | 0.5.3 | `LANGUAGE` + `LANGUAGE_INLINE` | `.md`, `.mdx` |
 
+Markdown parsing and heading/list/code-block extraction are owned by the dependency-light `tsift-md-ast` leaf crate. The crate exposes `parse()`, `reparse_incremental()` with serializable `MdTextEdit` source-range edits, `reparse_incremental_with_input_edit()` for callers that already have a tree-sitter edit, and `markdown_symbols_from_tree()` so `tsift-graph` and external live-document consumers share tree-sitter-md behavior without depending on the graph/index stack.
+
 ### Language Module Structure
 
 ```
