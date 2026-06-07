@@ -88,7 +88,7 @@ impl Lang {
             #[cfg(feature = "lang-bash")]
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
             #[cfg(feature = "lang-markdown")]
-            Self::Markdown => tree_sitter_md::LANGUAGE.into(),
+            Self::Markdown => tsift_md_ast::markdown_language(),
         }
     }
 
@@ -254,7 +254,10 @@ impl Lang {
             .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
         #[cfg(feature = "lang-markdown")]
         if *self == Self::Markdown {
-            return Ok(extract_markdown_symbols(&tree, source));
+            return Ok(tsift_md_ast::markdown_symbols_from_tree(&tree, source)
+                .into_iter()
+                .map(md_symbol_to_symbol)
+                .collect());
         }
         let query = Query::new(&ts_lang, self.symbol_query())?;
         let mut cursor = QueryCursor::new();
@@ -427,229 +430,18 @@ fn symbol_body_span(node: tree_sitter::Node<'_>) -> Option<(usize, usize)> {
 }
 
 #[cfg(feature = "lang-markdown")]
-#[derive(Debug, Clone)]
-struct MarkdownHeading {
-    name: String,
-    level: usize,
-    start_byte: usize,
-    heading_end_byte: usize,
-    start_line: usize,
-}
-
-#[cfg(feature = "lang-markdown")]
-fn extract_markdown_symbols(tree: &tree_sitter::Tree, source: &[u8]) -> Vec<Symbol> {
-    let mut headings = Vec::new();
-    let mut symbols = Vec::new();
-    collect_markdown_symbols(tree.root_node(), source, &mut headings, &mut symbols);
-    headings.sort_by(|left, right| {
-        left.start_byte
-            .cmp(&right.start_byte)
-            .then(left.level.cmp(&right.level))
-            .then(left.name.cmp(&right.name))
-    });
-
-    for (idx, heading) in headings.iter().enumerate() {
-        let section_end_byte = headings
-            .iter()
-            .skip(idx + 1)
-            .find(|candidate| candidate.level <= heading.level)
-            .map(|candidate| candidate.start_byte)
-            .unwrap_or(source.len());
-        let body_start_byte =
-            markdown_next_line_start(source, heading.heading_end_byte).min(section_end_byte);
-        symbols.push(Symbol {
-            name: heading.name.clone(),
-            kind: "heading".to_string(),
-            line: heading.start_line,
-            end_line: markdown_zero_based_end_line(source, section_end_byte),
-            node_kind: "atx_heading".to_string(),
-            start_byte: heading.start_byte,
-            end_byte: section_end_byte,
-            body_start_byte: Some(body_start_byte),
-            body_end_byte: Some(section_end_byte),
-        });
+fn md_symbol_to_symbol(md: tsift_md_ast::MdSymbol) -> Symbol {
+    Symbol {
+        name: md.name,
+        kind: md.kind,
+        line: md.line,
+        end_line: md.end_line,
+        node_kind: md.node_kind,
+        start_byte: md.start_byte,
+        end_byte: md.end_byte,
+        body_start_byte: md.body_start_byte,
+        body_end_byte: md.body_end_byte,
     }
-
-    symbols.sort_by(|left, right| {
-        left.line
-            .cmp(&right.line)
-            .then(left.start_byte.cmp(&right.start_byte))
-            .then(left.kind.cmp(&right.kind))
-            .then(left.name.cmp(&right.name))
-    });
-    symbols
-}
-
-#[cfg(feature = "lang-markdown")]
-fn collect_markdown_symbols(
-    node: tree_sitter::Node<'_>,
-    source: &[u8],
-    headings: &mut Vec<MarkdownHeading>,
-    symbols: &mut Vec<Symbol>,
-) {
-    match node.kind() {
-        "atx_heading" => {
-            if let Some(level) = markdown_heading_level(node)
-                && let Some(name) = markdown_heading_name(node, source)
-            {
-                headings.push(MarkdownHeading {
-                    name,
-                    level,
-                    start_byte: node.start_byte(),
-                    heading_end_byte: node.end_byte(),
-                    start_line: node.start_position().row,
-                });
-            }
-        }
-        "fenced_code_block" => {
-            let language = markdown_fenced_code_language(node, source)
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "code".to_string());
-            let body_span = markdown_fenced_code_body_span(node, source);
-            symbols.push(Symbol {
-                name: language,
-                kind: "code_block".to_string(),
-                line: node.start_position().row,
-                end_line: markdown_zero_based_end_line(source, node.end_byte()),
-                node_kind: "fenced_code_block".to_string(),
-                start_byte: node.start_byte(),
-                end_byte: node.end_byte(),
-                body_start_byte: body_span.map(|(start, _)| start),
-                body_end_byte: body_span.map(|(_, end)| end),
-            });
-        }
-        "list_item" => {
-            let name = markdown_list_item_name(node, source);
-            symbols.push(Symbol {
-                name,
-                kind: "list_item".to_string(),
-                line: node.start_position().row,
-                end_line: markdown_zero_based_end_line(source, node.end_byte()),
-                node_kind: "list_item".to_string(),
-                start_byte: node.start_byte(),
-                end_byte: node.end_byte(),
-                body_start_byte: Some(node.start_byte()),
-                body_end_byte: Some(node.end_byte()),
-            });
-        }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_markdown_symbols(child, source, headings, symbols);
-    }
-}
-
-#[cfg(feature = "lang-markdown")]
-fn markdown_heading_level(node: tree_sitter::Node<'_>) -> Option<usize> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        let kind = child.kind();
-        if let Some(level) = kind
-            .strip_prefix("atx_h")
-            .and_then(|suffix| suffix.strip_suffix("_marker"))
-            .and_then(|value| value.parse::<usize>().ok())
-        {
-            return Some(level);
-        }
-    }
-    None
-}
-
-#[cfg(feature = "lang-markdown")]
-fn markdown_heading_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "inline" {
-            let text = child.utf8_text(source).ok()?.trim();
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
-        }
-    }
-    let line = node.utf8_text(source).ok()?.lines().next()?.trim();
-    let text = line.trim_start_matches('#').trim();
-    (!text.is_empty()).then(|| text.to_string())
-}
-
-#[cfg(feature = "lang-markdown")]
-fn markdown_fenced_code_language(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
-    if node.kind() == "language" || node.kind() == "info_string" {
-        let text = node.utf8_text(source).ok()?.trim();
-        if !text.is_empty() {
-            return Some(text.to_string());
-        }
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if let Some(language) = markdown_fenced_code_language(child, source) {
-            return Some(language);
-        }
-    }
-    None
-}
-
-#[cfg(feature = "lang-markdown")]
-fn markdown_fenced_code_body_span(
-    node: tree_sitter::Node<'_>,
-    source: &[u8],
-) -> Option<(usize, usize)> {
-    let text = node.utf8_text(source).ok()?;
-    let first_newline = text.find('\n')?;
-    let body_start = node.start_byte().saturating_add(first_newline + 1);
-    let closing_start = source[node.start_byte()..node.end_byte()]
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map(|offset| node.start_byte() + offset + 1)
-        .unwrap_or(node.end_byte());
-    Some((body_start.min(closing_start), closing_start))
-}
-
-#[cfg(feature = "lang-markdown")]
-fn markdown_list_item_name(node: tree_sitter::Node<'_>, source: &[u8]) -> String {
-    let text = node.utf8_text(source).unwrap_or("");
-    let first_line = text.lines().next().unwrap_or("").trim();
-    let marker_stripped = first_line
-        .strip_prefix("- ")
-        .or_else(|| first_line.strip_prefix("* "))
-        .or_else(|| first_line.strip_prefix("+ "))
-        .or_else(|| {
-            let (digits, rest) = first_line.split_at(
-                first_line
-                    .find(|ch: char| !ch.is_ascii_digit())
-                    .unwrap_or(first_line.len()),
-            );
-            (!digits.is_empty())
-                .then_some(rest)
-                .and_then(|rest| rest.strip_prefix(". "))
-        })
-        .unwrap_or(first_line)
-        .trim();
-    if marker_stripped.is_empty() {
-        "list item".to_string()
-    } else {
-        marker_stripped.chars().take(96).collect()
-    }
-}
-
-#[cfg(feature = "lang-markdown")]
-fn markdown_next_line_start(source: &[u8], byte: usize) -> usize {
-    let byte = byte.min(source.len());
-    source[byte..]
-        .iter()
-        .position(|value| *value == b'\n')
-        .map(|offset| byte + offset + 1)
-        .unwrap_or(byte)
-}
-
-#[cfg(feature = "lang-markdown")]
-fn markdown_zero_based_end_line(source: &[u8], end_byte: usize) -> usize {
-    let byte = end_byte.saturating_sub(1).min(source.len());
-    source[..byte]
-        .iter()
-        .filter(|value| **value == b'\n')
-        .count()
 }
 
 #[cfg(test)]

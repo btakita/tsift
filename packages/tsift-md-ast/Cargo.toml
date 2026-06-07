@@ -1,0 +1,17 @@
+[package]
+name = "tsift-md-ast"
+version = "0.1.63"
+edition = "2024"
+description = "Focused tree-sitter-md markdown AST + heading/section model — a leaf crate shared by tsift and other consumers (e.g. agent-doc) with no hard tsift dependency"
+license = "MIT"
+repository = "https://github.com/btakita/tsift"
+authors = ["Brian Takita <brian.takita@gmail.com>"]
+readme = "README.md"
+keywords = ["markdown", "tree-sitter", "ast", "agent", "context"]
+categories = ["parsing", "text-processing"]
+publish = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tree-sitter = "0.26"
+tree-sitter-md = "0.5"

@@ -5268,12 +5268,12 @@ dependencies = [
  "tree-sitter-bash",
  "tree-sitter-javascript",
  "tree-sitter-kotlin-ng",
- "tree-sitter-md",
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "tree-sitter-zig",
  "tsift-core",
+ "tsift-md-ast",
 ]
 
 [[package]]
@@ -5306,6 +5306,15 @@ dependencies = [
  "tempfile",
  "tokio",
  "tsift-core",
+]
+
+[[package]]
+name = "tsift-md-ast"
+version = "0.1.63"
+dependencies = [
+ "serde",
+ "tree-sitter",
+ "tree-sitter-md",
 ]
 
 [[package]]

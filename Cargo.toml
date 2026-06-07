@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-memory", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-resolution", "packages/tsift-quality", "packages/tsift-index", "packages/tsift-agent-doc", "packages/tsift-session", "packages/tsift-summarize", "packages/tsift-digest", "packages/tsift-search", "packages/tsift-status", "packages/tsift-surrealdb", "packages/tsift-cli", "packages/tsift-sim-world"]
+members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-memory", "packages/tsift-md-ast", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-resolution", "packages/tsift-quality", "packages/tsift-index", "packages/tsift-agent-doc", "packages/tsift-session", "packages/tsift-summarize", "packages/tsift-digest", "packages/tsift-search", "packages/tsift-status", "packages/tsift-surrealdb", "packages/tsift-cli", "packages/tsift-sim-world"]
 resolver = "3"
 
 [package]
