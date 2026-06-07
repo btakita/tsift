@@ -16,7 +16,7 @@ fn versioned_section() -> String {
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead. Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`; OpenCode projects can install per-project tsift command shortcuts with `tsift init --opencode`.
 
 Use the commands listed in its `use:` output:
-- `tsift --envelope source-read <file> --start <n> --lines <n> --budget normal` — AST-aware bounded source window with symbol metadata and expansion commands (prefer over cat/head for source code files)
+- `tsift --envelope source-read <file> --budget normal` — AST-symbol projection with span metadata and source-window expansion commands (prefer over cat/head for source code files)
 - `tsift --envelope symbol-read <symbol> --budget normal` — token-budgeted symbol body, AST span metadata, child refs, and graph/source expansion commands
 - `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)
 - `tsift --envelope explain <symbol> --budget normal` — callers, callees, community preview
@@ -466,7 +466,7 @@ const OPENCODE_COMMANDS: &[OpenCodeCommandSpec] = &[
     OpenCodeCommandSpec {
         name: "tsift-source-read",
         description: "AST-aware source code reading via tsift source-read",
-        body: r#"Read source code using `tsift --envelope source-read <file> --start <n> --lines <n> --budget normal`, where `<file>` is `$ARGUMENTS` or the file the user wants to inspect. Prefer this over the raw Read tool for source code files (Rust, TypeScript, JavaScript, Python, Markdown, and other indexed languages). The envelope returns a bounded source window with AST symbol metadata, line previews, and expansion commands for before/after/full-file ranges. When `$ARGUMENTS` includes a line range, parse `start` and `lines` from it; otherwise default to `--start 1 --lines 80`. Use the returned `expand` commands to read adjacent ranges instead of re-reading the entire file. Fall back to the raw Read tool only for non-indexed files or binary assets."#,
+        body: r#"Read source code using `tsift --envelope source-read <file> --budget normal`, where `<file>` is `$ARGUMENTS` or the file the user wants to inspect. Prefer this over the raw Read tool for source code files (Rust, TypeScript, JavaScript, Python, Markdown, and other indexed languages). The envelope returns an AST-symbol projection with stable span metadata, `symbol-read` expansion commands for bodies, and `expand.window` commands for literal line previews. When `$ARGUMENTS` includes a line range, pass it as `--start <n> --lines <n>` to bound the AST projection. Add `--style window` only when the user needs numbered source lines. Fall back to the raw Read tool only for non-indexed files or binary assets."#,
     },
     OpenCodeCommandSpec {
         name: "tsift-search",
@@ -481,7 +481,7 @@ const OPENCODE_COMMANDS: &[OpenCodeCommandSpec] = &[
     OpenCodeCommandSpec {
         name: "tsift-symbol-read",
         description: "Read symbol body with AST metadata via tsift symbol-read",
-        body: r#"Read the symbol named by `$ARGUMENTS` using `tsift --envelope symbol-read '<symbol>' --budget normal`. Prefer this over reading entire source files when you need a specific function, struct, or type definition. The envelope returns the symbol body, AST span metadata, child references, and expansion commands for graph/source navigation. When `$ARGUMENTS` includes a file hint, pass it as `--file '<path>'` to disambiguate duplicate names. Use the returned `expand` commands to inspect callers, callees, or the full source file. Fall back to `tsift --envelope source-read '<file>' --start <n> --lines <n> --budget normal` when the symbol is not found or when you need raw source without AST context."#,
+        body: r#"Read the symbol named by `$ARGUMENTS` using `tsift --envelope symbol-read '<symbol>' --budget normal`. Prefer this over reading entire source files when you need a specific function, struct, or type definition. The envelope returns the symbol body, AST span metadata, child references, and expansion commands for graph/source navigation. When `$ARGUMENTS` includes a file hint, pass it as `--file '<path>'` to disambiguate duplicate names. Use the returned `expand` commands to inspect callers, callees, or the full source file. Fall back to `tsift --envelope source-read '<file>' --budget normal` when the symbol is not found, or add `--style window --start <n> --lines <n>` only when you need raw numbered source lines."#,
     },
     OpenCodeCommandSpec {
         name: "tsift-graph",

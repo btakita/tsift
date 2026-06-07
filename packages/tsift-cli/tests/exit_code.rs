@@ -2781,6 +2781,8 @@ fn source_read_json_reports_bounded_window_handles_and_expansion_commands() {
             "main.rs",
             "--path",
             dir.path().to_str().unwrap(),
+            "--style",
+            "window",
             "--start",
             "1",
             "--lines",
@@ -2829,7 +2831,7 @@ fn source_read_json_reports_bounded_window_handles_and_expansion_commands() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|cmd| cmd.as_str().unwrap().contains("tsift source-read"))
+            .any(|cmd| cmd.as_str().unwrap().contains("source-read"))
     );
 
     let symbols = json["report"]["symbols"].as_array().unwrap();
@@ -2859,6 +2861,68 @@ fn source_read_json_reports_bounded_window_handles_and_expansion_commands() {
 }
 
 #[test]
+fn source_read_json_defaults_to_ast_symbol_projection() {
+    let dir = indexed_cli_fixture();
+
+    let output = tsift_bin()
+        .args([
+            "--envelope",
+            "source-read",
+            "main.rs",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "source-read stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["tool"], "source-read");
+    assert_eq!(json["view"], "ast");
+    assert!(
+        json["report"]["handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("sast-")
+    );
+    assert_eq!(json["report"]["file"], "main.rs");
+    assert_eq!(json["report"]["range"]["start"], 1);
+    assert_eq!(
+        json["report"]["range"]["end"],
+        json["report"]["range"]["total_lines"]
+    );
+    assert!(json["report"]["preview"].is_null());
+
+    let symbols = json["report"]["symbols"].as_array().unwrap();
+    let main_symbol = symbols
+        .iter()
+        .find(|symbol| symbol["name"] == "main")
+        .unwrap_or_else(|| panic!("expected main symbol ref: {json}"));
+    assert!(
+        main_symbol["expand"]
+            .as_str()
+            .unwrap()
+            .contains("tsift --envelope symbol-read")
+    );
+    assert!(
+        main_symbol["span"]["handle"]
+            .as_str()
+            .unwrap()
+            .starts_with("span-")
+    );
+    assert!(
+        json["report"]["expand"]["window"]
+            .as_str()
+            .unwrap()
+            .contains("--style window")
+    );
+}
+
+#[test]
 fn source_read_json_reports_markdown_section_list_and_code_spans() {
     let dir = markdown_edit_fixture();
 
@@ -2869,6 +2933,8 @@ fn source_read_json_reports_markdown_section_list_and_code_spans() {
             "README.md",
             "--path",
             dir.path().to_str().unwrap(),
+            "--style",
+            "window",
             "--start",
             "1",
             "--lines",
@@ -3325,7 +3391,7 @@ fn symbol_read_json_reports_symbol_body_and_navigation_commands() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|cmd| cmd.as_str().unwrap().contains("tsift source-read"))
+            .any(|cmd| cmd.as_str().unwrap().contains("source-read"))
     );
 }
 
@@ -3423,7 +3489,7 @@ fn edit_intents_json_validates_semantic_write_plan_without_mutating() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|cmd| cmd.as_str().unwrap().contains("tsift source-read"))
+            .any(|cmd| cmd.as_str().unwrap().contains("source-read"))
     );
 }
 
@@ -5061,6 +5127,8 @@ fn source_read_json_includes_cached_summary_refs_for_file() {
             "main.rs",
             "--path",
             dir.path().to_str().unwrap(),
+            "--style",
+            "window",
             "--start",
             "1",
             "--lines",

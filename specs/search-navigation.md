@@ -46,7 +46,7 @@ tsift memory import-claude-mem . --all --apply --json # fallback migration for s
 tsift memory status . --json # reports claude_mem_retirement=hold until full import, graph-db semantic retrieval, memory_retrieval_gate parity eval, and one normal no-direct-claude-mem session cycle are proven; rollback commands remain listed while held
 tsift memory capture-agent-doc-closeout . --session-path tasks/software/tsift.md --prompt-target 'do [#id]' --response-summary '<summary>' --commit-hash <sha> --session-check-status clean --json # capture agent-doc closeout events into tsift-memory
 tsift --envelope explain <symbol> --budget normal # bounded agent preview
-tsift --envelope source-read src/main.rs --start 1 --lines 80 --budget normal # bounded source-file preview with expansion handles
+tsift --envelope source-read src/main.rs --budget normal # AST-symbol projection with span handles and source-window expansions
 tsift --envelope markdown-ast README.md --path . --budget normal # Markdown AST nodes with stable handles, hierarchy, spans, and edit/source expansions
 tsift --envelope symbol-read <symbol> --file src/main.rs --budget normal # bounded symbol body packet with child refs and graph/source expansion commands
 tsift edit < edits.json         # staged multi-file search/replace batch
@@ -137,18 +137,17 @@ Because that auto-exact routing closes the main literal-lookup gap after the sta
 
 ## Bounded Source-File Reads
 
-`tsift source-read <file>` returns a bounded 1-based line window for source inspection. It is intended for agent workflows that would otherwise re-read whole files after search results or diagnostics. Relative file arguments resolve inside the nearest project/workspace root discovered from `--path`, and paths outside that root fail closed.
+`tsift source-read <file>` defaults to an AST-symbol projection for source inspection. It is intended for agent workflows that would otherwise re-read whole files after search results or diagnostics. Relative file arguments resolve inside the nearest project/workspace root discovered from `--path`, and paths outside that root fail closed. Pass `--style window` when a literal numbered source preview is needed.
 
-The JSON and envelope forms (`tsift --envelope source-read src/main.rs --start 40 --lines 80 --budget normal`) emit:
+The default JSON and envelope forms (`tsift --envelope source-read src/main.rs --budget normal`) emit:
 
-- a stable `swin-*` window handle for the file/range
-- line-numbered preview rows capped by the response budget and a body token cap (default 1500 tokens for Normal, 500 for Small, 3000 for Deep); when the preview exceeds the token cap it is truncated and an `expand.body` command is emitted for the remaining lines
-- `ssym-*` symbol refs for indexed symbols intersecting the window, each with a `symbol-read` expansion command and optional AST `span` metadata (`span-*` handle, node kind, byte range, body range, parent handle, and child handles). Markdown refs include full heading section ranges, `markdown.heading_level`, `markdown.section_path`, `markdown.section_handle`, `markdown.list_depth`, and `markdown.fence_language` where applicable.
+- a stable `sast-*` AST projection handle for the file/range
+- `ssym-*` symbol refs for indexed symbols intersecting the selected range, each with a `symbol-read` expansion command and optional AST `span` metadata (`span-*` handle, node kind, byte range, body range, parent handle, and child handles). Markdown refs include full heading section ranges, `markdown.heading_level`, `markdown.section_path`, `markdown.section_handle`, `markdown.list_depth`, and `markdown.fence_language` where applicable.
 - cached `sum-*` summary refs for the file when `.tsift/summaries.db` is present, each with a `summarize` expansion command
 - Markdown files include a bounded `markdown` projection with an outline-first section/block preview, stable `mdast-*`/`span-*` handles for visible nodes, and selected-node expansion commands
-- explicit `before`, `after`, `body`, full-file, and Markdown AST expansion commands so the next read can expand incrementally instead of falling back to `cat`/large `sed` windows
+- explicit `expand.window`, `expand.file_window`, and Markdown AST expansion commands so the next read can expand incrementally into source lines only when a literal preview is needed
 
-The command still returns the source preview when index or summary stores are missing; those enrichment failures are reported as warnings. `--scope` restricts index refs for workspace submodule indexes, and nested paths infer the matching workspace scope when possible.
+`--start`, `--lines`, and `--end` bound the AST projection range without changing the default AST output. `--style window` restores the legacy source preview mode: it emits a stable `swin-*` window handle, line-numbered preview rows capped by the response budget and body token cap, intersecting `ssym-*` refs, summaries, Markdown projection data, and explicit `before`/`after`/`body`/full-file expansion commands. The command still returns a structured packet when index or summary stores are missing; those enrichment failures are reported as warnings. `--scope` restricts index refs for workspace submodule indexes, and nested paths infer the matching workspace scope when possible.
 
 `tsift markdown-ast <file>` is the first-class Markdown projection surface. It parses the current `.md`/`.mdx` buffer directly with tree-sitter Markdown, reuses an in-process per-file/content-hash parse cache across Markdown edit planning/apply and source-read enrichment, and emits bounded block-level nodes for headings, list items, and fenced code blocks. The shared `tsift-md-ast` leaf crate also exposes `MdTextEdit`, `reparse_incremental()`, and `reparse_incremental_with_input_edit()` so CRDT/live-document consumers can update one Markdown source-range edit against a previous tree without depending on tsift's graph/index stack. Supported fenced-code languages (`rust`, `python`, `typescript`, `javascript`, `tsx`, `jsx`, `kotlin`, `zig`, `bash`, plus common extension aliases) are parsed as embedded language islands; code-block node metadata includes `embedded_symbols[]` with stable `span-*` handles, language/kind/node kind, absolute Markdown-file byte spans, and line ranges for the extracted symbols. Reports include `projection.mode` (`outline_first` or `selected_node`), `projection.cache` with source hash, cache-hit flag, node counts, and parse duration, plus phase timings for parse/extract and outline projection. Each node carries:
 
@@ -264,7 +263,7 @@ When a search envelope includes `report.scale_guard`, run one of its `narrow_com
 
 Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
 - `tsift --envelope session-review <path> --next-context --budget normal` or `tsift --envelope context-pack <path> --budget normal` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
-- `tsift --envelope source-read <file> --path . --start 1 --lines 80 --budget normal` instead of large whole-file source reads. `tsift rewrite` automatically routes full-file `cat`/`bat` reads and oversized `head`/`tail`/`sed -n` source windows to this surface when the file lives inside an indexed tsift project, while leaving small explicit windows and non-source files untouched.
+- `tsift --envelope source-read <file> --path . --budget normal` instead of large whole-file source reads. Add `--style window --start N --lines N` only when a literal line preview is required. `tsift rewrite` automatically routes full-file `cat`/`bat` reads and oversized `head`/`tail`/`sed -n` source windows to this surface when the file lives inside an indexed tsift project, while leaving small explicit windows and non-source files untouched.
 - `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
 - `tsift --envelope digest-runner --kind test --path . --shell-command '<test command>'` / `tsift --envelope digest-runner --kind log --path . --shell-command '<build command>'` for noisy test/build/install output, or let the rewrite/hooks create those artifact-backed envelopes for `cargo test`, `pytest`, and verbose cargo commands.
 - If RTK is installed, digest-runner delegates supported generic command families through `rtk rewrite` and records the chosen compact filter in `report.filter` while preserving tsift artifact handles.

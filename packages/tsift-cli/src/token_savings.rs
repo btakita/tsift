@@ -5,10 +5,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::output::{OutputFormat, ToolEnvelopeSummary};
-use crate::{
-    envelope_metric, print_json_or_envelope, shell_quote,
-    stable_handle,
-};
+use crate::{envelope_metric, print_json_or_envelope, shell_quote, stable_handle};
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct TokenSavingsFixture {
@@ -379,7 +376,7 @@ pub(crate) fn token_savings_source_read_envelope(
                 lines: read.envelope_lines,
                 required_line_anchors: read.required_line_anchors.clone(),
                 expand: format!(
-                    "tsift --envelope source-read {} --start {} --lines {} --budget normal",
+                    "tsift --envelope source-read {} --style window --start {} --lines {} --budget normal",
                     shell_quote(&read.file),
                     read.envelope_start,
                     read.envelope_lines
@@ -422,7 +419,9 @@ pub(crate) fn token_savings_markdown_projection_envelope(
         .collect()
 }
 
-pub(crate) fn build_token_savings_report(fixture: &TokenSavingsFixture) -> Result<TokenSavingsReport> {
+pub(crate) fn build_token_savings_report(
+    fixture: &TokenSavingsFixture,
+) -> Result<TokenSavingsReport> {
     let mut cases = Vec::new();
     let mut total_raw_bytes = 0;
     let mut total_envelope_bytes = 0;
@@ -536,7 +535,11 @@ fn print_token_savings_human(report: &TokenSavingsReport) {
     );
 }
 
-pub(crate) fn cmd_token_savings(fixture_path: &Path, fail_under: bool, format: OutputFormat) -> Result<()> {
+pub(crate) fn cmd_token_savings(
+    fixture_path: &Path,
+    fail_under: bool,
+    format: OutputFormat,
+) -> Result<()> {
     let fixture_body = std::fs::read_to_string(fixture_path)
         .with_context(|| format!("reading token-savings fixture: {}", fixture_path.display()))?;
     let fixture: TokenSavingsFixture = serde_json::from_str(&fixture_body)

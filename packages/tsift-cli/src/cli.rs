@@ -480,13 +480,16 @@ pub enum Commands {
         #[command(subcommand)]
         query: GraphDbQuery,
     },
-    /// Read a bounded source-file line window with expansion handles and index refs
+    /// Read a source file as an AST-symbol projection by default, or as a bounded line window
     SourceRead {
         /// Source file to preview (relative to --path/root unless absolute)
         file: PathBuf,
         /// Path to the indexed codebase (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
+        /// Projection style: ast emits indexed symbols/spans; window emits numbered source lines
+        #[arg(long, value_enum, default_value = "ast")]
+        style: SourceReadStyle,
         /// First line to include (1-based)
         #[arg(long, default_value = "1")]
         start: usize,
@@ -1291,6 +1294,12 @@ pub enum TraverseFormat {
 pub enum DispatchTraceFormat {
     Json,
     Html,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SourceReadStyle {
+    Ast,
+    Window,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

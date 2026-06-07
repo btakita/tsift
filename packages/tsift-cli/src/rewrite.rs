@@ -1,11 +1,11 @@
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _};
 use std::path::Path;
 use std::process::Command;
 
 use crate::output::OutputFormat;
-use crate::{relativize_pathbuf, shell_split, shell_quote};
+use crate::{relativize_pathbuf, shell_quote, shell_split};
 use tsift_agent_doc::session_digest;
 use tsift_graph::lang::Lang;
 use tsift_quality::lint;
@@ -824,7 +824,7 @@ fn build_source_read_rewrite_command(
     lines: usize,
 ) -> String {
     format!(
-        "tsift --envelope source-read {} --path {} --start {} --lines {} --budget normal",
+        "tsift --envelope source-read {} --path {} --style window --start {} --lines {} --budget normal",
         shell_quote(file),
         shell_quote(&root.to_string_lossy()),
         start,

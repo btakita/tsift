@@ -81,7 +81,7 @@ use token_savings::{
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use cli::{Cli, Commands, DispatchTraceFormat, GraphDbQuery, SemanticRelatedKind};
+use cli::{Cli, Commands, DispatchTraceFormat, GraphDbQuery, SemanticRelatedKind, SourceReadStyle};
 #[cfg(test)]
 use cli::{GraphDbBackend, TraverseFormat};
 use commands::digests::{
@@ -875,6 +875,7 @@ pub fn run() -> Result<()> {
         Some(Commands::SourceRead {
             file,
             path,
+            style,
             start,
             lines,
             end,
@@ -886,6 +887,7 @@ pub fn run() -> Result<()> {
         }) => cmd_source_read(
             &file,
             &path,
+            style,
             start,
             lines,
             end,
@@ -11308,7 +11310,7 @@ pub(crate) fn graph_db_backend_eval_synthetic_projection(
             .with_property("line", "1")
             .with_property(
                 "expand",
-                "tsift source-read tasks/software/synthetic.md --start 1 --lines 40",
+                "tsift --envelope source-read tasks/software/synthetic.md --style window --start 1 --lines 40 --budget normal",
             ),
         SubstrateGraphNode::new("gjob-synthetic", "job_packet", "do #synthetic")
             .with_property("ref_id", "synthetic"),
@@ -11317,7 +11319,7 @@ pub(crate) fn graph_db_backend_eval_synthetic_projection(
             .with_property("summary", "Synthetic worker owns synthetic.rs")
             .with_property(
                 "expand",
-                "tsift source-read synthetic.rs --start 1 --lines 80",
+                "tsift --envelope source-read synthetic.rs --style window --start 1 --lines 80 --budget normal",
             ),
         SubstrateGraphNode::new("gsrc-synthetic", "source_handle", "synthetic.rs:1-80")
             .with_property("file", "synthetic.rs")
@@ -11325,7 +11327,7 @@ pub(crate) fn graph_db_backend_eval_synthetic_projection(
             .with_property("end", "80")
             .with_property(
                 "expand",
-                "tsift source-read synthetic.rs --start 1 --lines 80",
+                "tsift --envelope source-read synthetic.rs --style window --start 1 --lines 80 --budget normal",
             ),
         SubstrateGraphNode::new("gfil-synthetic", "file", "synthetic.rs")
             .with_property("path", "synthetic.rs"),
@@ -15404,6 +15406,29 @@ struct SourceReadReport {
 }
 
 #[derive(Serialize)]
+struct SourceReadAstExpandCommands {
+    window: String,
+    file_window: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    markdown_ast: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SourceReadAstReport {
+    handle: String,
+    root: String,
+    file: String,
+    range: SourceRangePreview,
+    symbols: Vec<SourceSymbolRef>,
+    summaries: Vec<SourceSummaryRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    markdown: Option<SourceReadMarkdownProjection>,
+    expand: SourceReadAstExpandCommands,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
 struct SymbolReadTarget {
     handle: String,
     name: String,
@@ -15640,12 +15665,29 @@ pub(crate) fn resolve_source_file(root: &Path, file: &Path) -> Result<PathBuf> {
 }
 
 pub(crate) fn source_read_command(root: &Path, file: &str, start: usize, lines: usize) -> String {
+    source_read_window_command(root, file, start, lines)
+}
+
+pub(crate) fn source_read_window_command(
+    root: &Path,
+    file: &str,
+    start: usize,
+    lines: usize,
+) -> String {
     format!(
-        "tsift source-read {} --path {} --start {} --lines {} --budget normal",
+        "tsift --envelope source-read {} --path {} --style window --start {} --lines {} --budget normal",
         shell_quote(file),
         shell_quote(&root.to_string_lossy()),
         start,
         lines
+    )
+}
+
+pub(crate) fn source_read_ast_command(root: &Path, file: &str) -> String {
+    format!(
+        "tsift --envelope source-read {} --path {} --budget normal",
+        shell_quote(file),
+        shell_quote(&root.to_string_lossy())
     )
 }
 
@@ -16961,6 +17003,7 @@ fn cmd_markdown_ast(
 fn cmd_source_read(
     file: &Path,
     path: &Path,
+    style: SourceReadStyle,
     start: usize,
     lines: usize,
     end: Option<usize>,
@@ -17005,6 +17048,173 @@ fn cmd_source_read(
     }
     let requested_end = end.unwrap_or_else(|| start.saturating_add(lines).saturating_sub(1));
     let end_line = requested_end.min(total_lines);
+    let mut warnings = Vec::new();
+    let max_items = budget.preview_items();
+    let max_bytes = budget.preview_bytes();
+    if style == SourceReadStyle::Ast {
+        let symbols = load_source_symbols(
+            &root,
+            &file_abs,
+            &file_display,
+            &source,
+            scope,
+            start,
+            end_line,
+            max_items,
+            max_bytes,
+            &mut warnings,
+        );
+        let summaries =
+            load_source_summaries(&root, &file_display, max_items, max_bytes, &mut warnings);
+        let markdown = if is_markdown_path(&file_abs) {
+            match source_read_markdown_projection(
+                &root,
+                &file_display,
+                &source,
+                start,
+                end_line,
+                budget,
+            ) {
+                Ok(markdown) => Some(markdown),
+                Err(err) => {
+                    warnings.push(format!("markdown projection unavailable: {err:#}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let window_lines = end_line.saturating_sub(start).saturating_add(1).max(1);
+        let report = SourceReadAstReport {
+            handle: stable_handle("sast", &format!("{file_display}:{start}:{end_line}")),
+            root: root.to_string_lossy().to_string(),
+            file: file_display.clone(),
+            range: SourceRangePreview {
+                start,
+                end: end_line,
+                total_lines,
+                truncated_before: start > 1,
+                truncated_after: end_line < total_lines,
+            },
+            symbols,
+            summaries,
+            markdown,
+            expand: SourceReadAstExpandCommands {
+                window: source_read_window_command(&root, &file_display, start, window_lines),
+                file_window: source_read_window_command(
+                    &root,
+                    &file_display,
+                    1,
+                    total_lines.max(window_lines),
+                ),
+                markdown_ast: is_markdown_path(&file_abs)
+                    .then(|| markdown_ast_command(&root, &file_display, None)),
+            },
+            warnings,
+        };
+
+        if format.json_output {
+            let truncated = report.range.truncated_before
+                || report.range.truncated_after
+                || report.symbols.len() >= max_items
+                || report.summaries.len() >= max_items;
+            let follow_up = [
+                Some(report.expand.window.clone()),
+                Some(report.expand.file_window.clone()),
+                report.expand.markdown_ast.clone(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            print_json_or_envelope(
+                &report,
+                &format,
+                "source-read",
+                "ast",
+                ToolEnvelopeSummary {
+                    text: format!(
+                        "source ast {}:{}-{}",
+                        report.file, report.range.start, report.range.end
+                    ),
+                    metrics: vec![
+                        envelope_metric("symbols", report.symbols.len()),
+                        envelope_metric("summaries", report.summaries.len()),
+                        envelope_metric(
+                            "markdown_nodes",
+                            report
+                                .markdown
+                                .as_ref()
+                                .map_or(0, |markdown| markdown.visible_nodes),
+                        ),
+                    ],
+                },
+                truncated,
+                follow_up,
+            )?;
+        } else if format.compact {
+            println!(
+                "source-ast {}:{}-{} / {} handle:{}",
+                report.file,
+                report.range.start,
+                report.range.end,
+                report.range.total_lines,
+                report.handle
+            );
+            for symbol in &report.symbols {
+                println!(
+                    "  {} {}:{} {}",
+                    symbol.name, symbol.file, symbol.line, symbol.expand
+                );
+            }
+            if !report.summaries.is_empty() {
+                println!("summaries[{}]", report.summaries.len());
+            }
+            for warning in &report.warnings {
+                eprintln!("warning: {warning}");
+            }
+        } else {
+            println!(
+                "Source AST `{}` lines {}-{} of {} ({})",
+                report.file,
+                report.range.start,
+                report.range.end,
+                report.range.total_lines,
+                report.handle
+            );
+            if !report.symbols.is_empty() {
+                println!();
+                println!("Symbol refs:");
+                for symbol in &report.symbols {
+                    println!(
+                        "  {} `{}` {}:{} — {}",
+                        symbol.handle, symbol.name, symbol.file, symbol.line, symbol.expand
+                    );
+                }
+            }
+            if !report.summaries.is_empty() {
+                println!();
+                println!("Summary refs:");
+                for summary in &report.summaries {
+                    println!(
+                        "  {} `{}` — {}",
+                        summary.handle, summary.symbol_name, summary.expand
+                    );
+                }
+            }
+            println!();
+            println!("Expand:");
+            println!("  window:      {}", report.expand.window);
+            println!("  file window: {}", report.expand.file_window);
+            if let Some(markdown_ast) = &report.expand.markdown_ast {
+                println!("  markdown:    {}", markdown_ast);
+            }
+            for warning in &report.warnings {
+                eprintln!("warning: {warning}");
+            }
+        }
+
+        return Ok(());
+    }
     let max_bytes = budget.preview_bytes();
     let token_cap = budget.body_token_cap();
     let (preview, preview_end, body_truncated) = if total_lines == 0 {
@@ -17015,13 +17225,11 @@ fn cmd_source_read(
     };
     let effective_end = if body_truncated { preview_end } else { end_line };
 
-    let mut warnings = Vec::new();
     if body_truncated {
         warnings.push(format!(
             "body preview capped at ~{token_cap} tokens at line {preview_end} of {end_line}"
         ));
     }
-    let max_items = budget.preview_items();
     let symbols = load_source_symbols(
         &root,
         &file_abs,
@@ -17055,19 +17263,18 @@ fn cmd_source_read(
         None
     };
 
-    let effective_lines = effective_end.saturating_sub(start).saturating_add(1).max(1);
     let expand = SourceExpandCommands {
         before: (start > 1).then(|| {
             let before_start = start.saturating_sub(lines).max(1);
-            source_read_command(&root, &file_display, before_start, start - before_start)
+            source_read_window_command(&root, &file_display, before_start, start - before_start)
         }),
         after: (effective_end < total_lines)
-            .then(|| source_read_command(&root, &file_display, effective_end + 1, lines)),
+            .then(|| source_read_window_command(&root, &file_display, effective_end + 1, lines)),
         body: body_truncated.then(|| {
             let remaining = end_line.saturating_sub(effective_end);
-            source_read_command(&root, &file_display, effective_end + 1, remaining)
+            source_read_window_command(&root, &file_display, effective_end + 1, remaining)
         }),
-        file: source_read_command(&root, &file_display, 1, total_lines.max(effective_lines)),
+        file: source_read_ast_command(&root, &file_display),
         markdown_ast: is_markdown_path(&file_abs)
             .then(|| markdown_ast_command(&root, &file_display, None)),
     };
@@ -17363,12 +17570,12 @@ fn cmd_symbol_read(
         .saturating_add(1)
         .max(1);
     let expand = SymbolReadExpandCommands {
-        source_window: source_read_command(&root, &file_display, target_start, source_lines),
+        source_window: source_read_window_command(&root, &file_display, target_start, source_lines),
         body: body_truncated.then(|| {
             let remaining = target_end.saturating_sub(preview_end);
-            source_read_command(&root, &file_display, preview_end + 1, remaining)
+            source_read_window_command(&root, &file_display, preview_end + 1, remaining)
         }),
-        file: source_read_command(&root, &file_display, 1, total_lines.max(source_lines)),
+        file: source_read_ast_command(&root, &file_display),
         explain: source_symbol_expand_command(&root, &selected.name),
         callers: source_symbol_graph_command(&root, &selected.name, "callers"),
         callees: source_symbol_graph_command(&root, &selected.name, "callees"),
@@ -22309,7 +22516,7 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
         assert_eq!(
             result,
             Some(format!(
-                "tsift --envelope source-read \"src/lib.rs\" --path {} --start 1 --lines 80 --budget normal",
+                "tsift --envelope source-read \"src/lib.rs\" --path {} --style window --start 1 --lines 80 --budget normal",
                 shell_quote(&dir.path().to_string_lossy())
             ))
         );
@@ -22343,7 +22550,7 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
         assert_eq!(
             result,
             Some(format!(
-                "tsift --envelope source-read \"src/lib.rs\" --path {} --start 40 --lines 121 --budget normal",
+                "tsift --envelope source-read \"src/lib.rs\" --path {} --style window --start 40 --lines 121 --budget normal",
                 shell_quote(&dir.path().to_string_lossy())
             ))
         );
@@ -22363,7 +22570,7 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
         assert_eq!(
             result,
             Some(format!(
-                "tsift --envelope source-read \"src/lib.rs\" --path {} --start 81 --lines 120 --budget normal",
+                "tsift --envelope source-read \"src/lib.rs\" --path {} --style window --start 81 --lines 120 --budget normal",
                 shell_quote(&dir.path().to_string_lossy())
             ))
         );
@@ -30180,7 +30387,7 @@ fn sample() {}
                 start: 1,
                 end: 32,
                 reason: "changed file".to_string(),
-                expand: "tsift source-read main.rs --path . --start 1 --lines 32".to_string(),
+                expand: "tsift --envelope source-read main.rs --path . --style window --start 1 --lines 32 --budget normal".to_string(),
             }],
             worker_context: vec![ExplorationWorkerContext {
                 handle: "xwrk-test".to_string(),

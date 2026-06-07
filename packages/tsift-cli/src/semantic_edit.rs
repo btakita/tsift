@@ -8,18 +8,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
+use tree_sitter::StreamingIterator as _;
 use tsift_graph as graph;
 use tsift_index::index;
 use tsift_quality::lint;
 use tsift_search::impact;
-use tree_sitter::StreamingIterator as _;
 
 use crate::output::{OutputFormat, ResponseBudget, ToolEnvelopeSummary};
 use crate::{
-    envelope_metric, markdown_ast_projection, print_json_or_envelope, relativize_pathbuf,
-    resolve_query_db_path, resolve_source_file, shell_quote, source_read_command,
-    stable_handle, symbol_hit_ast_span, symbol_hit_end_line, symbol_hit_line,
-    truncate_for_budget, SourceRangePreview,
+    SourceRangePreview, envelope_metric, markdown_ast_projection, print_json_or_envelope,
+    relativize_pathbuf, resolve_query_db_path, resolve_source_file, shell_quote,
+    source_read_command, stable_handle, symbol_hit_ast_span, symbol_hit_end_line, symbol_hit_line,
+    truncate_for_budget,
 };
 
 #[derive(Deserialize)]
@@ -2150,7 +2150,10 @@ pub(crate) fn markdown_section_spans(content: &str) -> Result<Vec<MarkdownSectio
     Ok(sections)
 }
 
-pub(crate) fn markdown_block_spans(content: &str, kind: &str) -> Result<Vec<MarkdownBlockEditSpan>> {
+pub(crate) fn markdown_block_spans(
+    content: &str,
+    kind: &str,
+) -> Result<Vec<MarkdownBlockEditSpan>> {
     parse_semantic_edit_source(
         content,
         SemanticEditExecutorLanguage::Markdown,
@@ -2772,7 +2775,11 @@ fn preview_semantic_edit_content(
     }
 }
 
-pub(crate) fn semantic_edit_diff_preview(before: &str, after: &str, budget: ResponseBudget) -> Option<String> {
+pub(crate) fn semantic_edit_diff_preview(
+    before: &str,
+    after: &str,
+    budget: ResponseBudget,
+) -> Option<String> {
     if before == after {
         return None;
     }
@@ -3503,6 +3510,8 @@ fn run_semantic_edit_verification_source_read(
             file,
             "--path",
             &root_display,
+            "--style",
+            "window",
             "--start",
             &start.to_string(),
             "--lines",
@@ -3544,7 +3553,7 @@ fn run_semantic_edit_verification_source_read(
         symbol_refs,
         summary_refs,
         command: format!(
-            "tsift --envelope source-read {} --path {} --start {} --lines {} --budget normal",
+            "tsift --envelope source-read {} --path {} --style window --start {} --lines {} --budget normal",
             shell_quote(file),
             shell_quote(&root_display),
             start,
