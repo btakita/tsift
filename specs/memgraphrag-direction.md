@@ -1,8 +1,8 @@
 # MemGraphRAG Direction
 
-**Status:** Direction / proposal (not yet implemented)
+**Status:** Phase 1 + 3 implemented (`#memgraphrag1` decay retrieval, `#memgraphrag2` graph unification); `#trt1` authored nodes still pending
 **Source:** [arxiv 2606.00610 — *MemGraphRAG: Memory-based Multi-Agent System for Graph Retrieval-Augmented Generation*](https://arxiv.org/pdf/2606.00610)
-**Tracking:** backlog `#trt1`, `#rankdefault`; gated `#memgraphrag1`, `#memgraphrag2`
+**Tracking:** backlog `#trt1`, `#rankdefault`; ✅ `#memgraphrag1`, `#memgraphrag2`
 
 ## Summary
 
@@ -59,24 +59,39 @@ freshness fields gated on `community_graph_watermark` for staleness. Retrieval v
 archives; graph store as source of truth. This *is* the mem-graph roadmap — do not
 duplicate it. See `specs/graph.md` and `SPEC.md`.
 
-### 2. Temporal decay-weighted retrieval — `#memgraphrag1` (gated)
+### 2. Temporal decay-weighted retrieval — `#memgraphrag1` ✅ implemented
 
-The paper's signature mechanism and the one capability tsift lacks. The fields
-already exist (`MemoryEvent.observed_at_unix`, `community_graph_watermark`); they
-are simply not factored into ranking. Add recency/decay weighting to memory
-retrieval scoring in `MemoryQueryPlan` (`packages/tsift-memory/src/lib.rs`,
-~`query_plan`), reusing the existing staleness signals, and coordinate with
-`#rankdefault` (`ranked_neighborhood`) so memory and code share one ranking
-function. Lowest-risk first step toward this direction.
+The paper's signature mechanism. Implemented in `packages/tsift-memory/src/lib.rs`:
 
-### 3. One graph, not two — `#memgraphrag2` (gated)
+- `MemoryDecayConfig { half_life_secs, lexical_weight, recency_weight }` — default
+  one-week half-life, 0.6 lexical / 0.4 recency blend.
+- `rank_memory_events(events, query, now_unix, config, limit) -> Vec<ScoredMemoryEvent>`
+  blends a lexical-overlap component with exponential recency decay
+  (`0.5 ^ (age / half_life)`) over `MemoryEvent.observed_at_unix`; events without a
+  timestamp keep their lexical score but earn no recency credit. Ties break toward
+  the more recent event. `ScoredMemoryEvent` exposes `lexical_score` /
+  `recency_score` / `score` for explainability.
+- `MemoryQueryPlan` now carries the `decay` config so `tsift memory query-plan`
+  documents the ranking contract.
 
-Today `tsift-memory`'s `GraphProjection` (`packages/tsift-memory/src/lib.rs`,
-~`projection`) and the code `GraphStore` are separate. Merging them so authored
-memory nodes (`#trt1`) and code symbols live in a single queryable graph surface
-(`context-pack` / search injection) is the architectural move that earns the
-"mem graph RAG" label: memory stream + code graph + decay retrieval over one
-substrate. Depends on `#trt1` and a product decision.
+Still to do: fold this into `#rankdefault` (`ranked_neighborhood`) so memory and
+code share one ranking function once memory nodes are in the graph (below).
+
+### 3. One graph, not two — `#memgraphrag2` ✅ implemented (core)
+
+`tsift-memory`'s `project_memory_events` already emits `tsift-core` `GraphProjection`
+nodes/edges, and `SqliteGraphStore::upsert_projection` already ingests them. The
+wiring is now in place:
+
+- `tsift memory project-graph [PATH] [--graph-db <p>] [--limit N]` reads stored
+  memory events, projects them (`memory_session` / `memory_event` nodes,
+  `records_memory_event` edges), and upserts them into the shared
+  `.tsift/graph.db` so memory nodes are queryable alongside code symbols via the
+  same `graph-db` retrieval surface (`packages/tsift-cli/src/commands/memory.rs`,
+  `project_memory_into_graph`).
+
+Remaining for full unification: authored `Finding`/`Decision`/`Note` node types
+(`#trt1`) and decay-aware ranking over the merged graph. Depends on `#trt1`.
 
 ## Out of scope: multi-agent orchestration
 

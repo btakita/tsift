@@ -1181,6 +1181,22 @@ pub enum MemoryCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Project stored memory events into the shared code graph store so memory
+    /// nodes are queryable alongside code symbols (#memgraphrag2)
+    ProjectGraph {
+        /// Project root whose .tsift/memory.db is projected into .tsift/graph.db
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Override the destination graph DB path (defaults to .tsift/graph.db)
+        #[arg(long)]
+        graph_db: Option<PathBuf>,
+        /// Maximum memory events to project
+        #[arg(long, default_value = "5000")]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl MemoryCommand {
@@ -1192,7 +1208,8 @@ impl MemoryCommand {
             | Self::CaptureAgentDocCloseout { json, .. }
             | Self::HandoffPlan { json, .. }
             | Self::BudgetGuard { json, .. }
-            | Self::QueryPlan { json, .. } => *json,
+            | Self::QueryPlan { json, .. }
+            | Self::ProjectGraph { json, .. } => *json,
         }
     }
 }

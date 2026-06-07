@@ -1459,13 +1459,122 @@ pub fn project_memory_events(events: &[MemoryEvent]) -> GraphProjection {
     projection
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Decay-weighted memory retrieval configuration (`#memgraphrag1`).
+///
+/// Retrieval combines a lexical relevance component with a recency component
+/// that decays exponentially in the age of each event. `half_life_secs` is the
+/// age at which an event's recency contribution halves; the two weights blend
+/// the lexical and recency components into the final score.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MemoryDecayConfig {
+    pub half_life_secs: f64,
+    pub lexical_weight: f64,
+    pub recency_weight: f64,
+}
+
+impl Default for MemoryDecayConfig {
+    fn default() -> Self {
+        // One-week half-life with a slight lexical bias: recent context matters
+        // but a strong term match should still surface older events.
+        Self {
+            half_life_secs: 7.0 * 24.0 * 3600.0,
+            lexical_weight: 0.6,
+            recency_weight: 0.4,
+        }
+    }
+}
+
+/// A memory event scored by [`rank_memory_events`], with its component scores
+/// exposed for explainability.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScoredMemoryEvent {
+    pub event: MemoryEvent,
+    pub lexical_score: f64,
+    pub recency_score: f64,
+    pub score: f64,
+}
+
+fn memory_query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(|term| term.to_lowercase())
+        .collect()
+}
+
+fn memory_lexical_overlap(terms: &[String], text: &str) -> f64 {
+    if terms.is_empty() {
+        return 0.0;
+    }
+    let haystack = text.to_lowercase();
+    let hits = terms
+        .iter()
+        .filter(|term| haystack.contains(term.as_str()))
+        .count();
+    hits as f64 / terms.len() as f64
+}
+
+/// Exponential recency decay: `0.5 ^ (age / half_life)`. Events without an
+/// `observed_at_unix` timestamp receive no recency credit (they still rank on
+/// lexical relevance).
+fn memory_recency_decay(observed_at_unix: Option<i64>, now_unix: i64, half_life_secs: f64) -> f64 {
+    match observed_at_unix {
+        Some(observed) => {
+            let age = (now_unix - observed).max(0) as f64;
+            0.5f64.powf(age / half_life_secs.max(1.0))
+        }
+        None => 0.0,
+    }
+}
+
+/// Rank memory events for a query, blending lexical relevance with exponential
+/// recency decay (`#memgraphrag1`). Returns at most `limit` events, highest
+/// score first; ties break toward the more recent event.
+pub fn rank_memory_events(
+    events: &[MemoryEvent],
+    query: &str,
+    now_unix: i64,
+    config: MemoryDecayConfig,
+    limit: usize,
+) -> Vec<ScoredMemoryEvent> {
+    let terms = memory_query_terms(query);
+    let mut scored: Vec<ScoredMemoryEvent> = events
+        .iter()
+        .map(|event| {
+            let lexical_score = memory_lexical_overlap(&terms, &event.text);
+            let recency_score =
+                memory_recency_decay(event.observed_at_unix, now_unix, config.half_life_secs);
+            let score = config.lexical_weight * lexical_score + config.recency_weight * recency_score;
+            ScoredMemoryEvent {
+                event: event.clone(),
+                lexical_score,
+                recency_score,
+                score,
+            }
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.recency_score
+                    .partial_cmp(&a.recency_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    scored.truncate(limit);
+    scored
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryQueryPlan {
     pub contract_version: String,
     pub query: String,
     pub limit: usize,
     pub max_tokens: usize,
     pub estimated_query_tokens: usize,
+    pub decay: MemoryDecayConfig,
     pub output_contract: Vec<String>,
     pub next_commands: Vec<String>,
 }
@@ -1480,14 +1589,17 @@ pub fn plan_memory_query(query: &str, limit: usize, max_tokens: usize) -> Result
         limit,
         max_tokens,
         estimated_query_tokens: estimate_tokens(query),
+        decay: MemoryDecayConfig::default(),
         output_contract: vec![
-            "ranked memory_event ids".to_string(),
+            "decay-weighted ranked memory_event ids (lexical + recency)".to_string(),
+            "per-event lexical_score, recency_score, and blended score".to_string(),
             "source_ref handles for expansion".to_string(),
             "graph node ids for neighborhood projection".to_string(),
             "token estimates for every returned packet".to_string(),
         ],
         next_commands: vec![
             "tsift memory status . --json".to_string(),
+            "tsift memory project-graph . --json".to_string(),
             "tsift graph-db --path . --json related '<query>'".to_string(),
         ],
     })
@@ -1520,6 +1632,67 @@ mod tests {
             plan.deferred_events[0].reason,
             "event_exceeds_max_event_tokens"
         );
+    }
+
+    fn event_at(text: &str, observed_at_unix: i64) -> MemoryEvent {
+        let mut event = MemoryEvent::new(MemoryEventKind::ResponseSummary, "session.md", text);
+        event.observed_at_unix = Some(observed_at_unix);
+        event
+    }
+
+    #[test]
+    fn recency_decay_halves_at_half_life() {
+        let now = 1_000_000;
+        let half_life = 1000.0;
+        let fresh = memory_recency_decay(Some(now), now, half_life);
+        let one_half_life = memory_recency_decay(Some(now - 1000), now, half_life);
+        let two_half_lives = memory_recency_decay(Some(now - 2000), now, half_life);
+        assert!((fresh - 1.0).abs() < 1e-9);
+        assert!((one_half_life - 0.5).abs() < 1e-9);
+        assert!((two_half_lives - 0.25).abs() < 1e-9);
+        // Missing timestamps get no recency credit.
+        assert_eq!(memory_recency_decay(None, now, half_life), 0.0);
+    }
+
+    #[test]
+    fn rank_recent_event_outranks_old_with_equal_lexical() {
+        let now = 10_000_000;
+        let config = MemoryDecayConfig {
+            half_life_secs: 1000.0,
+            lexical_weight: 0.5,
+            recency_weight: 0.5,
+        };
+        let recent = event_at("graph retrieval decay", now - 100);
+        let old = event_at("graph retrieval decay", now - 100_000);
+        let ranked = rank_memory_events(&[old, recent], "graph retrieval", now, config, 10);
+        assert_eq!(ranked.len(), 2);
+        assert!(ranked[0].event.observed_at_unix.unwrap() > ranked[1].event.observed_at_unix.unwrap());
+        assert!(ranked[0].score > ranked[1].score);
+    }
+
+    #[test]
+    fn rank_strong_lexical_can_beat_recency_and_respects_limit() {
+        let now = 10_000_000;
+        let config = MemoryDecayConfig::default();
+        let on_topic_old = event_at("decay weighted memory retrieval ranking", now - 60 * 3600);
+        let off_topic_fresh = event_at("unrelated build log output", now - 10);
+        let ranked = rank_memory_events(
+            &[off_topic_fresh, on_topic_old],
+            "decay weighted retrieval",
+            now,
+            config,
+            1,
+        );
+        assert_eq!(ranked.len(), 1, "limit must be respected");
+        assert!(ranked[0].event.text.contains("decay weighted memory retrieval"));
+        assert!(ranked[0].lexical_score > 0.0);
+    }
+
+    #[test]
+    fn plan_memory_query_carries_default_decay_config() {
+        let plan = plan_memory_query("graph rag", 5, 1500).unwrap();
+        assert_eq!(plan.decay, MemoryDecayConfig::default());
+        assert!(plan.output_contract.iter().any(|line| line.contains("decay")));
     }
 
     #[test]

@@ -10,8 +10,10 @@ use tsift_memory::{
     MemoryHandoffPlan, MemoryQueryPlan, MemoryStore, agent_doc_closeout_events,
     agent_doc_hook_contract, default_claude_mem_db_path, default_memory_db_path,
     guard_memory_handoff, import_claude_mem, inspect_claude_mem, memory_graph_node_kinds,
-    memory_schema_sql, plan_capture_handoff, plan_memory_query,
+    memory_schema_sql, plan_capture_handoff, plan_memory_query, project_memory_events,
+    read_memory_events,
 };
+use tsift_sqlite::SqliteGraphStore;
 
 const DEFAULT_CLAUDE_MEM_IMPORT_LIMIT: usize = 1000;
 
@@ -158,6 +160,12 @@ pub(crate) fn cmd_memory(command: MemoryCommand, format: OutputFormat) -> Result
             max_tokens,
             ..
         } => cmd_memory_query_plan(&query, limit, max_tokens, format),
+        MemoryCommand::ProjectGraph {
+            path,
+            graph_db,
+            limit,
+            ..
+        } => cmd_memory_project_graph(&path, graph_db.as_deref(), limit, format),
     }
 }
 
@@ -619,6 +627,85 @@ fn cmd_memory_query_plan(
     )
 }
 
+#[derive(Serialize)]
+struct MemoryProjectGraphReport {
+    contract_version: String,
+    memory_db: String,
+    graph_db: String,
+    events_projected: usize,
+    nodes_upserted: usize,
+    edges_upserted: usize,
+    graph_node_kinds: Vec<&'static str>,
+    next_commands: Vec<String>,
+}
+
+/// Project stored memory events into the shared code graph store (#memgraphrag2).
+/// Memory `memory_session`/`memory_event` nodes become queryable alongside code
+/// symbols through the same `graph-db` retrieval surface.
+/// Core of `#memgraphrag2`: read memory events, project them, and upsert into the
+/// shared graph store. Returns `(events_projected, nodes_upserted, edges_upserted)`.
+fn project_memory_into_graph(
+    memory_db: &Path,
+    graph_db: &Path,
+    limit: usize,
+) -> Result<(usize, usize, usize)> {
+    let events = read_memory_events(memory_db, limit)?;
+    let projection = project_memory_events(&events);
+    let nodes = projection.nodes.len();
+    let edges = projection.edges.len();
+    if let Some(parent) = graph_db.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create graph db dir {}", parent.display()))?;
+    }
+    let mut store = SqliteGraphStore::open(graph_db)
+        .with_context(|| format!("open graph store {}", graph_db.display()))?;
+    store.upsert_projection(&projection)?;
+    Ok((events.len(), nodes, edges))
+}
+
+fn cmd_memory_project_graph(
+    path: &Path,
+    graph_db_override: Option<&Path>,
+    limit: usize,
+    format: OutputFormat,
+) -> Result<()> {
+    let memory_db = default_memory_db_path(path);
+    let graph_db = graph_db_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| crate::graph_substrate_db_path(path, None));
+    let (events_projected, nodes_upserted, edges_upserted) =
+        project_memory_into_graph(&memory_db, &graph_db, limit)?;
+
+    let next_commands = vec![
+        "tsift graph-db --path . --json related '<query>'".to_string(),
+        "tsift memory status . --json".to_string(),
+    ];
+    let report = MemoryProjectGraphReport {
+        contract_version: tsift_memory::MEMORY_CONTRACT_VERSION.to_string(),
+        memory_db: memory_db.display().to_string(),
+        graph_db: graph_db.display().to_string(),
+        events_projected,
+        nodes_upserted,
+        edges_upserted,
+        graph_node_kinds: memory_graph_node_kinds(),
+        next_commands: next_commands.clone(),
+    };
+    print_memory_report(
+        &report,
+        &format,
+        "project-graph",
+        ToolEnvelopeSummary {
+            text: "memory events projected into shared graph store".to_string(),
+            metrics: vec![
+                envelope_metric("events", events_projected),
+                envelope_metric("nodes", nodes_upserted),
+                envelope_metric("edges", edges_upserted),
+            ],
+        },
+        next_commands,
+    )
+}
+
 fn resolve_claude_mem_path(explicit: Option<&Path>) -> Result<PathBuf> {
     explicit
         .map(Path::to_path_buf)
@@ -654,4 +741,64 @@ fn print_memory_report<T: Serialize>(
 #[allow(dead_code)]
 fn _schema_sql_for_tests() -> &'static str {
     memory_schema_sql()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+    use tsift_memory::MemoryStore;
+
+    #[test]
+    fn project_memory_into_graph_persists_memory_nodes() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let memory_db = default_memory_db_path(root);
+        std::fs::create_dir_all(memory_db.parent().unwrap()).unwrap();
+
+        let store = MemoryStore::open_or_create(&memory_db).unwrap();
+        let mut prompt = MemoryEvent::new(
+            MemoryEventKind::PromptTarget,
+            "session.md",
+            "run the gated backlog items",
+        );
+        prompt.session_id = Some("sess-1".to_string());
+        prompt.observed_at_unix = Some(1_700_000_000);
+        let mut response = MemoryEvent::new(
+            MemoryEventKind::ResponseSummary,
+            "session.md",
+            "decay weighted retrieval shipped",
+        );
+        response.session_id = Some("sess-1".to_string());
+        response.observed_at_unix = Some(1_700_000_100);
+        store.insert_event(&prompt).unwrap();
+        store.insert_event(&response).unwrap();
+
+        let graph_db = root.join(".tsift").join("graph.db");
+        let (events, nodes, edges) =
+            project_memory_into_graph(&memory_db, &graph_db, 100).unwrap();
+        assert_eq!(events, 2);
+        assert!(nodes >= 3, "two events + one session node, got {nodes}");
+        assert!(edges >= 2, "session records each event, got {edges}");
+
+        // The unified graph store persists memory nodes alongside code symbols.
+        let conn = Connection::open(&graph_db).unwrap();
+        let memory_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_nodes WHERE kind = 'memory_event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(memory_events, 2);
+        let sessions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_nodes WHERE kind = 'memory_session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sessions, 1);
+    }
 }
