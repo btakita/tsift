@@ -1197,6 +1197,46 @@ pub enum MemoryCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Derive and materialize the Semantic Ontology Graph layer (node/edge KIND
+    /// type-nodes + permitted relations) from the shared graph store (#memgraphrag-ont)
+    OntologyGraph {
+        /// Project root whose .tsift/graph.db is introspected and updated
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Override the graph DB path (defaults to .tsift/graph.db)
+        #[arg(long)]
+        graph_db: Option<PathBuf>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add an authored finding/decision/note node anchored to a symbol handle (#trt1)
+    FindingAdd {
+        /// Project root whose .tsift/graph.db receives the authored node
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Authored node kind: finding | decision | note
+        #[arg(long, default_value = "finding")]
+        kind: String,
+        /// Finding text
+        #[arg(long)]
+        text: String,
+        /// Stable symbol handle / graph node id to anchor to (NOT a line number)
+        #[arg(long)]
+        anchor: String,
+        /// Confidence in 0..=1
+        #[arg(long, default_value = "1.0")]
+        confidence: f64,
+        /// Optional session id to tag the authored node
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Override the graph DB path (defaults to .tsift/graph.db)
+        #[arg(long)]
+        graph_db: Option<PathBuf>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl MemoryCommand {
@@ -1209,7 +1249,9 @@ impl MemoryCommand {
             | Self::HandoffPlan { json, .. }
             | Self::BudgetGuard { json, .. }
             | Self::QueryPlan { json, .. }
-            | Self::ProjectGraph { json, .. } => *json,
+            | Self::ProjectGraph { json, .. }
+            | Self::OntologyGraph { json, .. }
+            | Self::FindingAdd { json, .. } => *json,
         }
     }
 }

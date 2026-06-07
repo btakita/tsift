@@ -1,8 +1,8 @@
 # MemGraphRAG Direction
 
-**Status:** Phase 1 + 3 implemented (`#memgraphrag1` decay retrieval, `#memgraphrag2` graph unification); `#trt1` authored nodes still pending
+**Status:** All three layers implemented (core) — `#memgraphrag1` decay retrieval, `#memgraphrag2` graph unification, `#trt1` authored nodes (core), `#memgraphrag-ont` ontology layer. Remaining: `#rankdefault` unified ranking + `#trt1` follow-on phases (capture/injection/projection).
 **Source:** [arxiv 2606.00610 — *MemGraphRAG: Memory-based Multi-Agent System for Graph Retrieval-Augmented Generation*](https://arxiv.org/pdf/2606.00610)
-**Tracking:** backlog `#trt1`, `#rankdefault`; ✅ `#memgraphrag1`, `#memgraphrag2`
+**Tracking:** ✅ `#memgraphrag1`, `#memgraphrag2`, `#trt1` (core), `#memgraphrag-ont`; backlog `#rankdefault`
 
 ## Summary
 
@@ -50,14 +50,23 @@ flowchart LR
 
 ## Gaps and roadmap
 
-### 1. Authored memory nodes anchored to code — `#trt1` (already specced)
+### 1. Authored memory nodes anchored to code — `#trt1` ✅ implemented (core)
 
-Add `Finding` / `Decision` / `Note` nodes to `GraphStore`, anchored by stable
-symbol-handle / tagpath edges (not line numbers), with provenance + confidence +
-freshness fields gated on `community_graph_watermark` for staleness. Retrieval via
-`context-pack` / search injection; opt-in/passive capture from agent-doc session
-archives; graph store as source of truth. This *is* the mem-graph roadmap — do not
-duplicate it. See `specs/graph.md` and `SPEC.md`.
+Implemented in `packages/tsift-memory/src/lib.rs`:
+- `AuthoredNodeKind` (`Finding` / `Decision` / `Note`) and
+  `authored_node_projection(kind, text, anchor_handle, confidence, observed_at_unix, session_id)`
+  build a content-stable node anchored to a stable symbol handle (graph node id /
+  tagpath — not a line number) via an `annotates` edge, with `confidence`
+  (clamped 0..=1), `observed_at_unix` freshness, and provenance.
+- CLI: `tsift memory finding-add --text <t> --anchor <handle> [--kind decision|note] [--confidence c]`
+  (`packages/tsift-cli/src/commands/memory.rs`). The `annotates` edge requires
+  the anchor node to exist (FK); when it does not, the authored node is still
+  recorded (carrying `anchor_handle`) and the edge is deferred until the anchor
+  lands (`anchor_resolved` in the report).
+
+Follow-on phases (queued separately): `context-pack` / search injection,
+`community_graph_watermark` staleness gating, opt-in/passive capture from
+agent-doc session archives, and md/html projection.
 
 ### 2. Temporal decay-weighted retrieval — `#memgraphrag1` ✅ implemented
 
@@ -90,8 +99,29 @@ wiring is now in place:
   same `graph-db` retrieval surface (`packages/tsift-cli/src/commands/memory.rs`,
   `project_memory_into_graph`).
 
-Remaining for full unification: authored `Finding`/`Decision`/`Note` node types
-(`#trt1`) and decay-aware ranking over the merged graph. Depends on `#trt1`.
+Remaining for full unification: decay-aware ranking over the merged graph
+(`#rankdefault`).
+
+### 4. Semantic Ontology Graph layer — `#memgraphrag-ont` ✅ implemented
+
+The paper's third layer (typed backbone). Implemented as a **data-driven** schema
+derived from the instance graph (`SqliteGraphStore::derive_ontology`,
+`packages/tsift-sqlite/src/lib.rs`):
+- one `ontology_type` node per distinct node kind (with `instance_count`), and
+- one `ontology_relation:<edge_kind>` edge per observed `(from_kind, edge_kind,
+  to_kind)` triple (with `instance_count`).
+
+Existing ontology rows are excluded from the derivation so it is idempotent and
+never folds itself in. CLI: `tsift memory ontology-graph` derives and upserts the
+layer back into `.tsift/graph.db`, so types + permitted relations are queryable
+alongside instances and retrieval can start from abstract types.
+
+**Ontology source (decided):** the base ontology = code `NodeKind`/edge-kind enums
++ `#trt1` authored-node types, surfacing automatically because the derivation is
+empirical over whatever node/edge kinds exist (code symbols, memory nodes, authored
+findings). An existence-lang ontology may be folded in as a basis **when a project
+actually uses existence-lang** (not always present); otherwise this efficient
+data-driven representation stands.
 
 ## Out of scope: multi-agent orchestration
 

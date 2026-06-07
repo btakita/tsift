@@ -1517,6 +1517,69 @@ impl SqliteGraphStore {
         })
     }
 
+    /// Derive a Semantic Ontology Graph (`#memgraphrag-ont`, MemGraphRAG arxiv
+    /// 2606.00610 third layer) from the instance graph: one `ontology_type` node
+    /// per distinct node kind, and one `ontology_relation:<edge_kind>` edge per
+    /// observed `(from_kind, edge_kind, to_kind)` triple, each carrying an
+    /// `instance_count`. This data-driven schema lets retrieval start from
+    /// abstract types and prune by permitted inter-type relations. Existing
+    /// ontology rows are excluded so the derivation is idempotent and never folds
+    /// the ontology layer into itself.
+    pub fn derive_ontology(&self) -> Result<GraphProjection> {
+        let mut projection = GraphProjection::default();
+
+        let mut node_stmt = self.conn.prepare(
+            "SELECT kind, COUNT(*) FROM graph_nodes \
+             WHERE kind != 'ontology_type' \
+             GROUP BY kind ORDER BY kind",
+        )?;
+        let node_rows =
+            node_stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        for row in node_rows {
+            let (kind, count) = row?;
+            projection.nodes.push(
+                GraphNode::new(format!("ontology_type:{kind}"), "ontology_type", &kind)
+                    .with_property("type_kind", &kind)
+                    .with_property("instance_count", count.to_string())
+                    .with_provenance(GraphProvenance::new("tsift-ontology", &kind)),
+            );
+        }
+
+        let mut rel_stmt = self.conn.prepare(
+            "SELECT n1.kind, e.kind, n2.kind, COUNT(*) \
+             FROM graph_edges e \
+             JOIN graph_nodes n1 ON e.from_id = n1.id \
+             JOIN graph_nodes n2 ON e.to_id = n2.id \
+             WHERE e.kind NOT LIKE 'ontology_relation:%' \
+               AND n1.kind != 'ontology_type' AND n2.kind != 'ontology_type' \
+             GROUP BY n1.kind, e.kind, n2.kind \
+             ORDER BY n1.kind, e.kind, n2.kind",
+        )?;
+        let rel_rows = rel_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        for row in rel_rows {
+            let (from_kind, edge_kind, to_kind, count) = row?;
+            projection.edges.push(
+                GraphEdge::new(
+                    format!("ontology_type:{from_kind}"),
+                    format!("ontology_type:{to_kind}"),
+                    format!("ontology_relation:{edge_kind}"),
+                )
+                .with_property("edge_kind", &edge_kind)
+                .with_property("instance_count", count.to_string())
+                .with_provenance(GraphProvenance::new("tsift-ontology", &edge_kind)),
+            );
+        }
+
+        Ok(projection)
+    }
+
     pub fn upsert_projection(&mut self, projection: &GraphProjection) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
@@ -4168,5 +4231,55 @@ mod tests {
         };
         store.replace_projection(&projection).unwrap();
         assert!(!store.temp_table_active.get());
+    }
+
+    #[test]
+    fn derive_ontology_summarizes_types_and_relations() {
+        let mut store = SqliteGraphStore::in_memory().unwrap();
+        let seed = GraphProjection {
+            nodes: vec![
+                GraphNode::new("fn:a", "function", "a"),
+                GraphNode::new("fn:b", "function", "b"),
+                GraphNode::new("mod:m", "module", "m"),
+            ],
+            edges: vec![
+                GraphEdge::new("fn:a", "fn:b", "calls"),
+                GraphEdge::new("mod:m", "fn:a", "contains"),
+            ],
+        };
+        store.upsert_projection(&seed).unwrap();
+
+        let onto = store.derive_ontology().unwrap();
+        let type_kinds: std::collections::BTreeSet<_> =
+            onto.nodes.iter().map(|n| n.label.clone()).collect();
+        assert!(type_kinds.contains("function"));
+        assert!(type_kinds.contains("module"));
+        assert!(onto.nodes.iter().all(|n| n.kind == "ontology_type"));
+
+        let rel: std::collections::BTreeSet<_> = onto
+            .edges
+            .iter()
+            .map(|e| (e.from_id.clone(), e.kind.clone(), e.to_id.clone()))
+            .collect();
+        assert!(rel.contains(&(
+            "ontology_type:function".into(),
+            "ontology_relation:calls".into(),
+            "ontology_type:function".into()
+        )));
+        assert!(rel.contains(&(
+            "ontology_type:module".into(),
+            "ontology_relation:contains".into(),
+            "ontology_type:function".into()
+        )));
+
+        let function_node = onto.nodes.iter().find(|n| n.label == "function").unwrap();
+        assert_eq!(function_node.properties.get("instance_count").unwrap(), "2");
+
+        // Idempotent: upserting the ontology then re-deriving excludes ontology rows.
+        store.upsert_projection(&onto).unwrap();
+        let onto2 = store.derive_ontology().unwrap();
+        assert!(onto2.nodes.iter().all(|n| n.kind == "ontology_type"));
+        assert_eq!(onto2.nodes.len(), onto.nodes.len());
+        assert_eq!(onto2.edges.len(), onto.edges.len());
     }
 }

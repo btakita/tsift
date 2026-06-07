@@ -3,7 +3,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_ite
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use tsift_core::{GraphEdge, GraphNode, GraphProjection, GraphProvenance};
+use tsift_core::{GraphEdge, GraphFreshness, GraphNode, GraphProjection, GraphProvenance};
 
 pub const MEMORY_CONTRACT_VERSION: &str = "tsift-memory-v1";
 pub const MEMORY_SCHEMA_VERSION: i64 = 1;
@@ -1413,6 +1413,79 @@ pub fn memory_graph_node_kinds() -> Vec<&'static str> {
     ]
 }
 
+/// Authored finding-graph node kinds (`#trt1`): human/agent-authored knowledge
+/// anchored to code, distinct from passively-captured `MemoryEvent`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthoredNodeKind {
+    Finding,
+    Decision,
+    Note,
+}
+
+impl AuthoredNodeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Finding => "finding",
+            Self::Decision => "decision",
+            Self::Note => "note",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "finding" => Ok(Self::Finding),
+            "decision" => Ok(Self::Decision),
+            "note" => Ok(Self::Note),
+            other => {
+                bail!("unsupported authored node kind `{other}` (expected finding|decision|note)")
+            }
+        }
+    }
+}
+
+/// Build a `GraphProjection` for an authored finding/decision/note node
+/// (`#trt1`), anchored to a stable symbol handle (graph node id / tagpath — NOT
+/// a line number) via an `annotates` edge. `confidence` is clamped to `0..=1`;
+/// `observed_at_unix` is the freshness stamp. The node id is content-stable, so
+/// re-authoring the same text on the same anchor dedupes instead of duplicating.
+pub fn authored_node_projection(
+    kind: AuthoredNodeKind,
+    text: &str,
+    anchor_handle: &str,
+    confidence: f64,
+    observed_at_unix: i64,
+    session_id: Option<&str>,
+) -> GraphProjection {
+    let mut projection = GraphProjection::default();
+    let confidence = confidence.clamp(0.0, 1.0);
+    let node_id = format!(
+        "{}:{}",
+        kind.as_str(),
+        blake3::hash(format!("{}|{}|{}", kind.as_str(), anchor_handle, text).as_bytes()).to_hex()
+    );
+    let label: String = text.chars().take(80).collect();
+    let mut node = GraphNode::new(&node_id, kind.as_str(), label)
+        .with_property("text", text)
+        .with_property("anchor_handle", anchor_handle)
+        .with_property("confidence", format!("{confidence:.3}"))
+        .with_property("observed_at_unix", observed_at_unix.to_string())
+        .with_provenance(GraphProvenance::new("tsift-findings", anchor_handle))
+        .with_freshness(GraphFreshness {
+            content_hash: None,
+            observed_at_unix: Some(observed_at_unix),
+        });
+    if let Some(session_id) = session_id {
+        node = node.with_property("session_id", session_id);
+    }
+    projection.nodes.push(node);
+    projection.edges.push(
+        GraphEdge::new(node_id, anchor_handle, "annotates")
+            .with_property("authored_kind", kind.as_str())
+            .with_provenance(GraphProvenance::new("tsift-findings", anchor_handle)),
+    );
+    projection
+}
+
 pub fn project_memory_events(events: &[MemoryEvent]) -> GraphProjection {
     let mut projection = GraphProjection::default();
     let mut sessions = BTreeSet::new();
@@ -1686,6 +1759,43 @@ mod tests {
         assert_eq!(ranked.len(), 1, "limit must be respected");
         assert!(ranked[0].event.text.contains("decay weighted memory retrieval"));
         assert!(ranked[0].lexical_score > 0.0);
+    }
+
+    #[test]
+    fn authored_node_projection_anchors_and_dedupes() {
+        let p = authored_node_projection(
+            AuthoredNodeKind::Finding,
+            "decay ranking ships in tsift-memory",
+            "symbol:rank_memory_events",
+            1.7, // out of range -> clamps to 1.0
+            1_700_000_000,
+            Some("sess-1"),
+        );
+        assert_eq!(p.nodes.len(), 1);
+        assert_eq!(p.edges.len(), 1);
+        let node = &p.nodes[0];
+        assert_eq!(node.kind, "finding");
+        assert_eq!(node.properties.get("confidence").unwrap(), "1.000");
+        assert_eq!(
+            node.properties.get("anchor_handle").unwrap(),
+            "symbol:rank_memory_events"
+        );
+        assert_eq!(p.edges[0].kind, "annotates");
+        assert_eq!(p.edges[0].to_id, "symbol:rank_memory_events");
+        assert_eq!(node.freshness.as_ref().unwrap().observed_at_unix, Some(1_700_000_000));
+
+        // Same kind+anchor+text -> identical (deduping) node id.
+        let again = authored_node_projection(
+            AuthoredNodeKind::Finding,
+            "decay ranking ships in tsift-memory",
+            "symbol:rank_memory_events",
+            0.5,
+            1_700_000_999,
+            None,
+        );
+        assert_eq!(again.nodes[0].id, node.id);
+        assert!(AuthoredNodeKind::parse("note").is_ok());
+        assert!(AuthoredNodeKind::parse("bogus").is_err());
     }
 
     #[test]

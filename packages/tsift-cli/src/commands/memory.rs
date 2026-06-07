@@ -5,15 +5,16 @@ use anyhow::{Context, Result, bail};
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tsift_memory::{
     ClaudeMemImportPlan, MemoryBudget, MemoryBudgetGuardInput, MemoryEvent, MemoryEventKind,
     MemoryHandoffPlan, MemoryQueryPlan, MemoryStore, agent_doc_closeout_events,
     agent_doc_hook_contract, default_claude_mem_db_path, default_memory_db_path,
-    guard_memory_handoff, import_claude_mem, inspect_claude_mem, memory_graph_node_kinds,
-    memory_schema_sql, plan_capture_handoff, plan_memory_query, project_memory_events,
-    read_memory_events,
+    AuthoredNodeKind, authored_node_projection, guard_memory_handoff, import_claude_mem,
+    inspect_claude_mem, memory_graph_node_kinds, memory_schema_sql, plan_capture_handoff,
+    plan_memory_query, project_memory_events, read_memory_events,
 };
-use tsift_sqlite::SqliteGraphStore;
+use tsift_sqlite::{GraphStore, SqliteGraphStore};
 
 const DEFAULT_CLAUDE_MEM_IMPORT_LIMIT: usize = 1000;
 
@@ -166,6 +167,28 @@ pub(crate) fn cmd_memory(command: MemoryCommand, format: OutputFormat) -> Result
             limit,
             ..
         } => cmd_memory_project_graph(&path, graph_db.as_deref(), limit, format),
+        MemoryCommand::OntologyGraph {
+            path, graph_db, ..
+        } => cmd_memory_ontology_graph(&path, graph_db.as_deref(), format),
+        MemoryCommand::FindingAdd {
+            path,
+            kind,
+            text,
+            anchor,
+            confidence,
+            session_id,
+            graph_db,
+            ..
+        } => cmd_memory_finding_add(
+            &path,
+            &kind,
+            &text,
+            &anchor,
+            confidence,
+            session_id.as_deref(),
+            graph_db.as_deref(),
+            format,
+        ),
     }
 }
 
@@ -706,6 +729,167 @@ fn cmd_memory_project_graph(
     )
 }
 
+#[derive(Serialize)]
+struct MemoryOntologyReport {
+    contract_version: String,
+    graph_db: String,
+    type_nodes: usize,
+    relations: usize,
+    next_commands: Vec<String>,
+}
+
+/// Derive the Semantic Ontology Graph layer (#memgraphrag-ont) from the shared
+/// graph store and upsert it back so node/edge KIND types + permitted relations
+/// are queryable alongside instances.
+fn cmd_memory_ontology_graph(
+    path: &Path,
+    graph_db_override: Option<&Path>,
+    format: OutputFormat,
+) -> Result<()> {
+    let graph_db = graph_db_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| crate::graph_substrate_db_path(path, None));
+    if !graph_db.exists() {
+        bail!(
+            "graph store {} does not exist; run `tsift graph-db refresh` or `tsift memory project-graph` first",
+            graph_db.display()
+        );
+    }
+    let mut store = SqliteGraphStore::open(&graph_db)
+        .with_context(|| format!("open graph store {}", graph_db.display()))?;
+    let ontology = store.derive_ontology()?;
+    let type_nodes = ontology.nodes.len();
+    let relations = ontology.edges.len();
+    store.upsert_projection(&ontology)?;
+
+    let next_commands = vec![
+        "tsift graph-db --path . --json related 'ontology_type'".to_string(),
+        "tsift memory finding-add --text '<finding>' --anchor '<symbol-handle>'".to_string(),
+    ];
+    let report = MemoryOntologyReport {
+        contract_version: tsift_memory::MEMORY_CONTRACT_VERSION.to_string(),
+        graph_db: graph_db.display().to_string(),
+        type_nodes,
+        relations,
+        next_commands: next_commands.clone(),
+    };
+    print_memory_report(
+        &report,
+        &format,
+        "ontology-graph",
+        ToolEnvelopeSummary {
+            text: "derived semantic ontology graph layer".to_string(),
+            metrics: vec![
+                envelope_metric("type_nodes", type_nodes),
+                envelope_metric("relations", relations),
+            ],
+        },
+        next_commands,
+    )
+}
+
+#[derive(Serialize)]
+struct MemoryFindingReport {
+    contract_version: String,
+    graph_db: String,
+    node_kind: String,
+    anchor_handle: String,
+    anchor_resolved: bool,
+    confidence: f64,
+    observed_at_unix: i64,
+    next_commands: Vec<String>,
+}
+
+/// Core of `#trt1`: build an authored node projection and upsert it into the
+/// graph store. The `annotates` edge requires the anchor node to exist (FK on
+/// graph_edges); if the anchor symbol is not in the graph yet, keep the authored
+/// node (it still carries `anchor_handle`) and defer the edge until the anchor
+/// lands. Returns `(anchor_resolved, nodes_upserted, edges_upserted)`.
+#[allow(clippy::too_many_arguments)]
+fn add_authored_node_to_graph(
+    graph_db: &Path,
+    kind: AuthoredNodeKind,
+    text: &str,
+    anchor: &str,
+    confidence: f64,
+    observed_at_unix: i64,
+    session_id: Option<&str>,
+) -> Result<(bool, usize, usize)> {
+    let mut projection =
+        authored_node_projection(kind, text, anchor, confidence, observed_at_unix, session_id);
+    if let Some(parent) = graph_db.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create graph db dir {}", parent.display()))?;
+    }
+    let mut store = SqliteGraphStore::open(graph_db)
+        .with_context(|| format!("open graph store {}", graph_db.display()))?;
+    let anchor_resolved = store.node(anchor)?.is_some();
+    if !anchor_resolved {
+        projection.edges.clear();
+    }
+    store.upsert_projection(&projection)?;
+    Ok((anchor_resolved, projection.nodes.len(), projection.edges.len()))
+}
+
+/// Add an authored finding/decision/note node anchored to a symbol handle (#trt1).
+#[allow(clippy::too_many_arguments)]
+fn cmd_memory_finding_add(
+    path: &Path,
+    kind: &str,
+    text: &str,
+    anchor: &str,
+    confidence: f64,
+    session_id: Option<&str>,
+    graph_db_override: Option<&Path>,
+    format: OutputFormat,
+) -> Result<()> {
+    let authored_kind = AuthoredNodeKind::parse(kind)?;
+    let observed_at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let graph_db = graph_db_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| crate::graph_substrate_db_path(path, None));
+    let (anchor_resolved, nodes_upserted, edges_upserted) = add_authored_node_to_graph(
+        &graph_db,
+        authored_kind,
+        text,
+        anchor,
+        confidence,
+        observed_at_unix,
+        session_id,
+    )?;
+
+    let next_commands = vec![
+        "tsift memory ontology-graph . --json".to_string(),
+        format!("tsift graph-db --path . --json related '{anchor}'"),
+    ];
+    let report = MemoryFindingReport {
+        contract_version: tsift_memory::MEMORY_CONTRACT_VERSION.to_string(),
+        graph_db: graph_db.display().to_string(),
+        node_kind: authored_kind.as_str().to_string(),
+        anchor_handle: anchor.to_string(),
+        anchor_resolved,
+        confidence: confidence.clamp(0.0, 1.0),
+        observed_at_unix,
+        next_commands: next_commands.clone(),
+    };
+    print_memory_report(
+        &report,
+        &format,
+        "finding-add",
+        ToolEnvelopeSummary {
+            text: format!("authored {} node anchored to {anchor}", authored_kind.as_str()),
+            metrics: vec![
+                envelope_metric("nodes", nodes_upserted),
+                envelope_metric("edges", edges_upserted),
+            ],
+        },
+        next_commands,
+    )
+}
+
 fn resolve_claude_mem_path(explicit: Option<&Path>) -> Result<PathBuf> {
     explicit
         .map(Path::to_path_buf)
@@ -800,5 +984,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sessions, 1);
+    }
+
+    #[test]
+    fn finding_add_defers_edge_when_anchor_missing_then_resolves() {
+        use tsift_core::GraphNode;
+        let dir = TempDir::new().unwrap();
+        let graph_db = dir.path().join("graph.db");
+
+        // Anchor not yet in the graph: node is added, edge deferred.
+        let (resolved, nodes, edges) = add_authored_node_to_graph(
+            &graph_db,
+            AuthoredNodeKind::Finding,
+            "decay ranking lives in rank_memory_events",
+            "symbol:rank_memory_events",
+            0.8,
+            1_700_000_000,
+            None,
+        )
+        .unwrap();
+        assert!(!resolved);
+        assert_eq!(nodes, 1);
+        assert_eq!(edges, 0); // edge deferred (cleared) while anchor is absent
+
+        let conn = Connection::open(&graph_db).unwrap();
+        let findings: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_nodes WHERE kind = 'finding'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(findings, 1);
+        let annotates: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_edges WHERE kind = 'annotates'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(annotates, 0, "edge deferred while anchor absent");
+
+        // Now the anchor symbol exists: re-adding resolves the annotates edge.
+        {
+            let mut store = SqliteGraphStore::open(&graph_db).unwrap();
+            let seed = tsift_core::GraphProjection {
+                nodes: vec![GraphNode::new(
+                    "symbol:rank_memory_events",
+                    "function",
+                    "rank_memory_events",
+                )],
+                edges: vec![],
+            };
+            store.upsert_projection(&seed).unwrap();
+        }
+        let (resolved2, _, _) = add_authored_node_to_graph(
+            &graph_db,
+            AuthoredNodeKind::Finding,
+            "decay ranking lives in rank_memory_events",
+            "symbol:rank_memory_events",
+            0.8,
+            1_700_000_100,
+            None,
+        )
+        .unwrap();
+        assert!(resolved2);
+        let conn2 = Connection::open(&graph_db).unwrap();
+        let annotates2: i64 = conn2
+            .query_row(
+                "SELECT COUNT(*) FROM graph_edges WHERE kind = 'annotates'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(annotates2, 1, "edge materializes once anchor exists");
     }
 }
