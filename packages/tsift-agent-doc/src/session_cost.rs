@@ -10,12 +10,14 @@ const MAX_RUNTIME_EVENTS: usize = 8;
 const MAX_GUARDRAILS: usize = 8;
 const MAX_LOOP_CLUSTERS: usize = 8;
 const MAX_FILE_READ_DIAGNOSTICS: usize = 8;
+const MAX_PROMPT_CACHE_TIMELINE: usize = 8;
 const MAX_COMMANDS_PER_BUNDLE: usize = 6;
 const PROMPT_BUDGET_WARN_TOKENS: u64 = 100_000;
 const CACHED_RATIO_WARN_PERCENT: f64 = 90.0;
 const CACHED_RATIO_WARN_PROMPT_TOKENS: u64 = 50_000;
 const PROMPT_CACHE_CANDIDATE_TOKENS: u64 = 16_000;
 const PROMPT_CACHE_GOOD_HIT_PERCENT: f64 = 75.0;
+const PROMPT_CACHE_TREND_DELTA_PERCENT: f64 = 5.0;
 const RESTART_LOOP_WARN_OCCURRENCES: usize = 3;
 const NOOP_CLOSEOUT_WARN_OCCURRENCES: usize = 3;
 const DEFAULT_FULL_FILE_READ_TOKENS: u64 = 4_000;
@@ -83,6 +85,8 @@ pub struct SessionCostPromptCachePlan {
     pub observed_cache_creation_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_cached_input_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analytics: Option<SessionCostPromptCacheAnalytics>,
     pub invariants: Vec<String>,
     pub provider_adapters: Vec<SessionCostPromptCacheProvider>,
     pub actions: Vec<SessionCostPromptCacheAction>,
@@ -101,6 +105,41 @@ pub struct SessionCostPromptCacheAction {
     pub severity: String,
     pub message: String,
     pub guidance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCostPromptCacheAnalytics {
+    pub sample_count: usize,
+    pub effective: bool,
+    pub trend: String,
+    pub total_prompt_tokens: u64,
+    pub total_cached_input_tokens: u64,
+    pub total_cache_creation_tokens: u64,
+    pub net_cached_input_tokens: i64,
+    pub timeline_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub average_cached_input_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_cached_input_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_cached_input_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_ratio_delta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_to_creation_ratio: Option<String>,
+    pub timeline: Vec<SessionCostPromptCacheTimelineEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCostPromptCacheTimelineEntry {
+    pub label: String,
+    pub prompt_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_ratio: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -314,6 +353,13 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
     flush_pending_commands(&mut state);
     let loop_clusters = collect_loop_clusters(&state.loop_signals);
     let file_read_diagnostics = collect_file_read_diagnostics(&state.file_read_signals);
+    let prompt_cache_plan = derive_prompt_cache_plan(
+        prompt_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+        cached_input_ratio,
+        &state.usage_turns,
+    );
 
     let mut largest_turns = state.usage_turns;
     largest_turns.sort_by(|left, right| {
@@ -357,13 +403,6 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
         noop_closeout_occurrences,
         max_restart_count: state.max_restart_count,
     });
-    let prompt_cache_plan = derive_prompt_cache_plan(
-        prompt_tokens,
-        cached_input_tokens,
-        cache_creation_input_tokens,
-        cached_input_ratio,
-        usage_samples,
-    );
 
     if usage_samples == 0 && runtime_event_groups == 0 {
         state
@@ -491,8 +530,9 @@ fn derive_prompt_cache_plan(
     cached_input_tokens: u64,
     cache_creation_input_tokens: u64,
     cached_input_ratio: Option<f64>,
-    usage_samples: usize,
+    usage_turns: &[SessionCostTurn],
 ) -> Option<SessionCostPromptCachePlan> {
+    let usage_samples = usage_turns.len();
     if usage_samples == 0 {
         return None;
     }
@@ -558,6 +598,13 @@ fn derive_prompt_cache_plan(
         observed_cached_input_tokens: cached_input_tokens,
         observed_cache_creation_tokens: cache_creation_input_tokens,
         observed_cached_input_ratio: cached_input_ratio.map(|ratio| format!("{ratio:.2}%")),
+        analytics: derive_prompt_cache_analytics(
+            usage_turns,
+            prompt_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+            cached_input_ratio,
+        ),
         invariants: vec![
             "place stable system/developer context before per-turn content".to_string(),
             "treat conversation history as append-only until an intentional compaction boundary"
@@ -598,6 +645,128 @@ fn derive_prompt_cache_plan(
         ],
         actions,
     })
+}
+
+fn derive_prompt_cache_analytics(
+    usage_turns: &[SessionCostTurn],
+    prompt_tokens: u64,
+    cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cached_input_ratio: Option<f64>,
+) -> Option<SessionCostPromptCacheAnalytics> {
+    if usage_turns.is_empty() {
+        return None;
+    }
+
+    let first_ratio = usage_turns
+        .first()
+        .and_then(|turn| percent_ratio(turn.cached_input_tokens, turn.prompt_tokens));
+    let last_ratio = usage_turns
+        .last()
+        .and_then(|turn| percent_ratio(turn.cached_input_tokens, turn.prompt_tokens));
+    let ratio_delta = first_ratio
+        .zip(last_ratio)
+        .map(|(first, last)| last - first);
+    let trend = prompt_cache_trend(usage_turns.len(), ratio_delta).to_string();
+    let effective = cached_input_ratio.is_some_and(|ratio| ratio >= PROMPT_CACHE_GOOD_HIT_PERCENT)
+        && cached_input_tokens >= cache_creation_input_tokens;
+    let cache_read_to_creation_ratio = (cache_creation_input_tokens > 0).then(|| {
+        format!(
+            "{:.2}x",
+            (cached_input_tokens as f64) / (cache_creation_input_tokens as f64)
+        )
+    });
+    let timeline = prompt_cache_timeline(usage_turns);
+
+    Some(SessionCostPromptCacheAnalytics {
+        sample_count: usage_turns.len(),
+        effective,
+        trend,
+        total_prompt_tokens: prompt_tokens,
+        total_cached_input_tokens: cached_input_tokens,
+        total_cache_creation_tokens: cache_creation_input_tokens,
+        net_cached_input_tokens: signed_token_delta(
+            cached_input_tokens,
+            cache_creation_input_tokens,
+        ),
+        timeline_truncated: usage_turns.len() > MAX_PROMPT_CACHE_TIMELINE,
+        average_cached_input_ratio: cached_input_ratio.map(format_percent),
+        first_cached_input_ratio: first_ratio.map(format_percent),
+        last_cached_input_ratio: last_ratio.map(format_percent),
+        cached_input_ratio_delta: ratio_delta.map(format_signed_percent),
+        cache_read_to_creation_ratio,
+        timeline,
+    })
+}
+
+fn prompt_cache_timeline(
+    usage_turns: &[SessionCostTurn],
+) -> Vec<SessionCostPromptCacheTimelineEntry> {
+    let selected = if usage_turns.len() <= MAX_PROMPT_CACHE_TIMELINE {
+        usage_turns.iter().collect::<Vec<_>>()
+    } else {
+        let tail_count = MAX_PROMPT_CACHE_TIMELINE.saturating_sub(1);
+        let mut selected = Vec::with_capacity(MAX_PROMPT_CACHE_TIMELINE);
+        if let Some(first) = usage_turns.first() {
+            selected.push(first);
+        }
+        selected.extend(usage_turns.iter().skip(usage_turns.len() - tail_count));
+        selected
+    };
+
+    selected
+        .into_iter()
+        .map(|turn| SessionCostPromptCacheTimelineEntry {
+            label: turn.label.clone(),
+            prompt_tokens: turn.prompt_tokens,
+            cached_input_tokens: turn.cached_input_tokens,
+            cache_creation_input_tokens: turn.cache_creation_input_tokens,
+            cached_input_ratio: percent_ratio(turn.cached_input_tokens, turn.prompt_tokens)
+                .map(format_percent),
+            cache_creation_ratio: percent_ratio(
+                turn.cache_creation_input_tokens,
+                turn.prompt_tokens,
+            )
+            .map(format_percent),
+        })
+        .collect()
+}
+
+fn prompt_cache_trend(sample_count: usize, ratio_delta: Option<f64>) -> &'static str {
+    if sample_count < 2 {
+        return "single_sample";
+    }
+    let Some(delta) = ratio_delta else {
+        return "insufficient_data";
+    };
+    if delta >= PROMPT_CACHE_TREND_DELTA_PERCENT {
+        "improving"
+    } else if delta <= -PROMPT_CACHE_TREND_DELTA_PERCENT {
+        "declining"
+    } else {
+        "stable"
+    }
+}
+
+fn percent_ratio(numerator: u64, denominator: u64) -> Option<f64> {
+    (denominator > 0)
+        .then_some(((numerator as f64) / (denominator as f64) * 10_000.0).round() / 100.0)
+}
+
+fn format_percent(value: f64) -> String {
+    format!("{value:.2}%")
+}
+
+fn format_signed_percent(value: f64) -> String {
+    format!("{value:+.2}%")
+}
+
+fn signed_token_delta(read_tokens: u64, creation_tokens: u64) -> i64 {
+    if read_tokens >= creation_tokens {
+        i64::try_from(read_tokens - creation_tokens).unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(creation_tokens - read_tokens).unwrap_or(i64::MAX)
+    }
 }
 
 fn resolve_source(input: &str, source_hint: Option<&str>) -> Result<SessionCostSource> {
@@ -2013,6 +2182,48 @@ mod tests {
         assert_eq!(report.reasoning_output_tokens, 30);
         assert_eq!(report.total_tokens, 2635);
         assert_eq!(report.largest_turn_total_tokens, 1050);
+    }
+
+    #[test]
+    fn prompt_cache_plan_summarizes_effectiveness_over_time() {
+        let input = concat!(
+            r#"{"timestamp":"2026-05-05T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":1050},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":1050}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2000,"cached_input_tokens":600,"output_tokens":100,"reasoning_output_tokens":0,"total_tokens":2100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":500,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":1050}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3000,"cached_input_tokens":1500,"output_tokens":150,"reasoning_output_tokens":0,"total_tokens":3150},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":1050}}}}"#,
+            "\n",
+        );
+
+        let report = compute(input, Some("codex-jsonl")).unwrap();
+        let analytics = report
+            .prompt_cache_plan
+            .as_ref()
+            .and_then(|plan| plan.analytics.as_ref())
+            .expect("prompt cache analytics should be present");
+
+        assert_eq!(analytics.sample_count, 3);
+        assert!(!analytics.effective);
+        assert_eq!(analytics.trend, "improving");
+        assert_eq!(
+            analytics.average_cached_input_ratio.as_deref(),
+            Some("50.00%")
+        );
+        assert_eq!(
+            analytics.first_cached_input_ratio.as_deref(),
+            Some("10.00%")
+        );
+        assert_eq!(analytics.last_cached_input_ratio.as_deref(), Some("90.00%"));
+        assert_eq!(
+            analytics.cached_input_ratio_delta.as_deref(),
+            Some("+80.00%")
+        );
+        assert_eq!(analytics.net_cached_input_tokens, 1500);
+        assert_eq!(analytics.timeline.len(), 3);
+        assert_eq!(
+            analytics.timeline[2].cached_input_ratio.as_deref(),
+            Some("90.00%")
+        );
     }
 
     #[test]

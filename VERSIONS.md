@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- `session-cost` prompt-cache diagnostics now include bounded effectiveness analytics: sample count, stable/improving/declining trend, average/first/last cached-input ratios, net cached-read versus creation tokens, optional read/create ratio, and a first-plus-latest per-turn cache timeline in JSON and text output.
+
 ## 0.1.65
 
 - `tsift init` now keeps the generated AGENTS/CLAUDE Code Navigation block self-contained for Codex/OpenCode prompt reuse while pointing repositories that ship current `.claude/skills/tsift/SKILL.md` or `runbooks/code-navigation.md` back to those deeper runbooks, avoiding a runbook-only install that breaks standalone checkouts.

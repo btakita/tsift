@@ -43,7 +43,13 @@ pub(crate) fn cmd_diff_digest(
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
+            to_json_schema(
+                &report,
+                format.pretty,
+                format.terse,
+                format.ultra_terse,
+                format.schema
+            )?
         );
         return Ok(());
     }
@@ -272,7 +278,13 @@ pub(crate) fn cmd_metric_digest(
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
+            to_json_schema(
+                &report,
+                format.pretty,
+                format.terse,
+                format.ultra_terse,
+                format.schema
+            )?
         );
         return Ok(());
     }
@@ -466,7 +478,13 @@ pub(crate) fn cmd_session_digest(
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
+            to_json_schema(
+                &report,
+                format.pretty,
+                format.terse,
+                format.ultra_terse,
+                format.schema
+            )?
         );
         return Ok(());
     }
@@ -658,7 +676,13 @@ pub(crate) fn cmd_session_cost(
     if format.json_output {
         println!(
             "{}",
-            to_json_schema(&report, format.pretty, format.terse, format.ultra_terse, format.schema)?
+            to_json_schema(
+                &report,
+                format.pretty,
+                format.terse,
+                format.ultra_terse,
+                format.schema
+            )?
         );
         return Ok(());
     }
@@ -733,10 +757,32 @@ pub(crate) fn cmd_session_cost(
             );
         }
         if let Some(plan) = &report.prompt_cache_plan {
+            let analytics = plan.analytics.as_ref();
+            let trend = analytics
+                .map(|analytics| analytics.trend.as_str())
+                .unwrap_or("-");
+            let average_ratio = analytics
+                .and_then(|analytics| analytics.average_cached_input_ratio.as_deref())
+                .unwrap_or("-");
+            let net_cached_input_tokens = analytics
+                .map(|analytics| {
+                    if analytics.net_cached_input_tokens < 0 {
+                        format!(
+                            "-{}",
+                            format_compact_count(analytics.net_cached_input_tokens.unsigned_abs())
+                        )
+                    } else {
+                        format_compact_count(analytics.net_cached_input_tokens as u64)
+                    }
+                })
+                .unwrap_or_else(|| "-".to_string());
             println!(
-                "prompt-cache status:{} feasible:{} adapters:{} actions:{}",
+                "prompt-cache status:{} feasible:{} trend:{} avg_cache_ratio:{} net_cached:{} adapters:{} actions:{}",
                 plan.status,
                 plan.feasible,
+                trend,
+                average_ratio,
+                net_cached_input_tokens,
                 plan.provider_adapters.len(),
                 plan.actions.len()
             );
@@ -878,6 +924,47 @@ pub(crate) fn cmd_session_cost(
         );
         if let Some(ratio) = &plan.observed_cached_input_ratio {
             println!("  - observed ratio: {ratio}");
+        }
+        if let Some(analytics) = &plan.analytics {
+            let average_ratio = analytics
+                .average_cached_input_ratio
+                .as_deref()
+                .unwrap_or("-");
+            let first_ratio = analytics.first_cached_input_ratio.as_deref().unwrap_or("-");
+            let last_ratio = analytics.last_cached_input_ratio.as_deref().unwrap_or("-");
+            let delta = analytics.cached_input_ratio_delta.as_deref().unwrap_or("-");
+            let read_to_creation = analytics
+                .cache_read_to_creation_ratio
+                .as_deref()
+                .unwrap_or("-");
+            println!(
+                "  - analytics: samples={} trend={} effective={} avg={} first={} last={} delta={} net_cached={} read/create={}",
+                analytics.sample_count,
+                analytics.trend,
+                analytics.effective,
+                average_ratio,
+                first_ratio,
+                last_ratio,
+                delta,
+                analytics.net_cached_input_tokens,
+                read_to_creation
+            );
+            for turn in &analytics.timeline {
+                let cache_ratio = turn.cached_input_ratio.as_deref().unwrap_or("-");
+                let creation_ratio = turn.cache_creation_ratio.as_deref().unwrap_or("-");
+                println!(
+                    "    timeline {}: prompt={} cached={} creation={} cache_ratio={} creation_ratio={}",
+                    turn.label,
+                    turn.prompt_tokens,
+                    turn.cached_input_tokens,
+                    turn.cache_creation_input_tokens,
+                    cache_ratio,
+                    creation_ratio
+                );
+            }
+            if analytics.timeline_truncated {
+                println!("    timeline truncated to first and latest samples");
+            }
         }
         for adapter in &plan.provider_adapters {
             println!(

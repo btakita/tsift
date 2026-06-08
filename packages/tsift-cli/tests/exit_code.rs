@@ -9177,6 +9177,33 @@ fn session_cost_reads_codex_token_counts_from_stdin() {
         json["prompt_cache_plan"]["observed_cached_input_ratio"],
         "96.00%"
     );
+    assert_eq!(json["prompt_cache_plan"]["analytics"]["sample_count"], 2);
+    assert_eq!(json["prompt_cache_plan"]["analytics"]["effective"], true);
+    assert_eq!(json["prompt_cache_plan"]["analytics"]["trend"], "stable");
+    assert_eq!(
+        json["prompt_cache_plan"]["analytics"]["average_cached_input_ratio"],
+        "96.00%"
+    );
+    assert_eq!(
+        json["prompt_cache_plan"]["analytics"]["first_cached_input_ratio"],
+        "95.83%"
+    );
+    assert_eq!(
+        json["prompt_cache_plan"]["analytics"]["last_cached_input_ratio"],
+        "96.15%"
+    );
+    assert_eq!(
+        json["prompt_cache_plan"]["analytics"]["cached_input_ratio_delta"],
+        "+0.32%"
+    );
+    assert_eq!(
+        json["prompt_cache_plan"]["analytics"]["net_cached_input_tokens"],
+        48000
+    );
+    assert_eq!(
+        json["prompt_cache_plan"]["analytics"]["timeline"][1]["cached_input_ratio"],
+        "96.15%"
+    );
     assert!(
         json["prompt_cache_plan"]["provider_adapters"]
             .as_array()
@@ -9228,6 +9255,16 @@ fn session_cost_recommends_prompt_cache_for_large_uncached_prompt() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["prompt_cache_plan"]["status"], "candidate");
     assert_eq!(json["prompt_cache_plan"]["observed_cached_input_tokens"], 0);
+    assert_eq!(json["prompt_cache_plan"]["analytics"]["sample_count"], 1);
+    assert_eq!(json["prompt_cache_plan"]["analytics"]["effective"], false);
+    assert_eq!(
+        json["prompt_cache_plan"]["analytics"]["trend"],
+        "single_sample"
+    );
+    assert_eq!(
+        json["prompt_cache_plan"]["analytics"]["average_cached_input_ratio"],
+        "0.00%"
+    );
     assert!(
         json["prompt_cache_plan"]["invariants"]
             .as_array()
