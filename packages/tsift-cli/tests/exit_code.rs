@@ -233,6 +233,7 @@ fn release_crate_order() -> &'static [&'static str] {
         "tsift-sqlite",
         "tsift-algorithms",
         "tsift-resolution",
+        "tsift-cache",
         "tsift-tokensave",
         "tsift-libsql",
         "tsift-index",
@@ -285,6 +286,7 @@ fn split_crate_manifests_are_publish_ready() {
         ("tsift", "Cargo.toml"),
         ("tsift-agent-doc", "packages/tsift-agent-doc/Cargo.toml"),
         ("tsift-algorithms", "packages/tsift-algorithms/Cargo.toml"),
+        ("tsift-cache", "packages/tsift-cache/Cargo.toml"),
         ("tsift-cli", "packages/tsift-cli/Cargo.toml"),
         ("tsift-core", "packages/tsift-core/Cargo.toml"),
         ("tsift-digest", "packages/tsift-digest/Cargo.toml"),
@@ -389,6 +391,7 @@ fn cli_manifest_uses_split_crates_without_root_shim() {
     for name in [
         "tsift-agent-doc",
         "tsift-algorithms",
+        "tsift-cache",
         "tsift-core",
         "tsift-digest",
         "tsift-graph",

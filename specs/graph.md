@@ -120,7 +120,7 @@ A surface that is absent from history is treated as `missing` and blocks the gat
 
 ### Cycle Packet Cache
 
-The cycle packet cache (`#gpackreuse`) reuses graph/context packets across repeated tsift CLI invocations within a single agent-doc cycle. It is implemented in `tsift_quality::cycle_packet_cache` and exercised by `tests/cycle_packet_cache.rs` plus unit tests in `packages/tsift-quality/src/cycle_packet_cache.rs`.
+The cycle packet cache (`#gpackreuse`) reuses graph/context packets across repeated tsift CLI invocations within a single agent-doc cycle. It is implemented in `tsift_cache::cycle_packet_cache`, re-exported from `tsift_quality::cycle_packet_cache` for compatibility, and exercised by `tests/cycle_packet_cache.rs` plus unit tests in `packages/tsift-cache/src/cycle_packet_cache.rs`.
 
 **Problem.** Within one agent-doc cycle, the harness calls `tsift context-pack`, `tsift graph-db evidence`, `tsift conflict-matrix`, and `tsift dispatch-trace` in sequence. Each invocation starts a new process, so the existing in-memory `CONFLICT_MATRIX_PREPARATION_CACHE` (static `OnceLock<Mutex<BTreeMap>>`) does not persist between calls. The conflict-matrix preparation cache and graph-prepared cache persist to disk under `.tsift/conflict-matrix-cache/`, but evidence packets and dispatch-trace results do not, causing redundant graph traversals and conflict-matrix pipeline rebuilds.
 

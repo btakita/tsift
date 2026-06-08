@@ -32,6 +32,7 @@ tree-sitter = "0.26"
 tempfile = "3"
 tsift-agent-doc = { path = "../tsift-agent-doc", version = "0.1.65" }
 tsift-algorithms = { path = "../tsift-algorithms", version = "0.1.65" }
+tsift-cache = { path = "../tsift-cache", version = "0.1.65" }
 tsift-core = { path = "../tsift-core", version = "0.1.65" }
 tsift-digest = { path = "../tsift-digest", version = "0.1.65" }
 tsift-graph = { path = "../tsift-graph", version = "0.1.65" }

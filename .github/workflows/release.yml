@@ -69,6 +69,7 @@ jobs:
             tsift-sqlite \
             tsift-algorithms \
             tsift-resolution \
+            tsift-cache \
             tsift-tokensave \
             tsift-libsql \
             tsift-index \
@@ -260,6 +261,7 @@ jobs:
             tsift-sqlite \
             tsift-algorithms \
             tsift-resolution \
+            tsift-cache \
             tsift-tokensave \
             tsift-libsql \
             tsift-index \

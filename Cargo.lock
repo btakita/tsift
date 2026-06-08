@@ -5162,6 +5162,7 @@ version = "0.1.65"
 dependencies = [
  "tsift-agent-doc",
  "tsift-algorithms",
+ "tsift-cache",
  "tsift-cli",
  "tsift-digest",
  "tsift-graph",
@@ -5198,6 +5199,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tsift-cache"
+version = "0.1.65"
+dependencies = [
+ "blake3",
+ "filetime",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "tsift-cli"
 version = "0.1.65"
 dependencies = [
@@ -5216,6 +5228,7 @@ dependencies = [
  "tree-sitter",
  "tsift-agent-doc",
  "tsift-algorithms",
+ "tsift-cache",
  "tsift-core",
  "tsift-digest",
  "tsift-graph",
@@ -5335,12 +5348,11 @@ name = "tsift-quality"
 version = "0.1.65"
 dependencies = [
  "anyhow",
- "blake3",
- "filetime",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
+ "tsift-cache",
  "tsift-index",
 ]
 

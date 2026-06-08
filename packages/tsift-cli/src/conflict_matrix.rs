@@ -14,7 +14,8 @@ use substrate::{
     TerseGraphNode as SubstrateTerseGraphNode,
 };
 use tsift_digest::diff_digest;
-use tsift_quality::{cycle_packet_cache, lint};
+use tsift_cache::cycle_packet_cache;
+use tsift_quality::lint;
 use tsift_resolution as resolution;
 use tsift_search::impact;
 

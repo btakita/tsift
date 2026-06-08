@@ -1,4 +1,4 @@
-use tsift_quality::cycle_packet_cache;
+use tsift_cache::cycle_packet_cache;
 use cycle_packet_cache::{
     CyclePacketKind, cycle_packet_cache_dir, cycle_packet_evidence_key,
     cycle_packet_read_cache, cycle_packet_watermark_key, cycle_packet_write_cache,
