@@ -140,6 +140,8 @@ pub(crate) struct SemanticEditIntentPlan {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) diff: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) patch_proposal: Option<SemanticEditPatchProposal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) formatter: Option<String>,
     pub(crate) message: String,
 }
@@ -185,6 +187,61 @@ pub(crate) struct SemanticEditTargetSelection {
     pub(crate) source_window: String,
     pub(crate) symbol_read: String,
     pub(crate) message: String,
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct SemanticEditPatchProposal {
+    pub(crate) schema_version: u8,
+    pub(crate) strategy: String,
+    pub(crate) status: String,
+    pub(crate) parser_state: SemanticEditPatchParserState,
+    pub(crate) trivia: SemanticEditPatchTriviaPolicy,
+    pub(crate) files: Vec<SemanticEditPatchFileProposal>,
+    pub(crate) message: String,
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct SemanticEditPatchParserState {
+    pub(crate) input: String,
+    pub(crate) output: String,
+    pub(crate) validator: String,
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct SemanticEditPatchTriviaPolicy {
+    pub(crate) mode: String,
+    pub(crate) preserves_comments: bool,
+    pub(crate) preserves_formatting: bool,
+    pub(crate) preserves_trivia: bool,
+    pub(crate) message: String,
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct SemanticEditPatchFileProposal {
+    pub(crate) file: String,
+    pub(crate) language: String,
+    pub(crate) before_hash: String,
+    pub(crate) after_hash: String,
+    pub(crate) hunks: Vec<SemanticEditPatchHunk>,
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct SemanticEditPatchHunk {
+    pub(crate) before: SemanticEditPatchRange,
+    pub(crate) after: SemanticEditPatchRange,
+    pub(crate) context_before: usize,
+    pub(crate) context_after: usize,
+    pub(crate) preview_truncated: bool,
+    pub(crate) diff: String,
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct SemanticEditPatchRange {
+    pub(crate) start_byte: usize,
+    pub(crate) end_byte: usize,
+    pub(crate) start_line: usize,
+    pub(crate) end_line: usize,
+    pub(crate) line_count: usize,
 }
 
 #[derive(Serialize)]
@@ -3074,11 +3131,49 @@ fn preview_semantic_edit_content(
     }
 }
 
-pub(crate) fn semantic_edit_diff_preview(
+fn semantic_edit_line_offsets(content: &str) -> Vec<usize> {
+    let mut offsets = vec![0usize];
+    for (idx, byte) in content.bytes().enumerate() {
+        if byte == b'\n' {
+            offsets.push(idx + 1);
+        }
+    }
+    offsets
+}
+
+fn semantic_edit_patch_range_for_lines(
+    content: &str,
+    start_line_index: usize,
+    end_line_index: usize,
+) -> SemanticEditPatchRange {
+    let offsets = semantic_edit_line_offsets(content);
+    let start_byte = offsets
+        .get(start_line_index)
+        .copied()
+        .unwrap_or(content.len());
+    let end_byte = offsets
+        .get(end_line_index)
+        .copied()
+        .unwrap_or(content.len());
+    let line_count = end_line_index.saturating_sub(start_line_index);
+    SemanticEditPatchRange {
+        start_byte,
+        end_byte,
+        start_line: start_line_index + 1,
+        end_line: if line_count == 0 {
+            start_line_index + 1
+        } else {
+            start_line_index + line_count
+        },
+        line_count,
+    }
+}
+
+fn semantic_edit_diff_hunk(
     before: &str,
     after: &str,
     budget: ResponseBudget,
-) -> Option<String> {
+) -> Option<SemanticEditPatchHunk> {
     if before == after {
         return None;
     }
@@ -3102,10 +3197,13 @@ pub(crate) fn semantic_edit_diff_preview(
         suffix += 1;
     }
 
+    let before_changed_end = before_lines.len().saturating_sub(suffix);
+    let after_changed_end = after_lines.len().saturating_sub(suffix);
     let before_start = prefix.saturating_sub(2);
     let after_start = before_start;
-    let before_end = before_lines.len().saturating_sub(suffix).min(prefix + 8);
-    let after_end = after_lines.len().saturating_sub(suffix).min(prefix + 8);
+    let before_end = before_changed_end.min(prefix + 8);
+    let after_end = after_changed_end.min(prefix + 8);
+    let preview_truncated = before_end < before_changed_end || after_end < after_changed_end;
     let mut lines = vec![
         "--- before".to_string(),
         "+++ after".to_string(),
@@ -3126,10 +3224,93 @@ pub(crate) fn semantic_edit_diff_preview(
     for line in &after_lines[prefix..after_end] {
         lines.push(format!("+{line}"));
     }
-    Some(truncate_for_budget(
-        &lines.join("\n"),
-        budget.preview_bytes(),
-    ))
+    Some(SemanticEditPatchHunk {
+        before: semantic_edit_patch_range_for_lines(before, prefix, before_changed_end),
+        after: semantic_edit_patch_range_for_lines(after, prefix, after_changed_end),
+        context_before: prefix.saturating_sub(before_start),
+        context_after: before_end.saturating_sub(before_changed_end.min(before_end)),
+        preview_truncated,
+        diff: truncate_for_budget(&lines.join("\n"), budget.preview_bytes()),
+    })
+}
+
+pub(crate) fn semantic_edit_diff_preview(
+    before: &str,
+    after: &str,
+    budget: ResponseBudget,
+) -> Option<String> {
+    semantic_edit_diff_hunk(before, after, budget).map(|hunk| hunk.diff)
+}
+
+struct SemanticEditPatchFileInput<'a> {
+    file_abs: &'a Path,
+    language: &'a str,
+    before: &'a str,
+    after: &'a str,
+}
+
+fn semantic_edit_patch_proposal(
+    root: &Path,
+    kind: &str,
+    files: &[SemanticEditPatchFileInput<'_>],
+    budget: ResponseBudget,
+) -> Result<Option<SemanticEditPatchProposal>> {
+    let mut proposal_files = Vec::new();
+    let mut validator_names = Vec::new();
+    for file in files {
+        if file.before == file.after {
+            continue;
+        }
+        let executor =
+            semantic_edit_executor_language(file.language, file.file_abs).with_context(|| {
+                format!(
+                    "no parser registered for language {:?} while building patch proposal",
+                    file.language
+                )
+            })?;
+        parse_semantic_edit_source(file.before, executor, "patch proposal input")?;
+        parse_semantic_edit_source(file.after, executor, "patch proposal output")?;
+        validator_names.push(executor.name());
+        let Some(hunk) = semantic_edit_diff_hunk(file.before, file.after, budget) else {
+            continue;
+        };
+        proposal_files.push(SemanticEditPatchFileProposal {
+            file: semantic_edit_file_display(root, file.file_abs),
+            language: file.language.to_string(),
+            before_hash: semantic_edit_content_hash(file.before.as_bytes()),
+            after_hash: semantic_edit_content_hash(file.after.as_bytes()),
+            hunks: vec![hunk],
+        });
+    }
+
+    if proposal_files.is_empty() {
+        return Ok(None);
+    }
+    validator_names.sort_unstable();
+    validator_names.dedup();
+    Ok(Some(SemanticEditPatchProposal {
+        schema_version: 1,
+        strategy: "ast_cst_minimal_textual_patch".to_string(),
+        status: "ready".to_string(),
+        parser_state: SemanticEditPatchParserState {
+            input: "valid".to_string(),
+            output: "valid".to_string(),
+            validator: validator_names.join(", "),
+        },
+        trivia: SemanticEditPatchTriviaPolicy {
+            mode: "preserve_unchanged_bytes".to_string(),
+            preserves_comments: true,
+            preserves_formatting: true,
+            preserves_trivia: true,
+            message:
+                "unchanged bytes outside proposed hunks are copied verbatim; inserted text is bounded to executor-selected ranges"
+                    .to_string(),
+        },
+        files: proposal_files,
+        message: format!(
+            "validated {kind} patch proposal against parser input/output and bounded diff hunks"
+        ),
+    }))
 }
 
 fn command_available(command: &str) -> bool {
@@ -3359,10 +3540,11 @@ fn plan_semantic_edit_intent(
         .is_some_and(|expected| expected != content_hash);
 
     let language = semantic_edit_target_language(target_symbol.as_ref(), &file_abs);
-    let (status, apply_supported, diff, message) = if conflict {
+    let (status, apply_supported, diff, patch_proposal, message) = if conflict {
         (
             "conflict".to_string(),
             semantic_edit_kind_apply_supported(&kind, &language, &file_abs),
+            None,
             None,
             "expected_content_hash does not match current file content; intent was not planned for mutation"
                 .to_string(),
@@ -3391,37 +3573,76 @@ fn plan_semantic_edit_intent(
                             .map(|preview| (destination_text, preview))
                         }) {
                         Ok((destination_text, ((source_preview, _), (destination_preview, _)))) => {
-                            let mut diff_parts = Vec::new();
-                            if let Some(source_diff) =
-                                semantic_edit_diff_preview(&source_text, &source_preview, budget)
-                            {
-                                diff_parts.push(format!("{target_file}\n{source_diff}"));
-                            }
-                            if let Some(destination_file) = &destination_file
-                                && let Some(destination_diff) = semantic_edit_diff_preview(
-                                    &destination_text,
-                                    &destination_preview,
-                                    budget,
-                                )
-                            {
-                                diff_parts.push(format!("{destination_file}\n{destination_diff}"));
-                            }
-                            (
-                                "planned".to_string(),
-                                true,
-                                (!diff_parts.is_empty()).then(|| {
-                                    truncate_for_budget(
-                                        &diff_parts.join("\n\n"),
-                                        budget.preview_bytes(),
+                            let destination_language =
+                                semantic_edit_language_for_file(destination_file_abs);
+                            match semantic_edit_patch_proposal(
+                                root,
+                                &kind,
+                                &[
+                                    SemanticEditPatchFileInput {
+                                        file_abs: &file_abs,
+                                        language: &language,
+                                        before: &source_text,
+                                        after: &source_preview,
+                                    },
+                                    SemanticEditPatchFileInput {
+                                        file_abs: destination_file_abs,
+                                        language: &destination_language,
+                                        before: &destination_text,
+                                        after: &destination_preview,
+                                    },
+                                ],
+                                budget,
+                            ) {
+                                Ok(patch_proposal) => {
+                                    let mut diff_parts = Vec::new();
+                                    if let Some(source_diff) = semantic_edit_diff_preview(
+                                        &source_text,
+                                        &source_preview,
+                                        budget,
+                                    ) {
+                                        diff_parts.push(format!("{target_file}\n{source_diff}"));
+                                    }
+                                    if let Some(destination_file) = &destination_file
+                                        && let Some(destination_diff) = semantic_edit_diff_preview(
+                                            &destination_text,
+                                            &destination_preview,
+                                            budget,
+                                        )
+                                    {
+                                        diff_parts.push(format!(
+                                            "{destination_file}\n{destination_diff}"
+                                        ));
+                                    }
+                                    (
+                                        "planned".to_string(),
+                                        true,
+                                        (!diff_parts.is_empty()).then(|| {
+                                            truncate_for_budget(
+                                                &diff_parts.join("\n\n"),
+                                                budget.preview_bytes(),
+                                            )
+                                        }),
+                                        patch_proposal,
+                                        "validated move_declaration intent; Rust executor can apply this edit"
+                                            .to_string(),
                                     )
-                                }),
-                                "validated move_declaration intent; Rust executor can apply this edit"
-                                    .to_string(),
-                            )
+                                }
+                                Err(err) => (
+                                    "unsupported".to_string(),
+                                    false,
+                                    None,
+                                    None,
+                                    format!(
+                                        "move_declaration patch proposal was refused by parser validation: {err:#}"
+                                    ),
+                                ),
+                            }
                         }
                         Err(err) => (
                             "unsupported".to_string(),
                             false,
+                            None,
                             None,
                             format!(
                                 "move_declaration intent is not applyable by the current executor: {err:#}"
@@ -3441,18 +3662,41 @@ fn plan_semantic_edit_intent(
                             cross_file_total: cross_file_call_ref_total,
                         },
                     ) {
-                        Ok((preview, _)) => (
-                            "planned".to_string(),
-                            true,
-                            semantic_edit_diff_preview(&source_text, &preview, budget),
-                            format!(
-                                "validated {kind} intent; {} executor can apply this edit",
-                                semantic_edit_executor_name(&language, &file_abs)
+                        Ok((preview, _)) => match semantic_edit_patch_proposal(
+                            root,
+                            &kind,
+                            &[SemanticEditPatchFileInput {
+                                file_abs: &file_abs,
+                                language: &language,
+                                before: &source_text,
+                                after: &preview,
+                            }],
+                            budget,
+                        ) {
+                            Ok(patch_proposal) => (
+                                "planned".to_string(),
+                                true,
+                                semantic_edit_diff_preview(&source_text, &preview, budget),
+                                patch_proposal,
+                                format!(
+                                    "validated {kind} intent; {} executor can apply this edit",
+                                    semantic_edit_executor_name(&language, &file_abs)
+                                ),
                             ),
-                        ),
+                            Err(err) => (
+                                "unsupported".to_string(),
+                                false,
+                                None,
+                                None,
+                                format!(
+                                    "{kind} patch proposal was refused by parser validation: {err:#}"
+                                ),
+                            ),
+                        },
                         Err(err) => (
                             "unsupported".to_string(),
                             false,
+                            None,
                             None,
                             format!(
                                 "{kind} intent is not applyable by the current executor: {err:#}"
@@ -3464,6 +3708,7 @@ fn plan_semantic_edit_intent(
             Err(err) => (
                 "unsupported".to_string(),
                 false,
+                None,
                 None,
                 format!("semantic edit executor requires UTF-8 source: {err}"),
             ),
@@ -3490,6 +3735,7 @@ fn plan_semantic_edit_intent(
             target_range,
             content_hash,
             diff,
+            patch_proposal,
             formatter: None,
             message: truncate_for_budget(&message, budget.preview_bytes()),
         },

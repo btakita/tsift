@@ -41,12 +41,15 @@ Semantic edits emit text patches, not synthetic whole-file rewrites. For every p
 
 - the target file and current content hash
 - target symbol or Markdown node metadata, including stable handle/span information when available
+- `patch_proposal` with schema version, `ast_cst_minimal_textual_patch` strategy, parser input/output validation status, trivia-preservation policy, per-file hashes, and ordered hunks
 - ordered text edit ranges in byte coordinates, with line-range previews for humans
 - a bounded unified diff preview in dry-run and apply modes
 - whether the diff was truncated, plus an expansion path when the full diff is artifact-backed
 - formatter and validator decisions that changed or rejected the patch
 
 Generated patches should touch only the selected ranges plus required structural companions such as imports, module declarations, or same-file call-site updates. If formatting expands the diff outside the expected region, the executor must either justify that expansion in the report or refuse before mutating the real tree.
+
+`patch_proposal` is emitted only after parser validation succeeds for the current input and proposed output. Unsupported parser states, parse-error WIP files, unresolved parser languages, or proposal output that cannot reparse produce `status=unsupported`, `apply_supported=false`, a refusal message, and no patch proposal.
 
 ## Refusal Modes
 

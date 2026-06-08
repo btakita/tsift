@@ -3522,6 +3522,33 @@ fn edit_intents_json_validates_semantic_write_plan_without_mutating() {
             .unwrap()
             .contains("alpha_renamed")
     );
+    let patch = &json["report"]["plans"][0]["patch_proposal"];
+    assert_eq!(patch["schema_version"], 1);
+    assert_eq!(patch["strategy"], "ast_cst_minimal_textual_patch");
+    assert_eq!(patch["status"], "ready");
+    assert_eq!(patch["parser_state"]["input"], "valid");
+    assert_eq!(patch["parser_state"]["output"], "valid");
+    assert_eq!(patch["parser_state"]["validator"], "Rust");
+    assert_eq!(patch["trivia"]["mode"], "preserve_unchanged_bytes");
+    assert_eq!(patch["trivia"]["preserves_comments"], true);
+    assert_eq!(patch["trivia"]["preserves_formatting"], true);
+    assert_eq!(patch["trivia"]["preserves_trivia"], true);
+    assert_eq!(patch["files"][0]["file"], "main.rs");
+    assert_eq!(patch["files"][0]["language"], "rust");
+    assert!(
+        patch["files"][0]["hunks"][0]["diff"]
+            .as_str()
+            .unwrap()
+            .contains("alpha_renamed")
+    );
+    assert!(
+        patch["files"][0]["hunks"][0]["before"]["end_byte"]
+            .as_u64()
+            .unwrap()
+            > patch["files"][0]["hunks"][0]["before"]["start_byte"]
+                .as_u64()
+                .unwrap()
+    );
     assert!(
         json["follow_up"]
             .as_array()
@@ -3746,6 +3773,57 @@ fn edit_intents_resolves_symbol_read_and_graph_handles_without_mutating() {
         graph_handle
     );
     assert_eq!(plans[1]["target_symbol"]["name"], "alpha");
+}
+
+#[test]
+fn edit_intents_patch_proposal_refuses_parse_errors_without_mutating() {
+    let dir = indexed_cli_fixture();
+    let path = dir.path().join("main.rs");
+    let invalid = "fn alpha( {\n    beta();\n}\n";
+    fs::write(&path, invalid).unwrap();
+
+    let input = serde_json::json!({
+        "intents": [{
+            "kind": "rename_symbol",
+            "symbol": "alpha",
+            "file": "main.rs",
+            "new_name": "alpha_from_invalid"
+        }]
+    })
+    .to_string();
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--budget",
+            "normal",
+        ],
+        &input,
+    );
+    assert!(
+        output.status.success(),
+        "edit-intents stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["report"]["unsupported_total"], 1);
+    let plan = &json["report"]["plans"][0];
+    assert_eq!(plan["status"], "unsupported");
+    assert_eq!(plan["apply_supported"], false);
+    assert!(plan.get("patch_proposal").is_none());
+    assert!(
+        plan["message"]
+            .as_str()
+            .unwrap()
+            .contains("patch proposal input produced Rust source with parse errors"),
+        "plan message: {}",
+        plan["message"]
+    );
 }
 
 #[test]
@@ -5276,7 +5354,7 @@ fn edit_intents_apply_refuses_stale_hash_without_mutating() {
 }
 
 #[test]
-fn edit_intents_apply_formats_before_write_and_leaves_source_on_formatter_failure() {
+fn edit_intents_apply_refuses_invalid_parser_output_without_mutating() {
     let dir = indexed_cli_fixture();
     let before = fs::read_to_string(dir.path().join("main.rs")).unwrap();
     let input = r#"{
@@ -5313,13 +5391,19 @@ fn edit_intents_apply_formats_before_write_and_leaves_source_on_formatter_failur
             .unwrap();
     }
     let output = child.wait_with_output().unwrap();
-    assert!(!output.status.success(), "formatter failure should fail");
+    assert!(
+        !output.status.success(),
+        "invalid parser output should fail"
+    );
     assert_eq!(
         fs::read_to_string(dir.path().join("main.rs")).unwrap(),
         before
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("rustfmt rejected"), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("patch proposal output produced Rust source with parse errors"),
+        "stderr was: {stderr}"
+    );
 }
 
 #[test]
