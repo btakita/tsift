@@ -14,6 +14,8 @@ const MAX_COMMANDS_PER_BUNDLE: usize = 6;
 const PROMPT_BUDGET_WARN_TOKENS: u64 = 100_000;
 const CACHED_RATIO_WARN_PERCENT: f64 = 90.0;
 const CACHED_RATIO_WARN_PROMPT_TOKENS: u64 = 50_000;
+const PROMPT_CACHE_CANDIDATE_TOKENS: u64 = 16_000;
+const PROMPT_CACHE_GOOD_HIT_PERCENT: f64 = 75.0;
 const RESTART_LOOP_WARN_OCCURRENCES: usize = 3;
 const NOOP_CLOSEOUT_WARN_OCCURRENCES: usize = 3;
 const DEFAULT_FULL_FILE_READ_TOKENS: u64 = 4_000;
@@ -67,6 +69,34 @@ pub struct SessionCostRuntimeEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionCostGuardrail {
+    pub kind: String,
+    pub severity: String,
+    pub message: String,
+    pub guidance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCostPromptCachePlan {
+    pub status: String,
+    pub feasible: bool,
+    pub observed_cached_input_tokens: u64,
+    pub observed_cache_creation_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_cached_input_ratio: Option<String>,
+    pub invariants: Vec<String>,
+    pub provider_adapters: Vec<SessionCostPromptCacheProvider>,
+    pub actions: Vec<SessionCostPromptCacheAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCostPromptCacheProvider {
+    pub provider: String,
+    pub status: String,
+    pub requirements: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCostPromptCacheAction {
     pub kind: String,
     pub severity: String,
     pub message: String,
@@ -133,6 +163,8 @@ pub struct SessionCostReport {
     pub restart_churn: Vec<RestartChurnSummary>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub guardrails: Vec<SessionCostGuardrail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_plan: Option<SessionCostPromptCachePlan>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
 }
@@ -325,6 +357,13 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
         noop_closeout_occurrences,
         max_restart_count: state.max_restart_count,
     });
+    let prompt_cache_plan = derive_prompt_cache_plan(
+        prompt_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+        cached_input_ratio,
+        usage_samples,
+    );
 
     if usage_samples == 0 && runtime_event_groups == 0 {
         state
@@ -354,6 +393,7 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
         file_read_diagnostics,
         restart_churn,
         guardrails,
+        prompt_cache_plan,
         warnings: state.warnings,
     })
 }
@@ -444,6 +484,120 @@ pub fn derive_guardrails(input: &SessionCostGuardrailInput) -> Vec<SessionCostGu
 
     guardrails.truncate(MAX_GUARDRAILS);
     guardrails
+}
+
+fn derive_prompt_cache_plan(
+    prompt_tokens: u64,
+    cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cached_input_ratio: Option<f64>,
+    usage_samples: usize,
+) -> Option<SessionCostPromptCachePlan> {
+    if usage_samples == 0 {
+        return None;
+    }
+
+    let observed = cached_input_tokens > 0 || cache_creation_input_tokens > 0;
+    let candidate = prompt_tokens >= PROMPT_CACHE_CANDIDATE_TOKENS;
+    if !observed && !candidate {
+        return None;
+    }
+
+    let mut actions = Vec::new();
+    if !observed {
+        actions.push(SessionCostPromptCacheAction {
+            kind: "enable_provider_cache".to_string(),
+            severity: "recommend".to_string(),
+            message: format!(
+                "prompt volume reached {prompt_tokens} tokens without observed cache reads"
+            ),
+            guidance: "add a provider adapter that keeps stable context byte-identical and passes the provider cache hint on each turn"
+                .to_string(),
+        });
+    } else if cached_input_ratio.is_some_and(|ratio| ratio < PROMPT_CACHE_GOOD_HIT_PERCENT) {
+        actions.push(SessionCostPromptCacheAction {
+            kind: "improve_cache_hit_rate".to_string(),
+            severity: "recommend".to_string(),
+            message: format!(
+                "cached input ratio was {:.2}% across {prompt_tokens} prompt tokens",
+                cached_input_ratio.unwrap_or_default()
+            ),
+            guidance:
+                "move volatile timestamps, generated headers, and one-off compaction prompts after the cached prefix"
+                    .to_string(),
+        });
+    } else {
+        actions.push(SessionCostPromptCacheAction {
+            kind: "preserve_cache_shape".to_string(),
+            severity: "info".to_string(),
+            message: format!(
+                "cache reads were observed across {cached_input_tokens} input tokens"
+            ),
+            guidance:
+                "keep the stable prefix and append-only transcript shape intact while adding new tools or context"
+                    .to_string(),
+        });
+    }
+
+    if cache_creation_input_tokens > cached_input_tokens && cached_input_tokens > 0 {
+        actions.push(SessionCostPromptCacheAction {
+            kind: "reduce_cache_rewrites".to_string(),
+            severity: "recommend".to_string(),
+            message: format!(
+                "cache creation tokens ({cache_creation_input_tokens}) exceeded cache read tokens ({cached_input_tokens})"
+            ),
+            guidance:
+                "check for prefix churn before each model call; repeated writes can erase the economics of prompt caching"
+                    .to_string(),
+        });
+    }
+
+    Some(SessionCostPromptCachePlan {
+        status: if observed { "observed" } else { "candidate" }.to_string(),
+        feasible: true,
+        observed_cached_input_tokens: cached_input_tokens,
+        observed_cache_creation_tokens: cache_creation_input_tokens,
+        observed_cached_input_ratio: cached_input_ratio.map(|ratio| format!("{ratio:.2}%")),
+        invariants: vec![
+            "place stable system/developer context before per-turn content".to_string(),
+            "treat conversation history as append-only until an intentional compaction boundary"
+                .to_string(),
+            "exclude volatile timestamps, random ids, and transient instructions from the cached prefix"
+                .to_string(),
+            "run compaction against the same live prefix whenever the provider cache is still warm"
+                .to_string(),
+        ],
+        provider_adapters: vec![
+            SessionCostPromptCacheProvider {
+                provider: "anthropic".to_string(),
+                status: "explicit_breakpoints".to_string(),
+                requirements: vec![
+                    "attach cache_control to the stable system block".to_string(),
+                    "attach cache_control to the final tool definition when tools are sent"
+                        .to_string(),
+                    "attach cache_control to the last two user-role messages; skip one-off compaction instructions"
+                        .to_string(),
+                ],
+            },
+            SessionCostPromptCacheProvider {
+                provider: "openai".to_string(),
+                status: "cache_key".to_string(),
+                requirements: vec![
+                    "derive prompt_cache_key from the stable thread/session id".to_string(),
+                    "keep prefixes byte-identical across consecutive calls for the same key".to_string(),
+                ],
+            },
+            SessionCostPromptCacheProvider {
+                provider: "self_hosted_or_edge".to_string(),
+                status: "affinity_required".to_string(),
+                requirements: vec![
+                    "route consecutive calls for the same cache key to the same replica when the provider cache is replica-local"
+                        .to_string(),
+                ],
+            },
+        ],
+        actions,
+    })
 }
 
 fn resolve_source(input: &str, source_hint: Option<&str>) -> Result<SessionCostSource> {

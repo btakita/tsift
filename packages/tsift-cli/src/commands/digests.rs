@@ -732,6 +732,23 @@ pub(crate) fn cmd_session_cost(
                     .join(" || ")
             );
         }
+        if let Some(plan) = &report.prompt_cache_plan {
+            println!(
+                "prompt-cache status:{} feasible:{} adapters:{} actions:{}",
+                plan.status,
+                plan.feasible,
+                plan.provider_adapters.len(),
+                plan.actions.len()
+            );
+            for action in &plan.actions {
+                println!(
+                    "prompt-cache-action {} {} {}",
+                    action.severity,
+                    action.kind,
+                    truncate_for_compact(&action.message, 100)
+                );
+            }
+        }
         for guardrail in &report.guardrails {
             println!(
                 "guardrail {} {} {}",
@@ -846,6 +863,35 @@ pub(crate) fn cmd_session_cost(
             for command in &diagnostic.follow_up_commands {
                 println!("    follow-up: {command}");
             }
+        }
+    }
+
+    if let Some(plan) = &report.prompt_cache_plan {
+        println!();
+        println!("Prompt cache plan:");
+        println!(
+            "  - status: {} | feasible: {} | cached: {} | creation: {}",
+            plan.status,
+            plan.feasible,
+            plan.observed_cached_input_tokens,
+            plan.observed_cache_creation_tokens
+        );
+        if let Some(ratio) = &plan.observed_cached_input_ratio {
+            println!("  - observed ratio: {ratio}");
+        }
+        for adapter in &plan.provider_adapters {
+            println!(
+                "  - provider {}: {} ({})",
+                adapter.provider,
+                adapter.status,
+                adapter.requirements.join("; ")
+            );
+        }
+        for action in &plan.actions {
+            println!(
+                "  - {} {}: {} ({})",
+                action.severity, action.kind, action.message, action.guidance
+            );
         }
     }
 

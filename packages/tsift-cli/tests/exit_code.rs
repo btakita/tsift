@@ -9171,12 +9171,87 @@ fn session_cost_reads_codex_token_counts_from_stdin() {
     assert_eq!(json["total_tokens"], 50650);
     assert_eq!(json["largest_turn_total_tokens"], 26350);
     assert_eq!(json["cached_input_ratio"], 96.0);
+    assert_eq!(json["prompt_cache_plan"]["status"], "observed");
+    assert_eq!(json["prompt_cache_plan"]["feasible"], true);
+    assert_eq!(
+        json["prompt_cache_plan"]["observed_cached_input_ratio"],
+        "96.00%"
+    );
+    assert!(
+        json["prompt_cache_plan"]["provider_adapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|adapter| { adapter["provider"] == "openai" && adapter["status"] == "cache_key" })
+    );
+    assert!(
+        json["prompt_cache_plan"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["kind"] == "preserve_cache_shape")
+    );
     assert!(
         json["guardrails"]
             .as_array()
             .unwrap()
             .iter()
             .any(|guardrail| guardrail["kind"] == "cache_resend")
+    );
+}
+
+#[test]
+fn session_cost_recommends_prompt_cache_for_large_uncached_prompt() {
+    let input = concat!(
+        r#"{"timestamp":"2026-05-05T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20000,"cached_input_tokens":0,"output_tokens":300,"reasoning_output_tokens":50,"total_tokens":20300}}}}"#,
+        "\n"
+    );
+
+    let mut child = tsift_bin()
+        .args(["session-cost", "--json"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "session-cost should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["prompt_cache_plan"]["status"], "candidate");
+    assert_eq!(json["prompt_cache_plan"]["observed_cached_input_tokens"], 0);
+    assert!(
+        json["prompt_cache_plan"]["invariants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|invariant| invariant
+                .as_str()
+                .is_some_and(|text| text.contains("append-only")))
+    );
+    assert!(
+        json["prompt_cache_plan"]["provider_adapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|adapter| {
+                adapter["provider"] == "anthropic" && adapter["status"] == "explicit_breakpoints"
+            })
+    );
+    assert!(
+        json["prompt_cache_plan"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["kind"] == "enable_provider_cache")
     );
 }
 

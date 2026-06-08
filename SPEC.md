@@ -15,7 +15,7 @@ This file is the stable index. Normative detail lives in behavior-bounded siblin
 | [specs/search-navigation.md](specs/search-navigation.md) | New Subcommands, Search Stale Precheck + Timeout, Bounded Source-File Reads, Handle-Preserving Search Workflow, Index Quiet Mode, Init, Code Navigation, Status, Summarize |
 | [specs/ast-edits.md](specs/ast-edits.md) | Hybrid AST/CST Edit Strategy, Edit Target Selection, Minimal Textual Patch Output, Refusal Modes, Diff Visibility, Verification Requirements |
 | [specs/output-formats.md](specs/output-formats.md) | Global Compact Output, Budget-Aware Preview Profiles, Structured Envelopes, Compact/Terse/Ultra-Terse JSON, Tabular Output, Schema-Then-Values Mode, Relative Paths, Output Caps, Output Contract |
-| [specs/digests-sessions.md](specs/digests-sessions.md) | Diff Digest, Test Digest, Metric Digest, DCI Benchmark, Deterministic SimWorld, Log Digest, Session Digest, Session Cost, Session Review |
+| [specs/digests-sessions.md](specs/digests-sessions.md) | Diff Digest, Test Digest, Metric Digest, DCI Benchmark, Deterministic SimWorld, Log Digest, Session Digest, Session Cost, Prompt Cache Plan, Session Review |
 | [specs/release-integration.md](specs/release-integration.md) | Release Workflow, Skill Audit, Markdown Lint, Hook Integration, Tagpath integration, What NOT to build |
 
 **Authoring rule:** when a section grows or a new behavior boundary appears, follow the agent-doc `split-spec-files` runbook — keep this index stable and move normative detail into the sibling that owns that boundary. Do not duplicate an invariant across siblings unless intentional and kept in sync.
