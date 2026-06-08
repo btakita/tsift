@@ -5158,7 +5158,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tsift"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "tsift-agent-doc",
  "tsift-algorithms",
@@ -5179,7 +5179,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-agent-doc"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "serde",
@@ -5190,7 +5190,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-algorithms"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "serde",
@@ -5199,7 +5199,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-cli"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5234,7 +5234,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-core"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5245,7 +5245,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-digest"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "serde",
@@ -5258,7 +5258,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-graph"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5278,7 +5278,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-index"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "fs4",
@@ -5296,7 +5296,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-libsql"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5310,7 +5310,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-md-ast"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "serde",
  "tree-sitter",
@@ -5319,7 +5319,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-memory"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5332,7 +5332,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-quality"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5346,7 +5346,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-resolution"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "serde",
@@ -5355,7 +5355,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-search"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "ignore",
@@ -5372,14 +5372,14 @@ dependencies = [
 
 [[package]]
 name = "tsift-session"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "tsift-agent-doc",
 ]
 
 [[package]]
 name = "tsift-sim-world"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "tempfile",
  "tsift",
@@ -5389,7 +5389,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-sqlite"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5402,7 +5402,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-status"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "fs4",
@@ -5418,7 +5418,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-summarize"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5435,7 +5435,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-surrealdb"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5449,7 +5449,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-tokensave"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "anyhow",
  "rusqlite",

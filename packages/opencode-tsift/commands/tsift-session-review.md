@@ -1,4 +1,4 @@
-<!-- tsift:opencode-command v=0.1.64 name=tsift-session-review -->
+<!-- tsift:opencode-command v=0.1.65 name=tsift-session-review -->
 ---
 description: Summarize bounded agent session context
 ---

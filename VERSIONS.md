@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.65
+
 - `tsift init` now keeps the generated AGENTS/CLAUDE Code Navigation block self-contained for Codex/OpenCode prompt reuse while pointing repositories that ship current `.claude/skills/tsift/SKILL.md` or `runbooks/code-navigation.md` back to those deeper runbooks, avoiding a runbook-only install that breaks standalone checkouts.
 - **`#source-read-envelope-columns`**: `tsift --envelope source-read` now applies the existing schema-then-values transform by default, keeping JSON while emitting dense repeated lists such as `summary.metrics`, source `preview` lines, symbol refs, and Markdown outline nodes as `_c`/`_r` column tables. Non-envelope `source-read --json` remains the expanded object-array shape unless callers pass `--schema`. Updated the output-format spec, source-read envelope tests, and nested semantic-edit verification source-read parsing.
 - **`#release-publish-md-ast`**: added `tsift-md-ast` to the dependency-ordered crates.io package-check and publish lists, and tightened the release guard test so every split crate in the publish order is checked in both workflow steps.
