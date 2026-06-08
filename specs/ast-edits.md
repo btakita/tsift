@@ -20,6 +20,21 @@ The planner then chooses a language executor. Executors own language-specific pa
 
 When `--apply` is requested, tsift composes per-file non-overlapping text edits, writes staged files beside their targets, validates every staged file, formats only when the language contract requires it, and swaps staged files into place atomically with rollback on failure. Multi-file batches must either complete all planned file swaps or restore the original files before returning an error.
 
+## Edit Target Selection
+
+Semantic edit intents may identify a target with `symbol`/`file`, or with `target_handle` when a previous tsift read/navigation command already selected the node. The handle-selection prototype is read-only during dry run: it scans the current index, recomputes known concrete handle families, and maps the requested handle to one indexed AST span before patch planning begins.
+
+Supported concrete handle families:
+
+- `span-*` from `search` AST artifacts, `source-read` symbol refs, `symbol-read`, Markdown AST span refs, or traversal AST-span nodes
+- `ssym-*` from `source-read` symbol refs
+- `sread-*` from `symbol-read` target packets
+- `gsym-*` from traversal graph symbol nodes
+
+The resulting plan includes `target_selection` with the requested handle, matched handle, handle family, source surface, file/name/kind/language, full span metadata, a bounded source-window command, and a `symbol-read` command. This proof is additive: `target_symbol` and `target_range` still carry the normalized target used by existing edit planning.
+
+Non-concrete search preview handles such as `sfam-*`, `srnk-*`, and lexical file-hit handles are not writable targets by themselves because their stable hashes intentionally omit enough reverse-mapping context to select a unique current AST node. They must fail closed with guidance to pass the nested `ast.span.handle` from the search result instead.
+
 ## Minimal Textual Patch Output
 
 Semantic edits emit text patches, not synthetic whole-file rewrites. For every planned file, the report must expose:

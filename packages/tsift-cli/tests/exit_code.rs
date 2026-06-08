@@ -3532,6 +3532,223 @@ fn edit_intents_json_validates_semantic_write_plan_without_mutating() {
 }
 
 #[test]
+fn edit_intents_resolves_search_ast_span_handle_without_mutating() {
+    let dir = indexed_cli_fixture();
+    let before = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+
+    let search = tsift_bin()
+        .args([
+            "--envelope",
+            "search",
+            "alpha",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--strategy",
+            "lexical",
+            "--json",
+            "--budget",
+            "normal",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search stderr: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let search_json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    let alpha = search_json["report"]["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|symbol| symbol["name"] == "alpha")
+        .unwrap_or_else(|| panic!("expected alpha search symbol: {search_json}"));
+    let span_handle = alpha["ast"]["span"]["handle"].as_str().unwrap();
+
+    let input = serde_json::json!({
+        "intents": [{
+            "kind": "rename_symbol",
+            "target_handle": span_handle,
+            "new_name": "alpha_from_handle"
+        }]
+    })
+    .to_string();
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--budget",
+            "normal",
+        ],
+        &input,
+    );
+    assert!(
+        output.status.success(),
+        "edit-intents stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+        before
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = &json["report"]["plans"][0];
+    assert_eq!(plan["status"], "planned");
+    assert_eq!(plan["applied"], false);
+    assert_eq!(plan["target_symbol"]["name"], "alpha");
+    assert_eq!(
+        plan["target_symbol"]["span"]["start_byte"],
+        alpha["ast"]["span"]["start_byte"]
+    );
+    assert_eq!(
+        plan["target_selection"]["requested_handle"]
+            .as_str()
+            .unwrap(),
+        span_handle
+    );
+    assert_eq!(
+        plan["target_selection"]["matched_handle"].as_str().unwrap(),
+        span_handle
+    );
+    assert_eq!(plan["target_selection"]["handle_family"], "ast_span");
+    assert_eq!(
+        plan["target_selection"]["source"],
+        "search/source/symbol AST span"
+    );
+    assert!(
+        plan["target_selection"]["source_window"]
+            .as_str()
+            .unwrap()
+            .contains("source-read")
+    );
+}
+
+#[test]
+fn edit_intents_resolves_symbol_read_and_graph_handles_without_mutating() {
+    let dir = indexed_cli_fixture();
+    let before = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+
+    let symbol_read = tsift_bin()
+        .args([
+            "--envelope",
+            "symbol-read",
+            "alpha",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--file",
+            "main.rs",
+            "--json",
+            "--budget",
+            "normal",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        symbol_read.status.success(),
+        "symbol-read stderr: {}",
+        String::from_utf8_lossy(&symbol_read.stderr)
+    );
+    let symbol_json: serde_json::Value = serde_json::from_slice(&symbol_read.stdout).unwrap();
+    let symbol_handle = symbol_json["report"]["symbol"]["handle"].as_str().unwrap();
+    assert!(symbol_handle.starts_with("sread-"));
+
+    let traverse = tsift_bin()
+        .args([
+            "traverse",
+            "alpha",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        traverse.status.success(),
+        "traverse stderr: {}",
+        String::from_utf8_lossy(&traverse.stderr)
+    );
+    let traverse_json: serde_json::Value = serde_json::from_slice(&traverse.stdout).unwrap();
+    let graph_handle = traverse_json["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["kind"] == "symbol" && node["label"] == "alpha")
+        .unwrap_or_else(|| panic!("expected alpha graph symbol: {traverse_json}"))["handle"]
+        .as_str()
+        .unwrap();
+    assert!(graph_handle.starts_with("gsym-"));
+
+    let input = serde_json::json!({
+        "intents": [
+            {
+                "kind": "replace_function_body",
+                "target_handle": symbol_handle,
+                "replacement": "gamma();"
+            },
+            {
+                "kind": "rename_symbol",
+                "target_handle": graph_handle,
+                "new_name": "alpha_graph"
+            }
+        ]
+    })
+    .to_string();
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--budget",
+            "normal",
+        ],
+        &input,
+    );
+    assert!(
+        output.status.success(),
+        "edit-intents stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+        before
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["report"]["planned_total"], 2);
+    assert_eq!(json["report"]["applied_total"], 0);
+    let plans = json["report"]["plans"].as_array().unwrap();
+    assert_eq!(plans[0]["target_selection"]["handle_family"], "symbol_read");
+    assert_eq!(
+        plans[0]["target_selection"]["requested_handle"]
+            .as_str()
+            .unwrap(),
+        symbol_handle
+    );
+    assert_eq!(
+        plans[0]["target_symbol"]["span"]["node_kind"],
+        "function_item"
+    );
+    assert_eq!(
+        plans[1]["target_selection"]["handle_family"],
+        "graph_symbol"
+    );
+    assert_eq!(
+        plans[1]["target_selection"]["requested_handle"]
+            .as_str()
+            .unwrap(),
+        graph_handle
+    );
+    assert_eq!(plans[1]["target_symbol"]["name"], "alpha");
+}
+
+#[test]
 fn edit_intents_markdown_contract_recognizes_heading_intent_without_mutating() {
     let dir = markdown_edit_fixture();
     let before = fs::read_to_string(dir.path().join("README.md")).unwrap();

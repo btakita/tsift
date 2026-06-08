@@ -18,7 +18,8 @@ use crate::output::{OutputFormat, ResponseBudget, ToolEnvelopeSummary};
 use crate::{
     SourceRangePreview, envelope_metric, markdown_ast_projection, print_json_or_envelope,
     relativize_pathbuf, resolve_query_db_path, resolve_source_file, shell_quote,
-    source_read_command, stable_handle, symbol_hit_ast_span, symbol_hit_end_line, symbol_hit_line,
+    source_read_command, source_symbol_line, source_symbol_read_command, stable_handle,
+    stored_symbol_ast_span, symbol_hit_ast_span, symbol_hit_end_line, symbol_hit_line,
     truncate_for_budget,
 };
 
@@ -35,6 +36,8 @@ pub(crate) struct SemanticEditIntentBatch {
 #[derive(Deserialize)]
 pub(crate) struct SemanticEditIntent {
     pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) target_handle: Option<String>,
     #[serde(default)]
     pub(crate) symbol: Option<String>,
     #[serde(default)]
@@ -121,6 +124,8 @@ pub(crate) struct SemanticEditIntentPlan {
     pub(crate) status: String,
     pub(crate) apply_supported: bool,
     pub(crate) applied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) target_selection: Option<SemanticEditTargetSelection>,
     pub(crate) target_symbol: Option<SemanticEditSymbolTarget>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) call_refs: Vec<SemanticEditCallRef>,
@@ -162,6 +167,24 @@ pub(crate) struct SemanticEditSymbolTarget {
     pub(crate) end_line: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) span: Option<AstSpanPreview>,
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct SemanticEditTargetSelection {
+    pub(crate) requested_handle: String,
+    pub(crate) matched_handle: String,
+    pub(crate) handle_family: String,
+    pub(crate) source: String,
+    pub(crate) file: String,
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) language: String,
+    pub(crate) line: usize,
+    pub(crate) end_line: usize,
+    pub(crate) span: AstSpanPreview,
+    pub(crate) source_window: String,
+    pub(crate) symbol_read: String,
+    pub(crate) message: String,
 }
 
 #[derive(Serialize)]
@@ -236,6 +259,23 @@ pub(crate) struct SemanticEditIntentDraft {
     pub(crate) file_abs: PathBuf,
     pub(crate) destination_file_abs: Option<PathBuf>,
     pub(crate) language: String,
+}
+
+struct SemanticEditResolvedHandleTarget {
+    target_symbol: SemanticEditSymbolTarget,
+    file_abs: PathBuf,
+    target_range: SourceRangePreview,
+    selection: SemanticEditTargetSelection,
+}
+
+struct SemanticEditTargetSelectionInput<'a> {
+    requested_handle: &'a str,
+    matched_handle: &'a str,
+    handle_family: &'a str,
+    source: &'a str,
+    symbol: &'a index::StoredSymbol,
+    file_abs: &'a Path,
+    span: &'a AstSpanPreview,
 }
 
 #[derive(Deserialize)]
@@ -405,12 +445,20 @@ fn validate_semantic_edit_intent(kind: &str, intent: &SemanticEditIntent) -> Res
             SEMANTIC_EDIT_KINDS.join(", ")
         );
     }
+    let has_target_handle = intent
+        .target_handle
+        .as_deref()
+        .is_some_and(|handle| !handle.trim().is_empty());
     if semantic_edit_kind_requires_symbol(kind)
         && intent.symbol.as_deref().is_none_or(str::is_empty)
+        && !has_target_handle
     {
-        bail!("semantic edit kind {kind:?} requires `symbol`");
+        bail!("semantic edit kind {kind:?} requires `symbol` or `target_handle`");
     }
-    if semantic_edit_kind_requires_file(kind) && intent.file.is_none() {
+    if semantic_edit_kind_requires_file(kind)
+        && intent.file.is_none()
+        && !(has_target_handle && kind != "move_declaration")
+    {
         bail!("semantic edit kind {kind:?} requires `file`");
     }
     if semantic_edit_kind_requires_replacement(kind)
@@ -523,6 +571,257 @@ fn resolve_semantic_edit_call_refs(
             .then(left.caller.cmp(&right.caller))
     });
     Ok((refs, cross_file))
+}
+
+fn semantic_edit_handle_family(handle: &str) -> Option<(&'static str, &'static str)> {
+    if handle.starts_with("span-") {
+        Some(("ast_span", "search/source/symbol AST span"))
+    } else if handle.starts_with("ssym-") {
+        Some(("source_symbol", "source-read symbol reference"))
+    } else if handle.starts_with("sread-") {
+        Some(("symbol_read", "symbol-read target"))
+    } else if handle.starts_with("gsym-") {
+        Some(("graph_symbol", "graph traversal symbol"))
+    } else {
+        None
+    }
+}
+
+fn semantic_edit_stored_symbol_handles(
+    root: &Path,
+    symbol: &index::StoredSymbol,
+    file_abs: &Path,
+    span: &AstSpanPreview,
+) -> Vec<(String, &'static str, &'static str)> {
+    let file_display = semantic_edit_file_display(root, file_abs);
+    let mut handles = vec![
+        (
+            span.handle.clone(),
+            "ast_span",
+            "search/source/symbol AST span",
+        ),
+        (
+            stable_handle(
+                "ssym",
+                &format!(
+                    "{}:{}:{}",
+                    file_display,
+                    symbol.name,
+                    source_symbol_line(symbol)
+                ),
+            ),
+            "source_symbol",
+            "source-read symbol reference",
+        ),
+        (
+            stable_handle(
+                "sread",
+                &format!("{}:{}:{}", file_display, symbol.name, span.start_line),
+            ),
+            "symbol_read",
+            "symbol-read target",
+        ),
+        (
+            stable_handle(
+                "gsym",
+                &format!("symbol:{}:{}:{}", file_display, symbol.line, symbol.name),
+            ),
+            "graph_symbol",
+            "graph traversal symbol",
+        ),
+    ];
+    let display_span_handle = stable_handle(
+        "span",
+        &format!(
+            "{}:{}:{}:{}:{}",
+            file_display, symbol.kind, symbol.name, span.start_byte, span.end_byte
+        ),
+    );
+    if display_span_handle != span.handle {
+        handles.push((
+            display_span_handle,
+            "ast_span",
+            "search/source/symbol AST span",
+        ));
+    }
+    handles
+}
+
+fn semantic_edit_target_selection(
+    root: &Path,
+    input: SemanticEditTargetSelectionInput<'_>,
+) -> (
+    SemanticEditSymbolTarget,
+    SourceRangePreview,
+    SemanticEditTargetSelection,
+) {
+    let SemanticEditTargetSelectionInput {
+        requested_handle,
+        matched_handle,
+        handle_family,
+        source,
+        symbol,
+        file_abs,
+        span,
+    } = input;
+    let file_display = semantic_edit_file_display(root, file_abs);
+    let line_count = span
+        .end_line
+        .saturating_sub(span.start_line)
+        .saturating_add(1)
+        .max(1);
+    let target_symbol = SemanticEditSymbolTarget {
+        name: symbol.name.clone(),
+        kind: symbol.kind.clone(),
+        language: symbol.language.clone(),
+        file: file_display.clone(),
+        line: span.start_line,
+        end_line: Some(span.end_line),
+        span: Some(span.clone()),
+    };
+    let target_range = SourceRangePreview {
+        start: span.start_line,
+        end: span.end_line,
+        total_lines: 0,
+        truncated_before: false,
+        truncated_after: false,
+    };
+    let selection = SemanticEditTargetSelection {
+        requested_handle: requested_handle.to_string(),
+        matched_handle: matched_handle.to_string(),
+        handle_family: handle_family.to_string(),
+        source: source.to_string(),
+        file: file_display.clone(),
+        name: symbol.name.clone(),
+        kind: symbol.kind.clone(),
+        language: symbol.language.clone(),
+        line: span.start_line,
+        end_line: span.end_line,
+        span: span.clone(),
+        source_window: source_read_command(root, &file_display, span.start_line, line_count),
+        symbol_read: source_symbol_read_command(root, &symbol.name, &file_display),
+        message: "resolved target_handle to a concrete indexed AST span without mutating source"
+            .to_string(),
+    };
+    (target_symbol, target_range, selection)
+}
+
+fn resolve_semantic_edit_target_handle(
+    root: &Path,
+    scope: Option<&str>,
+    handle: &str,
+    file_hint: Option<&Path>,
+    budget: ResponseBudget,
+) -> Result<SemanticEditResolvedHandleTarget> {
+    let handle = handle.trim();
+    if handle.is_empty() {
+        bail!("semantic edit `target_handle` must not be empty");
+    }
+    if matches!(
+        handle.split_once('-').map(|(prefix, _)| prefix),
+        Some("sfam" | "srnk" | "shit")
+    ) {
+        bail!(
+            "search preview handle {handle:?} is not a concrete AST/CST target; pass the nested `ast.span.handle` from the search result instead"
+        );
+    }
+    let Some((expected_family, expected_source)) = semantic_edit_handle_family(handle) else {
+        bail!(
+            "unsupported semantic edit target_handle {handle:?}; expected span-*, ssym-*, sread-*, or gsym-*"
+        );
+    };
+
+    let hinted_file_abs = file_hint
+        .map(|file| resolve_source_file(root, file))
+        .transpose()?;
+    let path_hint = hinted_file_abs.as_deref().unwrap_or(root);
+    let db_path = resolve_query_db_path(root, path_hint, scope)?;
+    if !db_path.exists() {
+        bail!(
+            "index refs unavailable: no index found at {}",
+            db_path.display()
+        );
+    }
+    let db = index::IndexDb::open_read_only_resilient(&db_path)
+        .with_context(|| format!("opening symbol index {}", db_path.display()))?;
+    let symbols = db
+        .all_symbols()
+        .with_context(|| format!("loading symbols from {}", db_path.display()))?;
+    let mut symbols_by_file: BTreeMap<String, Vec<index::StoredSymbol>> = BTreeMap::new();
+    for symbol in &symbols {
+        symbols_by_file
+            .entry(symbol.file.clone())
+            .or_default()
+            .push(symbol.clone());
+    }
+    let mut source_cache: BTreeMap<String, (PathBuf, Vec<u8>)> = BTreeMap::new();
+    let mut matches = Vec::new();
+
+    for symbol in &symbols {
+        if !source_cache.contains_key(&symbol.file) {
+            let file_abs = resolve_source_file(root, Path::new(&symbol.file))
+                .with_context(|| format!("resolving indexed source file for {}", symbol.file))?;
+            let source =
+                fs::read(&file_abs).with_context(|| format!("reading {}", file_abs.display()))?;
+            source_cache.insert(symbol.file.clone(), (file_abs, source));
+        }
+        let (file_abs, source) = source_cache
+            .get(&symbol.file)
+            .expect("source cache populated above");
+        if hinted_file_abs
+            .as_ref()
+            .is_some_and(|hinted| hinted != file_abs)
+        {
+            continue;
+        }
+        let file_symbols = symbols_by_file
+            .get(&symbol.file)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let Some(span) =
+            stored_symbol_ast_span(symbol, source, file_symbols, budget.preview_items())
+        else {
+            continue;
+        };
+        for (candidate, family, source_label) in
+            semantic_edit_stored_symbol_handles(root, symbol, file_abs, &span)
+        {
+            if candidate == handle {
+                let (target_symbol, target_range, selection) = semantic_edit_target_selection(
+                    root,
+                    SemanticEditTargetSelectionInput {
+                        requested_handle: handle,
+                        matched_handle: &candidate,
+                        handle_family: family,
+                        source: source_label,
+                        symbol,
+                        file_abs,
+                        span: &span,
+                    },
+                );
+                matches.push(SemanticEditResolvedHandleTarget {
+                    target_symbol,
+                    file_abs: file_abs.clone(),
+                    target_range,
+                    selection,
+                });
+            }
+        }
+    }
+
+    if matches.is_empty() {
+        bail!(
+            "{expected_source} handle {handle:?} did not match any indexed concrete AST span in {}",
+            db_path.display()
+        );
+    }
+    if matches.len() > 1 {
+        bail!(
+            "{expected_family} handle {handle:?} resolved ambiguously to {} indexed targets; add `file` to narrow it",
+            matches.len()
+        );
+    }
+    Ok(matches.remove(0))
 }
 
 fn semantic_edit_file_display(root: &Path, file_abs: &Path) -> String {
@@ -2957,9 +3256,32 @@ fn plan_semantic_edit_intent(
     };
 
     let mut target_hit = None;
-    let (mut target_symbol, file_abs, mut target_range) = if let Some(symbol) =
-        intent.symbol.as_deref()
+    let mut target_selection = None;
+    let (mut target_symbol, file_abs, mut target_range) = if let Some(handle) =
+        intent.target_handle.as_deref()
     {
+        let file_hint = if kind == "move_declaration" {
+            None
+        } else {
+            intent.file.as_deref()
+        };
+        let resolved = resolve_semantic_edit_target_handle(root, scope, handle, file_hint, budget)?;
+        if let Some(expected_symbol) = intent.symbol.as_deref()
+            && expected_symbol != resolved.target_symbol.name
+        {
+            bail!(
+                "semantic edit target_handle resolved to symbol {:?}, but intent requested symbol {:?}",
+                resolved.target_symbol.name,
+                expected_symbol
+            );
+        }
+        target_selection = Some(resolved.selection);
+        (
+            Some(resolved.target_symbol),
+            resolved.file_abs,
+            Some(resolved.target_range),
+        )
+    } else if let Some(symbol) = intent.symbol.as_deref() {
         let file_hint = if kind == "move_declaration" {
             None
         } else {
@@ -3158,6 +3480,7 @@ fn plan_semantic_edit_intent(
             status,
             apply_supported,
             applied: false,
+            target_selection,
             target_symbol,
             call_refs,
             cross_file_call_ref_total: (cross_file_call_ref_total > 0)
