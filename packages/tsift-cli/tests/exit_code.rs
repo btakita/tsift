@@ -607,6 +607,73 @@ fn git_indexed_cli_fixture() -> tempfile::TempDir {
     dir
 }
 
+fn write_ast_cst_rust_edit_fixture(path: &Path) {
+    fs::write(
+        path.join("main.rs"),
+        r#"#![allow(dead_code)]
+
+use std::io;
+
+// Keep the module banner comment.
+
+// <generated:do-not-edit>
+macro_rules! make_value {
+    () => {
+        41
+    };
+}
+// </generated:do-not-edit>
+
+fn alpha() {
+    // Keep the local comment until a body replacement owns this range.
+    let value = make_value!();
+    println!("value: {value}");
+}
+
+// Keep beta call comment.
+fn beta() {
+    alpha();
+}
+"#,
+    )
+    .unwrap();
+}
+
+fn ast_cst_rust_edit_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write_ast_cst_rust_edit_fixture(dir.path());
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
+}
+
+fn git_ast_cst_rust_edit_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write_ast_cst_rust_edit_fixture(dir.path());
+    init_git_repo(dir.path());
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
+}
+
 fn structural_edit_fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -684,6 +751,45 @@ def alpha(value):
 
 def beta(value):
     return value + 1
+"#,
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
+}
+
+fn mixed_language_markdown_edit_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("README.md"),
+        r#"# Mixed Blocks
+
+## Usage
+
+```rust
+fn sample() {}
+```
+
+```ts
+function sample() {
+  return 1;
+}
+```
+
+```python
+def sample():
+    return 1
+```
 "#,
     )
     .unwrap();
@@ -3827,6 +3933,235 @@ fn edit_intents_patch_proposal_refuses_parse_errors_without_mutating() {
 }
 
 #[test]
+fn edit_intents_apply_preserves_comments_formatting_and_generated_macro_sections() {
+    let dir = ast_cst_rust_edit_fixture();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "insert_import",
+                "file": "main.rs",
+                "replacement": "std::fmt"
+            },
+            {
+                "kind": "replace_function_body",
+                "symbol": "alpha",
+                "file": "main.rs",
+                "replacement": "let value = make_value!() + 1;\nprintln!(\"value: {value}\");"
+            }
+        ]
+    }"#;
+
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+            "--budget",
+            "normal",
+        ],
+        input,
+    );
+    assert!(
+        output.status.success(),
+        "AST/CST apply stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["report"]["planned_total"], 2);
+    assert_eq!(json["report"]["applied_total"], 2);
+    assert_eq!(json["report"]["unsupported_total"], 0);
+
+    let plans = json["report"]["plans"].as_array().unwrap();
+    for plan in plans {
+        let patch = &plan["patch_proposal"];
+        assert_eq!(patch["strategy"], "ast_cst_minimal_textual_patch");
+        assert_eq!(patch["parser_state"]["input"], "valid");
+        assert_eq!(patch["parser_state"]["output"], "valid");
+        assert_eq!(patch["trivia"]["preserves_comments"], true);
+        assert_eq!(patch["trivia"]["preserves_formatting"], true);
+        assert_eq!(patch["trivia"]["preserves_trivia"], true);
+    }
+    let body_hunk = &plans[1]["patch_proposal"]["files"][0]["hunks"][0];
+    assert!(
+        body_hunk["before"]["start_line"].as_u64().unwrap() > 12,
+        "{}",
+        body_hunk
+    );
+
+    let source = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    assert!(source.contains("use std::fmt;"), "{source}");
+    assert!(source.contains("use std::io;"), "{source}");
+    assert!(
+        source.contains("// Keep the module banner comment."),
+        "{source}"
+    );
+    assert!(source.contains("// <generated:do-not-edit>"), "{source}");
+    assert!(source.contains("macro_rules! make_value"), "{source}");
+    assert!(source.contains("// </generated:do-not-edit>"), "{source}");
+    assert!(source.contains("// Keep beta call comment."), "{source}");
+    assert!(
+        source.contains("let value = make_value!() + 1;"),
+        "{source}"
+    );
+}
+
+#[test]
+fn edit_intents_markdown_rewrites_selected_fence_without_touching_mixed_language_blocks() {
+    let dir = mixed_language_markdown_edit_fixture();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "rewrite_code_fence",
+                "symbol": "rust",
+                "file": "README.md",
+                "replacement": "fn sample() {\n    println!(\"ok\");\n}\n"
+            }
+        ]
+    }"#;
+
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+            "--budget",
+            "normal",
+        ],
+        input,
+    );
+    assert!(
+        output.status.success(),
+        "mixed Markdown fence apply stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["report"]["planned_total"], 1);
+    assert_eq!(json["report"]["applied_total"], 1);
+    let plan = &json["report"]["plans"][0];
+    assert_eq!(plan["target_symbol"]["kind"], "code_block");
+    assert_eq!(
+        plan["target_symbol"]["span"]["markdown"]["fence_language"],
+        "rust"
+    );
+    assert_eq!(
+        plan["patch_proposal"]["parser_state"]["validator"],
+        "Markdown"
+    );
+
+    let readme = fs::read_to_string(dir.path().join("README.md")).unwrap();
+    assert!(
+        readme.contains("```rust\nfn sample() {\n    println!(\"ok\");\n}\n```"),
+        "{readme}"
+    );
+    assert!(
+        readme.contains("```ts\nfunction sample() {\n  return 1;\n}\n```"),
+        "{readme}"
+    );
+    assert!(
+        readme.contains("```python\ndef sample():\n    return 1\n```"),
+        "{readme}"
+    );
+}
+
+#[test]
+fn edit_intents_apply_refuses_syntax_error_work_in_progress_source_without_mutating() {
+    let dir = ast_cst_rust_edit_fixture();
+    let path = dir.path().join("main.rs");
+    let before = fs::read_to_string(&path).unwrap();
+    let invalid = before.replace(
+        "fn beta() {\n    alpha();\n}",
+        "fn beta( {\n    alpha();\n}",
+    );
+    assert_ne!(before, invalid);
+    fs::write(&path, &invalid).unwrap();
+
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "replace_function_body",
+                "symbol": "alpha",
+                "file": "main.rs",
+                "replacement": "let value = make_value!() + 1;"
+            }
+        ]
+    }"#;
+
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+            "--budget",
+            "normal",
+        ],
+        input,
+    );
+    assert!(
+        !output.status.success(),
+        "syntax-error WIP apply should fail"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("parse errors"), "stderr was: {stderr}");
+}
+
+#[test]
+fn edit_intents_verify_failure_blocks_real_ast_cst_mutation() {
+    let dir = git_ast_cst_rust_edit_fixture();
+    let path = dir.path().join("main.rs");
+    let before = fs::read_to_string(&path).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "replace_function_body",
+                "symbol": "alpha",
+                "file": "main.rs",
+                "replacement": "let value = make_value!() + 1;"
+            }
+        ]
+    }"#;
+
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--verify",
+            "--verify-command",
+            "exit 23",
+            "--apply",
+            "--budget",
+            "normal",
+        ],
+        input,
+    );
+    assert!(
+        !output.status.success(),
+        "failing AST/CST verify command should block apply"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("semantic edit verification command failed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn edit_intents_markdown_contract_recognizes_heading_intent_without_mutating() {
     let dir = markdown_edit_fixture();
     let before = fs::read_to_string(dir.path().join("README.md")).unwrap();
@@ -4679,6 +5014,164 @@ fn edit_intents_apply_formats_and_mutates_supported_rust_intents() {
 }
 
 #[test]
+fn edit_intents_insert_import_preserves_rust_inner_prelude() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        r#"//! crate docs
+#![allow(dead_code)]
+
+use std::io;
+
+fn main() {}
+"#,
+    )
+    .unwrap();
+    let index = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        index.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "insert_import",
+                "file": "main.rs",
+                "replacement": "std::fmt"
+            }
+        ]
+    }"#;
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ],
+        input,
+    );
+    assert!(
+        output.status.success(),
+        "insert_import stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["report"]["planned_total"], 1);
+    assert_eq!(json["report"]["applied_total"], 1);
+    let source = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    assert!(
+        source.starts_with("//! crate docs\n#![allow(dead_code)]"),
+        "{source}"
+    );
+    let attr_pos = source.find("#![allow(dead_code)]").unwrap();
+    let import_pos = source.find("use std::fmt;").unwrap();
+    let fn_pos = source.find("fn main").unwrap();
+    assert!(attr_pos < import_pos, "{source}");
+    assert!(import_pos < fn_pos, "{source}");
+}
+
+#[test]
+fn edit_intents_replace_function_body_uses_rust_ast_body_range() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("main.rs"),
+        r#"const TEMPLATE: &str = "fn beta() { ignored(); }";
+
+fn alpha() {}
+fn gamma() {}
+
+fn beta() {
+    alpha();
+}
+"#,
+    )
+    .unwrap();
+    let index = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        index.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let search = tsift_bin()
+        .args([
+            "--envelope",
+            "search",
+            "beta",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--strategy",
+            "lexical",
+            "--json",
+            "--budget",
+            "normal",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search stderr: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let search_json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    let beta = search_json["report"]["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|symbol| symbol["name"] == "beta")
+        .unwrap_or_else(|| panic!("expected beta search symbol: {search_json}"));
+    let target_handle = beta["ast"]["span"]["handle"].as_str().unwrap();
+
+    let input = serde_json::json!({
+        "intents": [{
+            "kind": "replace_function_body",
+            "target_handle": target_handle,
+            "replacement": "gamma();"
+        }]
+    })
+    .to_string();
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ],
+        &input,
+    );
+    assert!(
+        output.status.success(),
+        "replace_function_body stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = &json["report"]["plans"][0];
+    assert_eq!(plan["status"], "applied");
+    assert_eq!(plan["target_selection"]["requested_handle"], target_handle);
+    let source = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    assert!(
+        source.contains("const TEMPLATE: &str = \"fn beta() { ignored(); }\";"),
+        "{source}"
+    );
+    assert!(source.contains("fn beta() {\n    gamma();\n}"), "{source}");
+    assert!(!source.contains("fn beta() {\n    alpha();\n}"), "{source}");
+}
+
+#[test]
 fn edit_intents_apply_rewrites_indexed_rust_call_sites() {
     let dir = indexed_cli_fixture();
     let input = r#"{
@@ -5401,7 +5894,8 @@ fn edit_intents_apply_refuses_invalid_parser_output_without_mutating() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("patch proposal output produced Rust source with parse errors"),
+        stderr.contains("replace_function_body produced Rust source with parse errors")
+            || stderr.contains("patch proposal output produced Rust source with parse errors"),
         "stderr was: {stderr}"
     );
 }

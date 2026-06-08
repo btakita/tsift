@@ -1628,42 +1628,6 @@ fn replace_script_function_body(
     Ok((out, 1))
 }
 
-fn find_matching_rust_brace(content: &str, open_idx: usize) -> Result<usize> {
-    let mut depth = 0usize;
-    for (idx, ch) in content[open_idx..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Ok(open_idx + idx);
-                }
-            }
-            _ => {}
-        }
-    }
-    bail!("could not find matching Rust function body brace")
-}
-
-fn find_rust_function_open_brace(content: &str, name: &str) -> Result<usize> {
-    validate_rust_identifier(name, "symbol")?;
-    let needle = format!("fn {name}");
-    let mut search_start = 0;
-    while let Some(relative) = content[search_start..].find(&needle) {
-        let start = search_start + relative;
-        let name_end = start + needle.len();
-        let after_name_is_ident = content[name_end..]
-            .chars()
-            .next()
-            .is_some_and(rust_ident_char);
-        if !after_name_is_ident && let Some(brace_relative) = content[name_end..].find('{') {
-            return Ok(name_end + brace_relative);
-        }
-        search_start = name_end;
-    }
-    bail!("could not find Rust function {name:?}")
-}
-
 fn rust_function_body_replacement(replacement: &str, base_indent: &str) -> String {
     let body_indent = format!("{base_indent}    ");
     let trimmed = replacement.trim_matches('\n');
@@ -1686,18 +1650,130 @@ fn rust_function_body_replacement(replacement: &str, base_indent: &str) -> Strin
     body
 }
 
+fn rust_target_span_matches_node(
+    target: &SemanticEditSymbolTarget,
+    node: tree_sitter::Node,
+) -> bool {
+    target
+        .span
+        .as_ref()
+        .is_none_or(|span| node.start_byte() == span.start_byte && node.end_byte() == span.end_byte)
+}
+
+fn find_rust_function_body_range(
+    content: &str,
+    target: &SemanticEditSymbolTarget,
+) -> Result<(usize, usize, String)> {
+    validate_rust_identifier(&target.name, "symbol")?;
+    let source = content.as_bytes();
+    let language = graph::Lang::Rust.tree_sitter_language();
+    let tree = parse_semantic_edit_source(
+        content,
+        SemanticEditExecutorLanguage::Rust,
+        "replace_function_body input",
+    )?;
+    let query = tree_sitter::Query::new(
+        &language,
+        r#"
+        (function_item name: (identifier) @function.name body: (block) @function.body) @function.item
+        "#,
+    )?;
+    let capture_names = query.capture_names();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source);
+    let mut candidates = Vec::new();
+    while let Some(m) = matches.next() {
+        let mut name_node = None;
+        let mut body_node = None;
+        let mut item_node = None;
+        for capture in m.captures {
+            match capture_names[capture.index as usize] {
+                "function.name" => name_node = Some(capture.node),
+                "function.body" => body_node = Some(capture.node),
+                "function.item" => item_node = Some(capture.node),
+                _ => {}
+            }
+        }
+        let (Some(name_node), Some(body_node), Some(item_node)) = (name_node, body_node, item_node)
+        else {
+            continue;
+        };
+        if name_node.utf8_text(source)? != target.name {
+            continue;
+        }
+        if source.get(body_node.start_byte()).copied() != Some(b'{')
+            || source.get(body_node.end_byte().saturating_sub(1)).copied() != Some(b'}')
+        {
+            bail!(
+                "Rust function {:?} does not have a supported block body",
+                target.name
+            );
+        }
+        candidates.push((
+            body_node.start_byte() + 1,
+            body_node.end_byte().saturating_sub(1),
+            line_indent_at(content, body_node.start_byte()),
+            rust_target_span_matches_node(target, item_node),
+        ));
+    }
+
+    if target.span.is_some() {
+        let mut exact_span_candidates = candidates
+            .iter()
+            .filter(|(_, _, _, span_matches)| *span_matches)
+            .cloned()
+            .collect::<Vec<_>>();
+        match exact_span_candidates.len() {
+            1 => {
+                let (start, end, indent, _) = exact_span_candidates.remove(0);
+                return Ok((start, end, indent));
+            }
+            count if count > 1 => {
+                bail!(
+                    "Rust function {:?} matched multiple resolved AST spans",
+                    target.name
+                )
+            }
+            _ => {}
+        }
+    }
+
+    match candidates.len() {
+        1 => {
+            let (start, end, indent, _) = candidates.remove(0);
+            Ok((start, end, indent))
+        }
+        0 if target.span.is_some() => bail!(
+            "could not find Rust function {:?} at the resolved AST span",
+            target.name
+        ),
+        0 => bail!("could not find Rust function {:?}", target.name),
+        _ if target.span.is_some() => bail!(
+            "Rust function {:?} resolved AST span is stale and the current file has ambiguous functions with that name",
+            target.name
+        ),
+        _ => bail!(
+            "Rust function {:?} is ambiguous without a concrete AST span; pass target_handle from search/source-read/symbol-read",
+            target.name
+        ),
+    }
+}
+
 fn replace_rust_function_body(
     content: &str,
-    name: &str,
+    target: &SemanticEditSymbolTarget,
     replacement: &str,
 ) -> Result<(String, usize)> {
-    let open_idx = find_rust_function_open_brace(content, name)?;
-    let close_idx = find_matching_rust_brace(content, open_idx)?;
-    let base_indent = line_indent_at(content, open_idx);
+    let (start, end, base_indent) = find_rust_function_body_range(content, target)?;
     let mut out = String::with_capacity(content.len() + replacement.len());
-    out.push_str(&content[..=open_idx]);
+    out.push_str(&content[..start]);
     out.push_str(&rust_function_body_replacement(replacement, &base_indent));
-    out.push_str(&content[close_idx..]);
+    out.push_str(&content[end..]);
+    parse_semantic_edit_source(
+        &out,
+        SemanticEditExecutorLanguage::Rust,
+        "replace_function_body",
+    )?;
     Ok((out, 1))
 }
 
@@ -1720,33 +1796,55 @@ fn normalize_rust_import(replacement: &str) -> Result<String> {
     Ok(import)
 }
 
+fn line_end_after_byte(content: &str, idx: usize) -> usize {
+    content[idx..]
+        .find('\n')
+        .map(|relative| idx + relative + 1)
+        .unwrap_or(content.len())
+}
+
+fn rust_import_insert_offset(content: &str) -> Result<usize> {
+    let source = content.as_bytes();
+    let tree = parse_semantic_edit_source(
+        content,
+        SemanticEditExecutorLanguage::Rust,
+        "insert_import input",
+    )?;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let mut insert_at = 0usize;
+    for child in root.named_children(&mut cursor) {
+        match child.kind() {
+            "shebang" | "inner_attribute_item" | "use_declaration" | "extern_crate_declaration" => {
+                insert_at = line_end_after_byte(content, child.end_byte());
+            }
+            "line_comment" | "block_comment" => {
+                let text = child.utf8_text(source)?.trim_start();
+                if text.starts_with("//!") || text.starts_with("/*!") {
+                    insert_at = line_end_after_byte(content, child.end_byte());
+                    continue;
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    Ok(insert_at)
+}
+
 fn insert_rust_import(content: &str, replacement: &str) -> Result<(String, usize)> {
     let import = normalize_rust_import(replacement)?;
     if content.lines().any(|line| line.trim() == import) {
         return Ok((content.to_string(), 0));
     }
-
-    let mut offset = 0usize;
-    let mut insert_at = 0usize;
-    for line in content.split_inclusive('\n') {
-        let trimmed = line.trim();
-        if trimmed.starts_with("use ")
-            || trimmed.starts_with("pub use ")
-            || trimmed.starts_with("extern crate ")
-            || (insert_at == 0 && (trimmed.is_empty() || trimmed.starts_with("#!")))
-        {
-            insert_at = offset + line.len();
-            offset += line.len();
-            continue;
-        }
-        break;
-    }
+    let insert_at = rust_import_insert_offset(content)?;
 
     let mut out = String::with_capacity(content.len() + import.len() + 1);
     out.push_str(&content[..insert_at]);
     out.push_str(&import);
     out.push('\n');
     out.push_str(&content[insert_at..]);
+    parse_semantic_edit_source(&out, SemanticEditExecutorLanguage::Rust, "insert_import")?;
     Ok((out, 1))
 }
 
@@ -3079,7 +3177,9 @@ fn preview_semantic_edit_content(
         ),
         "replace_function_body" => replace_rust_function_body(
             content,
-            target_symbol_name(target_symbol, kind)?,
+            target_symbol.with_context(
+                || "semantic edit kind \"replace_function_body\" requires a resolved target symbol",
+            )?,
             intent
                 .replacement
                 .as_deref()

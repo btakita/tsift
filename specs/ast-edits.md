@@ -84,4 +84,10 @@ Dry-run planning verifies target uniqueness, range extraction, parser support, b
 
 ## Promotion Order
 
-New AST/CST edit operations are promoted narrowly. `insert_import` and `replace_function_body` are the baseline operations because their target ranges and expected diffs are easy to inspect. Broader rename, move, call-site, and signature operations require additional graph/index proof and tests that cover comments, formatting preservation, unsupported parser states, macro or generated regions, syntax-error work-in-progress files, and verification failures.
+New AST/CST edit operations are promoted narrowly. `insert_import` and `replace_function_body` are the baseline operations because their target ranges and expected diffs are easy to inspect.
+
+For Rust, `replace_function_body` must select a parsed `function_item` body. When the intent includes a concrete target handle or indexed span, the executor must match that exact span before replacing bytes so duplicate function names do not silently edit the first textual match. Without a concrete span, duplicate same-file function names are ambiguous and must fail closed.
+
+For Rust, `insert_import` must parse the current source and anchor insertion after the source-file prelude that can safely precede imports: shebangs, crate-level inner doc comments, inner attributes, `use` declarations, and `extern crate` declarations. The emitted mutation is still a minimal textual insertion and must reparse before planning or applying.
+
+Broader rename, move, call-site, and signature operations require additional graph/index proof and tests that cover comments, formatting preservation, unsupported parser states, macro or generated regions, syntax-error work-in-progress files, and verification failures.
