@@ -3496,6 +3496,13 @@ fn semantic_edit_verification_source_windows(
         .collect()
 }
 
+fn structured_json_row_count(value: &serde_json::Value) -> usize {
+    value.as_array().map_or_else(
+        || value["_r"].as_array().map_or(0, |rows| rows.len()),
+        |rows| rows.len(),
+    )
+}
+
 fn run_semantic_edit_verification_source_read(
     root: &Path,
     file: &str,
@@ -3538,13 +3545,9 @@ fn run_semantic_edit_verification_source_read(
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).context("parsing source-read verification JSON")?;
     let report = &json["report"];
-    let preview_lines = report["preview"].as_array().map_or(0, |lines| lines.len());
-    let symbol_refs = report["symbols"]
-        .as_array()
-        .map_or(0, |symbols| symbols.len());
-    let summary_refs = report["summaries"]
-        .as_array()
-        .map_or(0, |summaries| summaries.len());
+    let preview_lines = structured_json_row_count(&report["preview"]);
+    let symbol_refs = structured_json_row_count(&report["symbols"]);
+    let summary_refs = structured_json_row_count(&report["summaries"]);
     Ok(SemanticEditVerificationSourceRead {
         file: file.to_string(),
         start,

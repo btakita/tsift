@@ -32,6 +32,41 @@ fn run_tsift_stdin(args: &[&str], input: &str) -> std::process::Output {
     child.wait_with_output().unwrap()
 }
 
+fn structured_rows(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    if let Some(rows) = value.as_array() {
+        return rows.clone();
+    }
+
+    let columns = value["_c"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected structured table columns or row array: {value}"));
+    let rows = value["_r"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected structured table rows or row array: {value}"));
+
+    rows.iter()
+        .map(|row| {
+            let values = row
+                .as_array()
+                .unwrap_or_else(|| panic!("expected structured table row values: {row}"));
+            let object = columns
+                .iter()
+                .zip(values)
+                .map(|(column, value)| {
+                    (
+                        column
+                            .as_str()
+                            .unwrap_or_else(|| panic!("expected string column: {column}"))
+                            .to_string(),
+                        value.clone(),
+                    )
+                })
+                .collect();
+            serde_json::Value::Object(object)
+        })
+        .collect()
+}
+
 fn hold_rollback_journal_lock(db_path: &std::path::Path) -> Connection {
     let conn = Connection::open(db_path).unwrap();
     conn.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
@@ -2813,13 +2848,17 @@ fn source_read_json_reports_bounded_window_handles_and_expansion_commands() {
             .as_bool()
             .unwrap()
     );
-    assert_eq!(json["report"]["preview"].as_array().unwrap().len(), 8);
-    assert!(
-        json["report"]["preview"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("fn main")
+    assert_eq!(
+        json["summary"]["metrics"]["_c"],
+        serde_json::json!(["label", "value"])
     );
+    assert_eq!(
+        json["report"]["preview"]["_c"],
+        serde_json::json!(["line", "text"])
+    );
+    let preview = structured_rows(&json["report"]["preview"]);
+    assert_eq!(preview.len(), 8);
+    assert!(preview[0]["text"].as_str().unwrap().contains("fn main"));
     assert!(
         json["report"]["expand"]["after"]
             .as_str()
@@ -2834,7 +2873,7 @@ fn source_read_json_reports_bounded_window_handles_and_expansion_commands() {
             .any(|cmd| cmd.as_str().unwrap().contains("source-read"))
     );
 
-    let symbols = json["report"]["symbols"].as_array().unwrap();
+    let symbols = structured_rows(&json["report"]["symbols"]);
     let main_symbol = symbols
         .iter()
         .find(|symbol| symbol["name"] == "main")
@@ -2897,7 +2936,7 @@ fn source_read_json_defaults_to_ast_symbol_projection() {
     );
     assert!(json["report"]["preview"].is_null());
 
-    let symbols = json["report"]["symbols"].as_array().unwrap();
+    let symbols = structured_rows(&json["report"]["symbols"]);
     let main_symbol = symbols
         .iter()
         .find(|symbol| symbol["name"] == "main")
@@ -2952,7 +2991,7 @@ fn source_read_json_reports_markdown_section_list_and_code_spans() {
     );
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let symbols = json["report"]["symbols"].as_array().unwrap();
+    let symbols = structured_rows(&json["report"]["symbols"]);
     let install = symbols
         .iter()
         .find(|symbol| symbol["kind"] == "heading" && symbol["name"] == "Install")
@@ -3026,10 +3065,9 @@ fn source_read_json_reports_markdown_section_list_and_code_spans() {
             >= 3,
         "expected visible Markdown AST nodes in source-read projection: {json}"
     );
+    let outline = structured_rows(&json["report"]["markdown"]["outline"]);
     assert!(
-        json["report"]["markdown"]["outline"]
-            .as_array()
-            .unwrap()
+        outline
             .iter()
             .any(|node| node["name"] == "Install" && node["kind"] == "heading"),
         "expected outline-first Markdown projection in source-read report: {json}"

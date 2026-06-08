@@ -103,6 +103,8 @@ Preview reports keep their item-level `handle` + `expand` fields inside `report`
 
 Search preview reports may also include `report.scale_guard`. Clients should surface that warning prominently and prefer the guard's `narrow_commands` before launching independent search/explain/summarize work, because those commands encode the result-count, corpus-size, and preview-budget context that made the original query risky.
 
+`source-read` envelopes apply the schema-then-values transform by default. Source windows and Markdown projections contain dense repeated lists (`summary.metrics`, `report.preview`, `report.symbols`, `report.markdown.outline`) where record keys would otherwise dominate the response. The payload stays JSON, but homogeneous arrays use the columnar `{"_c":[...],"_r":[...]}` form described below. Non-envelope `source-read --json` keeps the command-specific object arrays unless `--schema` is passed explicitly.
+
 ### Command/Test-Run Envelopes
 
 `tsift --envelope digest-runner ... --json` now wraps command-execution digests in a summary-first envelope for `test` and `log` runs.
@@ -220,6 +222,7 @@ Output format: for an array of objects with keys `[k1, k2, k3]`, produces `{"_c"
 tsift --schema search "main"               # schema-then-values JSON
 tsift --schema --terse search "main"       # abbreviated keys + columnar
 tsift --schema --pretty explain main       # indented columnar JSON
+tsift --envelope source-read src/lib.rs    # source-read envelopes use columnar repeated lists by default
 ```
 
 **Example output (`--schema`):**

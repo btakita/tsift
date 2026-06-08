@@ -1541,6 +1541,7 @@ pub(crate) fn print_json_or_envelope<T: Serialize>(
     follow_up: Vec<String>,
 ) -> Result<()> {
     if format.envelope {
+        let schema = format.schema || tool == "source-read";
         let envelope = ToolEnvelope {
             tool,
             view,
@@ -1556,7 +1557,7 @@ pub(crate) fn print_json_or_envelope<T: Serialize>(
                 format.pretty,
                 format.terse,
                 format.ultra_terse,
-                format.schema
+                schema
             )?
         );
     } else {
