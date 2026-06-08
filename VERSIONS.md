@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.66
+
 - Added a dedicated `tsift-memgraphrag` workspace crate for the MemGraphRAG graph/RAG layer. `tsift-memory` now stays focused on durable memory storage, capture contracts, and imports, while `tsift-memgraphrag` owns decay-weighted ranking/query plans, memory-event graph projections, `.tsift/memory.db` upsert into the shared graph store, traversal refresh memory/semantic rows, and ontology materialization. The root crate re-exports it as `tsift::memgraphrag`, and `tsift-cli` depends on it directly.
 - Added a dedicated `tsift-cache` workspace crate and moved the cycle-packet cache implementation there, leaving `tsift_quality::cycle_packet_cache` as a compatibility re-export. CLI callers now depend on `tsift-cache` directly, and root `tsift` re-exports the crate as `tsift::cache` so agent-doc-facing consumers can pull shared cache primitives without taking the full quality-gate surface.
 - `session-cost` prompt-cache diagnostics now include bounded effectiveness analytics: sample count, stable/improving/declining trend, average/first/last cached-input ratios, net cached-read versus creation tokens, optional read/create ratio, likely invalidation diagnostics for ratio drops, creation spikes, and read/create regressions, and a first-plus-latest per-turn cache timeline in JSON and text output.

@@ -1,6 +1,6 @@
 [package]
 name = "tsift-session"
-version = "0.1.65"
+version = "0.1.66"
 edition = "2024"
 description = "Session observability for tsift — session cost / digest / review across Claude, Codex, and agent-doc transcripts"
 license = "MIT"
@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "development-tools"]
 publish = true
 
 [dependencies]
-tsift-agent-doc = { path = "../tsift-agent-doc", version = "0.1.65" }
+tsift-agent-doc = { path = "../tsift-agent-doc", version = "0.1.66" }
 
 [features]
 # Re-exports otherwise test-only digest helpers (e.g.
