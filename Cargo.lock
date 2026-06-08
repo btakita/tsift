@@ -5168,6 +5168,7 @@ dependencies = [
  "tsift-graph",
  "tsift-index",
  "tsift-libsql",
+ "tsift-memgraphrag",
  "tsift-memory",
  "tsift-quality",
  "tsift-resolution",
@@ -5233,6 +5234,7 @@ dependencies = [
  "tsift-digest",
  "tsift-graph",
  "tsift-index",
+ "tsift-memgraphrag",
  "tsift-memory",
  "tsift-quality",
  "tsift-resolution",
@@ -5328,6 +5330,21 @@ dependencies = [
  "serde",
  "tree-sitter",
  "tree-sitter-md",
+]
+
+[[package]]
+name = "tsift-memgraphrag"
+version = "0.1.65"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tsift-core",
+ "tsift-memory",
+ "tsift-sqlite",
 ]
 
 [[package]]

@@ -146,7 +146,9 @@ use tsift_agent_doc::session_review;
 use tsift_digest::{diff_digest, log_digest, metric_digest, test_digest};
 use tsift_graph as graph;
 use tsift_index::{config, index, init, multiplicity, walk};
-use tsift_memory::{MemoryEvent, default_memory_db_path, read_memory_events};
+use tsift_memgraphrag::append_tsift_memory_graph_projection_rows;
+#[cfg(test)]
+use tsift_memory::MemoryEvent;
 use tsift_cache::cycle_packet_cache;
 use tsift_quality::{dci_benchmark, lint, perf_gate, token_gate};
 use tsift_resolution as resolution;
@@ -3404,7 +3406,6 @@ fn edge_with_content_freshness(mut edge: SubstrateGraphEdge) -> Result<Substrate
 
 const SEMANTIC_EMBEDDING_DIM: usize = 32;
 const SEMANTIC_EMBEDDING_MODEL: &str = "tsift-local-hash-v1";
-const CLAUDE_MEM_GRAPH_LIMIT_PER_TABLE: usize = 200;
 
 fn semantic_related_kind_name(kind: SemanticRelatedKind) -> &'static str {
     match kind {
@@ -3577,216 +3578,6 @@ fn insert_semantic_edge(
     edge_map
         .entry((edge.from_id.clone(), edge.to_id.clone(), edge.kind.clone()))
         .or_insert(edge);
-}
-
-fn memory_event_key(event: &MemoryEvent) -> String {
-    match (event.imported_from.as_deref(), event.imported_id.as_deref()) {
-        (Some(imported_from), Some(imported_id)) => {
-            format!("{imported_from}:{imported_id}")
-        }
-        _ => event.stable_id(),
-    }
-}
-
-fn memory_event_label(event: &MemoryEvent) -> String {
-    let first_line = event
-        .text
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or(event.kind.as_str());
-    match event.kind.as_str() {
-        "imported_observation" => {
-            let observation_type = event
-                .metadata
-                .get("observation_type")
-                .map(String::as_str)
-                .unwrap_or("observation");
-            truncate_for_compact(&format!("{observation_type}: {first_line}"), 80)
-        }
-        "imported_session_summary" => truncate_for_compact(&format!("summary: {first_line}"), 80),
-        "imported_user_prompt" => truncate_for_compact(&format!("prompt: {first_line}"), 80),
-        _ => truncate_for_compact(first_line, 80),
-    }
-}
-
-fn append_tsift_memory_graph_projection_rows(
-    root: &Path,
-    nodes: &mut Vec<SubstrateGraphNode>,
-    edges: &mut Vec<SubstrateGraphEdge>,
-) -> Result<()> {
-    let memory_db = default_memory_db_path(root);
-    if !memory_db.exists() {
-        return Ok(());
-    }
-    let events = match read_memory_events(&memory_db, CLAUDE_MEM_GRAPH_LIMIT_PER_TABLE * 3) {
-        Ok(events) => events,
-        Err(_) => return Ok(()),
-    };
-    if events.is_empty() {
-        return Ok(());
-    }
-
-    let mut seen_sessions = BTreeSet::new();
-    let mut edge_map = BTreeMap::<(String, String, String), SubstrateGraphEdge>::new();
-
-    for event in &events {
-        let event_id = event.stable_id();
-        let event_key = memory_event_key(event);
-        let source_handle = stable_handle("tmemsrc", &event_key);
-        let semantic_handle = stable_handle("tmemsem", &event_key);
-        let provenance = GraphProvenance::new("tsift-memory", &event.source_ref);
-        let imported_from = event.imported_from.as_deref().unwrap_or("native");
-
-        if let Some(session_id) = &event.session_id {
-            let session_handle =
-                format!("memsess:{}", blake3::hash(session_id.as_bytes()).to_hex());
-            if seen_sessions.insert(session_id.clone()) {
-                let session_node = SubstrateGraphNode::new(
-                    session_handle.clone(),
-                    "memory_session",
-                    truncate_for_compact(session_id, 80),
-                )
-                .with_property("handle", session_handle.clone())
-                .with_property("ref_id", session_id.clone())
-                .with_property("session_id", session_id.clone())
-                .with_property("provider", "tsift-memory")
-                .with_property(
-                    "expand",
-                    format!(
-                        "tsift memory status {} --json",
-                        shell_quote(root.to_string_lossy().as_ref())
-                    ),
-                )
-                .with_provenance(provenance.clone());
-                nodes.push(node_with_content_freshness(session_node)?);
-            }
-
-            insert_semantic_edge(
-                &mut edge_map,
-                SubstrateGraphEdge::new(
-                    session_handle.clone(),
-                    event_id.clone(),
-                    "records_memory_event",
-                )
-                .with_property("label", "tsift-memory session event")
-                .with_provenance(provenance.clone()),
-            );
-            insert_semantic_edge(
-                &mut edge_map,
-                SubstrateGraphEdge::new(
-                    session_handle,
-                    source_handle.clone(),
-                    "records_memory_source",
-                )
-                .with_property("label", "tsift-memory session source")
-                .with_provenance(provenance.clone()),
-            );
-        }
-
-        let label = memory_event_label(event);
-        let mut event_node =
-            SubstrateGraphNode::new(event_id.clone(), "memory_event", event.kind.as_str())
-                .with_property("handle", event_id.clone())
-                .with_property("ref_id", event.source_ref.clone())
-                .with_property("source_ref", event.source_ref.clone())
-                .with_property("provider", "tsift-memory")
-                .with_property("memory_kind", event.kind.as_str())
-                .with_property("imported_from", imported_from)
-                .with_property("text_preview", truncate_for_compact(&event.text, 240))
-                .with_property("token_estimate", event.token_estimate.to_string())
-                .with_property(
-                    "expand",
-                    format!(
-                        "tsift memory status {} --json",
-                        shell_quote(root.to_string_lossy().as_ref())
-                    ),
-                )
-                .with_provenance(provenance.clone());
-        if let Some(session_id) = &event.session_id {
-            event_node = event_node.with_property("session_id", session_id.clone());
-        }
-        if let Some(observed_at_unix) = event.observed_at_unix {
-            event_node = event_node.with_property("observed_at_unix", observed_at_unix.to_string());
-        }
-        if let Some(imported_id) = &event.imported_id {
-            event_node = event_node.with_property("imported_id", imported_id.clone());
-        }
-        nodes.push(node_with_content_freshness(event_node)?);
-
-        let mut source_node =
-            SubstrateGraphNode::new(source_handle.clone(), "source_handle", label.clone())
-                .with_property("handle", source_handle.clone())
-                .with_property("ref_id", event.source_ref.clone())
-                .with_property("source_ref", event.source_ref.clone())
-                .with_property("provider", "tsift-memory")
-                .with_property("memory_kind", event.kind.as_str())
-                .with_property("imported_from", imported_from)
-                .with_property("text_preview", truncate_for_compact(&event.text, 240))
-                .with_property("token_estimate", event.token_estimate.to_string())
-                .with_property(
-                    "expand",
-                    format!(
-                        "tsift memory status {} --json",
-                        shell_quote(root.to_string_lossy().as_ref())
-                    ),
-                )
-                .with_provenance(provenance.clone());
-        if let Some(session_id) = &event.session_id {
-            source_node = source_node.with_property("session_id", session_id.clone());
-        }
-        if let Some(observed_at_unix) = event.observed_at_unix {
-            source_node =
-                source_node.with_property("observed_at_unix", observed_at_unix.to_string());
-        }
-        if let Some(imported_id) = &event.imported_id {
-            source_node = source_node.with_property("imported_id", imported_id.clone());
-        }
-        nodes.push(node_with_content_freshness(source_node)?);
-
-        insert_semantic_edge(
-            &mut edge_map,
-            SubstrateGraphEdge::new(event_id.clone(), source_handle.clone(), "projects_source")
-                .with_property("label", "tsift-memory source projection")
-                .with_provenance(provenance.clone()),
-        );
-
-        let semantic_text = format!("{} {}", label, event.text);
-        let semantic_node =
-            SubstrateGraphNode::new(semantic_handle.clone(), "semantic_concept", label.clone())
-                .with_property("handle", semantic_handle.clone())
-                .with_property("ref_id", event.source_ref.clone())
-                .with_property("detail", "semantic row from tsift-memory")
-                .with_property("source_ref", event.source_ref.clone())
-                .with_property("provider", "tsift-memory")
-                .with_property("memory_kind", event.kind.as_str())
-                .with_property("imported_from", imported_from)
-                .with_property("embedding_model", SEMANTIC_EMBEDDING_MODEL)
-                .with_property("embedding", semantic_embedding_property(&semantic_text))
-                .with_property(
-                    "expand",
-                    semantic_related_command(root, &label, SemanticRelatedKind::Concept),
-                )
-                .with_provenance(provenance.clone());
-        nodes.push(node_with_content_freshness(semantic_node)?);
-
-        insert_semantic_edge(
-            &mut edge_map,
-            SubstrateGraphEdge::new(
-                source_handle.clone(),
-                semantic_handle.clone(),
-                "mentions_concept",
-            )
-            .with_property("label", "tsift-memory semantic source")
-            .with_provenance(provenance.clone()),
-        );
-    }
-
-    for edge in edge_map.into_values() {
-        edges.push(edge_with_content_freshness(edge)?);
-    }
-
-    Ok(())
 }
 
 fn append_summary_semantic_projection_rows(

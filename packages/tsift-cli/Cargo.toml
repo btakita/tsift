@@ -38,6 +38,7 @@ tsift-digest = { path = "../tsift-digest", version = "0.1.65" }
 tsift-graph = { path = "../tsift-graph", version = "0.1.65" }
 tsift-index = { path = "../tsift-index", version = "0.1.65" }
 tsift-memory = { path = "../tsift-memory", version = "0.1.65" }
+tsift-memgraphrag = { path = "../tsift-memgraphrag", version = "0.1.65" }
 tsift-quality = { path = "../tsift-quality", version = "0.1.65" }
 tsift-resolution = { path = "../tsift-resolution", version = "0.1.65" }
 tsift-search = { path = "../tsift-search", version = "0.1.65" }

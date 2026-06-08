@@ -22,9 +22,9 @@ The multi-agent orchestration layer is deliberately **out of scope** for tsift.
 | MemGraphRAG pillar | tsift today | Gap |
 |---|---|---|
 | **Graph** — node/edge schema, hierarchical traversal | `GraphStore` over SQLite/SurrealDB: symbols/edges, communities, callers/callees, `properties_json`/`provenance_json`/`freshness_json` | none — substrate exists |
-| **Memory** — agent interactions, decision history | `tsift-memory`: `MemoryEvent` stream (`PromptTarget`/`ToolCall`/`ToolResultArtifact`/`ResponseSummary`/`CloseoutProof`/`SessionCheck` + `Imported*`), `GraphProjection` (events→graph), budgeted `MemoryQueryPlan`, cross-session `MemoryHandoffPlan`, claude-mem import | memory graph is **separate** from the code graph |
-| **RAG** — retrieval + context aggregation | hybrid BM25 + structural search, `context-pack` injection | retrieval has **no temporal decay** |
-| **Decay / recency** | `observed_at_unix` on each `MemoryEvent`; `community_graph_watermark` staleness signal | not wired into ranking |
+| **Memory** — agent interactions, decision history | `tsift-memory`: `MemoryEvent` stream (`PromptTarget`/`ToolCall`/`ToolResultArtifact`/`ResponseSummary`/`CloseoutProof`/`SessionCheck` + `Imported*`), cross-session `MemoryHandoffPlan`, claude-mem import | none — durable substrate exists |
+| **RAG** — retrieval + context aggregation | `tsift-memgraphrag`: memory-event `GraphProjection`, budgeted `MemoryQueryPlan`, shared graph upsert, semantic/source rows; hybrid BM25 + structural search, `context-pack` injection | unified graph ranking remains `#rankdefault` |
+| **Decay / recency** | `tsift-memgraphrag::rank_memory_events` over `MemoryEvent.observed_at_unix`; `community_graph_watermark` staleness signal | decay not yet folded into default graph-neighborhood ranking |
 | **Multi-agent** | tsift is the *shared substrate* read/written by Claude / Codex / OpenCode harnesses (`session_id`, `imported_from`) | orchestration is **not** (and should not be) tsift's job |
 
 ## Architecture
@@ -36,13 +36,14 @@ flowchart LR
   end
   subgraph tsift["tsift = mem graph RAG substrate"]
     ME[tsift-memory: MemoryEvent stream]
+    MGR[tsift-memgraphrag: decay + projection]
     GP[GraphProjection]
     GS[GraphStore: code symbols + edges + communities]
     RET[hybrid retrieval + context-pack]
-    ME --> GP
+    ME --> MGR --> GP
     GP -. "#memgraphrag2 unify" .-> GS
     GS --> RET
-    ME -. "#memgraphrag1 decay" .-> RET
+    MGR -. "#memgraphrag1 decay" .-> RET
     AD -->|closeout capture| ME
   end
   RET --> Harnesses
@@ -70,7 +71,7 @@ agent-doc session archives, and md/html projection.
 
 ### 2. Temporal decay-weighted retrieval — `#memgraphrag1` ✅ implemented
 
-The paper's signature mechanism. Implemented in `packages/tsift-memory/src/lib.rs`:
+The paper's signature mechanism. Implemented in `packages/tsift-memgraphrag/src/lib.rs`:
 
 - `MemoryDecayConfig { half_life_secs, lexical_weight, recency_weight }` — default
   one-week half-life, 0.6 lexical / 0.4 recency blend.
@@ -88,7 +89,7 @@ code share one ranking function once memory nodes are in the graph (below).
 
 ### 3. One graph, not two — `#memgraphrag2` ✅ implemented (core)
 
-`tsift-memory`'s `project_memory_events` already emits `tsift-core` `GraphProjection`
+`tsift-memgraphrag`'s `project_memory_events` emits `tsift-core` `GraphProjection`
 nodes/edges, and `SqliteGraphStore::upsert_projection` already ingests them. The
 wiring is now in place:
 
@@ -97,7 +98,7 @@ wiring is now in place:
   `records_memory_event` edges), and upserts them into the shared
   `.tsift/graph.db` so memory nodes are queryable alongside code symbols via the
   same `graph-db` retrieval surface (`packages/tsift-cli/src/commands/memory.rs`,
-  `project_memory_into_graph`).
+  `tsift_memgraphrag::project_memory_into_graph`).
 
 Remaining for full unification: decay-aware ranking over the merged graph
 (`#rankdefault`).
@@ -106,7 +107,8 @@ Remaining for full unification: decay-aware ranking over the merged graph
 
 The paper's third layer (typed backbone). Implemented as a **data-driven** schema
 derived from the instance graph (`SqliteGraphStore::derive_ontology`,
-`packages/tsift-sqlite/src/lib.rs`):
+`packages/tsift-sqlite/src/lib.rs`) and materialized through
+`tsift_memgraphrag::derive_memory_ontology_graph`:
 - one `ontology_type` node per distinct node kind (with `instance_count`), and
 - one `ontology_relation:<edge_kind>` edge per observed `(from_kind, edge_kind,
   to_kind)` triple (with `instance_count`).

@@ -8,4 +8,8 @@ fn root_reexports_algorithm_tokensave_and_memory_crates() {
         "tsift_tokensave::TokensaveDb"
     );
     assert_eq!(tsift::memory::MEMORY_CONTRACT_VERSION, "tsift-memory-v1");
+    assert_eq!(
+        tsift::memgraphrag::MEMGRAPHRAG_CONTRACT_VERSION,
+        "tsift-memgraphrag-v1"
+    );
 }

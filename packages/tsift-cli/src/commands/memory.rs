@@ -6,13 +6,16 @@ use rusqlite::OptionalExtension;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tsift_memgraphrag::{
+    MemoryQueryPlan, derive_memory_ontology_graph, memory_graph_node_kinds, plan_memory_query,
+    project_memory_into_graph,
+};
 use tsift_memory::{
     ClaudeMemImportPlan, MemoryBudget, MemoryBudgetGuardInput, MemoryEvent, MemoryEventKind,
-    MemoryHandoffPlan, MemoryQueryPlan, MemoryStore, agent_doc_closeout_events,
+    MemoryHandoffPlan, MemoryStore, agent_doc_closeout_events,
     agent_doc_hook_contract, default_claude_mem_db_path, default_memory_db_path,
     AuthoredNodeKind, authored_node_projection, guard_memory_handoff, import_claude_mem,
-    inspect_claude_mem, memory_graph_node_kinds, memory_schema_sql, plan_capture_handoff,
-    plan_memory_query, project_memory_events, read_memory_events,
+    inspect_claude_mem, memory_schema_sql, plan_capture_handoff,
 };
 use tsift_sqlite::{GraphStore, SqliteGraphStore};
 
@@ -679,30 +682,6 @@ struct MemoryProjectGraphReport {
     next_commands: Vec<String>,
 }
 
-/// Project stored memory events into the shared code graph store (#memgraphrag2).
-/// Memory `memory_session`/`memory_event` nodes become queryable alongside code
-/// symbols through the same `graph-db` retrieval surface.
-/// Core of `#memgraphrag2`: read memory events, project them, and upsert into the
-/// shared graph store. Returns `(events_projected, nodes_upserted, edges_upserted)`.
-fn project_memory_into_graph(
-    memory_db: &Path,
-    graph_db: &Path,
-    limit: usize,
-) -> Result<(usize, usize, usize)> {
-    let events = read_memory_events(memory_db, limit)?;
-    let projection = project_memory_events(&events);
-    let nodes = projection.nodes.len();
-    let edges = projection.edges.len();
-    if let Some(parent) = graph_db.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create graph db dir {}", parent.display()))?;
-    }
-    let mut store = SqliteGraphStore::open(graph_db)
-        .with_context(|| format!("open graph store {}", graph_db.display()))?;
-    store.upsert_projection(&projection)?;
-    Ok((events.len(), nodes, edges))
-}
-
 fn cmd_memory_project_graph(
     path: &Path,
     graph_db_override: Option<&Path>,
@@ -713,8 +692,7 @@ fn cmd_memory_project_graph(
     let graph_db = graph_db_override
         .map(Path::to_path_buf)
         .unwrap_or_else(|| crate::graph_substrate_db_path(path, None));
-    let (events_projected, nodes_upserted, edges_upserted) =
-        project_memory_into_graph(&memory_db, &graph_db, limit)?;
+    let graph_report = project_memory_into_graph(&memory_db, &graph_db, limit)?;
 
     let next_commands = vec![
         "tsift graph-db --path . --json related '<query>'".to_string(),
@@ -724,9 +702,9 @@ fn cmd_memory_project_graph(
         contract_version: tsift_memory::MEMORY_CONTRACT_VERSION.to_string(),
         memory_db: memory_db.display().to_string(),
         graph_db: graph_db.display().to_string(),
-        events_projected,
-        nodes_upserted,
-        edges_upserted,
+        events_projected: graph_report.events_projected,
+        nodes_upserted: graph_report.nodes_upserted,
+        edges_upserted: graph_report.edges_upserted,
         graph_node_kinds: memory_graph_node_kinds(),
         next_commands: next_commands.clone(),
     };
@@ -737,9 +715,9 @@ fn cmd_memory_project_graph(
         ToolEnvelopeSummary {
             text: "memory events projected into shared graph store".to_string(),
             metrics: vec![
-                envelope_metric("events", events_projected),
-                envelope_metric("nodes", nodes_upserted),
-                envelope_metric("edges", edges_upserted),
+                envelope_metric("events", graph_report.events_projected),
+                envelope_metric("nodes", graph_report.nodes_upserted),
+                envelope_metric("edges", graph_report.edges_upserted),
             ],
         },
         next_commands,
@@ -766,18 +744,7 @@ fn cmd_memory_ontology_graph(
     let graph_db = graph_db_override
         .map(Path::to_path_buf)
         .unwrap_or_else(|| crate::graph_substrate_db_path(path, None));
-    if !graph_db.exists() {
-        bail!(
-            "graph store {} does not exist; run `tsift graph-db refresh` or `tsift memory project-graph` first",
-            graph_db.display()
-        );
-    }
-    let mut store = SqliteGraphStore::open(&graph_db)
-        .with_context(|| format!("open graph store {}", graph_db.display()))?;
-    let ontology = store.derive_ontology()?;
-    let type_nodes = ontology.nodes.len();
-    let relations = ontology.edges.len();
-    store.upsert_projection(&ontology)?;
+    let ontology = derive_memory_ontology_graph(&graph_db)?;
 
     let next_commands = vec![
         "tsift graph-db --path . --json related 'ontology_type'".to_string(),
@@ -786,8 +753,8 @@ fn cmd_memory_ontology_graph(
     let report = MemoryOntologyReport {
         contract_version: tsift_memory::MEMORY_CONTRACT_VERSION.to_string(),
         graph_db: graph_db.display().to_string(),
-        type_nodes,
-        relations,
+        type_nodes: ontology.type_nodes,
+        relations: ontology.relations,
         next_commands: next_commands.clone(),
     };
     print_memory_report(
@@ -797,8 +764,8 @@ fn cmd_memory_ontology_graph(
         ToolEnvelopeSummary {
             text: "derived semantic ontology graph layer".to_string(),
             metrics: vec![
-                envelope_metric("type_nodes", type_nodes),
-                envelope_metric("relations", relations),
+                envelope_metric("type_nodes", ontology.type_nodes),
+                envelope_metric("relations", ontology.relations),
             ],
         },
         next_commands,
@@ -1105,11 +1072,18 @@ mod tests {
         store.insert_event(&response).unwrap();
 
         let graph_db = root.join(".tsift").join("graph.db");
-        let (events, nodes, edges) =
-            project_memory_into_graph(&memory_db, &graph_db, 100).unwrap();
-        assert_eq!(events, 2);
-        assert!(nodes >= 3, "two events + one session node, got {nodes}");
-        assert!(edges >= 2, "session records each event, got {edges}");
+        let report = project_memory_into_graph(&memory_db, &graph_db, 100).unwrap();
+        assert_eq!(report.events_projected, 2);
+        assert!(
+            report.nodes_upserted >= 3,
+            "two events + one session node, got {}",
+            report.nodes_upserted
+        );
+        assert!(
+            report.edges_upserted >= 2,
+            "session records each event, got {}",
+            report.edges_upserted
+        );
 
         // The unified graph store persists memory nodes alongside code symbols.
         let conn = Connection::open(&graph_db).unwrap();
