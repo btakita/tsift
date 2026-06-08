@@ -235,6 +235,7 @@ With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject
 9. The injected Code Navigation section explicitly tells harnesses to switch to the owning repo or submodule root before running tsift/build/test commands, so submodule work does not inherit the wider superproject instruction surface by accident.
 10. The injected section also steers harnesses toward envelope-backed `search`, `explain`, `session-review`, `context-pack`, and digest-runner artifacts instead of raw transcript replays, `git diff/show/log` patch dumps, or verbose build/test output reads.
 11. The injected section tells agents to run the local default suite with `make check`, then check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1`; deterministic simulation coverage runs in the default suite, and CI failures must be fixed before the work is complete.
+12. The injected section stays self-contained for Codex/OpenCode prompt reuse, while pointing repositories that ship current `.claude/skills/tsift/SKILL.md` or `runbooks/code-navigation.md` back to those deeper runbooks instead of duplicating them inline.
 
 The OpenCode command shortcut set is intentionally prompt-template based rather than a background hook: OpenCode already reads project `AGENTS.md`, and the managed commands give operators explicit `/tsift-status`, `/tsift-session-review`, `/tsift-context-pack`, `/tsift-diff-digest`, `/tsift-test-digest`, `/tsift-log-digest`, `/tsift-rewrite-run`, `/tsift-explain`, `/tsift-symbol-read`, and `/tsift-graph` entrypoints that route common workflows through bounded tsift evidence without depending on raw terminal replay.
 
@@ -245,15 +246,17 @@ On plugin load and on the `installation.updated` lifecycle hook, the plugin runs
 ### Injected Section
 
 ```markdown
-<!-- tsift:code-navigation v=0.1.42 -->
+<!-- tsift:code-navigation v=0.1.64 -->
 ## Code Navigation
+
+Keep this block self-contained for Codex/OpenCode prompt reuse. If this repository also ships current `.claude/skills/tsift/SKILL.md` or `runbooks/code-navigation.md`, use those deeper runbooks for command detail instead of expanding this block.
 
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead. Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`; OpenCode projects can install per-project tsift command shortcuts with `tsift init --opencode`.
 
 Use the commands listed in its `use:` output:
+- `tsift --envelope source-read <file> --budget normal` — AST-symbol projection with span metadata and source-window expansion commands (prefer over cat/head for source code files)
+- `tsift --envelope symbol-read <symbol> --budget normal` — token-budgeted symbol body, AST span metadata, child refs, and graph/source expansion commands
 - `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)
-- `tsift --envelope symbol-read <symbol> --budget normal` — token-budgeted symbol body, child refs, and graph/source expansion commands
-- `tsift --envelope edit-intents --path . --budget normal` — semantic edit dry-run plans with target spans, indexed call refs, structural destinations, and Markdown intent recognition; add `--verify` for temp-worktree apply/reindex/source-read/impact checks and optional `--verify-command`, or `--apply` for supported, conflict-free Rust/TS/JS/Python and Markdown section/block intents with formatting or parse validation and rollback
 - `tsift --envelope explain <symbol> --budget normal` — callers, callees, community preview
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation
 - `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
@@ -263,7 +266,6 @@ When a search envelope includes `report.scale_guard`, run one of its `narrow_com
 
 Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
 - `tsift --envelope session-review <path> --next-context --budget normal` or `tsift --envelope context-pack <path> --budget normal` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
-- `tsift --envelope source-read <file> --path . --budget normal` instead of large whole-file source reads. Add `--style window --start N --lines N` only when a literal line preview is required. `tsift rewrite` automatically routes full-file `cat`/`bat` reads and oversized `head`/`tail`/`sed -n` source windows to this surface when the file lives inside an indexed tsift project, while leaving small explicit windows and non-source files untouched.
 - `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
 - `tsift --envelope digest-runner --kind test --path . --shell-command '<test command>'` / `tsift --envelope digest-runner --kind log --path . --shell-command '<build command>'` for noisy test/build/install output, or let the rewrite/hooks create those artifact-backed envelopes for `cargo test`, `pytest`, and verbose cargo commands.
 - If RTK is installed, digest-runner delegates supported generic command families through `rtk rewrite` and records the chosen compact filter in `report.filter` while preserving tsift artifact handles.
