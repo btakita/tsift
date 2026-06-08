@@ -8,7 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
-- `session-cost` prompt-cache diagnostics now include bounded effectiveness analytics: sample count, stable/improving/declining trend, average/first/last cached-input ratios, net cached-read versus creation tokens, optional read/create ratio, and a first-plus-latest per-turn cache timeline in JSON and text output.
+- `session-cost` prompt-cache diagnostics now include bounded effectiveness analytics: sample count, stable/improving/declining trend, average/first/last cached-input ratios, net cached-read versus creation tokens, optional read/create ratio, likely invalidation diagnostics for ratio drops, creation spikes, and read/create regressions, and a first-plus-latest per-turn cache timeline in JSON and text output.
 
 ## 0.1.65
 

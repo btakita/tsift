@@ -9293,6 +9293,55 @@ fn session_cost_recommends_prompt_cache_for_large_uncached_prompt() {
 }
 
 #[test]
+fn session_cost_reports_prompt_cache_invalidation_diagnostics() {
+    let input = concat!(
+        r#"{"timestamp":"2026-05-05T00:00:01Z","message":{"id":"msg-1","role":"assistant","usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":9000,"output_tokens":50}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-05-05T00:00:02Z","message":{"id":"msg-2","role":"assistant","usage":{"input_tokens":3000,"cache_creation_input_tokens":6000,"cache_read_input_tokens":1000,"output_tokens":50}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-05-05T00:00:03Z","message":{"id":"msg-3","role":"assistant","usage":{"input_tokens":3000,"cache_creation_input_tokens":6000,"cache_read_input_tokens":1000,"output_tokens":50}}}"#,
+        "\n",
+    );
+
+    let output = run_tsift_stdin(
+        &["session-cost", "--source", "claude-jsonl", "--json"],
+        input,
+    );
+    assert!(output.status.success(), "session-cost should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let diagnostics = json["prompt_cache_plan"]["analytics"]["diagnostics"]
+        .as_array()
+        .unwrap();
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic["kind"] == "cached_ratio_drop" && diagnostic["label"] == "2026-05-05T00:00:02Z"
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic["kind"] == "cache_creation_spike"
+            && diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("60.00%"))
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic["kind"] == "read_create_regression"
+            && diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("0.92x"))
+    }));
+
+    let compact = run_tsift_stdin(
+        &["session-cost", "--source", "claude-jsonl", "--compact"],
+        input,
+    );
+    assert!(
+        compact.status.success(),
+        "session-cost compact should succeed"
+    );
+    let compact_stdout = String::from_utf8_lossy(&compact.stdout);
+    assert!(compact_stdout.contains("prompt-cache-diagnostic warn cached_ratio_drop"));
+    assert!(compact_stdout.contains("prompt-cache-diagnostic recommend read_create_regression"));
+}
+
+#[test]
 fn session_cost_reads_codex_last_usage_when_cumulative_streams_interleave() {
     let input = concat!(
         r#"{"timestamp":"2026-05-05T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":10,"total_tokens":1050},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":10,"total_tokens":1050}}}}"#,

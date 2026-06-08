@@ -786,6 +786,17 @@ pub(crate) fn cmd_session_cost(
                 plan.provider_adapters.len(),
                 plan.actions.len()
             );
+            if let Some(analytics) = analytics {
+                for diagnostic in &analytics.diagnostics {
+                    println!(
+                        "prompt-cache-diagnostic {} {} {} {}",
+                        diagnostic.severity,
+                        diagnostic.kind,
+                        truncate_for_compact(&diagnostic.label, 80),
+                        truncate_for_compact(&diagnostic.message, 100)
+                    );
+                }
+            }
             for action in &plan.actions {
                 println!(
                     "prompt-cache-action {} {} {}",
@@ -964,6 +975,14 @@ pub(crate) fn cmd_session_cost(
             }
             if analytics.timeline_truncated {
                 println!("    timeline truncated to first and latest samples");
+            }
+            for diagnostic in &analytics.diagnostics {
+                println!(
+                    "    diagnostic [{}:{}] {}: {}",
+                    diagnostic.severity, diagnostic.kind, diagnostic.label, diagnostic.message
+                );
+                println!("      likely: {}", diagnostic.likely_causes.join("; "));
+                println!("      guidance: {}", diagnostic.guidance);
             }
         }
         for adapter in &plan.provider_adapters {

@@ -11,6 +11,7 @@ const MAX_GUARDRAILS: usize = 8;
 const MAX_LOOP_CLUSTERS: usize = 8;
 const MAX_FILE_READ_DIAGNOSTICS: usize = 8;
 const MAX_PROMPT_CACHE_TIMELINE: usize = 8;
+const MAX_PROMPT_CACHE_DIAGNOSTICS: usize = 6;
 const MAX_COMMANDS_PER_BUNDLE: usize = 6;
 const PROMPT_BUDGET_WARN_TOKENS: u64 = 100_000;
 const CACHED_RATIO_WARN_PERCENT: f64 = 90.0;
@@ -18,6 +19,9 @@ const CACHED_RATIO_WARN_PROMPT_TOKENS: u64 = 50_000;
 const PROMPT_CACHE_CANDIDATE_TOKENS: u64 = 16_000;
 const PROMPT_CACHE_GOOD_HIT_PERCENT: f64 = 75.0;
 const PROMPT_CACHE_TREND_DELTA_PERCENT: f64 = 5.0;
+const PROMPT_CACHE_RATIO_DROP_WARN_PERCENT: f64 = 20.0;
+const PROMPT_CACHE_CREATION_SPIKE_WARN_PERCENT: f64 = 20.0;
+const PROMPT_CACHE_READ_CREATE_REGRESSION_RATIO: f64 = 2.0;
 const RESTART_LOOP_WARN_OCCURRENCES: usize = 3;
 const NOOP_CLOSEOUT_WARN_OCCURRENCES: usize = 3;
 const DEFAULT_FULL_FILE_READ_TOKENS: u64 = 4_000;
@@ -127,7 +131,19 @@ pub struct SessionCostPromptCacheAnalytics {
     pub cached_input_ratio_delta: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_to_creation_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub diagnostics: Vec<SessionCostPromptCacheDiagnostic>,
     pub timeline: Vec<SessionCostPromptCacheTimelineEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCostPromptCacheDiagnostic {
+    pub kind: String,
+    pub severity: String,
+    pub label: String,
+    pub message: String,
+    pub likely_causes: Vec<String>,
+    pub guidance: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -677,6 +693,11 @@ fn derive_prompt_cache_analytics(
         )
     });
     let timeline = prompt_cache_timeline(usage_turns);
+    let diagnostics = derive_prompt_cache_diagnostics(
+        usage_turns,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+    );
 
     Some(SessionCostPromptCacheAnalytics {
         sample_count: usage_turns.len(),
@@ -695,8 +716,110 @@ fn derive_prompt_cache_analytics(
         last_cached_input_ratio: last_ratio.map(format_percent),
         cached_input_ratio_delta: ratio_delta.map(format_signed_percent),
         cache_read_to_creation_ratio,
+        diagnostics,
         timeline,
     })
+}
+
+fn derive_prompt_cache_diagnostics(
+    usage_turns: &[SessionCostTurn],
+    cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+) -> Vec<SessionCostPromptCacheDiagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for pair in usage_turns.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        let Some(previous_ratio) =
+            percent_ratio(previous.cached_input_tokens, previous.prompt_tokens)
+        else {
+            continue;
+        };
+        let Some(current_ratio) = percent_ratio(current.cached_input_tokens, current.prompt_tokens)
+        else {
+            continue;
+        };
+        let drop = previous_ratio - current_ratio;
+        if drop >= PROMPT_CACHE_RATIO_DROP_WARN_PERCENT {
+            diagnostics.push(SessionCostPromptCacheDiagnostic {
+                kind: "cached_ratio_drop".to_string(),
+                severity: "warn".to_string(),
+                label: current.label.clone(),
+                message: format!(
+                    "cached input ratio dropped from {} to {} at {}",
+                    format_percent(previous_ratio),
+                    format_percent(current_ratio),
+                    current.label
+                ),
+                likely_causes: vec![
+                    "stable prefix bytes changed before the cache boundary".to_string(),
+                    "prompt_cache_key or thread/session id changed".to_string(),
+                    "replica-local cache affinity was lost".to_string(),
+                ],
+                guidance:
+                    "compare the prefix, tool set, cache key, compaction boundary, and routing between the previous turn and this turn"
+                        .to_string(),
+            });
+        }
+    }
+
+    for turn in usage_turns {
+        let Some(creation_ratio) =
+            percent_ratio(turn.cache_creation_input_tokens, turn.prompt_tokens)
+        else {
+            continue;
+        };
+        if turn.cache_creation_input_tokens > 0
+            && creation_ratio >= PROMPT_CACHE_CREATION_SPIKE_WARN_PERCENT
+        {
+            diagnostics.push(SessionCostPromptCacheDiagnostic {
+                kind: "cache_creation_spike".to_string(),
+                severity: "warn".to_string(),
+                label: turn.label.clone(),
+                message: format!(
+                    "cache creation was {} of prompt tokens at {}",
+                    format_percent(creation_ratio),
+                    turn.label
+                ),
+                likely_causes: vec![
+                    "provider created a fresh cached prefix instead of reusing the warm prefix"
+                        .to_string(),
+                    "system, developer, or tool block changed before the cache boundary"
+                        .to_string(),
+                    "compaction or transient instructions entered the cached prefix".to_string(),
+                ],
+                guidance:
+                    "inspect the cached prefix and provider breakpoint placement for this turn before treating the cache as effective"
+                        .to_string(),
+            });
+        }
+    }
+
+    if cache_creation_input_tokens > 0 {
+        let read_to_creation = (cached_input_tokens as f64) / (cache_creation_input_tokens as f64);
+        if read_to_creation < PROMPT_CACHE_READ_CREATE_REGRESSION_RATIO {
+            diagnostics.push(SessionCostPromptCacheDiagnostic {
+                kind: "read_create_regression".to_string(),
+                severity: "recommend".to_string(),
+                label: "session".to_string(),
+                message: format!(
+                    "cache read/create ratio was {read_to_creation:.2}x ({cached_input_tokens} read tokens, {cache_creation_input_tokens} creation tokens)"
+                ),
+                likely_causes: vec![
+                    "cached prefix is being rewritten too often for warm reuse".to_string(),
+                    "volatile values are inside the cached prefix".to_string(),
+                    "cache key or replica routing is changing between turns".to_string(),
+                ],
+                guidance:
+                    "stabilize the prefix/key/routing path until cache reads clearly exceed creation work"
+                        .to_string(),
+            });
+        }
+    }
+
+    diagnostics.truncate(MAX_PROMPT_CACHE_DIAGNOSTICS);
+    diagnostics
 }
 
 fn prompt_cache_timeline(
@@ -2224,6 +2347,41 @@ mod tests {
             analytics.timeline[2].cached_input_ratio.as_deref(),
             Some("90.00%")
         );
+    }
+
+    #[test]
+    fn prompt_cache_plan_classifies_likely_invalidation_diagnostics() {
+        let input = concat!(
+            r#"{"timestamp":"2026-05-05T00:00:01Z","message":{"id":"msg-1","role":"assistant","usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":9000,"output_tokens":50}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:02Z","message":{"id":"msg-2","role":"assistant","usage":{"input_tokens":3000,"cache_creation_input_tokens":6000,"cache_read_input_tokens":1000,"output_tokens":50}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:03Z","message":{"id":"msg-3","role":"assistant","usage":{"input_tokens":3000,"cache_creation_input_tokens":6000,"cache_read_input_tokens":1000,"output_tokens":50}}}"#,
+            "\n",
+        );
+
+        let report = compute(input, Some("claude-jsonl")).unwrap();
+        let diagnostics = &report
+            .prompt_cache_plan
+            .as_ref()
+            .and_then(|plan| plan.analytics.as_ref())
+            .expect("prompt cache analytics should be present")
+            .diagnostics;
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == "cached_ratio_drop"
+                && diagnostic.label == "2026-05-05T00:00:02Z"
+                && diagnostic
+                    .likely_causes
+                    .iter()
+                    .any(|cause| cause.contains("prompt_cache_key"))
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == "cache_creation_spike" && diagnostic.message.contains("60.00%")
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == "read_create_regression" && diagnostic.message.contains("0.92x")
+        }));
     }
 
     #[test]
