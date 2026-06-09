@@ -9,6 +9,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 ## Unreleased
 
 - **`#kx6s`**: Added a MemGraphRAG performance baseline gate to `metric-digest`. Runs with `memgraphrag.<workload>.duration_micros` metrics now emit `memgraphrag_performance_gate`, requiring memory query, memory project-graph, `graph-db related`, and semantic seeded neighborhood latency evidence with a compared baseline and a 25% max latency regression. Added `fixtures/memgraphrag-performance-history.json`, CLI fixture coverage, and spec notes.
+- **`#qszc`**: Indexed MemGraphRAG memory candidate retrieval. `tsift-memory` schema v2 now maintains observed/create-time indexes plus an FTS5 `memory_events_fts` index, and `tsift-memgraphrag` ranks bounded FTS/recent candidate sets instead of every stored memory event.
 
 ## 0.1.66
 

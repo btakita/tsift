@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use tsift_core::{GraphEdge, GraphFreshness, GraphNode, GraphProjection, GraphProvenance};
-use tsift_memory::{MemoryEvent, estimate_tokens, read_memory_events};
+use tsift_memory::{
+    DEFAULT_MEMORY_CANDIDATE_LIMIT, MemoryEvent, estimate_tokens, read_memory_event_candidates,
+    read_memory_events,
+};
 use tsift_sqlite::SqliteGraphStore;
 
 pub const MEMGRAPHRAG_CONTRACT_VERSION: &str = "tsift-memgraphrag-v1";
@@ -11,6 +14,7 @@ pub const SEMANTIC_EMBEDDING_MODEL: &str = "tsift-local-hash-v1";
 
 const SEMANTIC_EMBEDDING_DIM: usize = 32;
 const DEFAULT_TRAVERSAL_MEMORY_EVENT_LIMIT: usize = 600;
+const MEMORY_RANK_CANDIDATE_MULTIPLIER: usize = 8;
 
 pub fn memory_graph_node_kinds() -> Vec<&'static str> {
     vec![
@@ -162,11 +166,39 @@ pub fn rank_memory_events(
     scored
 }
 
+pub fn memory_rank_candidate_limit(limit: usize) -> usize {
+    if limit == 0 {
+        return 0;
+    }
+    limit
+        .saturating_mul(MEMORY_RANK_CANDIDATE_MULTIPLIER)
+        .min(DEFAULT_MEMORY_CANDIDATE_LIMIT.max(limit))
+}
+
+pub fn rank_memory_event_candidates(
+    memory_db: &Path,
+    query: &str,
+    now_unix: i64,
+    config: MemoryDecayConfig,
+    limit: usize,
+) -> Result<Vec<ScoredMemoryEvent>> {
+    let candidate_limit = memory_rank_candidate_limit(limit);
+    let candidates = read_memory_event_candidates(memory_db, query, candidate_limit)?;
+    Ok(rank_memory_events(
+        &candidates,
+        query,
+        now_unix,
+        config,
+        limit,
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryQueryPlan {
     pub contract_version: String,
     pub query: String,
     pub limit: usize,
+    pub candidate_limit: usize,
     pub max_tokens: usize,
     pub estimated_query_tokens: usize,
     pub decay: MemoryDecayConfig,
@@ -182,10 +214,12 @@ pub fn plan_memory_query(query: &str, limit: usize, max_tokens: usize) -> Result
         contract_version: MEMGRAPHRAG_CONTRACT_VERSION.to_string(),
         query: query.to_string(),
         limit,
+        candidate_limit: memory_rank_candidate_limit(limit),
         max_tokens,
         estimated_query_tokens: estimate_tokens(query),
         decay: MemoryDecayConfig::default(),
         output_contract: vec![
+            "indexed FTS/recent candidate set capped before ranking".to_string(),
             "decay-weighted ranked memory_event ids (lexical + recency)".to_string(),
             "per-event lexical_score, recency_score, and blended score".to_string(),
             "source_ref handles for expansion".to_string(),
@@ -671,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn rank_memory_events_keeps_lexical_hits_without_timestamp() {
+fn rank_memory_events_keeps_lexical_hits_without_timestamp() {
         let now = 1_700_000_000;
         let event = MemoryEvent::new(
             MemoryEventKind::ResponseSummary,
@@ -692,16 +726,76 @@ mod tests {
             config,
             10,
         );
-        assert_eq!(ranked[0].event.source_ref, event.source_ref);
-    }
+    assert_eq!(ranked[0].event.source_ref, event.source_ref);
+}
 
-    #[test]
-    fn plan_memory_query_carries_default_decay_config() {
-        let plan = plan_memory_query("graph rag", 5, 1500).unwrap();
-        assert_eq!(plan.decay, MemoryDecayConfig::default());
-        assert!(
-            plan.next_commands
-                .iter()
+#[test]
+fn rank_memory_event_candidates_bounds_db_candidates_before_scoring() {
+    let dir = TempDir::new().unwrap();
+    let memory_db = default_memory_db_path(dir.path());
+    std::fs::create_dir_all(memory_db.parent().unwrap()).unwrap();
+    let store = MemoryStore::open_or_create(&memory_db).unwrap();
+    let now = 1_700_000_000;
+    for index in 0..40 {
+        store
+            .insert_event(
+                &MemoryEvent::new(
+                    MemoryEventKind::ResponseSummary,
+                    format!("old-{index}"),
+                    format!("ordinary memory event {index}"),
+                )
+                .with_observed_at_unix(now - 20_000 - index),
+            )
+            .unwrap();
+    }
+    store
+        .insert_event(
+            &MemoryEvent::new(
+                MemoryEventKind::ResponseSummary,
+                "needle",
+                "semantic needle graph retrieval",
+            )
+            .with_observed_at_unix(now - 30_000),
+        )
+        .unwrap();
+    store
+        .insert_event(
+            &MemoryEvent::new(
+                MemoryEventKind::ResponseSummary,
+                "recent",
+                "fresh unrelated release note",
+            )
+            .with_observed_at_unix(now - 10),
+        )
+        .unwrap();
+
+    assert_eq!(memory_rank_candidate_limit(2), 16);
+    let ranked = rank_memory_event_candidates(
+        &memory_db,
+        "semantic needle",
+        now,
+        MemoryDecayConfig::default(),
+        2,
+    )
+    .unwrap();
+    assert_eq!(ranked.len(), 2);
+    assert!(ranked.iter().any(|scored| scored.event.source_ref == "needle"));
+    assert!(ranked.iter().any(|scored| scored.event.source_ref == "recent"));
+}
+
+#[test]
+fn plan_memory_query_carries_default_decay_config() {
+    let plan = plan_memory_query("graph rag", 5, 1500).unwrap();
+    assert_eq!(plan.decay, MemoryDecayConfig::default());
+    assert_eq!(plan.candidate_limit, 40);
+    assert!(
+        plan.output_contract
+            .iter()
+            .any(|contract| contract.contains("candidate set capped before ranking"))
+    );
+    assert!(
+        plan.next_commands
+            .iter()
                 .any(|cmd| cmd.contains("project-graph"))
         );
     }

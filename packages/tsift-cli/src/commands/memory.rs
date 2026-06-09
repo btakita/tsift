@@ -250,6 +250,8 @@ fn cmd_memory_status(
         event_count,
         schema_tables: vec![
             "memory_events",
+            "memory_events_fts",
+            "memory_internal_state",
             "memory_session_summaries",
             "memory_artifacts",
             "memory_tool_spans",
@@ -663,6 +665,7 @@ fn cmd_memory_query_plan(
             text: "tsift-memory query packet contract".to_string(),
             metrics: vec![
                 envelope_metric("limit", limit),
+                envelope_metric("candidate_limit", plan.candidate_limit),
                 envelope_metric("max_tokens", max_tokens),
             ],
         },

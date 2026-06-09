@@ -24,7 +24,7 @@ The multi-agent orchestration layer is deliberately **out of scope** for tsift.
 | **Graph** — node/edge schema, hierarchical traversal | `GraphStore` over SQLite/SurrealDB: symbols/edges, communities, callers/callees, `properties_json`/`provenance_json`/`freshness_json` | none — substrate exists |
 | **Memory** — agent interactions, decision history | `tsift-memory`: `MemoryEvent` stream (`PromptTarget`/`ToolCall`/`ToolResultArtifact`/`ResponseSummary`/`CloseoutProof`/`SessionCheck` + `Imported*`), cross-session `MemoryHandoffPlan`, claude-mem import | none — durable substrate exists |
 | **RAG** — retrieval + context aggregation | `tsift-memgraphrag`: memory-event `GraphProjection`, budgeted `MemoryQueryPlan`, shared graph upsert, semantic/source rows; hybrid BM25 + structural search, `context-pack` injection | unified graph ranking remains `#rankdefault` |
-| **Decay / recency** | `tsift-memgraphrag::rank_memory_events` over `MemoryEvent.observed_at_unix`; `community_graph_watermark` staleness signal | decay not yet folded into default graph-neighborhood ranking |
+| **Decay / recency** | `tsift-memgraphrag::rank_memory_event_candidates` reads a bounded FTS/recent candidate set from `tsift-memory`, then ranks over `MemoryEvent.observed_at_unix`; `community_graph_watermark` staleness signal | decay not yet folded into default graph-neighborhood ranking |
 | **Multi-agent** | tsift is the *shared substrate* read/written by Claude / Codex / OpenCode harnesses (`session_id`, `imported_from`) | orchestration is **not** (and should not be) tsift's job |
 
 ## Architecture
@@ -76,13 +76,19 @@ The paper's signature mechanism. Implemented in `packages/tsift-memgraphrag/src/
 - `MemoryDecayConfig { half_life_secs, lexical_weight, recency_weight }` — default
   one-week half-life, 0.6 lexical / 0.4 recency blend.
 - `rank_memory_events(events, query, now_unix, config, limit) -> Vec<ScoredMemoryEvent>`
-  blends a lexical-overlap component with exponential recency decay
-  (`0.5 ^ (age / half_life)`) over `MemoryEvent.observed_at_unix`; events without a
-  timestamp keep their lexical score but earn no recency credit. Ties break toward
-  the more recent event. `ScoredMemoryEvent` exposes `lexical_score` /
-  `recency_score` / `score` for explainability.
+blends a lexical-overlap component with exponential recency decay
+(`0.5 ^ (age / half_life)`) over `MemoryEvent.observed_at_unix`; events without a
+timestamp keep their lexical score but earn no recency credit. Ties break toward
+the more recent event. `ScoredMemoryEvent` exposes `lexical_score` /
+`recency_score` / `score` for explainability.
+- `read_memory_event_candidates(memory_db, query, limit)` uses `memory_events_fts`
+plus `COALESCE(observed_at_unix, created_at_unix)` / `created_at_unix` indexes to
+fetch FTS hits and a recent fallback into a deduplicated, bounded candidate set.
+`rank_memory_event_candidates(memory_db, query, now_unix, config, limit)` ranks
+only that candidate set instead of scanning every stored memory event.
 - `MemoryQueryPlan` now carries the `decay` config so `tsift memory query-plan`
-  documents the ranking contract.
+documents the ranking contract, including the candidate limit used before
+ranking.
 
 Still to do: fold this into `#rankdefault` (`ranked_neighborhood`) so memory and
 code share one ranking function once memory nodes are in the graph (below).

@@ -1,18 +1,21 @@
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params, params_from_iter};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tsift_core::{GraphEdge, GraphFreshness, GraphNode, GraphProjection, GraphProvenance};
 
 pub const MEMORY_CONTRACT_VERSION: &str = "tsift-memory-v1";
-pub const MEMORY_SCHEMA_VERSION: i64 = 1;
+pub const MEMORY_SCHEMA_VERSION: i64 = 2;
 pub const DEFAULT_MAX_PROMPT_TOKENS: usize = 4096;
 pub const DEFAULT_RESERVE_TOKENS: usize = 512;
 pub const DEFAULT_MAX_EVENT_TOKENS: usize = 1536;
 pub const MEMORY_BUDGET_GUARD_CONTRACT_VERSION: &str = "tsift-memory-budget-guard-v1";
 
 const MAX_IMPORT_EVENT_IDS: usize = 100;
+pub const DEFAULT_MEMORY_CANDIDATE_LIMIT: usize = 256;
+const MEMORY_FTS_BACKFILL_KEY: &str = "memory_events_fts_rebuilt_schema_version";
+const MAX_MEMORY_FTS_TERMS: usize = 16;
 
 const MEMORY_SCHEMA_SQL: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -24,6 +27,14 @@ CREATE TABLE IF NOT EXISTS memory_schema_versions (
 
 INSERT OR IGNORE INTO memory_schema_versions(version, applied_at_unix)
 VALUES (1, strftime('%s','now'));
+
+INSERT OR IGNORE INTO memory_schema_versions(version, applied_at_unix)
+VALUES (2, strftime('%s','now'));
+
+CREATE TABLE IF NOT EXISTS memory_internal_state (
+key TEXT PRIMARY KEY,
+value TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS memory_events (
   id TEXT PRIMARY KEY,
@@ -45,9 +56,43 @@ ON memory_events(kind);
 CREATE INDEX IF NOT EXISTS idx_memory_events_session
 ON memory_events(session_id);
 
+CREATE INDEX IF NOT EXISTS idx_memory_events_observed_created
+ON memory_events(COALESCE(observed_at_unix, created_at_unix), created_at_unix, id);
+
+CREATE INDEX IF NOT EXISTS idx_memory_events_created_at
+ON memory_events(created_at_unix, id);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_events_import_source
 ON memory_events(imported_from, imported_id)
 WHERE imported_from IS NOT NULL AND imported_id IS NOT NULL;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_events_fts
+USING fts5(
+text,
+source_ref,
+kind,
+metadata_json,
+content='memory_events',
+content_rowid='rowid',
+tokenize = 'unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS memory_events_ai AFTER INSERT ON memory_events BEGIN
+INSERT INTO memory_events_fts(rowid, text, source_ref, kind, metadata_json)
+VALUES (new.rowid, new.text, new.source_ref, new.kind, new.metadata_json);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_events_ad AFTER DELETE ON memory_events BEGIN
+INSERT INTO memory_events_fts(memory_events_fts, rowid, text, source_ref, kind, metadata_json)
+VALUES('delete', old.rowid, old.text, old.source_ref, old.kind, old.metadata_json);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_events_au AFTER UPDATE ON memory_events BEGIN
+INSERT INTO memory_events_fts(memory_events_fts, rowid, text, source_ref, kind, metadata_json)
+VALUES('delete', old.rowid, old.text, old.source_ref, old.kind, old.metadata_json);
+INSERT INTO memory_events_fts(rowid, text, source_ref, kind, metadata_json)
+VALUES (new.rowid, new.text, new.source_ref, new.kind, new.metadata_json);
+END;
 
 CREATE TABLE IF NOT EXISTS memory_session_summaries (
   id TEXT PRIMARY KEY,
@@ -699,6 +744,8 @@ impl MemoryStore {
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.execute_batch(MEMORY_SCHEMA_SQL)
             .with_context(|| format!("initialize {}", path.display()))?;
+        ensure_memory_fts_backfill(&conn)
+            .with_context(|| format!("backfill memory FTS index for {}", path.display()))?;
         Ok(Self { conn })
     }
 
@@ -758,6 +805,96 @@ fn insert_event_on(conn: &Connection, event: &MemoryEvent) -> Result<MemoryInser
     })
 }
 
+fn ensure_memory_fts_backfill(conn: &Connection) -> Result<()> {
+    let target_version = MEMORY_SCHEMA_VERSION.to_string();
+    let backfilled_version: Option<String> = conn
+        .query_row(
+            "SELECT value FROM memory_internal_state WHERE key = ?1",
+            [MEMORY_FTS_BACKFILL_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if backfilled_version.as_deref() == Some(target_version.as_str()) {
+        return Ok(());
+    }
+
+    conn.execute(
+        "INSERT INTO memory_events_fts(memory_events_fts) VALUES('rebuild')",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO memory_internal_state(key, value) VALUES (?1, ?2)",
+        params![MEMORY_FTS_BACKFILL_KEY, target_version],
+    )?;
+    Ok(())
+}
+
+fn memory_event_from_row(row: &Row<'_>, offset: usize) -> Result<MemoryEvent> {
+    let kind_raw: String = row.get(offset)?;
+    let session_id: Option<String> = row.get(offset + 1)?;
+    let source_ref: String = row.get(offset + 2)?;
+    let text: String = row.get(offset + 3)?;
+    let metadata_json: String = row.get(offset + 4)?;
+    let observed_at_unix: Option<i64> = row.get(offset + 5)?;
+    let token_estimate: i64 = row.get(offset + 6)?;
+    let imported_from: Option<String> = row.get(offset + 7)?;
+    let imported_id: Option<String> = row.get(offset + 8)?;
+    let metadata = serde_json::from_str::<BTreeMap<String, String>>(&metadata_json)
+        .with_context(|| format!("parse memory metadata for {source_ref}"))?;
+    let mut event = MemoryEvent::new(MemoryEventKind::parse(&kind_raw)?, source_ref, text);
+    event.session_id = session_id;
+    event.metadata = metadata;
+    event.observed_at_unix = observed_at_unix;
+    event.token_estimate = token_estimate.max(0) as usize;
+    event.imported_from = imported_from;
+    event.imported_id = imported_id;
+    Ok(event)
+}
+
+fn memory_fts_query(query: &str) -> Option<String> {
+    let mut seen = BTreeSet::new();
+    let terms: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|term| term.len() > 1)
+        .map(|term| term.to_lowercase())
+        .filter(|term| seen.insert(term.clone()))
+        .take(MAX_MEMORY_FTS_TERMS)
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" OR "))
+    }
+}
+
+fn memory_events_fts_available(conn: &Connection) -> Result<bool> {
+    let exists: Option<i64> = conn
+        .query_row(
+            r#"
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'memory_events_fts'
+            "#,
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(exists.is_some())
+}
+
+fn push_memory_candidate(
+    events: &mut Vec<MemoryEvent>,
+    seen_rowids: &mut BTreeSet<i64>,
+    rowid: i64,
+    event: MemoryEvent,
+    limit: usize,
+) {
+    if events.len() < limit && seen_rowids.insert(rowid) {
+        events.push(event);
+    }
+}
+
 pub fn read_memory_events(memory_db_path: &Path, limit: usize) -> Result<Vec<MemoryEvent>> {
     if !memory_db_path.exists() {
         return Ok(Vec::new());
@@ -779,26 +916,85 @@ pub fn read_memory_events(memory_db_path: &Path, limit: usize) -> Result<Vec<Mem
     let mut rows = stmt.query([limit as i64])?;
     let mut events = Vec::new();
     while let Some(row) = rows.next()? {
-        let kind_raw: String = row.get(0)?;
-        let session_id: Option<String> = row.get(1)?;
-        let source_ref: String = row.get(2)?;
-        let text: String = row.get(3)?;
-        let metadata_json: String = row.get(4)?;
-        let observed_at_unix: Option<i64> = row.get(5)?;
-        let token_estimate: i64 = row.get(6)?;
-        let imported_from: Option<String> = row.get(7)?;
-        let imported_id: Option<String> = row.get(8)?;
-        let metadata = serde_json::from_str::<BTreeMap<String, String>>(&metadata_json)
-            .with_context(|| format!("parse memory metadata for {source_ref}"))?;
-        let mut event = MemoryEvent::new(MemoryEventKind::parse(&kind_raw)?, source_ref, text);
-        event.session_id = session_id;
-        event.metadata = metadata;
-        event.observed_at_unix = observed_at_unix;
-        event.token_estimate = token_estimate.max(0) as usize;
-        event.imported_from = imported_from;
-        event.imported_id = imported_id;
-        events.push(event);
+        events.push(memory_event_from_row(row, 0)?);
     }
+    Ok(events)
+}
+
+pub fn read_memory_event_candidates(
+    memory_db_path: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<MemoryEvent>> {
+    if limit == 0 || !memory_db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open_with_flags(
+        memory_db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("open memory db {}", memory_db_path.display()))?;
+
+    let mut events = Vec::new();
+    let mut seen_rowids = BTreeSet::new();
+    let fts_query = memory_fts_query(query);
+    let recent_reserve = if fts_query.is_some() && limit >= 8 {
+        (limit / 4).max(1)
+    } else {
+        0
+    };
+    let fts_limit = limit.saturating_sub(recent_reserve);
+    if let Some(fts_query) = fts_query
+        && fts_limit > 0
+        && memory_events_fts_available(&conn)?
+    {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT e.rowid, e.kind, e.session_id, e.source_ref, e.text, e.metadata_json,
+                   e.observed_at_unix, e.token_estimate, e.imported_from, e.imported_id
+            FROM memory_events_fts
+            JOIN memory_events e ON e.rowid = memory_events_fts.rowid
+            WHERE memory_events_fts MATCH ?1
+            ORDER BY bm25(memory_events_fts),
+                     COALESCE(e.observed_at_unix, e.created_at_unix) DESC,
+                     e.id DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let mut rows = stmt.query(params![fts_query, fts_limit as i64])?;
+        while let Some(row) = rows.next()? {
+            let rowid: i64 = row.get(0)?;
+            let event = memory_event_from_row(row, 1)?;
+            push_memory_candidate(&mut events, &mut seen_rowids, rowid, event, limit);
+        }
+    }
+
+    let remaining = limit.saturating_sub(events.len());
+    if remaining > 0 {
+        let recent_limit = if seen_rowids.is_empty() {
+            remaining
+        } else {
+            limit
+        };
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT rowid, kind, session_id, source_ref, text, metadata_json,
+                   observed_at_unix, token_estimate, imported_from, imported_id
+            FROM memory_events
+            ORDER BY COALESCE(observed_at_unix, created_at_unix) DESC,
+                     created_at_unix DESC,
+                     id DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let mut rows = stmt.query([recent_limit as i64])?;
+        while let Some(row) = rows.next()? {
+            let rowid: i64 = row.get(0)?;
+            let event = memory_event_from_row(row, 1)?;
+            push_memory_candidate(&mut events, &mut seen_rowids, rowid, event, limit);
+        }
+    }
+
     Ok(events)
 }
 
@@ -1787,7 +1983,7 @@ mod tests {
     }
 
     #[test]
-    fn read_memory_events_round_trips_closeout_events() {
+fn read_memory_events_round_trips_closeout_events() {
         let dir = TempDir::new().unwrap();
         let db = dir.path().join("memory.db");
         let store = MemoryStore::open_or_create(&db).unwrap();
@@ -1810,11 +2006,102 @@ mod tests {
         assert!(events.iter().any(|event| {
             event.kind == MemoryEventKind::CloseoutProof
                 && event.metadata.get("commit_hash") == Some(&"abc123".to_string())
-        }));
-    }
+    }));
+}
 
-    #[test]
-    fn budget_guard_fails_closed_with_retryable_chunks() {
+#[test]
+fn memory_schema_creates_candidate_indexes_and_fts_table() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("memory.db");
+    MemoryStore::open_or_create(&db).unwrap();
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    for name in [
+        "idx_memory_events_observed_created",
+        "idx_memory_events_created_at",
+        "memory_events_fts",
+    ] {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "expected schema object {name}");
+    }
+}
+
+#[test]
+fn read_memory_event_candidates_uses_fts_and_recent_bound() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("memory.db");
+    let store = MemoryStore::open_or_create(&db).unwrap();
+    let now = 1_700_000_000;
+    for index in 0..20 {
+        store
+            .insert_event(
+                &MemoryEvent::new(
+                    MemoryEventKind::ResponseSummary,
+                    format!("old-{index}"),
+                    format!("ordinary memory event {index}"),
+                )
+                .with_observed_at_unix(now - 1_000 - index),
+            )
+            .unwrap();
+    }
+    store
+        .insert_event(
+            &MemoryEvent::new(
+                MemoryEventKind::ResponseSummary,
+                "needle",
+                "semantic needle graph retrieval",
+            )
+            .with_observed_at_unix(now - 10_000),
+        )
+        .unwrap();
+    store
+        .insert_event(
+            &MemoryEvent::new(
+                MemoryEventKind::ResponseSummary,
+                "recent",
+                "fresh unrelated release note",
+            )
+            .with_observed_at_unix(now),
+        )
+        .unwrap();
+
+    let candidates = read_memory_event_candidates(&db, "semantic needle", 5).unwrap();
+    assert!(candidates.len() <= 5);
+    assert!(candidates.iter().any(|event| event.source_ref == "needle"));
+    assert!(candidates.iter().any(|event| event.source_ref == "recent"));
+}
+
+#[test]
+fn read_memory_event_candidates_returns_recent_for_empty_query() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("memory.db");
+    let store = MemoryStore::open_or_create(&db).unwrap();
+    store
+        .insert_event(
+            &MemoryEvent::new(MemoryEventKind::ResponseSummary, "old", "older note")
+                .with_observed_at_unix(1_700_000_000),
+        )
+        .unwrap();
+    store
+        .insert_event(
+            &MemoryEvent::new(MemoryEventKind::ResponseSummary, "recent", "newer note")
+                .with_observed_at_unix(1_700_000_100),
+        )
+        .unwrap();
+
+    let candidates = read_memory_event_candidates(&db, " ", 1).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].source_ref, "recent");
+}
+
+#[test]
+fn budget_guard_fails_closed_with_retryable_chunks() {
         let report = guard_memory_handoff(
             MemoryBudgetGuardInput::new("tool.log", "tool_result", "x".repeat(5_000)),
             MemoryBudget {

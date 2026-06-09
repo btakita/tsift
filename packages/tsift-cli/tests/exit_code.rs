@@ -9006,6 +9006,7 @@ fn memory_query_plan_uses_graph_db_related_with_parent_json_flag() {
         String::from_utf8_lossy(&output.stderr)
     );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["candidate_limit"], 80);
     let next_commands = json["next_commands"].as_array().unwrap();
     assert!(next_commands.iter().any(|command| {
         command
