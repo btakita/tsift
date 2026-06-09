@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const SQLITE_GRAPH_SCHEMA_VERSION: i64 = 5;
+pub const SQLITE_GRAPH_SCHEMA_VERSION: i64 = 6;
+pub const GRAPH_SEMANTIC_VECTOR_PROPERTY_KEY: &str = "embedding";
+pub const GRAPH_SEMANTIC_VECTOR_MODEL_PROPERTY_KEY: &str = "embedding_model";
+pub const GRAPH_SEMANTIC_VECTOR_DEFAULT_MODEL: &str = "tsift-local-hash-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphProvenance {
@@ -54,6 +57,12 @@ pub struct GraphNode {
     pub provenance: Vec<GraphProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freshness: Option<GraphFreshness>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphSemanticCandidate {
+    pub node: GraphNode,
+    pub score: f64,
 }
 
 impl GraphNode {

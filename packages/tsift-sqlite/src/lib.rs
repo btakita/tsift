@@ -15,10 +15,14 @@ pub use tsift_core::{
     ConvexEdgeRow, ConvexGraphClient, ConvexGraphStore, ConvexNodeRow, ConvexProjectionRows,
     ConvexRowsGraphClient, GraphEdge, GraphFreshness, GraphNode, GraphPagedSubgraph, GraphPath,
     GraphProjection, GraphPropertyFilter, GraphProvenance, GraphQueryOptions, GraphQueryPage,
-    GraphStore, GraphSubgraph, PropertyMode, RankedNeighborhoodOptions, RankedNeighborhoodResult,
+    GraphSemanticCandidate, GraphStore, GraphSubgraph, PropertyMode, RankedNeighborhoodOptions,
+    RankedNeighborhoodResult, GRAPH_SEMANTIC_VECTOR_DEFAULT_MODEL,
+    GRAPH_SEMANTIC_VECTOR_MODEL_PROPERTY_KEY, GRAPH_SEMANTIC_VECTOR_PROPERTY_KEY,
     SQLITE_GRAPH_SCHEMA_VERSION, TerseGraphEdge, TerseGraphNode,
     apply_graph_edge_query_page,
-    apply_graph_query_page, graph_edge_id, shortest_path_using_outgoing, stable_graph_edge_id,
+    apply_graph_query_page, graph_edge_id, graph_semantic_cosine,
+    graph_semantic_top_candidates_by_property_scan, parse_graph_semantic_vector_property,
+    shortest_path_using_outgoing, stable_graph_edge_id,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -229,6 +233,21 @@ fn sqlite_column_exists(conn: &Connection, table: &str, column: &str) -> Result<
     Ok(false)
 }
 
+fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = ?1
+        )
+        "#,
+        [table],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(Into::into)
+}
+
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -302,6 +321,10 @@ fn migrate_sqlite_graph_schema(conn: &Connection, old_version: i64) -> Result<()
         ensure_sqlite_graph_edge_properties_schema(conn)?;
         rebuild_graph_edge_properties(conn)?;
     }
+    if old_version < 6 {
+        ensure_sqlite_graph_semantic_vectors_schema(conn)?;
+        rebuild_graph_node_semantic_vectors(conn)?;
+    }
     Ok(())
 }
 
@@ -344,6 +367,24 @@ fn ensure_sqlite_graph_edge_properties_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_sqlite_graph_semantic_vectors_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS graph_node_semantic_vectors (
+            node_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            model TEXT NOT NULL,
+            dimensions INTEGER NOT NULL,
+            vector_blob BLOB NOT NULL,
+            FOREIGN KEY (node_id) REFERENCES graph_nodes(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_graph_node_semantic_vectors_kind_dims
+            ON graph_node_semantic_vectors(kind, dimensions, node_id);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn replace_node_properties(
     conn: &Connection,
     node_id: &str,
@@ -364,6 +405,81 @@ fn replace_node_properties(
     for (key, value) in properties {
         insert.execute((node_id, key, value))?;
     }
+    Ok(())
+}
+
+struct GraphSemanticVectorRow {
+    model: String,
+    dimensions: usize,
+    vector_blob: Vec<u8>,
+}
+
+fn graph_semantic_vector_row(
+    properties: &BTreeMap<String, String>,
+) -> Option<GraphSemanticVectorRow> {
+    let vector = properties
+        .get(GRAPH_SEMANTIC_VECTOR_PROPERTY_KEY)
+        .and_then(|value| parse_graph_semantic_vector_property(value))?;
+    Some(GraphSemanticVectorRow {
+        model: properties
+            .get(GRAPH_SEMANTIC_VECTOR_MODEL_PROPERTY_KEY)
+            .cloned()
+            .unwrap_or_else(|| GRAPH_SEMANTIC_VECTOR_DEFAULT_MODEL.to_string()),
+        dimensions: vector.len(),
+        vector_blob: semantic_vector_to_blob(&vector),
+    })
+}
+
+fn semantic_vector_to_blob(vector: &[f64]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(std::mem::size_of_val(vector));
+    for value in vector {
+        blob.extend_from_slice(&value.to_le_bytes());
+    }
+    blob
+}
+
+fn semantic_vector_from_blob(blob: &[u8], dimensions: usize) -> Option<Vec<f64>> {
+    if dimensions == 0 || blob.len() != dimensions * std::mem::size_of::<f64>() {
+        return None;
+    }
+    let mut vector = Vec::with_capacity(dimensions);
+    for chunk in blob.chunks_exact(std::mem::size_of::<f64>()) {
+        let value = f64::from_le_bytes(chunk.try_into().ok()?);
+        if !value.is_finite() {
+            return None;
+        }
+        vector.push(value);
+    }
+    Some(vector)
+}
+
+fn replace_node_semantic_vector(
+    conn: &Connection,
+    node_id: &str,
+    kind: &str,
+    properties: &BTreeMap<String, String>,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM graph_node_semantic_vectors WHERE node_id = ?1",
+        [node_id],
+    )?;
+    let Some(row) = graph_semantic_vector_row(properties) else {
+        return Ok(());
+    };
+    conn.execute(
+        r#"
+        INSERT INTO graph_node_semantic_vectors
+            (node_id, kind, model, dimensions, vector_blob)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+        (
+            node_id,
+            kind,
+            row.model,
+            row.dimensions as i64,
+            row.vector_blob,
+        ),
+    )?;
     Ok(())
 }
 
@@ -404,6 +520,38 @@ fn rebuild_graph_node_properties(conn: &Connection) -> Result<()> {
           AND json_each.value IS NOT NULL
         "#,
     )?;
+    Ok(())
+}
+
+fn rebuild_graph_node_semantic_vectors(conn: &Connection) -> Result<()> {
+    if !sqlite_column_exists(conn, "graph_nodes", "properties_json")?
+        || !sqlite_table_exists(conn, "graph_node_semantic_vectors")?
+    {
+        return Ok(());
+    }
+    conn.execute("DELETE FROM graph_node_semantic_vectors", [])?;
+    let rows = {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, kind, properties_json
+            FROM graph_nodes
+            WHERE json_extract(properties_json, '$.embedding') IS NOT NULL
+            ORDER BY id
+            "#,
+        )?;
+        collect_rows(stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?)?
+    };
+    for (node_id, kind, properties_json) in rows {
+        let properties: BTreeMap<String, String> = serde_json::from_str(&properties_json)
+            .with_context(|| format!("parsing semantic properties for graph node {node_id}"))?;
+        replace_node_semantic_vector(conn, &node_id, &kind, &properties)?;
+    }
     Ok(())
 }
 
@@ -566,6 +714,13 @@ fn sqlite_stage_projection_nodes(
     nodes: &[&GraphNode],
     source_watermark: Option<&str>,
 ) -> Result<()> {
+    let mut insert_semantic_vector = tx.prepare(
+        r#"
+        INSERT INTO next_graph_node_semantic_vectors
+            (node_id, kind, model, dimensions, vector_blob)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )?;
     for chunk in nodes.chunks(SQLITE_GRAPH_STAGING_CHUNK_ROWS) {
         let sql = format!(
             r#"
@@ -595,6 +750,18 @@ fn sqlite_stage_projection_nodes(
             );
         }
         tx.execute(&sql, params_from_iter(values))?;
+        for node in chunk {
+            let Some(row) = graph_semantic_vector_row(&node.properties) else {
+                continue;
+            };
+            insert_semantic_vector.execute((
+                &node.id,
+                &node.kind,
+                row.model,
+                row.dimensions as i64,
+                row.vector_blob,
+            ))?;
+        }
     }
     Ok(())
 }
@@ -764,6 +931,17 @@ impl SqliteGraphStore {
             CREATE INDEX IF NOT EXISTS idx_graph_node_properties_key_value_node
                 ON graph_node_properties(key, value, node_id);
 
+            CREATE TABLE IF NOT EXISTS graph_node_semantic_vectors (
+                node_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                model TEXT NOT NULL,
+                dimensions INTEGER NOT NULL,
+                vector_blob BLOB NOT NULL,
+                FOREIGN KEY (node_id) REFERENCES graph_nodes(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_graph_node_semantic_vectors_kind_dims
+                ON graph_node_semantic_vectors(kind, dimensions, node_id);
+
             CREATE TABLE IF NOT EXISTS graph_operator_stats (
                 scope TEXT PRIMARY KEY,
                 nodes INTEGER NOT NULL,
@@ -894,6 +1072,13 @@ impl SqliteGraphStore {
                 value TEXT NOT NULL,
                 PRIMARY KEY (node_id, key)
             );
+            CREATE TEMP TABLE IF NOT EXISTS next_graph_node_semantic_vectors (
+                node_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                model TEXT NOT NULL,
+                dimensions INTEGER NOT NULL,
+                vector_blob BLOB NOT NULL
+            );
             CREATE TEMP TABLE IF NOT EXISTS next_graph_edge_properties (
                 edge_key TEXT NOT NULL,
                 key TEXT NOT NULL,
@@ -915,6 +1100,7 @@ impl SqliteGraphStore {
             DELETE FROM next_graph_nodes;
             DELETE FROM next_graph_edges;
             DELETE FROM next_graph_node_properties;
+            DELETE FROM next_graph_node_semantic_vectors;
             DELETE FROM next_graph_edge_properties;
             DELETE FROM next_graph_changed_nodes;
             DELETE FROM next_graph_changed_edges;
@@ -1269,10 +1455,41 @@ impl SqliteGraphStore {
                 source_watermark = excluded.source_watermark
             WHERE graph_nodes.row_hash IS NOT excluded.row_hash
             "#;
-        tx.execute(upsert_nodes_sql, [])?;
-        let upsert_edges_sql = r#"
+            tx.execute(upsert_nodes_sql, [])?;
+            tx.execute(
+                r#"
+                DELETE FROM graph_node_semantic_vectors
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM next_graph_changed_nodes c
+                    WHERE c.id = graph_node_semantic_vectors.node_id
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM next_graph_node_semantic_vectors n
+                    WHERE n.node_id = graph_node_semantic_vectors.node_id
+                )
+                "#,
+                [],
+            )?;
+            tx.execute(
+                r#"
+                INSERT INTO graph_node_semantic_vectors
+                    (node_id, kind, model, dimensions, vector_blob)
+                SELECT n.node_id, n.kind, n.model, n.dimensions, n.vector_blob
+                FROM next_graph_node_semantic_vectors n
+                WHERE true
+                ON CONFLICT(node_id) DO UPDATE SET
+                    kind = excluded.kind,
+                    model = excluded.model,
+                    dimensions = excluded.dimensions,
+                    vector_blob = excluded.vector_blob
+                "#,
+                [],
+            )?;
+            let upsert_edges_sql = r#"
             INSERT INTO graph_edges
-                (edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
+            (edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json, row_hash, source_watermark)
             SELECT
                 n.edge_key,
                 n.from_id,
@@ -1620,6 +1837,7 @@ impl SqliteGraphStore {
                 for (key, value) in &node.properties {
                     insert_property.execute((&node.id, key, value))?;
                 }
+                replace_node_semantic_vector(&tx, &node.id, &node.kind, &node.properties)?;
             }
         }
         {
@@ -2003,6 +2221,7 @@ impl GraphStore for SqliteGraphStore {
             ),
         )?;
         replace_node_properties(&self.conn, &node.id, &node.properties)?;
+        replace_node_semantic_vector(&self.conn, &node.id, &node.kind, &node.properties)?;
         Ok(())
     }
 
@@ -2190,6 +2409,88 @@ impl GraphStore for SqliteGraphStore {
             "#,
         )?;
         collect_rows(stmt.query_map([kind], node_from_row)?)
+    }
+
+    fn semantic_top_candidates(
+        &self,
+        query_vector: &[f64],
+        kinds: &[&str],
+        limit: usize,
+    ) -> Result<Vec<GraphSemanticCandidate>> {
+        if query_vector.is_empty() || kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !sqlite_table_exists(&self.conn, "graph_node_semantic_vectors")? {
+            return graph_semantic_top_candidates_by_property_scan(
+                self,
+                query_vector,
+                kinds,
+                limit,
+            );
+        }
+
+        let unique_kinds = kinds.iter().copied().collect::<BTreeSet<_>>();
+        if unique_kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let kind_placeholders = unique_kinds
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT n.id, n.kind, n.label, n.properties_json, n.provenance_json, n.freshness_json,
+                   graph_node_semantic_vectors.vector_blob,
+                   graph_node_semantic_vectors.dimensions
+            FROM graph_node_semantic_vectors INDEXED BY idx_graph_node_semantic_vectors_kind_dims
+            JOIN graph_nodes n ON n.id = graph_node_semantic_vectors.node_id
+            WHERE graph_node_semantic_vectors.dimensions = ?
+              AND graph_node_semantic_vectors.kind IN ({kind_placeholders})
+            ORDER BY graph_node_semantic_vectors.kind, n.label, n.id
+            "#
+        );
+        let mut values = vec![Value::Integer(query_vector.len() as i64)];
+        values.extend(
+            unique_kinds
+                .into_iter()
+                .map(|kind| Value::Text(kind.to_string())),
+        );
+        let rows = {
+            let mut stmt = self.conn.prepare(&sql)?;
+            collect_rows(stmt.query_map(params_from_iter(values.iter()), |row| {
+                Ok((
+                    node_from_row_at(row, 0)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })?)?
+        };
+
+        let mut candidates = rows
+            .into_iter()
+            .filter_map(|(node, blob, dimensions)| {
+                let dimensions = usize::try_from(dimensions).ok()?;
+                let vector = semantic_vector_from_blob(&blob, dimensions)?;
+                Some(GraphSemanticCandidate {
+                    score: graph_semantic_cosine(query_vector, &vector),
+                    node,
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.node.kind.cmp(&right.node.kind))
+                .then_with(|| left.node.label.cmp(&right.node.label))
+                .then_with(|| left.node.id.cmp(&right.node.id))
+        });
+        if limit > 0 && candidates.len() > limit {
+            candidates.truncate(limit);
+        }
+        Ok(candidates)
     }
 
     fn paged_nodes_by_kind(
@@ -3659,6 +3960,61 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_semantic_top_candidates_use_materialized_vector_table() {
+        let store = SqliteGraphStore::in_memory().unwrap();
+        store
+            .upsert_node(
+                &GraphNode::new("concept:graph", "semantic_concept", "graph navigation")
+                    .with_property("embedding_model", "fixture-v1")
+                    .with_property("embedding", "1.0,0.0"),
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                &GraphNode::new("concept:sqlite", "semantic_concept", "sqlite search")
+                    .with_property("embedding", "0.0,1.0"),
+            )
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("entity:skip", "semantic_entity", "skipped"))
+            .unwrap();
+
+        let vector_rows: usize = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_node_semantic_vectors",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(vector_rows, 2);
+
+        let candidates = store
+            .semantic_top_candidates(&[1.0, 0.0], &["semantic_concept"], 1)
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].node.id, "concept:graph");
+        assert_eq!(candidates[0].score, 1.0);
+
+        store
+            .upsert_node(&GraphNode::new(
+                "concept:graph",
+                "semantic_concept",
+                "graph navigation",
+            ))
+            .unwrap();
+        let vector_rows_after_update: usize = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_node_semantic_vectors WHERE node_id = 'concept:graph'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(vector_rows_after_update, 0);
+    }
+
+    #[test]
     fn sqlite_store_filters_edges_by_kind_and_paths() {
         let store = SqliteGraphStore::in_memory().unwrap();
         for id in ["a", "b", "c"] {
@@ -3968,10 +4324,11 @@ mod tests {
                 deleted_at_unix INTEGER NOT NULL
             );
             INSERT INTO graph_nodes
-                (id, kind, label, properties_json, provenance_json)
+            (id, kind, label, properties_json, provenance_json)
             VALUES
-                ('topic:rooms', 'topic', 'Rooms', '{"domain":"livekit"}', '[]'),
-                ('topic:egress', 'topic', 'Egress', '{"domain":"recording"}', '[]');
+            ('topic:rooms', 'topic', 'Rooms', '{"domain":"livekit"}', '[]'),
+            ('topic:egress', 'topic', 'Egress', '{"domain":"recording"}', '[]'),
+            ('concept:graph', 'semantic_concept', 'Graph navigation', '{"embedding":"1.0,0.0","embedding_model":"fixture-v1"}', '[]');
             INSERT INTO graph_edges
                 (from_id, to_id, kind, properties_json, provenance_json)
             VALUES
@@ -4004,6 +4361,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(edge_property_rows, 1);
+        let semantic_vector_rows: usize = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_node_semantic_vectors WHERE model = 'fixture-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(semantic_vector_rows, 1);
         let edge = store
             .edge(&GraphEdge::stable_id(
                 "topic:rooms",

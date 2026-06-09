@@ -7,14 +7,18 @@ pub use convex::{
     ConvexRowsGraphClient,
 };
 pub use store::{
-    GraphStore, apply_graph_edge_query_page, apply_graph_query_page, shortest_path_using_outgoing,
+    GraphStore, apply_graph_edge_query_page, apply_graph_query_page, graph_semantic_cosine,
+    graph_semantic_top_candidates_by_property_scan, parse_graph_semantic_vector_property,
+    shortest_path_using_outgoing,
 };
 pub use types::{
-    GraphEdge, GraphFreshness, GraphNode, GraphPagedSubgraph, GraphPath, GraphProjection,
-    GraphPropertyFilter, GraphProvenance, GraphQueryOptions, GraphQueryPage, GraphSubgraph,
-    NeighborhoodScoring, PropertyMode, RankedNeighborhoodOptions, RankedNeighborhoodResult,
-    SQLITE_GRAPH_SCHEMA_VERSION, TerseGraphEdge, TerseGraphNode, TerseGraphSubgraph,
-    TerseHealthScore, TerseSearchHit, graph_edge_id, stable_graph_edge_id,
+    GRAPH_SEMANTIC_VECTOR_DEFAULT_MODEL, GRAPH_SEMANTIC_VECTOR_MODEL_PROPERTY_KEY,
+    GRAPH_SEMANTIC_VECTOR_PROPERTY_KEY, GraphEdge, GraphFreshness, GraphNode, GraphPagedSubgraph,
+    GraphPath, GraphProjection, GraphPropertyFilter, GraphProvenance, GraphQueryOptions,
+    GraphQueryPage, GraphSemanticCandidate, GraphSubgraph, NeighborhoodScoring, PropertyMode,
+    RankedNeighborhoodOptions, RankedNeighborhoodResult, SQLITE_GRAPH_SCHEMA_VERSION,
+    TerseGraphEdge, TerseGraphNode, TerseGraphSubgraph, TerseHealthScore, TerseSearchHit,
+    graph_edge_id, stable_graph_edge_id,
 };
 
 impl GraphProjection {

@@ -14769,18 +14769,12 @@ fn semantic_related_report_from_store(
         SemanticRelatedKind::All => &["semantic_concept", "semantic_entity"],
     };
 
-    let mut items = Vec::new();
-    for node_kind in node_kinds {
-        for node in store.nodes_by_kind(node_kind)? {
-            let Some(embedding) = node
-                .properties
-                .get("embedding")
-                .and_then(|value| parse_semantic_embedding_property(value))
-            else {
-                continue;
-            };
-            let score = semantic_cosine(&query_embedding, &embedding);
-            items.push(SemanticRelatedItem {
+    let items = store
+        .semantic_top_candidates(&query_embedding, node_kinds, limit)?
+        .into_iter()
+        .map(|candidate| {
+            let node = candidate.node;
+            SemanticRelatedItem {
                 handle: node
                     .properties
                     .get("handle")
@@ -14788,7 +14782,7 @@ fn semantic_related_report_from_store(
                     .unwrap_or_else(|| node.id.clone()),
                 kind: node.kind,
                 label: node.label,
-                score,
+                score: candidate.score,
                 file_path: node
                     .properties
                     .get("source_file")
@@ -14805,22 +14799,9 @@ fn semantic_related_report_from_store(
                     .get("expand")
                     .cloned()
                     .unwrap_or_else(|| traversal_expand_command(root, &node.id)),
-            });
-        }
-    }
-
-    items.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left.kind.cmp(&right.kind))
-            .then_with(|| left.label.cmp(&right.label))
-            .then_with(|| left.handle.cmp(&right.handle))
-    });
-    if limit > 0 && items.len() > limit {
-        items.truncate(limit);
-    }
+            }
+        })
+        .collect::<Vec<_>>();
 
     let mut warnings = Vec::new();
     if items.is_empty() {
@@ -23975,6 +23956,15 @@ fn main() { api::handler(); }
         seed_traversal_semantic_summaries(dir.path());
         refresh_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
         let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
+        let semantic_vector_rows: usize = Connection::open(dir.path().join(".tsift/graph.db"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM graph_node_semantic_vectors",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(semantic_vector_rows > 0);
 
         let report = semantic_related_report_from_store(
             dir.path(),

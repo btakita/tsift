@@ -89,6 +89,9 @@ only that candidate set instead of scanning every stored memory event.
 - `MemoryQueryPlan` now carries the `decay` config so `tsift memory query-plan`
 documents the ranking contract, including the candidate limit used before
 ranking.
+- `graph-db related` semantic seeding now uses `GraphStore::semantic_top_candidates`;
+  SQLite serves this from `graph_node_semantic_vectors` typed blob rows instead of
+  scanning/parsing every semantic node property during retrieval.
 
 Still to do: fold this into `#rankdefault` (`ranked_neighborhood`) so memory and
 code share one ranking function once memory nodes are in the graph (below).

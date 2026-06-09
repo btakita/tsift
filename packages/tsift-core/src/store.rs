@@ -310,6 +310,25 @@ pub fn apply_graph_edge_query_page(
     }
 }
 
+pub fn parse_graph_semantic_vector_property(value: &str) -> Option<Vec<f64>> {
+    let parsed = value
+        .split(',')
+        .map(|part| part.trim().parse::<f64>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    (!parsed.is_empty() && parsed.iter().all(|value| value.is_finite())).then_some(parsed)
+}
+
+pub fn graph_semantic_cosine(left: &[f64], right: &[f64]) -> f64 {
+    if left.len() != right.len() || left.is_empty() {
+        return 0.0;
+    }
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum::<f64>()
+}
+
 pub trait GraphStore {
     fn upsert_node(&self, node: &GraphNode) -> Result<()>;
     fn upsert_edge(&self, edge: &GraphEdge) -> Result<()>;
@@ -668,6 +687,15 @@ pub trait GraphStore {
         Ok(rows)
     }
 
+    fn semantic_top_candidates(
+        &self,
+        query_vector: &[f64],
+        kinds: &[&str],
+        limit: usize,
+    ) -> Result<Vec<GraphSemanticCandidate>> {
+        graph_semantic_top_candidates_by_property_scan(self, query_vector, kinds, limit)
+    }
+
     fn resolve_evidence_target(&self, target: &str, kinds: &[&str]) -> Result<Option<GraphNode>> {
         if let Some(node) = self.node(target)? {
             return Ok(Some(node));
@@ -691,6 +719,53 @@ pub trait GraphStore {
         }
         Ok(None)
     }
+}
+
+pub fn graph_semantic_top_candidates_by_property_scan<S: GraphStore + ?Sized>(
+    store: &S,
+    query_vector: &[f64],
+    kinds: &[&str],
+    limit: usize,
+) -> Result<Vec<GraphSemanticCandidate>> {
+    if query_vector.is_empty() || kinds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut seen_kinds = BTreeSet::new();
+    let mut candidates = Vec::new();
+    for kind in kinds {
+        if !seen_kinds.insert(*kind) {
+            continue;
+        }
+        for node in store.nodes_by_kind(kind)? {
+            let Some(vector) = node
+                .properties
+                .get(GRAPH_SEMANTIC_VECTOR_PROPERTY_KEY)
+                .and_then(|value| parse_graph_semantic_vector_property(value))
+            else {
+                continue;
+            };
+            if vector.len() != query_vector.len() {
+                continue;
+            }
+            candidates.push(GraphSemanticCandidate {
+                score: graph_semantic_cosine(query_vector, &vector),
+                node,
+            });
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.node.kind.cmp(&right.node.kind))
+            .then_with(|| left.node.label.cmp(&right.node.label))
+            .then_with(|| left.node.id.cmp(&right.node.id))
+    });
+    if limit > 0 && candidates.len() > limit {
+        candidates.truncate(limit);
+    }
+    Ok(candidates)
 }
 
 pub fn shortest_path_using_outgoing(
