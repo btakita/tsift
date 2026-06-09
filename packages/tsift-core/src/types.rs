@@ -5,6 +5,21 @@ pub const SQLITE_GRAPH_SCHEMA_VERSION: i64 = 6;
 pub const GRAPH_SEMANTIC_VECTOR_PROPERTY_KEY: &str = "embedding";
 pub const GRAPH_SEMANTIC_VECTOR_MODEL_PROPERTY_KEY: &str = "embedding_model";
 pub const GRAPH_SEMANTIC_VECTOR_DEFAULT_MODEL: &str = "tsift-local-hash-v1";
+pub const DEFAULT_RANKED_NEIGHBORHOOD_OBSERVED_AT_HALF_LIFE_SECS: i64 = 7 * 24 * 3600;
+pub const DEFAULT_RANKED_NEIGHBORHOOD_OBSERVED_AT_WEIGHT: i64 = 24;
+pub const DEFAULT_RANKED_NEIGHBORHOOD_MEMORY_NODE_BOOST: i64 = 18;
+
+fn default_ranked_neighborhood_observed_at_half_life_secs() -> i64 {
+    DEFAULT_RANKED_NEIGHBORHOOD_OBSERVED_AT_HALF_LIFE_SECS
+}
+
+fn default_ranked_neighborhood_observed_at_weight() -> i64 {
+    DEFAULT_RANKED_NEIGHBORHOOD_OBSERVED_AT_WEIGHT
+}
+
+fn default_ranked_neighborhood_memory_node_boost() -> i64 {
+    DEFAULT_RANKED_NEIGHBORHOOD_MEMORY_NODE_BOOST
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphProvenance {
@@ -394,6 +409,14 @@ pub struct RankedNeighborhoodOptions {
     pub edge_kind: Option<String>,
     #[serde(default)]
     pub property_mode: PropertyMode,
+    #[serde(default)]
+    pub observed_at_now_unix: Option<i64>,
+    #[serde(default = "default_ranked_neighborhood_observed_at_half_life_secs")]
+    pub observed_at_half_life_secs: i64,
+    #[serde(default = "default_ranked_neighborhood_observed_at_weight")]
+    pub observed_at_weight: i64,
+    #[serde(default = "default_ranked_neighborhood_memory_node_boost")]
+    pub memory_node_boost: i64,
 }
 
 impl RankedNeighborhoodOptions {
@@ -404,6 +427,10 @@ impl RankedNeighborhoodOptions {
             scoring: NeighborhoodScoring::BreadthFirst,
             edge_kind: None,
             property_mode: PropertyMode::Full,
+            observed_at_now_unix: None,
+            observed_at_half_life_secs: DEFAULT_RANKED_NEIGHBORHOOD_OBSERVED_AT_HALF_LIFE_SECS,
+            observed_at_weight: DEFAULT_RANKED_NEIGHBORHOOD_OBSERVED_AT_WEIGHT,
+            memory_node_boost: DEFAULT_RANKED_NEIGHBORHOOD_MEMORY_NODE_BOOST,
         }
     }
 
@@ -419,6 +446,26 @@ impl RankedNeighborhoodOptions {
 
     pub fn with_property_mode(mut self, mode: PropertyMode) -> Self {
         self.property_mode = mode;
+        self
+    }
+
+    pub fn with_observed_at_now_unix(mut self, now_unix: i64) -> Self {
+        self.observed_at_now_unix = Some(now_unix);
+        self
+    }
+
+    pub fn with_observed_at_half_life_secs(mut self, half_life_secs: i64) -> Self {
+        self.observed_at_half_life_secs = half_life_secs.max(1);
+        self
+    }
+
+    pub fn with_observed_at_weight(mut self, weight: i64) -> Self {
+        self.observed_at_weight = weight.max(0);
+        self
+    }
+
+    pub fn with_memory_node_boost(mut self, boost: i64) -> Self {
+        self.memory_node_boost = boost.max(0);
         self
     }
 }

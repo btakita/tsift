@@ -12,13 +12,15 @@ pub use store::{
     shortest_path_using_outgoing,
 };
 pub use types::{
-    GRAPH_SEMANTIC_VECTOR_DEFAULT_MODEL, GRAPH_SEMANTIC_VECTOR_MODEL_PROPERTY_KEY,
-    GRAPH_SEMANTIC_VECTOR_PROPERTY_KEY, GraphEdge, GraphFreshness, GraphNode, GraphPagedSubgraph,
-    GraphPath, GraphProjection, GraphPropertyFilter, GraphProvenance, GraphQueryOptions,
-    GraphQueryPage, GraphSemanticCandidate, GraphSubgraph, NeighborhoodScoring, PropertyMode,
-    RankedNeighborhoodOptions, RankedNeighborhoodResult, SQLITE_GRAPH_SCHEMA_VERSION,
-    TerseGraphEdge, TerseGraphNode, TerseGraphSubgraph, TerseHealthScore, TerseSearchHit,
-    graph_edge_id, stable_graph_edge_id,
+    DEFAULT_RANKED_NEIGHBORHOOD_MEMORY_NODE_BOOST,
+    DEFAULT_RANKED_NEIGHBORHOOD_OBSERVED_AT_HALF_LIFE_SECS,
+    DEFAULT_RANKED_NEIGHBORHOOD_OBSERVED_AT_WEIGHT, GRAPH_SEMANTIC_VECTOR_DEFAULT_MODEL,
+    GRAPH_SEMANTIC_VECTOR_MODEL_PROPERTY_KEY, GRAPH_SEMANTIC_VECTOR_PROPERTY_KEY, GraphEdge,
+    GraphFreshness, GraphNode, GraphPagedSubgraph, GraphPath, GraphProjection, GraphPropertyFilter,
+    GraphProvenance, GraphQueryOptions, GraphQueryPage, GraphSemanticCandidate, GraphSubgraph,
+    NeighborhoodScoring, PropertyMode, RankedNeighborhoodOptions, RankedNeighborhoodResult,
+    SQLITE_GRAPH_SCHEMA_VERSION, TerseGraphEdge, TerseGraphNode, TerseGraphSubgraph,
+    TerseHealthScore, TerseSearchHit, graph_edge_id, stable_graph_edge_id,
 };
 
 impl GraphProjection {
@@ -425,6 +427,56 @@ mod tests {
     }
 
     #[test]
+    fn ranked_neighborhood_prefers_recent_memory_nodes_when_pruning() {
+        let store = ConvexGraphStore::new(MemoryConvexGraphClient::default());
+        store
+            .upsert_node(&GraphNode::new("center", "file", "center"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("aaa-code", "symbol", "code candidate"))
+            .unwrap();
+        store
+            .upsert_node(
+                &GraphNode::new("mmm-stale", "memory_event", "stale memory")
+                    .with_property("provider", "tsift-memory")
+                    .with_property("observed_at_unix", "1000"),
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                &GraphNode::new("zzz-fresh", "memory_event", "fresh memory")
+                    .with_property("provider", "tsift-memory")
+                    .with_property("observed_at_unix", "1995"),
+            )
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("center", "aaa-code", "mentions"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("center", "mmm-stale", "mentions"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("center", "zzz-fresh", "mentions"))
+            .unwrap();
+
+        let options = RankedNeighborhoodOptions::new(1, 1)
+            .with_observed_at_now_unix(2000)
+            .with_observed_at_half_life_secs(100);
+        let result = store
+            .ranked_neighborhood("center", &options)
+            .unwrap()
+            .unwrap();
+        let ids: Vec<_> = result.nodes.iter().map(|node| node.id.as_str()).collect();
+        assert!(ids.contains(&"center"));
+        assert!(
+            ids.contains(&"zzz-fresh"),
+            "fresh memory node should survive pruning: {ids:?}"
+        );
+        assert!(!ids.contains(&"aaa-code"));
+        assert!(!ids.contains(&"mmm-stale"));
+    }
+
+    #[test]
     fn ranked_neighborhood_includes_center_node() {
         let store = ConvexGraphStore::new(MemoryConvexGraphClient::default());
         store
@@ -548,5 +600,50 @@ mod tests {
             &BTreeMap::new(),
         );
         assert!(score_semantic > score_unknown);
+    }
+
+    #[test]
+    fn compute_ranked_neighborhood_score_applies_decay_and_memory_signal() {
+        let options = RankedNeighborhoodOptions::new(1, 1)
+            .with_observed_at_now_unix(2_000)
+            .with_observed_at_half_life_secs(100)
+            .with_observed_at_weight(24)
+            .with_memory_node_boost(18);
+        let context = store::NeighborhoodScoreContext::from_options(&options);
+        let code = GraphNode::new("code", "symbol", "code");
+        let stale_memory = GraphNode::new("stale", "memory_event", "stale")
+            .with_property("provider", "tsift-memory")
+            .with_property("observed_at_unix", "1000");
+        let fresh_memory = GraphNode::new("fresh", "memory_event", "fresh")
+            .with_property("provider", "tsift-memory")
+            .with_property("observed_at_unix", "1995");
+
+        let code_score = store::compute_ranked_neighborhood_score(
+            &options,
+            context,
+            1,
+            "mentions",
+            &code,
+            &BTreeMap::new(),
+        );
+        let stale_score = store::compute_ranked_neighborhood_score(
+            &options,
+            context,
+            1,
+            "mentions",
+            &stale_memory,
+            &BTreeMap::new(),
+        );
+        let fresh_score = store::compute_ranked_neighborhood_score(
+            &options,
+            context,
+            1,
+            "mentions",
+            &fresh_memory,
+            &BTreeMap::new(),
+        );
+
+        assert!(fresh_score > stale_score);
+        assert!(stale_score > code_score);
     }
 }

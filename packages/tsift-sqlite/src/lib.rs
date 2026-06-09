@@ -2921,7 +2921,7 @@ impl GraphStore for SqliteGraphStore {
         }
         let center = self.node(center_id)?.unwrap();
 
-        let score_expr = match options.scoring {
+        let base_score_expr = match options.scoring {
             tsift_core::NeighborhoodScoring::BreadthFirst => {
                 "MAX(0, 120 - (walk.depth * 18))".to_string()
             }
@@ -2952,6 +2952,51 @@ impl GraphStore for SqliteGraphStore {
                     .to_string()
             }
         };
+        let now_unix = options.observed_at_now_unix.unwrap_or_else(unix_now);
+        let observed_at_half_life_secs = options.observed_at_half_life_secs.max(1);
+        let observed_at_weight = options.observed_at_weight.max(0);
+        let memory_node_boost = options.memory_node_boost.max(0);
+        let observed_at_value = "COALESCE(\
+            CAST(json_extract(n_score.freshness_json, '$.observed_at_unix') AS INTEGER), \
+            CAST(json_extract(n_score.properties_json, '$.observed_at_unix') AS INTEGER), \
+            CAST(json_extract(n_score.properties_json, '$.max_observed_at_unix') AS INTEGER)\
+        )";
+        let observed_at_expr = if observed_at_weight == 0 {
+            "0".to_string()
+        } else {
+            format!(
+                "CASE \
+                 WHEN {observed_at_value} IS NULL THEN 0 \
+                 WHEN ({now_unix} - {observed_at_value}) < {observed_at_half_life_secs} THEN {observed_at_weight} \
+                 WHEN ({now_unix} - {observed_at_value}) < ({observed_at_half_life_secs} * 2) THEN {observed_at_weight} / 2 \
+                 WHEN ({now_unix} - {observed_at_value}) < ({observed_at_half_life_secs} * 4) THEN {observed_at_weight} / 4 \
+                 ELSE 0 END"
+            )
+        };
+        let confidence_value =
+            "CAST(json_extract(n_score.properties_json, '$.confidence') AS REAL)";
+        let memory_signal_expr = if memory_node_boost == 0 {
+            "0".to_string()
+        } else {
+            format!(
+                "(CASE \
+                  WHEN n_score.kind = 'memory_projection' THEN 0 \
+                  WHEN n_score.kind IN ('finding', 'decision', 'memory_event') THEN {memory_node_boost} \
+                  WHEN n_score.kind IN ('note', 'memory_session') THEN {memory_node_boost} / 2 \
+                  WHEN n_score.kind IN ('source_handle', 'semantic_concept', 'semantic_vector_handle') \
+                    AND json_extract(n_score.properties_json, '$.provider') = 'tsift-memory' THEN {memory_node_boost} / 2 \
+                  WHEN n_score.kind LIKE 'memory_%' THEN {memory_node_boost} \
+                  WHEN json_extract(n_score.properties_json, '$.provider') = 'tsift-memory' THEN {memory_node_boost} / 2 \
+                  ELSE 0 END) \
+                 + (CASE \
+                  WHEN json_extract(n_score.properties_json, '$.confidence') IS NULL THEN 0 \
+                  WHEN {confidence_value} <= 0.0 THEN 0 \
+                  WHEN {confidence_value} >= 1.0 THEN {memory_node_boost} \
+                  ELSE CAST(ROUND({memory_node_boost} * {confidence_value}) AS INTEGER) END)"
+            )
+        };
+        let score_expr =
+            format!("({base_score_expr}) + ({observed_at_expr}) + ({memory_signal_expr})");
 
         let use_degree_cache = matches!(
             options.scoring,
@@ -2959,27 +3004,28 @@ impl GraphStore for SqliteGraphStore {
         );
         let degree_cte = if use_degree_cache {
             "degree_cache AS ( \
-             SELECT id, (SELECT COUNT(*) FROM graph_edges e WHERE e.from_id = n.id OR e.to_id = n.id) AS degree \
-             FROM graph_nodes n), "
+            SELECT id, (SELECT COUNT(*) FROM graph_edges e WHERE e.from_id = n.id OR e.to_id = n.id) AS degree \
+            FROM graph_nodes n), "
         } else {
             ""
         };
         let mut sql = format!(
             r#"
-            WITH {degree_cte}RECURSIVE walk(id, depth, edge_kind, score) AS (
-                SELECT ?, 0, '', ?
-                UNION
-                SELECT e.to_id, walk.depth + 1, e.kind,
-            "#,
+WITH RECURSIVE {degree_cte}walk(id, depth, edge_kind, score) AS (
+SELECT ?, 0, '', ?
+UNION
+SELECT e.to_id, walk.depth + 1, e.kind,
+"#,
         );
         sql.push_str(&format!("    {}\n", score_expr));
         sql.push_str(
             r#"
-                FROM walk
-                JOIN graph_edges e INDEXED BY idx_graph_edges_from_kind
-                    ON e.from_id = walk.id
-                WHERE walk.depth < ?
-            "#,
+FROM walk
+JOIN graph_edges e INDEXED BY idx_graph_edges_from_kind
+ON e.from_id = walk.id
+JOIN graph_nodes n_score ON n_score.id = e.to_id
+WHERE walk.depth < ?
+"#,
         );
         let mut values = vec![
             Value::Text(center_id.to_string()),
@@ -2993,12 +3039,12 @@ impl GraphStore for SqliteGraphStore {
         sql.push_str(
             r#"
             ),
-            scored_nodes AS (
-                SELECT walk.id, walk.score,
-                    n.kind AS node_kind, n.label, n.properties_json, n.provenance_json, n.freshness_json
-                FROM walk
-                JOIN graph_nodes n ON n.id = walk.id
-                GROUP BY walk.id
+scored_nodes AS (
+SELECT walk.id, MAX(walk.score) AS score,
+n.kind AS node_kind, n.label, n.properties_json, n.provenance_json, n.freshness_json
+FROM walk
+JOIN graph_nodes n ON n.id = walk.id
+GROUP BY walk.id
             ),
             ranked AS (
                 SELECT id, score, node_kind, label, properties_json, provenance_json, freshness_json
@@ -3038,9 +3084,9 @@ impl GraphStore for SqliteGraphStore {
             FROM graph_edges e
             WHERE EXISTS (SELECT 1 FROM kept k WHERE k.id = e.from_id)
               AND EXISTS (SELECT 1 FROM kept k2 WHERE k2.id = e.to_id)
-            "#,
+"#,
         );
-        values.push(Value::Integer(options.max_nodes as i64));
+        values.push(Value::Integer(options.max_nodes.saturating_add(1) as i64));
 
         let mut stmt = self.conn.prepare(&sql)?;
         let mut nodes = vec![center.clone()];
@@ -3963,6 +4009,56 @@ mod tests {
         }
 
         assert_crud_contract(&SqliteGraphStore::in_memory().unwrap());
+    }
+
+    #[test]
+    fn sqlite_ranked_neighborhood_prefers_recent_memory_nodes_when_pruning() {
+        let store = SqliteGraphStore::in_memory().unwrap();
+        store
+            .upsert_node(&GraphNode::new("center", "file", "center"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("aaa-code", "symbol", "code candidate"))
+            .unwrap();
+        store
+            .upsert_node(
+                &GraphNode::new("mmm-stale", "memory_event", "stale memory")
+                    .with_property("provider", "tsift-memory")
+                    .with_property("observed_at_unix", "1000"),
+            )
+            .unwrap();
+        store
+            .upsert_node(
+                &GraphNode::new("zzz-fresh", "memory_event", "fresh memory")
+                    .with_property("provider", "tsift-memory")
+                    .with_property("observed_at_unix", "1995"),
+            )
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("center", "aaa-code", "mentions"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("center", "mmm-stale", "mentions"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("center", "zzz-fresh", "mentions"))
+            .unwrap();
+
+        let options = RankedNeighborhoodOptions::new(1, 1)
+            .with_observed_at_now_unix(2000)
+            .with_observed_at_half_life_secs(100);
+        let result = store
+            .ranked_neighborhood("center", &options)
+            .unwrap()
+            .unwrap();
+        let ids: Vec<_> = result.nodes.iter().map(|node| node.id.as_str()).collect();
+        assert!(ids.contains(&"center"));
+        assert!(
+            ids.contains(&"zzz-fresh"),
+            "fresh memory node should survive pruning: {ids:?}"
+        );
+        assert!(!ids.contains(&"aaa-code"));
+        assert!(!ids.contains(&"mmm-stale"));
     }
 
     #[test]

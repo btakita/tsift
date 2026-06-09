@@ -1,6 +1,7 @@
 use anyhow::Result;
 use lazily::{Context as LazyContext, SlotHandle};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::types::*;
 
@@ -64,6 +65,113 @@ pub(crate) fn compute_neighborhood_score(
             depth_score.saturating_add(degree_bonus)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NeighborhoodScoreContext {
+    pub now_unix: i64,
+}
+
+impl NeighborhoodScoreContext {
+    pub(crate) fn from_options(options: &RankedNeighborhoodOptions) -> Self {
+        Self {
+            now_unix: options.observed_at_now_unix.unwrap_or_else(unix_now),
+        }
+    }
+}
+
+pub(crate) fn compute_ranked_neighborhood_score(
+    options: &RankedNeighborhoodOptions,
+    context: NeighborhoodScoreContext,
+    depth: usize,
+    edge_kind: &str,
+    node: &GraphNode,
+    degree_map: &BTreeMap<String, usize>,
+) -> i64 {
+    compute_neighborhood_score(&options.scoring, depth, edge_kind, node, degree_map)
+        .saturating_add(observed_at_decay_bonus(
+            node,
+            context.now_unix,
+            options.observed_at_half_life_secs,
+            options.observed_at_weight,
+        ))
+        .saturating_add(memory_node_signal_bonus(node, options.memory_node_boost))
+}
+
+pub(crate) fn graph_node_observed_at_unix(node: &GraphNode) -> Option<i64> {
+    node.freshness
+        .as_ref()
+        .and_then(|freshness| freshness.observed_at_unix)
+        .or_else(|| graph_node_i64_property(node, "observed_at_unix"))
+        .or_else(|| graph_node_i64_property(node, "max_observed_at_unix"))
+}
+
+pub(crate) fn observed_at_decay_bonus(
+    node: &GraphNode,
+    now_unix: i64,
+    half_life_secs: i64,
+    weight: i64,
+) -> i64 {
+    if weight <= 0 {
+        return 0;
+    }
+    let Some(observed_at_unix) = graph_node_observed_at_unix(node) else {
+        return 0;
+    };
+    let half_life_secs = half_life_secs.max(1);
+    let age_secs = now_unix.saturating_sub(observed_at_unix).max(0);
+    match age_secs / half_life_secs {
+        0 => weight,
+        1 => weight / 2,
+        2 | 3 => weight / 4,
+        _ => 0,
+    }
+}
+
+pub(crate) fn memory_node_signal_bonus(node: &GraphNode, configured_boost: i64) -> i64 {
+    if configured_boost <= 0 {
+        return 0;
+    }
+    let provider_memory = node
+        .properties
+        .get("provider")
+        .is_some_and(|provider| provider == "tsift-memory");
+    let authored_kind = matches!(node.kind.as_str(), "finding" | "decision" | "note");
+    let memory_kind = node.kind.starts_with("memory_") || provider_memory || authored_kind;
+    if !memory_kind || node.kind == "memory_projection" {
+        return 0;
+    }
+
+    let base = match node.kind.as_str() {
+        "finding" | "decision" | "memory_event" => configured_boost,
+        "note" | "memory_session" => configured_boost / 2,
+        "source_handle" | "semantic_concept" | "semantic_vector_handle" if provider_memory => {
+            configured_boost / 2
+        }
+        _ if provider_memory => configured_boost / 2,
+        _ => configured_boost,
+    };
+
+    base.saturating_add(confidence_bonus(node, configured_boost))
+}
+
+fn confidence_bonus(node: &GraphNode, configured_boost: i64) -> i64 {
+    node.properties
+        .get("confidence")
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(|confidence| (configured_boost as f64 * confidence.clamp(0.0, 1.0)).round() as i64)
+        .unwrap_or(0)
+}
+
+fn graph_node_i64_property(node: &GraphNode, key: &str) -> Option<i64> {
+    node.properties.get(key)?.parse().ok()
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 #[derive(Clone)]
@@ -551,6 +659,7 @@ pub trait GraphStore {
             ctx.slot(move |_| Ok(initial.clone()));
         let mut state = ctx.get(&layer).map_err(graph_cache_error)?;
         let options = options.clone();
+        let score_context = NeighborhoodScoreContext::from_options(&options);
 
         while let Some(entry) = state.queue.peek().cloned() {
             let fetched = if entry.depth < options.depth {
@@ -573,6 +682,7 @@ pub trait GraphStore {
                 let Some(fetched) = &fetched else {
                     return Ok(state);
                 };
+                let mut candidates = Vec::new();
                 for edge in &fetched.edges {
                     let edge_key = (edge.from_id.clone(), edge.kind.clone(), edge.to_id.clone());
                     state.edges.entry(edge_key).or_insert_with(|| edge.clone());
@@ -581,25 +691,32 @@ pub trait GraphStore {
                     if state.seen.contains(&edge.to_id) {
                         continue;
                     }
-                    state.seen.insert(edge.to_id.clone());
-                    state.total_discovered += 1;
                     let Some(neighbor) = fetched.neighbor_nodes.get(&edge.to_id) else {
                         continue;
                     };
-                    if state.nodes.len() > options.max_nodes {
-                        state.pruned_count += 1;
-                        continue;
-                    }
-                    let score = compute_neighborhood_score(
-                        &options.scoring,
+                    let score = compute_ranked_neighborhood_score(
+                        &options,
+                        score_context,
                         entry.depth + 1,
                         &edge.kind,
                         neighbor,
                         &state.degree_map,
                     );
-                    state.nodes.insert(edge.to_id.clone(), neighbor.clone());
+                    candidates.push((edge.to_id.clone(), neighbor.clone(), score));
+                }
+                candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+                for (to_id, neighbor, score) in candidates {
+                    if !state.seen.insert(to_id.clone()) {
+                        continue;
+                    }
+                    state.total_discovered += 1;
+                    if state.nodes.len() > options.max_nodes {
+                        state.pruned_count += 1;
+                        continue;
+                    }
+                    state.nodes.insert(to_id.clone(), neighbor);
                     state.queue.push(ScoredQueueEntry {
-                        id: edge.to_id.clone(),
+                        id: to_id,
                         depth: entry.depth + 1,
                         score,
                     });

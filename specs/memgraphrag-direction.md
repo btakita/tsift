@@ -99,9 +99,11 @@ ranking.
 - `graph-db related` semantic seeding now uses `GraphStore::semantic_top_candidates`;
   SQLite serves this from `graph_node_semantic_vectors` typed blob rows instead of
   scanning/parsing every semantic node property during retrieval.
-
-Still to do: fold this into `#rankdefault` (`ranked_neighborhood`) so memory and
-code share one ranking function once memory nodes are in the graph (below).
+- `#rankdefault` / `#58p8` folds observed-at freshness and memory-node boosts into
+  `GraphStore::ranked_neighborhood`, so projected memory nodes, authored
+  finding/decision/note nodes, and code symbols prune through one graph-ranking
+  path. The default store path now sorts fetched sibling candidates by this score
+  before applying `max_nodes`; SQLite mirrors the score in SQL.
 
 Performance baseline: `fixtures/memgraphrag-performance-history.json` records the
 canonical four-surface latency sample shape for MemGraphRAG work. Running
@@ -122,9 +124,9 @@ wiring is now in place:
   `.tsift/graph.db` so memory nodes are queryable alongside code symbols via the
   same `graph-db` retrieval surface (`packages/tsift-cli/src/commands/memory.rs`,
   `tsift_memgraphrag::project_memory_into_graph`).
-
-Remaining for full unification: decay-aware ranking over the merged graph
-(`#rankdefault`).
+- `GraphStore::ranked_neighborhood` now consumes the projected memory timestamps
+  and node-kind/provider signals directly, completing the decay-aware merged graph
+  ranking path for bounded neighborhoods.
 
 ### 4. Semantic Ontology Graph layer — `#memgraphrag-ont` ✅ implemented
 
