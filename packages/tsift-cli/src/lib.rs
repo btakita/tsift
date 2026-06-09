@@ -28233,6 +28233,44 @@ tier = "private"
     }
 
     #[test]
+    fn cli_parses_memory_project_graph_read_policy() {
+        let cli = parse_cli([
+            "tsift",
+            "memory",
+            "project-graph",
+            ".",
+            "--read-policy",
+            "query-relevant",
+            "--query",
+            "semantic memory",
+            "--limit",
+            "7",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::Memory {
+                command:
+                    crate::cli::MemoryCommand::ProjectGraph {
+                        read_policy,
+                        query,
+                        limit,
+                        json,
+                        ..
+                    },
+            }) => {
+                assert_eq!(
+                    read_policy,
+                    crate::cli::MemoryProjectReadPolicy::QueryRelevant
+                );
+                assert_eq!(query.as_deref(), Some("semantic memory"));
+                assert_eq!(limit, 7);
+                assert!(json);
+            }
+            _ => panic!("expected memory project-graph command"),
+        }
+    }
+
+    #[test]
     fn cli_locks_accepts_scope_flag() {
         let cli = parse_cli(["tsift", "locks", "--scope", "alpha"]);
         match cli.command {

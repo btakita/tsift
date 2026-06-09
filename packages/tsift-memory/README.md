@@ -6,7 +6,11 @@ This crate owns the stable memory schema, budgeted capture contracts, and migrat
 
 Current surfaces:
 
-- `MemoryStore` initializes `.tsift/memory.db` with schema version `1`.
+- `MemoryStore` initializes `.tsift/memory.db` with schema version `2`.
+- `read_memory_events_with_policy` reads bounded memory slices with explicit
+  `recent_first`, `oldest_first`, or `query_relevant` policies, and
+  `memory_read_watermark` hashes the selected event set plus memory-table high
+  water marks for projection freshness.
 - `plan_capture_handoff` estimates tokens before model calls and reports split/defer decisions.
 - `guard_memory_handoff` fails closed on oversized raw payloads and emits digest/context replacements plus retryable chunk commands.
 - `inspect_claude_mem` and `read_claude_mem_events` inspect the observed `claude-mem` SQLite schema without writing to it.

@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use tsift_core::{GraphEdge, GraphFreshness, GraphNode, GraphProjection, GraphProvenance};
 use tsift_memory::{
-    DEFAULT_MEMORY_CANDIDATE_LIMIT, MemoryEvent, estimate_tokens, read_memory_event_candidates,
-    read_memory_events,
+    DEFAULT_MEMORY_CANDIDATE_LIMIT, MemoryEvent, MemoryReadPolicy, MemoryReadWatermark,
+    estimate_tokens, memory_read_watermark, read_memory_event_candidates, read_memory_events,
+    read_memory_events_with_policy,
 };
 use tsift_sqlite::SqliteGraphStore;
 
@@ -15,6 +16,7 @@ pub const SEMANTIC_EMBEDDING_MODEL: &str = "tsift-local-hash-v1";
 const SEMANTIC_EMBEDDING_DIM: usize = 32;
 const DEFAULT_TRAVERSAL_MEMORY_EVENT_LIMIT: usize = 600;
 const MEMORY_RANK_CANDIDATE_MULTIPLIER: usize = 8;
+const MEMORY_PROJECTION_NODE_ID: &str = "memory_projection:tsift-memory";
 
 pub fn memory_graph_node_kinds() -> Vec<&'static str> {
     vec![
@@ -24,6 +26,7 @@ pub fn memory_graph_node_kinds() -> Vec<&'static str> {
         "source_handle",
         "semantic_concept",
         "semantic_vector_handle",
+        "memory_projection",
     ]
 }
 
@@ -239,6 +242,10 @@ pub struct MemoryGraphProjectReport {
     pub events_projected: usize,
     pub nodes_upserted: usize,
     pub edges_upserted: usize,
+    pub read_policy: MemoryReadPolicy,
+    pub source_watermark: String,
+    pub content_hash: String,
+    pub events_available: usize,
 }
 
 pub fn project_memory_into_graph(
@@ -246,8 +253,19 @@ pub fn project_memory_into_graph(
     graph_db: &Path,
     limit: usize,
 ) -> Result<MemoryGraphProjectReport> {
-    let events = read_memory_events(memory_db, limit)?;
-    let projection = project_memory_events(&events);
+    project_memory_into_graph_with_policy(memory_db, graph_db, limit, &MemoryReadPolicy::default())
+}
+
+pub fn project_memory_into_graph_with_policy(
+    memory_db: &Path,
+    graph_db: &Path,
+    limit: usize,
+    read_policy: &MemoryReadPolicy,
+) -> Result<MemoryGraphProjectReport> {
+    let events = read_memory_events_with_policy(memory_db, read_policy, limit)?;
+    let watermark = memory_read_watermark(memory_db, read_policy, limit, &events)?;
+    let mut projection = project_memory_events(&events);
+    append_memory_projection_metadata(&mut projection, &watermark)?;
     let nodes_upserted = projection.nodes.len();
     let edges_upserted = projection.edges.len();
     if let Some(parent) = graph_db.parent() {
@@ -261,7 +279,52 @@ pub fn project_memory_into_graph(
         events_projected: events.len(),
         nodes_upserted,
         edges_upserted,
+        read_policy: read_policy.clone(),
+        source_watermark: watermark.source_watermark,
+        content_hash: watermark.content_hash,
+        events_available: watermark.events_available,
     })
+}
+
+fn append_memory_projection_metadata(
+    projection: &mut GraphProjection,
+    watermark: &MemoryReadWatermark,
+) -> Result<()> {
+    let mut node = GraphNode::new(
+        MEMORY_PROJECTION_NODE_ID,
+        "memory_projection",
+        "tsift-memory graph projection",
+    )
+    .with_property("handle", MEMORY_PROJECTION_NODE_ID)
+    .with_property("ref_id", "tsift-memory")
+    .with_property("provider", "tsift-memory")
+    .with_property("read_policy", watermark.policy.order.as_str())
+    .with_property("limit", watermark.limit.to_string())
+    .with_property("events_read", watermark.events_read.to_string())
+    .with_property("events_available", watermark.events_available.to_string())
+    .with_property("source_watermark", watermark.source_watermark.clone())
+    .with_property("content_hash", watermark.content_hash.clone())
+    .with_provenance(
+        GraphProvenance::new("tsift-memory", "memory_events")
+            .with_content_hash(watermark.content_hash.clone()),
+    )
+    .with_freshness(GraphFreshness::content_hash(
+        watermark.source_watermark.clone(),
+    ));
+    if let Some(query) = &watermark.policy.query {
+        node = node.with_property("query", query.clone());
+    }
+    if let Some(max_rowid) = watermark.max_rowid {
+        node = node.with_property("max_rowid", max_rowid.to_string());
+    }
+    if let Some(max_observed_at_unix) = watermark.max_observed_at_unix {
+        node = node.with_property("max_observed_at_unix", max_observed_at_unix.to_string());
+    }
+    if let Some(max_created_at_unix) = watermark.max_created_at_unix {
+        node = node.with_property("max_created_at_unix", max_created_at_unix.to_string());
+    }
+    projection.nodes.push(node_with_content_freshness(node)?);
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -705,7 +768,7 @@ mod tests {
     }
 
     #[test]
-fn rank_memory_events_keeps_lexical_hits_without_timestamp() {
+    fn rank_memory_events_keeps_lexical_hits_without_timestamp() {
         let now = 1_700_000_000;
         let event = MemoryEvent::new(
             MemoryEventKind::ResponseSummary,
@@ -726,76 +789,84 @@ fn rank_memory_events_keeps_lexical_hits_without_timestamp() {
             config,
             10,
         );
-    assert_eq!(ranked[0].event.source_ref, event.source_ref);
-}
+        assert_eq!(ranked[0].event.source_ref, event.source_ref);
+    }
 
-#[test]
-fn rank_memory_event_candidates_bounds_db_candidates_before_scoring() {
-    let dir = TempDir::new().unwrap();
-    let memory_db = default_memory_db_path(dir.path());
-    std::fs::create_dir_all(memory_db.parent().unwrap()).unwrap();
-    let store = MemoryStore::open_or_create(&memory_db).unwrap();
-    let now = 1_700_000_000;
-    for index in 0..40 {
+    #[test]
+    fn rank_memory_event_candidates_bounds_db_candidates_before_scoring() {
+        let dir = TempDir::new().unwrap();
+        let memory_db = default_memory_db_path(dir.path());
+        std::fs::create_dir_all(memory_db.parent().unwrap()).unwrap();
+        let store = MemoryStore::open_or_create(&memory_db).unwrap();
+        let now = 1_700_000_000;
+        for index in 0..40 {
+            store
+                .insert_event(
+                    &MemoryEvent::new(
+                        MemoryEventKind::ResponseSummary,
+                        format!("old-{index}"),
+                        format!("ordinary memory event {index}"),
+                    )
+                    .with_observed_at_unix(now - 20_000 - index),
+                )
+                .unwrap();
+        }
         store
             .insert_event(
                 &MemoryEvent::new(
                     MemoryEventKind::ResponseSummary,
-                    format!("old-{index}"),
-                    format!("ordinary memory event {index}"),
+                    "needle",
+                    "semantic needle graph retrieval",
                 )
-                .with_observed_at_unix(now - 20_000 - index),
+                .with_observed_at_unix(now - 30_000),
             )
             .unwrap();
+        store
+            .insert_event(
+                &MemoryEvent::new(
+                    MemoryEventKind::ResponseSummary,
+                    "recent",
+                    "fresh unrelated release note",
+                )
+                .with_observed_at_unix(now - 10),
+            )
+            .unwrap();
+
+        assert_eq!(memory_rank_candidate_limit(2), 16);
+        let ranked = rank_memory_event_candidates(
+            &memory_db,
+            "semantic needle",
+            now,
+            MemoryDecayConfig::default(),
+            2,
+        )
+        .unwrap();
+        assert_eq!(ranked.len(), 2);
+        assert!(
+            ranked
+                .iter()
+                .any(|scored| scored.event.source_ref == "needle")
+        );
+        assert!(
+            ranked
+                .iter()
+                .any(|scored| scored.event.source_ref == "recent")
+        );
     }
-    store
-        .insert_event(
-            &MemoryEvent::new(
-                MemoryEventKind::ResponseSummary,
-                "needle",
-                "semantic needle graph retrieval",
-            )
-            .with_observed_at_unix(now - 30_000),
-        )
-        .unwrap();
-    store
-        .insert_event(
-            &MemoryEvent::new(
-                MemoryEventKind::ResponseSummary,
-                "recent",
-                "fresh unrelated release note",
-            )
-            .with_observed_at_unix(now - 10),
-        )
-        .unwrap();
 
-    assert_eq!(memory_rank_candidate_limit(2), 16);
-    let ranked = rank_memory_event_candidates(
-        &memory_db,
-        "semantic needle",
-        now,
-        MemoryDecayConfig::default(),
-        2,
-    )
-    .unwrap();
-    assert_eq!(ranked.len(), 2);
-    assert!(ranked.iter().any(|scored| scored.event.source_ref == "needle"));
-    assert!(ranked.iter().any(|scored| scored.event.source_ref == "recent"));
-}
-
-#[test]
-fn plan_memory_query_carries_default_decay_config() {
-    let plan = plan_memory_query("graph rag", 5, 1500).unwrap();
-    assert_eq!(plan.decay, MemoryDecayConfig::default());
-    assert_eq!(plan.candidate_limit, 40);
-    assert!(
-        plan.output_contract
-            .iter()
-            .any(|contract| contract.contains("candidate set capped before ranking"))
-    );
-    assert!(
-        plan.next_commands
-            .iter()
+    #[test]
+    fn plan_memory_query_carries_default_decay_config() {
+        let plan = plan_memory_query("graph rag", 5, 1500).unwrap();
+        assert_eq!(plan.decay, MemoryDecayConfig::default());
+        assert_eq!(plan.candidate_limit, 40);
+        assert!(
+            plan.output_contract
+                .iter()
+                .any(|contract| contract.contains("candidate set capped before ranking"))
+        );
+        assert!(
+            plan.next_commands
+                .iter()
                 .any(|cmd| cmd.contains("project-graph"))
         );
     }

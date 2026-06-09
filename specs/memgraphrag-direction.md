@@ -86,6 +86,13 @@ plus `COALESCE(observed_at_unix, created_at_unix)` / `created_at_unix` indexes t
 fetch FTS hits and a recent fallback into a deduplicated, bounded candidate set.
 `rank_memory_event_candidates(memory_db, query, now_unix, config, limit)` ranks
 only that candidate set instead of scanning every stored memory event.
+- Memory graph projection has explicit bounded read policies:
+  `recent-first`, `oldest-first`, and `query-relevant` (FTS/recent candidate
+  retrieval, requiring a non-empty query). The selected event slice is hashed into
+  a memory source watermark/content hash, reported by `tsift memory project-graph`
+  and materialized as a `memory_projection` graph node. Repeated SQLite upsert
+  projections skip unchanged row hashes, so memory projection refreshes no longer
+  rewrite unchanged graph rows or materialized property/vector tables.
 - `MemoryQueryPlan` now carries the `decay` config so `tsift memory query-plan`
 documents the ranking contract, including the candidate limit used before
 ranking.

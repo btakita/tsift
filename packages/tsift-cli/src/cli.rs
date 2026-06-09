@@ -1196,6 +1196,12 @@ pub enum MemoryCommand {
         /// Maximum memory events to project
         #[arg(long, default_value = "5000")]
         limit: usize,
+        /// Memory read policy for the bounded projection slice
+        #[arg(long, value_enum, default_value_t = MemoryProjectReadPolicy::RecentFirst)]
+        read_policy: MemoryProjectReadPolicy,
+        /// Query text required when --read-policy=query-relevant
+        #[arg(long)]
+        query: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -1282,6 +1288,13 @@ impl MemoryCommand {
             | Self::FindingAdd { json, .. } => *json,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum MemoryProjectReadPolicy {
+    RecentFirst,
+    OldestFirst,
+    QueryRelevant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

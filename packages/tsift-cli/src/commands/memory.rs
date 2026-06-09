@@ -1,4 +1,4 @@
-use crate::cli::MemoryCommand;
+use crate::cli::{MemoryCommand, MemoryProjectReadPolicy};
 use crate::output::{OutputFormat, ToolEnvelopeSummary};
 use crate::{envelope_metric, print_json_or_envelope, to_json_schema};
 use anyhow::{Context, Result, bail};
@@ -8,14 +8,14 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tsift_memgraphrag::{
     MemoryQueryPlan, derive_memory_ontology_graph, memory_graph_node_kinds, plan_memory_query,
-    project_memory_into_graph,
+    project_memory_into_graph_with_policy,
 };
 use tsift_memory::{
-    ClaudeMemImportPlan, MemoryBudget, MemoryBudgetGuardInput, MemoryEvent, MemoryEventKind,
-    MemoryHandoffPlan, MemoryStore, agent_doc_closeout_events,
-    agent_doc_hook_contract, default_claude_mem_db_path, default_memory_db_path,
-    AuthoredNodeKind, authored_node_projection, guard_memory_handoff, import_claude_mem,
-    inspect_claude_mem, memory_schema_sql, plan_capture_handoff,
+    AuthoredNodeKind, ClaudeMemImportPlan, MemoryBudget, MemoryBudgetGuardInput, MemoryEvent,
+    MemoryEventKind, MemoryHandoffPlan, MemoryReadPolicy, MemoryStore, agent_doc_closeout_events,
+    agent_doc_hook_contract, authored_node_projection, default_claude_mem_db_path,
+    default_memory_db_path, guard_memory_handoff, import_claude_mem, inspect_claude_mem,
+    memory_schema_sql, plan_capture_handoff,
 };
 use tsift_sqlite::{GraphStore, SqliteGraphStore};
 
@@ -168,11 +168,20 @@ pub(crate) fn cmd_memory(command: MemoryCommand, format: OutputFormat) -> Result
             path,
             graph_db,
             limit,
+            read_policy,
+            query,
             ..
-        } => cmd_memory_project_graph(&path, graph_db.as_deref(), limit, format),
-        MemoryCommand::OntologyGraph {
-            path, graph_db, ..
-        } => cmd_memory_ontology_graph(&path, graph_db.as_deref(), format),
+        } => cmd_memory_project_graph(
+            &path,
+            graph_db.as_deref(),
+            limit,
+            read_policy,
+            query.as_deref(),
+            format,
+        ),
+        MemoryCommand::OntologyGraph { path, graph_db, .. } => {
+            cmd_memory_ontology_graph(&path, graph_db.as_deref(), format)
+        }
         MemoryCommand::Findings {
             path,
             kind,
@@ -678,6 +687,10 @@ struct MemoryProjectGraphReport {
     contract_version: String,
     memory_db: String,
     graph_db: String,
+    read_policy: MemoryReadPolicy,
+    source_watermark: String,
+    content_hash: String,
+    events_available: usize,
     events_projected: usize,
     nodes_upserted: usize,
     edges_upserted: usize,
@@ -689,13 +702,26 @@ fn cmd_memory_project_graph(
     path: &Path,
     graph_db_override: Option<&Path>,
     limit: usize,
+    policy_arg: MemoryProjectReadPolicy,
+    query: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
     let memory_db = default_memory_db_path(path);
     let graph_db = graph_db_override
         .map(Path::to_path_buf)
         .unwrap_or_else(|| crate::graph_substrate_db_path(path, None));
-    let graph_report = project_memory_into_graph(&memory_db, &graph_db, limit)?;
+    let read_policy = match policy_arg {
+        MemoryProjectReadPolicy::RecentFirst => MemoryReadPolicy::recent_first(),
+        MemoryProjectReadPolicy::OldestFirst => MemoryReadPolicy::oldest_first(),
+        MemoryProjectReadPolicy::QueryRelevant => {
+            let Some(query) = query.filter(|value| !value.trim().is_empty()) else {
+                bail!("memory project-graph --read-policy=query-relevant requires --query");
+            };
+            MemoryReadPolicy::query_relevant(query)
+        }
+    };
+    let graph_report =
+        project_memory_into_graph_with_policy(&memory_db, &graph_db, limit, &read_policy)?;
 
     let next_commands = vec![
         "tsift graph-db --path . --json related '<query>'".to_string(),
@@ -705,6 +731,10 @@ fn cmd_memory_project_graph(
         contract_version: tsift_memory::MEMORY_CONTRACT_VERSION.to_string(),
         memory_db: memory_db.display().to_string(),
         graph_db: graph_db.display().to_string(),
+        read_policy: graph_report.read_policy,
+        source_watermark: graph_report.source_watermark,
+        content_hash: graph_report.content_hash,
+        events_available: graph_report.events_available,
         events_projected: graph_report.events_projected,
         nodes_upserted: graph_report.nodes_upserted,
         edges_upserted: graph_report.edges_upserted,
@@ -718,6 +748,7 @@ fn cmd_memory_project_graph(
         ToolEnvelopeSummary {
             text: "memory events projected into shared graph store".to_string(),
             metrics: vec![
+                envelope_metric("available", graph_report.events_available),
                 envelope_metric("events", graph_report.events_projected),
                 envelope_metric("nodes", graph_report.nodes_upserted),
                 envelope_metric("edges", graph_report.edges_upserted),
@@ -943,7 +974,11 @@ fn add_authored_node_to_graph(
         projection.edges.clear();
     }
     store.upsert_projection(&projection)?;
-    Ok((anchor_resolved, projection.nodes.len(), projection.edges.len()))
+    Ok((
+        anchor_resolved,
+        projection.nodes.len(),
+        projection.edges.len(),
+    ))
 }
 
 /// Add an authored finding/decision/note node anchored to a symbol handle (#trt1).
@@ -995,7 +1030,10 @@ fn cmd_memory_finding_add(
         &format,
         "finding-add",
         ToolEnvelopeSummary {
-            text: format!("authored {} node anchored to {anchor}", authored_kind.as_str()),
+            text: format!(
+                "authored {} node anchored to {anchor}",
+                authored_kind.as_str()
+            ),
             metrics: vec![
                 envelope_metric("nodes", nodes_upserted),
                 envelope_metric("edges", edges_upserted),
@@ -1032,7 +1070,10 @@ fn print_memory_report<T: Serialize>(
     if format.json_output {
         print_json_or_envelope(report, format, "memory", view, summary, false, follow_up)
     } else {
-        println!("{}", to_json_schema(report, format.pretty, false, false, false)?);
+        println!(
+            "{}",
+            to_json_schema(report, format.pretty, false, false, false)?
+        );
         Ok(())
     }
 }
@@ -1075,11 +1116,16 @@ mod tests {
         store.insert_event(&response).unwrap();
 
         let graph_db = root.join(".tsift").join("graph.db");
-        let report = project_memory_into_graph(&memory_db, &graph_db, 100).unwrap();
+        let report =
+            tsift_memgraphrag::project_memory_into_graph(&memory_db, &graph_db, 100).unwrap();
         assert_eq!(report.events_projected, 2);
+        assert_eq!(report.events_available, 2);
+        assert_eq!(report.read_policy.order.as_str(), "recent_first");
+        assert!(!report.source_watermark.is_empty());
+        assert!(!report.content_hash.is_empty());
         assert!(
-            report.nodes_upserted >= 3,
-            "two events + one session node, got {}",
+            report.nodes_upserted >= 4,
+            "two events + one session node + projection metadata, got {}",
             report.nodes_upserted
         );
         assert!(
@@ -1106,6 +1152,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sessions, 1);
+        let projection_metadata: (String, String, String) = conn
+            .query_row(
+                "SELECT json_extract(properties_json, '$.read_policy'),
+                        json_extract(properties_json, '$.source_watermark'),
+                        json_extract(properties_json, '$.content_hash')
+                 FROM graph_nodes
+                 WHERE id = 'memory_projection:tsift-memory'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(projection_metadata.0, "recent_first");
+        assert_eq!(projection_metadata.1, report.source_watermark);
+        assert_eq!(projection_metadata.2, report.content_hash);
     }
 
     #[test]
@@ -1240,9 +1300,15 @@ mod tests {
 
         // Missing graph db -> empty, no error.
         assert!(
-            query_findings(dir.path().join("missing.db").as_path(), "all", None, None, 5)
-                .unwrap()
-                .is_empty()
+            query_findings(
+                dir.path().join("missing.db").as_path(),
+                "all",
+                None,
+                None,
+                5
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 }

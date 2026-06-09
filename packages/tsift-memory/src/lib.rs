@@ -186,6 +186,101 @@ pub fn estimate_tokens(text: &str) -> usize {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum MemoryReadOrder {
+    OldestFirst,
+    RecentFirst,
+    QueryRelevant,
+}
+
+impl MemoryReadOrder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OldestFirst => "oldest_first",
+            Self::RecentFirst => "recent_first",
+            Self::QueryRelevant => "query_relevant",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryReadPolicy {
+    pub order: MemoryReadOrder,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+}
+
+impl MemoryReadPolicy {
+    pub fn oldest_first() -> Self {
+        Self {
+            order: MemoryReadOrder::OldestFirst,
+            query: None,
+        }
+    }
+
+    pub fn recent_first() -> Self {
+        Self {
+            order: MemoryReadOrder::RecentFirst,
+            query: None,
+        }
+    }
+
+    pub fn query_relevant(query: impl Into<String>) -> Self {
+        Self {
+            order: MemoryReadOrder::QueryRelevant,
+            query: Some(query.into()),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.order == MemoryReadOrder::QueryRelevant
+            && self
+                .query
+                .as_deref()
+                .is_none_or(|query| query.trim().is_empty())
+        {
+            bail!("query_relevant memory read policy requires a non-empty query");
+        }
+        Ok(())
+    }
+}
+
+impl Default for MemoryReadPolicy {
+    fn default() -> Self {
+        Self::recent_first()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryReadWatermark {
+    pub policy: MemoryReadPolicy,
+    pub limit: usize,
+    pub events_read: usize,
+    pub events_available: usize,
+    pub max_rowid: Option<i64>,
+    pub min_observed_at_unix: Option<i64>,
+    pub max_observed_at_unix: Option<i64>,
+    pub max_created_at_unix: Option<i64>,
+    pub first_event_id: Option<String>,
+    pub last_event_id: Option<String>,
+    pub source_watermark: String,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemorySourceStats {
+    events_available: usize,
+    max_rowid: Option<i64>,
+    max_observed_at_unix: Option<i64>,
+    max_created_at_unix: Option<i64>,
+}
+
+fn memory_content_hash<T: Serialize>(value: &T) -> Result<String> {
+    let bytes = serde_json::to_vec(value)?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MemoryEventKind {
     PromptTarget,
     ToolCall,
@@ -895,8 +990,12 @@ fn push_memory_candidate(
     }
 }
 
-pub fn read_memory_events(memory_db_path: &Path, limit: usize) -> Result<Vec<MemoryEvent>> {
-    if !memory_db_path.exists() {
+fn read_memory_events_ordered(
+    memory_db_path: &Path,
+    limit: usize,
+    recent_first: bool,
+) -> Result<Vec<MemoryEvent>> {
+    if limit == 0 || !memory_db_path.exists() {
         return Ok(Vec::new());
     }
     let conn = Connection::open_with_flags(
@@ -904,21 +1003,131 @@ pub fn read_memory_events(memory_db_path: &Path, limit: usize) -> Result<Vec<Mem
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
     .with_context(|| format!("open memory db {}", memory_db_path.display()))?;
-    let mut stmt = conn.prepare(
+    let sql = if recent_first {
+        r#"
+        SELECT kind, session_id, source_ref, text, metadata_json,
+               observed_at_unix, token_estimate, imported_from, imported_id
+        FROM memory_events
+        ORDER BY COALESCE(observed_at_unix, created_at_unix) DESC,
+                 created_at_unix DESC,
+                 id DESC
+        LIMIT ?1
+        "#
+    } else {
         r#"
         SELECT kind, session_id, source_ref, text, metadata_json,
                observed_at_unix, token_estimate, imported_from, imported_id
         FROM memory_events
         ORDER BY COALESCE(observed_at_unix, created_at_unix), id
         LIMIT ?1
-        "#,
-    )?;
+        "#
+    };
+    let mut stmt = conn.prepare(sql)?;
     let mut rows = stmt.query([limit as i64])?;
     let mut events = Vec::new();
     while let Some(row) = rows.next()? {
         events.push(memory_event_from_row(row, 0)?);
     }
     Ok(events)
+}
+
+pub fn read_memory_events(memory_db_path: &Path, limit: usize) -> Result<Vec<MemoryEvent>> {
+    read_memory_events_ordered(memory_db_path, limit, false)
+}
+
+pub fn read_memory_events_with_policy(
+    memory_db_path: &Path,
+    policy: &MemoryReadPolicy,
+    limit: usize,
+) -> Result<Vec<MemoryEvent>> {
+    policy.validate()?;
+    match policy.order {
+        MemoryReadOrder::OldestFirst => read_memory_events_ordered(memory_db_path, limit, false),
+        MemoryReadOrder::RecentFirst => read_memory_events_ordered(memory_db_path, limit, true),
+        MemoryReadOrder::QueryRelevant => read_memory_event_candidates(
+            memory_db_path,
+            policy.query.as_deref().unwrap_or_default(),
+            limit,
+        ),
+    }
+}
+
+fn memory_source_stats(memory_db_path: &Path) -> Result<MemorySourceStats> {
+    if !memory_db_path.exists() {
+        return Ok(MemorySourceStats {
+            events_available: 0,
+            max_rowid: None,
+            max_observed_at_unix: None,
+            max_created_at_unix: None,
+        });
+    }
+    let conn = Connection::open_with_flags(
+        memory_db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("open memory db {}", memory_db_path.display()))?;
+    conn.query_row(
+        r#"
+        SELECT COUNT(*), MAX(rowid), MAX(observed_at_unix), MAX(created_at_unix)
+        FROM memory_events
+        "#,
+        [],
+        |row| {
+            let count: i64 = row.get(0)?;
+            Ok(MemorySourceStats {
+                events_available: count.max(0) as usize,
+                max_rowid: row.get(1)?,
+                max_observed_at_unix: row.get(2)?,
+                max_created_at_unix: row.get(3)?,
+            })
+        },
+    )
+    .map_err(Into::into)
+}
+
+pub fn memory_read_watermark(
+    memory_db_path: &Path,
+    policy: &MemoryReadPolicy,
+    limit: usize,
+    events: &[MemoryEvent],
+) -> Result<MemoryReadWatermark> {
+    policy.validate()?;
+    let stats = memory_source_stats(memory_db_path)?;
+    let event_ids: Vec<String> = events.iter().map(MemoryEvent::stable_id).collect();
+    let content_hash = memory_content_hash(&events)?;
+    let min_observed_at_unix = events
+        .iter()
+        .filter_map(|event| event.observed_at_unix)
+        .min();
+    let max_observed_at_unix = events
+        .iter()
+        .filter_map(|event| event.observed_at_unix)
+        .max();
+    let source_watermark = memory_content_hash(&serde_json::json!({
+        "schema_version": MEMORY_SCHEMA_VERSION,
+        "policy": policy,
+        "limit": limit,
+        "events_available": stats.events_available,
+        "max_rowid": stats.max_rowid,
+        "max_observed_at_unix": stats.max_observed_at_unix,
+        "max_created_at_unix": stats.max_created_at_unix,
+        "selected_event_ids": event_ids,
+        "selected_content_hash": content_hash,
+    }))?;
+    Ok(MemoryReadWatermark {
+        policy: policy.clone(),
+        limit,
+        events_read: events.len(),
+        events_available: stats.events_available,
+        max_rowid: stats.max_rowid,
+        min_observed_at_unix,
+        max_observed_at_unix,
+        max_created_at_unix: stats.max_created_at_unix,
+        first_event_id: event_ids.first().cloned(),
+        last_event_id: event_ids.last().cloned(),
+        source_watermark,
+        content_hash,
+    })
 }
 
 pub fn read_memory_event_candidates(
@@ -1721,7 +1930,10 @@ mod tests {
         );
         assert_eq!(p.edges[0].kind, "annotates");
         assert_eq!(p.edges[0].to_id, "symbol:rank_memory_events");
-        assert_eq!(node.freshness.as_ref().unwrap().observed_at_unix, Some(1_700_000_000));
+        assert_eq!(
+            node.freshness.as_ref().unwrap().observed_at_unix,
+            Some(1_700_000_000)
+        );
 
         // Same kind+anchor+text -> identical (deduping) node id.
         let again = authored_node_projection(
@@ -1983,7 +2195,7 @@ mod tests {
     }
 
     #[test]
-fn read_memory_events_round_trips_closeout_events() {
+    fn read_memory_events_round_trips_closeout_events() {
         let dir = TempDir::new().unwrap();
         let db = dir.path().join("memory.db");
         let store = MemoryStore::open_or_create(&db).unwrap();
@@ -2006,102 +2218,174 @@ fn read_memory_events_round_trips_closeout_events() {
         assert!(events.iter().any(|event| {
             event.kind == MemoryEventKind::CloseoutProof
                 && event.metadata.get("commit_hash") == Some(&"abc123".to_string())
-    }));
-}
+        }));
+    }
 
-#[test]
-fn memory_schema_creates_candidate_indexes_and_fts_table() {
-    let dir = TempDir::new().unwrap();
-    let db = dir.path().join("memory.db");
-    MemoryStore::open_or_create(&db).unwrap();
-
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    for name in [
-        "idx_memory_events_observed_created",
-        "idx_memory_events_created_at",
-        "memory_events_fts",
-    ] {
-        let exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
-                [name],
-                |row| row.get(0),
+    #[test]
+    fn read_memory_events_with_policy_orders_explicitly() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("memory.db");
+        let store = MemoryStore::open_or_create(&db).unwrap();
+        store
+            .insert_event(
+                &MemoryEvent::new(MemoryEventKind::ResponseSummary, "old", "old note")
+                    .with_observed_at_unix(1_700_000_000),
             )
             .unwrap();
-        assert_eq!(exists, 1, "expected schema object {name}");
-    }
-}
+        store
+            .insert_event(
+                &MemoryEvent::new(MemoryEventKind::ResponseSummary, "new", "new note")
+                    .with_observed_at_unix(1_700_000_100),
+            )
+            .unwrap();
 
-#[test]
-fn read_memory_event_candidates_uses_fts_and_recent_bound() {
-    let dir = TempDir::new().unwrap();
-    let db = dir.path().join("memory.db");
-    let store = MemoryStore::open_or_create(&db).unwrap();
-    let now = 1_700_000_000;
-    for index in 0..20 {
+        let legacy = read_memory_events(&db, 1).unwrap();
+        assert_eq!(legacy[0].source_ref, "old");
+        let recent =
+            read_memory_events_with_policy(&db, &MemoryReadPolicy::recent_first(), 1).unwrap();
+        assert_eq!(recent[0].source_ref, "new");
+        let oldest =
+            read_memory_events_with_policy(&db, &MemoryReadPolicy::oldest_first(), 1).unwrap();
+        assert_eq!(oldest[0].source_ref, "old");
+    }
+
+    #[test]
+    fn query_relevant_read_policy_requires_query_and_hashes_selection() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("memory.db");
+        let store = MemoryStore::open_or_create(&db).unwrap();
         store
             .insert_event(
                 &MemoryEvent::new(
                     MemoryEventKind::ResponseSummary,
-                    format!("old-{index}"),
-                    format!("ordinary memory event {index}"),
+                    "needle",
+                    "semantic graph retrieval",
                 )
-                .with_observed_at_unix(now - 1_000 - index),
+                .with_observed_at_unix(1_700_000_000),
             )
             .unwrap();
+        store
+            .insert_event(
+                &MemoryEvent::new(MemoryEventKind::ResponseSummary, "recent", "fresh note")
+                    .with_observed_at_unix(1_700_000_100),
+            )
+            .unwrap();
+
+        let missing_query =
+            read_memory_events_with_policy(&db, &MemoryReadPolicy::query_relevant(" "), 2);
+        assert!(missing_query.is_err());
+        let policy = MemoryReadPolicy::query_relevant("semantic graph");
+        let events = read_memory_events_with_policy(&db, &policy, 2).unwrap();
+        assert!(events.iter().any(|event| event.source_ref == "needle"));
+        let watermark = memory_read_watermark(&db, &policy, 2, &events).unwrap();
+        assert_eq!(watermark.events_available, 2);
+        assert_eq!(watermark.events_read, events.len());
+        assert!(!watermark.content_hash.is_empty());
+        assert!(!watermark.source_watermark.is_empty());
+
+        let recent_policy = MemoryReadPolicy::recent_first();
+        let recent = read_memory_events_with_policy(&db, &recent_policy, 1).unwrap();
+        let recent_watermark = memory_read_watermark(&db, &recent_policy, 1, &recent).unwrap();
+        assert_ne!(watermark.content_hash, recent_watermark.content_hash);
+        assert_ne!(
+            watermark.source_watermark,
+            recent_watermark.source_watermark
+        );
     }
-    store
-        .insert_event(
-            &MemoryEvent::new(
-                MemoryEventKind::ResponseSummary,
-                "needle",
-                "semantic needle graph retrieval",
+
+    #[test]
+    fn memory_schema_creates_candidate_indexes_and_fts_table() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("memory.db");
+        MemoryStore::open_or_create(&db).unwrap();
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for name in [
+            "idx_memory_events_observed_created",
+            "idx_memory_events_created_at",
+            "memory_events_fts",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "expected schema object {name}");
+        }
+    }
+
+    #[test]
+    fn read_memory_event_candidates_uses_fts_and_recent_bound() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("memory.db");
+        let store = MemoryStore::open_or_create(&db).unwrap();
+        let now = 1_700_000_000;
+        for index in 0..20 {
+            store
+                .insert_event(
+                    &MemoryEvent::new(
+                        MemoryEventKind::ResponseSummary,
+                        format!("old-{index}"),
+                        format!("ordinary memory event {index}"),
+                    )
+                    .with_observed_at_unix(now - 1_000 - index),
+                )
+                .unwrap();
+        }
+        store
+            .insert_event(
+                &MemoryEvent::new(
+                    MemoryEventKind::ResponseSummary,
+                    "needle",
+                    "semantic needle graph retrieval",
+                )
+                .with_observed_at_unix(now - 10_000),
             )
-            .with_observed_at_unix(now - 10_000),
-        )
-        .unwrap();
-    store
-        .insert_event(
-            &MemoryEvent::new(
-                MemoryEventKind::ResponseSummary,
-                "recent",
-                "fresh unrelated release note",
+            .unwrap();
+        store
+            .insert_event(
+                &MemoryEvent::new(
+                    MemoryEventKind::ResponseSummary,
+                    "recent",
+                    "fresh unrelated release note",
+                )
+                .with_observed_at_unix(now),
             )
-            .with_observed_at_unix(now),
-        )
-        .unwrap();
+            .unwrap();
 
-    let candidates = read_memory_event_candidates(&db, "semantic needle", 5).unwrap();
-    assert!(candidates.len() <= 5);
-    assert!(candidates.iter().any(|event| event.source_ref == "needle"));
-    assert!(candidates.iter().any(|event| event.source_ref == "recent"));
-}
+        let candidates = read_memory_event_candidates(&db, "semantic needle", 5).unwrap();
+        assert!(candidates.len() <= 5);
+        assert!(candidates.iter().any(|event| event.source_ref == "needle"));
+        assert!(candidates.iter().any(|event| event.source_ref == "recent"));
+    }
 
-#[test]
-fn read_memory_event_candidates_returns_recent_for_empty_query() {
-    let dir = TempDir::new().unwrap();
-    let db = dir.path().join("memory.db");
-    let store = MemoryStore::open_or_create(&db).unwrap();
-    store
-        .insert_event(
-            &MemoryEvent::new(MemoryEventKind::ResponseSummary, "old", "older note")
-                .with_observed_at_unix(1_700_000_000),
-        )
-        .unwrap();
-    store
-        .insert_event(
-            &MemoryEvent::new(MemoryEventKind::ResponseSummary, "recent", "newer note")
-                .with_observed_at_unix(1_700_000_100),
-        )
-        .unwrap();
+    #[test]
+    fn read_memory_event_candidates_returns_recent_for_empty_query() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("memory.db");
+        let store = MemoryStore::open_or_create(&db).unwrap();
+        store
+            .insert_event(
+                &MemoryEvent::new(MemoryEventKind::ResponseSummary, "old", "older note")
+                    .with_observed_at_unix(1_700_000_000),
+            )
+            .unwrap();
+        store
+            .insert_event(
+                &MemoryEvent::new(MemoryEventKind::ResponseSummary, "recent", "newer note")
+                    .with_observed_at_unix(1_700_000_100),
+            )
+            .unwrap();
 
-    let candidates = read_memory_event_candidates(&db, " ", 1).unwrap();
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].source_ref, "recent");
-}
+        let candidates = read_memory_event_candidates(&db, " ", 1).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source_ref, "recent");
+    }
 
-#[test]
-fn budget_guard_fails_closed_with_retryable_chunks() {
+    #[test]
+    fn budget_guard_fails_closed_with_retryable_chunks() {
         let report = guard_memory_handoff(
             MemoryBudgetGuardInput::new("tool.log", "tool_result", "x".repeat(5_000)),
             MemoryBudget {
