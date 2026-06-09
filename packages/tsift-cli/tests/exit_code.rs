@@ -9279,6 +9279,14 @@ fn session_cost_reads_codex_token_counts_from_stdin() {
         json["prompt_cache_plan"]["analytics"]["timeline"][1]["cached_input_ratio"],
         "96.15%"
     );
+    assert_eq!(
+        json["prompt_cache_plan"]["analytics"]["timeline"][1]["prompt_cache_metadata"]["provider"],
+        "openai"
+    );
+    assert!(json["prompt_cache_plan"]["analytics"]["timeline"][1]["prompt_cache_metadata"]
+        ["stable_prefix_fingerprint"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("spfx-")));
     assert!(
         json["prompt_cache_plan"]["provider_adapters"]
             .as_array()
@@ -9414,6 +9422,8 @@ fn session_cost_reports_prompt_cache_invalidation_diagnostics() {
     let compact_stdout = String::from_utf8_lossy(&compact.stdout);
     assert!(compact_stdout.contains("prompt-cache-diagnostic warn cached_ratio_drop"));
     assert!(compact_stdout.contains("prompt-cache-diagnostic recommend read_create_regression"));
+    assert!(compact_stdout.contains("prompt-cache-call 2026-05-05T00:00:02Z provider:anthropic"));
+    assert!(compact_stdout.contains("fingerprint:spfx-"));
 }
 
 #[test]

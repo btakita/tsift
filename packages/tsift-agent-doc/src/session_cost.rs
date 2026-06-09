@@ -12,6 +12,7 @@ const MAX_LOOP_CLUSTERS: usize = 8;
 const MAX_FILE_READ_DIAGNOSTICS: usize = 8;
 const MAX_PROMPT_CACHE_TIMELINE: usize = 8;
 const MAX_PROMPT_CACHE_DIAGNOSTICS: usize = 6;
+const MAX_PROMPT_CACHE_BREAKPOINTS: usize = 8;
 const MAX_COMMANDS_PER_BUNDLE: usize = 6;
 const PROMPT_BUDGET_WARN_TOKENS: u64 = 100_000;
 const CACHED_RATIO_WARN_PERCENT: f64 = 90.0;
@@ -57,6 +58,18 @@ impl SessionCostSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCostPromptCacheMetadata {
+    pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
+    pub stable_prefix_fingerprint: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub breakpoints: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_affinity: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionCostTurn {
     pub label: String,
     pub prompt_tokens: u64,
@@ -65,6 +78,8 @@ pub struct SessionCostTurn {
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
     pub total_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_metadata: Option<SessionCostPromptCacheMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -156,6 +171,8 @@ pub struct SessionCostPromptCacheTimelineEntry {
     pub cached_input_ratio: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_metadata: Option<SessionCostPromptCacheMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1029,6 +1046,7 @@ fn prompt_cache_timeline(
                 turn.prompt_tokens,
             )
             .map(format_percent),
+            prompt_cache_metadata: turn.prompt_cache_metadata.clone(),
         })
         .collect()
 }
@@ -1195,6 +1213,10 @@ fn ingest_claude_jsonl(input: &str, state: &mut CostState) -> Result<()> {
             output_tokens,
             reasoning_output_tokens: 0,
             total_tokens,
+            prompt_cache_metadata: Some(prompt_cache_metadata(
+                &value,
+                SessionCostSource::ClaudeJsonl,
+            )),
         });
     }
     Ok(())
@@ -1282,6 +1304,10 @@ fn ingest_codex_jsonl(input: &str, state: &mut CostState) -> Result<()> {
             total_tokens: delta
                 .total_tokens
                 .max(delta.prompt_tokens + delta.output_tokens),
+            prompt_cache_metadata: Some(prompt_cache_metadata(
+                &value,
+                SessionCostSource::CodexJsonl,
+            )),
         });
     }
 
@@ -2379,6 +2405,217 @@ fn should_count_runtime_event(
     true
 }
 
+fn prompt_cache_metadata(
+    value: &Value,
+    source: SessionCostSource,
+) -> SessionCostPromptCacheMetadata {
+    let provider = find_first_string_field(
+        value,
+        &[
+            "provider",
+            "model_provider",
+            "provider_id",
+            "model_provider_id",
+        ],
+    )
+    .unwrap_or_else(|| default_prompt_cache_provider(source).to_string());
+    let cache_key = find_first_string_field(
+        value,
+        &[
+            "prompt_cache_key",
+            "promptCacheKey",
+            "cache_key",
+            "cacheKey",
+        ],
+    );
+    let routing_affinity = find_first_string_field(
+        value,
+        &[
+            "routing_affinity",
+            "routingAffinity",
+            "replica",
+            "replica_id",
+            "replicaId",
+            "deployment_id",
+            "deploymentId",
+        ],
+    );
+    let explicit_fingerprint = find_first_string_field(
+        value,
+        &[
+            "stable_prefix_fingerprint",
+            "stablePrefixFingerprint",
+            "prefix_fingerprint",
+            "prefixFingerprint",
+        ],
+    );
+    let stable_prefix = find_first_string_field(
+        value,
+        &[
+            "stable_prefix",
+            "stablePrefix",
+            "cached_prefix",
+            "cachedPrefix",
+            "prompt_prefix",
+            "promptPrefix",
+        ],
+    );
+    let mut breakpoints = Vec::new();
+    collect_prompt_cache_breakpoints(value, "$", &mut breakpoints);
+    breakpoints.sort();
+    breakpoints.dedup();
+    breakpoints.truncate(MAX_PROMPT_CACHE_BREAKPOINTS);
+
+    let stable_prefix_fingerprint = explicit_fingerprint.unwrap_or_else(|| {
+        let mut material = vec![format!("provider={provider}")];
+        if let Some(cache_key) = &cache_key {
+            material.push(format!("cache_key={cache_key}"));
+        }
+        if let Some(stable_prefix) = &stable_prefix {
+            material.push(format!("stable_prefix={stable_prefix}"));
+        }
+        for breakpoint in &breakpoints {
+            material.push(format!("breakpoint={breakpoint}"));
+        }
+        stable_prompt_cache_fingerprint(&material.join("\n"))
+    });
+
+    SessionCostPromptCacheMetadata {
+        provider,
+        cache_key,
+        stable_prefix_fingerprint,
+        breakpoints,
+        routing_affinity,
+    }
+}
+
+fn default_prompt_cache_provider(source: SessionCostSource) -> &'static str {
+    match source {
+        SessionCostSource::ClaudeJsonl => "anthropic",
+        SessionCostSource::CodexJsonl => "openai",
+        SessionCostSource::AgentDocLog => "agent_doc_log",
+    }
+}
+
+fn find_first_string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    let mut matches = Vec::new();
+    collect_string_field_matches(value, "$", keys, &mut matches);
+    matches.sort_by(|left, right| left.0.cmp(&right.0));
+    matches
+        .into_iter()
+        .map(|(_, value)| value)
+        .find(|value| !value.trim().is_empty())
+}
+
+fn collect_string_field_matches(
+    value: &Value,
+    path: &str,
+    keys: &[&str],
+    matches: &mut Vec<(String, String)>,
+) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let child_path = json_child_path(path, key);
+                if metadata_key_matches(key, keys)
+                    && let Some(text) = child.as_str()
+                {
+                    matches.push((child_path.clone(), text.to_string()));
+                }
+                collect_string_field_matches(child, &child_path, keys, matches);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                let child_path = format!("{path}[{index}]");
+                collect_string_field_matches(child, &child_path, keys, matches);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_prompt_cache_breakpoints(value: &Value, path: &str, breakpoints: &mut Vec<String>) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let child_path = json_child_path(path, key);
+                if metadata_key_matches(
+                    key,
+                    &[
+                        "cache_control",
+                        "cacheControl",
+                        "cache_breakpoint",
+                        "cacheBreakpoint",
+                        "prompt_cache_breakpoint",
+                        "promptCacheBreakpoint",
+                    ],
+                ) {
+                    breakpoints.push(format!(
+                        "{}={}",
+                        child_path.trim_start_matches("$."),
+                        describe_prompt_cache_breakpoint(child)
+                    ));
+                }
+                collect_prompt_cache_breakpoints(child, &child_path, breakpoints);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                let child_path = format!("{path}[{index}]");
+                collect_prompt_cache_breakpoints(child, &child_path, breakpoints);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn describe_prompt_cache_breakpoint(value: &Value) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_string();
+    }
+    if let Some(enabled) = value.as_bool() {
+        return enabled.to_string();
+    }
+    if let Some(object) = value.as_object()
+        && let Some(kind) = object.get("type").and_then(Value::as_str)
+    {
+        return format!("type:{kind}");
+    }
+    value.to_string()
+}
+
+fn metadata_key_matches(key: &str, candidates: &[&str]) -> bool {
+    let key = normalize_metadata_key(key);
+    candidates
+        .iter()
+        .any(|candidate| key == normalize_metadata_key(candidate))
+}
+
+fn normalize_metadata_key(key: &str) -> String {
+    key.chars()
+        .filter(|value| *value != '_' && *value != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn json_child_path(parent: &str, key: &str) -> String {
+    if parent == "$" {
+        format!("$.{key}")
+    } else {
+        format!("{parent}.{key}")
+    }
+}
+
+fn stable_prompt_cache_fingerprint(material: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in material.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("spfx-{hash:016x}")
+}
+
 fn usage_u64(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
@@ -2524,6 +2761,45 @@ mod tests {
         assert_eq!(
             analytics.timeline[2].cached_input_ratio.as_deref(),
             Some("90.00%")
+        );
+    }
+
+    #[test]
+    fn prompt_cache_timeline_emits_attribution_metadata() {
+        let input = concat!(
+            r#"{"timestamp":"2026-05-05T00:00:01Z","provider":"anthropic","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","message":{"id":"msg-1","role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}],"usage":{"input_tokens":1000,"cache_creation_input_tokens":100,"cache_read_input_tokens":900,"output_tokens":10}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:02Z","provider":"anthropic","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","message":{"id":"msg-2","role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}],"usage":{"input_tokens":1100,"cache_creation_input_tokens":0,"cache_read_input_tokens":1000,"output_tokens":12}}}"#,
+            "\n",
+        );
+
+        let report = compute(input, Some("claude-jsonl")).unwrap();
+        let analytics = report
+            .prompt_cache_plan
+            .as_ref()
+            .and_then(|plan| plan.analytics.as_ref())
+            .expect("prompt cache analytics should be present");
+        let first = analytics.timeline[0]
+            .prompt_cache_metadata
+            .as_ref()
+            .expect("timeline should include prompt cache metadata");
+        let second = analytics.timeline[1]
+            .prompt_cache_metadata
+            .as_ref()
+            .expect("timeline should include prompt cache metadata");
+
+        assert_eq!(first.provider, "anthropic");
+        assert_eq!(first.cache_key.as_deref(), Some("agent-doc:tsift"));
+        assert_eq!(first.routing_affinity.as_deref(), Some("replica-a"));
+        assert!(
+            first.breakpoints.iter().any(|breakpoint| {
+                breakpoint == "message.content[0].cache_control=type:ephemeral"
+            })
+        );
+        assert!(first.stable_prefix_fingerprint.starts_with("spfx-"));
+        assert_eq!(
+            first.stable_prefix_fingerprint,
+            second.stable_prefix_fingerprint
         );
     }
 

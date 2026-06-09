@@ -693,6 +693,22 @@ pub(crate) fn cmd_session_digest(
     Ok(())
 }
 
+fn compact_prompt_cache_breakpoints(breakpoints: &[String]) -> String {
+    if breakpoints.is_empty() {
+        "-".to_string()
+    } else {
+        truncate_for_compact(&breakpoints.join(","), 120)
+    }
+}
+
+fn human_prompt_cache_breakpoints(breakpoints: &[String]) -> String {
+    if breakpoints.is_empty() {
+        "-".to_string()
+    } else {
+        breakpoints.join("; ")
+    }
+}
+
 pub(crate) fn cmd_session_cost(
     input_path: Option<&Path>,
     fixture_path: Option<&Path>,
@@ -945,6 +961,27 @@ pub(crate) fn cmd_session_cost(
                         truncate_for_compact(&diagnostic.message, 100)
                     );
                 }
+                for turn in &analytics.timeline {
+                    if let Some(metadata) = &turn.prompt_cache_metadata {
+                        println!(
+                            "prompt-cache-call {} provider:{} cache_key:{} fingerprint:{} breakpoints:{} routing:{}",
+                            truncate_for_compact(&turn.label, 80),
+                            metadata.provider,
+                            metadata
+                                .cache_key
+                                .as_deref()
+                                .map(|value| truncate_for_compact(value, 80))
+                                .unwrap_or_else(|| "-".to_string()),
+                            metadata.stable_prefix_fingerprint,
+                            compact_prompt_cache_breakpoints(&metadata.breakpoints),
+                            metadata
+                                .routing_affinity
+                                .as_deref()
+                                .map(|value| truncate_for_compact(value, 80))
+                                .unwrap_or_else(|| "-".to_string())
+                        );
+                    }
+                }
             }
             for action in &plan.actions {
                 println!(
@@ -1121,6 +1158,16 @@ pub(crate) fn cmd_session_cost(
                     cache_ratio,
                     creation_ratio
                 );
+                if let Some(metadata) = &turn.prompt_cache_metadata {
+                    println!(
+                        "      cache metadata: provider={} cache_key={} fingerprint={} breakpoints={} routing={}",
+                        metadata.provider,
+                        metadata.cache_key.as_deref().unwrap_or("-"),
+                        metadata.stable_prefix_fingerprint,
+                        human_prompt_cache_breakpoints(&metadata.breakpoints),
+                        metadata.routing_affinity.as_deref().unwrap_or("-")
+                    );
+                }
             }
             if analytics.timeline_truncated {
                 println!("    timeline truncated to first and latest samples");

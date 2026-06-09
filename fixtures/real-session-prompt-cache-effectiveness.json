@@ -9,8 +9,8 @@
       "minimum_net_cached_input_tokens": 40000,
       "maximum_read_create_regressions": 0,
       "input_lines": [
-        "{\"timestamp\":\"2026-06-09T04:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":24000,\"cached_input_tokens\":23000,\"output_tokens\":300,\"reasoning_output_tokens\":100,\"total_tokens\":24300}}}}",
-        "{\"timestamp\":\"2026-06-09T04:00:04Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":50000,\"cached_input_tokens\":48000,\"output_tokens\":650,\"reasoning_output_tokens\":180,\"total_tokens\":50650}}}}"
+        "{\"timestamp\":\"2026-06-09T04:00:01Z\",\"type\":\"event_msg\",\"provider\":\"openai\",\"prompt_cache_key\":\"agent-doc:tsift-v0.1\",\"routing_affinity\":\"replica-a\",\"stable_prefix\":\"agent-doc stable prefix v1\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":24000,\"cached_input_tokens\":23000,\"output_tokens\":300,\"reasoning_output_tokens\":100,\"total_tokens\":24300}}}}",
+        "{\"timestamp\":\"2026-06-09T04:00:04Z\",\"type\":\"event_msg\",\"provider\":\"openai\",\"prompt_cache_key\":\"agent-doc:tsift-v0.1\",\"routing_affinity\":\"replica-a\",\"stable_prefix\":\"agent-doc stable prefix v1\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":50000,\"cached_input_tokens\":48000,\"output_tokens\":650,\"reasoning_output_tokens\":180,\"total_tokens\":50650}}}}"
       ]
     },
     {
@@ -20,8 +20,8 @@
       "minimum_net_cached_input_tokens": 60000,
       "maximum_read_create_regressions": 0,
       "input_lines": [
-        "{\"timestamp\":\"2026-06-09T04:10:01Z\",\"message\":{\"id\":\"msg-cache-1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":20000,\"cache_creation_input_tokens\":6000,\"cache_read_input_tokens\":50000,\"output_tokens\":600}}}",
-        "{\"timestamp\":\"2026-06-09T04:10:04Z\",\"message\":{\"id\":\"msg-cache-2\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":22000,\"cache_creation_input_tokens\":4000,\"cache_read_input_tokens\":74000,\"output_tokens\":700}}}"
+        "{\"timestamp\":\"2026-06-09T04:10:01Z\",\"provider\":\"anthropic\",\"prompt_cache_key\":\"agent-doc:tsift-v0.1\",\"routing_affinity\":\"replica-a\",\"stable_prefix\":\"agent-doc stable prefix v1\",\"message\":{\"id\":\"msg-cache-1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"cache probe\",\"cache_control\":{\"type\":\"ephemeral\"}}],\"usage\":{\"input_tokens\":20000,\"cache_creation_input_tokens\":6000,\"cache_read_input_tokens\":50000,\"output_tokens\":600}}}",
+        "{\"timestamp\":\"2026-06-09T04:10:04Z\",\"provider\":\"anthropic\",\"prompt_cache_key\":\"agent-doc:tsift-v0.1\",\"routing_affinity\":\"replica-a\",\"stable_prefix\":\"agent-doc stable prefix v1\",\"message\":{\"id\":\"msg-cache-2\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"cache probe\",\"cache_control\":{\"type\":\"ephemeral\"}}],\"usage\":{\"input_tokens\":22000,\"cache_creation_input_tokens\":4000,\"cache_read_input_tokens\":74000,\"output_tokens\":700}}}"
       ]
     }
   ]
