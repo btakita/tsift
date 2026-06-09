@@ -8768,6 +8768,74 @@ fn metric_digest_reports_community_search_gate_fixture() {
 }
 
 #[test]
+fn metric_digest_reports_memgraphrag_performance_gate_fixture() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/memgraphrag-performance-history.json");
+    assert!(
+        fixture.exists(),
+        "MemGraphRAG performance fixture should exist at {}",
+        fixture.display()
+    );
+
+    let output = tsift_bin()
+        .args([
+            "metric-digest",
+            "--input",
+            fixture.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "metric-digest should succeed for the MemGraphRAG performance fixture: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let gate = &json["memgraphrag_performance_gate"];
+    assert_eq!(gate["decision"], "pass");
+    assert_eq!(
+        gate["baseline_fixture"],
+        "fixtures/memgraphrag-performance-history.json"
+    );
+    assert_eq!(gate["workloads"].as_array().unwrap().len(), 4);
+    assert_eq!(gate["max_duration_regression_percent"], 25.0);
+    assert!(
+        gate["required_metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|metric| metric == "duration_micros")
+    );
+    for workload in [
+        "memory_query",
+        "memory_project_graph",
+        "graph_db_related",
+        "semantic_seeded_neighborhood",
+    ] {
+        assert!(
+            gate["workloads"].as_array().unwrap().iter().any(|row| {
+                row["workload"] == workload
+                    && row["status"] == "pass"
+                    && row["duration_micros"].as_f64().unwrap() > 0.0
+            }),
+            "MemGraphRAG gate should pass workload {workload}: {gate}"
+        );
+    }
+    assert!(
+        json["metric_deltas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|delta| {
+                delta["metric"] == "memgraphrag.memory_project_graph.duration_micros"
+                    && delta["trend"] == "regressed"
+            })
+    );
+}
+
+#[test]
 fn dci_benchmark_summarizes_recorded_strategy_fixture() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/dci-search-benchmark.json");
     assert!(

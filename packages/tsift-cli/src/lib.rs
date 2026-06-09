@@ -19632,6 +19632,15 @@ pub(crate) fn metric_digest_gate_label(
     }
 }
 
+pub(crate) fn memgraphrag_metric_digest_gate_label(
+    decision: metric_digest::MemGraphRagPerformanceGateDecision,
+) -> &'static str {
+    match decision {
+        metric_digest::MemGraphRagPerformanceGateDecision::Pass => "pass",
+        metric_digest::MemGraphRagPerformanceGateDecision::Block => "block",
+    }
+}
+
 fn cmd_dci_benchmark(fixture_path: &Path, format: OutputFormat) -> Result<()> {
     let input = fs::read_to_string(fixture_path)
         .with_context(|| format!("reading dci-benchmark fixture: {}", fixture_path.display()))?;

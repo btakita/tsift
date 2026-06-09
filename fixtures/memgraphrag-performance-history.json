@@ -1,0 +1,26 @@
+{
+  "runs": [
+    {
+      "label": "memgraphrag-performance-baseline",
+      "id": "memgraphrag-performance-2026-06-09-baseline",
+      "timestamp": "2026-06-09T00:00:00Z",
+      "metrics": {
+        "memgraphrag.memory_query.duration_micros": 42000,
+        "memgraphrag.memory_project_graph.duration_micros": 118000,
+        "memgraphrag.graph_db_related.duration_micros": 65000,
+        "memgraphrag.semantic_seeded_neighborhood.duration_micros": 78000
+      }
+    },
+    {
+      "label": "memgraphrag-performance-current",
+      "id": "memgraphrag-performance-2026-06-09-current",
+      "timestamp": "2026-06-09T00:15:00Z",
+      "metrics": {
+        "memgraphrag.memory_query.duration_micros": 43500,
+        "memgraphrag.memory_project_graph.duration_micros": 123000,
+        "memgraphrag.graph_db_related.duration_micros": 67000,
+        "memgraphrag.semantic_seeded_neighborhood.duration_micros": 76000
+      }
+    }
+  ]
+}

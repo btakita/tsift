@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const EPSILON: f64 = 1e-9;
 const COMMUNITY_SEARCH_PREFIXES: &[&str] = &["communities", "community_search"];
+const MEMGRAPHRAG_PREFIXES: &[&str] = &["memgraphrag", "mem_graph_rag"];
 pub const COMMUNITY_SEARCH_WORKLOADS: &[&str] = &["real", "synthetic_multi_module"];
 pub const COMMUNITY_SEARCH_REQUIRED_METRICS: &[&str] = &[
     "duration_micros",
@@ -18,6 +19,16 @@ pub const COMMUNITY_MAX_DURATION_REGRESSION_PERCENT: f64 = 25.0;
 pub const COMMUNITY_MIN_HANDLE_COVERAGE_PCT: f64 = 95.0;
 pub const COMMUNITY_MIN_DUPLICATE_NAME_PRECISION: f64 = 0.99;
 pub const COMMUNITY_MIN_TOP_COMMUNITY_STABILITY: f64 = 0.95;
+pub const MEMGRAPHRAG_PERFORMANCE_BASELINE_FIXTURE: &str =
+    "fixtures/memgraphrag-performance-history.json";
+pub const MEMGRAPHRAG_PERFORMANCE_WORKLOADS: &[&str] = &[
+    "memory_query",
+    "memory_project_graph",
+    "graph_db_related",
+    "semantic_seeded_neighborhood",
+];
+pub const MEMGRAPHRAG_PERFORMANCE_REQUIRED_METRICS: &[&str] = &["duration_micros"];
+pub const MEMGRAPHRAG_MAX_DURATION_REGRESSION_PERCENT: f64 = 25.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,6 +105,39 @@ pub struct CommunitySearchGateReport {
     pub diagnostics: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemGraphRagPerformanceGateDecision {
+    Pass,
+    Block,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MemGraphRagPerformanceWorkloadEvaluation {
+    pub workload: String,
+    pub status: MemGraphRagPerformanceGateDecision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_micros: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_regression_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub missing_metrics: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MemGraphRagPerformanceGateReport {
+    pub decision: MemGraphRagPerformanceGateDecision,
+    pub baseline_fixture: String,
+    pub required_workloads: Vec<String>,
+    pub required_metrics: Vec<String>,
+    pub max_duration_regression_percent: f64,
+    pub workloads: Vec<MemGraphRagPerformanceWorkloadEvaluation>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub diagnostics: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MetricDigestReport {
     pub runs_loaded: usize,
@@ -107,6 +151,8 @@ pub struct MetricDigestReport {
     pub top_regressions: Vec<MetricDigestDelta>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub community_search_gate: Option<CommunitySearchGateReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memgraphrag_performance_gate: Option<MemGraphRagPerformanceGateReport>,
     pub news_table_markdown: String,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
@@ -226,6 +272,19 @@ pub fn compute(
     ) {
         warnings.push("community search gate blocked on missing or regressed metrics".to_string());
     }
+    let memgraphrag_performance_gate =
+        build_memgraphrag_performance_gate(&current, previous.as_ref());
+    if matches!(
+        memgraphrag_performance_gate
+            .as_ref()
+            .map(|gate| gate.decision),
+        Some(MemGraphRagPerformanceGateDecision::Block)
+    ) {
+        warnings.push(
+            "MemGraphRAG performance gate blocked on missing or regressed latency metrics"
+                .to_string(),
+        );
+    }
 
     Ok(MetricDigestReport {
         runs_loaded: all_runs.len(),
@@ -237,6 +296,7 @@ pub fn compute(
         top_improvements: improvements,
         top_regressions: regressions,
         community_search_gate,
+        memgraphrag_performance_gate,
         news_table_markdown: build_news_table(&history_runs, &selected),
         warnings,
     })
@@ -709,6 +769,165 @@ fn normalize_ratio(value: f64) -> f64 {
     if value > 1.0 { value / 100.0 } else { value }
 }
 
+fn build_memgraphrag_performance_gate(
+    current: &InputRun,
+    previous: Option<&InputRun>,
+) -> Option<MemGraphRagPerformanceGateReport> {
+    if !has_memgraphrag_metrics(current) && previous.is_none_or(|run| !has_memgraphrag_metrics(run))
+    {
+        return None;
+    }
+
+    let mut workloads = Vec::new();
+    let mut diagnostics = Vec::new();
+    for workload in MEMGRAPHRAG_PERFORMANCE_WORKLOADS {
+        let evaluation = evaluate_memgraphrag_performance_workload(current, previous, workload);
+        diagnostics.extend(
+            evaluation
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!("{workload}: {diagnostic}")),
+        );
+        workloads.push(evaluation);
+    }
+
+    let decision = if workloads
+        .iter()
+        .all(|workload| workload.status == MemGraphRagPerformanceGateDecision::Pass)
+    {
+        MemGraphRagPerformanceGateDecision::Pass
+    } else {
+        MemGraphRagPerformanceGateDecision::Block
+    };
+
+    Some(MemGraphRagPerformanceGateReport {
+        decision,
+        baseline_fixture: MEMGRAPHRAG_PERFORMANCE_BASELINE_FIXTURE.to_string(),
+        required_workloads: MEMGRAPHRAG_PERFORMANCE_WORKLOADS
+            .iter()
+            .map(|workload| (*workload).to_string())
+            .collect(),
+        required_metrics: MEMGRAPHRAG_PERFORMANCE_REQUIRED_METRICS
+            .iter()
+            .map(|metric| (*metric).to_string())
+            .collect(),
+        max_duration_regression_percent: MEMGRAPHRAG_MAX_DURATION_REGRESSION_PERCENT,
+        workloads,
+        diagnostics,
+    })
+}
+
+fn evaluate_memgraphrag_performance_workload(
+    current: &InputRun,
+    previous: Option<&InputRun>,
+    workload: &str,
+) -> MemGraphRagPerformanceWorkloadEvaluation {
+    let duration_micros = memgraphrag_metric_value(
+        &current.metrics,
+        workload,
+        &["duration_micros", "latency_micros", "runtime_micros"],
+    );
+    let previous_duration_micros = previous.and_then(|previous_run| {
+        memgraphrag_metric_value(
+            &previous_run.metrics,
+            workload,
+            &["duration_micros", "latency_micros", "runtime_micros"],
+        )
+    });
+
+    let mut missing_metrics = Vec::new();
+    let mut diagnostics = Vec::new();
+    if duration_micros.is_none() {
+        missing_metrics.push("duration_micros".to_string());
+        diagnostics.push("missing metric `duration_micros`".to_string());
+    }
+
+    let duration_regression_percent = match (duration_micros, previous_duration_micros) {
+        (Some(_), None) => {
+            diagnostics.push("missing compared baseline metric `duration_micros`".to_string());
+            None
+        }
+        (Some(_), Some(previous_duration)) if previous_duration.abs() <= EPSILON => {
+            diagnostics.push("compared baseline metric `duration_micros` is zero".to_string());
+            None
+        }
+        (Some(current_duration), Some(previous_duration)) => {
+            Some(((current_duration - previous_duration) / previous_duration) * 100.0)
+        }
+        _ => None,
+    };
+
+    if duration_regression_percent
+        .is_some_and(|percent| percent > MEMGRAPHRAG_MAX_DURATION_REGRESSION_PERCENT)
+    {
+        diagnostics.push(format!(
+            "duration regression exceeds {:.1}% limit",
+            MEMGRAPHRAG_MAX_DURATION_REGRESSION_PERCENT
+        ));
+    }
+
+    let status = if diagnostics.is_empty() {
+        MemGraphRagPerformanceGateDecision::Pass
+    } else {
+        MemGraphRagPerformanceGateDecision::Block
+    };
+
+    MemGraphRagPerformanceWorkloadEvaluation {
+        workload: workload.to_string(),
+        status,
+        duration_micros,
+        duration_regression_percent,
+        missing_metrics,
+        diagnostics,
+    }
+}
+
+fn has_memgraphrag_metrics(run: &InputRun) -> bool {
+    run.metrics.keys().any(|metric| {
+        MEMGRAPHRAG_PREFIXES
+            .iter()
+            .any(|prefix| metric.starts_with(&format!("{prefix}.")))
+    })
+}
+
+fn memgraphrag_metric_value(
+    metrics: &BTreeMap<String, f64>,
+    workload: &str,
+    suffixes: &[&str],
+) -> Option<f64> {
+    for prefix in MEMGRAPHRAG_PREFIXES {
+        for workload_alias in memgraphrag_workload_aliases(workload) {
+            for suffix in suffixes {
+                let key = format!("{prefix}.{workload_alias}.{suffix}");
+                if let Some(value) = metrics.get(&key) {
+                    return Some(*value);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn memgraphrag_workload_aliases(workload: &str) -> &'static [&'static str] {
+    match workload {
+        "memory_query" => &["memory_query", "memory-query", "query"],
+        "memory_project_graph" => &[
+            "memory_project_graph",
+            "memory-project-graph",
+            "project_graph",
+            "project-graph",
+        ],
+        "graph_db_related" => &["graph_db_related", "graph-db-related", "related"],
+        "semantic_seeded_neighborhood" => &[
+            "semantic_seeded_neighborhood",
+            "semantic-seeded-neighborhood",
+            "seeded_neighborhood",
+            "seeded-neighborhood",
+        ],
+        _ => &[],
+    }
+}
+
 fn metric_delta_rank(left: &MetricDigestDelta, right: &MetricDigestDelta) -> std::cmp::Ordering {
     right
         .delta
@@ -966,6 +1185,106 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("community search gate blocked"))
+        );
+    }
+
+    #[test]
+    fn memgraphrag_performance_gate_passes_required_latency_workloads() {
+        let baseline = r#"{
+          "label": "memgraphrag-baseline",
+          "metrics": {
+            "memgraphrag.memory_query.duration_micros": 42000,
+            "memgraphrag.memory_project_graph.duration_micros": 118000,
+            "memgraphrag.graph_db_related.duration_micros": 65000,
+            "memgraphrag.semantic_seeded_neighborhood.duration_micros": 78000
+          }
+        }"#;
+        let current = r#"{
+          "label": "memgraphrag-current",
+          "metrics": {
+            "memgraphrag.memory_query.duration_micros": 43500,
+            "memgraphrag.memory_project_graph.duration_micros": 123000,
+            "memgraphrag.graph_db_related.duration_micros": 67000,
+            "memgraphrag.semantic_seeded_neighborhood.duration_micros": 76000
+          }
+        }"#;
+
+        let report = compute(current, Some(baseline), &[], &[], &[], 3, 3).unwrap();
+        let gate = report.memgraphrag_performance_gate.unwrap();
+
+        assert_eq!(gate.decision, MemGraphRagPerformanceGateDecision::Pass);
+        assert_eq!(
+            gate.baseline_fixture,
+            MEMGRAPHRAG_PERFORMANCE_BASELINE_FIXTURE
+        );
+        assert_eq!(gate.workloads.len(), 4);
+        assert!(gate.diagnostics.is_empty());
+        assert!(
+            gate.required_metrics
+                .iter()
+                .any(|metric| metric == "duration_micros")
+        );
+        assert!(gate.workloads.iter().all(|workload| {
+            workload.duration_micros.is_some()
+                && workload.duration_regression_percent.is_some()
+                && workload.status == MemGraphRagPerformanceGateDecision::Pass
+        }));
+    }
+
+    #[test]
+    fn memgraphrag_performance_gate_blocks_missing_or_regressed_latency() {
+        let baseline = r#"{
+          "label": "memgraphrag-baseline",
+          "metrics": {
+            "memgraphrag.memory_query.duration_micros": 42000,
+            "memgraphrag.memory_project_graph.duration_micros": 118000,
+            "memgraphrag.graph_db_related.duration_micros": 65000,
+            "memgraphrag.semantic_seeded_neighborhood.duration_micros": 78000
+          }
+        }"#;
+        let current = r#"{
+          "label": "memgraphrag-current",
+          "metrics": {
+            "memgraphrag.memory_query.duration_micros": 60000,
+            "memgraphrag.memory_project_graph.duration_micros": 123000,
+            "memgraphrag.graph_db_related.duration_micros": 67000
+          }
+        }"#;
+
+        let report = compute(current, Some(baseline), &[], &[], &[], 3, 3).unwrap();
+        let gate = report.memgraphrag_performance_gate.unwrap();
+        let memory_query = gate
+            .workloads
+            .iter()
+            .find(|workload| workload.workload == "memory_query")
+            .unwrap();
+        let semantic = gate
+            .workloads
+            .iter()
+            .find(|workload| workload.workload == "semantic_seeded_neighborhood")
+            .unwrap();
+
+        assert_eq!(gate.decision, MemGraphRagPerformanceGateDecision::Block);
+        assert_eq!(
+            memory_query.status,
+            MemGraphRagPerformanceGateDecision::Block
+        );
+        assert!(
+            memory_query
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("duration regression"))
+        );
+        assert!(
+            semantic
+                .missing_metrics
+                .contains(&"duration_micros".to_string())
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("MemGraphRAG performance gate blocked"))
         );
     }
 }

@@ -13,8 +13,8 @@ use crate::{
     build_session_review_next_context_budget_report, build_traversal_graph,
     diff_digest_empty_message, diff_digest_mode_display, diff_digest_mode_label,
     diff_digest_status_label, diff_digest_summary_label, envelope_metric, format_compact_count,
-    metric_digest_gate_label, metric_digest_trend_label, print_context_pack_human,
-    print_json_or_envelope, print_session_review_budget_human,
+    memgraphrag_metric_digest_gate_label, metric_digest_gate_label, metric_digest_trend_label,
+    print_context_pack_human, print_json_or_envelope, print_session_review_budget_human,
     print_session_review_next_context_budget_human, render_log_digest_from_input,
     render_test_digest_from_input, shell_quote, to_json_schema, truncate_for_compact,
     verify_convex_projection_snapshot,
@@ -322,6 +322,14 @@ pub(crate) fn cmd_metric_digest(
                 gate.diagnostics.len()
             );
         }
+        if let Some(gate) = &report.memgraphrag_performance_gate {
+            println!(
+                "memgraphrag-performance-gate decision:{} workloads:{} diagnostics:{}",
+                memgraphrag_metric_digest_gate_label(gate.decision),
+                gate.workloads.len(),
+                gate.diagnostics.len()
+            );
+        }
         for warning in &report.warnings {
             println!("warning: {warning}");
         }
@@ -439,6 +447,41 @@ pub(crate) fn cmd_metric_digest(
                 println!(
                     "    top_community_stability: {}",
                     metric_digest::format_number(stability)
+                );
+            }
+            for diagnostic in &workload.diagnostics {
+                println!("    warning: {diagnostic}");
+            }
+        }
+    }
+
+    if let Some(gate) = &report.memgraphrag_performance_gate {
+        println!();
+        println!("MemGraphRAG performance gate:");
+        println!(
+            "  decision: {}",
+            memgraphrag_metric_digest_gate_label(gate.decision)
+        );
+        println!("  baseline fixture: {}", gate.baseline_fixture);
+        println!(
+            "  threshold: duration +{:.1}%",
+            gate.max_duration_regression_percent
+        );
+        for workload in &gate.workloads {
+            println!(
+                "  {}: {}",
+                workload.workload,
+                memgraphrag_metric_digest_gate_label(workload.status)
+            );
+            if let Some(duration) = workload.duration_micros {
+                let regression = workload
+                    .duration_regression_percent
+                    .map(|value| format!(" ({value:+.2}%)"))
+                    .unwrap_or_default();
+                println!(
+                    "    duration_micros: {}{}",
+                    metric_digest::format_number(duration),
+                    regression
                 );
             }
             for diagnostic in &workload.diagnostics {

@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **`#kx6s`**: Added a MemGraphRAG performance baseline gate to `metric-digest`. Runs with `memgraphrag.<workload>.duration_micros` metrics now emit `memgraphrag_performance_gate`, requiring memory query, memory project-graph, `graph-db related`, and semantic seeded neighborhood latency evidence with a compared baseline and a 25% max latency regression. Added `fixtures/memgraphrag-performance-history.json`, CLI fixture coverage, and spec notes.
+
 ## 0.1.66
 
 - Added a dedicated `tsift-memgraphrag` workspace crate for the MemGraphRAG graph/RAG layer. `tsift-memory` now stays focused on durable memory storage, capture contracts, and imports, while `tsift-memgraphrag` owns decay-weighted ranking/query plans, memory-event graph projections, `.tsift/memory.db` upsert into the shared graph store, traversal refresh memory/semantic rows, and ontology materialization. The root crate re-exports it as `tsift::memgraphrag`, and `tsift-cli` depends on it directly.

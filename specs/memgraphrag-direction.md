@@ -87,6 +87,13 @@ The paper's signature mechanism. Implemented in `packages/tsift-memgraphrag/src/
 Still to do: fold this into `#rankdefault` (`ranked_neighborhood`) so memory and
 code share one ranking function once memory nodes are in the graph (below).
 
+Performance baseline: `fixtures/memgraphrag-performance-history.json` records the
+canonical four-surface latency sample shape for MemGraphRAG work. Running
+`tsift metric-digest --input fixtures/memgraphrag-performance-history.json --json`
+emits `memgraphrag_performance_gate`, which requires memory query, memory
+project-graph, `graph-db related`, and semantic seeded neighborhood latency
+metrics and blocks on missing baseline/current metrics or >25% latency regression.
+
 ### 3. One graph, not two — `#memgraphrag2` ✅ implemented (core)
 
 `tsift-memgraphrag`'s `project_memory_events` emits `tsift-core` `GraphProjection`
