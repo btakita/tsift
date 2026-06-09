@@ -9211,11 +9211,11 @@ pytest summary: 4 passed, 0 failed in 0.02s
 #[test]
 fn session_cost_reads_codex_token_counts_from_stdin() {
     let input = concat!(
-        r#"{"timestamp":"2026-05-05T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":24000,"cached_input_tokens":23000,"output_tokens":300,"reasoning_output_tokens":100,"total_tokens":24300}}}}"#,
+        r#"{"timestamp":"2026-05-05T00:00:01Z","provider":"openai","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":24000,"cached_input_tokens":23000,"output_tokens":300,"reasoning_output_tokens":100,"total_tokens":24300}}}}"#,
         "\n",
-        r#"{"timestamp":"2026-05-05T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50000,"cached_input_tokens":48000,"output_tokens":650,"reasoning_output_tokens":180,"total_tokens":50650}}}}"#,
+        r#"{"timestamp":"2026-05-05T00:00:04Z","provider":"openai","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50000,"cached_input_tokens":48000,"output_tokens":650,"reasoning_output_tokens":180,"total_tokens":50650}}}}"#,
         "\n",
-        r#"{"timestamp":"2026-05-05T00:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50000,"cached_input_tokens":48000,"output_tokens":650,"reasoning_output_tokens":180,"total_tokens":50650}}}}"#,
+        r#"{"timestamp":"2026-05-05T00:00:05Z","provider":"openai","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50000,"cached_input_tokens":48000,"output_tokens":650,"reasoning_output_tokens":180,"total_tokens":50650}}}}"#,
         "\n"
     );
 
@@ -9292,7 +9292,18 @@ fn session_cost_reads_codex_token_counts_from_stdin() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|adapter| { adapter["provider"] == "openai" && adapter["status"] == "cache_key" })
+            .any(|adapter| {
+                adapter["provider"] == "openai" && adapter["status"] == "prompt_cache_key"
+            })
+    );
+    assert!(
+        json["prompt_cache_plan"]["provider_adapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|adapter| {
+                adapter["provider"] == "replica_local" && adapter["status"] == "routing_affinity"
+            })
     );
     assert!(
         json["prompt_cache_plan"]["actions"]
@@ -9363,7 +9374,17 @@ fn session_cost_recommends_prompt_cache_for_large_uncached_prompt() {
             .unwrap()
             .iter()
             .any(|adapter| {
-                adapter["provider"] == "anthropic" && adapter["status"] == "explicit_breakpoints"
+                adapter["provider"] == "openai" && adapter["status"] == "missing_prompt_cache_key"
+            })
+    );
+    assert!(
+        json["prompt_cache_plan"]["provider_adapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|adapter| {
+                adapter["provider"] == "replica_local"
+                    && adapter["status"] == "missing_routing_affinity"
             })
     );
     assert!(
@@ -9372,6 +9393,13 @@ fn session_cost_recommends_prompt_cache_for_large_uncached_prompt() {
             .unwrap()
             .iter()
             .any(|action| action["kind"] == "enable_provider_cache")
+    );
+    assert!(
+        json["prompt_cache_plan"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["kind"] == "fix_openai_prompt_cache_key")
     );
 }
 
@@ -9465,6 +9493,59 @@ fn session_cost_prompt_cache_fixture_passes_fail_under() {
             .iter()
             .all(|case| case["status"] == "pass")
     );
+}
+
+#[test]
+fn session_cost_prompt_cache_fixture_fail_under_rejects_missing_adapter_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_path = dir.path().join("missing-prompt-cache-adapters.json");
+    let fixture = serde_json::json!({
+        "schema_version": 1,
+        "description": "missing adapter evidence",
+        "cases": [
+            {
+                "name": "missing-openai-key",
+                "source": "codex-jsonl",
+                "minimum_cached_input_ratio": 90.0,
+                "minimum_net_cached_input_tokens": 40000,
+                "maximum_read_create_regressions": 0,
+                "input_lines": [
+                    "{\"timestamp\":\"2026-05-05T00:00:01Z\",\"provider\":\"openai\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":24000,\"cached_input_tokens\":23000,\"output_tokens\":300,\"reasoning_output_tokens\":100,\"total_tokens\":24300}}}}",
+                    "{\"timestamp\":\"2026-05-05T00:00:04Z\",\"provider\":\"openai\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":50000,\"cached_input_tokens\":48000,\"output_tokens\":650,\"reasoning_output_tokens\":180,\"total_tokens\":50650}}}}"
+                ]
+            }
+        ]
+    });
+    fs::write(&fixture_path, serde_json::to_string(&fixture).unwrap()).unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "session-cost",
+            "--fixture",
+            fixture_path.to_str().unwrap(),
+            "--fail-under",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "prompt-cache fixture should fail missing adapter evidence"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!json["pass"].as_bool().unwrap());
+    let failures = json["cases"][0]["failures"].as_array().unwrap();
+    assert!(failures.iter().any(|failure| {
+        failure
+            .as_str()
+            .is_some_and(|text| text.contains("OpenAI prompt_cache_key"))
+    }));
+    assert!(failures.iter().any(|failure| {
+        failure
+            .as_str()
+            .is_some_and(|text| text.contains("replica-local routing_affinity"))
+    }));
 }
 
 #[test]

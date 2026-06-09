@@ -350,6 +350,18 @@ struct CostState {
     file_read_signals: Vec<FileReadSignal>,
 }
 
+#[derive(Debug, Default)]
+struct PromptCacheAdapterEvidence {
+    anthropic_samples: usize,
+    anthropic_cache_control_samples: usize,
+    openai_samples: usize,
+    openai_prompt_cache_key_samples: usize,
+    openai_prompt_cache_keys: BTreeSet<String>,
+    routed_provider_samples: usize,
+    routing_affinity_samples: usize,
+    routing_affinity_values: BTreeSet<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct LoopSignal {
     kind: LoopClusterKind,
@@ -605,6 +617,10 @@ pub fn build_prompt_cache_effectiveness_report(
                 read_create_regressions, case.maximum_read_create_regressions
             ));
         }
+        failures.extend(prompt_cache_provider_adapter_failures(
+            case,
+            report.prompt_cache_plan.as_ref(),
+        ));
 
         let status = if failures.is_empty() {
             "pass".to_string()
@@ -646,6 +662,72 @@ pub fn build_prompt_cache_effectiveness_report(
         totals,
         cases,
     })
+}
+
+fn prompt_cache_provider_adapter_failures(
+    case: &SessionCostPromptCacheEffectivenessCase,
+    plan: Option<&SessionCostPromptCachePlan>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let Some(plan) = plan else {
+        return failures;
+    };
+    let Ok(source) = SessionCostSource::parse(&case.source) else {
+        return failures;
+    };
+
+    match source {
+        SessionCostSource::ClaudeJsonl => require_prompt_cache_provider_adapter(
+            plan,
+            "anthropic",
+            "cache_control",
+            "Anthropic cache_control",
+            &mut failures,
+        ),
+        SessionCostSource::CodexJsonl => require_prompt_cache_provider_adapter(
+            plan,
+            "openai",
+            "prompt_cache_key",
+            "OpenAI prompt_cache_key",
+            &mut failures,
+        ),
+        SessionCostSource::AgentDocLog => {}
+    }
+    if matches!(
+        source,
+        SessionCostSource::ClaudeJsonl | SessionCostSource::CodexJsonl
+    ) {
+        require_prompt_cache_provider_adapter(
+            plan,
+            "replica_local",
+            "routing_affinity",
+            "replica-local routing_affinity",
+            &mut failures,
+        );
+    }
+
+    failures
+}
+
+fn require_prompt_cache_provider_adapter(
+    plan: &SessionCostPromptCachePlan,
+    provider: &str,
+    expected_status: &str,
+    label: &str,
+    failures: &mut Vec<String>,
+) {
+    match plan
+        .provider_adapters
+        .iter()
+        .find(|adapter| adapter.provider == provider)
+    {
+        Some(adapter) if adapter.status == expected_status => {}
+        Some(adapter) => failures.push(format!(
+            "{label} adapter status `{}`; expected `{expected_status}`",
+            adapter.status
+        )),
+        None => failures.push(format!("missing {label} adapter")),
+    }
 }
 
 pub fn derive_guardrails(input: &SessionCostGuardrailInput) -> Vec<SessionCostGuardrail> {
@@ -754,6 +836,7 @@ fn derive_prompt_cache_plan(
         return None;
     }
 
+    let adapter_evidence = prompt_cache_adapter_evidence(usage_turns);
     let mut actions = Vec::new();
     if !observed {
         actions.push(SessionCostPromptCacheAction {
@@ -799,9 +882,10 @@ fn derive_prompt_cache_plan(
             ),
             guidance:
                 "check for prefix churn before each model call; repeated writes can erase the economics of prompt caching"
-                    .to_string(),
+            .to_string(),
         });
     }
+    push_prompt_cache_adapter_actions(&adapter_evidence, &mut actions);
 
     Some(SessionCostPromptCachePlan {
         status: if observed { "observed" } else { "candidate" }.to_string(),
@@ -825,37 +909,164 @@ fn derive_prompt_cache_plan(
             "run compaction against the same live prefix whenever the provider cache is still warm"
                 .to_string(),
         ],
-        provider_adapters: vec![
-            SessionCostPromptCacheProvider {
-                provider: "anthropic".to_string(),
-                status: "explicit_breakpoints".to_string(),
-                requirements: vec![
-                    "attach cache_control to the stable system block".to_string(),
-                    "attach cache_control to the final tool definition when tools are sent"
-                        .to_string(),
-                    "attach cache_control to the last two user-role messages; skip one-off compaction instructions"
-                        .to_string(),
-                ],
-            },
-            SessionCostPromptCacheProvider {
-                provider: "openai".to_string(),
-                status: "cache_key".to_string(),
-                requirements: vec![
-                    "derive prompt_cache_key from the stable thread/session id".to_string(),
-                    "keep prefixes byte-identical across consecutive calls for the same key".to_string(),
-                ],
-            },
-            SessionCostPromptCacheProvider {
-                provider: "self_hosted_or_edge".to_string(),
-                status: "affinity_required".to_string(),
-                requirements: vec![
-                    "route consecutive calls for the same cache key to the same replica when the provider cache is replica-local"
-                        .to_string(),
-                ],
-            },
-        ],
+        provider_adapters: derive_prompt_cache_provider_adapters(&adapter_evidence),
         actions,
     })
+}
+
+fn derive_prompt_cache_provider_adapters(
+    evidence: &PromptCacheAdapterEvidence,
+) -> Vec<SessionCostPromptCacheProvider> {
+    vec![
+        SessionCostPromptCacheProvider {
+            provider: "anthropic".to_string(),
+            status: anthropic_cache_control_status(evidence).to_string(),
+            requirements: vec![
+                "attach cache_control to the stable system block".to_string(),
+                "attach cache_control to the final tool definition when tools are sent".to_string(),
+                "attach cache_control to the last two user-role messages; skip one-off compaction instructions"
+                    .to_string(),
+            ],
+        },
+        SessionCostPromptCacheProvider {
+            provider: "openai".to_string(),
+            status: openai_prompt_cache_key_status(evidence).to_string(),
+            requirements: vec![
+                "derive prompt_cache_key from the stable thread/session id".to_string(),
+                "keep prefixes byte-identical across consecutive calls for the same key".to_string(),
+            ],
+        },
+        SessionCostPromptCacheProvider {
+            provider: "replica_local".to_string(),
+            status: replica_local_routing_affinity_status(evidence).to_string(),
+            requirements: vec![
+                "route consecutive calls for the same cache key to the same replica when the provider cache is replica-local"
+                    .to_string(),
+            ],
+        },
+    ]
+}
+
+fn prompt_cache_adapter_evidence(usage_turns: &[SessionCostTurn]) -> PromptCacheAdapterEvidence {
+    let mut evidence = PromptCacheAdapterEvidence::default();
+    for metadata in usage_turns
+        .iter()
+        .filter_map(|turn| turn.prompt_cache_metadata.as_ref())
+    {
+        let anthropic = is_anthropic_provider(&metadata.provider);
+        let openai = is_openai_provider(&metadata.provider);
+        if anthropic {
+            evidence.anthropic_samples += 1;
+            if metadata_has_cache_control_breakpoint(metadata) {
+                evidence.anthropic_cache_control_samples += 1;
+            }
+        }
+        if openai {
+            evidence.openai_samples += 1;
+            if let Some(cache_key) = metadata.cache_key.as_ref() {
+                evidence.openai_prompt_cache_key_samples += 1;
+                evidence.openai_prompt_cache_keys.insert(cache_key.clone());
+            }
+        }
+        if anthropic || openai {
+            evidence.routed_provider_samples += 1;
+            if let Some(routing_affinity) = metadata.routing_affinity.as_ref() {
+                evidence.routing_affinity_samples += 1;
+                evidence
+                    .routing_affinity_values
+                    .insert(routing_affinity.clone());
+            }
+        }
+    }
+    evidence
+}
+
+fn anthropic_cache_control_status(evidence: &PromptCacheAdapterEvidence) -> &'static str {
+    if evidence.anthropic_samples == 0 {
+        "not_observed"
+    } else if evidence.anthropic_cache_control_samples == evidence.anthropic_samples {
+        "cache_control"
+    } else if evidence.anthropic_cache_control_samples > 0 {
+        "partial_cache_control"
+    } else {
+        "missing_cache_control"
+    }
+}
+
+fn openai_prompt_cache_key_status(evidence: &PromptCacheAdapterEvidence) -> &'static str {
+    if evidence.openai_samples == 0 {
+        "not_observed"
+    } else if evidence.openai_prompt_cache_key_samples < evidence.openai_samples {
+        if evidence.openai_prompt_cache_key_samples == 0 {
+            "missing_prompt_cache_key"
+        } else {
+            "partial_prompt_cache_key"
+        }
+    } else if evidence.openai_prompt_cache_keys.len() > 1 {
+        "prompt_cache_key_churn"
+    } else {
+        "prompt_cache_key"
+    }
+}
+
+fn replica_local_routing_affinity_status(evidence: &PromptCacheAdapterEvidence) -> &'static str {
+    if evidence.routed_provider_samples == 0 {
+        "not_observed"
+    } else if evidence.routing_affinity_samples < evidence.routed_provider_samples {
+        if evidence.routing_affinity_samples == 0 {
+            "missing_routing_affinity"
+        } else {
+            "partial_routing_affinity"
+        }
+    } else if evidence.routing_affinity_values.len() > 1 {
+        "routing_affinity_churn"
+    } else {
+        "routing_affinity"
+    }
+}
+
+fn push_prompt_cache_adapter_actions(
+    evidence: &PromptCacheAdapterEvidence,
+    actions: &mut Vec<SessionCostPromptCacheAction>,
+) {
+    match anthropic_cache_control_status(evidence) {
+        "missing_cache_control" | "partial_cache_control" => {
+            actions.push(SessionCostPromptCacheAction {
+                kind: "fix_anthropic_cache_control".to_string(),
+                severity: "recommend".to_string(),
+                message: "Anthropic prompt-cache calls are missing cache_control breakpoints"
+                    .to_string(),
+                guidance: "attach cache_control to the stable Anthropic system/tool/user blocks that should be cached"
+                    .to_string(),
+            });
+        }
+        _ => {}
+    }
+    match openai_prompt_cache_key_status(evidence) {
+        "missing_prompt_cache_key" | "partial_prompt_cache_key" | "prompt_cache_key_churn" => {
+            actions.push(SessionCostPromptCacheAction {
+                kind: "fix_openai_prompt_cache_key".to_string(),
+                severity: "recommend".to_string(),
+                message: "OpenAI prompt-cache calls need a stable prompt_cache_key".to_string(),
+                guidance: "derive prompt_cache_key from the stable session/thread id and keep it unchanged across warm-prefix calls"
+                    .to_string(),
+            });
+        }
+        _ => {}
+    }
+    match replica_local_routing_affinity_status(evidence) {
+        "missing_routing_affinity" | "partial_routing_affinity" | "routing_affinity_churn" => {
+            actions.push(SessionCostPromptCacheAction {
+                kind: "fix_replica_routing_affinity".to_string(),
+                severity: "recommend".to_string(),
+                message: "prompt-cache calls need stable replica-local routing affinity"
+                    .to_string(),
+                guidance: "route consecutive calls for the same cache key to the same provider replica or deployment"
+                    .to_string(),
+            });
+        }
+        _ => {}
+    }
 }
 
 fn derive_prompt_cache_analytics(
@@ -2585,6 +2796,25 @@ fn describe_prompt_cache_breakpoint(value: &Value) -> String {
     value.to_string()
 }
 
+fn metadata_has_cache_control_breakpoint(metadata: &SessionCostPromptCacheMetadata) -> bool {
+    metadata.breakpoints.iter().any(|breakpoint| {
+        let key = breakpoint
+            .split_once('=')
+            .map_or(breakpoint.as_str(), |(key, _)| key);
+        normalize_metadata_key(key).contains("cachecontrol")
+    })
+}
+
+fn is_anthropic_provider(provider: &str) -> bool {
+    let provider = normalize_metadata_key(provider);
+    provider.contains("anthropic") || provider.contains("claude")
+}
+
+fn is_openai_provider(provider: &str) -> bool {
+    let provider = normalize_metadata_key(provider);
+    provider.contains("openai") || provider.contains("azureopenai") || provider.contains("codex")
+}
+
 fn metadata_key_matches(key: &str, candidates: &[&str]) -> bool {
     let key = normalize_metadata_key(key);
     candidates
@@ -2651,6 +2881,16 @@ fn extract_field<'a>(detail: &'a str, key: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prompt_cache_adapter_status<'a>(
+        plan: &'a SessionCostPromptCachePlan,
+        provider: &str,
+    ) -> Option<&'a str> {
+        plan.provider_adapters
+            .iter()
+            .find(|adapter| adapter.provider == provider)
+            .map(|adapter| adapter.status.as_str())
+    }
 
     #[test]
     fn auto_detects_claude_jsonl_and_dedupes_usage_by_message_id() {
@@ -2774,6 +3014,10 @@ mod tests {
         );
 
         let report = compute(input, Some("claude-jsonl")).unwrap();
+        let plan = report
+            .prompt_cache_plan
+            .as_ref()
+            .expect("prompt cache plan should be present");
         let analytics = report
             .prompt_cache_plan
             .as_ref()
@@ -2800,6 +3044,93 @@ mod tests {
         assert_eq!(
             first.stable_prefix_fingerprint,
             second.stable_prefix_fingerprint
+        );
+        assert_eq!(
+            prompt_cache_adapter_status(plan, "anthropic"),
+            Some("cache_control")
+        );
+        assert_eq!(
+            prompt_cache_adapter_status(plan, "replica_local"),
+            Some("routing_affinity")
+        );
+    }
+
+    #[test]
+    fn prompt_cache_plan_marks_missing_provider_adapter_evidence() {
+        let input = concat!(
+            r#"{"timestamp":"2026-05-05T00:00:01Z","provider":"openai","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":24000,"cached_input_tokens":23000,"output_tokens":300,"reasoning_output_tokens":100,"total_tokens":24300}}}}"#,
+            "\n",
+        );
+
+        let report = compute(input, Some("codex-jsonl")).unwrap();
+        let plan = report
+            .prompt_cache_plan
+            .as_ref()
+            .expect("prompt cache plan should be present");
+
+        assert_eq!(
+            prompt_cache_adapter_status(plan, "openai"),
+            Some("missing_prompt_cache_key")
+        );
+        assert_eq!(
+            prompt_cache_adapter_status(plan, "replica_local"),
+            Some("missing_routing_affinity")
+        );
+        assert!(plan.actions.iter().any(|action| {
+            action.kind == "fix_openai_prompt_cache_key"
+                && action.guidance.contains("prompt_cache_key")
+        }));
+        assert!(plan.actions.iter().any(|action| {
+            action.kind == "fix_replica_routing_affinity"
+                && action.guidance.contains("same provider replica")
+        }));
+
+        let anthropic = concat!(
+            r#"{"timestamp":"2026-05-05T00:00:01Z","provider":"anthropic","routing_affinity":"replica-a","message":{"id":"msg-1","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1000,"cache_creation_input_tokens":100,"cache_read_input_tokens":900,"output_tokens":10}}}"#,
+            "\n",
+        );
+        let report = compute(anthropic, Some("claude-jsonl")).unwrap();
+        let plan = report
+            .prompt_cache_plan
+            .as_ref()
+            .expect("prompt cache plan should be present");
+        assert_eq!(
+            prompt_cache_adapter_status(plan, "anthropic"),
+            Some("missing_cache_control")
+        );
+        assert!(plan.actions.iter().any(|action| {
+            action.kind == "fix_anthropic_cache_control"
+                && action.guidance.contains("cache_control")
+        }));
+    }
+
+    #[test]
+    fn prompt_cache_plan_marks_routing_affinity_churn() {
+        let input = concat!(
+            r#"{"timestamp":"2026-05-05T00:00:01Z","provider":"openai","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":24000,"cached_input_tokens":23000,"output_tokens":300,"reasoning_output_tokens":100,"total_tokens":24300}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:02Z","provider":"openai","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-b","stable_prefix":"agent-doc stable prefix v1","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50000,"cached_input_tokens":48000,"output_tokens":650,"reasoning_output_tokens":180,"total_tokens":50650}}}}"#,
+            "\n",
+        );
+
+        let report = compute(input, Some("codex-jsonl")).unwrap();
+        let plan = report
+            .prompt_cache_plan
+            .as_ref()
+            .expect("prompt cache plan should be present");
+
+        assert_eq!(
+            prompt_cache_adapter_status(plan, "openai"),
+            Some("prompt_cache_key")
+        );
+        assert_eq!(
+            prompt_cache_adapter_status(plan, "replica_local"),
+            Some("routing_affinity_churn")
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|action| action.kind == "fix_replica_routing_affinity")
         );
     }
 
@@ -2847,8 +3178,8 @@ mod tests {
                 name: "warm-codex-prefix".to_string(),
                 source: "codex-jsonl".to_string(),
                 input_lines: vec![
-                    r#"{"timestamp":"2026-05-05T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":24000,"cached_input_tokens":23000,"output_tokens":300,"reasoning_output_tokens":100,"total_tokens":24300}}}}"#.to_string(),
-                    r#"{"timestamp":"2026-05-05T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50000,"cached_input_tokens":48000,"output_tokens":650,"reasoning_output_tokens":180,"total_tokens":50650}}}}"#.to_string(),
+                    r#"{"timestamp":"2026-05-05T00:00:01Z","provider":"openai","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":24000,"cached_input_tokens":23000,"output_tokens":300,"reasoning_output_tokens":100,"total_tokens":24300}}}}"#.to_string(),
+                    r#"{"timestamp":"2026-05-05T00:00:04Z","provider":"openai","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50000,"cached_input_tokens":48000,"output_tokens":650,"reasoning_output_tokens":180,"total_tokens":50650}}}}"#.to_string(),
                 ],
                 minimum_cached_input_ratio: 90.0,
                 minimum_net_cached_input_tokens: 40_000,
@@ -2865,6 +3196,54 @@ mod tests {
         assert_eq!(report.cases[0].cached_input_ratio, Some(96.0));
         assert_eq!(report.cases[0].net_cached_input_tokens, 48_000);
         assert_eq!(report.cases[0].read_create_regressions, 0);
+    }
+
+    #[test]
+    fn prompt_cache_effectiveness_fixture_fails_missing_adapter_evidence() {
+        let fixture = SessionCostPromptCacheEffectivenessFixture {
+            schema_version: 1,
+            description: "fixture".to_string(),
+            cases: vec![
+                SessionCostPromptCacheEffectivenessCase {
+                    name: "missing-openai-key".to_string(),
+                    source: "codex-jsonl".to_string(),
+                    input_lines: vec![
+                        r#"{"timestamp":"2026-05-05T00:00:01Z","provider":"openai","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":24000,"cached_input_tokens":23000,"output_tokens":300,"reasoning_output_tokens":100,"total_tokens":24300}}}}"#.to_string(),
+                        r#"{"timestamp":"2026-05-05T00:00:04Z","provider":"openai","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50000,"cached_input_tokens":48000,"output_tokens":650,"reasoning_output_tokens":180,"total_tokens":50650}}}}"#.to_string(),
+                    ],
+                    minimum_cached_input_ratio: 90.0,
+                    minimum_net_cached_input_tokens: 40_000,
+                    maximum_read_create_regressions: 0,
+                },
+                SessionCostPromptCacheEffectivenessCase {
+                    name: "missing-anthropic-cache-control".to_string(),
+                    source: "claude-jsonl".to_string(),
+                    input_lines: vec![
+                        r#"{"timestamp":"2026-05-05T00:00:01Z","provider":"anthropic","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","message":{"id":"msg-1","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1000,"cache_creation_input_tokens":100,"cache_read_input_tokens":9000,"output_tokens":10}}}"#.to_string(),
+                        r#"{"timestamp":"2026-05-05T00:00:02Z","provider":"anthropic","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","message":{"id":"msg-2","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1100,"cache_creation_input_tokens":0,"cache_read_input_tokens":10000,"output_tokens":12}}}"#.to_string(),
+                    ],
+                    minimum_cached_input_ratio: 70.0,
+                    minimum_net_cached_input_tokens: 1,
+                    maximum_read_create_regressions: 0,
+                },
+            ],
+        };
+
+        let report = build_prompt_cache_effectiveness_report(&fixture).unwrap();
+
+        assert!(!report.pass);
+        assert_eq!(report.totals.failed, 2);
+        assert!(report.cases[0].failures.iter().any(|failure| {
+            failure.contains("OpenAI prompt_cache_key")
+                && failure.contains("missing_prompt_cache_key")
+        }));
+        assert!(report.cases[0].failures.iter().any(|failure| {
+            failure.contains("replica-local routing_affinity")
+                && failure.contains("missing_routing_affinity")
+        }));
+        assert!(report.cases[1].failures.iter().any(|failure| {
+            failure.contains("Anthropic cache_control") && failure.contains("missing_cache_control")
+        }));
     }
 
     #[test]
