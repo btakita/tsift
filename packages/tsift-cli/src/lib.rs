@@ -11,46 +11,50 @@ mod session_review_budget;
 mod token_savings;
 mod workflow;
 
-pub use rewrite::rewrite_command;
-pub(crate) use rewrite::{apply_rewrite_output_format, execute_rewritten_command, no_rewrite_message};
 pub(crate) use community_detection::{
     CommunityDetectionReport, annotate_community_members_with_context,
     community_tagpath_cache_part, community_tagpath_cache_part_for_loaded,
-    detect_communities_cached, file_communities_from_callers,
-    graph_effectiveness_blocked, graph_effectiveness_ready,
-    resolve_tagpath_handle_for_callee_edge, update_community_annotation_diagnostics,
+    detect_communities_cached, file_communities_from_callers, graph_effectiveness_blocked,
+    graph_effectiveness_ready, resolve_tagpath_handle_for_callee_edge,
+    update_community_annotation_diagnostics,
 };
 #[allow(unused_imports)]
 pub(crate) use conflict_matrix::{
-    ConflictMatrixCandidate, ConflictMatrixGraphPreparedInputs,
-    ConflictMatrixPreparedInputs, ConflictMatrixReport,
-    ConflictMatrixSemanticRef, ConflictMatrixSharedPreparationSummary,
-    ConflictMatrixWorkerFeedback, ConflictMatrixWorkerPromptPacket,
-    build_conflict_matrix_report, build_conflict_matrix_report_from_prepared_graph,
-    cmd_conflict_matrix, collect_conflict_matrix_evidence_packets,
-    conflict_matrix_candidate_from_evidence, conflict_matrix_graph_index,
-    conflict_matrix_semantic_ref, conflict_matrix_shared_preparation_summary,
-    conflict_matrix_source_handle, conflict_matrix_target_scoped_graph_snapshot,
-    conflict_matrix_worker_feedback,
-    conflict_risk_label, extract_conflict_target_refs, hash_bytes_hex,
-    is_planner_config_path, normalize_conflict_target,
-    prepare_conflict_matrix_graph_orchestration,
-    prepare_conflict_matrix_inputs, resolve_conflict_matrix_targets,
-    sorted_intersection, sorted_set,
+    ConflictMatrixCandidate, ConflictMatrixGraphPreparedInputs, ConflictMatrixPreparedInputs,
+    ConflictMatrixReport, ConflictMatrixSemanticRef, ConflictMatrixSharedPreparationSummary,
+    ConflictMatrixWorkerFeedback, ConflictMatrixWorkerPromptPacket, build_conflict_matrix_report,
+    build_conflict_matrix_report_from_prepared_graph, cmd_conflict_matrix,
+    collect_conflict_matrix_evidence_packets, conflict_matrix_candidate_from_evidence,
+    conflict_matrix_graph_index, conflict_matrix_semantic_ref,
+    conflict_matrix_shared_preparation_summary, conflict_matrix_source_handle,
+    conflict_matrix_target_scoped_graph_snapshot, conflict_matrix_worker_feedback,
+    conflict_risk_label, extract_conflict_target_refs, hash_bytes_hex, is_planner_config_path,
+    normalize_conflict_target, prepare_conflict_matrix_graph_orchestration,
+    prepare_conflict_matrix_inputs, resolve_conflict_matrix_targets, sorted_intersection,
+    sorted_set,
 };
 #[allow(unused_imports)]
 pub(crate) use context_pack::{
-    ContextPackReport, ContextPackSummaryRefPreview,
-    build_context_pack_diff_preview, build_context_pack_log_preview,
-    build_context_pack_report, build_context_pack_report_with_profile,
-    build_context_pack_test_preview, context_pack_status_reminders,
-    exploration_ref_id, materialize_context_pack_exploration_packet,
+    ContextPackReport, ContextPackSummaryRefPreview, build_context_pack_diff_preview,
+    build_context_pack_log_preview, build_context_pack_report,
+    build_context_pack_report_with_profile, build_context_pack_test_preview,
+    context_pack_status_reminders, exploration_ref_id, materialize_context_pack_exploration_packet,
     print_context_pack_human,
 };
+pub use rewrite::rewrite_command;
+pub(crate) use rewrite::{
+    apply_rewrite_output_format, execute_rewritten_command, no_rewrite_message,
+};
+#[cfg(test)]
+use search_budget::{SearchBudgetReport, search_facet_filters_summary};
 pub(crate) use search_budget::{
-    SearchBudgetReportInput,
-    apply_search_facet_filters, build_search_budget_follow_up, build_search_budget_report,
-    print_search_budget_human,
+    SearchBudgetReportInput, apply_search_facet_filters, build_search_budget_follow_up,
+    build_search_budget_report, print_search_budget_human,
+};
+pub(crate) use semantic_edit::{
+    AstSpanPreview, EditBatch, EditResult, EditStatus, MarkdownEmbeddedSymbol,
+    MarkdownSpanMetadata, MetricDigestOptions, SemanticEditVerifyOptions,
+    apply_edit_plan_atomically, build_edit_plan, cmd_edit_intents,
 };
 #[allow(unused_imports)]
 pub(crate) use session_review_budget::{
@@ -59,16 +63,12 @@ pub(crate) use session_review_budget::{
     build_session_review_budget_report, build_session_review_next_context_budget_report,
     print_session_review_budget_human, print_session_review_next_context_budget_human,
 };
-#[cfg(test)]
-use search_budget::{SearchBudgetReport, search_facet_filters_summary};
-pub(crate) use semantic_edit::{
-    AstSpanPreview, EditBatch, EditResult, EditStatus,
-    MarkdownEmbeddedSymbol, MarkdownSpanMetadata, MetricDigestOptions,
-    SemanticEditVerifyOptions, apply_edit_plan_atomically, build_edit_plan, cmd_edit_intents,
-};
 
 #[cfg(test)]
-use rewrite::{apply_output_cap, effective_rewrite_run_command, resolve_digest_context_path, rewrite_output_cap, OutputCap};
+use rewrite::{
+    OutputCap, apply_output_cap, effective_rewrite_run_command, resolve_digest_context_path,
+    rewrite_output_cap,
+};
 #[cfg(test)]
 use std::io::{BufRead as _, BufReader};
 #[cfg(test)]
@@ -104,17 +104,16 @@ use commands::memory::cmd_memory;
 use commands::quality::{cmd_audit, cmd_audit_tagpath, cmd_lint};
 use commands::summarize::cmd_summarize;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
-use output::tagpath::{
-    TagpathAnnotationDiagnostic, TagpathSearchOpts,
-    annotate_communities_with_tagpath, annotate_hits_with_tagpath,
-    annotate_path_nodes_with_tagpath, annotate_stored_edges_with_tagpath,
-    annotate_stored_symbols_with_tagpath,
-};
 #[cfg(test)]
 use output::ResponseBudgetPreset;
+use output::tagpath::{
+    TagpathAnnotationDiagnostic, TagpathSearchOpts, annotate_communities_with_tagpath,
+    annotate_hits_with_tagpath, annotate_path_nodes_with_tagpath,
+    annotate_stored_edges_with_tagpath, annotate_stored_symbols_with_tagpath,
+};
 use output::{
-    OutputFormat, ResponseBudget, ToolEnvelope, ToolEnvelopeMetric,
-    ToolEnvelopeSummary, TranscriptArtifactRef,
+    OutputFormat, ResponseBudget, ToolEnvelope, ToolEnvelopeMetric, ToolEnvelopeSummary,
+    TranscriptArtifactRef,
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -134,22 +133,24 @@ use substrate::{
     ConvexEdgeRow, ConvexNodeRow, ConvexProjectionRows, GraphEdge as SubstrateGraphEdge,
     GraphFreshness, GraphNode as SubstrateGraphNode, GraphProjection, GraphPropertyFilter,
     GraphProvenance, GraphQueryOptions, GraphQueryPage, GraphStore, SQLITE_GRAPH_SCHEMA_VERSION,
-    SqliteGraphStore, SqliteProjectionRefresh,
-    TerseGraphNode as SubstrateTerseGraphNode, TerseGraphEdge as SubstrateTerseGraphEdge,
+    SqliteGraphStore, SqliteProjectionRefresh, TerseGraphEdge as SubstrateTerseGraphEdge,
+    TerseGraphNode as SubstrateTerseGraphNode,
 };
-use tsift_core::{NeighborhoodScoring, RankedNeighborhoodOptions};
 use tagpath::{family as tagpath_family, ontology as tagpath_ontology};
 #[cfg(test)]
 use tsift_agent_doc::session_cost;
 #[cfg(test)]
 use tsift_agent_doc::session_review;
+use tsift_cache::cycle_packet_cache;
+use tsift_core::{
+    NeighborhoodScoring, RankedNeighborhoodOptions, SemanticSeededNeighborhoodOptions,
+};
 use tsift_digest::{diff_digest, log_digest, metric_digest, test_digest};
 use tsift_graph as graph;
 use tsift_index::{config, index, init, multiplicity, walk};
 use tsift_memgraphrag::append_tsift_memory_graph_projection_rows;
 #[cfg(test)]
 use tsift_memory::MemoryEvent;
-use tsift_cache::cycle_packet_cache;
 use tsift_quality::{dci_benchmark, lint, perf_gate, token_gate};
 use tsift_resolution as resolution;
 use tsift_search::{impact, sift};
@@ -400,7 +401,6 @@ impl GraphDbExperimentalBackend {
         }
     }
 }
-
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -1288,17 +1288,20 @@ pub fn run() -> Result<()> {
             },
         ),
         Some(Commands::TokenGate { command }) => {
-            cmd_token_gate(command, OutputFormat {
-                json_output: true,
-                compact,
-                pretty,
-                terse,
-                ultra_terse,
-                schema,
-                envelope,
-            })?;
+            cmd_token_gate(
+                command,
+                OutputFormat {
+                    json_output: true,
+                    compact,
+                    pretty,
+                    terse,
+                    ultra_terse,
+                    schema,
+                    envelope,
+                },
+            )?;
             Ok(())
-        },
+        }
         Some(Commands::Workflow { topic, json }) => workflow::cmd_workflow(
             &topic,
             OutputFormat {
@@ -1582,10 +1585,7 @@ pub(crate) fn estimated_tokens_from_bytes(bytes: usize) -> usize {
     bytes.div_ceil(4)
 }
 
-fn cmd_token_gate(
-    command: cli::TokenGateCommand,
-    format: OutputFormat,
-) -> Result<()> {
+fn cmd_token_gate(command: cli::TokenGateCommand, format: OutputFormat) -> Result<()> {
     match command {
         cli::TokenGateCommand::Sample {
             surface,
@@ -1595,7 +1595,14 @@ fn cmd_token_gate(
             depth,
             sample_index,
             json: _,
-        } => cmd_token_gate_sample(&surface, &path, scope.as_deref(), target.as_deref(), depth, sample_index),
+        } => cmd_token_gate_sample(
+            &surface,
+            &path,
+            scope.as_deref(),
+            target.as_deref(),
+            depth,
+            sample_index,
+        ),
         cli::TokenGateCommand::Evaluate {
             history,
             allowed_regression_percent,
@@ -1624,11 +1631,7 @@ fn cmd_token_gate_sample(
     let tsift_bin = std::env::current_exe()?;
 
     let args: Vec<String> = match surface {
-        "context_pack" => vec![
-            "context-pack".to_string(),
-            "--json".to_string(),
-            path_str,
-        ],
+        "context_pack" => vec!["context-pack".to_string(), "--json".to_string(), path_str],
         "session_review_next_context" => vec![
             "session-review".to_string(),
             "--json".to_string(),
@@ -1734,25 +1737,33 @@ fn cmd_token_gate_evaluate(
     allowed_regression_percent: f64,
     format: &OutputFormat,
 ) -> Result<()> {
-    let history_path = history_path
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            p.push("../../fixtures/token-gate-history.json");
-            p
-        });
+    let history_path = history_path.map(PathBuf::from).unwrap_or_else(|| {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("../../fixtures/token-gate-history.json");
+        p
+    });
 
-    let raw = std::fs::read_to_string(&history_path)
-        .with_context(|| format!("failed to read token gate history: {}", history_path.display()))?;
+    let raw = std::fs::read_to_string(&history_path).with_context(|| {
+        format!(
+            "failed to read token gate history: {}",
+            history_path.display()
+        )
+    })?;
     let samples = token_gate::parse_token_history(&raw)?;
     let report = token_gate::evaluate_token_gate(&samples, allowed_regression_percent);
 
     if format.json_output {
-        println!("{}", to_json_schema(&report, format.pretty, format.terse, false, format.schema)?);
+        println!(
+            "{}",
+            to_json_schema(&report, format.pretty, format.terse, false, format.schema)?
+        );
     } else {
         println!("Token Gate Report");
         println!("  min_samples: {}", report.min_samples);
-        println!("  allowed_regression: {:.1}%", report.allowed_regression_percent);
+        println!(
+            "  allowed_regression: {:.1}%",
+            report.allowed_regression_percent
+        );
         println!("  decision: {:?}", report.decision);
         for eval in &report.surface_evaluations {
             println!(
@@ -1760,10 +1771,7 @@ fn cmd_token_gate_evaluate(
                 eval.display_name, eval.sample_count, eval.verdict
             );
             for me in &eval.metric_evaluations {
-                println!(
-                    "    {} ({:?}): {}",
-                    me.metric, me.direction, me.diagnostic
-                );
+                println!("    {} ({:?}): {}", me.metric, me.direction, me.diagnostic);
             }
         }
         for d in &report.diagnostics {
@@ -2028,10 +2036,9 @@ fn ultra_terse_transform(val: serde_json::Value) -> serde_json::Value {
                 map.remove("provenance");
                 map.remove("freshness");
             }
-            if is_graph_edge
-                && let Some(serde_json::Value::String(s)) = map.get_mut("k") {
-                    *s = abbreviate_edge_kind(s).to_string();
-                }
+            if is_graph_edge && let Some(serde_json::Value::String(s)) = map.get_mut("k") {
+                *s = abbreviate_edge_kind(s).to_string();
+            }
             let is_coverage = map.contains_key("mode")
                 && (map.contains_key("total_sector_count")
                     || map.contains_key("dirty_sector_count"));
@@ -2081,18 +2088,31 @@ fn edge_index_transform(val: serde_json::Value) -> serde_json::Value {
                 if let Some(serde_json::Value::Array(edges)) = map.get_mut("edges") {
                     for edge in edges.iter_mut() {
                         if let serde_json::Value::Object(edge_map) = edge {
-                            if let Some(serde_json::Value::String(fid)) = edge_map.remove("from_id") {
+                            if let Some(serde_json::Value::String(fid)) = edge_map.remove("from_id")
+                            {
                                 if let Some(&idx) = id_map.get(fid.as_str()) {
-                                    edge_map.insert("from".to_string(), serde_json::Value::Number(idx.into()));
+                                    edge_map.insert(
+                                        "from".to_string(),
+                                        serde_json::Value::Number(idx.into()),
+                                    );
                                 } else {
-                                    edge_map.insert("from_id".to_string(), serde_json::Value::String(fid));
+                                    edge_map.insert(
+                                        "from_id".to_string(),
+                                        serde_json::Value::String(fid),
+                                    );
                                 }
                             }
                             if let Some(serde_json::Value::String(tid)) = edge_map.remove("to_id") {
                                 if let Some(&idx) = id_map.get(tid.as_str()) {
-                                    edge_map.insert("to".to_string(), serde_json::Value::Number(idx.into()));
+                                    edge_map.insert(
+                                        "to".to_string(),
+                                        serde_json::Value::Number(idx.into()),
+                                    );
                                 } else {
-                                    edge_map.insert("to_id".to_string(), serde_json::Value::String(tid));
+                                    edge_map.insert(
+                                        "to_id".to_string(),
+                                        serde_json::Value::String(tid),
+                                    );
                                 }
                             }
                         }
@@ -2406,7 +2426,6 @@ pub(crate) fn relativize_symbol_hits(hits: &mut [index::SymbolHit], root: &std::
     }
 }
 
-
 /// Which endpoint of a `StoredEdge` is the row's primary symbol — caller
 /// (caller list) or callee (callee list).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2545,7 +2564,10 @@ fn canonical_tag_family_from_tags(tags: &str) -> Option<CanonicalTagFamily> {
     }
 }
 
-pub(crate) fn canonical_tag_family_from_symbol(name: &str, tags: Option<&str>) -> Option<CanonicalTagFamily> {
+pub(crate) fn canonical_tag_family_from_symbol(
+    name: &str,
+    tags: Option<&str>,
+) -> Option<CanonicalTagFamily> {
     tags.and_then(canonical_tag_family_from_tags)
         .or_else(|| canonical_tag_family_from_name(name))
 }
@@ -2959,7 +2981,6 @@ pub(crate) fn should_collapse_edge_groups(edges: &[index::StoredEdge]) -> bool {
     max_hits_per_file >= 3 || (edges.len() >= 6 && grouped.len() < edges.len())
 }
 
-
 fn resolve_query_index_target(
     root: &Path,
     path_hint: &Path,
@@ -3053,7 +3074,11 @@ fn resolve_query_index_target(
     );
 }
 
-pub(crate) fn resolve_query_db_path(root: &Path, path_hint: &Path, scope: Option<&str>) -> Result<PathBuf> {
+pub(crate) fn resolve_query_db_path(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+) -> Result<PathBuf> {
     Ok(resolve_query_index_target(root, path_hint, scope)?.db_path)
 }
 
@@ -7753,12 +7778,7 @@ fn graph_db_semantic_readiness(
             )
         }
         status::SummaryStatus::Unavailable => {
-            let mut repair: Vec<String> = report
-                .recommendations
-                .run
-                .clone()
-                .into_iter()
-                .collect();
+            let mut repair: Vec<String> = report.recommendations.run.clone().into_iter().collect();
             let summarize = "tsift summarize --extract .".to_string();
             repair.push(summarize);
             repair.push(graph_db_refresh_command(root, scope));
@@ -9137,11 +9157,8 @@ pub(crate) fn graph_db_evidence_report_from_store<S: GraphStore>(
             repair_commands.join("; ")
         );
     }
-    let semantic_readiness = graph_db_semantic_readiness(
-        root,
-        scope,
-        graph_store_semantic_node_count(store).ok(),
-    );
+    let semantic_readiness =
+        graph_db_semantic_readiness(root, scope, graph_store_semantic_node_count(store).ok());
     if semantic_readiness.fail_closed {
         warnings.push(format!(
             "graph evidence semantic readiness blocked: {} — {}",
@@ -14844,55 +14861,14 @@ fn graph_db_semantic_node_discovery_cap(seed_count: usize, limit: usize) -> usiz
     limit.saturating_mul(3).max(limit).max(seed_count)
 }
 
-fn graph_db_semantic_edge_other_id<'a>(
-    edge: &'a SubstrateGraphEdge,
-    current_id: &str,
-) -> Option<&'a str> {
-    if edge.from_id == current_id {
-        Some(edge.to_id.as_str())
-    } else if edge.to_id == current_id {
-        Some(edge.from_id.as_str())
-    } else {
-        None
-    }
-}
-
-fn graph_db_semantic_edge_score(edge: &SubstrateGraphEdge, current_id: &str) -> i64 {
-    let mut score = resolution::edge_kind_rank_score(&edge.kind).saturating_mul(10);
-    score += if edge.from_id == current_id { 8 } else { 4 };
-    score += match edge.kind.as_str() {
-        "mentions_concept" | "mentions_entity" | "tagged_concept" | "tagged_entity"
-        | "related_concept" => 30,
-        "semantic_relation" => 28,
-        "calls" => 24,
-        "mentions" => 22,
-        "requests_context" | "scopes_context" | "scopes_source" | "explains_result" => 18,
-        "defines" | "contains" | "belongs_to" => 12,
-        _ => 0,
-    };
-    score
-}
-
 fn graph_db_semantic_seeded_neighborhood(
     store: &impl GraphStore,
     seed_ids: &[String],
     depth: usize,
     limit: usize,
 ) -> Result<GraphDbSemanticSeededSubgraph> {
-    let seed_rank = seed_ids
-        .iter()
-        .enumerate()
-        .map(|(idx, seed)| (seed.clone(), idx))
-        .collect::<BTreeMap<_, _>>();
-    let mut nodes = BTreeMap::<String, SubstrateGraphNode>::new();
-    let mut edges = BTreeMap::<String, SubstrateGraphEdge>::new();
-    let mut node_score_by_id = BTreeMap::<String, i64>::new();
-    let mut queue = VecDeque::<(String, usize)>::new();
-    let mut seen_at_depth = BTreeMap::<String, usize>::new();
     let edge_scan_cap = graph_db_semantic_edge_scan_cap(limit);
     let node_discovery_cap = graph_db_semantic_node_discovery_cap(seed_ids.len(), limit);
-    let mut skipped_by_edge_cap = 0usize;
-    let mut skipped_by_node_cap = 0usize;
     let mut diagnostics = vec![
         "semantic-seeded retrieval uses phrase similarity to pick graph seeds".to_string(),
         "seed expansion traverses both outgoing and incident edges so code, markdown, conversation, and memory adapters can link into semantic rows without reversing their edge direction".to_string(),
@@ -14911,138 +14887,41 @@ fn graph_db_semantic_seeded_neighborhood(
         ),
     ];
 
-    for (idx, seed_id) in seed_ids.iter().enumerate() {
-        if let Some(node) = store.node(seed_id)? {
-            nodes.entry(seed_id.clone()).or_insert(node);
-            node_score_by_id
-                .entry(seed_id.clone())
-                .or_insert(1_000_000i64.saturating_sub(idx as i64));
-            queue.push_back((seed_id.clone(), 0));
-            seen_at_depth.entry(seed_id.clone()).or_insert(0);
-        } else {
-            diagnostics.push(format!(
-                "semantic seed {seed_id} was not present in the graph store"
-            ));
-        }
-    }
+    let options = SemanticSeededNeighborhoodOptions::new(depth, limit)
+        .with_edge_scan_cap(edge_scan_cap)
+        .with_node_discovery_cap(node_discovery_cap);
+    let result = store.semantic_seeded_neighborhood(seed_ids, &options)?;
 
-    while let Some((current_id, current_depth)) = queue.pop_front() {
-        if current_depth >= depth {
-            continue;
-        }
-
-        let mut expansion_edges_by_key = BTreeMap::<String, SubstrateGraphEdge>::new();
-        for edge in store.outgoing_edges(&current_id, None)? {
-            expansion_edges_by_key
-                .entry(graph_db_edge_key(&edge))
-                .or_insert(edge);
-        }
-        for edge in store.incident_edges(&current_id, None)? {
-            expansion_edges_by_key
-                .entry(graph_db_edge_key(&edge))
-                .or_insert(edge);
-        }
-        let mut expansion_edges = expansion_edges_by_key.into_values().collect::<Vec<_>>();
-        expansion_edges.sort_by(|left, right| {
-            graph_db_semantic_edge_score(right, &current_id)
-                .cmp(&graph_db_semantic_edge_score(left, &current_id))
-                .then_with(|| graph_db_edge_key(left).cmp(&graph_db_edge_key(right)))
-        });
-        if edge_scan_cap > 0 && expansion_edges.len() > edge_scan_cap {
-            skipped_by_edge_cap += expansion_edges.len() - edge_scan_cap;
-            expansion_edges.truncate(edge_scan_cap);
-        }
-
-        for edge in expansion_edges {
-            let Some(other_id) = graph_db_semantic_edge_other_id(&edge, &current_id) else {
-                continue;
-            };
-            let other_known = nodes.contains_key(other_id);
-            if !other_known && nodes.len() >= node_discovery_cap {
-                skipped_by_node_cap += 1;
-                continue;
-            }
-            let other_id = other_id.to_string();
-            let edge_score = graph_db_semantic_edge_score(&edge, &current_id)
-                .saturating_add((depth.saturating_sub(current_depth) as i64).saturating_mul(5));
-            node_score_by_id
-                .entry(other_id.clone())
-                .and_modify(|score| *score = (*score).max(edge_score))
-                .or_insert(edge_score);
-            let edge_key = graph_db_edge_key(&edge);
-            edges.entry(edge_key).or_insert_with(|| edge.clone());
-            if let std::collections::btree_map::Entry::Vacant(entry) = nodes.entry(other_id.clone())
-                && let Some(node) = store.node(&other_id)?
-            {
-                entry.insert(node);
-            }
-            if !nodes.contains_key(&other_id) {
-                continue;
-            }
-            let next_depth = current_depth + 1;
-            let should_queue = seen_at_depth
-                .get(&other_id)
-                .is_none_or(|seen_depth| next_depth < *seen_depth);
-            if should_queue {
-                seen_at_depth.insert(other_id.clone(), next_depth);
-                queue.push_back((other_id, next_depth));
-            }
-        }
-    }
-
-    if skipped_by_edge_cap > 0 {
+    for seed_id in &result.missing_seed_ids {
         diagnostics.push(format!(
-            "semantic-seeded expansion skipped {skipped_by_edge_cap} lower-scoring incident/outgoing edge(s) after per-node caps"
-        ));
-    }
-    if skipped_by_node_cap > 0 {
-        diagnostics.push(format!(
-            "semantic-seeded expansion skipped {skipped_by_node_cap} lower-scoring node discovery edge(s) after the discovery cap"
+            "semantic seed {seed_id} was not present in the graph store"
         ));
     }
 
-    let mut nodes = nodes.into_values().collect::<Vec<_>>();
-    nodes.sort_by(|left, right| {
-        seed_rank
-            .get(&left.id)
-            .copied()
-            .unwrap_or(usize::MAX)
-            .cmp(&seed_rank.get(&right.id).copied().unwrap_or(usize::MAX))
-            .then_with(|| {
-                node_score_by_id
-                    .get(&right.id)
-                    .copied()
-                    .unwrap_or_default()
-                    .cmp(&node_score_by_id.get(&left.id).copied().unwrap_or_default())
-            })
-            .then(left.id.cmp(&right.id))
-    });
-
-    let before_limit = nodes.len();
-    let truncated = limit > 0 && nodes.len() > limit;
-    if truncated {
-        nodes.truncate(limit);
+    if result.skipped_by_edge_cap > 0 {
         diagnostics.push(format!(
-            "semantic-seeded neighborhood truncated from {before_limit} to {limit} node(s)"
+            "semantic-seeded expansion skipped {} lower-scoring incident/outgoing edge(s) after per-node caps",
+            result.skipped_by_edge_cap
+        ));
+    }
+    if result.skipped_by_node_cap > 0 {
+        diagnostics.push(format!(
+            "semantic-seeded expansion skipped {} lower-scoring node discovery edge(s) after the discovery cap",
+            result.skipped_by_node_cap
         ));
     }
 
-    let node_ids = nodes
-        .iter()
-        .map(|node| node.id.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut edges = edges
-        .into_values()
-        .filter(|edge| {
-            node_ids.contains(edge.from_id.as_str()) && node_ids.contains(edge.to_id.as_str())
-        })
-        .collect::<Vec<_>>();
-    edges.sort_by_key(graph_db_edge_key);
+    if result.truncated {
+        diagnostics.push(format!(
+            "semantic-seeded neighborhood truncated from {} to {limit} node(s)",
+            result.total_discovered
+        ));
+    }
 
     Ok(GraphDbSemanticSeededSubgraph {
-        nodes,
-        edges,
-        truncated,
+        nodes: result.nodes,
+        edges: result.edges,
+        truncated: result.truncated,
         diagnostics,
     })
 }
@@ -16412,7 +16291,10 @@ pub(crate) fn stored_symbol_ast_span(
     })
 }
 
-pub(crate) fn symbol_hit_ast_span(symbol: &index::SymbolHit, source: &[u8]) -> Option<AstSpanPreview> {
+pub(crate) fn symbol_hit_ast_span(
+    symbol: &index::SymbolHit,
+    source: &[u8],
+) -> Option<AstSpanPreview> {
     let (start_byte, end_byte) = symbol_hit_span_bounds(symbol)?;
     let node_kind = symbol.node_kind.clone()?;
     let body_start_byte = symbol_span_byte(symbol.body_start_byte);
@@ -16997,7 +16879,11 @@ fn cmd_source_read(
         let capped = build_token_capped_preview(&all_lines, start, end_line, max_bytes, token_cap);
         (capped.preview, capped.capped_end, capped.was_capped)
     };
-    let effective_end = if body_truncated { preview_end } else { end_line };
+    let effective_end = if body_truncated {
+        preview_end
+    } else {
+        end_line
+    };
 
     if body_truncated {
         warnings.push(format!(
@@ -17281,13 +17167,24 @@ fn cmd_symbol_read(
         .min(target_end)
         .min(total_lines.max(target_start));
     let token_cap = budget.body_token_cap();
-    let (body, effective_preview_end, body_truncated) = if total_lines == 0 || target_start > total_lines {
-        (Vec::new(), line_capped_end, false)
+    let (body, effective_preview_end, body_truncated) =
+        if total_lines == 0 || target_start > total_lines {
+            (Vec::new(), line_capped_end, false)
+        } else {
+            let capped = build_token_capped_preview(
+                &all_lines,
+                target_start,
+                line_capped_end,
+                max_bytes,
+                token_cap,
+            );
+            (capped.preview, capped.capped_end, capped.was_capped)
+        };
+    let preview_end = if body_truncated {
+        effective_preview_end
     } else {
-        let capped = build_token_capped_preview(&all_lines, target_start, line_capped_end, max_bytes, token_cap);
-        (capped.preview, capped.capped_end, capped.was_capped)
+        line_capped_end
     };
-    let preview_end = if body_truncated { effective_preview_end } else { line_capped_end };
     let child_symbols = file_symbols
         .iter()
         .filter(|candidate| {
@@ -20082,9 +19979,7 @@ pub(crate) fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> 
     if eviction.evicted_entries > 0 {
         eprintln!(
             "status fix: evicted {} cycle packet cache entry/entries ({} bytes, {} remaining)",
-            eviction.evicted_entries,
-            eviction.evicted_bytes,
-            eviction.remaining_entries
+            eviction.evicted_entries, eviction.evicted_bytes, eviction.remaining_entries
         );
     }
 
@@ -20913,7 +20808,6 @@ pub(crate) fn resolve_search_strategy(query: &str, strategy: Option<String>) -> 
     })
 }
 
-
 pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     if path.is_file() {
@@ -20953,14 +20847,13 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
 }
 
 #[cfg(test)]
- mod tests {
-     use super::*;
-     use super::semantic_edit::{
-         EditOp,
-         apply_edit_op, apply_edit_plan_atomically_inner, markdown_block_spans,
-         markdown_section_spans,
-     };
-     use tsift_memory::{MemoryEventKind, MemoryStore};
+mod tests {
+    use super::semantic_edit::{
+        EditOp, apply_edit_op, apply_edit_plan_atomically_inner, markdown_block_spans,
+        markdown_section_spans,
+    };
+    use super::*;
+    use tsift_memory::{MemoryEventKind, MemoryStore};
 
     use std::cell::RefCell;
     use substrate::{ConvexEdgeRow, ConvexGraphClient, ConvexGraphStore, ConvexNodeRow};
@@ -21146,7 +21039,9 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
 
     #[test]
     fn token_capped_preview_truncates_when_over_cap() {
-        let lines: Vec<&str> = (0..200).map(|_| "    let x = some_very_long_expression_here();").collect();
+        let lines: Vec<&str> = (0..200)
+            .map(|_| "    let x = some_very_long_expression_here();")
+            .collect();
         let result = build_token_capped_preview(&lines, 1, 200, 160, 100);
         assert!(result.was_capped);
         assert!(result.preview.len() < 200);
@@ -24508,7 +24403,10 @@ fn main() { api::handler(); }
         )
         .unwrap();
         assert_eq!(
-            edge_report.edge.as_ref().map(|e| graph_db_edge_key(&SubstrateGraphEdge::from(e))),
+            edge_report
+                .edge
+                .as_ref()
+                .map(|e| graph_db_edge_key(&SubstrateGraphEdge::from(e))),
             Some(edge_id.clone())
         );
 
@@ -24685,11 +24583,10 @@ fn main() { api::handler(); }
         depth_by_id.insert("target".to_string(), 0);
         for idx in 0..20 {
             let id = format!("ev-{idx}");
-            nodes.push(SubstrateGraphNode::new(
-                id.clone(),
-                "source_handle",
-                format!("evidence row {idx}"),
-            ).with_property("detail", "x".repeat(400)));
+            nodes.push(
+                SubstrateGraphNode::new(id.clone(), "source_handle", format!("evidence row {idx}"))
+                    .with_property("detail", "x".repeat(400)),
+            );
             depth_by_id.insert(id, 1);
         }
         let origin_ids = vec!["target".to_string()];
@@ -24713,10 +24610,7 @@ fn main() { api::handler(); }
             "expected next_cursor when truncated"
         );
         let cursor = first_page.next_cursor.unwrap();
-        assert!(
-            !cursor.is_empty(),
-            "cursor should be a non-empty node id"
-        );
+        assert!(!cursor.is_empty(), "cursor should be a non-empty node id");
         let first_ids: BTreeSet<_> = first_page.nodes.iter().map(|n| n.id.clone()).collect();
         let second_page = graph_db_apply_output_budget_with_depths_and_cursor(
             &origin_ids,
@@ -24734,7 +24628,11 @@ fn main() { api::handler(); }
             "pages should not overlap, but found shared ids: {overlap:?}"
         );
         assert!(
-            second_page.report.diagnostics.iter().any(|d| d.contains("cursor skipped")),
+            second_page
+                .report
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("cursor skipped")),
             "expected cursor skip diagnostic, got {:?}",
             second_page.report.diagnostics
         );
@@ -24807,7 +24705,11 @@ fn main() { api::handler(); }
             Some("nonexistent-id"),
         );
         assert!(
-            result.report.diagnostics.iter().any(|d| d.contains("cursor skipped 0")),
+            result
+                .report
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("cursor skipped 0")),
             "invalid cursor should skip 0 candidates, got {:?}",
             result.report.diagnostics
         );
@@ -31873,7 +31775,9 @@ fn sample() {}
 
     #[test]
     fn build_token_capped_preview_truncates_long_body() {
-        let owned: Vec<String> = (0..200).map(|i| format!("    let line_{i} = {i};")).collect();
+        let owned: Vec<String> = (0..200)
+            .map(|i| format!("    let line_{i} = {i};"))
+            .collect();
         let lines: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
         let capped = build_token_capped_preview(&lines, 1, 200, 160, 100);
         assert!(capped.was_capped);
@@ -32071,7 +31975,6 @@ pub(crate) fn execute_query(
     }
     Ok((col_names, rows))
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DigestRunnerKind {

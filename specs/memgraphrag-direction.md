@@ -100,10 +100,14 @@ ranking.
   SQLite serves this from `graph_node_semantic_vectors` typed blob rows instead of
   scanning/parsing every semantic node property during retrieval.
 - `#rankdefault` / `#58p8` folds observed-at freshness and memory-node boosts into
-  `GraphStore::ranked_neighborhood`, so projected memory nodes, authored
-  finding/decision/note nodes, and code symbols prune through one graph-ranking
-  path. The default store path now sorts fetched sibling candidates by this score
-  before applying `max_nodes`; SQLite mirrors the score in SQL.
+`GraphStore::ranked_neighborhood`, so projected memory nodes, authored
+finding/decision/note nodes, and code symbols prune through one graph-ranking
+path. The default store path now sorts fetched sibling candidates by this score
+before applying `max_nodes`; SQLite mirrors the score in SQL.
+- `#kn0d` moves semantic-seeded neighborhood caps into `GraphStore`, so
+`graph-db related` uses one shared expansion path. The default store batches
+candidate node lookup per ranked expansion, while SQLite ranks and limits
+incident/outgoing expansion edges in SQL before loading capped candidate nodes.
 
 Performance baseline: `fixtures/memgraphrag-performance-history.json` records the
 canonical four-surface latency sample shape for MemGraphRAG work. Running

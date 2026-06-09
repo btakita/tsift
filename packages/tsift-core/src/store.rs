@@ -437,12 +437,55 @@ pub fn graph_semantic_cosine(left: &[f64], right: &[f64]) -> f64 {
         .sum::<f64>()
 }
 
+pub fn graph_semantic_seeded_edge_other_id<'a>(
+    edge: &'a GraphEdge,
+    current_id: &str,
+) -> Option<&'a str> {
+    if edge.from_id == current_id {
+        Some(edge.to_id.as_str())
+    } else if edge.to_id == current_id {
+        Some(edge.from_id.as_str())
+    } else {
+        None
+    }
+}
+
+pub fn graph_semantic_seeded_edge_score(edge: &GraphEdge, current_id: &str) -> i64 {
+    let mut score = edge_kind_weighted_score(&edge.kind).saturating_mul(10);
+    score += if edge.from_id == current_id { 8 } else { 4 };
+    score += match edge.kind.as_str() {
+        "mentions_concept" | "mentions_entity" | "tagged_concept" | "tagged_entity"
+        | "related_concept" => 30,
+        "semantic_relation" => 28,
+        "calls" => 24,
+        "mentions" => 22,
+        "requests_context" | "scopes_context" | "scopes_source" | "explains_result" => 18,
+        "defines" | "contains" | "belongs_to" => 12,
+        _ => 0,
+    };
+    score
+}
+
 pub trait GraphStore {
     fn upsert_node(&self, node: &GraphNode) -> Result<()>;
     fn upsert_edge(&self, edge: &GraphEdge) -> Result<()>;
     fn delete_node(&self, id: &str) -> Result<usize>;
     fn delete_edge(&self, from_id: &str, to_id: &str, kind: &str) -> Result<usize>;
     fn node(&self, id: &str) -> Result<Option<GraphNode>>;
+    fn nodes_by_ids(&self, ids: &[String]) -> Result<Vec<GraphNode>> {
+        let mut nodes = Vec::new();
+        let mut seen = BTreeSet::new();
+        for id in ids {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if let Some(node) = self.node(id)? {
+                nodes.push(node);
+            }
+        }
+        nodes.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(nodes)
+    }
     fn all_nodes(&self) -> Result<Vec<GraphNode>>;
     fn all_edges(&self) -> Result<Vec<GraphEdge>>;
     fn edge(&self, edge_id: &str) -> Result<Option<GraphEdge>> {
@@ -504,6 +547,38 @@ pub trait GraphStore {
             .collect::<Vec<_>>();
         edges.sort_by_key(graph_edge_id);
         Ok(edges)
+    }
+    fn semantic_seeded_expansion_edges(
+        &self,
+        current_id: &str,
+        options: &SemanticSeededNeighborhoodOptions,
+    ) -> Result<SemanticSeededNeighborhoodExpansion> {
+        let mut expansion_edges_by_key = BTreeMap::<String, GraphEdge>::new();
+        for edge in self.outgoing_edges(current_id, None)? {
+            expansion_edges_by_key
+                .entry(graph_edge_id(&edge))
+                .or_insert(edge);
+        }
+        for edge in self.incident_edges(current_id, None)? {
+            expansion_edges_by_key
+                .entry(graph_edge_id(&edge))
+                .or_insert(edge);
+        }
+        let mut edges = expansion_edges_by_key.into_values().collect::<Vec<_>>();
+        edges.sort_by(|left, right| {
+            graph_semantic_seeded_edge_score(right, current_id)
+                .cmp(&graph_semantic_seeded_edge_score(left, current_id))
+                .then_with(|| graph_edge_id(left).cmp(&graph_edge_id(right)))
+        });
+        let mut skipped_by_edge_cap = 0usize;
+        if options.edge_scan_cap > 0 && edges.len() > options.edge_scan_cap {
+            skipped_by_edge_cap = edges.len() - options.edge_scan_cap;
+            edges.truncate(options.edge_scan_cap);
+        }
+        Ok(SemanticSeededNeighborhoodExpansion {
+            edges,
+            skipped_by_edge_cap,
+        })
     }
     fn paged_edges(
         &self,
@@ -632,6 +707,151 @@ pub trait GraphStore {
         Ok(self.neighborhood(center_id, depth, kind)?.map(|subgraph| {
             apply_graph_query_page(subgraph.nodes, subgraph.edges, options, Vec::new())
         }))
+    }
+    fn semantic_seeded_neighborhood(
+        &self,
+        seed_ids: &[String],
+        options: &SemanticSeededNeighborhoodOptions,
+    ) -> Result<SemanticSeededNeighborhoodResult> {
+        let seed_rank = seed_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, seed)| (seed.clone(), idx))
+            .collect::<BTreeMap<_, _>>();
+        let seed_nodes_by_id = self
+            .nodes_by_ids(seed_ids)?
+            .into_iter()
+            .map(|node| (node.id.clone(), node))
+            .collect::<BTreeMap<_, _>>();
+        let mut nodes = BTreeMap::<String, GraphNode>::new();
+        let mut edges = BTreeMap::<String, GraphEdge>::new();
+        let mut node_score_by_id = BTreeMap::<String, i64>::new();
+        let mut queue = VecDeque::<(String, usize)>::new();
+        let mut seen_at_depth = BTreeMap::<String, usize>::new();
+        let mut missing_seed_ids = Vec::new();
+        let mut skipped_by_edge_cap = 0usize;
+        let mut skipped_by_node_cap = 0usize;
+
+        for (idx, seed_id) in seed_ids.iter().enumerate() {
+            if let Some(node) = seed_nodes_by_id.get(seed_id) {
+                nodes.entry(seed_id.clone()).or_insert_with(|| node.clone());
+                node_score_by_id
+                    .entry(seed_id.clone())
+                    .or_insert(1_000_000i64.saturating_sub(idx as i64));
+                if !seen_at_depth.contains_key(seed_id) {
+                    queue.push_back((seed_id.clone(), 0));
+                    seen_at_depth.insert(seed_id.clone(), 0);
+                }
+            } else {
+                missing_seed_ids.push(seed_id.clone());
+            }
+        }
+
+        while let Some((current_id, current_depth)) = queue.pop_front() {
+            if current_depth >= options.depth {
+                continue;
+            }
+
+            let expansion = self.semantic_seeded_expansion_edges(&current_id, options)?;
+            skipped_by_edge_cap = skipped_by_edge_cap.saturating_add(expansion.skipped_by_edge_cap);
+            let mut candidates = Vec::new();
+            let mut missing_candidate_ids = Vec::new();
+            for edge in expansion.edges {
+                let Some(other_id) = graph_semantic_seeded_edge_other_id(&edge, &current_id) else {
+                    continue;
+                };
+                let other_id = other_id.to_string();
+                let edge_score = graph_semantic_seeded_edge_score(&edge, &current_id)
+                    .saturating_add(
+                        (options.depth.saturating_sub(current_depth) as i64).saturating_mul(5),
+                    );
+                if !nodes.contains_key(&other_id) {
+                    missing_candidate_ids.push(other_id.clone());
+                }
+                candidates.push((edge, other_id, edge_score));
+            }
+
+            missing_candidate_ids.sort();
+            missing_candidate_ids.dedup();
+            let fetched_nodes_by_id = self
+                .nodes_by_ids(&missing_candidate_ids)?
+                .into_iter()
+                .map(|node| (node.id.clone(), node))
+                .collect::<BTreeMap<_, _>>();
+
+            for (edge, other_id, edge_score) in candidates {
+                let other_known = nodes.contains_key(&other_id);
+                if !other_known && nodes.len() >= options.node_discovery_cap {
+                    skipped_by_node_cap = skipped_by_node_cap.saturating_add(1);
+                    continue;
+                }
+                node_score_by_id
+                    .entry(other_id.clone())
+                    .and_modify(|score| *score = (*score).max(edge_score))
+                    .or_insert(edge_score);
+                let edge_key = graph_edge_id(&edge);
+                edges.entry(edge_key).or_insert(edge);
+                if !other_known && let Some(node) = fetched_nodes_by_id.get(&other_id) {
+                    nodes.insert(other_id.clone(), node.clone());
+                }
+                if !nodes.contains_key(&other_id) {
+                    continue;
+                }
+                let next_depth = current_depth + 1;
+                let should_queue = seen_at_depth
+                    .get(&other_id)
+                    .is_none_or(|seen_depth| next_depth < *seen_depth);
+                if should_queue {
+                    seen_at_depth.insert(other_id.clone(), next_depth);
+                    queue.push_back((other_id, next_depth));
+                }
+            }
+        }
+
+        let mut nodes = nodes.into_values().collect::<Vec<_>>();
+        nodes.sort_by(|left, right| {
+            seed_rank
+                .get(&left.id)
+                .copied()
+                .unwrap_or(usize::MAX)
+                .cmp(&seed_rank.get(&right.id).copied().unwrap_or(usize::MAX))
+                .then_with(|| {
+                    node_score_by_id
+                        .get(&right.id)
+                        .copied()
+                        .unwrap_or_default()
+                        .cmp(&node_score_by_id.get(&left.id).copied().unwrap_or_default())
+                })
+                .then(left.id.cmp(&right.id))
+        });
+
+        let total_discovered = nodes.len();
+        let truncated = options.limit > 0 && nodes.len() > options.limit;
+        if truncated {
+            nodes.truncate(options.limit);
+        }
+
+        let node_ids = nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut edges = edges
+            .into_values()
+            .filter(|edge| {
+                node_ids.contains(edge.from_id.as_str()) && node_ids.contains(edge.to_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        edges.sort_by_key(graph_edge_id);
+
+        Ok(SemanticSeededNeighborhoodResult {
+            nodes,
+            edges,
+            skipped_by_edge_cap,
+            skipped_by_node_cap,
+            missing_seed_ids,
+            total_discovered,
+            truncated,
+        })
     }
     fn ranked_neighborhood(
         &self,

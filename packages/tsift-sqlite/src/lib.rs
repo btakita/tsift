@@ -18,7 +18,8 @@ pub use tsift_core::{
     GraphFreshness, GraphNode, GraphPagedSubgraph, GraphPath, GraphProjection, GraphPropertyFilter,
     GraphProvenance, GraphQueryOptions, GraphQueryPage, GraphSemanticCandidate, GraphStore,
     GraphSubgraph, PropertyMode, RankedNeighborhoodOptions, RankedNeighborhoodResult,
-    SQLITE_GRAPH_SCHEMA_VERSION, TerseGraphEdge, TerseGraphNode, apply_graph_edge_query_page,
+    SQLITE_GRAPH_SCHEMA_VERSION, SemanticSeededNeighborhoodExpansion,
+    SemanticSeededNeighborhoodOptions, TerseGraphEdge, TerseGraphNode, apply_graph_edge_query_page,
     apply_graph_query_page, graph_edge_id, graph_semantic_cosine,
     graph_semantic_top_candidates_by_property_scan, parse_graph_semantic_vector_property,
     shortest_path_using_outgoing, stable_graph_edge_id,
@@ -2252,6 +2253,50 @@ fn sqlite_incident_edges_union_query(
     (sql, values)
 }
 
+fn sqlite_semantic_seeded_edge_score_expr(edge_alias: &str, direction_bonus: &str) -> String {
+    format!(
+        "(CASE {edge_alias}.kind \
+WHEN 'semantic_relation' THEN 340 \
+WHEN 'mentions_entity' THEN 280 \
+WHEN 'mentions_concept' THEN 280 \
+WHEN 'tagged_entity' THEN 280 \
+WHEN 'tagged_concept' THEN 280 \
+WHEN 'related_concept' THEN 280 \
+WHEN 'mentions' THEN 220 \
+WHEN 'calls' THEN 200 \
+WHEN 'requests_context' THEN 180 \
+WHEN 'scopes_context' THEN 180 \
+WHEN 'scopes_source' THEN 180 \
+WHEN 'explains_result' THEN 180 \
+WHEN 'defines' THEN 120 \
+WHEN 'contains' THEN 120 \
+WHEN 'belongs_to' THEN 120 \
+WHEN {edge_alias}.kind LIKE '%community%' THEN 200 \
+WHEN {edge_alias}.kind LIKE '%semantic%' \
+OR {edge_alias}.kind LIKE '%concept%' \
+OR {edge_alias}.kind LIKE '%entity%' THEN 240 \
+ELSE 80 END) \
++ ({direction_bonus}) \
++ (CASE {edge_alias}.kind \
+WHEN 'mentions_concept' THEN 30 \
+WHEN 'mentions_entity' THEN 30 \
+WHEN 'tagged_concept' THEN 30 \
+WHEN 'tagged_entity' THEN 30 \
+WHEN 'related_concept' THEN 30 \
+WHEN 'semantic_relation' THEN 28 \
+WHEN 'calls' THEN 24 \
+WHEN 'mentions' THEN 22 \
+WHEN 'requests_context' THEN 18 \
+WHEN 'scopes_context' THEN 18 \
+WHEN 'scopes_source' THEN 18 \
+WHEN 'explains_result' THEN 18 \
+WHEN 'defines' THEN 12 \
+WHEN 'contains' THEN 12 \
+WHEN 'belongs_to' THEN 12 \
+ELSE 0 END)"
+    )
+}
+
 impl GraphStore for SqliteGraphStore {
     fn upsert_node(&self, node: &GraphNode) -> Result<()> {
         self.conn.execute(
@@ -2332,7 +2377,7 @@ impl GraphStore for SqliteGraphStore {
         self.conn
             .query_row(
                 r#"
-                SELECT id, kind, label, properties_json, provenance_json, freshness_json
+SELECT id, kind, label, properties_json, provenance_json, freshness_json
                 FROM graph_nodes
                 WHERE id = ?1
                 "#,
@@ -2343,10 +2388,39 @@ impl GraphStore for SqliteGraphStore {
             .map_err(Into::into)
     }
 
+    fn nodes_by_ids(&self, ids: &[String]) -> Result<Vec<GraphNode>> {
+        let unique_ids = ids.iter().cloned().collect::<BTreeSet<_>>();
+        if unique_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut nodes = Vec::new();
+        let id_refs = unique_ids.iter().collect::<Vec<_>>();
+        for chunk in id_refs.chunks(450) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT id, kind, label, properties_json, provenance_json, freshness_json \
+FROM graph_nodes \
+WHERE id IN ({placeholders}) \
+ORDER BY id"
+            );
+            let values = chunk
+                .iter()
+                .map(|id| Value::Text((*id).clone()))
+                .collect::<Vec<_>>();
+            let mut stmt = self.conn.prepare(&sql)?;
+            nodes.extend(collect_rows(
+                stmt.query_map(params_from_iter(values.iter()), node_from_row)?,
+            )?);
+        }
+        nodes.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(nodes)
+    }
+
     fn all_nodes(&self) -> Result<Vec<GraphNode>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, kind, label, properties_json, provenance_json, freshness_json
+SELECT id, kind, label, properties_json, provenance_json, freshness_json
             FROM graph_nodes
             ORDER BY id
             "#,
@@ -2664,6 +2738,81 @@ impl GraphStore for SqliteGraphStore {
         let (sql, values) = sqlite_incident_edges_union_query(node_id, kind, &[], None, None);
         let mut stmt = self.conn.prepare(&sql)?;
         collect_rows(stmt.query_map(params_from_iter(values.iter()), edge_from_row)?)
+    }
+
+    fn semantic_seeded_expansion_edges(
+        &self,
+        current_id: &str,
+        options: &SemanticSeededNeighborhoodOptions,
+    ) -> Result<SemanticSeededNeighborhoodExpansion> {
+        let from_score = sqlite_semantic_seeded_edge_score_expr("e", "8");
+        let to_score = sqlite_semantic_seeded_edge_score_expr(
+            "e",
+            "CASE WHEN e.from_id = e.to_id THEN 8 ELSE 4 END",
+        );
+        let limit_clause = if options.edge_scan_cap > 0 {
+            "LIMIT ?"
+        } else {
+            ""
+        };
+        let sql = format!(
+            r#"
+WITH candidate_edges AS (
+    SELECT e.edge_key, e.from_id, e.to_id, e.kind, e.properties_json, e.provenance_json, e.freshness_json,
+           {from_score} AS score
+    FROM graph_edges e INDEXED BY idx_graph_edges_from_kind
+    WHERE e.from_id = ?
+    UNION ALL
+    SELECT e.edge_key, e.from_id, e.to_id, e.kind, e.properties_json, e.provenance_json, e.freshness_json,
+           {to_score} AS score
+    FROM graph_edges e INDEXED BY idx_graph_edges_to_kind
+    WHERE e.to_id = ?
+),
+ranked_edges AS (
+    SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json,
+           MAX(score) AS score
+    FROM candidate_edges
+    GROUP BY edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
+),
+limited_edges AS (
+    SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json,
+           score, COUNT(*) OVER () AS total_edges
+    FROM ranked_edges
+    ORDER BY score DESC, edge_key ASC
+    {limit_clause}
+)
+SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json, total_edges
+FROM limited_edges
+ORDER BY score DESC, edge_key ASC
+"#
+        );
+        let mut values = vec![
+            Value::Text(current_id.to_string()),
+            Value::Text(current_id.to_string()),
+        ];
+        if options.edge_scan_cap > 0 {
+            values.push(Value::Integer(
+                options
+                    .edge_scan_cap
+                    .saturating_add(1)
+                    .min(i64::MAX as usize) as i64,
+            ));
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = collect_rows(stmt.query_map(params_from_iter(values.iter()), |row| {
+            Ok((edge_from_row_at(row, 0)?, row.get::<_, i64>(7)? as usize))
+        })?)?;
+        let total_candidates = rows.first().map(|(_, total)| *total).unwrap_or(0);
+        let mut edges = rows.into_iter().map(|(edge, _)| edge).collect::<Vec<_>>();
+        let mut skipped_by_edge_cap = 0usize;
+        if options.edge_scan_cap > 0 && total_candidates > options.edge_scan_cap {
+            skipped_by_edge_cap = total_candidates - options.edge_scan_cap;
+            edges.truncate(options.edge_scan_cap);
+        }
+        Ok(SemanticSeededNeighborhoodExpansion {
+            edges,
+            skipped_by_edge_cap,
+        })
     }
 
     fn paged_edges(
@@ -4059,6 +4208,47 @@ mod tests {
         );
         assert!(!ids.contains(&"aaa-code"));
         assert!(!ids.contains(&"mmm-stale"));
+    }
+
+    #[test]
+    fn sqlite_semantic_seeded_neighborhood_scores_before_sql_edge_cap() {
+        let store = SqliteGraphStore::in_memory().unwrap();
+        store
+            .upsert_node(&GraphNode::new("seed", "semantic_concept", "graph budget"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("zzz_high", "symbol", "high_signal"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("zzz_high", "seed", "mentions_concept"))
+            .unwrap();
+        for idx in 0..24 {
+            let id = format!("aaa_low_{idx:02}");
+            store
+                .upsert_node(&GraphNode::new(id.clone(), "note", format!("low {idx}")))
+                .unwrap();
+            store
+                .upsert_edge(&GraphEdge::new(id, "seed", "weak_link"))
+                .unwrap();
+        }
+
+        let options = SemanticSeededNeighborhoodOptions::new(1, 3)
+            .with_edge_scan_cap(16)
+            .with_node_discovery_cap(9);
+        let result = store
+            .semantic_seeded_neighborhood(&["seed".to_string()], &options)
+            .unwrap();
+        let ids = result
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], "seed");
+        assert_eq!(ids[1], "zzz_high");
+        assert_eq!(result.skipped_by_edge_cap, 9);
+        assert!(result.truncated);
     }
 
     #[test]

@@ -478,6 +478,52 @@ pub struct RankedNeighborhoodResult {
     pub total_discovered: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticSeededNeighborhoodOptions {
+    pub depth: usize,
+    pub limit: usize,
+    pub edge_scan_cap: usize,
+    pub node_discovery_cap: usize,
+}
+
+impl SemanticSeededNeighborhoodOptions {
+    pub fn new(depth: usize, limit: usize) -> Self {
+        Self {
+            depth,
+            limit,
+            edge_scan_cap: 0,
+            node_discovery_cap: usize::MAX,
+        }
+    }
+
+    pub fn with_edge_scan_cap(mut self, cap: usize) -> Self {
+        self.edge_scan_cap = cap;
+        self
+    }
+
+    pub fn with_node_discovery_cap(mut self, cap: usize) -> Self {
+        self.node_discovery_cap = cap;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticSeededNeighborhoodExpansion {
+    pub edges: Vec<GraphEdge>,
+    pub skipped_by_edge_cap: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticSeededNeighborhoodResult {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    pub skipped_by_edge_cap: usize,
+    pub skipped_by_node_cap: usize,
+    pub missing_seed_ids: Vec<String>,
+    pub total_discovered: usize,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GraphQueryPage {
     pub cursor: Option<String>,

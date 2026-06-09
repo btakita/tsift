@@ -8,6 +8,7 @@ pub use convex::{
 };
 pub use store::{
     GraphStore, apply_graph_edge_query_page, apply_graph_query_page, graph_semantic_cosine,
+    graph_semantic_seeded_edge_other_id, graph_semantic_seeded_edge_score,
     graph_semantic_top_candidates_by_property_scan, parse_graph_semantic_vector_property,
     shortest_path_using_outgoing,
 };
@@ -19,8 +20,10 @@ pub use types::{
     GraphFreshness, GraphNode, GraphPagedSubgraph, GraphPath, GraphProjection, GraphPropertyFilter,
     GraphProvenance, GraphQueryOptions, GraphQueryPage, GraphSemanticCandidate, GraphSubgraph,
     NeighborhoodScoring, PropertyMode, RankedNeighborhoodOptions, RankedNeighborhoodResult,
-    SQLITE_GRAPH_SCHEMA_VERSION, TerseGraphEdge, TerseGraphNode, TerseGraphSubgraph,
-    TerseHealthScore, TerseSearchHit, graph_edge_id, stable_graph_edge_id,
+    SQLITE_GRAPH_SCHEMA_VERSION, SemanticSeededNeighborhoodExpansion,
+    SemanticSeededNeighborhoodOptions, SemanticSeededNeighborhoodResult, TerseGraphEdge,
+    TerseGraphNode, TerseGraphSubgraph, TerseHealthScore, TerseSearchHit, graph_edge_id,
+    stable_graph_edge_id,
 };
 
 impl GraphProjection {
@@ -474,6 +477,47 @@ mod tests {
         );
         assert!(!ids.contains(&"aaa-code"));
         assert!(!ids.contains(&"mmm-stale"));
+    }
+
+    #[test]
+    fn semantic_seeded_neighborhood_scores_before_caps() {
+        let store = ConvexGraphStore::new(MemoryConvexGraphClient::default());
+        store
+            .upsert_node(&GraphNode::new("seed", "semantic_concept", "graph budget"))
+            .unwrap();
+        store
+            .upsert_node(&GraphNode::new("zzz_high", "symbol", "high_signal"))
+            .unwrap();
+        store
+            .upsert_edge(&GraphEdge::new("zzz_high", "seed", "mentions_concept"))
+            .unwrap();
+        for idx in 0..24 {
+            let id = format!("aaa_low_{idx:02}");
+            store
+                .upsert_node(&GraphNode::new(id.clone(), "note", format!("low {idx}")))
+                .unwrap();
+            store
+                .upsert_edge(&GraphEdge::new(id, "seed", "weak_link"))
+                .unwrap();
+        }
+
+        let options = SemanticSeededNeighborhoodOptions::new(1, 3)
+            .with_edge_scan_cap(16)
+            .with_node_discovery_cap(9);
+        let result = store
+            .semantic_seeded_neighborhood(&["seed".to_string()], &options)
+            .unwrap();
+        let ids = result
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], "seed");
+        assert_eq!(ids[1], "zzz_high");
+        assert!(result.skipped_by_edge_cap > 0);
+        assert!(result.truncated);
     }
 
     #[test]
