@@ -1,6 +1,6 @@
 [package]
 name = "tsift-summarize"
-version = "0.1.66"
+version = "0.1.67"
 edition = "2024"
 description = "Tsift cached LLM analysis — pre-computed summaries, entities, relationships, and snapshot-fallback reader"
 license = "MIT"
@@ -20,8 +20,8 @@ rusqlite = { version = "0.34", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", features = ["json"] }
-tsift-index = { path = "../tsift-index", version = "0.1.66" }
-tsift-sqlite = { path = "../tsift-sqlite", version = "0.1.66" }
+tsift-index = { path = "../tsift-index", version = "0.1.67" }
+tsift-sqlite = { path = "../tsift-sqlite", version = "0.1.67" }
 
 [dev-dependencies]
 tempfile = "3"
