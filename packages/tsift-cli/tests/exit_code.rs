@@ -9417,6 +9417,47 @@ fn session_cost_reports_prompt_cache_invalidation_diagnostics() {
 }
 
 #[test]
+fn session_cost_prompt_cache_fixture_passes_fail_under() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/real-session-prompt-cache-effectiveness.json");
+    assert!(
+        fixture_path.exists(),
+        "real-session prompt-cache fixture should exist at {}",
+        fixture_path.display()
+    );
+
+    let output = tsift_bin()
+        .args([
+            "session-cost",
+            "--fixture",
+            fixture_path.to_str().unwrap(),
+            "--fail-under",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "prompt-cache fixture should pass thresholds: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["pass"].as_bool().unwrap());
+    assert_eq!(json["totals"]["cases"], 2);
+    assert_eq!(json["totals"]["failed"], 0);
+    assert!(json["totals"]["net_cached_input_tokens"].as_i64().unwrap() > 100_000);
+    assert_eq!(json["totals"]["read_create_regressions"], 0);
+    assert!(
+        json["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|case| case["status"] == "pass")
+    );
+}
+
+#[test]
 fn session_cost_reads_codex_last_usage_when_cumulative_streams_interleave() {
     let input = concat!(
         r#"{"timestamp":"2026-05-05T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":10,"total_tokens":1050},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50,"reasoning_output_tokens":10,"total_tokens":1050}}}}"#,

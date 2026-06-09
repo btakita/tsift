@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -222,6 +222,63 @@ pub struct SessionCostReport {
     pub prompt_cache_plan: Option<SessionCostPromptCachePlan>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionCostPromptCacheEffectivenessFixture {
+    pub schema_version: u64,
+    #[serde(default)]
+    pub description: String,
+    pub cases: Vec<SessionCostPromptCacheEffectivenessCase>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionCostPromptCacheEffectivenessCase {
+    pub name: String,
+    pub source: String,
+    pub input_lines: Vec<String>,
+    pub minimum_cached_input_ratio: f64,
+    pub minimum_net_cached_input_tokens: i64,
+    pub maximum_read_create_regressions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SessionCostPromptCacheEffectivenessReport {
+    pub schema_version: u64,
+    pub pass: bool,
+    pub totals: SessionCostPromptCacheEffectivenessTotals,
+    pub cases: Vec<SessionCostPromptCacheEffectivenessCaseReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCostPromptCacheEffectivenessTotals {
+    pub cases: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub prompt_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub net_cached_input_tokens: i64,
+    pub read_create_regressions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SessionCostPromptCacheEffectivenessCaseReport {
+    pub name: String,
+    pub source: String,
+    pub status: String,
+    pub prompt_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_ratio: Option<f64>,
+    pub minimum_cached_input_ratio: f64,
+    pub net_cached_input_tokens: i64,
+    pub minimum_net_cached_input_tokens: i64,
+    pub read_create_regressions: usize,
+    pub maximum_read_create_regressions: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub failures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -450,6 +507,127 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
         guardrails,
         prompt_cache_plan,
         warnings: state.warnings,
+    })
+}
+
+pub fn build_prompt_cache_effectiveness_report(
+    fixture: &SessionCostPromptCacheEffectivenessFixture,
+) -> Result<SessionCostPromptCacheEffectivenessReport> {
+    if fixture.cases.is_empty() {
+        bail!("prompt-cache effectiveness fixture has no cases");
+    }
+
+    let mut cases = Vec::new();
+    let mut totals = SessionCostPromptCacheEffectivenessTotals {
+        cases: 0,
+        passed: 0,
+        failed: 0,
+        prompt_tokens: 0,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        net_cached_input_tokens: 0,
+        read_create_regressions: 0,
+    };
+
+    for case in &fixture.cases {
+        if case.input_lines.is_empty() {
+            bail!(
+                "prompt-cache fixture case `{}` has no input_lines",
+                case.name
+            );
+        }
+        let input = format!("{}\n", case.input_lines.join("\n"));
+        let report = compute(&input, Some(&case.source))
+            .map_err(|err| err.context(format!("evaluating prompt-cache fixture {}", case.name)))?;
+        let analytics = report
+            .prompt_cache_plan
+            .as_ref()
+            .and_then(|plan| plan.analytics.as_ref());
+        let net_cached_input_tokens = analytics.map_or(
+            signed_token_delta(
+                report.cached_input_tokens,
+                report.cache_creation_input_tokens,
+            ),
+            |analytics| analytics.net_cached_input_tokens,
+        );
+        let read_create_regressions = analytics.map_or(0, |analytics| {
+            analytics
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.kind == "read_create_regression")
+                .count()
+        });
+
+        let mut failures = Vec::new();
+        if report.prompt_cache_plan.is_none() {
+            failures.push("missing prompt_cache_plan".to_string());
+        }
+        if analytics.is_none() {
+            failures.push("missing prompt_cache_plan.analytics".to_string());
+        }
+        match report.cached_input_ratio {
+            Some(ratio) if ratio >= case.minimum_cached_input_ratio => {}
+            Some(ratio) => failures.push(format!(
+                "cached_input_ratio {:.2}% below required {:.2}%",
+                ratio, case.minimum_cached_input_ratio
+            )),
+            None => failures.push(format!(
+                "cached_input_ratio missing; required {:.2}%",
+                case.minimum_cached_input_ratio
+            )),
+        }
+        if net_cached_input_tokens < case.minimum_net_cached_input_tokens {
+            failures.push(format!(
+                "net_cached_input_tokens {} below required {}",
+                net_cached_input_tokens, case.minimum_net_cached_input_tokens
+            ));
+        }
+        if read_create_regressions > case.maximum_read_create_regressions {
+            failures.push(format!(
+                "read_create_regressions {} exceeded allowed {}",
+                read_create_regressions, case.maximum_read_create_regressions
+            ));
+        }
+
+        let status = if failures.is_empty() {
+            "pass".to_string()
+        } else {
+            "fail".to_string()
+        };
+        totals.cases += 1;
+        if status == "pass" {
+            totals.passed += 1;
+        } else {
+            totals.failed += 1;
+        }
+        totals.prompt_tokens += report.prompt_tokens;
+        totals.cached_input_tokens += report.cached_input_tokens;
+        totals.cache_creation_input_tokens += report.cache_creation_input_tokens;
+        totals.net_cached_input_tokens += net_cached_input_tokens;
+        totals.read_create_regressions += read_create_regressions;
+
+        cases.push(SessionCostPromptCacheEffectivenessCaseReport {
+            name: case.name.clone(),
+            source: report.source,
+            status,
+            prompt_tokens: report.prompt_tokens,
+            cached_input_tokens: report.cached_input_tokens,
+            cache_creation_input_tokens: report.cache_creation_input_tokens,
+            cached_input_ratio: report.cached_input_ratio,
+            minimum_cached_input_ratio: case.minimum_cached_input_ratio,
+            net_cached_input_tokens,
+            minimum_net_cached_input_tokens: case.minimum_net_cached_input_tokens,
+            read_create_regressions,
+            maximum_read_create_regressions: case.maximum_read_create_regressions,
+            failures,
+        });
+    }
+
+    Ok(SessionCostPromptCacheEffectivenessReport {
+        schema_version: fixture.schema_version,
+        pass: totals.failed == 0,
+        totals,
+        cases,
     })
 }
 
@@ -2382,6 +2560,68 @@ mod tests {
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == "read_create_regression" && diagnostic.message.contains("0.92x")
         }));
+    }
+
+    #[test]
+    fn prompt_cache_effectiveness_fixture_passes_thresholds() {
+        let fixture = SessionCostPromptCacheEffectivenessFixture {
+            schema_version: 1,
+            description: "fixture".to_string(),
+            cases: vec![SessionCostPromptCacheEffectivenessCase {
+                name: "warm-codex-prefix".to_string(),
+                source: "codex-jsonl".to_string(),
+                input_lines: vec![
+                    r#"{"timestamp":"2026-05-05T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":24000,"cached_input_tokens":23000,"output_tokens":300,"reasoning_output_tokens":100,"total_tokens":24300}}}}"#.to_string(),
+                    r#"{"timestamp":"2026-05-05T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50000,"cached_input_tokens":48000,"output_tokens":650,"reasoning_output_tokens":180,"total_tokens":50650}}}}"#.to_string(),
+                ],
+                minimum_cached_input_ratio: 90.0,
+                minimum_net_cached_input_tokens: 40_000,
+                maximum_read_create_regressions: 0,
+            }],
+        };
+
+        let report = build_prompt_cache_effectiveness_report(&fixture).unwrap();
+
+        assert!(report.pass);
+        assert_eq!(report.totals.passed, 1);
+        assert_eq!(report.totals.failed, 0);
+        assert_eq!(report.cases[0].status, "pass");
+        assert_eq!(report.cases[0].cached_input_ratio, Some(96.0));
+        assert_eq!(report.cases[0].net_cached_input_tokens, 48_000);
+        assert_eq!(report.cases[0].read_create_regressions, 0);
+    }
+
+    #[test]
+    fn prompt_cache_effectiveness_fixture_fails_read_create_regression() {
+        let fixture = SessionCostPromptCacheEffectivenessFixture {
+            schema_version: 1,
+            description: "fixture".to_string(),
+            cases: vec![SessionCostPromptCacheEffectivenessCase {
+                name: "cold-rewrite".to_string(),
+                source: "claude-jsonl".to_string(),
+                input_lines: vec![
+                    r#"{"timestamp":"2026-05-05T00:00:01Z","message":{"id":"msg-1","role":"assistant","usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":9000,"output_tokens":50}}}"#.to_string(),
+                    r#"{"timestamp":"2026-05-05T00:00:02Z","message":{"id":"msg-2","role":"assistant","usage":{"input_tokens":3000,"cache_creation_input_tokens":6000,"cache_read_input_tokens":1000,"output_tokens":50}}}"#.to_string(),
+                    r#"{"timestamp":"2026-05-05T00:00:03Z","message":{"id":"msg-3","role":"assistant","usage":{"input_tokens":3000,"cache_creation_input_tokens":6000,"cache_read_input_tokens":1000,"output_tokens":50}}}"#.to_string(),
+                ],
+                minimum_cached_input_ratio: 70.0,
+                minimum_net_cached_input_tokens: 1,
+                maximum_read_create_regressions: 0,
+            }],
+        };
+
+        let report = build_prompt_cache_effectiveness_report(&fixture).unwrap();
+
+        assert!(!report.pass);
+        assert_eq!(report.totals.failed, 1);
+        assert_eq!(report.cases[0].status, "fail");
+        assert_eq!(report.cases[0].read_create_regressions, 1);
+        assert!(
+            report.cases[0]
+                .failures
+                .iter()
+                .any(|failure| failure.contains("read_create_regressions"))
+        );
     }
 
     #[test]

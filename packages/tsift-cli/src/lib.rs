@@ -1335,10 +1335,14 @@ pub fn run() -> Result<()> {
         ),
         Some(Commands::SessionCost {
             input,
+            fixture,
+            fail_under,
             source,
             json,
         }) => cmd_session_cost(
             input.as_deref(),
+            fixture.as_deref(),
+            fail_under,
             source.as_deref(),
             OutputFormat {
                 json_output: json || terse || schema || envelope,
@@ -28406,11 +28410,45 @@ tier = "private"
             Some(Commands::SessionCost {
                 json,
                 input,
+                fixture,
+                fail_under,
                 source,
             }) => {
                 assert!(json);
                 assert_eq!(input, Some(PathBuf::from("target/session.jsonl")));
+                assert_eq!(fixture, None);
+                assert!(!fail_under);
                 assert_eq!(source.as_deref(), Some("codex-jsonl"));
+            }
+            _ => panic!("expected SessionCost command"),
+        }
+
+        let cli = parse_cli([
+            "tsift",
+            "session-cost",
+            "--fixture",
+            "fixtures/real-session-prompt-cache-effectiveness.json",
+            "--fail-under",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::SessionCost {
+                json,
+                input,
+                fixture,
+                fail_under,
+                source,
+            }) => {
+                assert!(json);
+                assert_eq!(input, None);
+                assert_eq!(
+                    fixture,
+                    Some(PathBuf::from(
+                        "fixtures/real-session-prompt-cache-effectiveness.json"
+                    ))
+                );
+                assert!(fail_under);
+                assert_eq!(source, None);
             }
             _ => panic!("expected SessionCost command"),
         }

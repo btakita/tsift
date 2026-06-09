@@ -695,9 +695,115 @@ pub(crate) fn cmd_session_digest(
 
 pub(crate) fn cmd_session_cost(
     input_path: Option<&Path>,
+    fixture_path: Option<&Path>,
+    fail_under: bool,
     source: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
+    if let Some(fixture_path) = fixture_path {
+        if input_path.is_some() || source.is_some() {
+            bail!("session-cost --fixture cannot be combined with --input or --source");
+        }
+        let fixture_body = fs::read_to_string(fixture_path)
+            .with_context(|| format!("reading prompt-cache fixture: {}", fixture_path.display()))?;
+        let fixture: session_cost::SessionCostPromptCacheEffectivenessFixture =
+            serde_json::from_str(&fixture_body).with_context(|| {
+                format!("parsing prompt-cache fixture: {}", fixture_path.display())
+            })?;
+        let report = session_cost::build_prompt_cache_effectiveness_report(&fixture)?;
+        if format.json_output {
+            println!(
+                "{}",
+                to_json_schema(
+                    &report,
+                    format.pretty,
+                    format.terse,
+                    format.ultra_terse,
+                    format.schema
+                )?
+            );
+        } else if format.compact {
+            println!(
+                "prompt-cache-effectiveness cases:{} passed:{} failed:{} net_cached:{} regressions:{} status:{}",
+                report.totals.cases,
+                report.totals.passed,
+                report.totals.failed,
+                report.totals.net_cached_input_tokens,
+                report.totals.read_create_regressions,
+                if report.pass { "pass" } else { "fail" }
+            );
+            for case in &report.cases {
+                let ratio = case
+                    .cached_input_ratio
+                    .map(|ratio| format!("{ratio:.2}%"))
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "prompt-cache-case {} status:{} ratio:{} min_ratio:{:.2}% net_cached:{} min_net:{} regressions:{}/{} failures:{}",
+                    case.name,
+                    case.status,
+                    ratio,
+                    case.minimum_cached_input_ratio,
+                    case.net_cached_input_tokens,
+                    case.minimum_net_cached_input_tokens,
+                    case.read_create_regressions,
+                    case.maximum_read_create_regressions,
+                    case.failures.len()
+                );
+            }
+        } else {
+            println!("Prompt cache effectiveness fixture");
+            println!("  cases:                  {}", report.totals.cases);
+            println!("  passed:                 {}", report.totals.passed);
+            println!("  failed:                 {}", report.totals.failed);
+            println!(
+                "  net cached input tokens: {}",
+                report.totals.net_cached_input_tokens
+            );
+            println!(
+                "  read/create regressions: {}",
+                report.totals.read_create_regressions
+            );
+            println!(
+                "  status:                 {}",
+                if report.pass { "pass" } else { "fail" }
+            );
+            for case in &report.cases {
+                println!();
+                println!("{} [{}]", case.name, case.status);
+                if let Some(ratio) = case.cached_input_ratio {
+                    println!(
+                        "  cached input ratio:     {ratio:.2}% (min {:.2}%)",
+                        case.minimum_cached_input_ratio
+                    );
+                } else {
+                    println!(
+                        "  cached input ratio:     missing (min {:.2}%)",
+                        case.minimum_cached_input_ratio
+                    );
+                }
+                println!(
+                    "  net cached input:       {} (min {})",
+                    case.net_cached_input_tokens, case.minimum_net_cached_input_tokens
+                );
+                println!(
+                    "  read/create regressions: {} (max {})",
+                    case.read_create_regressions, case.maximum_read_create_regressions
+                );
+                for failure in &case.failures {
+                    println!("  failure: {failure}");
+                }
+            }
+        }
+        if fail_under && !report.pass {
+            bail!("prompt-cache effectiveness threshold failed");
+        }
+        return Ok(());
+    }
+
+    if fail_under {
+        bail!("session-cost --fail-under requires --fixture");
+    }
+
     let input = match input_path {
         Some(file_path) => fs::read_to_string(file_path)
             .with_context(|| format!("reading session-cost input: {}", file_path.display()))?,

@@ -917,6 +917,12 @@ pub enum Commands {
         /// Read session transcript or agent-doc log input from a file instead of stdin
         #[arg(long)]
         input: Option<PathBuf>,
+        /// Run a prompt-cache effectiveness fixture instead of one transcript/log
+        #[arg(long)]
+        fixture: Option<PathBuf>,
+        /// Exit non-zero when a prompt-cache fixture case misses its thresholds
+        #[arg(long)]
+        fail_under: bool,
         /// Force the input source (`claude-jsonl`, `codex-jsonl`, or `agent-doc-log`)
         #[arg(long)]
         source: Option<String>,
