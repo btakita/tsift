@@ -78,6 +78,8 @@ pub(crate) struct SessionReviewNextTokenAction {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) restart_command: Option<String>,
     pub(crate) digest_commands: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) rewrite_commands: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -439,6 +441,9 @@ fn build_next_token_actions(
             let restart_command = doc_command_target
                 .as_ref()
                 .map(|target| format!("agent-doc start {target}"));
+            let digest_commands = token_action_digest_commands(&target);
+            let rewrite_commands =
+                guardrail_rewrite_commands(report, &guardrail.kind, &target, max_items);
             Some(SessionReviewNextTokenAction {
                 priority,
                 kind: guardrail.kind.clone(),
@@ -447,15 +452,17 @@ fn build_next_token_actions(
                 guidance: truncate_for_budget(&guardrail.guidance, max_bytes),
                 compact_command,
                 restart_command,
-                digest_commands: vec![
-                    format!(
-                        "tsift --envelope session-review {target} --next-context --budget normal"
-                    ),
-                    format!("tsift --envelope context-pack {target} --budget normal"),
-                ],
+                digest_commands,
+                rewrite_commands,
             })
         })
         .collect::<Vec<_>>();
+    if let Some(action) = repeated_raw_read_action(report, &target, max_items, max_bytes) {
+        actions.push(action);
+    }
+    if let Some(action) = repeated_command_bundle_action(report, &target, max_items, max_bytes) {
+        actions.push(action);
+    }
     actions.sort_by(|left, right| {
         left.priority
             .cmp(&right.priority)
@@ -470,10 +477,249 @@ fn token_action_priority(kind: &str) -> Option<usize> {
     match kind {
         "prompt_budget" => Some(1),
         "cache_resend" => Some(2),
-        "restart_loop" => Some(3),
-        "noop_closeout" => Some(4),
+        "repeated_raw_read" => Some(3),
+        "repeated_command_bundle" => Some(4),
+        "restart_loop" => Some(5),
+        "noop_closeout" => Some(6),
         _ => None,
     }
+}
+
+fn token_action_digest_commands(target: &str) -> Vec<String> {
+    vec![
+        format!("tsift --envelope session-review {target} --next-context --budget normal"),
+        format!("tsift --envelope context-pack {target} --budget normal"),
+    ]
+}
+
+fn guardrail_rewrite_commands(
+    report: &session_review::SessionReviewReport,
+    kind: &str,
+    target: &str,
+    max_items: usize,
+) -> Vec<String> {
+    let limit = max_items.max(1);
+    let mut commands = Vec::new();
+    let mut seen = BTreeSet::new();
+    match kind {
+        "prompt_budget" | "cache_resend" => {
+            push_unique_command(
+                &mut commands,
+                &mut seen,
+                format!("tsift --envelope context-pack {target} --budget normal"),
+                limit,
+            );
+            push_unique_command(
+                &mut commands,
+                &mut seen,
+                format!("tsift --envelope session-review {target} --next-context --budget normal"),
+                limit,
+            );
+        }
+        "restart_loop" | "noop_closeout" => {
+            push_unique_command(
+                &mut commands,
+                &mut seen,
+                format!("tsift --envelope session-review {target} --next-context --budget normal"),
+                limit,
+            );
+            push_unique_command(
+                &mut commands,
+                &mut seen,
+                format!("tsift --envelope context-pack {target} --budget normal"),
+                limit,
+            );
+        }
+        _ => {}
+    }
+    if matches!(kind, "prompt_budget" | "cache_resend") {
+        for command in repeated_raw_read_commands(report, limit) {
+            push_unique_command(&mut commands, &mut seen, command, limit);
+        }
+    }
+    if matches!(kind, "prompt_budget" | "restart_loop") {
+        for command in repeated_command_bundle_rewrite_commands(report, limit) {
+            push_unique_command(&mut commands, &mut seen, command, limit);
+        }
+    }
+    commands
+}
+
+fn repeated_raw_read_action(
+    report: &session_review::SessionReviewReport,
+    target: &str,
+    max_items: usize,
+    max_bytes: usize,
+) -> Option<SessionReviewNextTokenAction> {
+    if report.file_read_diagnostics.is_empty() {
+        return None;
+    }
+    let rewrite_commands = repeated_raw_read_commands(report, max_items.max(1));
+    if rewrite_commands.is_empty() {
+        return None;
+    }
+    Some(SessionReviewNextTokenAction {
+        priority: token_action_priority("repeated_raw_read").expect("known token action"),
+        kind: "repeated_raw_read".to_string(),
+        severity: "warn".to_string(),
+        message: truncate_for_budget(
+            &format!(
+                "repeated raw file reads detected across {} path/range group(s)",
+                report.file_read_diagnostics.len()
+            ),
+            max_bytes,
+        ),
+        guidance: truncate_for_budget(
+            "run the listed tsift rewrite/source-read commands instead of repeating cat/head/tail/sed or raw transcript/log reads",
+            max_bytes,
+        ),
+        compact_command: None,
+        restart_command: None,
+        digest_commands: token_action_digest_commands(target),
+        rewrite_commands,
+    })
+}
+
+fn repeated_command_bundle_action(
+    report: &session_review::SessionReviewReport,
+    target: &str,
+    max_items: usize,
+    max_bytes: usize,
+) -> Option<SessionReviewNextTokenAction> {
+    let bundle_count = report
+        .loop_clusters
+        .iter()
+        .filter(|cluster| cluster.kind == "command_bundle")
+        .count();
+    if bundle_count == 0 {
+        return None;
+    }
+    let rewrite_commands = repeated_command_bundle_rewrite_commands(report, max_items.max(1));
+    if rewrite_commands.is_empty() {
+        return None;
+    }
+    Some(SessionReviewNextTokenAction {
+        priority: token_action_priority("repeated_command_bundle").expect("known token action"),
+        kind: "repeated_command_bundle".to_string(),
+        severity: "warn".to_string(),
+        message: truncate_for_budget(
+            &format!("repeated command bundles detected across {bundle_count} cluster(s)"),
+            max_bytes,
+        ),
+        guidance: truncate_for_budget(
+            "run the listed tsift rewrite commands before repeating broad searches, raw reads, or verbose test/build commands",
+            max_bytes,
+        ),
+        compact_command: None,
+        restart_command: None,
+        digest_commands: token_action_digest_commands(target),
+        rewrite_commands,
+    })
+}
+
+fn repeated_raw_read_commands(
+    report: &session_review::SessionReviewReport,
+    limit: usize,
+) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut seen = BTreeSet::new();
+    for diagnostic in &report.file_read_diagnostics {
+        if let Some(raw_read) = raw_read_command_for_diagnostic(&diagnostic.path, &diagnostic.range)
+        {
+            push_unique_command(
+                &mut commands,
+                &mut seen,
+                format!("tsift rewrite --run {}", shell_quote(&raw_read)),
+                limit,
+            );
+        }
+        for command in &diagnostic.follow_up_commands {
+            push_unique_command(
+                &mut commands,
+                &mut seen,
+                normalize_file_read_follow_up_command(command),
+                limit,
+            );
+        }
+        if commands.len() >= limit {
+            break;
+        }
+    }
+    commands
+}
+
+fn repeated_command_bundle_rewrite_commands(
+    report: &session_review::SessionReviewReport,
+    limit: usize,
+) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut seen = BTreeSet::new();
+    for cluster in report
+        .loop_clusters
+        .iter()
+        .filter(|cluster| cluster.kind == "command_bundle")
+    {
+        for command in split_command_bundle_label(&cluster.label) {
+            push_unique_command(
+                &mut commands,
+                &mut seen,
+                format!("tsift rewrite --run {}", shell_quote(&command)),
+                limit,
+            );
+        }
+        if commands.len() >= limit {
+            break;
+        }
+    }
+    commands
+}
+
+fn push_unique_command(
+    commands: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    command: String,
+    limit: usize,
+) {
+    if commands.len() < limit && seen.insert(command.clone()) {
+        commands.push(command);
+    }
+}
+
+fn normalize_file_read_follow_up_command(command: &str) -> String {
+    command
+        .strip_prefix("tsift source-read ")
+        .map(|rest| format!("tsift --envelope source-read {rest}"))
+        .unwrap_or_else(|| command.to_string())
+}
+
+fn split_command_bundle_label(label: &str) -> Vec<String> {
+    label
+        .split(" -> ")
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn raw_read_command_for_diagnostic(path: &str, range: &str) -> Option<String> {
+    let path = shell_quote(path);
+    if range == "full" {
+        return Some(format!("cat {path}"));
+    }
+    if let Some(lines) = range.strip_prefix("head:") {
+        return Some(format!("head -n {lines} {path}"));
+    }
+    if let Some(lines) = range
+        .strip_prefix("tail:")
+        .or_else(|| range.strip_prefix("window:"))
+    {
+        return Some(format!("tail -n {lines} {path}"));
+    }
+    let (start, end) = range.split_once('-')?;
+    if start.chars().all(|ch| ch.is_ascii_digit()) && end.chars().all(|ch| ch.is_ascii_digit()) {
+        return Some(format!("sed -n {start},{end}p {path}"));
+    }
+    None
 }
 
 pub(crate) fn print_session_review_budget_human(report: &SessionReviewBudgetReport) {
@@ -621,6 +867,9 @@ pub(crate) fn print_session_review_next_context_budget_human(
         }
         for command in &action.digest_commands {
             println!("token-action-command {} digest {}", action.kind, command);
+        }
+        for command in &action.rewrite_commands {
+            println!("token-action-command {} rewrite {}", action.kind, command);
         }
     }
     if let Some(queue) = &report.agent_doc_queue {

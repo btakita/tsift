@@ -1440,6 +1440,7 @@ pub(crate) fn print_context_pack_human(report: &ContextPackReport, compact: bool
                 action.priority,
                 action.kind,
                 action.digest_commands.len()
+                    + action.rewrite_commands.len()
                     + usize::from(action.compact_command.is_some())
                     + usize::from(action.restart_command.is_some())
             );
@@ -1618,6 +1619,9 @@ pub(crate) fn print_context_pack_human(report: &ContextPackReport, compact: bool
             }
             for command in &action.digest_commands {
                 println!("    digest: {command}");
+            }
+            for command in &action.rewrite_commands {
+                println!("    rewrite: {command}");
             }
         }
     }

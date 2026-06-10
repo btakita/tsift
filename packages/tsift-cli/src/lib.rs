@@ -29821,8 +29821,23 @@ fn sample() {}
                     guidance: "avoid reopening without new edits".to_string(),
                 },
             ],
-            loop_clusters: vec![],
-            file_read_diagnostics: vec![],
+            loop_clusters: vec![session_cost::SessionCostLoopCluster {
+                kind: "command_bundle".to_string(),
+                label: "cargo test -> cargo build --release".to_string(),
+                occurrences: 2,
+                max_consecutive: 2,
+            }],
+            file_read_diagnostics: vec![session_cost::SessionCostFileReadDiagnostic {
+                path: "src/lib.rs".to_string(),
+                range: "12-40".to_string(),
+                occurrences: 3,
+                estimated_tokens: 1200,
+                duplicate_estimated_tokens: 800,
+                follow_up_commands: vec![
+                    "tsift source-read src/lib.rs --start 12 --lines 29 --budget normal"
+                        .to_string(),
+                ],
+            }],
             prompt_targets: vec![
                 session_review::SessionReviewPromptTarget {
                     text: "do one".to_string(),
@@ -29960,7 +29975,7 @@ fn sample() {}
 
         let full_action_report = build_session_review_next_context_budget_report(
             &report,
-            ResponseBudget::new(Some(4), Some(120)),
+            ResponseBudget::new(Some(6), Some(120)),
             None,
         );
         assert_eq!(
@@ -29972,6 +29987,8 @@ fn sample() {}
             vec![
                 "prompt_budget",
                 "cache_resend",
+                "repeated_raw_read",
+                "repeated_command_bundle",
                 "restart_loop",
                 "noop_closeout"
             ]
@@ -29994,6 +30011,37 @@ fn sample() {}
                 .iter()
                 .any(|command| command
                     == "tsift --envelope context-pack \"tasks/software/tsift.md\" --budget normal")
+        );
+        let raw_read_action = full_action_report
+            .next_token_actions
+            .iter()
+            .find(|action| action.kind == "repeated_raw_read")
+            .expect("raw read action");
+        assert!(
+            raw_read_action.rewrite_commands.iter().any(
+                |command| command == "tsift rewrite --run \"sed -n 12,40p \\\"src/lib.rs\\\"\""
+            ),
+            "raw read rewrite commands: {:?}",
+            raw_read_action.rewrite_commands
+        );
+        assert!(raw_read_action.rewrite_commands.iter().any(|command| command
+        == "tsift --envelope source-read src/lib.rs --start 12 --lines 29 --budget normal"));
+        let command_bundle_action = full_action_report
+            .next_token_actions
+            .iter()
+            .find(|action| action.kind == "repeated_command_bundle")
+            .expect("command bundle action");
+        assert!(
+            command_bundle_action
+                .rewrite_commands
+                .iter()
+                .any(|command| command == "tsift rewrite --run \"cargo test\"")
+        );
+        assert!(
+            command_bundle_action
+                .rewrite_commands
+                .iter()
+                .any(|command| command == "tsift rewrite --run \"cargo build --release\"")
         );
     }
 

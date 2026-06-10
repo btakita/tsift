@@ -10952,6 +10952,43 @@ fn session_review_json_surfaces_loop_clusters() {
             && cluster["label"] == "commit_already_current"
             && cluster["occurrences"] == 3
     }));
+
+    let next_context_output = tsift_bin()
+        .args([
+            "--envelope",
+            "session-review",
+            "--next-context",
+            "--json",
+            target.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        next_context_output.status.success(),
+        "session-review --next-context should succeed"
+    );
+    let next_context_json: serde_json::Value =
+        serde_json::from_slice(&next_context_output.stdout).unwrap();
+    let next_context_report = next_context_json
+        .get("report")
+        .unwrap_or(&next_context_json);
+    let actions = next_context_report["next_token_actions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing next_token_actions in {next_context_json}"));
+    let command_bundle_action = actions
+        .iter()
+        .find(|action| action["kind"] == "repeated_command_bundle")
+        .unwrap_or_else(|| panic!("missing repeated_command_bundle action in {next_context_json}"));
+    let rewrite_commands = command_bundle_action["rewrite_commands"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing rewrite_commands in {next_context_json}"));
+    assert!(
+        rewrite_commands
+            .iter()
+            .any(|command| command.as_str() == Some("tsift rewrite --run \"cargo test\"")),
+        "expected cargo test rewrite command in {next_context_json}"
+    );
 }
 
 #[test]
