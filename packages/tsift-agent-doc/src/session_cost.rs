@@ -12,6 +12,7 @@ const MAX_LOOP_CLUSTERS: usize = 8;
 const MAX_FILE_READ_DIAGNOSTICS: usize = 8;
 const MAX_PROMPT_CACHE_TIMELINE: usize = 8;
 const MAX_PROMPT_CACHE_DIAGNOSTICS: usize = 6;
+const MAX_PROMPT_CACHE_PREFIX_DRIFT: usize = 6;
 const MAX_PROMPT_CACHE_BREAKPOINTS: usize = 8;
 const MAX_COMMANDS_PER_BUNDLE: usize = 6;
 const PROMPT_BUDGET_WARN_TOKENS: u64 = 100_000;
@@ -148,6 +149,9 @@ pub struct SessionCostPromptCacheAnalytics {
     pub cache_read_to_creation_ratio: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub diagnostics: Vec<SessionCostPromptCacheDiagnostic>,
+    pub prefix_drift_truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub prefix_drift: Vec<SessionCostPromptCachePrefixDrift>,
     pub timeline: Vec<SessionCostPromptCacheTimelineEntry>,
 }
 
@@ -159,6 +163,29 @@ pub struct SessionCostPromptCacheDiagnostic {
     pub message: String,
     pub likely_causes: Vec<String>,
     pub guidance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCostPromptCachePrefixDrift {
+    pub previous_label: String,
+    pub current_label: String,
+    pub trigger: String,
+    pub severity: String,
+    pub first_changed_field: String,
+    pub field_changes: Vec<SessionCostPromptCacheFieldChange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_ratio_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_ratio_after: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_ratio: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCostPromptCacheFieldChange {
+    pub field: String,
+    pub previous: String,
+    pub current: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1099,6 +1126,7 @@ fn derive_prompt_cache_analytics(
         )
     });
     let timeline = prompt_cache_timeline(usage_turns);
+    let (prefix_drift, prefix_drift_truncated) = derive_prompt_cache_prefix_drift(usage_turns);
     let diagnostics = derive_prompt_cache_diagnostics(
         usage_turns,
         cached_input_tokens,
@@ -1123,6 +1151,8 @@ fn derive_prompt_cache_analytics(
         cached_input_ratio_delta: ratio_delta.map(format_signed_percent),
         cache_read_to_creation_ratio,
         diagnostics,
+        prefix_drift_truncated,
+        prefix_drift,
         timeline,
     })
 }
@@ -1148,21 +1178,39 @@ fn derive_prompt_cache_diagnostics(
         };
         let drop = previous_ratio - current_ratio;
         if drop >= PROMPT_CACHE_RATIO_DROP_WARN_PERCENT {
+            let first_changed_field = prompt_cache_first_changed_field(previous, current);
+            let drift_suffix = first_changed_field
+                .as_ref()
+                .map(|change| format!("; first changed prompt-cache field: {}", change.field))
+                .unwrap_or_else(|| {
+                    "; no prompt-cache metadata field changed between adjacent turns".to_string()
+                });
+            let mut likely_causes = vec![
+                "stable prefix bytes changed before the cache boundary".to_string(),
+                "prompt_cache_key or thread/session id changed".to_string(),
+                "replica-local cache affinity was lost".to_string(),
+            ];
+            if let Some(change) = first_changed_field {
+                likely_causes.insert(
+                    0,
+                    format!(
+                        "first changed prompt-cache field: {} ({} -> {})",
+                        change.field, change.previous, change.current
+                    ),
+                );
+            }
             diagnostics.push(SessionCostPromptCacheDiagnostic {
                 kind: "cached_ratio_drop".to_string(),
                 severity: "warn".to_string(),
                 label: current.label.clone(),
                 message: format!(
-                    "cached input ratio dropped from {} to {} at {}",
+                    "cached input ratio dropped from {} to {} at {}{}",
                     format_percent(previous_ratio),
                     format_percent(current_ratio),
-                    current.label
+                    current.label,
+                    drift_suffix
                 ),
-                likely_causes: vec![
-                    "stable prefix bytes changed before the cache boundary".to_string(),
-                    "prompt_cache_key or thread/session id changed".to_string(),
-                    "replica-local cache affinity was lost".to_string(),
-                ],
+                likely_causes,
                 guidance:
                     "compare the prefix, tool set, cache key, compaction boundary, and routing between the previous turn and this turn"
                         .to_string(),
@@ -1170,7 +1218,7 @@ fn derive_prompt_cache_diagnostics(
         }
     }
 
-    for turn in usage_turns {
+    for (index, turn) in usage_turns.iter().enumerate() {
         let Some(creation_ratio) =
             percent_ratio(turn.cache_creation_input_tokens, turn.prompt_tokens)
         else {
@@ -1179,22 +1227,42 @@ fn derive_prompt_cache_diagnostics(
         if turn.cache_creation_input_tokens > 0
             && creation_ratio >= PROMPT_CACHE_CREATION_SPIKE_WARN_PERCENT
         {
+            let first_changed_field = index
+                .checked_sub(1)
+                .and_then(|previous_index| usage_turns.get(previous_index))
+                .and_then(|previous| prompt_cache_first_changed_field(previous, turn));
+            let drift_suffix = first_changed_field
+                .as_ref()
+                .map(|change| format!("; first changed prompt-cache field: {}", change.field))
+                .unwrap_or_else(|| {
+                    "; no adjacent prompt-cache metadata drift was detected".to_string()
+                });
+            let mut likely_causes = vec![
+                "provider created a fresh cached prefix instead of reusing the warm prefix"
+                    .to_string(),
+                "system, developer, or tool block changed before the cache boundary".to_string(),
+                "compaction or transient instructions entered the cached prefix".to_string(),
+            ];
+            if let Some(change) = first_changed_field {
+                likely_causes.insert(
+                    0,
+                    format!(
+                        "first changed prompt-cache field: {} ({} -> {})",
+                        change.field, change.previous, change.current
+                    ),
+                );
+            }
             diagnostics.push(SessionCostPromptCacheDiagnostic {
                 kind: "cache_creation_spike".to_string(),
                 severity: "warn".to_string(),
                 label: turn.label.clone(),
                 message: format!(
-                    "cache creation was {} of prompt tokens at {}",
+                    "cache creation was {} of prompt tokens at {}{}",
                     format_percent(creation_ratio),
-                    turn.label
+                    turn.label,
+                    drift_suffix
                 ),
-                likely_causes: vec![
-                    "provider created a fresh cached prefix instead of reusing the warm prefix"
-                        .to_string(),
-                    "system, developer, or tool block changed before the cache boundary"
-                        .to_string(),
-                    "compaction or transient instructions entered the cached prefix".to_string(),
-                ],
+                likely_causes,
                 guidance:
                     "inspect the cached prefix and provider breakpoint placement for this turn before treating the cache as effective"
                         .to_string(),
@@ -1226,6 +1294,168 @@ fn derive_prompt_cache_diagnostics(
 
     diagnostics.truncate(MAX_PROMPT_CACHE_DIAGNOSTICS);
     diagnostics
+}
+
+fn derive_prompt_cache_prefix_drift(
+    usage_turns: &[SessionCostTurn],
+) -> (Vec<SessionCostPromptCachePrefixDrift>, bool) {
+    let mut drift = Vec::new();
+
+    for pair in usage_turns.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        let field_changes = prompt_cache_field_changes(previous, current);
+        let Some(first_changed_field) = field_changes.first().map(|change| change.field.clone())
+        else {
+            continue;
+        };
+
+        let ratio_drop = prompt_cache_ratio_drop_triggered(previous, current);
+        let creation_spike = prompt_cache_creation_spike_triggered(current);
+        let trigger = match (ratio_drop, creation_spike) {
+            (true, true) => "cached_ratio_drop_and_cache_creation_spike",
+            (true, false) => "cached_ratio_drop",
+            (false, true) => "cache_creation_spike",
+            (false, false) => "metadata_drift",
+        };
+
+        drift.push(SessionCostPromptCachePrefixDrift {
+            previous_label: previous.label.clone(),
+            current_label: current.label.clone(),
+            trigger: trigger.to_string(),
+            severity: if ratio_drop || creation_spike {
+                "warn".to_string()
+            } else {
+                "info".to_string()
+            },
+            first_changed_field,
+            field_changes,
+            cached_input_ratio_before: percent_ratio(
+                previous.cached_input_tokens,
+                previous.prompt_tokens,
+            )
+            .map(format_percent),
+            cached_input_ratio_after: percent_ratio(
+                current.cached_input_tokens,
+                current.prompt_tokens,
+            )
+            .map(format_percent),
+            cache_creation_ratio: percent_ratio(
+                current.cache_creation_input_tokens,
+                current.prompt_tokens,
+            )
+            .map(format_percent),
+        });
+    }
+
+    let truncated = drift.len() > MAX_PROMPT_CACHE_PREFIX_DRIFT;
+    drift.truncate(MAX_PROMPT_CACHE_PREFIX_DRIFT);
+    (drift, truncated)
+}
+
+fn prompt_cache_ratio_drop_triggered(
+    previous: &SessionCostTurn,
+    current: &SessionCostTurn,
+) -> bool {
+    let Some(previous_ratio) = percent_ratio(previous.cached_input_tokens, previous.prompt_tokens)
+    else {
+        return false;
+    };
+    let Some(current_ratio) = percent_ratio(current.cached_input_tokens, current.prompt_tokens)
+    else {
+        return false;
+    };
+    previous_ratio - current_ratio >= PROMPT_CACHE_RATIO_DROP_WARN_PERCENT
+}
+
+fn prompt_cache_creation_spike_triggered(turn: &SessionCostTurn) -> bool {
+    turn.cache_creation_input_tokens > 0
+        && percent_ratio(turn.cache_creation_input_tokens, turn.prompt_tokens)
+            .is_some_and(|ratio| ratio >= PROMPT_CACHE_CREATION_SPIKE_WARN_PERCENT)
+}
+
+fn prompt_cache_first_changed_field(
+    previous: &SessionCostTurn,
+    current: &SessionCostTurn,
+) -> Option<SessionCostPromptCacheFieldChange> {
+    prompt_cache_field_changes(previous, current)
+        .into_iter()
+        .next()
+}
+
+fn prompt_cache_field_changes(
+    previous: &SessionCostTurn,
+    current: &SessionCostTurn,
+) -> Vec<SessionCostPromptCacheFieldChange> {
+    let Some(previous) = previous.prompt_cache_metadata.as_ref() else {
+        return Vec::new();
+    };
+    let Some(current) = current.prompt_cache_metadata.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut changes = Vec::new();
+    push_prompt_cache_field_change(
+        &mut changes,
+        "stable_prefix_fingerprint",
+        &previous.stable_prefix_fingerprint,
+        &current.stable_prefix_fingerprint,
+    );
+    push_prompt_cache_field_change(
+        &mut changes,
+        "cache_key",
+        &prompt_cache_optional_value(previous.cache_key.as_deref()),
+        &prompt_cache_optional_value(current.cache_key.as_deref()),
+    );
+    push_prompt_cache_field_change(
+        &mut changes,
+        "breakpoints",
+        &prompt_cache_breakpoint_value(&previous.breakpoints),
+        &prompt_cache_breakpoint_value(&current.breakpoints),
+    );
+    push_prompt_cache_field_change(
+        &mut changes,
+        "routing_affinity",
+        &prompt_cache_optional_value(previous.routing_affinity.as_deref()),
+        &prompt_cache_optional_value(current.routing_affinity.as_deref()),
+    );
+    push_prompt_cache_field_change(
+        &mut changes,
+        "provider",
+        &previous.provider,
+        &current.provider,
+    );
+    changes
+}
+
+fn push_prompt_cache_field_change(
+    changes: &mut Vec<SessionCostPromptCacheFieldChange>,
+    field: &str,
+    previous: &str,
+    current: &str,
+) {
+    if previous != current {
+        changes.push(SessionCostPromptCacheFieldChange {
+            field: field.to_string(),
+            previous: previous.to_string(),
+            current: current.to_string(),
+        });
+    }
+}
+
+fn prompt_cache_optional_value(value: Option<&str>) -> String {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("-")
+        .to_string()
+}
+
+fn prompt_cache_breakpoint_value(breakpoints: &[String]) -> String {
+    if breakpoints.is_empty() {
+        "-".to_string()
+    } else {
+        breakpoints.join("; ")
+    }
 }
 
 fn prompt_cache_timeline(
@@ -3166,6 +3396,59 @@ mod tests {
         }));
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == "read_create_regression" && diagnostic.message.contains("0.92x")
+        }));
+    }
+
+    #[test]
+    fn prompt_cache_prefix_drift_points_regressions_at_first_changed_field() {
+        let input = concat!(
+            r#"{"timestamp":"2026-05-05T00:00:01Z","provider":"anthropic","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","message":{"id":"msg-1","role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}],"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":9000,"output_tokens":50}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:02Z","provider":"openai","prompt_cache_key":"agent-doc:tsift-cold","routing_affinity":"replica-b","stable_prefix":"agent-doc stable prefix v2","message":{"id":"msg-2","role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"persistent"}}],"usage":{"input_tokens":3000,"cache_creation_input_tokens":6000,"cache_read_input_tokens":1000,"output_tokens":50}}}"#,
+            "\n",
+        );
+
+        let report = compute(input, Some("claude-jsonl")).unwrap();
+        let analytics = report
+            .prompt_cache_plan
+            .as_ref()
+            .and_then(|plan| plan.analytics.as_ref())
+            .expect("prompt cache analytics should be present");
+
+        assert_eq!(analytics.prefix_drift.len(), 1);
+        let drift = &analytics.prefix_drift[0];
+        assert_eq!(drift.trigger, "cached_ratio_drop_and_cache_creation_spike");
+        assert_eq!(drift.severity, "warn");
+        assert_eq!(drift.first_changed_field, "stable_prefix_fingerprint");
+        assert_eq!(drift.cached_input_ratio_before.as_deref(), Some("90.00%"));
+        assert_eq!(drift.cached_input_ratio_after.as_deref(), Some("10.00%"));
+        assert_eq!(drift.cache_creation_ratio.as_deref(), Some("60.00%"));
+        for field in [
+            "stable_prefix_fingerprint",
+            "cache_key",
+            "breakpoints",
+            "routing_affinity",
+            "provider",
+        ] {
+            assert!(
+                drift
+                    .field_changes
+                    .iter()
+                    .any(|change| change.field == field),
+                "expected drift field {field}"
+            );
+        }
+        assert!(analytics.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == "cached_ratio_drop"
+                && diagnostic
+                    .message
+                    .contains("first changed prompt-cache field: stable_prefix_fingerprint")
+        }));
+        assert!(analytics.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == "cache_creation_spike"
+                && diagnostic.likely_causes.iter().any(|cause| {
+                    cause.contains("first changed prompt-cache field: stable_prefix_fingerprint")
+                })
         }));
     }
 

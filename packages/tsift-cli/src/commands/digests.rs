@@ -709,6 +709,23 @@ fn human_prompt_cache_breakpoints(breakpoints: &[String]) -> String {
     }
 }
 
+fn compact_prompt_cache_field_changes(
+    changes: &[session_cost::SessionCostPromptCacheFieldChange],
+) -> String {
+    if changes.is_empty() {
+        "-".to_string()
+    } else {
+        truncate_for_compact(
+            &changes
+                .iter()
+                .map(|change| change.field.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            120,
+        )
+    }
+}
+
 pub(crate) fn cmd_session_cost(
     input_path: Option<&Path>,
     fixture_path: Option<&Path>,
@@ -961,6 +978,20 @@ pub(crate) fn cmd_session_cost(
                         truncate_for_compact(&diagnostic.message, 100)
                     );
                 }
+                for drift in &analytics.prefix_drift {
+                    println!(
+                        "prompt-cache-prefix-drift {} {} {}->{} first_changed:{} changes:{} cache_ratio:{}->{} creation:{}",
+                        drift.severity,
+                        drift.trigger,
+                        truncate_for_compact(&drift.previous_label, 60),
+                        truncate_for_compact(&drift.current_label, 60),
+                        drift.first_changed_field,
+                        compact_prompt_cache_field_changes(&drift.field_changes),
+                        drift.cached_input_ratio_before.as_deref().unwrap_or("-"),
+                        drift.cached_input_ratio_after.as_deref().unwrap_or("-"),
+                        drift.cache_creation_ratio.as_deref().unwrap_or("-")
+                    );
+                }
                 for turn in &analytics.timeline {
                     if let Some(metadata) = &turn.prompt_cache_metadata {
                         println!(
@@ -1179,6 +1210,28 @@ pub(crate) fn cmd_session_cost(
                 );
                 println!("      likely: {}", diagnostic.likely_causes.join("; "));
                 println!("      guidance: {}", diagnostic.guidance);
+            }
+            for drift in &analytics.prefix_drift {
+                println!(
+                    "    prefix drift [{}:{}] {} -> {}: first changed {} | cache_ratio {} -> {} | creation {}",
+                    drift.severity,
+                    drift.trigger,
+                    drift.previous_label,
+                    drift.current_label,
+                    drift.first_changed_field,
+                    drift.cached_input_ratio_before.as_deref().unwrap_or("-"),
+                    drift.cached_input_ratio_after.as_deref().unwrap_or("-"),
+                    drift.cache_creation_ratio.as_deref().unwrap_or("-")
+                );
+                for change in &drift.field_changes {
+                    println!(
+                        "      {}: {} -> {}",
+                        change.field, change.previous, change.current
+                    );
+                }
+            }
+            if analytics.prefix_drift_truncated {
+                println!("    prefix drift truncated");
             }
         }
         for adapter in &plan.provider_adapters {

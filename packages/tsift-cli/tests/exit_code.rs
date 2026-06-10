@@ -9406,11 +9406,11 @@ fn session_cost_recommends_prompt_cache_for_large_uncached_prompt() {
 #[test]
 fn session_cost_reports_prompt_cache_invalidation_diagnostics() {
     let input = concat!(
-        r#"{"timestamp":"2026-05-05T00:00:01Z","message":{"id":"msg-1","role":"assistant","usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":9000,"output_tokens":50}}}"#,
+        r#"{"timestamp":"2026-05-05T00:00:01Z","provider":"anthropic","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","message":{"id":"msg-1","role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}],"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":9000,"output_tokens":50}}}"#,
         "\n",
-        r#"{"timestamp":"2026-05-05T00:00:02Z","message":{"id":"msg-2","role":"assistant","usage":{"input_tokens":3000,"cache_creation_input_tokens":6000,"cache_read_input_tokens":1000,"output_tokens":50}}}"#,
+        r#"{"timestamp":"2026-05-05T00:00:02Z","provider":"anthropic","prompt_cache_key":"agent-doc:tsift-cold","routing_affinity":"replica-b","stable_prefix":"agent-doc stable prefix v2","message":{"id":"msg-2","role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"persistent"}}],"usage":{"input_tokens":3000,"cache_creation_input_tokens":6000,"cache_read_input_tokens":1000,"output_tokens":50}}}"#,
         "\n",
-        r#"{"timestamp":"2026-05-05T00:00:03Z","message":{"id":"msg-3","role":"assistant","usage":{"input_tokens":3000,"cache_creation_input_tokens":6000,"cache_read_input_tokens":1000,"output_tokens":50}}}"#,
+        r#"{"timestamp":"2026-05-05T00:00:03Z","provider":"anthropic","prompt_cache_key":"agent-doc:tsift-cold","routing_affinity":"replica-b","stable_prefix":"agent-doc stable prefix v2","message":{"id":"msg-3","role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"persistent"}}],"usage":{"input_tokens":3000,"cache_creation_input_tokens":6000,"cache_read_input_tokens":1000,"output_tokens":50}}}"#,
         "\n",
     );
 
@@ -9438,6 +9438,18 @@ fn session_cost_reports_prompt_cache_invalidation_diagnostics() {
                 .as_str()
                 .is_some_and(|message| message.contains("0.92x"))
     }));
+    let prefix_drift = json["prompt_cache_plan"]["analytics"]["prefix_drift"]
+        .as_array()
+        .unwrap();
+    assert!(prefix_drift.iter().any(|drift| {
+        drift["trigger"] == "cached_ratio_drop_and_cache_creation_spike"
+            && drift["first_changed_field"] == "stable_prefix_fingerprint"
+            && drift["field_changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|change| change["field"] == "cache_key")
+    }));
 
     let compact = run_tsift_stdin(
         &["session-cost", "--source", "claude-jsonl", "--compact"],
@@ -9450,6 +9462,10 @@ fn session_cost_reports_prompt_cache_invalidation_diagnostics() {
     let compact_stdout = String::from_utf8_lossy(&compact.stdout);
     assert!(compact_stdout.contains("prompt-cache-diagnostic warn cached_ratio_drop"));
     assert!(compact_stdout.contains("prompt-cache-diagnostic recommend read_create_regression"));
+    assert!(
+        compact_stdout
+            .contains("prompt-cache-prefix-drift warn cached_ratio_drop_and_cache_creation_spike")
+    );
     assert!(compact_stdout.contains("prompt-cache-call 2026-05-05T00:00:02Z provider:anthropic"));
     assert!(compact_stdout.contains("fingerprint:spfx-"));
 }

@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **`#pcache-prefix-drift`**: Added a bounded prompt-cache prefix drift report to `session-cost`. Prompt-cache analytics now compare adjacent calls by stable-prefix fingerprint, prompt cache key, explicit breakpoint paths, routing affinity, and provider, then annotate cache-ratio drops or cache-creation spikes with the first changed field in JSON, compact, and human output.
+
 ## 0.1.67
 
 - **`#kx6s`**: Added a MemGraphRAG performance baseline gate to `metric-digest`. Runs with `memgraphrag.<workload>.duration_micros` metrics now emit `memgraphrag_performance_gate`, requiring memory query, memory project-graph, `graph-db related`, and semantic seeded neighborhood latency evidence with a compared baseline and a 25% max latency regression. Added `fixtures/memgraphrag-performance-history.json`, CLI fixture coverage, and spec notes.
