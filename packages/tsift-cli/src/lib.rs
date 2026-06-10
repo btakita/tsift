@@ -8785,6 +8785,14 @@ fn graph_db_schema() -> GraphDbSchema {
                 description: "Return or apply the post-reconciliation SQLite graph compaction policy, including WAL checkpoint/VACUUM proof and guarded tombstone pruning",
             },
             GraphDbSchemaOperation {
+                command: "snapshot-export <output.db.gz> [--force]",
+                description: "Export the current SQLite graph.db as a gzip-compressed shareable artifact only after freshness, doctor, WAL, and sidecar checks pass",
+            },
+            GraphDbSchemaOperation {
+                command: "snapshot-import <artifact.db.gz> [--replace]",
+                description: "Stage and validate a compressed SQLite graph.db artifact through doctor and freshness checks before replacing the local graph.db",
+            },
+            GraphDbSchemaOperation {
                 command: "backend-eval [--candidate duckdb-duckpgq|falkordb|ladybug|kuzu|surrealdb] [--target ID] [--full-projection]",
                 description: "Benchmark experimental read-only GraphStore backend prototypes against SQLite on bounded real, optional full-project, and synthetic projections across refresh/status/path tiers/evidence/conflict-matrix/dispatch-trace and emit promotion hold/eligibility gates",
             },
@@ -9472,6 +9480,12 @@ pub(crate) fn graph_db_report_from_store(
         }
         GraphDbQuery::Compact { .. } => {
             bail!("graph-db compact must be handled by the compact command path");
+        }
+        GraphDbQuery::SnapshotExport { .. } => {
+            bail!("graph-db snapshot-export must be handled by the snapshot command path");
+        }
+        GraphDbQuery::SnapshotImport { .. } => {
+            bail!("graph-db snapshot-import must be handled by the snapshot command path");
         }
         GraphDbQuery::BackendEval { .. } => {
             bail!("graph-db backend-eval must be handled by the benchmark command path");
@@ -24710,6 +24724,70 @@ fn main() { api::handler(); }
     }
 
     #[test]
+    fn graph_db_snapshot_export_import_round_trip_preserves_projection_metadata() {
+        let dir = setup_traversal_project();
+        refresh_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
+        let artifact = dir.path().join("graph.db.gz");
+
+        let exported =
+            commands::infra::graph_db_snapshot_export_report(dir.path(), None, &artifact, false)
+                .unwrap();
+        let exported_projection_version = exported.freshness.projection_version.clone();
+        let exported_content_hash = exported.freshness.content_hash.clone();
+        let exported_source_watermark = exported.freshness.source_watermark.clone();
+        let exported_nodes = exported.counts.nodes;
+        let exported_edges = exported.counts.edges;
+        assert_eq!(exported.operation, "snapshot-export");
+        assert!(exported.status.starts_with("exported"));
+        assert!(artifact.exists());
+        assert!(exported.artifact_bytes > 0);
+        assert_eq!(exported.compression, "gzip");
+
+        fs::remove_file(dir.path().join(".tsift/graph.db")).unwrap();
+
+        let imported =
+            commands::infra::graph_db_snapshot_import_report(dir.path(), None, &artifact, false)
+                .unwrap();
+        assert_eq!(imported.operation, "snapshot-import");
+        assert!(imported.status.starts_with("imported"));
+        assert_eq!(
+            imported.freshness.projection_version,
+            exported_projection_version
+        );
+        assert_eq!(imported.freshness.content_hash, exported_content_hash);
+        assert_eq!(
+            imported.freshness.source_watermark,
+            exported_source_watermark
+        );
+        assert_eq!(imported.counts.nodes, exported_nodes);
+        assert_eq!(imported.counts.edges, exported_edges);
+        assert!(dir.path().join(".tsift/graph.db").exists());
+    }
+
+    #[test]
+    fn graph_db_snapshot_export_fails_closed_when_wal_lock_requires_recovery() {
+        let dir = setup_traversal_project();
+        refresh_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
+        let graph_db = dir.path().join(".tsift/graph.db");
+        let _lock = hold_wal_database_lock(&graph_db);
+
+        let err = match commands::infra::graph_db_snapshot_export_report(
+            dir.path(),
+            None,
+            &dir.path().join("graph.db.gz"),
+            false,
+        ) {
+            Ok(report) => panic!("expected snapshot export to fail, got {}", report.status),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("recovered read path"),
+            "expected recovered read path diagnostic, got {err:#}"
+        );
+    }
+
+    #[test]
     fn graph_db_evidence_uses_snapshot_fallback_when_graph_db_is_locked() {
         let dir = setup_traversal_project();
         let session = dir.path().join("tasks/software/tsift.md");
@@ -31140,6 +31218,49 @@ fn sample() {}
                     assert!(confirmed_convex_reconciled);
                 }
                 _ => panic!("expected graph-db compact query"),
+            },
+            _ => panic!("expected GraphDb command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_db_snapshot_queries() {
+        let export_cli = parse_cli([
+            "tsift",
+            "graph-db",
+            "--json",
+            "snapshot-export",
+            "graph.db.gz",
+            "--force",
+        ]);
+        match export_cli.command {
+            Some(Commands::GraphDb { json, query, .. }) => {
+                assert!(json);
+                match query {
+                    GraphDbQuery::SnapshotExport { output, force } => {
+                        assert_eq!(output, PathBuf::from("graph.db.gz"));
+                        assert!(force);
+                    }
+                    _ => panic!("expected graph-db snapshot-export query"),
+                }
+            }
+            _ => panic!("expected GraphDb command"),
+        }
+
+        let import_cli = parse_cli([
+            "tsift",
+            "graph-db",
+            "snapshot-import",
+            "graph.db.gz",
+            "--replace",
+        ]);
+        match import_cli.command {
+            Some(Commands::GraphDb { query, .. }) => match query {
+                GraphDbQuery::SnapshotImport { artifact, replace } => {
+                    assert_eq!(artifact, PathBuf::from("graph.db.gz"));
+                    assert!(replace);
+                }
+                _ => panic!("expected graph-db snapshot-import query"),
             },
             _ => panic!("expected GraphDb command"),
         }

@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use serde::Serialize;
 use substrate::{
     ConvexGraphStore as SubstrateConvexGraphStore, ConvexProjectionRows, ConvexRowsGraphClient,
@@ -24,7 +25,8 @@ use crate::{
     GRAPH_PROJECTION_VERSION, GraphDbBackendEvalConfig, GraphDbBackendEvalOptions,
     GraphDbBackendEvalPhaseTiming, GraphDbBackendEvalReport, GraphDbCompactionReport,
     GraphDbDoctorReport, GraphDbDriftInput, GraphDbEvidenceInput, GraphDbExperimentalBackend,
-    GraphDbRefreshSummary, append_convex_snapshot_doctor_checks,
+    GraphDbFreshnessReport, GraphDbOperatorCounts, GraphDbOperatorReport, GraphDbRefreshSummary,
+    GraphEffectivenessReadiness, append_convex_snapshot_doctor_checks,
     append_graph_db_backend_eval_normalized_duration_metric,
     append_graph_db_backend_eval_phase_metrics, append_sqlite_graph_doctor_checks,
     append_tokensave_graph_doctor_checks, apply_edit_plan_atomically, apply_rewrite_output_format,
@@ -327,6 +329,615 @@ pub(crate) fn cmd_graph_db_refresh(
         warnings,
     )?;
     print_graph_db_operator_report(&report, format)
+}
+
+#[derive(Serialize)]
+pub(crate) struct GraphDbSnapshotReport {
+    pub(crate) root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scope: Option<String>,
+    pub(crate) graph_db: String,
+    pub(crate) operation: String,
+    pub(crate) status: String,
+    pub(crate) artifact: String,
+    pub(crate) compression: String,
+    pub(crate) artifact_bytes: u64,
+    pub(crate) database_bytes: u64,
+    pub(crate) freshness: GraphDbFreshnessReport,
+    pub(crate) readiness: GraphEffectivenessReadiness,
+    pub(crate) counts: GraphDbOperatorCounts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery: Option<substrate::ReadOnlyRecovery>,
+    pub(crate) doctor: GraphDbDoctorReport,
+    pub(crate) next_commands: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) warnings: Vec<String>,
+}
+
+fn graph_db_snapshot_import_command(root: &Path, scope: Option<&str>, artifact: &Path) -> String {
+    format!(
+        "tsift graph-db --path {}{} snapshot-import {} --replace --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope),
+        shell_quote(artifact.to_string_lossy().as_ref())
+    )
+}
+
+fn graph_db_snapshot_status_command(root: &Path, scope: Option<&str>) -> String {
+    format!(
+        "tsift graph-db --path {}{} status --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope)
+    )
+}
+
+fn graph_db_snapshot_doctor_command(root: &Path, scope: Option<&str>) -> String {
+    format!(
+        "tsift graph-db --path {}{} doctor --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope)
+    )
+}
+
+fn graph_db_snapshot_compact_command(root: &Path, scope: Option<&str>) -> String {
+    format!(
+        "tsift graph-db --path {}{} compact --apply --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope)
+    )
+}
+
+fn graph_db_snapshot_path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut raw = path.as_os_str().to_os_string();
+    raw.push(suffix);
+    PathBuf::from(raw)
+}
+
+fn graph_db_snapshot_unique_path(parent: &Path, stem: &str, suffix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    parent.join(format!(".{stem}-{}-{nanos}{suffix}", std::process::id()))
+}
+
+fn graph_db_snapshot_sidecar_diagnostics(
+    root: &Path,
+    scope: Option<&str>,
+    graph_db: &Path,
+) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    for (label, path) in [
+        (
+            "rollback journal",
+            substrate::rollback_journal_path(graph_db),
+        ),
+        ("WAL", substrate::wal_sidecar_path(graph_db)),
+        (
+            "shared-memory",
+            substrate::shared_memory_sidecar_path(graph_db),
+        ),
+    ] {
+        if path.exists() {
+            diagnostics.push(format!(
+                "graph.db {label} sidecar exists at {}; run `{}` or stop the active writer before using a shareable snapshot",
+                path.display(),
+                graph_db_snapshot_compact_command(root, scope)
+            ));
+        }
+    }
+    diagnostics
+}
+
+fn graph_db_snapshot_export_sidecar_warnings(graph_db: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (label, path) in [
+        (
+            "rollback journal",
+            substrate::rollback_journal_path(graph_db),
+        ),
+        ("WAL", substrate::wal_sidecar_path(graph_db)),
+        (
+            "shared-memory",
+            substrate::shared_memory_sidecar_path(graph_db),
+        ),
+    ] {
+        if path.exists() {
+            warnings.push(format!(
+                "graph.db {label} sidecar exists at {}; snapshot-export used a clean SQLite VACUUM INTO copy before compression",
+                path.display()
+            ));
+        }
+    }
+    warnings
+}
+
+fn graph_db_snapshot_doctor_report(
+    root: &Path,
+    scope: Option<&str>,
+    graph_db: &Path,
+    backend_name: &str,
+) -> GraphDbDoctorReport {
+    let mut report = GraphDbDoctorReport::new(root, scope, backend_name, graph_db, None);
+    append_sqlite_graph_doctor_checks(&mut report, root, scope, graph_db);
+    report.finalize();
+    report
+}
+
+fn graph_db_snapshot_fail_if_doctor_closed(
+    operation: &str,
+    doctor: &GraphDbDoctorReport,
+) -> Result<()> {
+    if doctor.fail_closed {
+        let summary = doctor.summary();
+        bail!(
+            "graph-db {operation} failed doctor checks: {}",
+            if summary.is_empty() {
+                "see diagnostics".to_string()
+            } else {
+                summary
+            }
+        );
+    }
+    Ok(())
+}
+
+fn graph_db_snapshot_fail_if_not_fresh(
+    operation: &str,
+    report: &GraphDbOperatorReport,
+) -> Result<()> {
+    if !report.materialized || report.freshness.fail_closed {
+        bail!(
+            "graph-db {operation} failed freshness checks: {}",
+            report.freshness.diagnostics.join("; ")
+        );
+    }
+    Ok(())
+}
+
+fn graph_db_snapshot_fail_if_unsafe_sidecars(
+    root: &Path,
+    scope: Option<&str>,
+    graph_db: &Path,
+) -> Result<()> {
+    let diagnostics = graph_db_snapshot_sidecar_diagnostics(root, scope, graph_db);
+    if !diagnostics.is_empty() {
+        bail!(
+            "graph-db snapshot blocked by live SQLite sidecar diagnostics: {}",
+            diagnostics.join("; ")
+        );
+    }
+    Ok(())
+}
+
+struct GraphDbSnapshotReportInput<'a> {
+    operation: &'a str,
+    success_status: &'a str,
+    artifact: &'a Path,
+    artifact_bytes: u64,
+    database_bytes: u64,
+    extra_next_commands: Vec<String>,
+    extra_warnings: Vec<String>,
+}
+
+fn graph_db_snapshot_report_from_operator(
+    operator: GraphDbOperatorReport,
+    doctor: GraphDbDoctorReport,
+    input: GraphDbSnapshotReportInput<'_>,
+) -> GraphDbSnapshotReport {
+    let GraphDbOperatorReport {
+        root,
+        scope,
+        graph_db,
+        operation: _,
+        status: _,
+        materialized: _,
+        freshness,
+        readiness,
+        counts,
+        refresh: _,
+        compaction: _,
+        recovery,
+        next_commands,
+        warnings,
+    } = operator;
+    let GraphDbSnapshotReportInput {
+        operation,
+        success_status,
+        artifact,
+        artifact_bytes,
+        database_bytes,
+        mut extra_next_commands,
+        mut extra_warnings,
+    } = input;
+    extra_next_commands.extend(next_commands);
+    extra_warnings.extend(warnings);
+    let status = if readiness.fail_closed {
+        format!("{success_status}_readiness_blocked")
+    } else {
+        success_status.to_string()
+    };
+    GraphDbSnapshotReport {
+        root,
+        scope,
+        graph_db,
+        operation: operation.to_string(),
+        status,
+        artifact: artifact.to_string_lossy().to_string(),
+        compression: "gzip".to_string(),
+        artifact_bytes,
+        database_bytes,
+        freshness,
+        readiness,
+        counts,
+        recovery,
+        doctor,
+        next_commands: dedupe_preserve_order(extra_next_commands),
+        warnings: dedupe_preserve_order(extra_warnings),
+    }
+}
+
+fn graph_db_snapshot_compress_file(source: &Path, output: &Path, force: bool) -> Result<u64> {
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("creating snapshot artifact directory {}", parent.display())
+        })?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    if force {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    let output_file = options
+        .open(output)
+        .with_context(|| format!("creating snapshot artifact {}", output.display()))?;
+    let mut input =
+        fs::File::open(source).with_context(|| format!("opening graph db {}", source.display()))?;
+    let mut encoder = GzEncoder::new(output_file, Compression::default());
+    std::io::copy(&mut input, &mut encoder)
+        .with_context(|| format!("compressing graph db into {}", output.display()))?;
+    let output_file = encoder
+        .finish()
+        .with_context(|| format!("finalizing snapshot artifact {}", output.display()))?;
+    output_file
+        .sync_all()
+        .with_context(|| format!("syncing snapshot artifact {}", output.display()))?;
+    Ok(fs::metadata(output)
+        .with_context(|| format!("stat snapshot artifact {}", output.display()))?
+        .len())
+}
+
+fn graph_db_snapshot_decompress_to_staged(artifact: &Path, staged: &Path) -> Result<u64> {
+    let input = fs::File::open(artifact)
+        .with_context(|| format!("opening graph-db snapshot artifact {}", artifact.display()))?;
+    let mut decoder = GzDecoder::new(input);
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staged)
+        .with_context(|| format!("creating staged graph-db snapshot {}", staged.display()))?;
+    std::io::copy(&mut decoder, &mut output)
+        .with_context(|| format!("decompressing graph-db snapshot {}", artifact.display()))?;
+    output
+        .sync_all()
+        .with_context(|| format!("syncing staged graph-db snapshot {}", staged.display()))?;
+    Ok(fs::metadata(staged)
+        .with_context(|| format!("stat staged graph-db snapshot {}", staged.display()))?
+        .len())
+}
+
+fn graph_db_snapshot_clean_export_copy(graph_db: &Path, clean_path: &Path) -> Result<u64> {
+    let conn =
+        substrate::open_graph_read_only_connection_resilient(graph_db).with_context(|| {
+            format!(
+                "opening graph db for snapshot export {}",
+                graph_db.display()
+            )
+        })?;
+    if let Some(recovery) = conn.recovery() {
+        bail!(
+            "graph-db snapshot-export refused recovered read path: {}; resolve the live database lock before exporting a shareable artifact",
+            graph_db_read_recovery_diagnostic(recovery)
+        );
+    }
+    let clean_path_str = clean_path.to_string_lossy().to_string();
+    conn.conn()
+        .execute("VACUUM INTO ?1", [clean_path_str.as_str()])
+        .with_context(|| {
+            format!(
+                "creating clean graph-db export copy {} from {}",
+                clean_path.display(),
+                graph_db.display()
+            )
+        })?;
+    Ok(fs::metadata(clean_path)
+        .with_context(|| format!("stat clean graph-db export copy {}", clean_path.display()))?
+        .len())
+}
+
+pub(crate) fn graph_db_snapshot_export_report(
+    root: &Path,
+    scope: Option<&str>,
+    output: &Path,
+    force: bool,
+) -> Result<GraphDbSnapshotReport> {
+    let graph_db = graph_substrate_db_path(root, scope);
+    let doctor = graph_db_snapshot_doctor_report(root, scope, &graph_db, "sqlite");
+    graph_db_snapshot_fail_if_doctor_closed("snapshot-export", &doctor)?;
+    let operator = graph_db_operator_report_from_disk(
+        root,
+        scope,
+        &graph_db,
+        "snapshot-export",
+        None,
+        vec![],
+    )?;
+    graph_db_snapshot_fail_if_not_fresh("snapshot-export", &operator)?;
+    if let Some(recovery) = operator.recovery {
+        bail!(
+            "graph-db snapshot-export refused recovered read path: {}; resolve the live database lock before exporting a shareable artifact",
+            graph_db_read_recovery_diagnostic(recovery)
+        );
+    }
+    let graph_parent = graph_db
+        .parent()
+        .with_context(|| format!("graph db path has no parent: {}", graph_db.display()))?;
+    let clean_path = graph_db_snapshot_unique_path(graph_parent, "graph-snapshot-export", ".db");
+    let export_result: Result<GraphDbSnapshotReport> = (|| {
+        let database_bytes = graph_db_snapshot_clean_export_copy(&graph_db, &clean_path)?;
+        let clean_doctor =
+            graph_db_snapshot_doctor_report(root, scope, &clean_path, "sqlite-snapshot");
+        graph_db_snapshot_fail_if_doctor_closed("snapshot-export clean copy", &clean_doctor)?;
+        let clean_operator = graph_db_operator_report_from_disk(
+            root,
+            scope,
+            &clean_path,
+            "snapshot-export-clean",
+            None,
+            vec![],
+        )?;
+        graph_db_snapshot_fail_if_not_fresh("snapshot-export clean copy", &clean_operator)?;
+        let artifact_bytes = graph_db_snapshot_compress_file(&clean_path, output, force)?;
+        Ok(graph_db_snapshot_report_from_operator(
+            operator,
+            doctor,
+            GraphDbSnapshotReportInput {
+                operation: "snapshot-export",
+                success_status: "exported",
+                artifact: output,
+                artifact_bytes,
+                database_bytes,
+                extra_next_commands: vec![graph_db_snapshot_import_command(root, scope, output)],
+                extra_warnings: graph_db_snapshot_export_sidecar_warnings(&graph_db),
+            },
+        ))
+    })();
+    let _ = fs::remove_file(&clean_path);
+    export_result
+}
+
+pub(crate) fn graph_db_snapshot_import_report(
+    root: &Path,
+    scope: Option<&str>,
+    artifact: &Path,
+    replace: bool,
+) -> Result<GraphDbSnapshotReport> {
+    let graph_db = graph_substrate_db_path(root, scope);
+    let graph_parent = graph_db
+        .parent()
+        .with_context(|| format!("graph db path has no parent: {}", graph_db.display()))?;
+    fs::create_dir_all(graph_parent)
+        .with_context(|| format!("creating graph db directory {}", graph_parent.display()))?;
+    let staged = graph_db_snapshot_unique_path(graph_parent, "graph-snapshot-import", ".db");
+    let backup = graph_db_snapshot_path_with_suffix(&graph_db, ".pre-snapshot-import-bak");
+    let import_result: Result<GraphDbSnapshotReport> = (|| {
+        let database_bytes = graph_db_snapshot_decompress_to_staged(artifact, &staged)?;
+        let validation_doctor =
+            graph_db_snapshot_doctor_report(root, scope, &staged, "sqlite-snapshot");
+        graph_db_snapshot_fail_if_doctor_closed("snapshot-import validation", &validation_doctor)?;
+        let validation_operator = graph_db_operator_report_from_disk(
+            root,
+            scope,
+            &staged,
+            "snapshot-import-validate",
+            None,
+            vec![],
+        )?;
+        graph_db_snapshot_fail_if_not_fresh("snapshot-import validation", &validation_operator)?;
+        if graph_db.exists() {
+            if !replace {
+                bail!(
+                    "graph-db snapshot-import would replace {}; pass --replace after reviewing snapshot diagnostics",
+                    graph_db.display()
+                );
+            }
+            graph_db_snapshot_fail_if_unsafe_sidecars(root, scope, &graph_db)?;
+            if backup.exists() {
+                bail!(
+                    "graph-db snapshot-import backup path already exists: {}; move it before retrying",
+                    backup.display()
+                );
+            }
+            fs::rename(&graph_db, &backup).with_context(|| {
+                format!(
+                    "backing up existing graph db {} to {}",
+                    graph_db.display(),
+                    backup.display()
+                )
+            })?;
+        }
+        if let Err(err) = fs::rename(&staged, &graph_db).with_context(|| {
+            format!(
+                "installing staged graph-db snapshot {} to {}",
+                staged.display(),
+                graph_db.display()
+            )
+        }) {
+            if backup.exists() {
+                let _ = fs::rename(&backup, &graph_db);
+            }
+            return Err(err);
+        }
+        let post_install: Result<GraphDbSnapshotReport> = (|| {
+            let doctor = graph_db_snapshot_doctor_report(root, scope, &graph_db, "sqlite");
+            graph_db_snapshot_fail_if_doctor_closed("snapshot-import post-install", &doctor)?;
+            let artifact_bytes = fs::metadata(artifact)
+                .with_context(|| format!("stat graph-db snapshot artifact {}", artifact.display()))?
+                .len();
+            let operator = graph_db_operator_report_from_disk(
+                root,
+                scope,
+                &graph_db,
+                "snapshot-import",
+                None,
+                vec![],
+            )?;
+            graph_db_snapshot_fail_if_not_fresh("snapshot-import post-install", &operator)?;
+            Ok(graph_db_snapshot_report_from_operator(
+                operator,
+                doctor,
+                GraphDbSnapshotReportInput {
+                    operation: "snapshot-import",
+                    success_status: "imported",
+                    artifact,
+                    artifact_bytes,
+                    database_bytes,
+                    extra_next_commands: vec![
+                        graph_db_snapshot_status_command(root, scope),
+                        graph_db_snapshot_doctor_command(root, scope),
+                    ],
+                    extra_warnings: Vec::new(),
+                },
+            ))
+        })();
+        match post_install {
+            Ok(report) => {
+                if backup.exists() {
+                    let _ = fs::remove_file(&backup);
+                }
+                Ok(report)
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&graph_db);
+                if backup.exists() {
+                    let _ = fs::rename(&backup, &graph_db);
+                }
+                Err(err)
+                    .context("snapshot import failed post-install validation and was rolled back")
+            }
+        }
+    })();
+    if import_result.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    import_result
+}
+
+fn print_graph_db_snapshot_report(
+    report: &GraphDbSnapshotReport,
+    format: OutputFormat,
+) -> Result<()> {
+    if format.json_output {
+        print_json_or_envelope(
+            report,
+            &format,
+            "graph-db",
+            &report.operation,
+            ToolEnvelopeSummary {
+                text: format!(
+                    "Graph DB {} {} with {} node(s), {} edge(s), {} byte artifact",
+                    report.operation,
+                    report.status,
+                    report.counts.nodes,
+                    report.counts.edges,
+                    report.artifact_bytes
+                ),
+                metrics: vec![
+                    envelope_metric("operation", &report.operation),
+                    envelope_metric("status", &report.status),
+                    envelope_metric("nodes", report.counts.nodes),
+                    envelope_metric("edges", report.counts.edges),
+                    envelope_metric("artifact_bytes", report.artifact_bytes),
+                    envelope_metric("readiness", &report.readiness.status),
+                ],
+            },
+            false,
+            report.next_commands.clone(),
+        )
+    } else {
+        println!(
+            "graph-db {} status: {} artifact: {}",
+            report.operation, report.status, report.artifact
+        );
+        println!("graph_db: {}", report.graph_db);
+        println!(
+            "projection: version={} hash={} watermark={}",
+            report
+                .freshness
+                .projection_version
+                .as_deref()
+                .unwrap_or("<missing>"),
+            report
+                .freshness
+                .content_hash
+                .as_deref()
+                .unwrap_or("<missing>"),
+            report
+                .freshness
+                .source_watermark
+                .as_deref()
+                .unwrap_or("<missing>")
+        );
+        println!(
+            "counts: {} node(s), {} edge(s), {} tombstone(s)",
+            report.counts.nodes, report.counts.edges, report.counts.tombstones.total
+        );
+        println!(
+            "bytes: artifact={} database={}",
+            report.artifact_bytes, report.database_bytes
+        );
+        println!(
+            "readiness: {} fail_closed={}",
+            report.readiness.status, report.readiness.fail_closed
+        );
+        for diagnostic in &report.readiness.diagnostics {
+            println!("readiness diagnostic: {diagnostic}");
+        }
+        for warning in &report.warnings {
+            println!("warning: {warning}");
+        }
+        for command in &report.next_commands {
+            println!("next: {command}");
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn cmd_graph_db_snapshot_export(
+    root: &Path,
+    scope: Option<&str>,
+    output: &Path,
+    force: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let report = graph_db_snapshot_export_report(root, scope, output, force)?;
+    print_graph_db_snapshot_report(&report, format)
+}
+
+pub(crate) fn cmd_graph_db_snapshot_import(
+    root: &Path,
+    scope: Option<&str>,
+    artifact: &Path,
+    replace: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let report = graph_db_snapshot_import_report(root, scope, artifact, replace)?;
+    print_graph_db_snapshot_report(&report, format)
 }
 
 pub(crate) fn cmd_graph_db_doctor(
@@ -1184,11 +1795,13 @@ pub(crate) fn cmd_graph_db_map(
             None => "unknown".to_string(),
         };
         let module_name = module.clone();
-        let entry = modules.entry(module).or_insert_with(|| GraphDbMapModuleEntry {
-            module: module_name,
-            node_count: 0,
-            kinds: BTreeMap::new(),
-        });
+        let entry = modules
+            .entry(module)
+            .or_insert_with(|| GraphDbMapModuleEntry {
+                module: module_name,
+                node_count: 0,
+                kinds: BTreeMap::new(),
+            });
         entry.node_count += 1;
         *entry.kinds.entry(node.kind.clone()).or_default() += 1;
     }
@@ -1198,10 +1811,7 @@ pub(crate) fn cmd_graph_db_map(
     {
         let mut from_map: HashMap<&str, Vec<&str>> = HashMap::new();
         for edge in &edges {
-            from_map
-                .entry(&edge.from_id)
-                .or_default()
-                .push(&edge.to_id);
+            from_map.entry(&edge.from_id).or_default().push(&edge.to_id);
         }
         let edge_pairs: Vec<(String, String)> = edges
             .iter()
@@ -1214,8 +1824,7 @@ pub(crate) fn cmd_graph_db_map(
             .enumerate()
             .filter(|(_, c)| c.members.len() >= 2)
             .map(|(i, c)| {
-                let mut names: Vec<String> =
-                    c.members.iter().map(|m| m.name.clone()).collect();
+                let mut names: Vec<String> = c.members.iter().map(|m| m.name.clone()).collect();
                 names.sort();
                 (i, c.members.len(), names)
             })
@@ -1259,8 +1868,7 @@ pub(crate) fn cmd_graph_db_map(
                 map_findings_for_keys(&findings_by_about, community.top_members.iter());
         }
         for hub in &mut hubs {
-            hub.findings =
-                map_findings_for_keys(&findings_by_about, std::iter::once(&hub.label));
+            hub.findings = map_findings_for_keys(&findings_by_about, std::iter::once(&hub.label));
         }
     }
 
@@ -1291,9 +1899,7 @@ pub(crate) fn cmd_graph_db_map(
                         &edge.from_id
                     };
                     if let Some(neighbor) = node_by_id.get(neighbor_id.as_str()) {
-                        *neighbor_kinds
-                            .entry(neighbor.kind.clone())
-                            .or_default() += 1;
+                        *neighbor_kinds.entry(neighbor.kind.clone()).or_default() += 1;
                     }
                 }
                 let comm_id = {
@@ -1377,9 +1983,7 @@ pub(crate) fn cmd_graph_db_map(
             if report.focus.is_some() {
                 vec![]
             } else {
-                vec![
-                    "Use --focus <symbol> to add a focused deep-dive tier".to_string(),
-                ]
+                vec!["Use --focus <symbol> to add a focused deep-dive tier".to_string()]
             },
         )
     } else {
@@ -1452,10 +2056,7 @@ fn print_graph_db_map_human(report: &GraphDbMapReport, compact: bool) {
             } else {
                 comm.top_members.join(", ")
             };
-            println!(
-                "  [{}] {} members: {}",
-                comm.id, comm.size, members_display
-            );
+            println!("  [{}] {} members: {}", comm.id, comm.size, members_display);
             for finding in &comm.findings {
                 println!(
                     "    finding [{}] {} (about {})",
@@ -1574,7 +2175,10 @@ fn render_graph_db_map_markdown(report: &GraphDbMapReport) -> String {
         modules.sort_by_key(|b| std::cmp::Reverse(b.node_count));
         out.push_str("\n## Modules\n\n");
         for module in modules.iter().take(15) {
-            out.push_str(&format!("- `{}`: {} nodes\n", module.module, module.node_count));
+            out.push_str(&format!(
+                "- `{}`: {} nodes\n",
+                module.module, module.node_count
+            ));
         }
     }
 
@@ -1638,7 +2242,10 @@ fn render_graph_db_map_html(report: &GraphDbMapReport) -> String {
         map_html_escape(&report.root)
     ));
     if let Some(scope) = &report.scope {
-        out.push_str(&format!(" · scope: <code>{}</code>", map_html_escape(scope)));
+        out.push_str(&format!(
+            " · scope: <code>{}</code>",
+            map_html_escape(scope)
+        ));
     }
     out.push_str("</p>\n");
     out.push_str(&format!(
@@ -1797,6 +2404,12 @@ pub(crate) fn cmd_graph_db(
                 *confirmed_convex_reconciled,
                 format,
             );
+        }
+        GraphDbQuery::SnapshotExport { output, force } => {
+            return cmd_graph_db_snapshot_export(&root, scope, output, *force, format);
+        }
+        GraphDbQuery::SnapshotImport { artifact, replace } => {
+            return cmd_graph_db_snapshot_import(&root, scope, artifact, *replace, format);
         }
         GraphDbQuery::BackendEval {
             candidates,
@@ -2026,7 +2639,9 @@ fn status_index_needs_auto_fix(report: &status::StatusReport) -> bool {
     match &report.index {
         status::IndexStatus::Fresh { .. } => false,
         status::IndexStatus::Stale { recovery: None, .. } => true,
-        status::IndexStatus::Stale { recovery: Some(_), .. } => false,
+        status::IndexStatus::Stale {
+            recovery: Some(_), ..
+        } => false,
         status::IndexStatus::Missing { .. } => true,
     }
 }
@@ -2041,12 +2656,11 @@ pub(crate) struct StatusCommandOptions {
     pub schema: bool,
 }
 
-pub(crate) fn cmd_status(
-    path: &std::path::Path,
-    options: StatusCommandOptions,
-) -> Result<()> {
+pub(crate) fn cmd_status(path: &std::path::Path, options: StatusCommandOptions) -> Result<()> {
     if options.fix {
-        eprintln!("warning: --fix is deprecated; auto-fix is now the default. Use --no-fix to skip.");
+        eprintln!(
+            "warning: --fix is deprecated; auto-fix is now the default. Use --no-fix to skip."
+        );
     }
     let auto_fix = !options.no_fix;
     let root = lint::resolve_project_root_or_canonical_path(path)?;
@@ -2070,7 +2684,13 @@ pub(crate) fn cmd_status(
     if options.json_output {
         println!(
             "{}",
-            to_json_schema(&report, options.pretty, options.terse, false, options.schema)?
+            to_json_schema(
+                &report,
+                options.pretty,
+                options.terse,
+                false,
+                options.schema
+            )?
         );
     } else {
         print!("{}", status::format_human(&report, options.compact));
@@ -2201,7 +2821,10 @@ pub(crate) fn cmd_sql(
                         serde_json::Value::Object(obj)
                     })
                     .collect();
-                println!("{}", to_json_schema(&json_rows, pretty, terse, false, schema)?);
+                println!(
+                    "{}",
+                    to_json_schema(&json_rows, pretty, terse, false, schema)?
+                );
             } else if compact {
                 println!("rows:{} cols:{}", rows.len(), columns.len());
                 for row in &rows {

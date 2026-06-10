@@ -1408,6 +1408,22 @@ pub enum GraphDbQuery {
         #[arg(long = "confirmed-convex-reconciled")]
         confirmed_convex_reconciled: bool,
     },
+    /// Export the current local SQLite graph.db as a compressed shareable snapshot artifact
+    SnapshotExport {
+        /// Output artifact path. The artifact is a gzip-compressed SQLite graph.db.
+        output: PathBuf,
+        /// Overwrite an existing artifact path.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Import a compressed SQLite graph.db snapshot after freshness and doctor validation
+    SnapshotImport {
+        /// Snapshot artifact path created by graph-db snapshot-export.
+        artifact: PathBuf,
+        /// Replace an existing local .tsift/graph.db after validation.
+        #[arg(long)]
+        replace: bool,
+    },
     /// Benchmark experimental read-only GraphStore candidates against SQLite before promotion
     BackendEval {
         /// Candidate backend prototype to evaluate. Repeatable; defaults to DuckDB/DuckPGQ, FalkorDB, Ladybug, Kuzu, and SurrealDB. Values: duckdb-duckpgq, falkordb, ladybug, kuzu, surrealdb.
