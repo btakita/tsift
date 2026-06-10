@@ -29258,6 +29258,172 @@ tier = "private"
     }
 
     #[test]
+    fn search_budget_exact_hit_expands_to_source_handle_and_containing_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let source = "fn alpha_helper() {\n    let needle = \"needle\";\n}\n\nfn other() {}\n";
+        let file = src_dir.join("lib.rs");
+        fs::write(&file, source).unwrap();
+
+        let mut response = empty_search_response(dir.path(), "exact");
+        let mut hit = test_lexical_search_hit(&file, 1, 10.0, "let needle = \"needle\";");
+        hit.location = Some("line 2".to_string());
+        response.hits.push(hit);
+
+        let symbol_hits = vec![index::SymbolHit {
+            name: "alpha_helper".to_string(),
+            kind: "function".to_string(),
+            language: "rust".to_string(),
+            file: file.to_string_lossy().to_string(),
+            line: 0,
+            end_line: Some(2),
+            node_kind: Some("function_item".to_string()),
+            start_byte: Some(0),
+            end_byte: Some(i64::try_from(source.find("\n\n").unwrap()).unwrap()),
+            body_start_byte: Some(i64::try_from(source.find('{').unwrap() + 1).unwrap()),
+            body_end_byte: Some(i64::try_from(source.find("\n}").unwrap()).unwrap()),
+            tags: Some("alpha,helper".to_string()),
+            score: 0.9,
+            match_type: "all_tags".to_string(),
+            tagpath_handle: None,
+        }];
+
+        let report = build_relative_search_budget_report(
+            "needle",
+            "exact",
+            dir.path(),
+            &response,
+            &symbol_hits,
+            ResponseBudget::new(Some(5), Some(128)),
+            &SearchFacetFilters::default(),
+        );
+
+        let hit = &report.hits[0];
+        assert_eq!(hit.line, Some(2));
+        let source_handle = hit
+            .source_handle
+            .as_ref()
+            .expect("exact hit should expose a bounded source_handle window");
+        assert!(source_handle.handle.starts_with("xwin-"));
+        assert_eq!(source_handle.kind, "source_handle");
+        assert_eq!(source_handle.file, "src/lib.rs");
+        assert_eq!(source_handle.start_line, 1);
+        assert_eq!(source_handle.end_line, 3);
+        assert!(source_handle.expand.contains("source-read"));
+
+        let containing_symbol = hit
+            .containing_symbol
+            .as_ref()
+            .expect("exact hit should expose its containing symbol when indexed");
+        assert_eq!(containing_symbol.name, "alpha_helper");
+        assert_eq!(containing_symbol.kind, "function");
+        assert_eq!(containing_symbol.line, 1);
+        assert_eq!(containing_symbol.end_line, Some(3));
+        assert!(containing_symbol.expand.contains("symbol-read"));
+
+        let lexical_rank = report
+            .ranked
+            .iter()
+            .find(|item| item.source == "lexical_file")
+            .expect("ranked preview should retain the lexical retrieval handle");
+        assert!(
+            lexical_rank
+                .reasons
+                .iter()
+                .any(|reason| reason == "source_handle")
+        );
+        assert!(
+            lexical_rank
+                .reasons
+                .iter()
+                .any(|reason| reason == "containing_symbol")
+        );
+    }
+
+    #[test]
+    fn search_budget_ranked_preview_prioritizes_source_definitions_before_tests() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        let tests_dir = dir.path().join("tests");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&tests_dir).unwrap();
+        let source_file = src_dir.join("lib.rs");
+        let test_file = tests_dir.join("alpha_test.rs");
+        fs::write(&source_file, "fn alpha_helper() {}\n").unwrap();
+        fs::write(&test_file, "#[test]\nfn alpha_helper_test() {}\n").unwrap();
+
+        let response = empty_search_response(dir.path(), "lexical");
+        let symbol_hits = vec![
+            index::SymbolHit {
+                name: "alpha_helper_test".to_string(),
+                kind: "function".to_string(),
+                language: "rust".to_string(),
+                file: test_file.to_string_lossy().to_string(),
+                line: 1,
+                end_line: Some(1),
+                node_kind: Some("function_item".to_string()),
+                start_byte: Some(8),
+                end_byte: Some(33),
+                body_start_byte: Some(31),
+                body_end_byte: Some(31),
+                tags: Some("alpha,helper,test".to_string()),
+                score: 1.0,
+                match_type: "exact_name".to_string(),
+                tagpath_handle: None,
+            },
+            index::SymbolHit {
+                name: "alpha_helper".to_string(),
+                kind: "function".to_string(),
+                language: "rust".to_string(),
+                file: source_file.to_string_lossy().to_string(),
+                line: 0,
+                end_line: Some(0),
+                node_kind: Some("function_item".to_string()),
+                start_byte: Some(0),
+                end_byte: Some(20),
+                body_start_byte: Some(18),
+                body_end_byte: Some(18),
+                tags: Some("alpha,helper".to_string()),
+                score: 0.78,
+                match_type: "all_tags".to_string(),
+                tagpath_handle: None,
+            },
+        ];
+
+        let report = build_relative_search_budget_report(
+            "alpha helper",
+            "lexical",
+            dir.path(),
+            &response,
+            &symbol_hits,
+            ResponseBudget::new(Some(5), Some(128)),
+            &SearchFacetFilters::default(),
+        );
+
+        assert_eq!(report.ranked[0].name.as_deref(), Some("alpha_helper"));
+        assert_eq!(report.ranked[0].path, "src/lib.rs");
+        assert!(
+            report.ranked[0]
+                .reasons
+                .iter()
+                .any(|reason| reason == "definition_kind")
+        );
+        assert!(
+            report.ranked[0]
+                .reasons
+                .iter()
+                .any(|reason| reason == "source_path")
+        );
+        let test_rank = report
+            .ranked
+            .iter()
+            .find(|item| item.name.as_deref() == Some("alpha_helper_test"))
+            .expect("test symbol should still be present in the ranked preview");
+        assert!(test_rank.reasons.iter().any(|reason| reason == "test_path"));
+    }
+
+    #[test]
     fn search_budget_ranked_preview_includes_summary_and_graph_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let source = "# Guide\n\n```rust\nfn sample() {}\n```\n";

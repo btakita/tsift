@@ -69,9 +69,39 @@ pub(crate) struct SearchBudgetHitPreview {
     pub(crate) handle: String,
     pub(crate) rank: usize,
     pub(crate) path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) line: Option<usize>,
     pub(crate) confidence: String,
     pub(crate) score: f64,
     pub(crate) preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_handle: Option<SearchBudgetSourceHandlePreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) containing_symbol: Option<SearchBudgetContainingSymbolPreview>,
+    pub(crate) expand: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct SearchBudgetSourceHandlePreview {
+    pub(crate) handle: String,
+    pub(crate) kind: String,
+    pub(crate) file: String,
+    pub(crate) start_line: usize,
+    pub(crate) end_line: usize,
+    pub(crate) reason: String,
+    pub(crate) expand: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct SearchBudgetContainingSymbolPreview {
+    pub(crate) handle: String,
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) language: String,
+    pub(crate) file: String,
+    pub(crate) line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) end_line: Option<usize>,
     pub(crate) expand: String,
 }
 
@@ -159,6 +189,8 @@ pub(crate) struct SearchBudgetReportInput<'a> {
 }
 
 const SEARCH_BUDGET_SURFACE_PREVIEW_LIMIT: usize = 3;
+const SEARCH_BUDGET_HIT_SOURCE_WINDOW_LINES: usize = 24;
+const SEARCH_BUDGET_SYMBOL_SOURCE_WINDOW_MAX_LINES: usize = 80;
 
 fn is_zero_usize(value: &usize) -> bool {
     *value == 0
@@ -381,6 +413,179 @@ fn search_budget_graph_neighbor_count(ast: Option<&SearchBudgetAstArtifact>) -> 
     count
 }
 
+fn search_budget_hit_line(hit: &sift::SearchHit) -> Option<usize> {
+    let location = hit.location.as_deref()?.trim();
+    let line = location.strip_prefix("line ")?;
+    line.parse::<usize>().ok().filter(|line| *line > 0)
+}
+
+fn search_budget_symbol_display_file(
+    root: &Path,
+    symbol: &index::SymbolHit,
+    absolute: bool,
+) -> String {
+    if absolute {
+        symbol.file.clone()
+    } else {
+        relativize(&symbol.file, root)
+    }
+}
+
+fn search_budget_symbol_end_line(symbol: &index::SymbolHit) -> Option<usize> {
+    symbol
+        .end_line
+        .and_then(|line| usize::try_from(line).ok())
+        .and_then(|line| line.checked_add(1))
+}
+
+fn search_budget_symbol_contains_line(symbol: &index::SymbolHit, line: usize) -> bool {
+    let start = symbol_hit_line(symbol);
+    let end = search_budget_symbol_end_line(symbol)
+        .unwrap_or(start)
+        .max(start);
+    start <= line && line <= end
+}
+
+fn search_budget_containing_symbol(
+    root: &Path,
+    display_path: &str,
+    line: usize,
+    symbol_hits: &[index::SymbolHit],
+    absolute: bool,
+) -> Option<index::SymbolHit> {
+    symbol_hits
+        .iter()
+        .filter_map(|symbol| {
+            let symbol_display_path = search_budget_symbol_display_file(root, symbol, absolute);
+            (symbol_display_path == display_path
+                && search_budget_symbol_contains_line(symbol, line))
+            .then_some((symbol, symbol_display_path))
+        })
+        .min_by_key(|(symbol, _)| {
+            let start = symbol_hit_line(symbol);
+            let end = search_budget_symbol_end_line(symbol)
+                .unwrap_or(start)
+                .max(start);
+            (
+                end.saturating_sub(start),
+                search_budget_path_looks_like_test(&symbol.file),
+                symbol.name.clone(),
+            )
+        })
+        .map(|(symbol, symbol_display_path)| {
+            let mut symbol = symbol.clone();
+            symbol.file = symbol_display_path;
+            symbol
+        })
+}
+
+fn search_budget_source_window_bounds(
+    line: usize,
+    containing_symbol: Option<&index::SymbolHit>,
+) -> (usize, usize) {
+    if let Some(symbol) = containing_symbol {
+        let start = symbol_hit_line(symbol);
+        let end = search_budget_symbol_end_line(symbol)
+            .unwrap_or(start)
+            .max(start);
+        let line_count = end.saturating_sub(start).saturating_add(1);
+        if line_count <= SEARCH_BUDGET_SYMBOL_SOURCE_WINDOW_MAX_LINES {
+            return (start, end);
+        }
+    }
+
+    let context_before = SEARCH_BUDGET_HIT_SOURCE_WINDOW_LINES / 3;
+    let start = line.saturating_sub(context_before).max(1);
+    let end = start
+        .saturating_add(SEARCH_BUDGET_HIT_SOURCE_WINDOW_LINES)
+        .saturating_sub(1);
+    (start, end)
+}
+
+fn search_budget_source_handle_preview(
+    root: &Path,
+    display_path: &str,
+    line: usize,
+    query: &str,
+    strategy: &str,
+    containing_symbol: Option<&index::SymbolHit>,
+) -> SearchBudgetSourceHandlePreview {
+    let (start_line, end_line) = search_budget_source_window_bounds(line, containing_symbol);
+    let line_count = end_line.saturating_sub(start_line).saturating_add(1).max(1);
+    let reason = containing_symbol
+        .map(|symbol| format!("search hit inside {} {}", symbol.kind, symbol.name))
+        .unwrap_or_else(|| format!("search hit line {line}"));
+    SearchBudgetSourceHandlePreview {
+        handle: stable_handle(
+            "xwin",
+            &format!("{display_path}:{start_line}:{end_line}:{query}:{strategy}"),
+        ),
+        kind: "source_handle".to_string(),
+        file: display_path.to_string(),
+        start_line,
+        end_line,
+        reason,
+        expand: source_read_command(root, display_path, start_line, line_count),
+    }
+}
+
+fn search_budget_containing_symbol_preview(
+    root: &Path,
+    symbol: &index::SymbolHit,
+) -> SearchBudgetContainingSymbolPreview {
+    let line = symbol_hit_line(symbol);
+    SearchBudgetContainingSymbolPreview {
+        handle: stable_handle(
+            "ssym",
+            &format!("{}:{}:{}:{}", symbol.file, symbol.name, symbol.kind, line),
+        ),
+        name: symbol.name.clone(),
+        kind: symbol.kind.clone(),
+        language: symbol.language.clone(),
+        file: symbol.file.clone(),
+        line,
+        end_line: search_budget_symbol_end_line(symbol),
+        expand: source_symbol_read_command(root, &symbol.name, &symbol.file),
+    }
+}
+
+fn search_budget_path_looks_like_test(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.starts_with("tests/")
+        || normalized.contains("/tests/")
+        || normalized.contains("/test/")
+        || normalized.contains("/__tests__/")
+        || normalized.contains("/spec/")
+        || normalized.ends_with("_test.rs")
+        || normalized.ends_with("_spec.rs")
+        || normalized.ends_with(".test.ts")
+        || normalized.ends_with(".test.tsx")
+        || normalized.ends_with(".spec.ts")
+        || normalized.ends_with(".spec.tsx")
+        || normalized.ends_with(".test.js")
+        || normalized.ends_with(".spec.js")
+}
+
+fn search_budget_symbol_kind_is_definition(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class"
+            | "const"
+            | "enum"
+            | "function"
+            | "impl"
+            | "interface"
+            | "macro"
+            | "method"
+            | "mod"
+            | "module"
+            | "static"
+            | "struct"
+            | "trait"
+            | "type"
+    )
+}
+
 fn search_budget_ranking_profile() -> SearchBudgetRankingProfile {
     SearchBudgetRankingProfile {
         mode: "ast_aware_merged".to_string(),
@@ -420,6 +625,17 @@ fn search_budget_symbol_rank_score(symbol: &SearchBudgetSymbolPreview) -> (f64, 
         score += boost;
         reasons.push(format!("graph_neighbors:{}", symbol.graph_neighbors));
     }
+    if search_budget_symbol_kind_is_definition(&symbol.kind) {
+        score += 8.0;
+        reasons.push("definition_kind".to_string());
+    }
+    if search_budget_path_looks_like_test(&symbol.file) {
+        score -= 18.0;
+        reasons.push("test_path".to_string());
+    } else {
+        score += 6.0;
+        reasons.push("source_path".to_string());
+    }
     (score, reasons)
 }
 
@@ -430,6 +646,18 @@ fn search_budget_lexical_rank_score(hit: &SearchBudgetHitPreview) -> (f64, Vec<S
     if hit.confidence.eq_ignore_ascii_case("High") {
         score += 3.0;
         reasons.push("high_confidence_lexical".to_string());
+    }
+    if hit.source_handle.is_some() {
+        score += 5.0;
+        reasons.push("source_handle".to_string());
+    }
+    if hit.containing_symbol.is_some() {
+        score += 4.0;
+        reasons.push("containing_symbol".to_string());
+    }
+    if search_budget_path_looks_like_test(&hit.path) {
+        score -= 12.0;
+        reasons.push("test_path".to_string());
     }
     (score, reasons)
 }
@@ -479,7 +707,7 @@ fn build_search_budget_ranked_previews(
             source: "lexical_file".to_string(),
             score,
             path: hit.path.clone(),
-            line: None,
+            line: hit.line.and_then(|line| i64::try_from(line).ok()),
             name: None,
             kind: None,
             language: None,
@@ -906,6 +1134,23 @@ pub(crate) fn build_search_budget_report(input: SearchBudgetReportInput<'_>) -> 
             } else {
                 relativize(&hit.path, root)
             };
+            let line = search_budget_hit_line(hit);
+            let containing_symbol = line.and_then(|line| {
+                search_budget_containing_symbol(root, &display_path, line, symbol_hits, absolute)
+            });
+            let source_handle = line.map(|line| {
+                search_budget_source_handle_preview(
+                    root,
+                    &display_path,
+                    line,
+                    query,
+                    strategy,
+                    containing_symbol.as_ref(),
+                )
+            });
+            let containing_symbol = containing_symbol
+                .as_ref()
+                .map(|symbol| search_budget_containing_symbol_preview(root, symbol));
             let key = format!("{}:{}:{}:{}", display_path, hit.rank, hit.score, query);
             let preview = compact_snippet(&hit.snippet)
                 .map(|snippet| truncate_for_budget(&snippet, max_bytes))
@@ -914,9 +1159,12 @@ pub(crate) fn build_search_budget_report(input: SearchBudgetReportInput<'_>) -> 
                 handle: stable_handle("shit", &key),
                 rank: hit.rank,
                 path: truncate_for_budget(&display_path, max_bytes),
+                line,
                 confidence: format!("{:?}", hit.confidence),
                 score: hit.score,
                 preview,
+                source_handle,
+                containing_symbol,
                 expand: build_search_budget_follow_up(query, strategy, &display_path),
             }
         })
@@ -1109,6 +1357,33 @@ pub(crate) fn print_search_budget_human(report: &SearchBudgetReport) {
                 format_score(hit.score, true),
                 hit.preview,
                 hit.expand
+            );
+        }
+        if let Some(source_handle) = &hit.source_handle {
+            println!(
+                "  source_handle {} {}:{}-{} reason:{} expand:{}",
+                source_handle.handle,
+                source_handle.file,
+                source_handle.start_line,
+                source_handle.end_line,
+                source_handle.reason,
+                source_handle.expand
+            );
+        }
+        if let Some(symbol) = &hit.containing_symbol {
+            let end_line = symbol
+                .end_line
+                .map(|line| format!("-{line}"))
+                .unwrap_or_default();
+            println!(
+                "  containing_symbol {} {} {} {}:{}{} expand:{}",
+                symbol.handle,
+                symbol.kind,
+                symbol.name,
+                symbol.file,
+                symbol.line,
+                end_line,
+                symbol.expand
             );
         }
     }
