@@ -10141,6 +10141,28 @@ Compacted content:
 do [#active]. spec-test-build-install-commit-push
 <!-- /agent:exchange -->
 
+## Queue
+
+<!-- agent:queue preset=\"#spec-test-build-install-commit-push\" go -->
+- ~~[#done]~~
+- [#active]
+- [#later]
+<!-- /agent:queue -->
+
+## Backlog
+
+<!-- agent:backlog priority queue -->
+- [ ] [#active] Add the active queue profile to context-pack.
+- [ ] [#later] Later prompt should remain queued.
+- [x] [#done] Completed prompt should stay out of the active profile.
+<!-- /agent:backlog -->
+
+## Review
+
+<!-- agent:review -->
+- [ ] [#review] Verify the queue profile output.
+<!-- /agent:review -->
+
 ## Completed / Reaped
 
 <!-- agent:done -->
@@ -10197,6 +10219,38 @@ do [#active]. spec-test-build-install-commit-push
     assert_eq!(
         json["active_prompt_targets"],
         serde_json::json!(["do [#active]. spec-test-build-install-commit-push"])
+    );
+    assert_eq!(
+        json["agent_doc_queue"]["active_queue_prompt"],
+        serde_json::json!("[#active] Add the active queue profile to context-pack.")
+    );
+    assert_eq!(
+        json["agent_doc_queue"]["live_exchange_tail"],
+        serde_json::json!(["do [#active]. spec-test-build-install-commit-push"])
+    );
+    assert!(
+        json["agent_doc_queue"]["backlog_rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| !row.as_str().unwrap().contains("#done"))
+    );
+    assert!(
+        json["agent_doc_queue"]["prompt_presets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|preset| preset
+                .as_str()
+                .unwrap()
+                .starts_with("#spec-test-build-install-commit-push:"))
+    );
+    assert!(
+        json["agent_doc_queue"]["expansion_handles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|handle| handle["expand"].as_str().unwrap().contains("context-pack"))
     );
     assert!(
         json["touched_files"]
@@ -10318,7 +10372,49 @@ fn context_pack_json_composes_next_context_and_optional_digests() {
     .unwrap();
     fs::write(
         root.path().join("tasks/software/tsift.md"),
-        "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n❯ do [#ts1b]. spec-test-build-install-commit-push\n",
+        "\
+---
+agent_doc_session: tsift-v0.1
+prompt_presets:
+  '#spec-test-build-install-commit-push': update spec + tests. commit + push
+---
+
+## Exchange
+
+<!-- agent:exchange patch=append -->
+### Session Summary
+
+Compacted content:
+- Archived stale queue head [#old].
+<!-- agent:boundary:ctx -->
+<!-- /agent:exchange -->
+
+## Queue
+
+<!-- agent:queue preset=\"#spec-test-build-install-commit-push\" go -->
+- ~~[#old]~~
+- [#ts1b]
+<!-- /agent:queue -->
+
+## Backlog
+
+<!-- agent:backlog priority queue -->
+- [ ] [#ts1b] do [#ts1b]. spec-test-build-install-commit-push
+- [x] [#old] stale completed prompt
+<!-- /agent:backlog -->
+
+## Review
+
+<!-- agent:review -->
+- [ ] [#rv1] check context-pack queue profile
+<!-- /agent:review -->
+
+## Completed / Reaped
+
+<!-- agent:done -->
+- 2026-05-12 [#old] stale completed prompt
+<!-- /agent:done -->
+",
     )
     .unwrap();
     fs::write(
@@ -10385,6 +10481,34 @@ fn context_pack_json_composes_next_context_and_optional_digests() {
             .as_str()
             .unwrap()
             .ends_with("tasks/software/tsift.md")
+    );
+    assert_eq!(
+        json["next_context"]["agent_doc_queue"]["active_queue_prompt"],
+        serde_json::json!("[#ts1b] do [#ts1b]. spec-test-build-install-commit-push")
+    );
+    assert!(
+        json["next_context"]["agent_doc_queue"]["backlog_rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| !row.as_str().unwrap().contains("#old"))
+    );
+    assert_eq!(
+        json["next_context"]["agent_doc_queue"]["review_rows"][0],
+        serde_json::json!("[#rv1] check context-pack queue profile")
+    );
+    assert!(
+        json["next_context"]["agent_doc_queue"]["prompt_presets"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("#spec-test-build-install-commit-push:")
+    );
+    assert!(
+        json["next_context"]["agent_doc_queue"]["expansion_handles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|handle| handle["handle"] == "adq-context-pack")
     );
     assert!(
         json["diff_digest"]["files_changed"].as_u64().unwrap() >= 1,

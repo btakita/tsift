@@ -29879,6 +29879,34 @@ fn sample() {}
                     command: None,
                     session_path: None,
                 }],
+                agent_doc_queue: Some(session_review::SessionReviewAgentDocQueueProfile {
+                    active_queue_prompt: Some(
+                        "[#one] do one with enough detail to truncate".to_string(),
+                    ),
+                    live_exchange_tail: vec!["do one".to_string(), "do two".to_string()],
+                    backlog_rows: vec!["[#one] do one".to_string(), "[#two] do two".to_string()],
+                    review_rows: vec![
+                        "[#review] review one".to_string(),
+                        "[#review2] review two".to_string(),
+                    ],
+                    prompt_presets: vec![
+                        "#spec-test-build-install-commit-push: update spec + tests"
+                            .to_string(),
+                        "#next-steps: collect follow-ups".to_string(),
+                    ],
+                    expansion_handles: vec![
+                        session_review::SessionReviewAgentDocExpansionHandle {
+                            handle: "adq-next-context".to_string(),
+                            label: "refresh next-context".to_string(),
+                            expand: "tsift --envelope session-review tasks/software/tsift.md --next-context --budget normal".to_string(),
+                        },
+                        session_review::SessionReviewAgentDocExpansionHandle {
+                            handle: "adq-context-pack".to_string(),
+                            label: "refresh context-pack".to_string(),
+                            expand: "tsift --envelope context-pack tasks/software/tsift.md --budget normal".to_string(),
+                        },
+                    ],
+                }),
                 next_digest_commands: vec![
                     "tsift session-review --next-context tasks/software/tsift.md".to_string(),
                     "tsift diff-digest .".to_string(),
@@ -29917,6 +29945,16 @@ fn sample() {}
             budget_report.next_digest_commands[2],
             "tsift test-digest --path . < target/very-long-test-output-file-name-that-must-remain-executable.log"
         );
+        let queue = budget_report
+            .agent_doc_queue
+            .as_ref()
+            .expect("agent-doc queue budget profile should be present");
+        assert_eq!(queue.active_queue_prompt.as_deref(), Some("[#one] do..."));
+        assert_eq!(queue.backlog_rows, vec!["[#one] do..."]);
+        assert_eq!(queue.review_row_total, 2);
+        assert_eq!(queue.prompt_presets.len(), 1);
+        assert_eq!(queue.expansion_handles.len(), 2);
+        assert!(queue.truncated);
         assert_eq!(budget_report.next_token_actions.len(), 1);
         assert_eq!(budget_report.next_token_actions[0].kind, "prompt_budget");
 

@@ -604,12 +604,14 @@
         "graph readiness blocked (summary_cache_empty); resolve readiness warnings before running conflict-matrix"
       ],
       "follow_up_mentions_conflict_matrix": false,
-      "worker_ownership_block_count": 4
+      "worker_ownership_block_count": 1
     },
     "session_review": {
       "contract_version": "session-review-follow-up-v1",
-      "prompt_target_total": 0,
-      "prompt_targets": [],
+      "prompt_target_total": 1,
+      "prompt_targets": [
+        "dispatch #spec-test-build-install-commit-push"
+      ],
       "next_digest_mentions_conflict_matrix": false,
       "next_digest_mentions_context_pack": false
     }

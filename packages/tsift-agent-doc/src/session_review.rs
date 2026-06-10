@@ -22,6 +22,7 @@ const MAX_AGGREGATE_ITEMS: usize = 12;
 const MAX_LARGEST_TURNS: usize = 8;
 const MAX_WARNINGS: usize = 16;
 const MAX_LOOP_CLUSTERS: usize = 12;
+const MAX_AGENT_DOC_QUEUE_PROFILE_ROWS: usize = 8;
 /// Per-source candidate budget for session discovery. Each source can collect at
 /// most this many most-recent files before content reads. Set generously above
 /// `MAX_SESSIONS` so the global top-N after cross-source merge still comes from
@@ -144,6 +145,34 @@ pub struct SessionReviewVerificationState {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionReviewAgentDocExpansionHandle {
+    pub handle: String,
+    pub label: String,
+    pub expand: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SessionReviewAgentDocQueueProfile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_queue_prompt: Option<String>,
+    pub live_exchange_tail: Vec<String>,
+    pub backlog_rows: Vec<String>,
+    pub review_rows: Vec<String>,
+    pub prompt_presets: Vec<String>,
+    pub expansion_handles: Vec<SessionReviewAgentDocExpansionHandle>,
+}
+
+impl SessionReviewAgentDocQueueProfile {
+    fn is_empty(&self) -> bool {
+        self.active_queue_prompt.is_none()
+            && self.live_exchange_tail.is_empty()
+            && self.backlog_rows.is_empty()
+            && self.review_rows.is_empty()
+            && self.prompt_presets.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionReviewNextContext {
     pub target: String,
@@ -152,6 +181,8 @@ pub struct SessionReviewNextContext {
     pub touched_files: Vec<String>,
     pub touched_symbols: Vec<String>,
     pub unresolved_failures: Vec<SessionReviewFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_doc_queue: Option<SessionReviewAgentDocQueueProfile>,
     pub next_digest_commands: Vec<String>,
 }
 
@@ -289,6 +320,7 @@ struct DocumentActiveContext {
     touched_files: Vec<SessionReviewFileRef>,
     touched_symbols: Vec<SessionReviewSymbolRef>,
     failures: Vec<SessionReviewFailure>,
+    agent_doc_queue: Option<SessionReviewAgentDocQueueProfile>,
 }
 
 impl DocumentActiveContext {
@@ -299,6 +331,17 @@ impl DocumentActiveContext {
             || !self.touched_symbols.is_empty()
             || !self.failures.is_empty()
     }
+}
+
+struct NextContextBuildInput<'a> {
+    context: &'a TargetContext,
+    active_prompt_targets: Vec<String>,
+    touched_files: &'a [SessionReviewFileRef],
+    touched_symbols: &'a [SessionReviewSymbolRef],
+    failures: &'a [SessionReviewFailure],
+    guardrails: &'a [SessionCostGuardrail],
+    last_verification: SessionReviewVerificationState,
+    agent_doc_queue: Option<SessionReviewAgentDocQueueProfile>,
 }
 
 #[derive(Debug, Clone)]
@@ -805,10 +848,10 @@ pub fn compute_with_options_and_phases(
     let (active_prompt_targets, next_context_files, next_context_symbols, next_context_failures) =
         if document_active_context.should_scope_next_context() {
             (
-                document_active_context.prompt_targets,
-                document_active_context.touched_files,
-                document_active_context.touched_symbols,
-                document_active_context.failures,
+                document_active_context.prompt_targets.clone(),
+                document_active_context.touched_files.clone(),
+                document_active_context.touched_symbols.clone(),
+                document_active_context.failures.clone(),
             )
         } else {
             (
@@ -821,18 +864,19 @@ pub fn compute_with_options_and_phases(
                 failures.clone(),
             )
         };
-    let next_context = build_next_context(
-        &context,
+    let next_context = build_next_context(NextContextBuildInput {
+        context: &context,
         active_prompt_targets,
-        &next_context_files,
-        &next_context_symbols,
-        &next_context_failures,
-        &guardrails,
-        last_verification.unwrap_or_else(|| SessionReviewVerificationState {
+        touched_files: &next_context_files,
+        touched_symbols: &next_context_symbols,
+        failures: &next_context_failures,
+        guardrails: &guardrails,
+        last_verification: last_verification.unwrap_or_else(|| SessionReviewVerificationState {
             status: "missing".to_string(),
             detail: "no verification closeout found in matched sessions".to_string(),
         }),
-    );
+        agent_doc_queue: document_active_context.agent_doc_queue,
+    });
     warnings.sort();
     warnings.truncate(MAX_WARNINGS);
 
@@ -967,15 +1011,17 @@ fn build_target_context(target: &Path) -> Result<TargetContext> {
     })
 }
 
-fn build_next_context(
-    context: &TargetContext,
-    active_prompt_targets: Vec<String>,
-    touched_files: &[SessionReviewFileRef],
-    touched_symbols: &[SessionReviewSymbolRef],
-    failures: &[SessionReviewFailure],
-    guardrails: &[SessionCostGuardrail],
-    last_verification: SessionReviewVerificationState,
-) -> SessionReviewNextContext {
+fn build_next_context(input: NextContextBuildInput<'_>) -> SessionReviewNextContext {
+    let NextContextBuildInput {
+        context,
+        active_prompt_targets,
+        touched_files,
+        touched_symbols,
+        failures,
+        guardrails,
+        last_verification,
+        agent_doc_queue,
+    } = input;
     let target = context
         .relative_target
         .clone()
@@ -1028,6 +1074,7 @@ fn build_next_context(
             .map(|entry| entry.symbol.clone())
             .collect(),
         unresolved_failures,
+        agent_doc_queue,
         next_digest_commands,
     }
 }
@@ -1081,20 +1128,50 @@ fn collect_document_active_context(context: &TargetContext) -> Result<DocumentAc
             context.canonical_target.display()
         )
     })?;
-    let Some(exchange) = extract_agent_component(&content, "exchange") else {
-        return Ok(DocumentActiveContext::default());
-    };
-    let tail = active_exchange_tail(exchange);
+    let tail = extract_agent_component(&content, "exchange")
+        .map(active_exchange_tail)
+        .unwrap_or_default();
+    let agent_doc_queue = collect_agent_doc_queue_profile(&content, context, &tail);
+    let has_live_tail = has_meaningful_live_tail(&tail);
+    if !has_live_tail {
+        let queue_prompt_target = agent_doc_queue
+            .as_ref()
+            .and_then(|profile| profile.active_queue_prompt.clone())
+            .into_iter()
+            .collect();
+        return Ok(DocumentActiveContext {
+            has_live_tail,
+            prompt_targets: queue_prompt_target,
+            touched_files: Vec::new(),
+            touched_symbols: Vec::new(),
+            failures: Vec::new(),
+            agent_doc_queue,
+        });
+    }
     let digest = session_digest::compute(&context.root, &tail, Some("markdown"))?;
     let fallback_prompt_targets = if digest.prompt_targets.is_empty() {
         collect_live_tail_prompt_lines(&tail)
     } else {
         Vec::new()
     };
+    let queue_prompt_target =
+        if digest.prompt_targets.is_empty() && fallback_prompt_targets.is_empty() {
+            agent_doc_queue
+                .as_ref()
+                .and_then(|profile| profile.active_queue_prompt.clone())
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
     Ok(DocumentActiveContext {
-        has_live_tail: has_meaningful_live_tail(&tail),
+        has_live_tail,
         prompt_targets: if digest.prompt_targets.is_empty() {
-            fallback_prompt_targets
+            if fallback_prompt_targets.is_empty() {
+                queue_prompt_target
+            } else {
+                fallback_prompt_targets
+            }
         } else {
             digest.prompt_targets
         },
@@ -1128,6 +1205,7 @@ fn collect_document_active_context(context: &TargetContext) -> Result<DocumentAc
                     .or_else(|| Some(context.canonical_target.display().to_string())),
             })
             .collect(),
+        agent_doc_queue,
     })
 }
 
@@ -1210,6 +1288,177 @@ fn active_exchange_tail(exchange: &str) -> String {
         }
     }
     prompt_region
+}
+
+fn collect_agent_doc_queue_profile(
+    content: &str,
+    context: &TargetContext,
+    live_tail: &str,
+) -> Option<SessionReviewAgentDocQueueProfile> {
+    let queue_rows = extract_agent_component(content, "queue")
+        .map(collect_agent_doc_component_rows)
+        .unwrap_or_default();
+    let backlog_rows = extract_agent_component(content, "backlog")
+        .map(collect_agent_doc_component_rows)
+        .unwrap_or_default();
+    let review_rows = extract_agent_component(content, "review")
+        .map(collect_agent_doc_component_rows)
+        .unwrap_or_default();
+    let prompt_presets = collect_agent_doc_prompt_presets(content);
+    let live_exchange_tail = collect_meaningful_live_tail_lines(live_tail);
+
+    let backlog_by_ref = backlog_rows
+        .iter()
+        .filter_map(|row| extract_first_backlog_ref(row).map(|id| (id, row.clone())))
+        .collect::<BTreeMap<_, _>>();
+    let active_queue_prompt = queue_rows.first().map(|queue_row| {
+        extract_first_backlog_ref(queue_row)
+            .and_then(|id| backlog_by_ref.get(&id).cloned())
+            .unwrap_or_else(|| queue_row.clone())
+    });
+
+    let mut profile = SessionReviewAgentDocQueueProfile {
+        active_queue_prompt,
+        live_exchange_tail,
+        backlog_rows,
+        review_rows,
+        prompt_presets,
+        expansion_handles: Vec::new(),
+    };
+    if profile.is_empty() {
+        return None;
+    }
+    profile.expansion_handles = agent_doc_queue_expansion_handles(context);
+    Some(profile)
+}
+
+fn collect_agent_doc_component_rows(component: &str) -> Vec<String> {
+    component
+        .lines()
+        .filter_map(normalize_agent_doc_component_row)
+        .take(MAX_AGENT_DOC_QUEUE_PROFILE_ROWS)
+        .collect()
+}
+
+fn normalize_agent_doc_component_row(raw_line: &str) -> Option<String> {
+    let mut line = raw_line.trim();
+    if line.is_empty() || line.starts_with("<!--") {
+        return None;
+    }
+    if let Some(rest) = line.strip_prefix("- ") {
+        line = rest.trim();
+    }
+    if line.starts_with("~~") || line.ends_with("~~") {
+        return None;
+    }
+    if let Some(rest) = line.strip_prefix("[ ]") {
+        line = rest.trim();
+    } else if line.starts_with("[x]") || line.starts_with("[X]") {
+        return None;
+    }
+    if line.is_empty() || line.starts_with("~~") {
+        return None;
+    }
+    Some(collapse_inline_whitespace(line))
+}
+
+fn collect_meaningful_live_tail_lines(tail: &str) -> Vec<String> {
+    tail.lines()
+        .filter_map(meaningful_live_tail_line)
+        .map(collapse_inline_whitespace)
+        .take(MAX_AGENT_DOC_QUEUE_PROFILE_ROWS)
+        .collect()
+}
+
+fn collect_agent_doc_prompt_presets(content: &str) -> Vec<String> {
+    let Some(frontmatter) = extract_frontmatter(content) else {
+        return Vec::new();
+    };
+    let mut in_prompt_presets = false;
+    let mut presets = Vec::new();
+    for raw_line in frontmatter.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed == "prompt_presets:" {
+            in_prompt_presets = true;
+            continue;
+        }
+        if !in_prompt_presets {
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !raw_line.starts_with(char::is_whitespace) {
+            break;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().trim_matches('\'').trim_matches('"');
+        if !key.starts_with('#') {
+            continue;
+        }
+        let value = value.trim().trim_matches('\'').trim_matches('"');
+        let preset = if value.is_empty() {
+            key.to_string()
+        } else {
+            format!("{key}: {}", collapse_inline_whitespace(value))
+        };
+        presets.push(preset);
+        if presets.len() >= MAX_AGENT_DOC_QUEUE_PROFILE_ROWS {
+            break;
+        }
+    }
+    presets
+}
+
+fn extract_frontmatter(content: &str) -> Option<&str> {
+    let rest = content.strip_prefix("---\n")?;
+    let end = rest.find("\n---")?;
+    Some(&rest[..end])
+}
+
+fn extract_first_backlog_ref(text: &str) -> Option<String> {
+    extract_backlog_refs(&[text.to_string()]).into_iter().next()
+}
+
+fn agent_doc_queue_expansion_handles(
+    context: &TargetContext,
+) -> Vec<SessionReviewAgentDocExpansionHandle> {
+    let target = context
+        .relative_target
+        .clone()
+        .unwrap_or_else(|| context.canonical_target.display().to_string());
+    vec![
+        SessionReviewAgentDocExpansionHandle {
+            handle: "adq-next-context".to_string(),
+            label: "refresh next-context".to_string(),
+            expand: format!(
+                "tsift --envelope session-review {} --next-context --budget normal",
+                shell_quote(&target)
+            ),
+        },
+        SessionReviewAgentDocExpansionHandle {
+            handle: "adq-context-pack".to_string(),
+            label: "refresh context-pack".to_string(),
+            expand: format!(
+                "tsift --envelope context-pack {} --budget normal",
+                shell_quote(&target)
+            ),
+        },
+        SessionReviewAgentDocExpansionHandle {
+            handle: "adq-document".to_string(),
+            label: "expand document".to_string(),
+            expand: format!(
+                "tsift --envelope source-read {} --budget normal",
+                shell_quote(&target)
+            ),
+        },
+    ]
+}
+
+fn collapse_inline_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn parse_agent_doc_session(path: &Path) -> Result<Option<String>> {
@@ -2204,6 +2453,28 @@ Compacted content:
 do [#active]. spec-test-build-install-commit-push
 <!-- /agent:exchange -->
 
+## Queue
+
+<!-- agent:queue preset=\"#spec-test-build-install-commit-push\" go -->
+- ~~[#done]~~
+- [#active]
+- [#later]
+<!-- /agent:queue -->
+
+## Backlog
+
+<!-- agent:backlog priority queue -->
+- [ ] [#active] Add the active queue profile to context-pack.
+- [ ] [#later] Later prompt should remain queued.
+- [x] [#done] Completed prompt should stay out of the active profile.
+<!-- /agent:backlog -->
+
+## Review
+
+<!-- agent:review -->
+- [ ] [#review] Verify the queue profile output.
+<!-- /agent:review -->
+
 ## Completed / Reaped
 
 <!-- agent:done -->
@@ -2262,6 +2533,47 @@ do [#active]. spec-test-build-install-commit-push
         assert_eq!(
             report.next_context.active_prompt_targets,
             vec!["do [#active]. spec-test-build-install-commit-push".to_string()]
+        );
+        let queue_profile = report
+            .next_context
+            .agent_doc_queue
+            .as_ref()
+            .expect("agent-doc queue profile should be present");
+        assert_eq!(
+            queue_profile.active_queue_prompt.as_deref(),
+            Some("[#active] Add the active queue profile to context-pack.")
+        );
+        assert_eq!(
+            queue_profile.live_exchange_tail,
+            vec!["do [#active]. spec-test-build-install-commit-push".to_string()]
+        );
+        assert!(
+            queue_profile
+                .backlog_rows
+                .iter()
+                .any(|row| row == "[#later] Later prompt should remain queued.")
+        );
+        assert!(
+            queue_profile
+                .backlog_rows
+                .iter()
+                .all(|row| !row.contains("#done"))
+        );
+        assert_eq!(
+            queue_profile.review_rows,
+            vec!["[#review] Verify the queue profile output.".to_string()]
+        );
+        assert!(
+            queue_profile
+                .prompt_presets
+                .iter()
+                .any(|preset| preset.starts_with("#spec-test-build-install-commit-push:"))
+        );
+        assert!(
+            queue_profile
+                .expansion_handles
+                .iter()
+                .any(|handle| handle.expand.contains("context-pack"))
         );
         assert!(
             report

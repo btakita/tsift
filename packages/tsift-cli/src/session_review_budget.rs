@@ -5,9 +5,9 @@ use tsift_agent_doc::session_review;
 
 use crate::output::ResponseBudget;
 use crate::{
+    CompactSymbolRefPreview, SESSION_REVIEW_FOLLOW_UP_CONTRACT_VERSION, TagOntologyPreviewContext,
     build_compact_symbol_ref_with_ontology, format_compact_count, format_symbol_preview_line,
-    shell_quote, stable_handle, truncate_for_budget, CompactSymbolRefPreview,
-    SESSION_REVIEW_FOLLOW_UP_CONTRACT_VERSION, TagOntologyPreviewContext,
+    shell_quote, stable_handle, truncate_for_budget,
 };
 
 #[derive(Clone, Serialize)]
@@ -81,6 +81,30 @@ pub(crate) struct SessionReviewNextTokenAction {
 }
 
 #[derive(Clone, Serialize)]
+pub(crate) struct SessionReviewAgentDocExpansionBudgetHandle {
+    pub(crate) handle: String,
+    pub(crate) label: String,
+    pub(crate) expand: String,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct SessionReviewAgentDocQueueBudgetProfile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) active_queue_prompt: Option<String>,
+    pub(crate) live_exchange_tail_total: usize,
+    pub(crate) backlog_row_total: usize,
+    pub(crate) review_row_total: usize,
+    pub(crate) prompt_preset_total: usize,
+    pub(crate) expansion_handle_total: usize,
+    pub(crate) truncated: bool,
+    pub(crate) live_exchange_tail: Vec<String>,
+    pub(crate) backlog_rows: Vec<String>,
+    pub(crate) review_rows: Vec<String>,
+    pub(crate) prompt_presets: Vec<String>,
+    pub(crate) expansion_handles: Vec<SessionReviewAgentDocExpansionBudgetHandle>,
+}
+
+#[derive(Clone, Serialize)]
 pub(crate) struct SessionReviewNextContextBudgetReport {
     pub(crate) contract_version: &'static str,
     pub(crate) target: String,
@@ -99,6 +123,8 @@ pub(crate) struct SessionReviewNextContextBudgetReport {
     pub(crate) unresolved_failures: Vec<SessionReviewBudgetFailurePreview>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) next_token_actions: Vec<SessionReviewNextTokenAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_doc_queue: Option<SessionReviewAgentDocQueueBudgetProfile>,
     pub(crate) next_digest_commands: Vec<String>,
 }
 
@@ -244,6 +270,12 @@ pub(crate) fn build_session_review_next_context_budget_report(
         .filter(|entry| !actionable_guardrail_failures.contains(&entry.kind))
         .collect::<Vec<_>>();
     let unresolved_failure_total = unresolved_failures.len();
+    let agent_doc_queue = report.next_context.agent_doc_queue.as_ref().map(|profile| {
+        build_agent_doc_queue_budget_profile(profile, max_items, max_bytes, follow_up_items)
+    });
+    let agent_doc_queue_truncated = agent_doc_queue
+        .as_ref()
+        .is_some_and(|profile| profile.truncated);
     SessionReviewNextContextBudgetReport {
         contract_version: SESSION_REVIEW_FOLLOW_UP_CONTRACT_VERSION,
         target: report.next_context.target.clone(),
@@ -257,7 +289,8 @@ pub(crate) fn build_session_review_next_context_budget_report(
             || report.next_context.touched_files.len() > max_items
             || report.next_context.touched_symbols.len() > max_items
             || unresolved_failure_total > max_items
-            || report.next_context.next_digest_commands.len() > follow_up_items,
+            || report.next_context.next_digest_commands.len() > follow_up_items
+            || agent_doc_queue_truncated,
         prompt_targets: report
             .next_context
             .active_prompt_targets
@@ -318,12 +351,71 @@ pub(crate) fn build_session_review_next_context_budget_report(
             })
             .collect(),
         next_token_actions,
+        agent_doc_queue,
         next_digest_commands: report
             .next_context
             .next_digest_commands
             .iter()
             .take(follow_up_items)
             .cloned()
+            .collect(),
+    }
+}
+
+fn build_agent_doc_queue_budget_profile(
+    profile: &session_review::SessionReviewAgentDocQueueProfile,
+    max_items: usize,
+    max_bytes: usize,
+    follow_up_items: usize,
+) -> SessionReviewAgentDocQueueBudgetProfile {
+    SessionReviewAgentDocQueueBudgetProfile {
+        active_queue_prompt: profile
+            .active_queue_prompt
+            .as_ref()
+            .map(|prompt| truncate_for_budget(prompt, max_bytes)),
+        live_exchange_tail_total: profile.live_exchange_tail.len(),
+        backlog_row_total: profile.backlog_rows.len(),
+        review_row_total: profile.review_rows.len(),
+        prompt_preset_total: profile.prompt_presets.len(),
+        expansion_handle_total: profile.expansion_handles.len(),
+        truncated: profile.live_exchange_tail.len() > max_items
+            || profile.backlog_rows.len() > max_items
+            || profile.review_rows.len() > max_items
+            || profile.prompt_presets.len() > max_items
+            || profile.expansion_handles.len() > follow_up_items,
+        live_exchange_tail: profile
+            .live_exchange_tail
+            .iter()
+            .take(max_items)
+            .map(|entry| truncate_for_budget(entry, max_bytes))
+            .collect(),
+        backlog_rows: profile
+            .backlog_rows
+            .iter()
+            .take(max_items)
+            .map(|entry| truncate_for_budget(entry, max_bytes))
+            .collect(),
+        review_rows: profile
+            .review_rows
+            .iter()
+            .take(max_items)
+            .map(|entry| truncate_for_budget(entry, max_bytes))
+            .collect(),
+        prompt_presets: profile
+            .prompt_presets
+            .iter()
+            .take(max_items)
+            .map(|entry| truncate_for_budget(entry, max_bytes))
+            .collect(),
+        expansion_handles: profile
+            .expansion_handles
+            .iter()
+            .take(follow_up_items)
+            .map(|entry| SessionReviewAgentDocExpansionBudgetHandle {
+                handle: entry.handle.clone(),
+                label: truncate_for_budget(&entry.label, max_bytes),
+                expand: entry.expand.clone(),
+            })
             .collect(),
     }
 }
@@ -529,6 +621,40 @@ pub(crate) fn print_session_review_next_context_budget_human(
         }
         for command in &action.digest_commands {
             println!("token-action-command {} digest {}", action.kind, command);
+        }
+    }
+    if let Some(queue) = &report.agent_doc_queue {
+        println!(
+            "agent-doc-queue active:{} exchange_tail:{}/{} backlog:{}/{} review:{}/{} presets:{}/{} handles:{}/{}",
+            queue.active_queue_prompt.as_deref().unwrap_or("-"),
+            queue.live_exchange_tail.len(),
+            queue.live_exchange_tail_total,
+            queue.backlog_rows.len(),
+            queue.backlog_row_total,
+            queue.review_rows.len(),
+            queue.review_row_total,
+            queue.prompt_presets.len(),
+            queue.prompt_preset_total,
+            queue.expansion_handles.len(),
+            queue.expansion_handle_total
+        );
+        for line in &queue.live_exchange_tail {
+            println!("agent-doc-exchange-tail {line}");
+        }
+        for row in &queue.backlog_rows {
+            println!("agent-doc-backlog {row}");
+        }
+        for row in &queue.review_rows {
+            println!("agent-doc-review {row}");
+        }
+        for preset in &queue.prompt_presets {
+            println!("agent-doc-preset {preset}");
+        }
+        for handle in &queue.expansion_handles {
+            println!(
+                "agent-doc-expand {} {} {}",
+                handle.handle, handle.label, handle.expand
+            );
         }
     }
     for command in &report.next_digest_commands {

@@ -1401,6 +1401,32 @@ pub(crate) fn cmd_session_review_with_budget(
             }
         }
 
+        if let Some(queue) = &report.next_context.agent_doc_queue {
+            println!();
+            println!("Agent-doc queue profile:");
+            if let Some(prompt) = &queue.active_queue_prompt {
+                println!("  - active: {prompt}");
+            }
+            for line in &queue.live_exchange_tail {
+                println!("  - exchange-tail: {line}");
+            }
+            for row in &queue.backlog_rows {
+                println!("  - backlog: {row}");
+            }
+            for row in &queue.review_rows {
+                println!("  - review: {row}");
+            }
+            for preset in &queue.prompt_presets {
+                println!("  - preset: {preset}");
+            }
+            for handle in &queue.expansion_handles {
+                println!(
+                    "  - expand {} [{}]: {}",
+                    handle.handle, handle.label, handle.expand
+                );
+            }
+        }
+
         if !report.next_context.touched_files.is_empty() {
             println!();
             println!("Touched files:");

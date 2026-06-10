@@ -5,7 +5,6 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use tsift_sqlite as substrate;
 use substrate::{
     GraphEdge as SubstrateGraphEdge, GraphNode as SubstrateGraphNode, GraphProjection,
     GraphProvenance, GraphStore, SqliteGraphStore,
@@ -13,34 +12,29 @@ use substrate::{
 use tsift_agent_doc::session_review;
 use tsift_digest::{diff_digest, log_digest, test_digest};
 use tsift_index::index;
+use tsift_sqlite as substrate;
 use tsift_status::status;
 
 use crate::output::ResponseBudget;
 use crate::session_review_budget::{
-    SessionReviewNextContextBudgetReport,
-    build_session_review_next_context_budget_report,
+    SessionReviewNextContextBudgetReport, build_session_review_next_context_budget_report,
 };
 use crate::{
-    CompactOntologyRefPreview, CompactSymbolRefPreview, ExplorationBudget, ExplorationPacket,
-    ExplorationRelation, ExplorationSourceWindow, ExplorationWorkerContext,
-    GraphDbBackendEvalPhaseTiming, GraphDbFreshnessReport, GraphEffectivenessReadiness,
-    TagOntologyPreviewContext,
-    build_compact_symbol_ref_with_ontology, compact_symbol_ref_token,
-    dedupe_preserve_order, diff_digest_mode_label, diff_digest_status_label,
-    diff_digest_summary_label, edge_with_content_freshness,
-    exploration_budget_for_counts, extract_conflict_target_refs,
-    format_summary_ref_line, format_symbol_preview_line,
-    graph_db_backend_eval_phase_timing, graph_db_backend_eval_timed_phase,
-    graph_db_evidence_packet_id, graph_db_read_recovery_diagnostic,
-    graph_db_resolve_evidence_target, graph_db_semantic_readiness,
-    graph_store_semantic_node_count, graph_substrate_db_path,
-    load_tag_ontology_preview_context, log_digest_summary_label,
-    node_with_content_freshness, ontology_refs_for_alias,
-    prepare_agent_doc_index_gate_cached,
-    shell_quote, source_read_command, sqlite_graph_freshness,
-    stable_handle, tag_alias_from_name, test_digest_summary_label,
+    CONTEXT_PACK_GRAPH_ORCHESTRATION_CONTRACT_VERSION, CompactOntologyRefPreview,
+    CompactSymbolRefPreview, ExplorationBudget, ExplorationPacket, ExplorationRelation,
+    ExplorationSourceWindow, ExplorationWorkerContext, GraphDbBackendEvalPhaseTiming,
+    GraphDbFreshnessReport, GraphEffectivenessReadiness, TagOntologyPreviewContext,
+    build_compact_symbol_ref_with_ontology, compact_symbol_ref_token, dedupe_preserve_order,
+    diff_digest_mode_label, diff_digest_status_label, diff_digest_summary_label,
+    edge_with_content_freshness, exploration_budget_for_counts, extract_conflict_target_refs,
+    format_summary_ref_line, format_symbol_preview_line, graph_db_backend_eval_phase_timing,
+    graph_db_backend_eval_timed_phase, graph_db_evidence_packet_id,
+    graph_db_read_recovery_diagnostic, graph_db_resolve_evidence_target,
+    graph_db_semantic_readiness, graph_store_semantic_node_count, graph_substrate_db_path,
+    load_tag_ontology_preview_context, log_digest_summary_label, node_with_content_freshness,
+    ontology_refs_for_alias, prepare_agent_doc_index_gate_cached, shell_quote, source_read_command,
+    sqlite_graph_freshness, stable_handle, tag_alias_from_name, test_digest_summary_label,
     truncate_for_budget,
-    CONTEXT_PACK_GRAPH_ORCHESTRATION_CONTRACT_VERSION,
 };
 
 #[derive(Clone, Serialize)]
@@ -1317,60 +1311,59 @@ fn context_pack_graph_orchestration(
         warnings.extend(readiness.diagnostics.clone());
     }
 
-    let (evidence_packet_ids, resolvable_targets, conflict_matrix_decisions) =
-        if readiness.fail_closed {
-            (
-                Vec::new(),
-                Vec::new(),
-                vec![format!(
-                    "graph readiness blocked ({}); resolve readiness warnings before running conflict-matrix",
-                    readiness.reason,
-                )],
-            )
-        } else {
-            let mut targets = next_context
-                .prompt_targets
-                .iter()
-                .flat_map(|prompt| extract_conflict_target_refs(prompt))
-                .collect::<Vec<_>>();
-            if targets.is_empty() {
-                targets.extend(
-                    exploration
-                        .worker_context
-                        .iter()
-                        .flat_map(|worker| extract_conflict_target_refs(&worker.summary)),
-                );
-            }
-            targets = dedupe_preserve_order(targets);
+    let (evidence_packet_ids, resolvable_targets, conflict_matrix_decisions) = if readiness
+        .fail_closed
+    {
+        (
+            Vec::new(),
+            Vec::new(),
+            vec![format!(
+                "graph readiness blocked ({}); resolve readiness warnings before running conflict-matrix",
+                readiness.reason,
+            )],
+        )
+    } else {
+        let mut targets = next_context
+            .prompt_targets
+            .iter()
+            .flat_map(|prompt| extract_conflict_target_refs(prompt))
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            targets.extend(
+                exploration
+                    .worker_context
+                    .iter()
+                    .flat_map(|worker| extract_conflict_target_refs(&worker.summary)),
+            );
+        }
+        targets = dedupe_preserve_order(targets);
 
-            let mut ev_ids = Vec::new();
-            let mut resolved = Vec::new();
-            for target in &targets {
-                match graph_db_resolve_evidence_target(&store, target)? {
-                    Some(node) => {
-                        ev_ids.push(graph_db_evidence_packet_id(
-                            target,
-                            &node,
-                            &projection_freshness,
-                        ));
-                        resolved.push(target.clone());
-                    }
-                    None => warnings.push(format!("graph evidence target not found: {target}")),
+        let mut ev_ids = Vec::new();
+        let mut resolved = Vec::new();
+        for target in &targets {
+            match graph_db_resolve_evidence_target(&store, target)? {
+                Some(node) => {
+                    ev_ids.push(graph_db_evidence_packet_id(
+                        target,
+                        &node,
+                        &projection_freshness,
+                    ));
+                    resolved.push(target.clone());
                 }
+                None => warnings.push(format!("graph evidence target not found: {target}")),
             }
+        }
 
-            let decisions = if resolved.is_empty() {
-                vec![
-                    "no resolvable backlog/job targets found for conflict-matrix".to_string(),
-                ]
-            } else {
-                vec![format!(
-                    "run conflict-matrix before parallel dispatch for {} target(s)",
-                    resolved.len()
-                )]
-            };
-            (ev_ids, resolved, decisions)
+        let decisions = if resolved.is_empty() {
+            vec!["no resolvable backlog/job targets found for conflict-matrix".to_string()]
+        } else {
+            vec![format!(
+                "run conflict-matrix before parallel dispatch for {} target(s)",
+                resolved.len()
+            )]
         };
+        (ev_ids, resolved, decisions)
+    };
 
     let mut follow_up_commands = vec![format!(
         "tsift graph-db --path {} status --json",
@@ -1449,6 +1442,20 @@ pub(crate) fn print_context_pack_human(report: &ContextPackReport, compact: bool
                 action.digest_commands.len()
                     + usize::from(action.compact_command.is_some())
                     + usize::from(action.restart_command.is_some())
+            );
+        }
+        if let Some(queue) = &report.next_context.agent_doc_queue {
+            println!(
+                "agent-doc-queue active:{} exchange_tail:{}/{} backlog:{}/{} review:{}/{} presets:{}/{}",
+                queue.active_queue_prompt.as_deref().unwrap_or("-"),
+                queue.live_exchange_tail.len(),
+                queue.live_exchange_tail_total,
+                queue.backlog_rows.len(),
+                queue.backlog_row_total,
+                queue.review_rows.len(),
+                queue.review_row_total,
+                queue.prompt_presets.len(),
+                queue.prompt_preset_total
             );
         }
         for file in &report.diff_digest.files {
@@ -1553,6 +1560,30 @@ pub(crate) fn print_context_pack_human(report: &ContextPackReport, compact: bool
     if !report.next_context.prompt_targets.is_empty() {
         for prompt in &report.next_context.prompt_targets {
             println!("  - prompt: {prompt}");
+        }
+    }
+    if let Some(queue) = &report.next_context.agent_doc_queue {
+        println!("  agent-doc queue:");
+        if let Some(prompt) = &queue.active_queue_prompt {
+            println!("  - active: {prompt}");
+        }
+        for line in &queue.live_exchange_tail {
+            println!("  - exchange-tail: {line}");
+        }
+        for row in &queue.backlog_rows {
+            println!("  - backlog: {row}");
+        }
+        for row in &queue.review_rows {
+            println!("  - review: {row}");
+        }
+        for preset in &queue.prompt_presets {
+            println!("  - preset: {preset}");
+        }
+        for handle in &queue.expansion_handles {
+            println!(
+                "  - expand {} [{}]: {}",
+                handle.handle, handle.label, handle.expand
+            );
         }
     }
     if !report.next_context.touched_files.is_empty() {

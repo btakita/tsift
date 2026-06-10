@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **`#contextpack-queue-slim`**: Added an `agent_doc_queue` profile to `session-review --next-context` and composed `context-pack` output for agent-doc markdown targets. The bounded profile resolves the active queue head to its backlog prompt, carries live unresolved exchange-tail lines, top unchecked backlog/review rows, compact prompt preset refs, and expansion handles while omitting archived summaries, done history, and stale transcript context by default.
 - **`#pcache-prefix-drift`**: Added a bounded prompt-cache prefix drift report to `session-cost`. Prompt-cache analytics now compare adjacent calls by stable-prefix fingerprint, prompt cache key, explicit breakpoint paths, routing affinity, and provider, then annotate cache-ratio drops or cache-creation spikes with the first changed field in JSON, compact, and human output.
 
 ## 0.1.67
