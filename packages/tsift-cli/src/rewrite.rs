@@ -6,7 +6,7 @@ use std::process::Command;
 
 use crate::output::OutputFormat;
 use crate::{relativize_pathbuf, shell_quote, shell_split};
-use tsift_agent_doc::session_digest;
+use tsift_agent_doc::{session_digest, session_markdown};
 use tsift_graph::lang::Lang;
 use tsift_quality::lint;
 
@@ -855,7 +855,7 @@ fn directory_contains_index_db(path: &Path) -> bool {
 
 fn detect_session_digest_source(path: &Path) -> Option<session_digest::SessionDigestSource> {
     match path.extension().and_then(|ext| ext.to_str()) {
-        Some("md") if file_looks_like_agent_doc_session(path) => {
+        Some("md") if session_markdown::markdown_file_looks_like_agent_doc_session(path) => {
             Some(session_digest::SessionDigestSource::Markdown)
         }
         Some("jsonl") if file_looks_like_claude_jsonl(path) => {
@@ -864,21 +864,11 @@ fn detect_session_digest_source(path: &Path) -> Option<session_digest::SessionDi
         Some("jsonl") if file_looks_like_codex_jsonl(path) => {
             Some(session_digest::SessionDigestSource::CodexJsonl)
         }
-        Some("log") if file_looks_like_agent_doc_log(path) => {
+        Some("log") if session_markdown::log_file_looks_like_agent_doc_runtime_log(path) => {
             Some(session_digest::SessionDigestSource::AgentDocLog)
         }
         _ => None,
     }
-}
-
-fn file_looks_like_agent_doc_session(path: &Path) -> bool {
-    let prefix = match read_file_prefix(path, 16 * 1024) {
-        Some(prefix) => prefix,
-        None => return false,
-    };
-    prefix.contains("agent_doc_session:")
-        || prefix.contains("<!-- agent:exchange")
-        || prefix.contains("\n## Exchange")
 }
 
 fn file_looks_like_claude_jsonl(path: &Path) -> bool {
@@ -924,19 +914,6 @@ fn file_looks_like_codex_jsonl(path: &Path) -> bool {
                 Some("session_meta" | "response_item" | "event_msg")
             )
         })
-}
-
-fn file_looks_like_agent_doc_log(path: &Path) -> bool {
-    let prefix = match read_file_prefix(path, 16 * 1024) {
-        Some(prefix) => prefix,
-        None => return false,
-    };
-    prefix
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .take(8)
-        .all(|line| line.starts_with('[') && line.contains("] "))
 }
 
 fn read_file_prefix(path: &Path, max_bytes: usize) -> Option<String> {

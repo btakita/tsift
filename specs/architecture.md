@@ -169,7 +169,7 @@ tsift treats repository multiplicity as an ordered ownership stack rather than a
 4. Cargo package/crate — the source, feature, target, dependency, and test ownership boundary declared by `[package]`
 5. language package-manager workspace — future npm/pnpm/yarn/Python workspace boundaries
 6. generated/runtime scope — `.tsift`, `.agent-doc`, build output, caches, and other generated paths excluded from source watermarks
-7. agent-doc session scope — the document, backlog, queue, worker-result, and source-window boundary used for orchestration
+7. agent-doc session scope — the document, backlog, queue, worker-result, and source-window boundary used for orchestration; agent-doc markdown/log recognition plus session-id, backlog, and queue row parsing belong to `tsift-agent-doc`, while CLI traversal/context surfaces consume those typed helpers and keep graph-node materialization local
 
 Higher-numbered layers refine lower-numbered ownership without overriding isolation. For example, a Cargo package inside an isolated git submodule can be selected and indexed locally, but it is still excluded from federated search unless the enclosing submodule permits federation. Selectors are deterministic and fail closed: `--scope <selector>` first preserves existing git-submodule matching, then accepts Cargo package selectors by package name, normalized crate name (`foo-bar` and `foo_bar`), relative package root, or manifest path. Duplicate package names promote selectors to relative package roots, mirroring duplicate submodule leaf-name handling.
 

@@ -139,6 +139,7 @@ use substrate::{
 use tagpath::{family as tagpath_family, ontology as tagpath_ontology};
 #[cfg(test)]
 use tsift_agent_doc::session_cost;
+use tsift_agent_doc::session_markdown::{self, AgentDocQueueItem, AgentDocSessionDocument};
 #[cfg(test)]
 use tsift_agent_doc::session_review;
 use tsift_cache::cycle_packet_cache;
@@ -12590,53 +12591,6 @@ fn traversal_node_tokens(node: &TraversalNode) -> BTreeSet<String> {
     tokens
 }
 
-fn parse_agent_doc_session_id(content: &str) -> Option<String> {
-    content.lines().find_map(|line| {
-        let trimmed = line.trim();
-        trimmed
-            .strip_prefix("agent_doc_session:")
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    })
-}
-
-fn parse_backlog_line(line: &str) -> Option<(String, String)> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with("- [") {
-        return None;
-    }
-    let start = trimmed.find("[#")?;
-    let after_start = start + 2;
-    let rest = &trimmed[after_start..];
-    let end = rest.find(']')?;
-    let id = rest[..end].trim();
-    if id.is_empty() {
-        return None;
-    }
-    let text = rest[end + 1..].trim().to_string();
-    Some((id.to_string(), text))
-}
-
-fn parse_queue_dispatch_line(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    ["dispatch ", "preset "].iter().find_map(|prefix| {
-        trimmed
-            .strip_prefix(prefix)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    })
-}
-
-fn parse_queue_do_line(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    let rest = trimmed.strip_prefix("- do [#")?;
-    let end = rest.find(']')?;
-    let id = rest[..end].trim();
-    (!id.is_empty()).then(|| id.to_string())
-}
-
 fn markdown_code_spans(input: &str) -> Vec<String> {
     input
         .split('`')
@@ -12795,13 +12749,6 @@ fn hinted_markdown_file(root: &Path, path_hint: &Path) -> Option<PathBuf> {
     None
 }
 
-fn traversal_markdown_content_looks_like_session(content: &str) -> bool {
-    parse_agent_doc_session_id(content).is_some()
-        || content.contains("<!-- agent:exchange")
-        || content.contains("<!-- agent:backlog")
-        || content.contains("## Backlog")
-}
-
 fn traversal_path_is_session_markdown(root: &Path, source_root: &Path, path: &Path) -> bool {
     let candidate = if path.is_absolute() {
         path.to_path_buf()
@@ -12818,7 +12765,7 @@ fn traversal_path_is_session_markdown(root: &Path, source_root: &Path, path: &Pa
         return false;
     }
     fs::read_to_string(&candidate)
-        .map(|content| traversal_markdown_content_looks_like_session(&content))
+        .map(|content| session_markdown::markdown_content_looks_like_agent_doc_session(&content))
         .unwrap_or(false)
 }
 
@@ -13192,22 +13139,24 @@ fn load_agent_doc_traversal_nodes(
                 continue;
             }
         };
-        if !traversal_markdown_content_looks_like_session(&content) {
+        let Some(document) = AgentDocSessionDocument::parse_if_session(&content) else {
             continue;
-        }
+        };
 
-        let session_id = parse_agent_doc_session_id(&content);
-        let session = traversal_session_node(root, &markdown_path, session_id.as_deref());
+        let session = traversal_session_node(root, &markdown_path, document.session_id.as_deref());
         graph.add_node(session.clone());
         let lines = content.lines().collect::<Vec<_>>();
         let mut backlog_by_id = BTreeMap::<String, TraversalNode>::new();
-        for (idx, line) in lines.iter().enumerate() {
-            let Some((id, text)) = parse_backlog_line(line) else {
-                continue;
-            };
-            let backlog = traversal_backlog_node(root, &markdown_path, &id, &text, idx as i64 + 1);
+        for item in &document.backlog_items {
+            let backlog = traversal_backlog_node(
+                root,
+                &markdown_path,
+                &item.id,
+                &item.text,
+                item.line as i64,
+            );
             graph.add_node(backlog.clone());
-            backlog_by_id.insert(id.clone(), backlog.clone());
+            backlog_by_id.insert(item.id.clone(), backlog.clone());
             graph.add_edge(
                 &session.handle,
                 &backlog.handle,
@@ -13215,75 +13164,64 @@ fn load_agent_doc_traversal_nodes(
                 Some("session backlog item".to_string()),
                 1,
             );
-            link_backlog_to_code_nodes(graph, &backlog, &text, lookup, 8);
+            link_backlog_to_code_nodes(graph, &backlog, &item.text, lookup, 8);
         }
 
-        let mut in_queue = false;
         let mut job_by_id = BTreeMap::<String, TraversalNode>::new();
-        for (idx, line) in lines.iter().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("<!-- agent:queue") {
-                in_queue = true;
-                continue;
-            }
-            if trimmed.starts_with("<!-- /agent:queue") {
-                in_queue = false;
-                continue;
-            }
-            if !in_queue {
-                continue;
-            }
-            if let Some(dispatch) = parse_queue_dispatch_line(line) {
-                let dispatch_ref = dispatch.strip_prefix('#').unwrap_or(dispatch.as_str());
-                let node = traversal_job_packet_node(
-                    root,
-                    &markdown_path,
-                    &format!("dispatch {dispatch}"),
-                    Some(dispatch_ref),
-                    "agent-doc dispatch preset",
-                    idx as i64 + 1,
-                );
-                graph.add_node(node.clone());
-                graph.add_edge(
-                    &session.handle,
-                    &node.handle,
-                    "contains",
-                    Some("session queued dispatch".to_string()),
-                    1,
-                );
-                continue;
-            }
-            if let Some(id) = parse_queue_do_line(line) {
-                let detail = backlog_by_id
-                    .get(&id)
-                    .and_then(|node| node.detail.clone())
-                    .unwrap_or_else(|| "queued backlog item".to_string());
-                let node = traversal_job_packet_node(
-                    root,
-                    &markdown_path,
-                    &format!("do #{id}"),
-                    Some(&id),
-                    &detail,
-                    idx as i64 + 1,
-                );
-                graph.add_node(node.clone());
-                graph.add_edge(
-                    &session.handle,
-                    &node.handle,
-                    "contains",
-                    Some("session queued job packet".to_string()),
-                    1,
-                );
-                if let Some(backlog) = backlog_by_id.get(&id) {
+        for item in &document.queue_items {
+            match item {
+                AgentDocQueueItem::Dispatch { value, line }
+                | AgentDocQueueItem::Preset { value, line } => {
+                    let dispatch_ref = value.strip_prefix('#').unwrap_or(value.as_str());
+                    let node = traversal_job_packet_node(
+                        root,
+                        &markdown_path,
+                        &format!("dispatch {value}"),
+                        Some(dispatch_ref),
+                        "agent-doc dispatch preset",
+                        *line as i64,
+                    );
+                    graph.add_node(node.clone());
                     graph.add_edge(
+                        &session.handle,
                         &node.handle,
-                        &backlog.handle,
-                        "targets",
-                        Some("queued backlog item".to_string()),
+                        "contains",
+                        Some("session queued dispatch".to_string()),
                         1,
                     );
                 }
-                job_by_id.insert(id, node);
+                AgentDocQueueItem::Do { id, line } => {
+                    let detail = backlog_by_id
+                        .get(id)
+                        .and_then(|node| node.detail.clone())
+                        .unwrap_or_else(|| "queued backlog item".to_string());
+                    let node = traversal_job_packet_node(
+                        root,
+                        &markdown_path,
+                        &format!("do #{id}"),
+                        Some(id),
+                        &detail,
+                        *line as i64,
+                    );
+                    graph.add_node(node.clone());
+                    graph.add_edge(
+                        &session.handle,
+                        &node.handle,
+                        "contains",
+                        Some("session queued job packet".to_string()),
+                        1,
+                    );
+                    if let Some(backlog) = backlog_by_id.get(id) {
+                        graph.add_edge(
+                            &node.handle,
+                            &backlog.handle,
+                            "targets",
+                            Some("queued backlog item".to_string()),
+                            1,
+                        );
+                    }
+                    job_by_id.insert(id.clone(), node);
+                }
             }
         }
 

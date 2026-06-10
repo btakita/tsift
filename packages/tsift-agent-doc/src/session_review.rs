@@ -13,7 +13,7 @@ use crate::{
         self, SessionCostFileReadDiagnostic, SessionCostGuardrail, SessionCostGuardrailInput,
         SessionCostLoopCluster, SessionCostPromptCacheRoiScorecard,
     },
-    session_digest,
+    session_digest, session_markdown,
 };
 use tsift_quality::runtime_churn::RestartChurnSummary;
 
@@ -1004,7 +1004,7 @@ fn build_target_context(target: &Path) -> Result<TargetContext> {
         .ok()
         .map(|path| path.to_string_lossy().replace('\\', "/"));
     let agent_doc_session = (kind == TargetKind::File)
-        .then(|| parse_agent_doc_session(&canonical_target))
+        .then(|| session_markdown::session_id_from_path(&canonical_target))
         .transpose()?
         .flatten();
 
@@ -1477,28 +1477,6 @@ fn agent_doc_queue_expansion_handles(
 
 fn collapse_inline_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn parse_agent_doc_session(path: &Path) -> Result<Option<String>> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("reading target document {}", path.display()))?;
-    let mut lines = content.lines();
-    if lines.next().map(str::trim) != Some("---") {
-        return Ok(None);
-    }
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed == "---" {
-            break;
-        }
-        if let Some(value) = trimmed.strip_prefix("agent_doc_session:") {
-            let session = value.trim().trim_matches('"').trim_matches('\'');
-            if !session.is_empty() {
-                return Ok(Some(session.to_string()));
-            }
-        }
-    }
-    Ok(None)
 }
 
 fn resolve_claude_projects_dir(root: &Path, options: &SessionReviewOptions) -> PathBuf {
