@@ -725,6 +725,23 @@ fn human_prompt_cache_scenario_list(scenarios: &[String]) -> String {
     }
 }
 
+fn session_cost_source_arg(source: &str) -> &str {
+    match source {
+        "claude_jsonl" => "claude-jsonl",
+        "codex_jsonl" => "codex-jsonl",
+        "agent_doc_log" => "agent-doc-log",
+        other => other,
+    }
+}
+
+fn compact_signed_count(value: i64) -> String {
+    if value < 0 {
+        format!("-{}", format_compact_count(value.unsigned_abs()))
+    } else {
+        format_compact_count(value as u64)
+    }
+}
+
 fn compact_prompt_cache_field_changes(
     changes: &[session_cost::SessionCostPromptCacheFieldChange],
 ) -> String {
@@ -898,7 +915,15 @@ pub(crate) fn cmd_session_cost(
         );
     }
 
-    let report = session_cost::compute(&input, source)?;
+    let mut report = session_cost::compute(&input, source)?;
+    if let Some(file_path) = input_path {
+        let next_command = format!(
+            "tsift session-cost --source {} --input {} --json",
+            session_cost_source_arg(&report.source),
+            shell_quote(&file_path.display().to_string())
+        );
+        session_cost::set_prompt_cache_scorecard_next_command(&mut report, &next_command);
+    }
     if format.json_output {
         println!(
             "{}",
@@ -1012,6 +1037,18 @@ pub(crate) fn cmd_session_cost(
                 plan.provider_adapters.len(),
                 plan.actions.len()
             );
+            for row in &plan.scorecard {
+                println!(
+                    "prompt-cache-roi provider:{} samples:{} net_cached:{} read_create:{} trend:{} cause:{} next:{}",
+                    row.provider,
+                    row.sample_count,
+                    compact_signed_count(row.net_cached_read_tokens),
+                    row.read_create_ratio,
+                    row.trend,
+                    truncate_for_compact(&row.suspected_invalidation_cause, 100),
+                    truncate_for_compact(&row.next_command, 120)
+                );
+            }
             if let Some(analytics) = analytics {
                 for diagnostic in &analytics.diagnostics {
                     println!(
@@ -1196,6 +1233,20 @@ pub(crate) fn cmd_session_cost(
         );
         if let Some(ratio) = &plan.observed_cached_input_ratio {
             println!("  - observed ratio: {ratio}");
+        }
+        if !plan.scorecard.is_empty() {
+            println!("  - ROI scorecard:");
+            for row in &plan.scorecard {
+                println!(
+                    "    {}: net_cached={} read/create={} trend={} cause={} | next: {}",
+                    row.provider,
+                    row.net_cached_read_tokens,
+                    row.read_create_ratio,
+                    row.trend,
+                    row.suspected_invalidation_cause,
+                    row.next_command
+                );
+            }
         }
         if let Some(analytics) = &plan.analytics {
             let average_ratio = analytics
@@ -1597,6 +1648,21 @@ pub(crate) fn cmd_session_review_with_budget(
                 truncate_for_compact(&session.path, 96)
             );
         }
+        for row in &report.prompt_cache_roi_scorecard {
+            println!(
+                "prompt-cache-roi provider:{} session:{} net_cached:{} read_create:{} trend:{} cause:{} next:{}",
+                row.provider,
+                row.session_path
+                    .as_deref()
+                    .map(|path| truncate_for_compact(path, 96))
+                    .unwrap_or_else(|| "-".to_string()),
+                compact_signed_count(row.net_cached_read_tokens),
+                row.read_create_ratio,
+                row.trend,
+                truncate_for_compact(&row.suspected_invalidation_cause, 100),
+                truncate_for_compact(&row.next_command, 120)
+            );
+        }
         for prompt in &report.prompt_targets {
             println!(
                 "prompt count:{} {}",
@@ -1707,6 +1773,23 @@ pub(crate) fn cmd_session_review_with_budget(
             "  latest session largest: {}",
             latest.largest_turn_total_tokens
         );
+    }
+
+    if !report.prompt_cache_roi_scorecard.is_empty() {
+        println!();
+        println!("Prompt cache ROI scorecard:");
+        for row in &report.prompt_cache_roi_scorecard {
+            println!(
+                "  - [{}] {} | net_cached={} | read/create={} | trend={} | cause={} | next: {}",
+                row.provider,
+                row.session_path.as_deref().unwrap_or("-"),
+                row.net_cached_read_tokens,
+                row.read_create_ratio,
+                row.trend,
+                row.suspected_invalidation_cause,
+                row.next_command
+            );
+        }
     }
 
     if !report.sessions.is_empty() {

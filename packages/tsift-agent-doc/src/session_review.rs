@@ -11,7 +11,7 @@ const SESSION_HEADER_PROBE_BUDGET_BYTES: usize = 256 * 1024;
 use crate::{
     session_cost::{
         self, SessionCostFileReadDiagnostic, SessionCostGuardrail, SessionCostGuardrailInput,
-        SessionCostLoopCluster,
+        SessionCostLoopCluster, SessionCostPromptCacheRoiScorecard,
     },
     session_digest,
 };
@@ -23,6 +23,7 @@ const MAX_LARGEST_TURNS: usize = 8;
 const MAX_WARNINGS: usize = 16;
 const MAX_LOOP_CLUSTERS: usize = 12;
 const MAX_AGENT_DOC_QUEUE_PROFILE_ROWS: usize = 8;
+const MAX_PROMPT_CACHE_ROI_SCORECARD: usize = 12;
 /// Per-source candidate budget for session discovery. Each source can collect at
 /// most this many most-recent files before content reads. Set generously above
 /// `MAX_SESSIONS` so the global top-N after cross-source merge still comes from
@@ -217,6 +218,8 @@ pub struct SessionReviewReport {
     pub aggregate_cost: SessionReviewCostSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_session_cost: Option<SessionReviewCostSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub prompt_cache_roi_scorecard: Vec<SessionCostPromptCacheRoiScorecard>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub guardrails: Vec<SessionCostGuardrail>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -484,6 +487,7 @@ pub fn compute_with_options_and_phases(
     let mut file_read_diagnostics =
         BTreeMap::<(String, String), FileReadDiagnosticAggregate>::new();
     let mut largest_turns = Vec::<SessionReviewLargestTurn>::new();
+    let mut prompt_cache_roi_scorecard = Vec::<SessionCostPromptCacheRoiScorecard>::new();
     let mut session_rows = Vec::<SessionReviewSession>::new();
 
     let mut claude_sessions = 0_usize;
@@ -631,6 +635,18 @@ pub fn compute_with_options_and_phases(
                     total_tokens: turn.total_tokens,
                 });
             }
+            let session_path = pending.path.display().to_string();
+            let next_command = format!(
+                "tsift session-cost --source {} --input {} --json",
+                pending.source.digest_source(),
+                shell_quote(&session_path)
+            );
+            prompt_cache_roi_scorecard.extend(session_cost::prompt_cache_scorecard_for_session(
+                cost,
+                pending.source.as_str(),
+                &session_path,
+                &next_command,
+            ));
             for cluster in &cost.loop_clusters {
                 let entry = loop_clusters
                     .entry((cluster.kind.clone(), cluster.label.clone()))
@@ -752,6 +768,7 @@ pub fn compute_with_options_and_phases(
             .then(left.label.cmp(&right.label))
     });
     largest_turns.truncate(MAX_LARGEST_TURNS);
+    prompt_cache_roi_scorecard.truncate(MAX_PROMPT_CACHE_ROI_SCORECARD);
 
     session_rows.truncate(MAX_SESSIONS);
     let prompt_targets =
@@ -908,6 +925,7 @@ pub fn compute_with_options_and_phases(
         largest_turn_total_tokens,
         aggregate_cost,
         latest_session_cost,
+        prompt_cache_roi_scorecard,
         guardrails,
         loop_clusters,
         file_read_diagnostics,

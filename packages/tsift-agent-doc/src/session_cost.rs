@@ -13,8 +13,11 @@ const MAX_FILE_READ_DIAGNOSTICS: usize = 8;
 const MAX_PROMPT_CACHE_TIMELINE: usize = 8;
 const MAX_PROMPT_CACHE_DIAGNOSTICS: usize = 6;
 const MAX_PROMPT_CACHE_PREFIX_DRIFT: usize = 6;
+const MAX_PROMPT_CACHE_SCORECARD: usize = 6;
 const MAX_PROMPT_CACHE_BREAKPOINTS: usize = 8;
 const MAX_COMMANDS_PER_BUNDLE: usize = 6;
+const PROMPT_CACHE_SCORECARD_DEFAULT_NEXT_COMMAND: &str =
+    "tsift session-cost --input <session.jsonl> --json";
 const PROMPT_BUDGET_WARN_TOKENS: u64 = 100_000;
 const CACHED_RATIO_WARN_PERCENT: f64 = 90.0;
 const CACHED_RATIO_WARN_PROMPT_TOKENS: u64 = 50_000;
@@ -107,6 +110,8 @@ pub struct SessionCostPromptCachePlan {
     pub observed_cached_input_ratio: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analytics: Option<SessionCostPromptCacheAnalytics>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub scorecard: Vec<SessionCostPromptCacheRoiScorecard>,
     pub invariants: Vec<String>,
     pub provider_adapters: Vec<SessionCostPromptCacheProvider>,
     pub actions: Vec<SessionCostPromptCacheAction>,
@@ -125,6 +130,21 @@ pub struct SessionCostPromptCacheAction {
     pub severity: String,
     pub message: String,
     pub guidance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCostPromptCacheRoiScorecard {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_path: Option<String>,
+    pub provider: String,
+    pub sample_count: usize,
+    pub net_cached_read_tokens: i64,
+    pub read_create_ratio: String,
+    pub trend: String,
+    pub suspected_invalidation_cause: String,
+    pub next_command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -500,6 +520,7 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
     let loop_clusters = collect_loop_clusters(&state.loop_signals);
     let file_read_diagnostics = collect_file_read_diagnostics(&state.file_read_signals);
     let prompt_cache_plan = derive_prompt_cache_plan(
+        source,
         prompt_tokens,
         cached_input_tokens,
         cache_creation_input_tokens,
@@ -581,6 +602,41 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
         prompt_cache_plan,
         warnings: state.warnings,
     })
+}
+
+pub fn set_prompt_cache_scorecard_next_command(
+    report: &mut SessionCostReport,
+    next_command: &str,
+) {
+    if let Some(plan) = &mut report.prompt_cache_plan {
+        for row in &mut plan.scorecard {
+            row.next_command = next_command.to_string();
+        }
+    }
+}
+
+pub fn prompt_cache_scorecard_for_session(
+    report: &SessionCostReport,
+    session_source: &str,
+    session_path: &str,
+    next_command: &str,
+) -> Vec<SessionCostPromptCacheRoiScorecard> {
+    report
+        .prompt_cache_plan
+        .as_ref()
+        .map(|plan| {
+            plan.scorecard
+                .iter()
+                .cloned()
+                .map(|mut row| {
+                    row.session_source = Some(session_source.to_string());
+                    row.session_path = Some(session_path.to_string());
+                    row.next_command = next_command.to_string();
+                    row
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn build_prompt_cache_effectiveness_report(
@@ -977,6 +1033,7 @@ pub fn derive_guardrails(input: &SessionCostGuardrailInput) -> Vec<SessionCostGu
 }
 
 fn derive_prompt_cache_plan(
+    source: SessionCostSource,
     prompt_tokens: u64,
     cached_input_tokens: u64,
     cache_creation_input_tokens: u64,
@@ -1057,6 +1114,11 @@ fn derive_prompt_cache_plan(
             cached_input_tokens,
             cache_creation_input_tokens,
             cached_input_ratio,
+        ),
+        scorecard: derive_prompt_cache_roi_scorecard(
+            usage_turns,
+            default_prompt_cache_provider(source),
+            PROMPT_CACHE_SCORECARD_DEFAULT_NEXT_COMMAND,
         ),
         invariants: vec![
             "place stable system/developer context before per-turn content".to_string(),
@@ -1286,6 +1348,198 @@ fn derive_prompt_cache_analytics(
         prefix_drift,
         timeline,
     })
+}
+
+fn derive_prompt_cache_roi_scorecard(
+    usage_turns: &[SessionCostTurn],
+    fallback_provider: &str,
+    next_command: &str,
+) -> Vec<SessionCostPromptCacheRoiScorecard> {
+    let mut by_provider = BTreeMap::<String, Vec<SessionCostTurn>>::new();
+    for turn in usage_turns {
+        let provider = turn
+            .prompt_cache_metadata
+            .as_ref()
+            .map(|metadata| metadata.provider.trim())
+            .filter(|provider| !provider.is_empty())
+            .unwrap_or(fallback_provider)
+            .to_ascii_lowercase();
+        by_provider.entry(provider).or_default().push(turn.clone());
+    }
+
+    let mut rows = by_provider
+        .into_iter()
+        .map(|(provider, turns)| prompt_cache_roi_scorecard_row(provider, &turns, next_command))
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .net_cached_read_tokens
+            .cmp(&left.net_cached_read_tokens)
+            .then(left.provider.cmp(&right.provider))
+    });
+    rows.truncate(MAX_PROMPT_CACHE_SCORECARD);
+    rows
+}
+
+fn prompt_cache_roi_scorecard_row(
+    provider: String,
+    turns: &[SessionCostTurn],
+    next_command: &str,
+) -> SessionCostPromptCacheRoiScorecard {
+    let prompt_tokens = turns
+        .iter()
+        .map(|turn| turn.prompt_tokens)
+        .sum::<u64>();
+    let cached_input_tokens = turns
+        .iter()
+        .map(|turn| turn.cached_input_tokens)
+        .sum::<u64>();
+    let cache_creation_input_tokens = turns
+        .iter()
+        .map(|turn| turn.cache_creation_input_tokens)
+        .sum::<u64>();
+    let first_ratio = turns
+        .first()
+        .and_then(|turn| percent_ratio(turn.cached_input_tokens, turn.prompt_tokens));
+    let last_ratio = turns
+        .last()
+        .and_then(|turn| percent_ratio(turn.cached_input_tokens, turn.prompt_tokens));
+    let ratio_delta = first_ratio
+        .zip(last_ratio)
+        .map(|(first, last)| last - first);
+    let diagnostics = derive_prompt_cache_diagnostics(
+        turns,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+    );
+    let (prefix_drift, _) = derive_prompt_cache_prefix_drift(turns);
+    let adapter_evidence = prompt_cache_adapter_evidence(turns);
+
+    SessionCostPromptCacheRoiScorecard {
+        session_source: None,
+        session_path: None,
+        provider: provider.clone(),
+        sample_count: turns.len(),
+        net_cached_read_tokens: signed_token_delta(
+            cached_input_tokens,
+            cache_creation_input_tokens,
+        ),
+        read_create_ratio: prompt_cache_read_create_ratio(
+            cached_input_tokens,
+            cache_creation_input_tokens,
+        ),
+        trend: prompt_cache_trend(turns.len(), ratio_delta).to_string(),
+        suspected_invalidation_cause: prompt_cache_scorecard_cause(
+            &provider,
+            &diagnostics,
+            &prefix_drift,
+            &adapter_evidence,
+            prompt_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+        ),
+        next_command: next_command.to_string(),
+    }
+}
+
+fn prompt_cache_read_create_ratio(
+    cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+) -> String {
+    if cache_creation_input_tokens > 0 {
+        format!(
+            "{:.2}x",
+            (cached_input_tokens as f64) / (cache_creation_input_tokens as f64)
+        )
+    } else if cached_input_tokens > 0 {
+        "read_only".to_string()
+    } else {
+        "-".to_string()
+    }
+}
+
+fn prompt_cache_scorecard_cause(
+    provider: &str,
+    diagnostics: &[SessionCostPromptCacheDiagnostic],
+    prefix_drift: &[SessionCostPromptCachePrefixDrift],
+    adapter_evidence: &PromptCacheAdapterEvidence,
+    prompt_tokens: u64,
+    cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+) -> String {
+    if let Some(diagnostic) = diagnostics.first() {
+        return diagnostic
+            .likely_causes
+            .first()
+            .cloned()
+            .unwrap_or_else(|| diagnostic.kind.clone());
+    }
+    if let Some(drift) = prefix_drift
+        .iter()
+        .find(|drift| drift.severity == "warn")
+        .or_else(|| prefix_drift.first())
+    {
+        return format!(
+            "{} changed ({})",
+            drift.first_changed_field, drift.trigger
+        );
+    }
+    if let Some(adapter_cause) = prompt_cache_adapter_scorecard_cause(provider, adapter_evidence) {
+        return adapter_cause;
+    }
+    if cached_input_tokens == 0 && prompt_tokens >= PROMPT_CACHE_CANDIDATE_TOKENS {
+        return "no provider cache reads observed".to_string();
+    }
+    if cache_creation_input_tokens > cached_input_tokens {
+        return "cache creation exceeded cache reads".to_string();
+    }
+    "none observed".to_string()
+}
+
+fn prompt_cache_adapter_scorecard_cause(
+    provider: &str,
+    evidence: &PromptCacheAdapterEvidence,
+) -> Option<String> {
+    if is_anthropic_provider(provider) {
+        match anthropic_cache_control_status(evidence) {
+            "missing_cache_control" => {
+                return Some("missing Anthropic cache_control breakpoints".to_string());
+            }
+            "partial_cache_control" => {
+                return Some("partial Anthropic cache_control breakpoint coverage".to_string());
+            }
+            _ => {}
+        }
+    }
+    if is_openai_provider(provider) {
+        match openai_prompt_cache_key_status(evidence) {
+            "missing_prompt_cache_key" => {
+                return Some("missing OpenAI prompt_cache_key".to_string());
+            }
+            "partial_prompt_cache_key" => {
+                return Some("partial OpenAI prompt_cache_key coverage".to_string());
+            }
+            "prompt_cache_key_churn" => {
+                return Some("OpenAI prompt_cache_key changed between calls".to_string());
+            }
+            _ => {}
+        }
+    }
+    if is_anthropic_provider(provider) || is_openai_provider(provider) {
+        match replica_local_routing_affinity_status(evidence) {
+            "missing_routing_affinity" => {
+                return Some("missing replica-local routing affinity".to_string());
+            }
+            "partial_routing_affinity" => {
+                return Some("partial replica-local routing affinity coverage".to_string());
+            }
+            "routing_affinity_churn" => {
+                return Some("replica-local routing affinity changed between calls".to_string());
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn derive_prompt_cache_diagnostics(

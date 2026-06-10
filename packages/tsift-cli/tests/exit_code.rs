@@ -9275,6 +9275,18 @@ fn session_cost_reads_codex_token_counts_from_stdin() {
         json["prompt_cache_plan"]["analytics"]["net_cached_input_tokens"],
         48000
     );
+    let scorecard = json["prompt_cache_plan"]["scorecard"].as_array().unwrap();
+    assert_eq!(scorecard.len(), 1);
+    assert_eq!(scorecard[0]["provider"], "openai");
+    assert_eq!(scorecard[0]["sample_count"], 2);
+    assert_eq!(scorecard[0]["net_cached_read_tokens"], 48000);
+    assert_eq!(scorecard[0]["read_create_ratio"], "read_only");
+    assert_eq!(scorecard[0]["trend"], "stable");
+    assert_eq!(scorecard[0]["suspected_invalidation_cause"], "none observed");
+    assert_eq!(
+        scorecard[0]["next_command"],
+        "tsift session-cost --input <session.jsonl> --json"
+    );
     assert_eq!(
         json["prompt_cache_plan"]["analytics"]["timeline"][1]["cached_input_ratio"],
         "96.15%"
@@ -9450,6 +9462,14 @@ fn session_cost_reports_prompt_cache_invalidation_diagnostics() {
                 .iter()
                 .any(|change| change["field"] == "cache_key")
     }));
+    let scorecard = json["prompt_cache_plan"]["scorecard"].as_array().unwrap();
+    assert_eq!(scorecard[0]["provider"], "anthropic");
+    assert_eq!(scorecard[0]["net_cached_read_tokens"], -1000);
+    assert_eq!(scorecard[0]["read_create_ratio"], "0.92x");
+    assert_eq!(scorecard[0]["trend"], "declining");
+    assert!(scorecard[0]["suspected_invalidation_cause"]
+        .as_str()
+        .is_some_and(|cause| cause.contains("stable_prefix_fingerprint")));
 
     let compact = run_tsift_stdin(
         &["session-cost", "--source", "claude-jsonl", "--compact"],
@@ -9461,6 +9481,8 @@ fn session_cost_reports_prompt_cache_invalidation_diagnostics() {
     );
     let compact_stdout = String::from_utf8_lossy(&compact.stdout);
     assert!(compact_stdout.contains("prompt-cache-diagnostic warn cached_ratio_drop"));
+    assert!(compact_stdout.contains("prompt-cache-roi provider:anthropic"));
+    assert!(compact_stdout.contains("read_create:0.92x"));
     assert!(compact_stdout.contains("prompt-cache-diagnostic recommend read_create_regression"));
     assert!(
         compact_stdout
@@ -11384,6 +11406,22 @@ fn session_review_separates_aggregate_and_latest_session_cost() {
     );
     assert_eq!(json["sessions"][0]["total_tokens"], 518_391);
     assert_eq!(json["sessions"][0]["largest_turn_total_tokens"], 67_644);
+    let scorecard = json["prompt_cache_roi_scorecard"].as_array().unwrap();
+    assert_eq!(scorecard.len(), 12);
+    assert_eq!(scorecard[0]["session_source"], "codex_jsonl");
+    assert_eq!(scorecard[0]["provider"], "openai");
+    assert_eq!(scorecard[0]["read_create_ratio"], "read_only");
+    assert_eq!(scorecard[0]["trend"], "stable");
+    assert!(scorecard[0]["session_path"]
+        .as_str()
+        .is_some_and(|path| path.ends_with("aa-latest-lower-cost.jsonl")));
+    assert!(scorecard[0]["next_command"]
+        .as_str()
+        .is_some_and(|command| {
+            command.contains("tsift session-cost --source codex-jsonl --input")
+                && command.contains("aa-latest-lower-cost.jsonl")
+                && command.ends_with(" --json")
+        }));
 }
 
 #[test]
