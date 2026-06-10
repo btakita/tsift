@@ -273,6 +273,8 @@ pub struct SessionCostPromptCacheEffectivenessFixture {
     pub schema_version: u64,
     #[serde(default)]
     pub description: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub required_regression_scenarios: Vec<String>,
     pub cases: Vec<SessionCostPromptCacheEffectivenessCase>,
 }
 
@@ -284,6 +286,12 @@ pub struct SessionCostPromptCacheEffectivenessCase {
     pub minimum_cached_input_ratio: f64,
     pub minimum_net_cached_input_tokens: i64,
     pub maximum_read_create_regressions: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub regression_scenarios: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub required_prefix_drift_fields: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub required_diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -291,6 +299,9 @@ pub struct SessionCostPromptCacheEffectivenessReport {
     pub schema_version: u64,
     pub pass: bool,
     pub totals: SessionCostPromptCacheEffectivenessTotals,
+    pub required_regression_scenarios: Vec<String>,
+    pub covered_regression_scenarios: Vec<String>,
+    pub missing_regression_scenarios: Vec<String>,
     pub cases: Vec<SessionCostPromptCacheEffectivenessCaseReport>,
 }
 
@@ -321,6 +332,12 @@ pub struct SessionCostPromptCacheEffectivenessCaseReport {
     pub minimum_net_cached_input_tokens: i64,
     pub read_create_regressions: usize,
     pub maximum_read_create_regressions: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub regression_scenarios: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub required_prefix_drift_fields: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub required_diagnostics: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub failures: Vec<String>,
 }
@@ -574,6 +591,9 @@ pub fn build_prompt_cache_effectiveness_report(
     }
 
     let mut cases = Vec::new();
+    let required_regression_scenarios =
+        normalized_prompt_cache_scenarios(&fixture.required_regression_scenarios);
+    let mut covered_regression_scenarios = BTreeSet::new();
     let mut totals = SessionCostPromptCacheEffectivenessTotals {
         cases: 0,
         passed: 0,
@@ -613,6 +633,8 @@ pub fn build_prompt_cache_effectiveness_report(
                 .filter(|diagnostic| diagnostic.kind == "read_create_regression")
                 .count()
         });
+        let regression_scenarios = normalized_prompt_cache_scenarios(&case.regression_scenarios);
+        covered_regression_scenarios.extend(regression_scenarios.iter().cloned());
 
         let mut failures = Vec::new();
         if report.prompt_cache_plan.is_none() {
@@ -648,6 +670,14 @@ pub fn build_prompt_cache_effectiveness_report(
             case,
             report.prompt_cache_plan.as_ref(),
         ));
+        failures.extend(prompt_cache_required_prefix_drift_failures(
+            analytics,
+            &case.required_prefix_drift_fields,
+        ));
+        failures.extend(prompt_cache_required_diagnostic_failures(
+            analytics,
+            &case.required_diagnostics,
+        ));
 
         let status = if failures.is_empty() {
             "pass".to_string()
@@ -679,16 +709,99 @@ pub fn build_prompt_cache_effectiveness_report(
             minimum_net_cached_input_tokens: case.minimum_net_cached_input_tokens,
             read_create_regressions,
             maximum_read_create_regressions: case.maximum_read_create_regressions,
+            regression_scenarios,
+            required_prefix_drift_fields: normalized_prompt_cache_scenarios(
+                &case.required_prefix_drift_fields,
+            ),
+            required_diagnostics: normalized_prompt_cache_scenarios(&case.required_diagnostics),
             failures,
         });
     }
 
+    let covered_regression_scenarios = covered_regression_scenarios.into_iter().collect::<Vec<_>>();
+    let covered_set = covered_regression_scenarios
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let missing_regression_scenarios = required_regression_scenarios
+        .iter()
+        .filter(|scenario| !covered_set.contains(*scenario))
+        .cloned()
+        .collect::<Vec<_>>();
+
     Ok(SessionCostPromptCacheEffectivenessReport {
         schema_version: fixture.schema_version,
-        pass: totals.failed == 0,
+        pass: totals.failed == 0 && missing_regression_scenarios.is_empty(),
         totals,
+        required_regression_scenarios,
+        covered_regression_scenarios,
+        missing_regression_scenarios,
         cases,
     })
+}
+
+fn normalized_prompt_cache_scenarios(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn prompt_cache_required_prefix_drift_failures(
+    analytics: Option<&SessionCostPromptCacheAnalytics>,
+    required_fields: &[String],
+) -> Vec<String> {
+    let required_fields = normalized_prompt_cache_scenarios(required_fields);
+    if required_fields.is_empty() {
+        return Vec::new();
+    }
+    let observed_fields = analytics
+        .map(|analytics| {
+            analytics
+                .prefix_drift
+                .iter()
+                .flat_map(|drift| {
+                    drift
+                        .field_changes
+                        .iter()
+                        .map(|change| change.field.clone())
+                })
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    required_fields
+        .into_iter()
+        .filter(|field| !observed_fields.contains(field))
+        .map(|field| format!("missing required prompt-cache prefix drift field `{field}`"))
+        .collect()
+}
+
+fn prompt_cache_required_diagnostic_failures(
+    analytics: Option<&SessionCostPromptCacheAnalytics>,
+    required_kinds: &[String],
+) -> Vec<String> {
+    let required_kinds = normalized_prompt_cache_scenarios(required_kinds);
+    if required_kinds.is_empty() {
+        return Vec::new();
+    }
+    let observed_kinds = analytics
+        .map(|analytics| {
+            analytics
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.kind.clone())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    required_kinds
+        .into_iter()
+        .filter(|kind| !observed_kinds.contains(kind))
+        .map(|kind| format!("missing required prompt-cache diagnostic `{kind}`"))
+        .collect()
 }
 
 fn prompt_cache_provider_adapter_failures(
@@ -707,14 +820,18 @@ fn prompt_cache_provider_adapter_failures(
         SessionCostSource::ClaudeJsonl => require_prompt_cache_provider_adapter(
             plan,
             "anthropic",
-            "cache_control",
+            &["cache_control"],
             "Anthropic cache_control",
             &mut failures,
         ),
         SessionCostSource::CodexJsonl => require_prompt_cache_provider_adapter(
             plan,
             "openai",
-            "prompt_cache_key",
+            if case_has_regression_scenario(case, "openai_prompt_cache_key_churn") {
+                &["prompt_cache_key", "prompt_cache_key_churn"]
+            } else {
+                &["prompt_cache_key"]
+            },
             "OpenAI prompt_cache_key",
             &mut failures,
         ),
@@ -727,7 +844,11 @@ fn prompt_cache_provider_adapter_failures(
         require_prompt_cache_provider_adapter(
             plan,
             "replica_local",
-            "routing_affinity",
+            if case_has_regression_scenario(case, "replica_routing_churn") {
+                &["routing_affinity", "routing_affinity_churn"]
+            } else {
+                &["routing_affinity"]
+            },
             "replica-local routing_affinity",
             &mut failures,
         );
@@ -739,7 +860,7 @@ fn prompt_cache_provider_adapter_failures(
 fn require_prompt_cache_provider_adapter(
     plan: &SessionCostPromptCachePlan,
     provider: &str,
-    expected_status: &str,
+    expected_statuses: &[&str],
     label: &str,
     failures: &mut Vec<String>,
 ) {
@@ -748,13 +869,23 @@ fn require_prompt_cache_provider_adapter(
         .iter()
         .find(|adapter| adapter.provider == provider)
     {
-        Some(adapter) if adapter.status == expected_status => {}
+        Some(adapter) if expected_statuses.contains(&adapter.status.as_str()) => {}
         Some(adapter) => failures.push(format!(
-            "{label} adapter status `{}`; expected `{expected_status}`",
-            adapter.status
+            "{label} adapter status `{}`; expected one of {}",
+            adapter.status,
+            expected_statuses.join(", ")
         )),
         None => failures.push(format!("missing {label} adapter")),
     }
+}
+
+fn case_has_regression_scenario(
+    case: &SessionCostPromptCacheEffectivenessCase,
+    scenario: &str,
+) -> bool {
+    case.regression_scenarios
+        .iter()
+        .any(|value| value.trim() == scenario)
 }
 
 pub fn derive_guardrails(input: &SessionCostGuardrailInput) -> Vec<SessionCostGuardrail> {
@@ -3457,6 +3588,7 @@ mod tests {
         let fixture = SessionCostPromptCacheEffectivenessFixture {
             schema_version: 1,
             description: "fixture".to_string(),
+            required_regression_scenarios: Vec::new(),
             cases: vec![SessionCostPromptCacheEffectivenessCase {
                 name: "warm-codex-prefix".to_string(),
                 source: "codex-jsonl".to_string(),
@@ -3467,6 +3599,9 @@ mod tests {
                 minimum_cached_input_ratio: 90.0,
                 minimum_net_cached_input_tokens: 40_000,
                 maximum_read_create_regressions: 0,
+                regression_scenarios: Vec::new(),
+                required_prefix_drift_fields: Vec::new(),
+                required_diagnostics: Vec::new(),
             }],
         };
 
@@ -3486,6 +3621,7 @@ mod tests {
         let fixture = SessionCostPromptCacheEffectivenessFixture {
             schema_version: 1,
             description: "fixture".to_string(),
+            required_regression_scenarios: Vec::new(),
             cases: vec![
                 SessionCostPromptCacheEffectivenessCase {
                     name: "missing-openai-key".to_string(),
@@ -3497,6 +3633,9 @@ mod tests {
                     minimum_cached_input_ratio: 90.0,
                     minimum_net_cached_input_tokens: 40_000,
                     maximum_read_create_regressions: 0,
+                    regression_scenarios: Vec::new(),
+                    required_prefix_drift_fields: Vec::new(),
+                    required_diagnostics: Vec::new(),
                 },
                 SessionCostPromptCacheEffectivenessCase {
                     name: "missing-anthropic-cache-control".to_string(),
@@ -3508,6 +3647,9 @@ mod tests {
                     minimum_cached_input_ratio: 70.0,
                     minimum_net_cached_input_tokens: 1,
                     maximum_read_create_regressions: 0,
+                    regression_scenarios: Vec::new(),
+                    required_prefix_drift_fields: Vec::new(),
+                    required_diagnostics: Vec::new(),
                 },
             ],
         };
@@ -3534,6 +3676,7 @@ mod tests {
         let fixture = SessionCostPromptCacheEffectivenessFixture {
             schema_version: 1,
             description: "fixture".to_string(),
+            required_regression_scenarios: Vec::new(),
             cases: vec![SessionCostPromptCacheEffectivenessCase {
                 name: "cold-rewrite".to_string(),
                 source: "claude-jsonl".to_string(),
@@ -3545,6 +3688,9 @@ mod tests {
                 minimum_cached_input_ratio: 70.0,
                 minimum_net_cached_input_tokens: 1,
                 maximum_read_create_regressions: 0,
+                regression_scenarios: Vec::new(),
+                required_prefix_drift_fields: Vec::new(),
+                required_diagnostics: Vec::new(),
             }],
         };
 
@@ -3560,6 +3706,45 @@ mod tests {
                 .iter()
                 .any(|failure| failure.contains("read_create_regressions"))
         );
+    }
+
+    #[test]
+    fn prompt_cache_effectiveness_fixture_requires_regression_coverage_and_drift_fields() {
+        let fixture = SessionCostPromptCacheEffectivenessFixture {
+            schema_version: 1,
+            description: "fixture".to_string(),
+            required_regression_scenarios: vec![
+                "volatile_prefix_generated_header".to_string(),
+                "openai_prompt_cache_key_churn".to_string(),
+            ],
+            cases: vec![SessionCostPromptCacheEffectivenessCase {
+                name: "volatile-prefix".to_string(),
+                source: "codex-jsonl".to_string(),
+                input_lines: vec![
+                    r#"{"timestamp":"2026-05-05T00:00:01Z","provider":"openai","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix\nGenerated: 2026-05-05T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":24000,"cached_input_tokens":23000,"output_tokens":300,"reasoning_output_tokens":100,"total_tokens":24300}}}}"#.to_string(),
+                    r#"{"timestamp":"2026-05-05T00:00:04Z","provider":"openai","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix\nGenerated: 2026-05-05T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50000,"cached_input_tokens":48000,"output_tokens":650,"reasoning_output_tokens":180,"total_tokens":50650}}}}"#.to_string(),
+                ],
+                minimum_cached_input_ratio: 90.0,
+                minimum_net_cached_input_tokens: 40_000,
+                maximum_read_create_regressions: 0,
+                regression_scenarios: vec!["volatile_prefix_generated_header".to_string()],
+                required_prefix_drift_fields: vec!["stable_prefix_fingerprint".to_string()],
+                required_diagnostics: Vec::new(),
+            }],
+        };
+
+        let report = build_prompt_cache_effectiveness_report(&fixture).unwrap();
+
+        assert!(!report.pass);
+        assert_eq!(
+            report.missing_regression_scenarios,
+            vec!["openai_prompt_cache_key_churn".to_string()]
+        );
+        assert_eq!(
+            report.covered_regression_scenarios,
+            vec!["volatile_prefix_generated_header".to_string()]
+        );
+        assert!(report.cases[0].failures.is_empty());
     }
 
     #[test]

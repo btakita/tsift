@@ -709,6 +709,22 @@ fn human_prompt_cache_breakpoints(breakpoints: &[String]) -> String {
     }
 }
 
+fn compact_prompt_cache_scenario_list(scenarios: &[String]) -> String {
+    if scenarios.is_empty() {
+        "-".to_string()
+    } else {
+        truncate_for_compact(&scenarios.join(","), 120)
+    }
+}
+
+fn human_prompt_cache_scenario_list(scenarios: &[String]) -> String {
+    if scenarios.is_empty() {
+        "-".to_string()
+    } else {
+        scenarios.join("; ")
+    }
+}
+
 fn compact_prompt_cache_field_changes(
     changes: &[session_cost::SessionCostPromptCacheFieldChange],
 ) -> String {
@@ -765,6 +781,14 @@ pub(crate) fn cmd_session_cost(
                 report.totals.read_create_regressions,
                 if report.pass { "pass" } else { "fail" }
             );
+            if !report.required_regression_scenarios.is_empty() {
+                println!(
+                    "prompt-cache-coverage required:{} covered:{} missing:{}",
+                    compact_prompt_cache_scenario_list(&report.required_regression_scenarios),
+                    compact_prompt_cache_scenario_list(&report.covered_regression_scenarios),
+                    compact_prompt_cache_scenario_list(&report.missing_regression_scenarios)
+                );
+            }
             for case in &report.cases {
                 let ratio = case
                     .cached_input_ratio
@@ -800,9 +824,29 @@ pub(crate) fn cmd_session_cost(
                 "  status:                 {}",
                 if report.pass { "pass" } else { "fail" }
             );
+            if !report.required_regression_scenarios.is_empty() {
+                println!(
+                    "  required scenarios:     {}",
+                    human_prompt_cache_scenario_list(&report.required_regression_scenarios)
+                );
+                println!(
+                    "  covered scenarios:      {}",
+                    human_prompt_cache_scenario_list(&report.covered_regression_scenarios)
+                );
+                println!(
+                    "  missing scenarios:      {}",
+                    human_prompt_cache_scenario_list(&report.missing_regression_scenarios)
+                );
+            }
             for case in &report.cases {
                 println!();
                 println!("{} [{}]", case.name, case.status);
+                if !case.regression_scenarios.is_empty() {
+                    println!(
+                        "  scenarios:              {}",
+                        human_prompt_cache_scenario_list(&case.regression_scenarios)
+                    );
+                }
                 if let Some(ratio) = case.cached_input_ratio {
                     println!(
                         "  cached input ratio:     {ratio:.2}% (min {:.2}%)",

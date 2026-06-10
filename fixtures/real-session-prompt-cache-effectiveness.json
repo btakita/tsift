@@ -1,6 +1,12 @@
 {
   "schema_version": 1,
-  "description": "Real-session prompt-cache effectiveness fixture derived from recent agent-doc/Codex and Claude cache-usage patterns. Cases fail closed when cached-input ratio, net cached tokens, or read/create regression thresholds miss.",
+  "description": "Real-session prompt-cache effectiveness fixture derived from recent agent-doc/Codex and Claude cache-usage patterns. Cases fail closed when cached-input ratio, net cached tokens, read/create regression thresholds, or required drift-mode coverage miss.",
+  "required_regression_scenarios": [
+    "volatile_prefix_generated_header",
+    "cold_standalone_compaction",
+    "openai_prompt_cache_key_churn",
+    "replica_routing_churn"
+  ],
   "cases": [
     {
       "name": "real-codex-agent-doc-warm-prefix",
@@ -22,6 +28,77 @@
       "input_lines": [
         "{\"timestamp\":\"2026-06-09T04:10:01Z\",\"provider\":\"anthropic\",\"prompt_cache_key\":\"agent-doc:tsift-v0.1\",\"routing_affinity\":\"replica-a\",\"stable_prefix\":\"agent-doc stable prefix v1\",\"message\":{\"id\":\"msg-cache-1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"cache probe\",\"cache_control\":{\"type\":\"ephemeral\"}}],\"usage\":{\"input_tokens\":20000,\"cache_creation_input_tokens\":6000,\"cache_read_input_tokens\":50000,\"output_tokens\":600}}}",
         "{\"timestamp\":\"2026-06-09T04:10:04Z\",\"provider\":\"anthropic\",\"prompt_cache_key\":\"agent-doc:tsift-v0.1\",\"routing_affinity\":\"replica-a\",\"stable_prefix\":\"agent-doc stable prefix v1\",\"message\":{\"id\":\"msg-cache-2\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"cache probe\",\"cache_control\":{\"type\":\"ephemeral\"}}],\"usage\":{\"input_tokens\":22000,\"cache_creation_input_tokens\":4000,\"cache_read_input_tokens\":74000,\"output_tokens\":700}}}"
+      ]
+    },
+    {
+      "name": "real-codex-volatile-generated-header-drift",
+      "source": "codex-jsonl",
+      "minimum_cached_input_ratio": 85.0,
+      "minimum_net_cached_input_tokens": 50000,
+      "maximum_read_create_regressions": 0,
+      "regression_scenarios": [
+        "volatile_prefix_generated_header"
+      ],
+      "required_prefix_drift_fields": [
+        "stable_prefix_fingerprint"
+      ],
+      "input_lines": [
+        "{\"timestamp\":\"2026-06-09T04:20:01Z\",\"type\":\"event_msg\",\"provider\":\"openai\",\"prompt_cache_key\":\"agent-doc:tsift-v0.1\",\"routing_affinity\":\"replica-a\",\"stable_prefix\":\"agent-doc stable prefix v1\\nGenerated: 2026-06-09T04:20:01Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":30000,\"cached_input_tokens\":27000,\"output_tokens\":300,\"reasoning_output_tokens\":100,\"total_tokens\":30300}}}}",
+        "{\"timestamp\":\"2026-06-09T04:20:04Z\",\"type\":\"event_msg\",\"provider\":\"openai\",\"prompt_cache_key\":\"agent-doc:tsift-v0.1\",\"routing_affinity\":\"replica-a\",\"stable_prefix\":\"agent-doc stable prefix v1\\nGenerated: 2026-06-09T04:20:04Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":62000,\"cached_input_tokens\":56000,\"output_tokens\":700,\"reasoning_output_tokens\":180,\"total_tokens\":62700}}}}"
+      ]
+    },
+    {
+      "name": "real-claude-cold-standalone-compaction",
+      "source": "claude-jsonl",
+      "minimum_cached_input_ratio": 65.0,
+      "minimum_net_cached_input_tokens": 100000,
+      "maximum_read_create_regressions": 0,
+      "regression_scenarios": [
+        "cold_standalone_compaction"
+      ],
+      "required_prefix_drift_fields": [
+        "stable_prefix_fingerprint"
+      ],
+      "required_diagnostics": [
+        "cache_creation_spike"
+      ],
+      "input_lines": [
+        "{\"timestamp\":\"2026-06-09T04:30:01Z\",\"provider\":\"anthropic\",\"prompt_cache_key\":\"agent-doc:tsift-v0.1\",\"routing_affinity\":\"replica-a\",\"stable_prefix\":\"agent-doc live warm prefix v1\",\"message\":{\"id\":\"msg-compaction-1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"warm cache probe\",\"cache_control\":{\"type\":\"ephemeral\"}}],\"usage\":{\"input_tokens\":20000,\"cache_creation_input_tokens\":4000,\"cache_read_input_tokens\":60000,\"output_tokens\":600}}}",
+        "{\"timestamp\":\"2026-06-09T04:30:04Z\",\"provider\":\"anthropic\",\"prompt_cache_key\":\"agent-doc:tsift-v0.1\",\"routing_affinity\":\"replica-a\",\"stable_prefix\":\"standalone cold compaction prefix with generated summary header\",\"message\":{\"id\":\"msg-compaction-2\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"cold compaction probe\",\"cache_control\":{\"type\":\"ephemeral\"}}],\"usage\":{\"input_tokens\":22000,\"cache_creation_input_tokens\":35000,\"cache_read_input_tokens\":100000,\"output_tokens\":700}}}"
+      ]
+    },
+    {
+      "name": "real-codex-prompt-cache-key-churn",
+      "source": "codex-jsonl",
+      "minimum_cached_input_ratio": 75.0,
+      "minimum_net_cached_input_tokens": 35000,
+      "maximum_read_create_regressions": 0,
+      "regression_scenarios": [
+        "openai_prompt_cache_key_churn"
+      ],
+      "required_prefix_drift_fields": [
+        "cache_key"
+      ],
+      "input_lines": [
+        "{\"timestamp\":\"2026-06-09T04:40:01Z\",\"type\":\"event_msg\",\"provider\":\"openai\",\"prompt_cache_key\":\"agent-doc:tsift-v0.1\",\"routing_affinity\":\"replica-a\",\"stable_prefix\":\"agent-doc stable prefix v1\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":22000,\"cached_input_tokens\":19000,\"output_tokens\":300,\"reasoning_output_tokens\":100,\"total_tokens\":22300}}}}",
+        "{\"timestamp\":\"2026-06-09T04:40:04Z\",\"type\":\"event_msg\",\"provider\":\"openai\",\"prompt_cache_key\":\"agent-doc:tsift-v0.1-rekeyed\",\"routing_affinity\":\"replica-a\",\"stable_prefix\":\"agent-doc stable prefix v1\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":50000,\"cached_input_tokens\":41000,\"output_tokens\":700,\"reasoning_output_tokens\":180,\"total_tokens\":50700}}}}"
+      ]
+    },
+    {
+      "name": "real-codex-replica-routing-churn",
+      "source": "codex-jsonl",
+      "minimum_cached_input_ratio": 80.0,
+      "minimum_net_cached_input_tokens": 40000,
+      "maximum_read_create_regressions": 0,
+      "regression_scenarios": [
+        "replica_routing_churn"
+      ],
+      "required_prefix_drift_fields": [
+        "routing_affinity"
+      ],
+      "input_lines": [
+        "{\"timestamp\":\"2026-06-09T04:50:01Z\",\"type\":\"event_msg\",\"provider\":\"openai\",\"prompt_cache_key\":\"agent-doc:tsift-v0.1\",\"routing_affinity\":\"replica-a\",\"stable_prefix\":\"agent-doc stable prefix v1\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":22000,\"cached_input_tokens\":20000,\"output_tokens\":300,\"reasoning_output_tokens\":100,\"total_tokens\":22300}}}}",
+        "{\"timestamp\":\"2026-06-09T04:50:04Z\",\"type\":\"event_msg\",\"provider\":\"openai\",\"prompt_cache_key\":\"agent-doc:tsift-v0.1\",\"routing_affinity\":\"replica-b\",\"stable_prefix\":\"agent-doc stable prefix v1\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":52000,\"cached_input_tokens\":45000,\"output_tokens\":700,\"reasoning_output_tokens\":180,\"total_tokens\":52700}}}}"
       ]
     }
   ]

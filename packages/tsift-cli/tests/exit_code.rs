@@ -9498,10 +9498,20 @@ fn session_cost_prompt_cache_fixture_passes_fail_under() {
     );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(json["pass"].as_bool().unwrap());
-    assert_eq!(json["totals"]["cases"], 2);
+    assert_eq!(json["totals"]["cases"], 6);
     assert_eq!(json["totals"]["failed"], 0);
-    assert!(json["totals"]["net_cached_input_tokens"].as_i64().unwrap() > 100_000);
+    assert!(json["totals"]["net_cached_input_tokens"].as_i64().unwrap() > 380_000);
     assert_eq!(json["totals"]["read_create_regressions"], 0);
+    assert_eq!(json["missing_regression_scenarios"], serde_json::json!([]));
+    assert_eq!(
+        json["covered_regression_scenarios"],
+        serde_json::json!([
+            "cold_standalone_compaction",
+            "openai_prompt_cache_key_churn",
+            "replica_routing_churn",
+            "volatile_prefix_generated_header"
+        ])
+    );
     assert!(
         json["cases"]
             .as_array()
