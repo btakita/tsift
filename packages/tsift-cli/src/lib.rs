@@ -24795,6 +24795,64 @@ fn main() { api::handler(); }
     }
 
     #[test]
+    fn graph_db_doctor_reports_snapshot_fallback_when_rollback_journal_is_locked() {
+        let dir = setup_traversal_project();
+        refresh_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
+        let graph_db = dir.path().join(".tsift/graph.db");
+        let _lock = hold_rollback_journal_lock(&graph_db);
+
+        let mut report = GraphDbDoctorReport::new(dir.path(), None, "sqlite", &graph_db, None);
+        append_sqlite_graph_doctor_checks(&mut report, dir.path(), None, &graph_db);
+        report.finalize();
+
+        assert_eq!(report.status, "ok");
+        assert!(!report.fail_closed);
+        let recovery_check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "sqlite_graph_db_read_recovery")
+            .expect("doctor should include read recovery diagnostic");
+        assert_eq!(recovery_check.status, "recovered");
+        assert!(
+            recovery_check
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("rollback-journal lock")),
+            "expected rollback-journal recovery diagnostic, got {:?}",
+            recovery_check.diagnostics
+        );
+    }
+
+    #[test]
+    fn graph_db_doctor_reports_wal_snapshot_fallback_when_locked() {
+        let dir = setup_traversal_project();
+        refresh_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
+        let graph_db = dir.path().join(".tsift/graph.db");
+        let _lock = hold_wal_database_lock(&graph_db);
+
+        let mut report = GraphDbDoctorReport::new(dir.path(), None, "sqlite", &graph_db, None);
+        append_sqlite_graph_doctor_checks(&mut report, dir.path(), None, &graph_db);
+        report.finalize();
+
+        assert_eq!(report.status, "ok");
+        assert!(!report.fail_closed);
+        let recovery_check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "sqlite_graph_db_read_recovery")
+            .expect("doctor should include WAL read recovery diagnostic");
+        assert_eq!(recovery_check.status, "recovered");
+        assert!(
+            recovery_check
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("WAL-aware snapshot fallback")),
+            "expected WAL recovery diagnostic, got {:?}",
+            recovery_check.diagnostics
+        );
+    }
+
+    #[test]
     fn graph_db_snapshot_export_import_round_trip_preserves_projection_metadata() {
         let dir = setup_traversal_project();
         refresh_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
