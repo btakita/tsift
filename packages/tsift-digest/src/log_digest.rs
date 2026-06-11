@@ -6,6 +6,7 @@ use tsift_quality::runtime_churn;
 use tsift_summarize::summarize::{self, SummaryDb};
 
 const MAX_REPEATED_LINES: usize = 8;
+const MAX_LINE_FAMILIES: usize = 8;
 const MAX_SIGNALS: usize = 12;
 const MAX_FILE_REFS: usize = 8;
 const MAX_SYMBOL_REFS: usize = 16;
@@ -49,6 +50,23 @@ pub struct LogDigestRepeatedLine {
     pub occurrences: usize,
 }
 
+/// A family of near-duplicate lines folded onto one template.
+///
+/// Exact-line collapsing (`repeated_lines`) only merges byte-identical lines.
+/// Line families additionally fold lines that differ only by variable tokens —
+/// paths, counts, timestamps, crate names, semantic versions, and hashes — so
+/// noisy build/test/install progress with one changing field per line collapses
+/// to a single row carrying a count, distinct-variant count, and first/last
+/// sample instead of dozens of nearly-identical repeated lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogDigestLineFamily {
+    pub template: String,
+    pub occurrences: usize,
+    pub variants: usize,
+    pub first_sample: String,
+    pub last_sample: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LogDigestFileRef {
     pub path: String,
@@ -85,11 +103,14 @@ pub struct LogDigestReport {
     pub signal_groups: usize,
     pub repeated_line_groups: usize,
     pub repeated_line_occurrences: usize,
+    pub line_family_groups: usize,
     pub file_ref_groups: usize,
     pub symbol_ref_groups: usize,
     pub stack_groups: usize,
     pub signals: Vec<LogDigestSignal>,
     pub repeated_lines: Vec<LogDigestRepeatedLine>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub line_families: Vec<LogDigestLineFamily>,
     pub file_refs: Vec<LogDigestFileRef>,
     pub symbol_refs: Vec<LogDigestSymbolRef>,
     pub stack_traces: Vec<LogDigestStackGroup>,
@@ -128,11 +149,20 @@ struct FileRefBuilder {
     occurrences: usize,
 }
 
+#[derive(Debug, Clone)]
+struct LineFamilyBuilder {
+    occurrences: usize,
+    variants: BTreeSet<String>,
+    first_sample: String,
+    last_sample: String,
+}
+
 pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
     let root = tsift_quality::lint::resolve_harness_root_or_canonical_path(path)?;
     let summary_db = open_summary_db_if_present(&root)?;
 
     let mut repeated_lines = BTreeMap::<String, usize>::new();
+    let mut line_families = BTreeMap::<String, LineFamilyBuilder>::new();
     let mut signals = BTreeMap::<String, SignalBuilder>::new();
     let mut file_refs = BTreeMap::<String, FileRefBuilder>::new();
     let mut symbol_counts = BTreeMap::<String, usize>::new();
@@ -153,7 +183,9 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
             continue;
         }
 
-        *repeated_lines.entry(normalize_line(trimmed)).or_default() += 1;
+        let normalized = normalize_line(trimmed);
+        *repeated_lines.entry(normalized.clone()).or_default() += 1;
+        record_line_family(&mut line_families, &normalized);
 
         if is_stack_frame_line(trimmed) {
             current_stack.push(normalize_stack_frame(trimmed));
@@ -238,6 +270,27 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
         .map(|item| item.occurrences.saturating_sub(1))
         .sum();
     repeated_line_items.truncate(MAX_REPEATED_LINES);
+
+    let mut line_family_items = line_families
+        .into_iter()
+        .filter(|(_, builder)| builder.variants.len() > 1)
+        .map(|(template, builder)| LogDigestLineFamily {
+            template,
+            occurrences: builder.occurrences,
+            variants: builder.variants.len(),
+            first_sample: builder.first_sample,
+            last_sample: builder.last_sample,
+        })
+        .collect::<Vec<_>>();
+    line_family_items.sort_by(|left, right| {
+        right
+            .occurrences
+            .cmp(&left.occurrences)
+            .then(right.variants.cmp(&left.variants))
+            .then(left.template.cmp(&right.template))
+    });
+    let line_family_groups = line_family_items.len();
+    line_family_items.truncate(MAX_LINE_FAMILIES);
 
     let mut signal_items = Vec::new();
     let mut signal_builders = signals.into_values().collect::<Vec<_>>();
@@ -354,11 +407,13 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
         signal_groups,
         repeated_line_groups,
         repeated_line_occurrences,
+        line_family_groups,
         file_ref_groups,
         symbol_ref_groups,
         stack_groups,
         signals: signal_items,
         repeated_lines: repeated_line_items,
+        line_families: line_family_items,
         file_refs: file_items,
         symbol_refs: symbol_items,
         stack_traces: stack_items,
@@ -579,6 +634,173 @@ fn record_display_file_ref(
 
 fn normalize_line(line: &str) -> String {
     line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Accumulate a whitespace-normalized line into its near-duplicate family,
+/// keyed by the variable-token-stripped template. The first sample is pinned on
+/// first sight; the last sample tracks the most recent member in input order.
+fn record_line_family(families: &mut BTreeMap<String, LineFamilyBuilder>, normalized: &str) {
+    let template = templatize_line(normalized);
+    let builder = families
+        .entry(template)
+        .or_insert_with(|| LineFamilyBuilder {
+            occurrences: 0,
+            variants: BTreeSet::new(),
+            first_sample: normalized.to_string(),
+            last_sample: normalized.to_string(),
+        });
+    builder.occurrences += 1;
+    builder.variants.insert(normalized.to_string());
+    builder.last_sample = normalized.to_string();
+}
+
+/// Replace variable tokens (timestamps, paths, semantic versions, hashes,
+/// numbers/durations/sizes, and cargo-style crate names) with stable
+/// placeholders so lines that differ only by those dimensions fold together.
+fn templatize_line(line: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for token in line.split_whitespace() {
+        let placeholder = templatize_token(token);
+        // Cargo/build progress is `<Verb> <crate> v<version>`; the crate name
+        // also varies, so fold the bare identifier immediately before a bare
+        // version token. Restricted to an exact `<ver>` placeholder so wrapped
+        // or `key=<ver>` tokens do not fold an unrelated preceding word.
+        if placeholder == "<ver>"
+            && let Some(prev) = out.last_mut()
+            && is_plain_name(prev)
+        {
+            *prev = "<name>".to_string();
+        }
+        out.push(placeholder);
+    }
+    out.join(" ")
+}
+
+fn templatize_token(token: &str) -> String {
+    // Bracketed epoch timestamps such as the `[1778646072]` agent-doc log prefix.
+    if let Some(inner) = token.strip_prefix('[').and_then(|tok| tok.strip_suffix(']'))
+        && !inner.is_empty()
+        && inner.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return "[<ts>]".to_string();
+    }
+
+    // `key=value` structured fields (agent-doc logs, `snap_len=4616`, `file=/x`):
+    // keep the key, templatize only the value so lifecycle lines that vary by a
+    // single field collapse together.
+    if let Some((key, value)) = token.split_once('=')
+        && !key.is_empty()
+        && !value.is_empty()
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        let (prefix, core, suffix) = split_token_wrappers(value);
+        return match classify_variable_core(core) {
+            Some(placeholder) => format!("{key}={prefix}{placeholder}{suffix}"),
+            None => token.to_string(),
+        };
+    }
+
+    let (prefix, core, suffix) = split_token_wrappers(token);
+    match classify_variable_core(core) {
+        Some(placeholder) => format!("{prefix}{placeholder}{suffix}"),
+        None => token.to_string(),
+    }
+}
+
+/// Split surrounding punctuation so wrapped variables like `(45.2s)` templatize
+/// to `(<n>)` instead of staying literal.
+fn split_token_wrappers(token: &str) -> (&str, &str, &str) {
+    let core = token
+        .trim_start_matches(['(', '[', '{', '"', '\''])
+        .trim_end_matches([')', ']', '}', '"', '\'', ',', ';', ':']);
+    let prefix_len = token.len() - token.trim_start_matches(['(', '[', '{', '"', '\'']).len();
+    let suffix_start = prefix_len + core.len();
+    (&token[..prefix_len], core, &token[suffix_start..])
+}
+
+fn classify_variable_core(core: &str) -> Option<&'static str> {
+    if core.is_empty() {
+        return None;
+    }
+    if looks_like_path(core) {
+        return Some("<path>");
+    }
+    if is_version_core(core) {
+        return Some("<ver>");
+    }
+    if is_hash_core(core) {
+        return Some("<hash>");
+    }
+    if is_numeric_core(core) {
+        return Some("<n>");
+    }
+    None
+}
+
+/// A semantic version: optional `v` prefix plus dot-separated numeric groups.
+/// Requires a `v` prefix with 2+ groups, or 3+ groups bare, so two-group
+/// decimals like `45.2` stay numeric rather than versions.
+fn is_version_core(core: &str) -> bool {
+    let (has_v, rest) = match core.strip_prefix('v') {
+        Some(rest) => (true, rest),
+        None => (false, core),
+    };
+    let groups = rest.split('.').collect::<Vec<_>>();
+    let min_groups = if has_v { 2 } else { 3 };
+    groups.len() >= min_groups
+        && groups
+            .iter()
+            .all(|group| !group.is_empty() && group.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+/// A hex hash/object id: 7..=40 hex chars with at least one letter so it is not
+/// mistaken for a plain number.
+fn is_hash_core(core: &str) -> bool {
+    let len = core.len();
+    (7..=40).contains(&len)
+        && core.chars().all(|ch| ch.is_ascii_hexdigit())
+        && core.chars().any(|ch| ch.is_ascii_alphabetic())
+}
+
+/// A number, duration, size, or percent: an optional sign, digits with optional
+/// commas and one decimal point, and an optional trailing alphabetic unit
+/// (`ms`, `s`, `MB`, ...) or `%`.
+fn is_numeric_core(core: &str) -> bool {
+    let core = core.trim_start_matches(['+', '-']);
+    let core = core.strip_suffix('%').unwrap_or(core);
+    let split_at = core
+        .find(|ch: char| ch.is_ascii_alphabetic())
+        .unwrap_or(core.len());
+    let (number, unit) = core.split_at(split_at);
+    if !unit.is_empty() && !unit.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return false;
+    }
+    let number = number.replace(',', "");
+    if number.is_empty() {
+        return false;
+    }
+    let mut seen_dot = false;
+    for ch in number.chars() {
+        match ch {
+            '.' if !seen_dot => seen_dot = true,
+            '.' => return false,
+            ch if ch.is_ascii_digit() => {}
+            _ => return false,
+        }
+    }
+    number.chars().any(|ch| ch.is_ascii_digit())
+}
+
+/// A bare identifier (crate/package name) that has not already been replaced by
+/// a placeholder.
+fn is_plain_name(token: &str) -> bool {
+    !token.starts_with('<')
+        && token.chars().any(|ch| ch.is_ascii_alphabetic())
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
 }
 
 fn classify_signals(line: &str) -> Vec<(&'static str, String)> {
@@ -974,6 +1196,60 @@ at src/lib.rs:1:1
         );
         assert_eq!(report.stack_traces.len(), 1);
         assert_eq!(report.stack_traces[0].occurrences, 2);
+    }
+
+    #[test]
+    fn log_digest_folds_near_duplicate_line_families() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let input = "\
+   Compiling serde v1.0.130
+   Compiling syn v2.0.80
+   Compiling tsift-cli v0.1.67
+    Finished release [optimized] target(s) in 45.2s
+    Finished release [optimized] target(s) in 12.8s
+[1778646072] commit_staging file=tasks/a.md snap_len=4616 file_len=4664
+[1778646090] commit_staging file=tasks/b.md snap_len=8192 file_len=8200
+unique uncollapsed line
+";
+
+        let report = compute(dir.path(), input).unwrap();
+
+        // Cargo crate name + version both fold to placeholders.
+        let compiling = report
+            .line_families
+            .iter()
+            .find(|family| family.template == "Compiling <name> <ver>")
+            .expect("compiling family present");
+        assert_eq!(compiling.occurrences, 3);
+        assert_eq!(compiling.variants, 3);
+        assert_eq!(compiling.first_sample, "Compiling serde v1.0.130");
+        assert_eq!(compiling.last_sample, "Compiling tsift-cli v0.1.67");
+
+        // Duration-only variance folds, keeping the literal scaffold.
+        assert!(report.line_families.iter().any(|family| {
+            family.template == "Finished release [optimized] target(s) in <n>"
+                && family.occurrences == 2
+                && family.variants == 2
+        }));
+
+        // Timestamp prefix + structured key=value lengths + path fold together.
+        assert!(report.line_families.iter().any(|family| {
+            family.template == "[<ts>] commit_staging file=<path> snap_len=<n> file_len=<n>"
+                && family.occurrences == 2
+                && family.variants == 2
+        }));
+
+        // line_family_groups counts all variant>1 families even past the cap.
+        assert_eq!(report.line_family_groups, report.line_families.len());
+
+        // A line with no near-duplicate is not reported as a family.
+        assert!(
+            !report
+                .line_families
+                .iter()
+                .any(|family| family.template.contains("uncollapsed"))
+        );
     }
 
     #[test]

@@ -19388,6 +19388,14 @@ pub(crate) fn render_log_digest_from_input(
                 truncate_for_compact(&repeated.line, 80)
             );
         }
+        for family in &report.line_families {
+            println!(
+                "family count:{} variants:{} template:{}",
+                family.occurrences,
+                family.variants,
+                truncate_for_compact(&family.template, 80)
+            );
+        }
         for symbol in &report.symbol_refs {
             println!(
                 "sym:{} count:{} sums:{}",
@@ -19413,6 +19421,10 @@ pub(crate) fn render_log_digest_from_input(
     println!(
         "  repeated line instances:  {}",
         report.repeated_line_occurrences
+    );
+    println!(
+        "  line families:            {}",
+        report.line_family_groups
     );
     println!("  file refs:                {}", report.file_ref_groups);
     println!("  symbol refs:              {}", report.symbol_ref_groups);
@@ -19453,6 +19465,27 @@ pub(crate) fn render_log_digest_from_input(
                 "  {}x {}",
                 repeated.occurrences,
                 truncate_for_compact(&repeated.line, 180)
+            );
+        }
+    }
+
+    if !report.line_families.is_empty() {
+        println!();
+        println!("Line families (near-duplicate folds):");
+        for family in &report.line_families {
+            println!(
+                "  {}x ({} variants) {}",
+                family.occurrences,
+                family.variants,
+                truncate_for_compact(&family.template, 180)
+            );
+            println!(
+                "    first: {}",
+                truncate_for_compact(&family.first_sample, 180)
+            );
+            println!(
+                "    last:  {}",
+                truncate_for_compact(&family.last_sample, 180)
             );
         }
     }
@@ -30979,6 +31012,7 @@ fn sample() {}
             signal_groups: 2,
             repeated_line_groups: 2,
             repeated_line_occurrences: 3,
+            line_family_groups: 0,
             file_ref_groups: 2,
             symbol_ref_groups: 2,
             stack_groups: 1,
@@ -31017,6 +31051,7 @@ fn sample() {}
                     occurrences: 2,
                 },
             ],
+            line_families: vec![],
             file_refs: vec![
                 log_digest::LogDigestFileRef {
                     path: "src/lib.rs".to_string(),
