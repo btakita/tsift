@@ -1015,8 +1015,7 @@ fn classify_generic_signal(line: &str) -> Option<(&'static str, String)> {
         || lower.starts_with("caused by:")
         || lower.starts_with("e       ")
         || trimmed.starts_with("E   ")
-        || lower.contains("err!")
-        || lower.contains("err_pnpm")
+        || has_npm_pnpm_error_token(trimmed)
     {
         return Some(("error", trimmed.to_string()));
     }
@@ -1028,6 +1027,18 @@ fn classify_generic_signal(line: &str) -> Option<(&'static str, String)> {
         return Some(("warning", trimmed.to_string()));
     }
     None
+}
+
+/// Detect npm/yarn `ERR!` and pnpm `ERR_PNPM_*` error markers as whitespace
+/// tokens rather than bare substrings, so benign lines that merely contain the
+/// fragments (`stderr!`, a `/path/err_pnpm-notes` token, a URL) are not flagged.
+fn has_npm_pnpm_error_token(line: &str) -> bool {
+    line.split_whitespace().any(|token| {
+        token.eq_ignore_ascii_case("err!")
+            || token
+                .get(..9)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("err_pnpm_"))
+    })
 }
 
 fn classify_agent_doc_runtime_signals(line: &str) -> Vec<(&'static str, String)> {
@@ -1472,6 +1483,43 @@ ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL build failed
         assert!(
             messages.iter().any(|m| m.contains("ERR_PNPM")),
             "pnpm error not classified: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn npm_pnpm_error_classification_is_token_anchored() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = "\
+npm ERR! code ELIFECYCLE
+ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL my-app@1.0.0 build
+flushed stderr! buffer to disk
+see the guide at https://example.com/err_pnpm-notes
+downloaded err_pnpmish.tar to /tmp
+";
+        let report = compute(dir.path(), input).unwrap();
+        let error_messages = report
+            .signals
+            .iter()
+            .filter(|signal| signal.severity == "error")
+            .map(|signal| signal.message.as_str())
+            .collect::<Vec<_>>();
+
+        // Real npm/pnpm markers are still classified.
+        assert!(error_messages.iter().any(|m| m.contains("npm ERR!")));
+        assert!(error_messages.iter().any(|m| m.contains("ERR_PNPM_RECURSIVE")));
+
+        // Benign lines that merely contain the fragments are NOT flagged.
+        assert!(
+            !error_messages.iter().any(|m| m.contains("stderr!")),
+            "stderr! must not be classified as an npm error: {error_messages:?}"
+        );
+        assert!(
+            !error_messages.iter().any(|m| m.contains("err_pnpm-notes")),
+            "a mid-token err_pnpm fragment must not be classified: {error_messages:?}"
+        );
+        assert!(
+            !error_messages.iter().any(|m| m.contains("err_pnpmish")),
+            "err_pnpmish is not a pnpm error code: {error_messages:?}"
         );
     }
 
