@@ -311,16 +311,18 @@ impl SurrealEdgeIndexes {
             Some(kind) => {
                 if let Some(ids) = kind_edges.get(kind) {
                     edges.extend(
-                        ids.values()
-                            .filter_map(|edge_id| self.by_id.get(edge_id).map(|arc| (**arc).clone())),
+                        ids.values().filter_map(|edge_id| {
+                            self.by_id.get(edge_id).map(|arc| (**arc).clone())
+                        }),
                     );
                 }
             }
             None => {
                 for ids in kind_edges.values() {
                     edges.extend(
-                        ids.values()
-                            .filter_map(|edge_id| self.by_id.get(edge_id).map(|arc| (**arc).clone())),
+                        ids.values().filter_map(|edge_id| {
+                            self.by_id.get(edge_id).map(|arc| (**arc).clone())
+                        }),
                     );
                 }
                 edges.sort_by(|left, right| {
@@ -615,10 +617,7 @@ impl SurrealdbGraphStore {
         Ok(store)
     }
 
-    fn connect_file_backed(
-        path: &Path,
-        rt: Arc<tokio::runtime::Runtime>,
-    ) -> Result<Self> {
+    fn connect_file_backed(path: &Path, rt: Arc<tokio::runtime::Runtime>) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -712,8 +711,7 @@ impl SurrealdbGraphStore {
             .map(|e| (graph_edge_id(e), row_hash(e).unwrap_or_default()))
             .collect();
 
-        let existing_node_ids: BTreeSet<String> =
-            self.nodes_read()?.keys().cloned().collect();
+        let existing_node_ids: BTreeSet<String> = self.nodes_read()?.keys().cloned().collect();
         let existing_edge_keys: BTreeSet<String> = {
             let edges = self.edges_read()?;
             edges.all_edge_keys()
@@ -725,16 +723,14 @@ impl SurrealdbGraphStore {
         let changed_node_ids: Vec<String> = new_node_hashes
             .iter()
             .filter(|(id, hash)| {
-                !existing_node_ids.contains(*id)
-                    || (stored_node_hashes.get(*id) != Some(*hash))
+                !existing_node_ids.contains(*id) || (stored_node_hashes.get(*id) != Some(*hash))
             })
             .map(|(id, _)| id.clone())
             .collect();
         let changed_edge_keys: Vec<String> = new_edge_hashes
             .iter()
             .filter(|(key, hash)| {
-                !existing_edge_keys.contains(*key)
-                    || (stored_edge_hashes.get(*key) != Some(*hash))
+                !existing_edge_keys.contains(*key) || (stored_edge_hashes.get(*key) != Some(*hash))
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -859,7 +855,10 @@ impl SurrealdbGraphStore {
             Ok::<(), anyhow::Error>(())
         })?;
         self.nodes_write()?.clear();
-        self.nodes_by_kind.write().map_err(|_| anyhow!("lock"))?.clear();
+        self.nodes_by_kind
+            .write()
+            .map_err(|_| anyhow!("lock"))?
+            .clear();
         self.edges_write()?.clear();
         if let Some(ref store_path) = self.path {
             let _ = std::fs::remove_file(sidecar_path(store_path));
@@ -878,7 +877,9 @@ impl SurrealdbGraphStore {
     }
 
     fn try_load_sidecar(&self) -> Result<bool> {
-        let Some(ref store_path) = self.path else { return Ok(false) };
+        let Some(ref store_path) = self.path else {
+            return Ok(false);
+        };
         let path = sidecar_path(store_path);
         if !path.exists() {
             return Ok(false);
@@ -898,7 +899,11 @@ impl SurrealdbGraphStore {
         if sidecar.stored_row_hash != stored {
             return Ok(false);
         }
-        *self.nodes_write()? = sidecar.nodes.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
+        *self.nodes_write()? = sidecar
+            .nodes
+            .into_iter()
+            .map(|(k, v)| (k, Arc::new(v)))
+            .collect();
         self.rebuild_nodes_by_kind_index()?;
         let mut edge_index = SurrealEdgeIndexes::default();
         for edge in sidecar.edges {
@@ -911,9 +916,13 @@ impl SurrealdbGraphStore {
     }
 
     fn write_sidecar(&self) -> Result<()> {
-        let Some(ref store_path) = self.path else { return Ok(()) };
+        let Some(ref store_path) = self.path else {
+            return Ok(());
+        };
         let stored_hash = self.stored_row_hash()?;
-        let Some(ref hash) = stored_hash else { return Ok(()) };
+        let Some(ref hash) = stored_hash else {
+            return Ok(());
+        };
         let nodes = self.nodes_read()?;
         let edges = self.edges_read()?;
         let node_hashes = self.node_row_hashes.read().map_err(|_| anyhow!("lock"))?;
@@ -921,7 +930,10 @@ impl SurrealdbGraphStore {
         let sidecar = SidecarData {
             version: SIDECAR_VERSION,
             stored_row_hash: Some(hash.clone()),
-            nodes: nodes.iter().map(|(k, v)| (k.clone(), (**v).clone())).collect(),
+            nodes: nodes
+                .iter()
+                .map(|(k, v)| (k.clone(), (**v).clone()))
+                .collect(),
             edges: edges.ordered_edges(),
             node_row_hashes: node_hashes.clone(),
             edge_row_hashes: edge_hashes.clone(),
@@ -1094,9 +1106,7 @@ impl SurrealdbGraphStore {
                 let nodes = self.nodes_read()?;
                 tombstoned_node_ids
                     .iter()
-                    .filter_map(|id| {
-                        nodes.get(id).map(|n| (id.clone(), n.kind.clone()))
-                    })
+                    .filter_map(|id| nodes.get(id).map(|n| (id.clone(), n.kind.clone())))
                     .collect()
             };
             for (id, kind) in &tombstoned_kinds {
@@ -1147,26 +1157,37 @@ impl SurrealdbGraphStore {
         Ok(())
     }
 
-    fn nodes_read(&self) -> Result<std::sync::RwLockReadGuard<'_, BTreeMap<String, Arc<GraphNode>>>> {
+    fn nodes_read(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, BTreeMap<String, Arc<GraphNode>>>> {
         self.nodes
             .read()
             .map_err(|_| anyhow!("SurrealDB graph node index lock poisoned"))
     }
 
-    fn nodes_write(&self) -> Result<std::sync::RwLockWriteGuard<'_, BTreeMap<String, Arc<GraphNode>>>> {
+    fn nodes_write(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, BTreeMap<String, Arc<GraphNode>>>> {
         self.nodes
             .write()
             .map_err(|_| anyhow!("SurrealDB graph node index lock poisoned"))
     }
 
-    fn nodes_by_kind_read(&self) -> Result<std::sync::RwLockReadGuard<'_, BTreeMap<String, BTreeSet<String>>>> {
+    fn nodes_by_kind_read(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, BTreeMap<String, BTreeSet<String>>>> {
         self.nodes_by_kind
             .read()
             .map_err(|_| anyhow!("SurrealDB graph node by_kind index lock poisoned"))
     }
 
     fn unindex_node_kind(&self, kind: &str, id: &str) -> Result<()> {
-        if let Some(ids) = self.nodes_by_kind.write().map_err(|_| anyhow!("lock"))?.get_mut(kind) {
+        if let Some(ids) = self
+            .nodes_by_kind
+            .write()
+            .map_err(|_| anyhow!("lock"))?
+            .get_mut(kind)
+        {
             ids.remove(id);
         }
         Ok(())
@@ -1231,7 +1252,8 @@ impl GraphStore for SurrealdbGraphStore {
                 .entry(node.kind.clone())
                 .or_default()
                 .insert(node.id.clone());
-            self.nodes_write()?.insert(node.id.clone(), Arc::new(node.clone()));
+            self.nodes_write()?
+                .insert(node.id.clone(), Arc::new(node.clone()));
         }
         self.invalidate_sidecar();
         Ok(())
@@ -1317,7 +1339,11 @@ impl GraphStore for SurrealdbGraphStore {
     }
 
     fn all_nodes(&self) -> Result<Vec<GraphNode>> {
-        let mut nodes = self.nodes_read()?.values().map(|arc| (**arc).clone()).collect::<Vec<_>>();
+        let mut nodes = self
+            .nodes_read()?
+            .values()
+            .map(|arc| (**arc).clone())
+            .collect::<Vec<_>>();
         nodes.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(nodes)
     }
@@ -1558,9 +1584,7 @@ mod tests {
 
         let changed_rows = ConvexProjectionRows {
             nodes: vec![ConvexNodeRow::from(&GraphNode::new(
-                "node:x",
-                "file",
-                "new.rs",
+                "node:x", "file", "new.rs",
             ))],
             edges: vec![],
         };
@@ -1595,9 +1619,12 @@ mod tests {
 
         let modified_rows = ConvexProjectionRows {
             nodes: vec![
-                ConvexNodeRow::from(&GraphNode::new("node:a", "symbol", "alpha").with_property("path", "a.rs")),
                 ConvexNodeRow::from(
-                    &GraphNode::new("node:b", "symbol", "beta-modified").with_property("path", "b-mod.rs"),
+                    &GraphNode::new("node:a", "symbol", "alpha").with_property("path", "a.rs"),
+                ),
+                ConvexNodeRow::from(
+                    &GraphNode::new("node:b", "symbol", "beta-modified")
+                        .with_property("path", "b-mod.rs"),
                 ),
             ],
             edges: vec![ConvexEdgeRow::from(
@@ -2058,9 +2085,9 @@ mod tests {
                 ConvexNodeRow::from(&GraphNode::new("node:x", "file", "new.rs")),
                 ConvexNodeRow::from(&GraphNode::new("node:y", "file", "other.rs")),
             ],
-            edges: vec![ConvexEdgeRow::from(
-                &GraphEdge::new("node:x", "node:y", "imports"),
-            )],
+            edges: vec![ConvexEdgeRow::from(&GraphEdge::new(
+                "node:x", "node:y", "imports",
+            ))],
         };
         let (store2, outcome2) =
             SurrealdbGraphStore::open_or_refresh(&store_path, &changed_rows).unwrap();
@@ -2117,9 +2144,7 @@ mod tests {
         assert_eq!(outgoing.len(), 1);
         assert_eq!(outgoing[0].to_id, "node:b");
 
-        let incident = store
-            .incident_edges("node:b", Some("calls"))
-            .unwrap();
+        let incident = store.incident_edges("node:b", Some("calls")).unwrap();
         assert_eq!(incident.len(), 1);
         assert_eq!(incident[0].from_id, "node:a");
 
@@ -2140,14 +2165,8 @@ mod tests {
 
         let reopened = SurrealdbGraphStore::open(&store_path).unwrap();
         assert_eq!(reopened.graph_counts().unwrap(), (2, 1));
-        assert_eq!(
-            reopened.edge(&edge_id).unwrap().unwrap().to_id,
-            "node:b"
-        );
-        assert_eq!(
-            reopened.stored_row_hash().unwrap(),
-            stored_hash
-        );
+        assert_eq!(reopened.edge(&edge_id).unwrap().unwrap().to_id, "node:b");
+        assert_eq!(reopened.stored_row_hash().unwrap(), stored_hash);
     }
 
     #[test]

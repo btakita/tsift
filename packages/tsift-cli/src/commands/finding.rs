@@ -56,7 +56,9 @@ fn symbol_watermark(root: &Path, symbol: &index::StoredSymbol) -> Option<String>
         && end >= start
         && (end as usize) <= bytes.len()
     {
-        return Some(tsift_graph::source_content_hash(&bytes[start as usize..end as usize]));
+        return Some(tsift_graph::source_content_hash(
+            &bytes[start as usize..end as usize],
+        ));
     }
     Some(tsift_graph::source_content_hash(&bytes))
 }
@@ -229,7 +231,10 @@ pub(crate) fn cmd_finding_add(
     // 4. Optional `relates_to` edge: finding -> finding.
     if let Some(relates) = relates {
         if store.node(relates)?.is_none() {
-            bail!("--relates target finding not found in {}: {relates}", db_path.display());
+            bail!(
+                "--relates target finding not found in {}: {relates}",
+                db_path.display()
+            );
         }
         let relates_edge = SubstrateGraphEdge::new(id.clone(), relates.to_string(), "relates_to");
         store.upsert_edge(&relates_edge)?;
@@ -396,7 +401,11 @@ pub(crate) fn cmd_finding_list(
                     .get("confidence")
                     .and_then(|value| value.parse::<f64>().ok()),
                 about: node_about,
-                anchor_node: node.properties.get("anchor_node").cloned().unwrap_or_default(),
+                anchor_node: node
+                    .properties
+                    .get("anchor_node")
+                    .cloned()
+                    .unwrap_or_default(),
                 anchor_kind,
                 captured_watermark: captured,
                 current_watermark: current,
@@ -727,8 +736,11 @@ fn upsert_harvested_finding(
     source: &str,
     observed: i64,
 ) -> Result<()> {
-    let mut anchor_node =
-        SubstrateGraphNode::new(anchor.node_id.clone(), anchor.node_kind, anchor.label.clone());
+    let mut anchor_node = SubstrateGraphNode::new(
+        anchor.node_id.clone(),
+        anchor.node_kind,
+        anchor.label.clone(),
+    );
     for (key, value) in &anchor.properties {
         anchor_node = anchor_node.with_property(key.clone(), value.clone());
     }
@@ -746,8 +758,7 @@ fn upsert_harvested_finding(
     if let Some(watermark) = &anchor.watermark {
         node = node.with_property("watermark", watermark.clone());
     }
-    let mut provenance =
-        GraphProvenance::new("findings", format!("passive-harvest:{source}"));
+    let mut provenance = GraphProvenance::new("findings", format!("passive-harvest:{source}"));
     if let Some(watermark) = &anchor.watermark {
         provenance = provenance.with_content_hash(watermark.clone());
     }
@@ -896,7 +907,10 @@ pub(crate) fn cmd_finding_harvest(
             println!("  {} [{}] {}", finding.id, finding.kind, finding.title);
             println!("    about: {} · source: {}", finding.about, finding.source);
         }
-        println!("  stored in {} (status: draft — promote with `tsift finding promote <id>`)", report.db);
+        println!(
+            "  stored in {} (status: draft — promote with `tsift finding promote <id>`)",
+            report.db
+        );
     }
     Ok(())
 }
@@ -965,7 +979,10 @@ pub(crate) fn cmd_finding_promote(
         };
         println!("{rendered}");
     } else if report.changed {
-        println!("promoted {} [{}] {} → trusted", report.id, report.kind, report.title);
+        println!(
+            "promoted {} [{}] {} → trusted",
+            report.id, report.kind, report.title
+        );
     } else {
         println!("{} is already trusted (no change)", report.id);
     }

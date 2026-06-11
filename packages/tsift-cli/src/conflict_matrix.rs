@@ -7,36 +7,30 @@ use std::time::Instant;
 
 use anyhow::{Context as AnyhowContext, Result, bail};
 use serde::{Deserialize, Serialize};
-use tsift_sqlite as substrate;
 use substrate::{
-    GraphEdge as SubstrateGraphEdge, GraphNode as SubstrateGraphNode,
-    GraphPropertyFilter, GraphQueryOptions, GraphStore, SqliteGraphStore,
-    TerseGraphNode as SubstrateTerseGraphNode,
+    GraphEdge as SubstrateGraphEdge, GraphNode as SubstrateGraphNode, GraphPropertyFilter,
+    GraphQueryOptions, GraphStore, SqliteGraphStore, TerseGraphNode as SubstrateTerseGraphNode,
 };
-use tsift_digest::diff_digest;
 use tsift_cache::cycle_packet_cache;
+use tsift_digest::diff_digest;
 use tsift_quality::lint;
 use tsift_resolution as resolution;
 use tsift_search::impact;
+use tsift_sqlite as substrate;
 
 use crate::context_pack::{ContextPackReport, build_context_pack_report_with_profile};
 use crate::output::{OutputFormat, ResponseBudget, ResponseBudgetPreset, ToolEnvelopeSummary};
 use crate::{
-    GraphDbBackendEvalPhaseTiming, GraphDbEvidenceInput, GraphDbEvidenceReport,
-    GraphDbFreshnessReport,
-    content_hash, dedupe_preserve_order, envelope_metric,
-    estimated_tokens_from_bytes,
-    graph_db_backend_eval_cached_refresh,
-    graph_db_backend_eval_phase_timing, graph_db_backend_eval_timed_phase,
-    graph_db_evidence_report_from_store,
-    graph_db_read_recovery_diagnostic, graph_db_resolve_evidence_target,
-    graph_db_scope_arg,
-    graph_substrate_db_path,
-    print_json_or_envelope, shell_quote, sqlite_graph_freshness, stable_handle,
-    traversal_expand_command, traversal_source_watermark,
-    write_traversal_graph_store,
     CONFLICT_MATRIX_CONTRACT_VERSION, CONFLICT_MATRIX_GRAPH_PREPARATION_CACHE_VERSION,
-    CONFLICT_MATRIX_PREPARATION_CACHE_VERSION, WORKER_PROMPT_PACKET_CONTRACT_VERSION,
+    CONFLICT_MATRIX_PREPARATION_CACHE_VERSION, GraphDbBackendEvalPhaseTiming, GraphDbEvidenceInput,
+    GraphDbEvidenceReport, GraphDbFreshnessReport, WORKER_PROMPT_PACKET_CONTRACT_VERSION,
+    content_hash, dedupe_preserve_order, envelope_metric, estimated_tokens_from_bytes,
+    graph_db_backend_eval_cached_refresh, graph_db_backend_eval_phase_timing,
+    graph_db_backend_eval_timed_phase, graph_db_evidence_report_from_store,
+    graph_db_read_recovery_diagnostic, graph_db_resolve_evidence_target, graph_db_scope_arg,
+    graph_substrate_db_path, print_json_or_envelope, shell_quote, sqlite_graph_freshness,
+    stable_handle, traversal_expand_command, traversal_source_watermark,
+    write_traversal_graph_store,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -382,7 +376,10 @@ pub(crate) fn sorted_set(values: &BTreeSet<String>) -> Vec<String> {
     values.iter().cloned().collect()
 }
 
-pub(crate) fn sorted_intersection(left: &BTreeSet<String>, right: &BTreeSet<String>) -> Vec<String> {
+pub(crate) fn sorted_intersection(
+    left: &BTreeSet<String>,
+    right: &BTreeSet<String>,
+) -> Vec<String> {
     left.intersection(right).cloned().collect()
 }
 
@@ -470,7 +467,9 @@ pub(crate) fn is_planner_config_path(path: &str) -> bool {
     resolution::is_planner_config_path(path)
 }
 
-pub(crate) fn conflict_matrix_source_handle(node: &SubstrateTerseGraphNode) -> Option<ConflictMatrixSourceHandle> {
+pub(crate) fn conflict_matrix_source_handle(
+    node: &SubstrateTerseGraphNode,
+) -> Option<ConflictMatrixSourceHandle> {
     let file = node.properties.get("file")?.clone();
     let start = node
         .properties
@@ -527,7 +526,9 @@ pub(crate) struct ConflictMatrixGraphIndex {
     pub(crate) symbols_by_file: BTreeMap<String, Vec<String>>,
 }
 
-pub(crate) fn conflict_matrix_graph_index(graph_nodes: &[SubstrateGraphNode]) -> ConflictMatrixGraphIndex {
+pub(crate) fn conflict_matrix_graph_index(
+    graph_nodes: &[SubstrateGraphNode],
+) -> ConflictMatrixGraphIndex {
     let mut symbols_by_file = BTreeMap::<String, Vec<String>>::new();
     for node in graph_nodes {
         if node.kind != "symbol" {
@@ -839,8 +840,8 @@ fn apply_conflict_matrix_worker_feedback_controls(candidates: &mut [ConflictMatr
 }
 
 fn empty_conflict_matrix_ownership(target: &str) -> ConflictMatrixOwnershipBlock {
-     ConflictMatrixOwnershipBlock {
-         contract_version: WORKER_PROMPT_PACKET_CONTRACT_VERSION.to_string(),
+    ConflictMatrixOwnershipBlock {
+        contract_version: WORKER_PROMPT_PACKET_CONTRACT_VERSION.to_string(),
         title: format!("Worker ownership for {target}"),
         owned_files: Vec::new(),
         owned_symbols: Vec::new(),
@@ -2272,9 +2273,12 @@ fn collect_evidence_for_target<S: GraphStore>(
     freshness: GraphDbFreshnessReport,
 ) -> Result<ConflictMatrixPreparedEvidence> {
     let cache_key = cycle_packet_cache::cycle_packet_evidence_key(target);
-    if let Some(cached) = cycle_packet_cache::cycle_packet_read_cache::<
-        ConflictMatrixPreparedEvidence,
-    >(root, cycle_packet_cache::CyclePacketKind::Evidence, &cache_key)
+    if let Some(cached) =
+        cycle_packet_cache::cycle_packet_read_cache::<ConflictMatrixPreparedEvidence>(
+            root,
+            cycle_packet_cache::CyclePacketKind::Evidence,
+            &cache_key,
+        )
     {
         return Ok(cached);
     }
@@ -2320,14 +2324,16 @@ pub(crate) fn collect_conflict_matrix_evidence_packets<S: GraphStore>(
 ) -> Result<Vec<ConflictMatrixPreparedEvidence>> {
     let db_path = graph_substrate_db_path(root, scope);
     let db_path_exists = db_path.exists();
-    let mut evidence: Vec<Option<ConflictMatrixPreparedEvidence>> =
-        vec![None; targets.len()];
+    let mut evidence: Vec<Option<ConflictMatrixPreparedEvidence>> = vec![None; targets.len()];
     let mut miss_indices: Vec<usize> = Vec::new();
     for (i, target) in targets.iter().enumerate() {
         let cache_key = cycle_packet_cache::cycle_packet_evidence_key(target);
-        if let Some(cached) = cycle_packet_cache::cycle_packet_read_cache::<
-            ConflictMatrixPreparedEvidence,
-        >(root, cycle_packet_cache::CyclePacketKind::Evidence, &cache_key)
+        if let Some(cached) =
+            cycle_packet_cache::cycle_packet_read_cache::<ConflictMatrixPreparedEvidence>(
+                root,
+                cycle_packet_cache::CyclePacketKind::Evidence,
+                &cache_key,
+            )
         {
             evidence[i] = Some(cached);
         } else {

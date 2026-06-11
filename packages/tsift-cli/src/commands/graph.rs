@@ -281,7 +281,10 @@ pub(crate) fn cmd_graph(
                 state.2.as_deref(),
             );
         }
-        println!("{}", to_json_schema(&combined, pretty, terse, false, schema)?);
+        println!(
+            "{}",
+            to_json_schema(&combined, pretty, terse, false, schema)?
+        );
     }
 
     Ok(())

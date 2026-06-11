@@ -513,7 +513,8 @@ impl GraphStore for LibsqlGraphStore {
     fn incident_edges(&self, node_id: &str, kind: Option<&str>) -> Result<Vec<GraphEdge>> {
         block_on(&self.rt, async {
             let sql = match kind {
-                Some(_) => r#"
+                Some(_) => {
+                    r#"
                     SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
                     FROM (
                         SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
@@ -525,8 +526,10 @@ impl GraphStore for LibsqlGraphStore {
                         WHERE to_id = ?1 AND kind = ?2
                     ) e
                     ORDER BY e.edge_key
-                    "#,
-                None => r#"
+                    "#
+                }
+                None => {
+                    r#"
                     SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
                     FROM (
                         SELECT edge_key, from_id, to_id, kind, properties_json, provenance_json, freshness_json
@@ -538,15 +541,13 @@ impl GraphStore for LibsqlGraphStore {
                         WHERE to_id = ?1
                     ) e
                     ORDER BY e.edge_key
-                    "#,
+                    "#
+                }
             };
             let mut edges = Vec::new();
             match kind {
                 Some(kind) => {
-                    let mut rows = self.conn.query(
-                        sql,
-                        libsql::params![node_id, kind],
-                    ).await?;
+                    let mut rows = self.conn.query(sql, libsql::params![node_id, kind]).await?;
                     while let Some(row) = rows.next().await? {
                         edges.push(edge_from_row(&row)?);
                     }
@@ -579,9 +580,8 @@ impl GraphStore for LibsqlGraphStore {
                 let row_placeholders: Vec<String> =
                     chunk.iter().map(|_| "(?)".to_string()).collect();
                 let placeholders = row_placeholders.join(", ");
-                let sql = format!(
-                    "INSERT OR IGNORE INTO _edges_between_ids (id) VALUES {placeholders}"
-                );
+                let sql =
+                    format!("INSERT OR IGNORE INTO _edges_between_ids (id) VALUES {placeholders}");
                 let values: Vec<String> = chunk.iter().map(|id| (*id).clone()).collect();
                 self.conn
                     .execute(

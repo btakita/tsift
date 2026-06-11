@@ -1,8 +1,8 @@
 use tsift_quality::token_gate;
 
 use token_gate::{
-    MIN_TOKEN_GATE_SAMPLES, TokenGateDecision, TokenSurfaceVerdict, evaluate_token_gate,
-    evaluate_token_regression, parse_token_history, TOKEN_GATE_SURFACES,
+    MIN_TOKEN_GATE_SAMPLES, TOKEN_GATE_SURFACES, TokenGateDecision, TokenSurfaceVerdict,
+    evaluate_token_gate, evaluate_token_regression, parse_token_history,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -17,9 +17,18 @@ fn synth_token_sample(
     useful_hit_density: f64,
 ) -> serde_json::Value {
     let mut metrics = serde_json::Map::new();
-    metrics.insert("prompt_tokens".into(), serde_json::Value::from(prompt_tokens));
-    metrics.insert("envelope_bytes".into(), serde_json::Value::from(envelope_bytes));
-    metrics.insert("runtime_micros".into(), serde_json::Value::from(runtime_micros));
+    metrics.insert(
+        "prompt_tokens".into(),
+        serde_json::Value::from(prompt_tokens),
+    );
+    metrics.insert(
+        "envelope_bytes".into(),
+        serde_json::Value::from(envelope_bytes),
+    );
+    metrics.insert(
+        "runtime_micros".into(),
+        serde_json::Value::from(runtime_micros),
+    );
     metrics.insert(
         "cache_hit_rate_percent".into(),
         serde_json::Value::from(cache_hit_rate),
@@ -82,10 +91,12 @@ fn token_gate_passes_when_all_surfaces_have_samples_with_signal() {
     let report = evaluate_token_gate(&history, 10.0);
     assert_eq!(report.decision, TokenGateDecision::Pass, "{report:?}");
     assert_eq!(report.surface_evaluations.len(), TOKEN_GATE_SURFACES.len());
-    assert!(report
-        .surface_evaluations
-        .iter()
-        .all(|s| s.verdict == TokenSurfaceVerdict::Pass));
+    assert!(
+        report
+            .surface_evaluations
+            .iter()
+            .all(|s| s.verdict == TokenSurfaceVerdict::Pass)
+    );
 }
 
 #[test]
@@ -138,10 +149,12 @@ fn token_gate_blocks_on_insufficient_samples() {
     let history = parse_token_history(&raw).unwrap();
     let report = evaluate_token_gate(&history, 10.0);
     assert_eq!(report.decision, TokenGateDecision::Block);
-    assert!(report
-        .surface_evaluations
-        .iter()
-        .all(|s| s.verdict == TokenSurfaceVerdict::InsufficientSamples));
+    assert!(
+        report
+            .surface_evaluations
+            .iter()
+            .all(|s| s.verdict == TokenSurfaceVerdict::InsufficientSamples)
+    );
 }
 
 #[test]

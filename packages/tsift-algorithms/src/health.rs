@@ -120,14 +120,26 @@ pub fn terse_health_report(edges: &[(String, String)], n: usize) -> TerseHealthR
 
     let (mut top_candidates, mut bottom_candidates) = {
         let mut sorted = raw_scores;
-        sorted.sort_by(|a, b| b.overall.partial_cmp(&a.overall).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| {
+            b.overall
+                .partial_cmp(&a.overall)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let top: Vec<TerseHealthScore> = sorted.iter().take(n).cloned().collect();
         let bottom: Vec<TerseHealthScore> = sorted.iter().rev().take(n).cloned().collect();
         (top, bottom)
     };
 
-    top_candidates.sort_by(|a, b| b.overall.partial_cmp(&a.overall).unwrap_or(std::cmp::Ordering::Equal));
-    bottom_candidates.sort_by(|a, b| a.overall.partial_cmp(&b.overall).unwrap_or(std::cmp::Ordering::Equal));
+    top_candidates.sort_by(|a, b| {
+        b.overall
+            .partial_cmp(&a.overall)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    bottom_candidates.sort_by(|a, b| {
+        a.overall
+            .partial_cmp(&b.overall)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     TerseHealthReport {
         top_scores: top_candidates,
@@ -485,7 +497,13 @@ mod tests {
 
     #[test]
     fn terse_matches_composite() {
-        let edges = vec![e("a", "b"), e("a", "c"), e("b", "c"), e("c", "d"), e("d", "a")];
+        let edges = vec![
+            e("a", "b"),
+            e("a", "c"),
+            e("b", "c"),
+            e("c", "d"),
+            e("d", "a"),
+        ];
         let full = composite_health_score(&edges);
         let terse = terse_health_report(&edges, 2);
         assert_eq!(terse.node_count, full.node_count);
@@ -535,7 +553,12 @@ mod tests {
         ];
         let terse = terse_health_report(&edges, 2);
         for s in terse.top_scores.iter().chain(terse.bottom_scores.iter()) {
-            assert!(s.overall >= 0.0 && s.overall <= 1.0, "{} overall={}", s.name, s.overall);
+            assert!(
+                s.overall >= 0.0 && s.overall <= 1.0,
+                "{} overall={}",
+                s.name,
+                s.overall
+            );
         }
     }
 

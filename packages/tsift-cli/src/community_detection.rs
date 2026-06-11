@@ -9,8 +9,10 @@ use tsift_graph as graph;
 use tsift_index::index;
 use tsift_search::tagpath_adapter;
 
-use crate::output::tagpath::{CommunityMemberAmbiguityDiagnostic, TagpathAnnotationDiagnostic, TagpathSearchOpts};
-use crate::{content_hash, GraphEffectivenessReadiness, hash_bytes_hex, shell_quote};
+use crate::output::tagpath::{
+    CommunityMemberAmbiguityDiagnostic, TagpathAnnotationDiagnostic, TagpathSearchOpts,
+};
+use crate::{GraphEffectivenessReadiness, content_hash, hash_bytes_hex, shell_quote};
 
 const COMMUNITY_DETECTION_CACHE_VERSION: &str = "community-detection-cache-v1";
 

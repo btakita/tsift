@@ -50,8 +50,8 @@ fn indexed_fixture(alpha_body: &str) -> tempfile::TempDir {
 fn add_finding(root: &Path, kind: &str, title: &str, about: &str) -> serde_json::Value {
     let out = run_ok(
         &[
-            "finding", "add", "--path", ".", "--kind", kind, "--title", title, "--body",
-            "the why", "--about", about, "--json",
+            "finding", "add", "--path", ".", "--kind", kind, "--title", title, "--body", "the why",
+            "--about", about, "--json",
         ],
         root,
     );
@@ -68,13 +68,23 @@ fn list_json(root: &Path, extra: &[&str]) -> serde_json::Value {
 /// Initialize a committed git repo so `context-pack`'s diff digest can run.
 fn init_git(root: &Path) {
     let run_git = |args: &[&str]| {
-        let status = Command::new("git").args(args).current_dir(root).status().unwrap();
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .unwrap();
         assert!(status.success(), "git {args:?} failed");
     };
     run_git(&["init"]);
     run_git(&["add", "."]);
     run_git(&[
-        "-c", "user.name=tsift-tests", "-c", "user.email=tests@tsift", "commit", "-m", "init",
+        "-c",
+        "user.name=tsift-tests",
+        "-c",
+        "user.email=tests@tsift",
+        "commit",
+        "-m",
+        "init",
     ]);
 }
 
@@ -143,7 +153,12 @@ fn context_pack_injects_trusted_fresh_finding_for_result_set_node() {
     init_git(root);
     write_session_doc(root);
 
-    add_finding(root, "decision", "main.rs owns the entrypoint wiring", "main.rs");
+    add_finding(
+        root,
+        "decision",
+        "main.rs owns the entrypoint wiring",
+        "main.rs",
+    );
 
     let pack = context_pack_json(root);
     let titles = finding_titles(&pack);
@@ -181,8 +196,19 @@ fn context_pack_excludes_draft_findings() {
 
     run_ok(
         &[
-            "finding", "add", "--path", ".", "--kind", "note", "--title",
-            "draft about main", "--body", "unverified", "--about", "main.rs", "--status",
+            "finding",
+            "add",
+            "--path",
+            ".",
+            "--kind",
+            "note",
+            "--title",
+            "draft about main",
+            "--body",
+            "unverified",
+            "--about",
+            "main.rs",
+            "--status",
             "draft",
         ],
         root,
@@ -324,10 +350,7 @@ fn finding_supports_three_node_kinds() {
     // Filter by kind.
     let only_notes = list_json(root, &["--kind", "note"]);
     assert_eq!(only_notes["total"].as_u64().unwrap(), 1);
-    assert_eq!(
-        only_notes["findings"][0]["kind"].as_str().unwrap(),
-        "note"
-    );
+    assert_eq!(only_notes["findings"][0]["kind"].as_str().unwrap(), "note");
 }
 
 #[test]
@@ -340,8 +363,21 @@ fn finding_relates_to_edge_threads_findings() {
 
     let out = run_ok(
         &[
-            "finding", "add", "--path", ".", "--kind", "note", "--title", "follow up", "--body",
-            "depends on base", "--about", "beta", "--relates", &first_id, "--json",
+            "finding",
+            "add",
+            "--path",
+            ".",
+            "--kind",
+            "note",
+            "--title",
+            "follow up",
+            "--body",
+            "depends on base",
+            "--about",
+            "beta",
+            "--relates",
+            &first_id,
+            "--json",
         ],
         root,
     );
@@ -361,8 +397,20 @@ fn finding_relates_to_unknown_target_fails() {
 
     let output = run(
         &[
-            "finding", "add", "--path", ".", "--kind", "note", "--title", "x", "--body", "y",
-            "--about", "alpha", "--relates", "finding:does-not-exist",
+            "finding",
+            "add",
+            "--path",
+            ".",
+            "--kind",
+            "note",
+            "--title",
+            "x",
+            "--body",
+            "y",
+            "--about",
+            "alpha",
+            "--relates",
+            "finding:does-not-exist",
         ],
         root,
     );
@@ -436,8 +484,20 @@ fn finding_add_rejects_invalid_kind_status_confidence() {
 
     let bad_conf = run(
         &[
-            "finding", "add", "--path", ".", "--kind", "note", "--title", "t", "--body", "b",
-            "--about", "alpha", "--confidence", "2.0",
+            "finding",
+            "add",
+            "--path",
+            ".",
+            "--kind",
+            "note",
+            "--title",
+            "t",
+            "--body",
+            "b",
+            "--about",
+            "alpha",
+            "--confidence",
+            "2.0",
         ],
         root,
     );
@@ -479,7 +539,11 @@ fn write_archive(root: &Path, name: &str, body: &str) {
 fn finding_harvest_fail_closed_without_config() {
     let dir = indexed_fixture("1");
     let root = dir.path();
-    write_archive(root, "s.md", "We decided `alpha` is the entrypoint by design.\n");
+    write_archive(
+        root,
+        "s.md",
+        "We decided `alpha` is the entrypoint by design.\n",
+    );
 
     let output = run(&["finding", "harvest", "."], root);
     assert!(!output.status.success(), "harvest must fail without opt-in");
@@ -523,7 +587,11 @@ fn finding_harvest_idempotent_skips_existing() {
     let dir = indexed_fixture("1");
     let root = dir.path();
     enable_passive_harvest(root);
-    write_archive(root, "s.md", "We decided `alpha` is the entrypoint by design.\n");
+    write_archive(
+        root,
+        "s.md",
+        "We decided `alpha` is the entrypoint by design.\n",
+    );
 
     run_ok(&["finding", "harvest", "."], root);
     let out = run_ok(&["finding", "harvest", ".", "--json"], root);
@@ -539,7 +607,11 @@ fn finding_promote_draft_to_trusted() {
     let dir = indexed_fixture("1");
     let root = dir.path();
     enable_passive_harvest(root);
-    write_archive(root, "s.md", "We decided `alpha` is the entrypoint by design.\n");
+    write_archive(
+        root,
+        "s.md",
+        "We decided `alpha` is the entrypoint by design.\n",
+    );
     run_ok(&["finding", "harvest", "."], root);
 
     let drafts = list_json(root, &["--status", "draft"]);
@@ -569,7 +641,11 @@ fn finding_promote_unknown_id_fails() {
     let root = dir.path();
     // findings.db is created lazily; promote with no store should error clearly.
     enable_passive_harvest(root);
-    write_archive(root, "s.md", "We decided `alpha` is the entrypoint by design.\n");
+    write_archive(
+        root,
+        "s.md",
+        "We decided `alpha` is the entrypoint by design.\n",
+    );
     run_ok(&["finding", "harvest", "."], root);
 
     let output = run(&["finding", "promote", "finding:does-not-exist", "."], root);
@@ -652,8 +728,20 @@ fn search_and_explain_exclude_draft_findings() {
     let root = dir.path();
     run_ok(
         &[
-            "finding", "add", "--path", ".", "--kind", "note", "--title", "alpha draft",
-            "--body", "unverified", "--about", "alpha", "--status", "draft",
+            "finding",
+            "add",
+            "--path",
+            ".",
+            "--kind",
+            "note",
+            "--title",
+            "alpha draft",
+            "--body",
+            "unverified",
+            "--about",
+            "alpha",
+            "--status",
+            "draft",
         ],
         root,
     );

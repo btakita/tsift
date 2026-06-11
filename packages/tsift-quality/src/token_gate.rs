@@ -224,10 +224,8 @@ pub fn evaluate_token_gate(
 
     for surface in TOKEN_GATE_SURFACES {
         let display = surface_display_name(surface).to_string();
-        let surface_samples: Vec<&TokenGateSample> = history
-            .iter()
-            .filter(|s| s.surface == surface)
-            .collect();
+        let surface_samples: Vec<&TokenGateSample> =
+            history.iter().filter(|s| s.surface == surface).collect();
         let sample_count = surface_samples.len();
 
         if sample_count == 0 {
@@ -291,14 +289,10 @@ pub fn evaluate_token_gate(
                         TokenMetricDirection::LowerIsBetter => "lower is better",
                         TokenMetricDirection::HigherIsBetter => "higher is better",
                     };
-                    format!(
-                        "`{metric_name}` median {m:.2} ({dir_label}) — present"
-                    )
+                    format!("`{metric_name}` median {m:.2} ({dir_label}) — present")
                 }
                 (Some(m), false) => {
-                    format!(
-                        "`{metric_name}` median {m:.2} is zero or negative — no signal"
-                    )
+                    format!("`{metric_name}` median {m:.2} is zero or negative — no signal")
                 }
                 (None, _) => {
                     format!(
@@ -364,14 +358,10 @@ pub fn evaluate_token_regression(
 
     for surface in TOKEN_GATE_SURFACES {
         let display = surface_display_name(surface).to_string();
-        let baseline_samples: Vec<&TokenGateSample> = baseline
-            .iter()
-            .filter(|s| s.surface == surface)
-            .collect();
-        let candidate_samples: Vec<&TokenGateSample> = candidate
-            .iter()
-            .filter(|s| s.surface == surface)
-            .collect();
+        let baseline_samples: Vec<&TokenGateSample> =
+            baseline.iter().filter(|s| s.surface == surface).collect();
+        let candidate_samples: Vec<&TokenGateSample> =
+            candidate.iter().filter(|s| s.surface == surface).collect();
 
         if baseline_samples.is_empty() && candidate_samples.is_empty() {
             surface_evaluations.push(TokenSurfaceEvaluation {
@@ -556,7 +546,10 @@ mod tests {
         metrics.insert("raw_read_avoidance".into(), Value::from(raw_read_avoidance));
         metrics.insert("useful_hit_density".into(), Value::from(useful_hit_density));
         let mut entry = serde_json::Map::new();
-        entry.insert("label".into(), Value::from(format!("synth {surface} sample")));
+        entry.insert(
+            "label".into(),
+            Value::from(format!("synth {surface} sample")),
+        );
         entry.insert("id".into(), Value::from(id.to_string()));
         entry.insert("timestamp".into(), Value::from("2026-06-02T00:00:00Z"));
         entry.insert("surface".into(), Value::from(surface.to_string()));
@@ -614,10 +607,12 @@ mod tests {
         let history = parse_token_history(&raw).unwrap();
         let report = evaluate_token_gate(&history, 10.0);
         assert_eq!(report.decision, TokenGateDecision::Pass, "{report:?}");
-        assert!(report
-            .surface_evaluations
-            .iter()
-            .all(|s| s.verdict == TokenSurfaceVerdict::Pass));
+        assert!(
+            report
+                .surface_evaluations
+                .iter()
+                .all(|s| s.verdict == TokenSurfaceVerdict::Pass)
+        );
     }
 
     #[test]
@@ -670,10 +665,12 @@ mod tests {
         let history = parse_token_history(&raw).unwrap();
         let report = evaluate_token_gate(&history, 10.0);
         assert_eq!(report.decision, TokenGateDecision::Block);
-        assert!(report
-            .surface_evaluations
-            .iter()
-            .all(|s| s.verdict == TokenSurfaceVerdict::InsufficientSamples));
+        assert!(
+            report
+                .surface_evaluations
+                .iter()
+                .all(|s| s.verdict == TokenSurfaceVerdict::InsufficientSamples)
+        );
     }
 
     #[test]
@@ -765,9 +762,11 @@ mod tests {
         let candidate = parse_token_history(&build_token_history(vec![])).unwrap();
         let report = evaluate_token_regression(&baseline, &candidate, 10.0);
         assert_eq!(report.decision, TokenGateDecision::Block);
-        assert!(report
-            .surface_evaluations
-            .iter()
-            .all(|s| s.verdict == TokenSurfaceVerdict::Missing));
+        assert!(
+            report
+                .surface_evaluations
+                .iter()
+                .all(|s| s.verdict == TokenSurfaceVerdict::Missing)
+        );
     }
 }

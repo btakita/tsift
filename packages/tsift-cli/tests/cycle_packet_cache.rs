@@ -1,22 +1,27 @@
-use tsift_cache::cycle_packet_cache;
 use cycle_packet_cache::{
-    CyclePacketKind, cycle_packet_cache_dir, cycle_packet_evidence_key,
+    CYCLE_PACKET_CACHE_VERSION, CyclePacketKind, cycle_packet_cache_dir, cycle_packet_evidence_key,
     cycle_packet_read_cache, cycle_packet_watermark_key, cycle_packet_write_cache,
-    CYCLE_PACKET_CACHE_VERSION,
 };
+use tsift_cache::cycle_packet_cache;
 
 #[test]
 fn evidence_cache_key_is_stable_across_calls() {
     let key_a = cycle_packet_evidence_key("gevd:target-abc:node123:hash456");
     let key_b = cycle_packet_evidence_key("gevd:target-abc:node123:hash456");
-    assert_eq!(key_a, key_b, "evidence cache key must be deterministic for the same packet_id");
+    assert_eq!(
+        key_a, key_b,
+        "evidence cache key must be deterministic for the same packet_id"
+    );
 }
 
 #[test]
 fn evidence_cache_key_differs_for_different_targets() {
     let key_a = cycle_packet_evidence_key("gevd:target-abc:node123:hash456");
     let key_b = cycle_packet_evidence_key("gevd:target-def:node456:hash789");
-    assert_ne!(key_a, key_b, "different packet_ids must produce different cache keys");
+    assert_ne!(
+        key_a, key_b,
+        "different packet_ids must produce different cache keys"
+    );
 }
 
 #[test]
@@ -81,11 +86,12 @@ fn dispatch_trace_cache_roundtrip() {
         "edges": []
     });
 
-    let cache_key = cycle_packet_watermark_key("sw1", "dw1", "sdw1", &[
-        "targets:#gpackreuse",
-        "depth:3",
-        "limit:8",
-    ]);
+    let cache_key = cycle_packet_watermark_key(
+        "sw1",
+        "dw1",
+        "sdw1",
+        &["targets:#gpackreuse", "depth:3", "limit:8"],
+    );
     cycle_packet_write_cache(root, CyclePacketKind::ConflictMatrix, &cache_key, &report);
 
     let loaded: serde_json::Value =

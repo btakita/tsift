@@ -10,13 +10,12 @@ use tsift_summarize::summarize;
 
 use crate::output::ResponseBudget;
 use crate::{
-    compact_snippet, dedupe_preserve_order, format_score, format_symbol_preview_line,
-    canonical_tag_family_from_symbol, family_query_from_tag_alias, relativize,
-    resolve_query_db_path, shell_quote, source_read_command, source_symbol_read_command,
-    source_symbol_line, stable_handle, stored_symbol_ast_span, stored_symbol_span_bounds,
-    stored_symbol_span_handle, symbol_hit_ast_span, symbol_hit_line, symbol_hit_span_bounds,
-    markdown_ast_command, truncate_for_budget,
-    AstSpanPreview, SearchFacetFilters,
+    AstSpanPreview, SearchFacetFilters, canonical_tag_family_from_symbol, compact_snippet,
+    dedupe_preserve_order, family_query_from_tag_alias, format_score, format_symbol_preview_line,
+    markdown_ast_command, relativize, resolve_query_db_path, shell_quote, source_read_command,
+    source_symbol_line, source_symbol_read_command, stable_handle, stored_symbol_ast_span,
+    stored_symbol_span_bounds, stored_symbol_span_handle, symbol_hit_ast_span, symbol_hit_line,
+    symbol_hit_span_bounds, truncate_for_budget,
 };
 
 #[derive(Serialize)]

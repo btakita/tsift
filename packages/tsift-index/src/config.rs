@@ -383,7 +383,11 @@ federation = false
         let dir = tempfile::tempdir().unwrap();
         let tsift_dir = dir.path().join(".tsift");
         fs::create_dir_all(&tsift_dir).unwrap();
-        fs::write(tsift_dir.join("config.toml"), "[defaults]\nfederation = true\n").unwrap();
+        fs::write(
+            tsift_dir.join("config.toml"),
+            "[defaults]\nfederation = true\n",
+        )
+        .unwrap();
         assert!(!Config::load(dir.path()).unwrap().findings.passive_harvest);
     }
 

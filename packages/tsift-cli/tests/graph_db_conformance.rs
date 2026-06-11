@@ -5818,10 +5818,7 @@ fn graph_db_map_annotates_hub_with_trusted_finding() {
             hub["label"] == "alpha"
                 && hub["findings"]
                     .as_array()
-                    .map(|f| {
-                        f.iter()
-                            .any(|x| x["title"] == "alpha is the orchestrator")
-                    })
+                    .map(|f| f.iter().any(|x| x["title"] == "alpha is the orchestrator"))
                     .unwrap_or(false)
         });
     assert!(
@@ -5845,7 +5842,10 @@ fn graph_db_map_md_and_html_projections_render_findings() {
     );
 
     let md = map_projection(project.path(), "md");
-    assert!(md.starts_with("# Graph Map"), "md should be markdown: {md:.120}");
+    assert!(
+        md.starts_with("# Graph Map"),
+        "md should be markdown: {md:.120}"
+    );
     assert!(
         md.contains("📌 decision: alpha is the orchestrator (about `alpha`)"),
         "md should render the finding line: {md}"
@@ -5884,5 +5884,9 @@ fn graph_db_map_excludes_draft_findings() {
                 .map(|f| f.iter().any(|x| x["title"] == "draft about alpha"))
                 .unwrap_or(false)
         });
-    assert!(!leaked, "draft finding must not annotate the map: {}", map["overview"]["top_hubs"]);
+    assert!(
+        !leaked,
+        "draft finding must not annotate the map: {}",
+        map["overview"]["top_hubs"]
+    );
 }

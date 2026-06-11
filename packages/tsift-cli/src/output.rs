@@ -109,8 +109,10 @@ impl ResponseBudgetPreset {
             ResponseBudgetPreset::Small => {
                 ResponseBudget::new(Some(3), Some(120)).with_body_token_cap(500)
             }
-            ResponseBudgetPreset::Normal => ResponseBudget::new(Some(DEFAULT_BUDGET_ITEMS), Some(DEFAULT_BUDGET_BYTES))
-                .with_body_token_cap(DEFAULT_BODY_TOKEN_CAP),
+            ResponseBudgetPreset::Normal => {
+                ResponseBudget::new(Some(DEFAULT_BUDGET_ITEMS), Some(DEFAULT_BUDGET_BYTES))
+                    .with_body_token_cap(DEFAULT_BODY_TOKEN_CAP)
+            }
             ResponseBudgetPreset::Deep => {
                 ResponseBudget::new(Some(10), Some(240)).with_body_token_cap(3000)
             }

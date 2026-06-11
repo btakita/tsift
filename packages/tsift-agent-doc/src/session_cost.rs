@@ -604,10 +604,7 @@ pub fn compute(input: &str, source_hint: Option<&str>) -> Result<SessionCostRepo
     })
 }
 
-pub fn set_prompt_cache_scorecard_next_command(
-    report: &mut SessionCostReport,
-    next_command: &str,
-) {
+pub fn set_prompt_cache_scorecard_next_command(report: &mut SessionCostReport, next_command: &str) {
     if let Some(plan) = &mut report.prompt_cache_plan {
         for row in &mut plan.scorecard {
             row.next_command = next_command.to_string();
@@ -1386,10 +1383,7 @@ fn prompt_cache_roi_scorecard_row(
     turns: &[SessionCostTurn],
     next_command: &str,
 ) -> SessionCostPromptCacheRoiScorecard {
-    let prompt_tokens = turns
-        .iter()
-        .map(|turn| turn.prompt_tokens)
-        .sum::<u64>();
+    let prompt_tokens = turns.iter().map(|turn| turn.prompt_tokens).sum::<u64>();
     let cached_input_tokens = turns
         .iter()
         .map(|turn| turn.cached_input_tokens)
@@ -1407,11 +1401,8 @@ fn prompt_cache_roi_scorecard_row(
     let ratio_delta = first_ratio
         .zip(last_ratio)
         .map(|(first, last)| last - first);
-    let diagnostics = derive_prompt_cache_diagnostics(
-        turns,
-        cached_input_tokens,
-        cache_creation_input_tokens,
-    );
+    let diagnostics =
+        derive_prompt_cache_diagnostics(turns, cached_input_tokens, cache_creation_input_tokens);
     let (prefix_drift, _) = derive_prompt_cache_prefix_drift(turns);
     let adapter_evidence = prompt_cache_adapter_evidence(turns);
 
@@ -1479,10 +1470,7 @@ fn prompt_cache_scorecard_cause(
         .find(|drift| drift.severity == "warn")
         .or_else(|| prefix_drift.first())
     {
-        return format!(
-            "{} changed ({})",
-            drift.first_changed_field, drift.trigger
-        );
+        return format!("{} changed ({})", drift.first_changed_field, drift.trigger);
     }
     if let Some(adapter_cause) = prompt_cache_adapter_scorecard_cause(provider, adapter_evidence) {
         return adapter_cause;
