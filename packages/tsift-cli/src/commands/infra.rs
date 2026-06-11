@@ -42,19 +42,19 @@ use crate::{
     graph_db_backend_eval_reused_cached_projection, graph_db_backend_eval_synthetic_projection,
     graph_db_backend_eval_targets, graph_db_backend_eval_timed_phase,
     graph_db_backend_eval_update_source_watermark, graph_db_compaction_policy,
-    graph_db_drift_report, graph_db_evidence_report_from_store, graph_db_operator_report_from_disk,
-    graph_db_operator_status_warnings, graph_db_read_recovery_diagnostic,
-    graph_db_report_from_store, graph_db_resolve_evidence_target, graph_db_scope_arg,
-    graph_projection_content_hash, graph_substrate_db_path, load_convex_projection_rows,
-    load_convex_projection_snapshot_value, no_rewrite_message, open_db,
-    prepare_conflict_matrix_inputs, print_convex_sync_human, print_graph_db_backend_eval_human,
-    print_graph_db_compaction_human, print_graph_db_doctor_human, print_graph_db_drift_human,
-    print_graph_db_evidence_report, print_graph_db_human, print_graph_db_operator_report,
-    print_json_or_envelope, rewrite_command, schema_overview, shell_quote,
-    sqlite_convex_rows_from_conn, sqlite_graph_freshness, status_missing_workspace_scopes,
-    table_columns, to_json_schema, tokensave_graph_freshness, traversal_source_watermark,
-    truncate_for_compact, validate_convex_projection_rows, write_traversal_graph_store,
-    write_traversal_graph_store_with_options,
+    graph_db_drift_report, graph_db_evidence_preferred_path, graph_db_evidence_report_from_store,
+    graph_db_operator_report_from_disk, graph_db_operator_status_warnings,
+    graph_db_read_recovery_diagnostic, graph_db_report_from_store,
+    graph_db_resolve_evidence_target_with_path, graph_db_scope_arg, graph_projection_content_hash,
+    graph_substrate_db_path, load_convex_projection_rows, load_convex_projection_snapshot_value,
+    no_rewrite_message, open_db, prepare_conflict_matrix_inputs, print_convex_sync_human,
+    print_graph_db_backend_eval_human, print_graph_db_compaction_human,
+    print_graph_db_doctor_human, print_graph_db_drift_human, print_graph_db_evidence_report,
+    print_graph_db_human, print_graph_db_operator_report, print_json_or_envelope, rewrite_command,
+    schema_overview, shell_quote, sqlite_convex_rows_from_conn, sqlite_graph_freshness,
+    status_missing_workspace_scopes, table_columns, to_json_schema, tokensave_graph_freshness,
+    traversal_source_watermark, truncate_for_compact, validate_convex_projection_rows,
+    write_traversal_graph_store, write_traversal_graph_store_with_options,
 };
 use tsift_tokensave::TokensaveDb;
 
@@ -2378,6 +2378,12 @@ pub(crate) fn cmd_graph_db(
     format: OutputFormat,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let preferred_path = if matches!(&query, GraphDbQuery::Evidence { .. }) {
+        graph_db_evidence_preferred_path(&root, path)
+    } else {
+        None
+    };
+    let preferred_path = preferred_path.as_deref();
     match &query {
         GraphDbQuery::Refresh => {
             return cmd_graph_db_refresh(&root, path, scope, format);
@@ -2439,7 +2445,8 @@ pub(crate) fn cmd_graph_db(
         let needs_refresh = if graph_db.exists() {
             let store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
             sqlite_graph_freshness(&store, scope.unwrap_or("root"))?.fail_closed
-                || graph_db_resolve_evidence_target(&store, target)?.is_none()
+                || graph_db_resolve_evidence_target_with_path(&store, target, preferred_path)?
+                    .is_none()
         } else {
             true
         };
@@ -2468,6 +2475,7 @@ pub(crate) fn cmd_graph_db(
                     scope,
                     backend: "sqlite",
                     target,
+                    preferred_path,
                     depth: *depth,
                     limit: *limit,
                     cursor: cursor.as_deref(),
@@ -2526,6 +2534,7 @@ pub(crate) fn cmd_graph_db(
                     scope,
                     backend: "convex-snapshot",
                     target,
+                    preferred_path,
                     depth: *depth,
                     limit: *limit,
                     cursor: cursor.as_deref(),

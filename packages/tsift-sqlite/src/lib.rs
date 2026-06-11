@@ -3730,12 +3730,14 @@ GROUP BY walk.id
         Ok(results)
     }
 
-    fn resolve_evidence_target(&self, target: &str, kinds: &[&str]) -> Result<Option<GraphNode>> {
-        if let Some(node) = self.node(target)? {
-            return Ok(Some(node));
-        }
+    fn evidence_target_candidates(
+        &self,
+        target: &str,
+        kinds: &[&str],
+        preferred_path: Option<&str>,
+    ) -> Result<Vec<GraphNode>> {
         if kinds.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         let normalized = target.trim().trim_start_matches('#');
@@ -3748,11 +3750,24 @@ GROUP BY walk.id
             .map(|(rank, _)| format!("WHEN ? THEN {rank}"))
             .collect::<Vec<_>>()
             .join(" ");
+        let path_filter = if preferred_path.is_some() {
+            r#"
+AND EXISTS (
+    SELECT 1
+    FROM graph_node_properties p_path INDEXED BY idx_graph_node_properties_key_value_node
+    WHERE p_path.node_id = n.id
+      AND p_path.key = 'path'
+      AND p_path.value = ?
+)
+"#
+        } else {
+            ""
+        };
         let sql = format!(
             r#"
-            SELECT n.id, n.kind, n.label, n.properties_json, n.provenance_json, n.freshness_json
-            FROM graph_nodes n
-            WHERE n.kind IN ({kind_placeholders})
+SELECT n.id, n.kind, n.label, n.properties_json, n.provenance_json, n.freshness_json
+FROM graph_nodes n
+WHERE n.kind IN ({kind_placeholders})
               AND (
                 EXISTS (
                     SELECT 1
@@ -3767,13 +3782,13 @@ GROUP BY walk.id
                     WHERE p_ref.node_id = n.id
                       AND p_ref.key = 'ref_id'
                       AND p_ref.value = ?
-                )
-                OR n.label = ?
-                OR n.label = ?
-              )
-            ORDER BY CASE n.kind {kind_rank} ELSE 999 END, n.id
-            LIMIT 1
-            "#
+)
+OR n.label = ?
+OR n.label = ?
+)
+{path_filter}
+ORDER BY CASE n.kind {kind_rank} ELSE 999 END, n.id
+"#
         );
         let mut values = kinds
             .iter()
@@ -3783,11 +3798,22 @@ GROUP BY walk.id
         values.push(Value::Text(normalized.to_string()));
         values.push(Value::Text(target.to_string()));
         values.push(Value::Text(format!("#{normalized}")));
+        if let Some(path) = preferred_path {
+            values.push(Value::Text(path.to_string()));
+        }
         values.extend(kinds.iter().map(|kind| Value::Text((*kind).to_string())));
-        self.conn
-            .query_row(&sql, params_from_iter(values.iter()), node_from_row)
-            .optional()
-            .map_err(Into::into)
+        let mut stmt = self.conn.prepare(&sql)?;
+        collect_rows(stmt.query_map(params_from_iter(values.iter()), node_from_row)?)
+    }
+
+    fn resolve_evidence_target(&self, target: &str, kinds: &[&str]) -> Result<Option<GraphNode>> {
+        if let Some(node) = self.node(target)? {
+            return Ok(Some(node));
+        }
+        Ok(self
+            .evidence_target_candidates(target, kinds, None)?
+            .into_iter()
+            .next())
     }
 }
 
@@ -4617,7 +4643,11 @@ mod tests {
         for node in [
             GraphNode::new("gbak-refresh", "backlog", "#refresh")
                 .with_property("ref_id", "refresh")
+                .with_property("path", "tasks/current.md")
                 .with_property("handle", "backlog-handle"),
+            GraphNode::new("gbak-zrefresh", "backlog", "#refresh")
+                .with_property("ref_id", "refresh")
+                .with_property("path", "tasks/other.md"),
             GraphNode::new("gjob-refresh", "job_packet", "do #refresh")
                 .with_property("ref_id", "refresh"),
             GraphNode::new("gwres-refresh", "worker_result", "completed #refresh")
@@ -4636,6 +4666,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(by_handle.id, "gbak-refresh");
+        let by_path = store
+            .evidence_target_candidates("#refresh", &["backlog"], Some("tasks/other.md"))
+            .unwrap();
+        assert_eq!(by_path.len(), 1);
+        assert_eq!(by_path[0].id, "gbak-zrefresh");
     }
 
     #[test]

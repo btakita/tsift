@@ -2283,6 +2283,7 @@ fn collect_evidence_for_target<S: GraphStore>(
         scope,
         backend,
         target,
+        preferred_path: None,
         depth,
         limit,
         cursor: None,

@@ -6048,6 +6048,7 @@ pub(crate) struct GraphDbEvidenceInput<'a, S: GraphStore> {
     scope: Option<&'a str>,
     backend: &'a str,
     target: &'a str,
+    preferred_path: Option<&'a str>,
     depth: usize,
     limit: usize,
     cursor: Option<&'a str>,
@@ -8976,20 +8977,88 @@ pub(crate) fn append_tokensave_graph_doctor_checks(report: &mut GraphDbDoctorRep
     }
 }
 
+const GRAPH_DB_EVIDENCE_TARGET_KINDS: &[&str] = &[
+    "backlog",
+    "job_packet",
+    "worker_result",
+    "worker_context",
+    "source_handle",
+];
+
+pub(crate) fn graph_db_evidence_preferred_path(root: &Path, path_hint: &Path) -> Option<String> {
+    hinted_markdown_file(root, path_hint).map(|path| {
+        relativize_pathbuf(&path, root)
+            .to_string_lossy()
+            .replace('\\', "/")
+    })
+}
+
+fn graph_db_ambiguous_target_message(
+    target: &str,
+    kind: &str,
+    candidates: &[SubstrateGraphNode],
+) -> String {
+    let mut by_path = BTreeMap::<String, String>::new();
+    for candidate in candidates.iter().filter(|node| node.kind == kind) {
+        let path = candidate
+            .properties
+            .get("path")
+            .cloned()
+            .unwrap_or_else(|| "<no path>".to_string());
+        by_path.entry(path).or_insert_with(|| candidate.id.clone());
+    }
+    let examples = by_path
+        .iter()
+        .take(5)
+        .map(|(path, node_id)| format!("{node_id} path={path}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "graph-db evidence target {target} is ambiguous across {} {kind} node paths: {examples}; rerun with --path <agent-doc.md> or use an exact graph node id",
+        by_path.len()
+    )
+}
+
+pub(crate) fn graph_db_resolve_evidence_target_with_path(
+    store: &impl GraphStore,
+    target: &str,
+    preferred_path: Option<&str>,
+) -> Result<Option<SubstrateGraphNode>> {
+    if let Some(node) = store.node(target)? {
+        return Ok(Some(node));
+    }
+    let candidates =
+        store.evidence_target_candidates(target, GRAPH_DB_EVIDENCE_TARGET_KINDS, preferred_path)?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    if preferred_path.is_none() {
+        let first_kind = candidates[0].kind.as_str();
+        let distinct_paths = candidates
+            .iter()
+            .filter(|node| node.kind == first_kind)
+            .map(|node| {
+                node.properties
+                    .get("path")
+                    .map(String::as_str)
+                    .unwrap_or("")
+            })
+            .collect::<BTreeSet<_>>();
+        if distinct_paths.len() > 1 {
+            bail!(
+                "{}",
+                graph_db_ambiguous_target_message(target, first_kind, &candidates)
+            );
+        }
+    }
+    Ok(candidates.into_iter().next())
+}
+
 pub(crate) fn graph_db_resolve_evidence_target(
     store: &impl GraphStore,
     target: &str,
 ) -> Result<Option<SubstrateGraphNode>> {
-    store.resolve_evidence_target(
-        target,
-        &[
-            "backlog",
-            "job_packet",
-            "worker_result",
-            "worker_context",
-            "source_handle",
-        ],
-    )
+    graph_db_resolve_evidence_target_with_path(store, target, None)
 }
 
 fn graph_db_reachable_nodes_by_kind(
@@ -9154,6 +9223,7 @@ pub(crate) fn graph_db_evidence_report_from_store<S: GraphStore>(
         scope,
         backend,
         target,
+        preferred_path,
         depth,
         limit,
         cursor,
@@ -9183,7 +9253,7 @@ pub(crate) fn graph_db_evidence_report_from_store<S: GraphStore>(
             semantic_readiness.next_commands.join("; then ")
         ));
     }
-    let target_node = graph_db_resolve_evidence_target(store, target)?
+    let target_node = graph_db_resolve_evidence_target_with_path(store, target, preferred_path)?
         .with_context(|| format!("graph-db evidence target not found: {target}"))?;
     let max_rows = if limit == 0 { usize::MAX } else { limit };
     let mut reachable = store.reachable_nodes_by_kinds(
@@ -24041,6 +24111,7 @@ fn main() { api::handler(); }
             scope: None,
             backend: "sqlite",
             target: "kgnv",
+            preferred_path: None,
             depth: 4,
             limit: 8,
             cursor: None,
@@ -24850,6 +24921,7 @@ fn main() { api::handler(); }
             scope: None,
             backend: "sqlite",
             target: "kgnv",
+            preferred_path: None,
             depth: 3,
             limit: 8,
             cursor: None,

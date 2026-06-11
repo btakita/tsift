@@ -5296,6 +5296,57 @@ fn graph_db_evidence_refreshes_only_hinted_agent_doc_session() {
 }
 
 #[test]
+fn graph_db_evidence_prefers_hinted_session_path_for_colliding_backlog_ids() {
+    let project = large_graph_db_project(80);
+    let other_dir = project.path().join("tasks/professional");
+    fs::create_dir_all(&other_dir).unwrap();
+    fs::write(
+        other_dir.join("equityfundingsource.md"),
+        "<!-- agent:backlog -->\n- [ ] [#b000] Unrelated external backlog row.\n<!-- /agent:backlog -->\n",
+    )
+    .unwrap();
+
+    graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
+    let ambiguous = graph_db_failure(
+        project.path(),
+        Backend::Sqlite,
+        vec![
+            "evidence".to_string(),
+            "b000".to_string(),
+            "--depth".to_string(),
+            "3".to_string(),
+            "--limit".to_string(),
+            "8".to_string(),
+        ],
+    );
+    assert!(ambiguous.contains("ambiguous"), "{ambiguous}");
+    assert!(ambiguous.contains("tasks/software/tsift.md"), "{ambiguous}");
+    assert!(
+        ambiguous.contains("tasks/professional/equityfundingsource.md"),
+        "{ambiguous}"
+    );
+
+    let session = project.path().join("tasks/software/tsift.md");
+    let evidence = graph_db_json(
+        &session,
+        Backend::Sqlite,
+        vec![
+            "evidence".to_string(),
+            "b000".to_string(),
+            "--depth".to_string(),
+            "3".to_string(),
+            "--limit".to_string(),
+            "8".to_string(),
+        ],
+    );
+    assert_eq!(evidence["target_node"]["kind"], "backlog", "{evidence}");
+    assert_eq!(
+        evidence["target_node"]["properties"]["path"], "tasks/software/tsift.md",
+        "{evidence}"
+    );
+}
+
+#[test]
 fn graph_db_doctor_fails_closed_for_convex_index_duplicates_and_orphans() {
     let project = graph_db_project();
     let mut snapshot = current_convex_snapshot(project.path());

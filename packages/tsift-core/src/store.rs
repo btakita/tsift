@@ -1033,28 +1033,43 @@ pub trait GraphStore {
         graph_semantic_top_candidates_by_property_scan(self, query_vector, kinds, limit)
     }
 
-    fn resolve_evidence_target(&self, target: &str, kinds: &[&str]) -> Result<Option<GraphNode>> {
-        if let Some(node) = self.node(target)? {
-            return Ok(Some(node));
-        }
+    fn evidence_target_candidates(
+        &self,
+        target: &str,
+        kinds: &[&str],
+        preferred_path: Option<&str>,
+    ) -> Result<Vec<GraphNode>> {
         let normalized = target.trim().trim_start_matches('#');
+        let normalized_label = format!("#{normalized}");
+        let mut rows = Vec::new();
         for kind in kinds {
             let mut candidates = self
                 .nodes_by_kind(kind)?
                 .into_iter()
                 .filter(|node| {
-                    node.properties.get("handle").map(String::as_str) == Some(target)
+                    (node.properties.get("handle").map(String::as_str) == Some(target)
                         || node.properties.get("ref_id").map(String::as_str) == Some(normalized)
                         || node.label == target
-                        || node.label == format!("#{normalized}")
+                        || node.label == normalized_label)
+                        && preferred_path.is_none_or(|path| {
+                            node.properties.get("path").map(String::as_str) == Some(path)
+                        })
                 })
                 .collect::<Vec<_>>();
             candidates.sort_by(|left, right| left.id.cmp(&right.id));
-            if let Some(candidate) = candidates.into_iter().next() {
-                return Ok(Some(candidate));
-            }
+            rows.extend(candidates);
         }
-        Ok(None)
+        Ok(rows)
+    }
+
+    fn resolve_evidence_target(&self, target: &str, kinds: &[&str]) -> Result<Option<GraphNode>> {
+        if let Some(node) = self.node(target)? {
+            return Ok(Some(node));
+        }
+        Ok(self
+            .evidence_target_candidates(target, kinds, None)?
+            .into_iter()
+            .next())
     }
 }
 
