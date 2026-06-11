@@ -8,6 +8,11 @@ use tsift_summarize::summarize::{self, SummaryDb};
 const MAX_REPEATED_LINES: usize = 8;
 const MAX_LINE_FAMILIES: usize = 8;
 const MAX_SIGNALS: usize = 12;
+
+/// Raw logs at or above this byte size are bulky enough that callers should
+/// persist them behind an artifact handle instead of relying on inlined digest
+/// groups, so the full transcript stays expandable without re-piping it.
+pub const LOG_DIGEST_RAW_ARTIFACT_MIN_BYTES: usize = 4096;
 const MAX_FILE_REFS: usize = 8;
 const MAX_SYMBOL_REFS: usize = 16;
 const MAX_STACK_GROUPS: usize = 4;
@@ -95,6 +100,18 @@ pub struct LogDigestStackGroup {
     pub occurrences: usize,
 }
 
+/// A handle to a persisted raw-log chunk. Lets a bounded digest reference the
+/// full transcript (or a bulky group) behind a stable handle plus an expansion
+/// command, instead of inlining the raw lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogDigestArtifactRef {
+    pub handle: String,
+    pub path: String,
+    pub bytes: usize,
+    pub lines: usize,
+    pub expand: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LogDigestReport {
     pub root: String,
@@ -114,8 +131,22 @@ pub struct LogDigestReport {
     pub file_refs: Vec<LogDigestFileRef>,
     pub symbol_refs: Vec<LogDigestSymbolRef>,
     pub stack_traces: Vec<LogDigestStackGroup>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub raw_log_artifact: Option<LogDigestArtifactRef>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
+}
+
+/// Whether the raw log is bulky enough that callers should persist it behind an
+/// artifact handle. True when the transcript is large or when any group family
+/// overflows its inline cap (so the digest is hiding folded detail worth an
+/// expansion handle).
+pub fn raw_log_artifact_recommended(report: &LogDigestReport, input_bytes: usize) -> bool {
+    input_bytes >= LOG_DIGEST_RAW_ARTIFACT_MIN_BYTES
+        || report.line_family_groups > MAX_LINE_FAMILIES
+        || report.repeated_line_groups > MAX_REPEATED_LINES
+        || report.signal_groups > MAX_SIGNALS
+        || report.stack_groups > MAX_STACK_GROUPS
 }
 
 #[derive(Debug)]
@@ -417,6 +448,7 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
         file_refs: file_items,
         symbol_refs: symbol_items,
         stack_traces: stack_items,
+        raw_log_artifact: None,
         warnings,
     })
 }
@@ -1250,6 +1282,35 @@ unique uncollapsed line
                 .iter()
                 .any(|family| family.template.contains("uncollapsed"))
         );
+    }
+
+    #[test]
+    fn raw_log_artifact_recommended_for_bulky_or_overflowing_logs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Small clean log: no artifact recommended.
+        let small = compute(dir.path(), "Compiling serde v1.0.130\n").unwrap();
+        assert!(!raw_log_artifact_recommended(&small, "Compiling serde v1.0.130\n".len()));
+
+        // Same small report but a bulky byte count crosses the size threshold.
+        assert!(raw_log_artifact_recommended(
+            &small,
+            LOG_DIGEST_RAW_ARTIFACT_MIN_BYTES
+        ));
+        assert!(!raw_log_artifact_recommended(
+            &small,
+            LOG_DIGEST_RAW_ARTIFACT_MIN_BYTES - 1
+        ));
+
+        // Many distinct signal lines overflow the inline signal cap and trigger
+        // the handle recommendation even for a byte-small transcript.
+        let mut many_signals = String::new();
+        for idx in 0..(MAX_SIGNALS + 4) {
+            many_signals.push_str(&format!("error: distinct failure number {idx}\n"));
+        }
+        let overflow = compute(dir.path(), &many_signals).unwrap();
+        assert!(overflow.signal_groups > MAX_SIGNALS);
+        assert!(raw_log_artifact_recommended(&overflow, many_signals.len()));
     }
 
     #[test]

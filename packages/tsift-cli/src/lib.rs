@@ -19336,12 +19336,46 @@ fn cmd_dependency_dag(
     }
 }
 
+/// Persist a bulky raw log behind an artifact handle and attach it to the
+/// report, so the bounded digest references the full transcript via a stable
+/// handle + expansion command instead of losing it (stdin) or relying on
+/// inlined groups. No-op for small logs or when the artifacts dir is unwritable.
+fn maybe_attach_log_digest_raw_artifact(
+    root: &Path,
+    report: &mut log_digest::LogDigestReport,
+    input: &str,
+) -> Result<()> {
+    if input.trim().is_empty() || !log_digest::raw_log_artifact_recommended(report, input.len()) {
+        return Ok(());
+    }
+    let key = format!("logdigest:{}:{}", report.total_lines, input.len());
+    let artifact_path = root
+        .join(".tsift/artifacts")
+        .join(format!("{}.log", stable_handle("logdg", &key)));
+    let expand = format!(
+        "tsift log-digest --path {} --input {} --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        shell_quote(artifact_path.to_string_lossy().as_ref())
+    );
+    let artifact = persist_transcript_artifact(root, "logdg", "log", &key, input, expand)?;
+    report.raw_log_artifact = Some(log_digest::LogDigestArtifactRef {
+        handle: artifact.handle,
+        path: artifact.path,
+        bytes: artifact.bytes,
+        lines: artifact.lines,
+        expand: artifact.expand,
+    });
+    Ok(())
+}
+
 pub(crate) fn render_log_digest_from_input(
     path: &Path,
     input: &str,
     format: OutputFormat,
 ) -> Result<()> {
-    let report = log_digest::compute(path, input)?;
+    let mut report = log_digest::compute(path, input)?;
+    let root = tsift_quality::lint::resolve_harness_root_or_canonical_path(path)?;
+    maybe_attach_log_digest_raw_artifact(&root, &mut report, input)?;
     if format.json_output {
         println!(
             "{}",
@@ -19402,6 +19436,12 @@ pub(crate) fn render_log_digest_from_input(
                 symbol.symbol,
                 symbol.occurrences,
                 log_digest_summary_label(symbol.summary_state)
+            );
+        }
+        if let Some(artifact) = &report.raw_log_artifact {
+            println!(
+                "raw-artifact handle:{} lines:{} bytes:{} expand:{}",
+                artifact.handle, artifact.lines, artifact.bytes, artifact.expand
             );
         }
         for warning in &report.warnings {
@@ -19543,6 +19583,16 @@ pub(crate) fn render_log_digest_from_input(
                 println!("    - {}", frame);
             }
         }
+    }
+
+    if let Some(artifact) = &report.raw_log_artifact {
+        println!();
+        println!("Raw log artifact:");
+        println!("  handle: {}", artifact.handle);
+        println!("  path:   {}", artifact.path);
+        println!("  lines:  {}", artifact.lines);
+        println!("  bytes:  {}", artifact.bytes);
+        println!("  expand: {}", artifact.expand);
     }
 
     for warning in &report.warnings {
@@ -31004,6 +31054,32 @@ fn sample() {}
     }
 
     #[test]
+    fn maybe_attach_log_digest_raw_artifact_persists_bulky_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Small log: no artifact attached, nothing written.
+        let small_input = "Compiling serde v1.0.130\n";
+        let mut small = log_digest::compute(root, small_input).unwrap();
+        maybe_attach_log_digest_raw_artifact(root, &mut small, small_input).unwrap();
+        assert!(small.raw_log_artifact.is_none());
+        assert!(!root.join(".tsift/artifacts").exists());
+
+        // Bulky log: artifact persisted with a stable handle and expand command.
+        let bulky_input = "x".repeat(log_digest::LOG_DIGEST_RAW_ARTIFACT_MIN_BYTES) + "\n";
+        let mut bulky = log_digest::compute(root, &bulky_input).unwrap();
+        maybe_attach_log_digest_raw_artifact(root, &mut bulky, &bulky_input).unwrap();
+        let artifact = bulky.raw_log_artifact.expect("artifact attached for bulky log");
+        assert!(artifact.handle.starts_with("logdg-"));
+        assert_eq!(artifact.bytes, bulky_input.len());
+        assert!(artifact.expand.contains("tsift log-digest"));
+        assert!(artifact.expand.contains("--input"));
+        let persisted = root.join(&artifact.path);
+        assert!(persisted.exists(), "artifact file written to {persisted:?}");
+        assert_eq!(std::fs::read_to_string(&persisted).unwrap(), bulky_input);
+    }
+
+    #[test]
     fn context_pack_log_preview_limits_signals_and_refs() {
         let report = log_digest::LogDigestReport {
             root: "/repo".to_string(),
@@ -31094,6 +31170,7 @@ fn sample() {}
                 frames: vec!["frame one".to_string()],
                 occurrences: 1,
             }],
+            raw_log_artifact: None,
             warnings: vec!["warning text".to_string()],
         };
 

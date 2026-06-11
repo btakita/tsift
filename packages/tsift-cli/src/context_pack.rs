@@ -190,6 +190,8 @@ pub(crate) struct ContextPackLogPreview {
     pub(crate) repeated_lines: Vec<ContextPackLogRepeatedLinePreview>,
     pub(crate) file_refs: Vec<ContextPackLogFileRefPreview>,
     pub(crate) symbol_refs: Vec<ContextPackLogSymbolRefPreview>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub(crate) raw_log_artifact: Option<log_digest::LogDigestArtifactRef>,
     pub(crate) warnings: Vec<String>,
 }
 
@@ -874,6 +876,7 @@ pub(crate) fn build_context_pack_log_preview(
                 ),
             })
             .collect(),
+        raw_log_artifact: report.raw_log_artifact.clone(),
         warnings: report
             .warnings
             .iter()
@@ -1210,7 +1213,20 @@ pub(crate) fn build_context_pack_report_with_profile(
             if input.trim().is_empty() {
                 bail!("no log output provided in {}", file_path.display());
             }
-            let report = log_digest::compute(&root, &input)?;
+            let mut report = log_digest::compute(&root, &input)?;
+            if log_digest::raw_log_artifact_recommended(&report, input.len()) {
+                let expand = format!(
+                    "tsift log-digest --path . --input {} --json",
+                    shell_quote(file_path.to_str().unwrap_or_default())
+                );
+                report.raw_log_artifact = Some(log_digest::LogDigestArtifactRef {
+                    handle: stable_handle("logdg", &format!("ctxpack:{}", file_path.display())),
+                    path: file_path.display().to_string(),
+                    bytes: input.len(),
+                    lines: input.lines().count(),
+                    expand,
+                });
+            }
             let mut preview = build_context_pack_log_preview(&report, budget, ontology_ref);
             enrich_log_preview_with_diff_symbols(&mut preview, &diff_digest, ontology_ref);
             ContextPackOptionalSection {
