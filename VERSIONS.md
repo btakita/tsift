@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.69
+
+- **`#lazilybump`**: Upgraded the `lazily` dependency requirement from `0.2` to `0.10` in `tsift-core`, `tsift-graph`, `tsift-index`, `tsift-status`, and `tsift-summarize`. The crates already build and lock against `lazily` 0.10.x locally via the superproject path patch; the published manifests now declare the matching `^0.10` requirement so crates.io consumers resolve the same line instead of the stale `0.2.x` series.
+
 ## 0.1.68
 
 - **`#logfixturecov`**: Hardened the `log-digest` fixture gate with a false-positive guard. `forbidden_signals` now checks the *classified signal messages* (`signal_message_text`) instead of the full digest projection, because a benign line's tokens can still surface as a symbol or file ref even when the line is correctly not classified as an error. Added a `classifier-false-positive-precision` fixture case proving benign lines (`stderr!`, a `docs/err_pnpm-notes.md` path, a `err_pnpmish-fixture` symbol) are not misclassified as errors while the real `npm ERR!` / `ERR_PNPM_LIFECYCLE_FAIL` markers still classify, plus a unit test that the symbol-leak token is in the full projection but not the signal text.
