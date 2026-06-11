@@ -166,8 +166,13 @@ pub(crate) fn cmd_test_digest(
 pub(crate) fn cmd_log_digest(
     path: &Path,
     input_path: Option<&Path>,
+    fixture_path: Option<&Path>,
+    fail_under: bool,
     format: OutputFormat,
 ) -> Result<()> {
+    if let Some(fixture_path) = fixture_path {
+        return crate::render_log_digest_fixture(path, fixture_path, fail_under, format);
+    }
     let input = match input_path {
         Some(file_path) => fs::read_to_string(file_path)
             .with_context(|| format!("reading log output: {}", file_path.display()))?,

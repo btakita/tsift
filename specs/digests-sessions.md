@@ -114,7 +114,23 @@ Behavior:
 5. When `.tsift/summaries.db` already has current rows for anchored files or extracted symbols, include up to two cached summary snippets; otherwise report `missing`, `stale`, or `unavailable` without mutating the cache.
 6. When the raw log is bulky — at or above `LOG_DIGEST_RAW_ARTIFACT_MIN_BYTES` (4096 bytes), or when any signal/repeated-line/line-family/stack group overflows its inline cap so folded detail is hidden — persist the full transcript behind an artifact handle instead of losing it (stdin) or relying only on inlined groups. The standalone `log-digest` command writes the raw bytes to `.tsift/artifacts/<handle>.log` and attaches a `raw_log_artifact` ref carrying the handle, relative path, byte/line counts, and a `tsift log-digest --input <artifact> --json` expansion command; small logs attach nothing. `context-pack` surfaces the same `raw_log_artifact` shape on its bounded log preview, referencing the existing on-disk `--log-input` file rather than re-persisting it. This keeps the digest bounded by default while leaving the full raw transcript expandable through a stable handle. `raw_log_artifact` is omitted from JSON when absent.
 
-`log-digest` is intentionally transcript-only. It does not execute the underlying command, and it keeps summary enrichment read-only so digesting verbose output never contends with `tsift summarize --extract`.
+`log-digest` is intentionally transcript-only.
+
+### Log Digest Fixture Gate
+
+`tsift log-digest --fixture <file> [--fail-under]` runs a fixture-backed token-savings and false-negative gate for the log digest across `cargo`, `pytest`, `npm`, `pnpm`, and `agent-doc` runtime logs.
+
+```bash
+tsift log-digest --fixture fixtures/log-digest-token-savings.json --fail-under --json
+```
+
+Behavior:
+
+1. Each fixture case carries `name`, `ecosystem`, raw `input_lines`, a `minimum_savings_percent` token-savings floor, and `required_signals` / `forbidden_signals` substring lists.
+2. The gate runs each case through the same `log-digest` engine, projects the bounded digest an agent reads (signal messages, line-family templates/samples, repeated lines, anchored file paths, symbol refs, warnings) via `digest_signal_text`, and estimates tokens deterministically at ~4 chars/token.
+3. The **token-savings gate** requires `1 - digest_tokens/raw_tokens` to meet each case's `minimum_savings_percent`, proving the digest compresses bulky near-duplicate build/test/install noise rather than only claiming to.
+4. The **false-negative gate** requires every `required_signal` substring to survive into the digest projection and every `forbidden_signal` to be absent, proving real failures (`error[E0277]`, pytest `E   assert` / `FAILED ...`, `npm ERR!`, `ERR_PNPM_...`, `agent-doc exit: claude_exit code=1`) are never folded away as noise. The generic signal classifier recognizes these cargo/pytest/npm/pnpm error forms in addition to the existing `error:` / `warning:` / panic / traceback shapes.
+5. `--fail-under` exits non-zero when any case misses its savings floor, drops a required signal, or surfaces a forbidden one. This is the CI gate that keeps log-digest compression honest and regression-safe. It does not execute the underlying command, and it keeps summary enrichment read-only so digesting verbose output never contends with `tsift summarize --extract`.
 
 ## Session Digest
 

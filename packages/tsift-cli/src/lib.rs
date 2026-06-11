@@ -1109,9 +1109,17 @@ pub fn run() -> Result<()> {
                 envelope,
             },
         ),
-        Some(Commands::LogDigest { path, input, json }) => cmd_log_digest(
+        Some(Commands::LogDigest {
+            path,
+            input,
+            fixture,
+            fail_under,
+            json,
+        }) => cmd_log_digest(
             &path,
             input.as_deref(),
+            fixture.as_deref(),
+            fail_under,
             OutputFormat {
                 json_output: json || terse || schema || envelope,
                 compact,
@@ -19368,6 +19376,80 @@ fn maybe_attach_log_digest_raw_artifact(
     Ok(())
 }
 
+/// Run the log-digest token-savings + false-negative fixture gate: prove the
+/// digest both compresses raw cargo/pytest/npm/pnpm/agent-doc logs and preserves
+/// their real signals. With `fail_under`, exits non-zero on any case miss.
+pub(crate) fn render_log_digest_fixture(
+    path: &Path,
+    fixture_path: &Path,
+    fail_under: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let root = tsift_quality::lint::resolve_harness_root_or_canonical_path(path)?;
+    let fixture_body = fs::read_to_string(fixture_path)
+        .with_context(|| format!("reading log-digest fixture: {}", fixture_path.display()))?;
+    let fixture: log_digest::LogDigestFixture = serde_json::from_str(&fixture_body)
+        .with_context(|| format!("parsing log-digest fixture: {}", fixture_path.display()))?;
+    let report = log_digest::evaluate_fixture(&root, &fixture)?;
+
+    if format.json_output {
+        print_json_or_envelope(
+            &report,
+            &format,
+            "log-digest-fixture",
+            "report",
+            ToolEnvelopeSummary {
+                text: if report.passed {
+                    format!("log-digest gate passed for {} case(s)", report.total_cases)
+                } else {
+                    format!("log-digest gate failed {} case(s)", report.failed_cases)
+                },
+                metrics: vec![
+                    envelope_metric("cases", report.total_cases),
+                    envelope_metric("failed", report.failed_cases),
+                    envelope_metric("passed", report.passed),
+                ],
+            },
+            false,
+            vec![],
+        )?;
+    } else {
+        println!("Log digest fixture gate");
+        println!("  cases:  {}", report.total_cases);
+        println!("  failed: {}", report.failed_cases);
+        println!("  status: {}", if report.passed { "pass" } else { "fail" });
+        for case in &report.cases {
+            println!(
+                "  [{}] {} ({}): savings {:.1}% (min {:.1}%) raw_tok {} digest_tok {}",
+                if case.passed { "pass" } else { "FAIL" },
+                case.name,
+                case.ecosystem,
+                case.savings_percent,
+                case.minimum_savings_percent,
+                case.raw_tokens,
+                case.digest_tokens
+            );
+            if !case.missing_required_signals.is_empty() {
+                println!(
+                    "    missing required signals: {}",
+                    case.missing_required_signals.join(", ")
+                );
+            }
+            if !case.present_forbidden_signals.is_empty() {
+                println!(
+                    "    present forbidden signals: {}",
+                    case.present_forbidden_signals.join(", ")
+                );
+            }
+        }
+    }
+
+    if fail_under && !report.passed {
+        bail!("log-digest fixture gate failed");
+    }
+    Ok(())
+}
+
 pub(crate) fn render_log_digest_from_input(
     path: &Path,
     input: &str,
@@ -28526,10 +28608,18 @@ tier = "private"
             "--json",
         ]);
         match cli.command {
-            Some(Commands::LogDigest { json, path, input }) => {
+            Some(Commands::LogDigest {
+                json,
+                path,
+                input,
+                fixture,
+                fail_under,
+            }) => {
                 assert!(json);
                 assert_eq!(path, PathBuf::from("."));
                 assert_eq!(input, Some(PathBuf::from("target/build.log")));
+                assert!(fixture.is_none());
+                assert!(!fail_under);
             }
             _ => panic!("expected LogDigest command"),
         }

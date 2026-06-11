@@ -732,6 +732,12 @@ pub enum Commands {
         /// Read captured log output from a file instead of stdin
         #[arg(long)]
         input: Option<PathBuf>,
+        /// Run a token-savings + false-negative fixture gate instead of digesting one log
+        #[arg(long)]
+        fixture: Option<PathBuf>,
+        /// Exit non-zero when any fixture case misses its savings or signal thresholds
+        #[arg(long)]
+        fail_under: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,

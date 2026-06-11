@@ -9282,7 +9282,10 @@ fn session_cost_reads_codex_token_counts_from_stdin() {
     assert_eq!(scorecard[0]["net_cached_read_tokens"], 48000);
     assert_eq!(scorecard[0]["read_create_ratio"], "read_only");
     assert_eq!(scorecard[0]["trend"], "stable");
-    assert_eq!(scorecard[0]["suspected_invalidation_cause"], "none observed");
+    assert_eq!(
+        scorecard[0]["suspected_invalidation_cause"],
+        "none observed"
+    );
     assert_eq!(
         scorecard[0]["next_command"],
         "tsift session-cost --input <session.jsonl> --json"
@@ -9467,9 +9470,11 @@ fn session_cost_reports_prompt_cache_invalidation_diagnostics() {
     assert_eq!(scorecard[0]["net_cached_read_tokens"], -1000);
     assert_eq!(scorecard[0]["read_create_ratio"], "0.92x");
     assert_eq!(scorecard[0]["trend"], "declining");
-    assert!(scorecard[0]["suspected_invalidation_cause"]
-        .as_str()
-        .is_some_and(|cause| cause.contains("stable_prefix_fingerprint")));
+    assert!(
+        scorecard[0]["suspected_invalidation_cause"]
+            .as_str()
+            .is_some_and(|cause| cause.contains("stable_prefix_fingerprint"))
+    );
 
     let compact = run_tsift_stdin(
         &["session-cost", "--source", "claude-jsonl", "--compact"],
@@ -10630,6 +10635,59 @@ Compacted content:
 }
 
 #[test]
+fn log_digest_fixture_gate_passes_token_savings_and_false_negative_thresholds() {
+    let fixture_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/log-digest-token-savings.json");
+    assert!(
+        fixture_path.exists(),
+        "log-digest token-savings fixture should exist locally at {}",
+        fixture_path.display()
+    );
+
+    let output = tsift_bin()
+        .args([
+            "log-digest",
+            "--path",
+            ".",
+            "--fixture",
+            fixture_path.to_str().unwrap(),
+            "--fail-under",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "log-digest fixture gate should pass thresholds: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["passed"].as_bool().unwrap());
+    assert_eq!(json["failed_cases"], 0);
+    let ecosystems = json["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|case| case["ecosystem"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ecosystems, vec!["cargo", "pytest", "npm", "pnpm", "agent-doc"]);
+    // Every case must both compress (savings_ok) and keep its real signals.
+    for case in json["cases"].as_array().unwrap() {
+        assert!(
+            case["savings_ok"].as_bool().unwrap(),
+            "case {} should meet savings threshold",
+            case["name"]
+        );
+        assert!(
+            case["missing_required_signals"].as_array().unwrap().is_empty(),
+            "case {} dropped a required signal",
+            case["name"]
+        );
+    }
+}
+
+#[test]
 fn token_savings_accepts_tagpath_preview_fixture() {
     let fixture_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tsift-token-savings.json");
@@ -11412,16 +11470,20 @@ fn session_review_separates_aggregate_and_latest_session_cost() {
     assert_eq!(scorecard[0]["provider"], "openai");
     assert_eq!(scorecard[0]["read_create_ratio"], "read_only");
     assert_eq!(scorecard[0]["trend"], "stable");
-    assert!(scorecard[0]["session_path"]
-        .as_str()
-        .is_some_and(|path| path.ends_with("aa-latest-lower-cost.jsonl")));
-    assert!(scorecard[0]["next_command"]
-        .as_str()
-        .is_some_and(|command| {
-            command.contains("tsift session-cost --source codex-jsonl --input")
-                && command.contains("aa-latest-lower-cost.jsonl")
-                && command.ends_with(" --json")
-        }));
+    assert!(
+        scorecard[0]["session_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("aa-latest-lower-cost.jsonl"))
+    );
+    assert!(
+        scorecard[0]["next_command"]
+            .as_str()
+            .is_some_and(|command| {
+                command.contains("tsift session-cost --source codex-jsonl --input")
+                    && command.contains("aa-latest-lower-cost.jsonl")
+                    && command.ends_with(" --json")
+            })
+    );
 }
 
 #[test]

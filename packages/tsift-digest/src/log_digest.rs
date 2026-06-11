@@ -1,5 +1,5 @@
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tsift_quality::runtime_churn;
@@ -147,6 +147,160 @@ pub fn raw_log_artifact_recommended(report: &LogDigestReport, input_bytes: usize
         || report.repeated_line_groups > MAX_REPEATED_LINES
         || report.signal_groups > MAX_SIGNALS
         || report.stack_groups > MAX_STACK_GROUPS
+}
+
+/// Deterministic token estimate: ~4 chars per token, rounded up. Used by the
+/// fixture gate to compare raw-log tokens against digest tokens without a
+/// provider tokenizer.
+pub fn estimate_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(4)
+}
+
+/// The bounded text an agent actually reads from a digest — signal messages,
+/// line-family templates/samples, repeated lines, anchored file paths, symbol
+/// refs, and warnings. The fixture gate measures token savings and checks
+/// required/forbidden signals against this projection, not the raw transcript.
+pub fn digest_signal_text(report: &LogDigestReport) -> String {
+    let mut lines = Vec::new();
+    for signal in &report.signals {
+        let location = match (&signal.path, signal.line) {
+            (Some(path), Some(line)) => format!(" ({path}:{line})"),
+            (Some(path), None) => format!(" ({path})"),
+            _ => String::new(),
+        };
+        lines.push(format!(
+            "{}: {}{} x{}",
+            signal.severity, signal.message, location, signal.occurrences
+        ));
+    }
+    for family in &report.line_families {
+        lines.push(format!("family x{}: {}", family.occurrences, family.template));
+        lines.push(family.first_sample.clone());
+        lines.push(family.last_sample.clone());
+    }
+    for repeated in &report.repeated_lines {
+        lines.push(format!("repeat x{}: {}", repeated.occurrences, repeated.line));
+    }
+    for file_ref in &report.file_refs {
+        match file_ref.line {
+            Some(line) => lines.push(format!("{}:{}", file_ref.path, line)),
+            None => lines.push(file_ref.path.clone()),
+        }
+    }
+    for symbol in &report.symbol_refs {
+        lines.push(symbol.symbol.clone());
+    }
+    for warning in &report.warnings {
+        lines.push(format!("warning: {warning}"));
+    }
+    lines.join("\n")
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LogDigestFixture {
+    pub schema_version: u64,
+    #[serde(default)]
+    pub description: String,
+    pub cases: Vec<LogDigestFixtureCase>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LogDigestFixtureCase {
+    pub name: String,
+    /// Source ecosystem: cargo | pytest | npm | pnpm | agent-doc.
+    pub ecosystem: String,
+    /// Raw log lines fed through `compute`.
+    pub input_lines: Vec<String>,
+    /// Token-savings gate: digest must shrink raw tokens by at least this %.
+    pub minimum_savings_percent: f64,
+    /// False-negative guard: each substring MUST survive into the digest text.
+    #[serde(default)]
+    pub required_signals: Vec<String>,
+    /// Optional noise guard: each substring must NOT appear in the digest text.
+    #[serde(default)]
+    pub forbidden_signals: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LogDigestFixtureCaseReport {
+    pub name: String,
+    pub ecosystem: String,
+    pub raw_tokens: usize,
+    pub digest_tokens: usize,
+    pub savings_percent: f64,
+    pub minimum_savings_percent: f64,
+    pub savings_ok: bool,
+    pub missing_required_signals: Vec<String>,
+    pub present_forbidden_signals: Vec<String>,
+    pub passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LogDigestFixtureReport {
+    pub schema_version: u64,
+    pub total_cases: usize,
+    pub failed_cases: usize,
+    pub passed: bool,
+    pub cases: Vec<LogDigestFixtureCaseReport>,
+}
+
+/// Run every fixture case through `compute`, measure token savings against the
+/// digest projection, and enforce required/forbidden signal coverage. The gate
+/// proves the digest both compresses (token savings) and preserves real signals
+/// (no false negatives) for cargo/pytest/npm/pnpm/agent-doc logs.
+pub fn evaluate_fixture(root: &Path, fixture: &LogDigestFixture) -> Result<LogDigestFixtureReport> {
+    let mut cases = Vec::with_capacity(fixture.cases.len());
+    let mut failed_cases = 0;
+    for case in &fixture.cases {
+        let mut input = case.input_lines.join("\n");
+        input.push('\n');
+        let report = compute(root, &input)?;
+        let digest_text = digest_signal_text(&report);
+        let raw_tokens = estimate_tokens(&input);
+        let digest_tokens = estimate_tokens(&digest_text);
+        let savings_percent = if raw_tokens == 0 {
+            0.0
+        } else {
+            (1.0 - digest_tokens as f64 / raw_tokens as f64) * 100.0
+        };
+        let savings_ok = savings_percent >= case.minimum_savings_percent;
+        let missing_required_signals = case
+            .required_signals
+            .iter()
+            .filter(|needle| !digest_text.contains(needle.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let present_forbidden_signals = case
+            .forbidden_signals
+            .iter()
+            .filter(|needle| digest_text.contains(needle.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let passed =
+            savings_ok && missing_required_signals.is_empty() && present_forbidden_signals.is_empty();
+        if !passed {
+            failed_cases += 1;
+        }
+        cases.push(LogDigestFixtureCaseReport {
+            name: case.name.clone(),
+            ecosystem: case.ecosystem.clone(),
+            raw_tokens,
+            digest_tokens,
+            savings_percent,
+            minimum_savings_percent: case.minimum_savings_percent,
+            savings_ok,
+            missing_required_signals,
+            present_forbidden_signals,
+            passed,
+        });
+    }
+    Ok(LogDigestFixtureReport {
+        schema_version: fixture.schema_version,
+        total_cases: cases.len(),
+        failed_cases,
+        passed: failed_cases == 0,
+        cases,
+    })
 }
 
 #[derive(Debug)]
@@ -855,10 +1009,14 @@ fn classify_generic_signal(line: &str) -> Option<(&'static str, String)> {
         || lower.contains("exception")
         || lower.contains("error:")
         || lower.starts_with("error ")
+        || lower.starts_with("error[")
         || lower.starts_with("failed ")
         || lower.starts_with("fatal:")
         || lower.starts_with("caused by:")
         || lower.starts_with("e       ")
+        || trimmed.starts_with("E   ")
+        || lower.contains("err!")
+        || lower.contains("err_pnpm")
     {
         return Some(("error", trimmed.to_string()));
     }
@@ -1281,6 +1439,91 @@ unique uncollapsed line
                 .line_families
                 .iter()
                 .any(|family| family.template.contains("uncollapsed"))
+        );
+    }
+
+    #[test]
+    fn classifies_ecosystem_specific_error_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = "\
+error[E0277]: the trait bound `T: Foo` is not satisfied
+E   assert response.status_code == 200
+npm ERR! code ELIFECYCLE
+ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL build failed
+";
+        let report = compute(dir.path(), input).unwrap();
+        let messages = report
+            .signals
+            .iter()
+            .map(|signal| signal.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            messages.iter().any(|m| m.starts_with("error[E0277]")),
+            "cargo rustc error code not classified: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.starts_with("E   assert")),
+            "pytest assertion detail not classified: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("npm ERR!")),
+            "npm error not classified: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("ERR_PNPM")),
+            "pnpm error not classified: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn evaluate_fixture_enforces_savings_and_false_negative_guards() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut input_lines = vec![
+            "error[E0277]: the trait bound is not satisfied".to_string(),
+        ];
+        // Pad with bulky near-duplicate progress so token savings are real.
+        for idx in 0..60 {
+            input_lines.push(format!("   Compiling crate_{idx} v0.1.{idx}"));
+        }
+
+        // Passing case: real savings + the required error survives the digest.
+        let pass = LogDigestFixture {
+            schema_version: 1,
+            description: String::new(),
+            cases: vec![LogDigestFixtureCase {
+                name: "cargo-build".to_string(),
+                ecosystem: "cargo".to_string(),
+                input_lines: input_lines.clone(),
+                minimum_savings_percent: 50.0,
+                required_signals: vec!["error[E0277]".to_string()],
+                forbidden_signals: vec![],
+            }],
+        };
+        let report = evaluate_fixture(dir.path(), &pass).unwrap();
+        assert!(report.passed, "expected pass: {:?}", report.cases);
+        assert!(report.cases[0].savings_percent >= 50.0);
+        assert!(report.cases[0].digest_tokens < report.cases[0].raw_tokens);
+
+        // Failing case: a required signal that the digest never produces.
+        let fail = LogDigestFixture {
+            schema_version: 1,
+            description: String::new(),
+            cases: vec![LogDigestFixtureCase {
+                name: "missing-signal".to_string(),
+                ecosystem: "cargo".to_string(),
+                input_lines,
+                minimum_savings_percent: 50.0,
+                required_signals: vec!["this signal is never emitted".to_string()],
+                forbidden_signals: vec![],
+            }],
+        };
+        let report = evaluate_fixture(dir.path(), &fail).unwrap();
+        assert!(!report.passed);
+        assert_eq!(report.failed_cases, 1);
+        assert_eq!(
+            report.cases[0].missing_required_signals,
+            vec!["this signal is never emitted".to_string()]
         );
     }
 
