@@ -10671,8 +10671,16 @@ fn log_digest_fixture_gate_passes_token_savings_and_false_negative_thresholds() 
         .iter()
         .map(|case| case["ecosystem"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(ecosystems, vec!["cargo", "pytest", "npm", "pnpm", "agent-doc"]);
-    // Every case must both compress (savings_ok) and keep its real signals.
+    // All five ecosystems are covered (npm appears twice: an install failure
+    // plus a classifier false-positive precision case).
+    for ecosystem in ["cargo", "pytest", "npm", "pnpm", "agent-doc"] {
+        assert!(
+            ecosystems.contains(&ecosystem),
+            "fixture should cover the {ecosystem} ecosystem"
+        );
+    }
+    // Every case must compress (savings_ok), keep its real signals, and not
+    // misclassify any forbidden benign line as a signal.
     for case in json["cases"].as_array().unwrap() {
         assert!(
             case["savings_ok"].as_bool().unwrap(),
@@ -10682,6 +10690,14 @@ fn log_digest_fixture_gate_passes_token_savings_and_false_negative_thresholds() 
         assert!(
             case["missing_required_signals"].as_array().unwrap().is_empty(),
             "case {} dropped a required signal",
+            case["name"]
+        );
+        assert!(
+            case["present_forbidden_signals"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "case {} misclassified a forbidden benign line",
             case["name"]
         );
     }

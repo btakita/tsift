@@ -196,6 +196,20 @@ pub fn digest_signal_text(report: &LogDigestReport) -> String {
     lines.join("\n")
 }
 
+/// Just the classified signal messages (with severity), used by the fixture
+/// gate's false-positive guard. A benign line's tokens can still surface as a
+/// file ref or symbol in `digest_signal_text` even when it is correctly NOT
+/// classified as an error/warning, so the forbidden-signal check must look at
+/// classification output only, not the full projection.
+pub fn signal_message_text(report: &LogDigestReport) -> String {
+    report
+        .signals
+        .iter()
+        .map(|signal| format!("{}: {}", signal.severity, signal.message))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LogDigestFixture {
     pub schema_version: u64,
@@ -256,6 +270,7 @@ pub fn evaluate_fixture(root: &Path, fixture: &LogDigestFixture) -> Result<LogDi
         input.push('\n');
         let report = compute(root, &input)?;
         let digest_text = digest_signal_text(&report);
+        let signal_text = signal_message_text(&report);
         let raw_tokens = estimate_tokens(&input);
         let digest_tokens = estimate_tokens(&digest_text);
         let savings_percent = if raw_tokens == 0 {
@@ -264,6 +279,9 @@ pub fn evaluate_fixture(root: &Path, fixture: &LogDigestFixture) -> Result<LogDi
             (1.0 - digest_tokens as f64 / raw_tokens as f64) * 100.0
         };
         let savings_ok = savings_percent >= case.minimum_savings_percent;
+        // Required signals must survive somewhere in the bounded digest the
+        // agent reads; forbidden signals must not be misclassified as a
+        // signal (checked against classification output only).
         let missing_required_signals = case
             .required_signals
             .iter()
@@ -273,7 +291,7 @@ pub fn evaluate_fixture(root: &Path, fixture: &LogDigestFixture) -> Result<LogDi
         let present_forbidden_signals = case
             .forbidden_signals
             .iter()
-            .filter(|needle| digest_text.contains(needle.as_str()))
+            .filter(|needle| signal_text.contains(needle.as_str()))
             .cloned()
             .collect::<Vec<_>>();
         let passed =
@@ -1573,6 +1591,50 @@ downloaded err_pnpmish.tar to /tmp
             report.cases[0].missing_required_signals,
             vec!["this signal is never emitted".to_string()]
         );
+    }
+
+    #[test]
+    fn fixture_forbidden_signal_checks_classification_not_full_projection() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A benign line whose symbol-like token (`err_pnpmish-fixture`) leaks
+        // into the digest's symbol refs even though it is NOT classified as an
+        // error. The forbidden guard must look at signal classification only,
+        // so this case passes; a full-projection check would wrongly fail it.
+        let fixture = LogDigestFixture {
+            schema_version: 1,
+            description: String::new(),
+            cases: vec![LogDigestFixtureCase {
+                name: "precision".to_string(),
+                ecosystem: "npm".to_string(),
+                input_lines: vec![
+                    "npm http fetch GET 200 https://registry.npmjs.org/react 142ms".to_string(),
+                    "npm http fetch GET 200 https://registry.npmjs.org/axios 155ms".to_string(),
+                    "downloaded err_pnpmish-fixture sample into the cache".to_string(),
+                    "npm ERR! code ELIFECYCLE".to_string(),
+                ],
+                // Negative threshold isolates the forbidden/required logic from
+                // savings on this deliberately tiny input.
+                minimum_savings_percent: -1000.0,
+                required_signals: vec!["npm ERR!".to_string()],
+                forbidden_signals: vec!["err_pnpmish".to_string()],
+            }],
+        };
+        let report = evaluate_fixture(dir.path(), &fixture).unwrap();
+        assert!(report.passed, "precision case should pass: {:?}", report.cases);
+        assert!(report.cases[0].present_forbidden_signals.is_empty());
+
+        // Sanity: the benign symbol token IS in the full projection (so a naive
+        // full-projection forbidden check would have failed) but NOT in the
+        // classified signal text.
+        let computed = compute(
+            dir.path(),
+            "downloaded err_pnpmish-fixture sample into the cache\nnpm ERR! code ELIFECYCLE\n",
+        )
+        .unwrap();
+        assert!(digest_signal_text(&computed).contains("err_pnpmish"));
+        assert!(!signal_message_text(&computed).contains("err_pnpmish"));
+        assert!(signal_message_text(&computed).contains("npm ERR!"));
     }
 
     #[test]

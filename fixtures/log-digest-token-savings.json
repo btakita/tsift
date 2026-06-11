@@ -140,6 +140,32 @@
       ]
     },
     {
+      "name": "classifier-false-positive-precision",
+      "ecosystem": "npm",
+      "minimum_savings_percent": 45.0,
+      "required_signals": ["npm ERR!", "ERR_PNPM_LIFECYCLE_FAIL"],
+      "forbidden_signals": ["stderr!", "err_pnpm-notes", "err_pnpmish"],
+      "input_lines": [
+        "npm http fetch GET 200 https://registry.npmjs.org/react 142ms",
+        "npm http fetch GET 200 https://registry.npmjs.org/react-dom 138ms",
+        "npm http fetch GET 200 https://registry.npmjs.org/lodash 121ms",
+        "npm http fetch GET 200 https://registry.npmjs.org/axios 155ms",
+        "npm http fetch GET 200 https://registry.npmjs.org/express 133ms",
+        "npm http fetch GET 200 https://registry.npmjs.org/webpack 167ms",
+        "npm http fetch GET 200 https://registry.npmjs.org/typescript 149ms",
+        "npm http fetch GET 200 https://registry.npmjs.org/eslint 128ms",
+        "npm http fetch GET 200 https://registry.npmjs.org/jest 144ms",
+        "npm http fetch GET 200 https://registry.npmjs.org/babel 151ms",
+        "npm http fetch GET 200 https://registry.npmjs.org/vite 137ms",
+        "npm http fetch GET 200 https://registry.npmjs.org/rollup 141ms",
+        "flushed stderr! buffer to disk after the run completed cleanly",
+        "see the migration guide at docs/err_pnpm-notes.md for details",
+        "downloaded err_pnpmish-fixture sample into the local cache",
+        "npm ERR! code ELIFECYCLE",
+        "ERR_PNPM_LIFECYCLE_FAIL my-app@1.0.0 build failed"
+      ]
+    },
+    {
       "name": "agent-doc-restart-and-exit",
       "ecosystem": "agent-doc",
       "minimum_savings_percent": 55.0,
