@@ -1,6 +1,6 @@
 [package]
 name = "tsift-cli"
-version = "0.1.67"
+version = "0.1.68"
 edition = "2024"
 description = "CLI dispatch layer for tsift — clap types, command handlers, and output formatting"
 license = "MIT"
@@ -30,23 +30,23 @@ ureq = { version = "3", features = ["json"] }
 tagpath = { version = "0.11.1", default-features = false, features = ["lang-rust", "lang-python", "lang-javascript", "lang-typescript"] }
 tree-sitter = "0.26"
 tempfile = "3"
-tsift-agent-doc = { path = "../tsift-agent-doc", version = "0.1.67" }
-tsift-algorithms = { path = "../tsift-algorithms", version = "0.1.67" }
-tsift-cache = { path = "../tsift-cache", version = "0.1.67" }
-tsift-core = { path = "../tsift-core", version = "0.1.67" }
-tsift-digest = { path = "../tsift-digest", version = "0.1.67" }
-tsift-graph = { path = "../tsift-graph", version = "0.1.67" }
-tsift-index = { path = "../tsift-index", version = "0.1.67" }
-tsift-memory = { path = "../tsift-memory", version = "0.1.67" }
-tsift-memgraphrag = { path = "../tsift-memgraphrag", version = "0.1.67" }
-tsift-quality = { path = "../tsift-quality", version = "0.1.67" }
-tsift-resolution = { path = "../tsift-resolution", version = "0.1.67" }
-tsift-search = { path = "../tsift-search", version = "0.1.67" }
-tsift-sqlite = { path = "../tsift-sqlite", version = "0.1.67" }
-tsift-status = { path = "../tsift-status", version = "0.1.67" }
-tsift-summarize = { path = "../tsift-summarize", version = "0.1.67" }
-tsift-surrealdb = { path = "../tsift-surrealdb", version = "0.1.67", optional = true }
-tsift-tokensave = { path = "../tsift-tokensave", version = "0.1.67" }
+tsift-agent-doc = { path = "../tsift-agent-doc", version = "0.1.68" }
+tsift-algorithms = { path = "../tsift-algorithms", version = "0.1.68" }
+tsift-cache = { path = "../tsift-cache", version = "0.1.68" }
+tsift-core = { path = "../tsift-core", version = "0.1.68" }
+tsift-digest = { path = "../tsift-digest", version = "0.1.68" }
+tsift-graph = { path = "../tsift-graph", version = "0.1.68" }
+tsift-index = { path = "../tsift-index", version = "0.1.68" }
+tsift-memory = { path = "../tsift-memory", version = "0.1.68" }
+tsift-memgraphrag = { path = "../tsift-memgraphrag", version = "0.1.68" }
+tsift-quality = { path = "../tsift-quality", version = "0.1.68" }
+tsift-resolution = { path = "../tsift-resolution", version = "0.1.68" }
+tsift-search = { path = "../tsift-search", version = "0.1.68" }
+tsift-sqlite = { path = "../tsift-sqlite", version = "0.1.68" }
+tsift-status = { path = "../tsift-status", version = "0.1.68" }
+tsift-summarize = { path = "../tsift-summarize", version = "0.1.68" }
+tsift-surrealdb = { path = "../tsift-surrealdb", version = "0.1.68", optional = true }
+tsift-tokensave = { path = "../tsift-tokensave", version = "0.1.68" }
 
 [features]
 backend-surrealdb = ["dep:tsift-surrealdb"]

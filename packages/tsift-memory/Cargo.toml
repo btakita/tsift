@@ -1,6 +1,6 @@
 [package]
 name = "tsift-memory"
-version = "0.1.67"
+version = "0.1.68"
 edition = "2024"
 description = "First-party tsift memory substrate: schema, budgeted handoffs, graph projection, and imports"
 license = "MIT"
@@ -17,7 +17,7 @@ blake3 = "1"
 rusqlite = { version = "0.34", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tsift-core = { path = "../tsift-core", version = "0.1.67" }
+tsift-core = { path = "../tsift-core", version = "0.1.68" }
 
 [dev-dependencies]
 tempfile = "3"
