@@ -967,6 +967,12 @@ fn add_authored_node_to_graph(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create graph db dir {}", parent.display()))?;
     }
+    // Serialize the authored-node upsert against a concurrent graph-db
+    // refresh/snapshot-import/compact that holds the same advisory lock
+    // (#gdblockcover): without it the write races a refresh's WAL transaction or a
+    // snapshot-import rename window and hits the database-is-locked collision the
+    // lock was added to prevent.
+    let _write_lock = crate::acquire_graph_db_write_lock(graph_db)?;
     let mut store = SqliteGraphStore::open(graph_db)
         .with_context(|| format!("open graph store {}", graph_db.display()))?;
     let anchor_resolved = store.node(anchor)?.is_some();
@@ -1240,6 +1246,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(annotates2, 1, "edge materializes once anchor exists");
+    }
+
+    // #gdblockcover: `memory finding-add` upserts an authored-node projection and
+    // must take the same advisory write lock as graph-db refresh/snapshot-import,
+    // or the write races a concurrent refresh's WAL transaction. Hold the lock
+    // externally and prove the upsert blocks on it (rather than writing unguarded
+    // as it did before the fix), then completes once the lock is released.
+    #[test]
+    fn finding_add_blocks_on_held_graph_db_write_lock() {
+        let dir = TempDir::new().unwrap();
+        let graph_db = dir.path().join("graph.db");
+
+        let held = crate::acquire_graph_db_write_lock(&graph_db).expect("hold writer lock");
+
+        let graph_db_thread = graph_db.clone();
+        let handle = std::thread::spawn(move || {
+            add_authored_node_to_graph(
+                &graph_db_thread,
+                AuthoredNodeKind::Finding,
+                "authored finding under write-lock contention",
+                "symbol:contended",
+                0.8,
+                1_700_000_000,
+                None,
+            )
+        });
+
+        // While the lock is held the upsert cannot have finished — it must be
+        // parked in the acquire loop. Before the fix it wrote unguarded and would
+        // already be done here.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "finding-add must block on the held graph-db write lock, not write unguarded"
+        );
+
+        drop(held);
+        let result = handle.join().expect("finding-add thread joins");
+        assert!(
+            result.is_ok(),
+            "finding-add must succeed after the lock is released: {result:?}"
+        );
     }
 
     #[test]

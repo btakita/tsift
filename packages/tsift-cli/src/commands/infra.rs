@@ -1131,6 +1131,12 @@ pub(crate) fn cmd_graph_db_compact(
     let mut warnings = before.warnings.clone();
     let mut pruned_tombstones = 0usize;
     if apply {
+        // Serialize DELETE + wal_checkpoint(TRUNCATE) + VACUUM against a concurrent
+        // graph-db refresh/snapshot-import that holds the same lock (#gdblockcover):
+        // compact's VACUUM cannot run while another writer has a WAL transaction open,
+        // and a refresh creating -wal/-shm sidecars mid-VACUUM is the exact
+        // database-is-locked collision the advisory lock was added to prevent.
+        let _compact_lock = crate::acquire_graph_db_write_lock(&graph_db)?;
         let mut store = SqliteGraphStore::open(&graph_db)?;
         pruned_tombstones = store.compact_storage(scope.unwrap_or("root"), prune_tombstones)?;
         if prune_tombstones {

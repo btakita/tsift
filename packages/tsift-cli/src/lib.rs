@@ -21154,6 +21154,61 @@ mod tests {
         );
     }
 
+    // #gdblockcover: `graph-db compact --apply` (DELETE + wal_checkpoint(TRUNCATE)
+    // + VACUUM) must take the same advisory write lock as refresh/snapshot-import,
+    // or its VACUUM races a concurrent refresh's WAL transaction. Hold the lock
+    // externally and prove the compact blocks on it (rather than running unguarded
+    // as it did before the fix), then completes once the lock is released.
+    #[test]
+    fn graph_db_compact_apply_blocks_on_held_write_lock() {
+        let dir = setup_traversal_project();
+        let session = dir.path().join("tasks/software/tsift.md");
+        refresh_traversal_graph_store(dir.path(), &session, None).unwrap();
+        let graph_db = graph_substrate_db_path(dir.path(), None);
+
+        let held = acquire_graph_db_write_lock(&graph_db).expect("hold writer lock");
+
+        let root = dir.path().to_path_buf();
+        let handle = std::thread::Builder::new()
+            .name("compact-apply".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                crate::commands::infra::cmd_graph_db_compact(
+                    &root,
+                    None,
+                    true,
+                    false,
+                    false,
+                    OutputFormat {
+                        json_output: true,
+                        compact: true,
+                        pretty: false,
+                        terse: false,
+                        ultra_terse: false,
+                        schema: false,
+                        envelope: false,
+                    },
+                )
+            })
+            .unwrap();
+
+        // While the lock is held the compact cannot have finished — it must be
+        // parked in the acquire loop. Before the fix it ran VACUUM unguarded and
+        // would already be done here.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "compact --apply must block on the held graph-db write lock, not run unguarded"
+        );
+
+        drop(held);
+        let result = handle.join().expect("compact thread joins");
+        assert!(
+            result.is_ok(),
+            "compact --apply must succeed after the lock is released: {result:?}"
+        );
+    }
+
     fn parse_cli<I, T>(itr: I) -> Cli
     where
         I: IntoIterator<Item = T> + Send + 'static,
