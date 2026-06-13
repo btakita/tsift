@@ -16473,13 +16473,26 @@ fn load_source_symbols(
     max_bytes: usize,
     warnings: &mut Vec<String>,
 ) -> Vec<SourceSymbolRef> {
-    let db_path = match resolve_query_db_path(root, file_abs, scope) {
-        Ok(path) => path,
+    let target = match resolve_query_index_target(root, file_abs, scope) {
+        Ok(target) => target,
         Err(err) => {
             warnings.push(format!("index refs unavailable: {err:#}"));
             return Vec::new();
         }
     };
+    // Build/refresh the per-package cargo index on demand so source-read delivers
+    // AST symbol refs for any workspace member — not only members a prior
+    // graph/search/explain query happened to index. `open_index_db` (the
+    // search/explain/graph path) already ensures the index is current; before
+    // this, source-read only checked `db_path.exists()`, so a workspace member
+    // that had never been queried (≈60% of members here) silently degraded to
+    // window-only output with an "index refs unavailable" warning even though
+    // `tsift status` reported the index fresh (#cargoidxcov).
+    if let Err(err) = ensure_query_index_current(root, &target) {
+        warnings.push(format!("index refs unavailable: {err:#}"));
+        return Vec::new();
+    }
+    let db_path = target.db_path;
     if !db_path.exists() {
         warnings.push(format!(
             "index refs unavailable: no index found at {}",
@@ -17198,7 +17211,14 @@ fn cmd_symbol_read(
         .map(|file| resolve_source_file(&root, file))
         .transpose()?;
     let path_hint = hinted_file_abs.as_deref().unwrap_or(root.as_path());
-    let db_path = resolve_query_db_path(&root, path_hint, scope)?;
+    // Build/refresh the per-package cargo index on demand so symbol-read resolves
+    // symbols in any workspace member, not only ones a prior graph/search query
+    // indexed. Previously this checked existence only and bailed with "no index
+    // found" for never-queried members despite a fresh `tsift status`
+    // (#cargoidxcov).
+    let target = resolve_query_index_target(&root, path_hint, scope)?;
+    ensure_query_index_current(&root, &target)?;
+    let db_path = target.db_path;
     if !db_path.exists() {
         bail!(
             "index refs unavailable: no index found at {}",
@@ -23443,6 +23463,54 @@ agent_doc_format: template
         )
         .unwrap();
         assert!(targets[0].db_path.exists());
+    }
+
+    #[test]
+    fn source_read_symbols_build_cargo_package_index_on_demand() {
+        // A workspace member that has never been queried has no per-package cargo
+        // index yet. source-read must build it on demand and return AST symbol
+        // refs rather than silently degrading to window-only output with an
+        // "index refs unavailable" warning while `tsift status` reports fresh
+        // (#cargoidxcov).
+        let dir = setup_multiplicity_project();
+        let cargo_index = dir.path().join(".tsift/indexes/cargo/core-lib/index.db");
+        assert!(
+            !cargo_index.exists(),
+            "core-lib cargo index should not exist before the first source-read"
+        );
+
+        let file_abs = dir.path().join("crates/core-lib/src/lib.rs");
+        let source = std::fs::read(&file_abs).unwrap();
+        let mut warnings = Vec::new();
+        let symbols = load_source_symbols(
+            dir.path(),
+            &file_abs,
+            "crates/core-lib/src/lib.rs",
+            &source,
+            None,
+            1,
+            usize::MAX,
+            10,
+            4096,
+            &mut warnings,
+        );
+
+        assert!(
+            warnings.is_empty(),
+            "source-read must build the index on demand instead of warning: {warnings:?}"
+        );
+        let symbol_names = symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            symbol_names.contains(&"run"),
+            "source-read should resolve `run` from the on-demand-built cargo index: {symbol_names:?}"
+        );
+        assert!(
+            cargo_index.exists(),
+            "source-read should have built the core-lib cargo index on demand"
+        );
     }
 
     #[test]
