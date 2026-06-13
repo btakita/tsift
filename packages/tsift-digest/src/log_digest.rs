@@ -1033,6 +1033,12 @@ fn classify_generic_signal(line: &str) -> Option<(&'static str, String)> {
         || lower.starts_with("caused by:")
         || lower.starts_with("e       ")
         || trimmed.starts_with("E   ")
+        || lower.contains("test result: failed")
+        || lower.contains("segmentation fault")
+        || lower.contains("core dumped")
+        || is_make_error_line(trimmed, &lower)
+        || is_rust_assertion_failure(&lower)
+        || looks_like_failed_test_summary(&lower)
         || has_npm_pnpm_error_token(trimmed)
     {
         return Some(("error", trimmed.to_string()));
@@ -1057,6 +1063,35 @@ fn has_npm_pnpm_error_token(line: &str) -> bool {
                 .get(..9)
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("err_pnpm_"))
     })
+}
+
+/// Detect test-runner failure summaries such as pytest `1 failed, 3 passed in
+/// 2.1s`, `1 failed in 2.1s`, or jest `Tests: 2 failed, 5 passed`. Anchored to a
+/// `<non-zero number> failed` count token so passing summaries (`0 failed`) and
+/// prose (`the build failed`) are not flagged.
+fn looks_like_failed_test_summary(lower: &str) -> bool {
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    tokens.windows(2).any(|pair| {
+        let count = pair[0];
+        let word = pair[1].trim_end_matches([',', ';', '.', ':']);
+        word == "failed" && count.parse::<u64>().map(|n| n > 0).unwrap_or(false)
+    })
+}
+
+/// Detect GNU make error lines: `make: *** [build] Error 1`,
+/// `make[1]: *** [target] Error 2`, `*** No rule to make target`. Anchored on
+/// make's `*** ` sigil (line-leading or after the `<maker>: ` prefix) plus an
+/// error marker, so banners that merely contain `***` are not flagged.
+fn is_make_error_line(trimmed: &str, lower: &str) -> bool {
+    (trimmed.starts_with("*** ") || trimmed.contains(": *** "))
+        && (lower.contains("error") || lower.contains("no rule to make target"))
+}
+
+/// Detect Rust assertion panics: `assertion failed: <expr>` and the
+/// `assertion `left == right` failed` form.
+fn is_rust_assertion_failure(lower: &str) -> bool {
+    lower.contains("assertion failed")
+        || (lower.contains("assertion") && lower.contains("` failed"))
 }
 
 fn classify_agent_doc_runtime_signals(line: &str) -> Vec<(&'static str, String)> {
@@ -1538,6 +1573,66 @@ downloaded err_pnpmish.tar to /tmp
         assert!(
             !error_messages.iter().any(|m| m.contains("err_pnpmish")),
             "err_pnpmish is not a pnpm error code: {error_messages:?}"
+        );
+    }
+
+    #[test]
+    fn classifies_test_runner_and_build_failure_summaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = "\
+test result: FAILED. 2 passed; 1 failed; 0 ignored
+1 failed, 3 passed in 2.1s
+Tests: 2 failed, 5 passed
+make: *** [build] Error 1
+Segmentation fault (core dumped)
+assertion `left == right` failed
+assertion failed: response.ok
+";
+        let report = compute(dir.path(), input).unwrap();
+        let errors = report
+            .signals
+            .iter()
+            .filter(|signal| signal.severity == "error")
+            .map(|signal| signal.message.as_str())
+            .collect::<Vec<_>>();
+
+        for needle in [
+            "test result: FAILED",
+            "1 failed, 3 passed",
+            "Tests: 2 failed",
+            "*** [build] Error 1",
+            "Segmentation fault",
+            "assertion `left == right` failed",
+            "assertion failed: response.ok",
+        ] {
+            assert!(
+                errors.iter().any(|m| m.contains(needle)),
+                "failure line not classified ({needle:?}): {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_summary_classification_is_token_anchored() {
+        let dir = tempfile::tempdir().unwrap();
+        // Every line here is benign and must NOT be classified as an error.
+        let input = "\
+test result: ok. 49 passed; 0 failed; 0 ignored
+0 failed, 12 passed in 0.4s
+the build failed to find a cached artifact, retrying
+*** Welcome to the build banner ***
+this assertion about latency held under load
+";
+        let report = compute(dir.path(), input).unwrap();
+        let errors = report
+            .signals
+            .iter()
+            .filter(|signal| signal.severity == "error")
+            .map(|signal| signal.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            errors.is_empty(),
+            "benign lines must not be classified as errors: {errors:?}"
         );
     }
 

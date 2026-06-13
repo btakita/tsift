@@ -187,6 +187,48 @@
         "[1776528300] claude_start mode=fresh_restart restart_count=1 file=tasks/software/tsift.md",
         "[1776528532] claude_exit code=1 restart_count=0 file=tasks/software/tsift.md"
       ]
+    },
+    {
+      "name": "cargo-test-failure-summary",
+      "ecosystem": "cargo",
+      "minimum_savings_percent": 50.0,
+      "required_signals": ["test result: FAILED"],
+      "forbidden_signals": ["30 passed"],
+      "input_lines": [
+        "running 32 tests",
+        "test digest::tests::case_00 ... ok",
+        "test digest::tests::case_01 ... ok",
+        "test digest::tests::case_02 ... ok",
+        "test digest::tests::case_03 ... ok",
+        "test digest::tests::case_04 ... ok",
+        "test digest::tests::case_05 ... ok",
+        "test digest::tests::case_06 ... ok",
+        "test digest::tests::case_07 ... ok",
+        "test digest::tests::case_08 ... ok",
+        "test digest::tests::case_09 ... ok",
+        "test digest::tests::case_10 ... ok",
+        "test digest::tests::case_11 ... ok",
+        "test digest::tests::case_12 ... ok",
+        "test digest::tests::case_13 ... ok",
+        "test digest::tests::case_14 ... ok",
+        "test digest::tests::case_15 ... ok",
+        "test digest::tests::case_16 ... ok",
+        "test digest::tests::case_17 ... ok",
+        "test digest::tests::case_18 ... ok",
+        "test digest::tests::case_19 ... ok",
+        "test digest::tests::case_20 ... ok",
+        "test digest::tests::case_21 ... ok",
+        "test digest::tests::case_22 ... ok",
+        "test digest::tests::case_23 ... ok",
+        "test digest::tests::case_24 ... ok",
+        "test digest::tests::case_25 ... ok",
+        "test digest::tests::case_26 ... ok",
+        "test digest::tests::case_27 ... ok",
+        "test digest::tests::case_28 ... ok",
+        "test digest::tests::case_29 ... ok",
+        "test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+        "test result: FAILED. 28 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out"
+      ]
     }
   ]
 }
