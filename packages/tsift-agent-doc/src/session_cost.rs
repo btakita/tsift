@@ -67,6 +67,15 @@ pub struct SessionCostPromptCacheMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_key: Option<String>,
     pub stable_prefix_fingerprint: String,
+    // True when the provider supplied `stable_prefix_fingerprint` explicitly
+    // rather than us deriving it from provider/cache_key/stable_prefix/
+    // breakpoints. A derived fingerprint is a pure function of those tracked
+    // sub-fields, so a derived change is always a redundant echo of one of them
+    // and is suppressed from drift attribution; an explicit fingerprint is
+    // independent signal and is always reported (#tsreviewcleanup). This is an
+    // internal attribution detail, not part of the serialized report.
+    #[serde(skip)]
+    pub stable_prefix_fingerprint_explicit: bool,
     // Raw stable-prefix content, tracked independently of the fingerprint so
     // prefix-content drift is attributed even when a provider supplies an
     // explicit `stable_prefix_fingerprint` that bypasses the derived material
@@ -1852,12 +1861,20 @@ fn prompt_cache_field_changes(
         &prompt_cache_optional_value(previous.stable_prefix.as_deref()),
         &prompt_cache_optional_value(current.stable_prefix.as_deref()),
     );
-    push_prompt_cache_field_change(
-        &mut changes,
-        "stable_prefix_fingerprint",
-        &previous.stable_prefix_fingerprint,
-        &current.stable_prefix_fingerprint,
-    );
+    // A *derived* fingerprint is a pure function of already-tracked sub-fields
+    // (provider, cache_key, stable_prefix, breakpoints), so whenever it changes
+    // one of those entries changed too and is reported above — the fingerprint
+    // entry is a redundant echo. Suppress it on the derived path and report the
+    // fingerprint only when the provider supplied it *explicitly* (independent
+    // signal that is not captured by any tracked sub-field) (#tsreviewcleanup).
+    if current.stable_prefix_fingerprint_explicit {
+        push_prompt_cache_field_change(
+            &mut changes,
+            "stable_prefix_fingerprint",
+            &previous.stable_prefix_fingerprint,
+            &current.stable_prefix_fingerprint,
+        );
+    }
     changes
 }
 
@@ -3343,6 +3360,7 @@ fn prompt_cache_metadata(
     let mut breakpoints = aggregate_prompt_cache_breakpoint_counts(breakpoints);
     breakpoints.truncate(MAX_PROMPT_CACHE_BREAKPOINTS);
 
+    let stable_prefix_fingerprint_explicit = explicit_fingerprint.is_some();
     let stable_prefix_fingerprint = explicit_fingerprint.unwrap_or_else(|| {
         let mut material = vec![format!("provider={provider}")];
         if let Some(cache_key) = &cache_key {
@@ -3361,6 +3379,7 @@ fn prompt_cache_metadata(
         provider,
         cache_key,
         stable_prefix_fingerprint,
+        stable_prefix_fingerprint_explicit,
         stable_prefix,
         breakpoints,
         routing_affinity,
@@ -3470,6 +3489,17 @@ fn strip_json_array_indices(path: &str) -> String {
 /// repeated entries carry an `(xN)` count, so multiple breakpoints of the same
 /// shape keep their cardinality without re-introducing positional churn.
 fn aggregate_prompt_cache_breakpoint_counts(mut breakpoints: Vec<String>) -> Vec<String> {
+    // Escape any provider-supplied breakpoint text that already ends in a
+    // `(xN)`-shaped suffix, so a literal cannot masquerade as the count suffix
+    // this function appends. Without it, one literal `foo (x2)` would serialize
+    // identically to two plain `foo` breakpoints (which aggregate to
+    // `foo (x2)`), hiding real cache-boundary drift behind a false match
+    // (#tsreviewcleanup).
+    for breakpoint in &mut breakpoints {
+        if let Some(open) = breakpoint_count_suffix_start(breakpoint) {
+            *breakpoint = format!("{} (\\x{}", &breakpoint[..open], &breakpoint[open + 3..]);
+        }
+    }
     breakpoints.sort();
     let mut aggregated: Vec<String> = Vec::new();
     let mut index = 0;
@@ -3487,6 +3517,20 @@ fn aggregate_prompt_cache_breakpoint_counts(mut breakpoints: Vec<String>) -> Vec
         index += count;
     }
     aggregated
+}
+
+/// Byte offset of a trailing ` (x<digits>)` count-shaped suffix, if present.
+/// The real aggregation suffix never contains a backslash, so an escaped
+/// literal (` (\xN)`) is not matched and cannot be double-escaped.
+fn breakpoint_count_suffix_start(breakpoint: &str) -> Option<usize> {
+    let inner = breakpoint.strip_suffix(')')?;
+    let open = inner.rfind(" (x")?;
+    let digits = &inner[open + 3..];
+    if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        Some(open)
+    } else {
+        None
+    }
 }
 
 fn describe_prompt_cache_breakpoint(value: &Value) -> String {
@@ -3908,18 +3952,23 @@ mod tests {
         assert_eq!(drift.cached_input_ratio_before.as_deref(), Some("90.00%"));
         assert_eq!(drift.cached_input_ratio_after.as_deref(), Some("10.00%"));
         assert_eq!(drift.cache_creation_ratio.as_deref(), Some("60.00%"));
-        // Only the changed concrete field and the derived fingerprint are
-        // reported; unchanged fields do not appear.
-        for field in ["cache_key", "stable_prefix_fingerprint"] {
-            assert!(
-                drift
-                    .field_changes
-                    .iter()
-                    .any(|change| change.field == field),
-                "expected drift field {field}"
-            );
-        }
-        for field in ["provider", "routing_affinity", "breakpoints"] {
+        // Only the changed concrete field is reported. The derived fingerprint
+        // flips too (it hashes the cache_key), but that is a redundant echo of
+        // the cache_key change and is suppressed (#tsreviewcleanup).
+        assert!(
+            drift
+                .field_changes
+                .iter()
+                .any(|change| change.field == "cache_key"),
+            "expected drift field cache_key"
+        );
+        for field in [
+            "provider",
+            "routing_affinity",
+            "breakpoints",
+            "stable_prefix",
+            "stable_prefix_fingerprint",
+        ] {
             assert!(
                 !drift
                     .field_changes
@@ -3966,14 +4015,21 @@ mod tests {
 
         assert_eq!(analytics.prefix_drift.len(), 1);
         let drift = &analytics.prefix_drift[0];
-        // The concrete `stable_prefix` content change is the first (most
-        // specific) attributed cause, ahead of the derived fingerprint.
+        // The concrete `stable_prefix` content change is the attributed cause.
         assert_eq!(drift.first_changed_field, "stable_prefix");
-        // On the derived path the fingerprint folds in the prefix, so it also
-        // changes — but `stable_prefix` precedes it in the ordered list.
-        assert_eq!(drift.field_changes.len(), 2);
+        // On the derived path the fingerprint folds in the prefix, so it would
+        // also flip — but a derived fingerprint is a redundant echo of the
+        // tracked sub-field that fed it and is suppressed (#tsreviewcleanup),
+        // leaving `stable_prefix` as the sole reported change.
+        assert_eq!(drift.field_changes.len(), 1);
         assert_eq!(drift.field_changes[0].field, "stable_prefix");
-        assert_eq!(drift.field_changes[1].field, "stable_prefix_fingerprint");
+        assert!(
+            !drift
+                .field_changes
+                .iter()
+                .any(|change| change.field == "stable_prefix_fingerprint"),
+            "derived fingerprint echo must be suppressed when a sub-field changed"
+        );
     }
 
     #[test]
@@ -4061,6 +4117,29 @@ mod tests {
             bp,
             vec!["message.content.cache_control=type:ephemeral (x2)".to_string()]
         );
+    }
+
+    #[test]
+    fn prompt_cache_breakpoint_literal_count_suffix_does_not_collide_with_aggregation() {
+        // A provider breakpoint whose text literally ends in `(x2)` must not
+        // serialize identically to two plain breakpoints that aggregate to
+        // `... (x2)`, or real cache-boundary drift between the two states would
+        // be hidden behind a false match (#tsreviewcleanup).
+        let literal = aggregate_prompt_cache_breakpoint_counts(vec!["foo (x2)".to_string()]);
+        let aggregated =
+            aggregate_prompt_cache_breakpoint_counts(vec!["foo".to_string(), "foo".to_string()]);
+        assert_ne!(literal, aggregated);
+        // The literal is escaped (`(\x2)`); the genuine count suffix is `(x2)`.
+        assert_eq!(literal, vec!["foo (\\x2)".to_string()]);
+        assert_eq!(aggregated, vec!["foo (x2)".to_string()]);
+        // Two copies of the literal aggregate on the escaped form, still
+        // distinct from a single literal.
+        let two_literals = aggregate_prompt_cache_breakpoint_counts(vec![
+            "foo (x2)".to_string(),
+            "foo (x2)".to_string(),
+        ]);
+        assert_eq!(two_literals, vec!["foo (\\x2) (x2)".to_string()]);
+        assert_ne!(two_literals, literal);
     }
 
     #[test]
@@ -4244,7 +4323,10 @@ mod tests {
                 minimum_net_cached_input_tokens: 40_000,
                 maximum_read_create_regressions: 0,
                 regression_scenarios: vec!["volatile_prefix_generated_header".to_string()],
-                required_prefix_drift_fields: vec!["stable_prefix_fingerprint".to_string()],
+                // Prefix-content drift (the `Generated:` timestamp) is now
+                // attributed to the concrete `stable_prefix` field; the derived
+                // fingerprint echo is suppressed (#tsreviewcleanup).
+                required_prefix_drift_fields: vec!["stable_prefix".to_string()],
                 required_diagnostics: Vec::new(),
             }],
         };

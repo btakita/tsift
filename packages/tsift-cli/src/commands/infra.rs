@@ -631,6 +631,29 @@ fn graph_db_snapshot_decompress_to_staged(artifact: &Path, staged: &Path) -> Res
         .len())
 }
 
+/// Live-lock diagnostic for the snapshot-export recovery gate.
+///
+/// The resilient read-only open used by snapshot-export succeeds via a
+/// snapshot/recovery fallback in the realistic WAL-locked case rather than
+/// erroring, so the bare `map_live_lock` mapping on the open is near-dead for
+/// that case — the live-lock signal surfaces at the recovery gate instead. This
+/// keeps the recovery-gate wording consistent with `map_live_lock` so the
+/// operator gets the same actionable "a concurrent refresh/import holds the
+/// lock; wait and retry" guidance regardless of which gate trips
+/// (#tsreviewcleanup).
+fn graph_db_snapshot_recovery_live_lock_error(
+    graph_db: &Path,
+    recovery_diagnostic: String,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "graph-db snapshot-export could not read {} from the live database: a concurrent \
+         graph-db refresh or snapshot-import is in progress (database is locked), so the read \
+         fell back to a recovered path ({recovery_diagnostic}); wait for it to finish before \
+         retrying the export",
+        graph_db.display(),
+    )
+}
+
 pub(crate) fn graph_db_snapshot_clean_export_copy(graph_db: &Path, clean_path: &Path) -> Result<u64> {
     // A concurrent graph-db refresh / snapshot-import can hold an exclusive
     // database lock, which surfaces as a raw SQLite "database is locked" from
@@ -657,10 +680,10 @@ pub(crate) fn graph_db_snapshot_clean_export_copy(graph_db: &Path, clean_path: &
         )
     })?;
     if let Some(recovery) = conn.recovery() {
-        bail!(
-            "graph-db snapshot-export refused recovered read path: {}; resolve the live database lock before exporting a shareable artifact",
-            graph_db_read_recovery_diagnostic(recovery)
-        );
+        return Err(graph_db_snapshot_recovery_live_lock_error(
+            graph_db,
+            graph_db_read_recovery_diagnostic(recovery),
+        ));
     }
     let clean_path_str = clean_path.to_string_lossy().to_string();
     if let Err(err) = conn
@@ -700,10 +723,10 @@ pub(crate) fn graph_db_snapshot_export_report(
     )?;
     graph_db_snapshot_fail_if_not_fresh("snapshot-export", &operator)?;
     if let Some(recovery) = operator.recovery {
-        bail!(
-            "graph-db snapshot-export refused recovered read path: {}; resolve the live database lock before exporting a shareable artifact",
-            graph_db_read_recovery_diagnostic(recovery)
-        );
+        return Err(graph_db_snapshot_recovery_live_lock_error(
+            &graph_db,
+            graph_db_read_recovery_diagnostic(recovery),
+        ));
     }
     let graph_parent = graph_db
         .parent()

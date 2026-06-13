@@ -40,7 +40,7 @@
         "volatile_prefix_generated_header"
       ],
       "required_prefix_drift_fields": [
-        "stable_prefix_fingerprint"
+        "stable_prefix"
       ],
       "input_lines": [
         "{\"timestamp\":\"2026-06-09T04:20:01Z\",\"type\":\"event_msg\",\"provider\":\"openai\",\"prompt_cache_key\":\"agent-doc:tsift-v0.1\",\"routing_affinity\":\"replica-a\",\"stable_prefix\":\"agent-doc stable prefix v1\\nGenerated: 2026-06-09T04:20:01Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":30000,\"cached_input_tokens\":27000,\"output_tokens\":300,\"reasoning_output_tokens\":100,\"total_tokens\":30300}}}}",
@@ -57,7 +57,7 @@
         "cold_standalone_compaction"
       ],
       "required_prefix_drift_fields": [
-        "stable_prefix_fingerprint"
+        "stable_prefix"
       ],
       "required_diagnostics": [
         "cache_creation_spike"

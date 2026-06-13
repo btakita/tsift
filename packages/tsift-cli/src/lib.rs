@@ -25236,9 +25236,17 @@ fn main() { api::handler(); }
             Err(err) => err,
         };
 
+        // The resilient open succeeds via the recovery fallback in this WAL-lock
+        // case, so the live-lock signal surfaces at the recovery gate. Its
+        // wording is now unified with the `map_live_lock` open-path diagnostic so
+        // the operator gets the same actionable guidance regardless of which gate
+        // trips (#tsreviewcleanup).
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("recovered read path"),
-            "expected recovered read path diagnostic, got {err:#}"
+            message.contains("recovered path")
+                && message.contains("database is locked")
+                && message.contains("wait for it to finish before retrying the export"),
+            "expected unified live-lock recovery diagnostic, got {err:#}"
         );
     }
 
