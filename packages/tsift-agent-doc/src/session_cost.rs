@@ -679,13 +679,17 @@ pub fn build_prompt_cache_effectiveness_report(
             ),
             |analytics| analytics.net_cached_input_tokens,
         );
-        let read_create_regressions = analytics.map_or(0, |analytics| {
-            analytics
-                .diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.kind == "read_create_regression")
-                .count()
-        });
+        // Count the regression from the raw token signal, not the display-
+        // truncated diagnostics vec, so a long degraded session whose per-turn
+        // diagnostics would truncate the session-level regression cannot pass
+        // the read/create gate (#pcacheregtrunc).
+        let read_create_regressions = usize::from(
+            prompt_cache_read_create_regression(
+                report.cached_input_tokens,
+                report.cache_creation_input_tokens,
+            )
+            .is_some(),
+        );
         let regression_scenarios = normalized_prompt_cache_scenarios(&case.regression_scenarios);
         covered_regression_scenarios.extend(regression_scenarios.iter().cloned());
 
@@ -1643,30 +1647,57 @@ fn derive_prompt_cache_diagnostics(
         }
     }
 
-    if cache_creation_input_tokens > 0 {
-        let read_to_creation = (cached_input_tokens as f64) / (cache_creation_input_tokens as f64);
-        if read_to_creation < PROMPT_CACHE_READ_CREATE_REGRESSION_RATIO {
-            diagnostics.push(SessionCostPromptCacheDiagnostic {
-                kind: "read_create_regression".to_string(),
-                severity: "recommend".to_string(),
-                label: "session".to_string(),
-                message: format!(
-                    "cache read/create ratio was {read_to_creation:.2}x ({cached_input_tokens} read tokens, {cache_creation_input_tokens} creation tokens)"
-                ),
-                likely_causes: vec![
-                    "cached prefix is being rewritten too often for warm reuse".to_string(),
-                    "volatile values are inside the cached prefix".to_string(),
-                    "cache key or replica routing is changing between turns".to_string(),
-                ],
-                guidance:
-                    "stabilize the prefix/key/routing path until cache reads clearly exceed creation work"
-                        .to_string(),
-            });
-        }
-    }
+    // The session-level read/create regression is computed once per session.
+    let read_create_regression = prompt_cache_read_create_regression(
+        cached_input_tokens,
+        cache_creation_input_tokens,
+    )
+    .map(|read_to_creation| SessionCostPromptCacheDiagnostic {
+        kind: "read_create_regression".to_string(),
+        severity: "recommend".to_string(),
+        label: "session".to_string(),
+        message: format!(
+            "cache read/create ratio was {read_to_creation:.2}x ({cached_input_tokens} read tokens, {cache_creation_input_tokens} creation tokens)"
+        ),
+        likely_causes: vec![
+            "cached prefix is being rewritten too often for warm reuse".to_string(),
+            "volatile values are inside the cached prefix".to_string(),
+            "cache key or replica routing is changing between turns".to_string(),
+        ],
+        guidance:
+            "stabilize the prefix/key/routing path until cache reads clearly exceed creation work"
+                .to_string(),
+    });
 
-    diagnostics.truncate(MAX_PROMPT_CACHE_DIAGNOSTICS);
+    // Reserve a slot for the session-level regression before truncating the
+    // per-turn diagnostics, so a long degraded session with many per-turn
+    // ratio-drop/creation-spike diagnostics cannot truncate the regression away
+    // and silently pass the read/create gate (#pcacheregtrunc).
+    let per_turn_cap = if read_create_regression.is_some() {
+        MAX_PROMPT_CACHE_DIAGNOSTICS.saturating_sub(1)
+    } else {
+        MAX_PROMPT_CACHE_DIAGNOSTICS
+    };
+    diagnostics.truncate(per_turn_cap);
+    if let Some(regression) = read_create_regression {
+        diagnostics.push(regression);
+    }
     diagnostics
+}
+
+/// The session-level cache read/create regression signal: returns the
+/// read-to-creation ratio when creation tokens exist and the ratio is below the
+/// regression threshold. Computed from raw token totals so it is independent of
+/// the display-truncated diagnostics vec.
+fn prompt_cache_read_create_regression(
+    cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+) -> Option<f64> {
+    if cache_creation_input_tokens == 0 {
+        return None;
+    }
+    let read_to_creation = (cached_input_tokens as f64) / (cache_creation_input_tokens as f64);
+    (read_to_creation < PROMPT_CACHE_READ_CREATE_REGRESSION_RATIO).then_some(read_to_creation)
 }
 
 fn derive_prompt_cache_prefix_drift(
@@ -3870,6 +3901,42 @@ mod tests {
         // The fingerprint is the only reported change — no concrete sub-field moved.
         assert_eq!(drift.field_changes.len(), 1);
         assert_eq!(drift.field_changes[0].field, "stable_prefix_fingerprint");
+    }
+
+    #[test]
+    fn read_create_regression_survives_diagnostics_truncation() {
+        // Eight turns each trigger a cache-creation spike (50% creation ratio),
+        // producing more per-turn diagnostics than MAX_PROMPT_CACHE_DIAGNOSTICS,
+        // plus an overall read/create regression (800 read / 4000 creation =
+        // 0.2x, far below the 2.0 threshold).
+        let turns: Vec<SessionCostTurn> = (0..8)
+            .map(|idx| SessionCostTurn {
+                label: format!("t{idx}"),
+                prompt_tokens: 1000,
+                cached_input_tokens: 100,
+                cache_creation_input_tokens: 500,
+                output_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: 1100,
+                prompt_cache_metadata: None,
+            })
+            .collect();
+
+        let diagnostics = derive_prompt_cache_diagnostics(&turns, 800, 4000);
+
+        assert_eq!(diagnostics.len(), MAX_PROMPT_CACHE_DIAGNOSTICS);
+        // Before the fix the session-level regression was pushed last and
+        // truncated away, so the read/create gate read 0 and passed (#pcacheregtrunc).
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "read_create_regression"),
+            "session-level read/create regression must survive diagnostics truncation: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.kind.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -14038,8 +14038,7 @@ pub(crate) struct GraphDbWriteLock {
 
 impl Drop for GraphDbWriteLock {
     fn drop(&mut self) {
-        use fs4::fs_std::FileExt;
-        let _ = self.file.unlock();
+        let _ = fs4::fs_std::FileExt::unlock(&self.file);
     }
 }
 
