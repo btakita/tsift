@@ -26,7 +26,7 @@ const PROMPT_CACHE_GOOD_HIT_PERCENT: f64 = 75.0;
 const PROMPT_CACHE_TREND_DELTA_PERCENT: f64 = 5.0;
 const PROMPT_CACHE_RATIO_DROP_WARN_PERCENT: f64 = 20.0;
 const PROMPT_CACHE_CREATION_SPIKE_WARN_PERCENT: f64 = 20.0;
-const PROMPT_CACHE_READ_CREATE_REGRESSION_RATIO: f64 = 2.0;
+pub(crate) const PROMPT_CACHE_READ_CREATE_REGRESSION_RATIO: f64 = 2.0;
 const RESTART_LOOP_WARN_OCCURRENCES: usize = 3;
 const NOOP_CLOSEOUT_WARN_OCCURRENCES: usize = 3;
 const DEFAULT_FULL_FILE_READ_TOKENS: u64 = 4_000;
@@ -1709,7 +1709,7 @@ fn derive_prompt_cache_diagnostics(
 /// read-to-creation ratio when creation tokens exist and the ratio is below the
 /// regression threshold. Computed from raw token totals so it is independent of
 /// the display-truncated diagnostics vec.
-fn prompt_cache_read_create_regression(
+pub(crate) fn prompt_cache_read_create_regression(
     cached_input_tokens: u64,
     cache_creation_input_tokens: u64,
 ) -> Option<f64> {
@@ -1995,7 +1995,7 @@ fn format_signed_percent(value: f64) -> String {
     format!("{value:+.2}%")
 }
 
-fn signed_token_delta(read_tokens: u64, creation_tokens: u64) -> i64 {
+pub(crate) fn signed_token_delta(read_tokens: u64, creation_tokens: u64) -> i64 {
     if read_tokens >= creation_tokens {
         i64::try_from(read_tokens - creation_tokens).unwrap_or(i64::MAX)
     } else {

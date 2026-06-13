@@ -9,6 +9,7 @@ use std::time::{Instant, UNIX_EPOCH};
 const SESSION_HEADER_PROBE_BUDGET_BYTES: usize = 256 * 1024;
 
 use crate::{
+    prompt_cache_history::PromptCacheCrossRunComparison,
     session_cost::{
         self, SessionCostFileReadDiagnostic, SessionCostGuardrail, SessionCostGuardrailInput,
         SessionCostLoopCluster, SessionCostPromptCacheRoiScorecard,
@@ -218,6 +219,11 @@ pub struct SessionReviewReport {
     pub aggregate_cost: SessionReviewCostSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_session_cost: Option<SessionReviewCostSummary>,
+    /// Cross-run prompt-cache effectiveness comparison for the latest matched
+    /// session vs. the previous recorded run (#avbq). Populated by the CLI,
+    /// which owns persistence under `.tsift/prompt-cache-history/`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_cross_run: Option<PromptCacheCrossRunComparison>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub prompt_cache_roi_scorecard: Vec<SessionCostPromptCacheRoiScorecard>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -925,6 +931,7 @@ pub fn compute_with_options_and_phases(
         largest_turn_total_tokens,
         aggregate_cost,
         latest_session_cost,
+        prompt_cache_cross_run: None,
         prompt_cache_roi_scorecard,
         guardrails,
         loop_clusters,

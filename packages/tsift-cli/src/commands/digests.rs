@@ -3,7 +3,7 @@ use std::io::Read as _;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use tsift_agent_doc::{session_cost, session_digest, session_review};
+use tsift_agent_doc::{prompt_cache_history, session_cost, session_digest, session_review};
 use tsift_digest::{diff_digest, metric_digest};
 use tsift_quality::lint;
 
@@ -1369,6 +1369,36 @@ pub(crate) fn cmd_session_cost(
     Ok(())
 }
 
+/// Persist the latest matched session's prompt-cache effectiveness reading and
+/// attach the cross-run comparison to the report (#avbq). Recording is
+/// best-effort: a write failure (read-only tree, etc.) is logged to stderr and
+/// does not fail the read-only `session-review` command.
+fn record_session_review_prompt_cache_history(report: &mut session_review::SessionReviewReport) {
+    let Some(latest) = report.sessions.first() else {
+        return;
+    };
+    let recorded_at_unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let sample = prompt_cache_history::PromptCacheEffectivenessSample::from_tokens(
+        recorded_at_unix_secs,
+        latest.source.clone(),
+        latest.path.clone(),
+        latest.modified_unix_secs,
+        latest.prompt_tokens,
+        latest.cached_input_tokens,
+        latest.cache_creation_input_tokens,
+    );
+    let root = Path::new(&report.root);
+    match prompt_cache_history::record_prompt_cache_sample(root, sample) {
+        Ok(comparison) => report.prompt_cache_cross_run = Some(comparison),
+        Err(error) => {
+            eprintln!("session-review: prompt-cache history not recorded: {error:#}");
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn cmd_session_review(
     path: &Path,
@@ -1384,7 +1414,8 @@ pub(crate) fn cmd_session_review_with_budget(
     format: OutputFormat,
     budget: ResponseBudget,
 ) -> Result<()> {
-    let report = session_review::compute(path)?;
+    let mut report = session_review::compute(path)?;
+    record_session_review_prompt_cache_history(&mut report);
     if budget.is_active() {
         if next_context {
             let budget_report =

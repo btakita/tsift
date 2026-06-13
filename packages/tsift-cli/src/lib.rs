@@ -30556,6 +30556,7 @@ fn sample() {}
                 cached_input_ratio: Some(66.67),
                 largest_turn_total_tokens: 240,
             }),
+            prompt_cache_cross_run: None,
             prompt_cache_roi_scorecard: vec![],
             guardrails: vec![
                 session_cost::SessionCostGuardrail {
