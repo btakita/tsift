@@ -9,6 +9,19 @@ const MAX_REPEATED_LINES: usize = 8;
 const MAX_LINE_FAMILIES: usize = 8;
 const MAX_SIGNALS: usize = 12;
 
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// Sort rank for signal severities: errors before warnings before anything else.
+fn signal_severity_rank(severity: &str) -> u8 {
+    match severity {
+        "error" => 0,
+        "warning" => 1,
+        _ => 2,
+    }
+}
+
 /// Raw logs at or above this byte size are bulky enough that callers should
 /// persist them behind an artifact handle instead of relying on inlined digest
 /// groups, so the full transcript stays expandable without re-piping it.
@@ -68,6 +81,11 @@ pub struct LogDigestLineFamily {
     pub template: String,
     pub occurrences: usize,
     pub variants: usize,
+    /// How many of the folded distinct variants classified as an error. Non-zero
+    /// means this family hid that many distinct failures behind the template, so
+    /// consumers (and the raw-log artifact) must not treat it as benign noise.
+    #[serde(skip_serializing_if = "is_zero", default)]
+    pub error_variants: usize,
     pub first_sample: String,
     pub last_sample: String,
 }
@@ -174,7 +192,14 @@ pub fn digest_signal_text(report: &LogDigestReport) -> String {
         ));
     }
     for family in &report.line_families {
-        lines.push(format!("family x{}: {}", family.occurrences, family.template));
+        if family.error_variants > 0 {
+            lines.push(format!(
+                "family x{} ({} distinct errors): {}",
+                family.occurrences, family.error_variants, family.template
+            ));
+        } else {
+            lines.push(format!("family x{}: {}", family.occurrences, family.template));
+        }
         lines.push(family.first_sample.clone());
         lines.push(family.last_sample.clone());
     }
@@ -356,6 +381,11 @@ struct FileRefBuilder {
 struct LineFamilyBuilder {
     occurrences: usize,
     variants: BTreeSet<String>,
+    /// Distinct member lines that classified as an error severity. Tracked so a
+    /// family that folds many distinct *failures* (e.g. per-test `FAILED ...`
+    /// lines that templatize identically) is not mistaken for benign progress
+    /// noise and the hidden-error count survives past first/last sampling.
+    error_variants: BTreeSet<String>,
     first_sample: String,
     last_sample: String,
 }
@@ -388,7 +418,9 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
 
         let normalized = normalize_line(trimmed);
         *repeated_lines.entry(normalized.clone()).or_default() += 1;
-        record_line_family(&mut line_families, &normalized);
+        let line_signals = classify_signals(trimmed);
+        let line_is_error = line_signals.iter().any(|(severity, _)| *severity == "error");
+        record_line_family(&mut line_families, &normalized, line_is_error);
 
         if is_stack_frame_line(trimmed) {
             current_stack.push(normalize_stack_frame(trimmed));
@@ -419,7 +451,7 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
             *symbol_counts.entry(symbol).or_default() += 1;
         }
 
-        for (severity, message) in classify_signals(trimmed) {
+        for (severity, message) in line_signals {
             let (path, line, column) = if let Some(anchor) = &anchor {
                 (
                     Some(normalize_display_path(&root, &anchor.path)?),
@@ -481,14 +513,18 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
             template,
             occurrences: builder.occurrences,
             variants: builder.variants.len(),
+            error_variants: builder.error_variants.len(),
             first_sample: builder.first_sample,
             last_sample: builder.last_sample,
         })
         .collect::<Vec<_>>();
     line_family_items.sort_by(|left, right| {
-        right
-            .occurrences
-            .cmp(&left.occurrences)
+        // Families that hid distinct failures rank first so the inline cap never
+        // truncates away an error-bearing family in favor of benign progress noise.
+        (right.error_variants > 0)
+            .cmp(&(left.error_variants > 0))
+            .then(right.error_variants.cmp(&left.error_variants))
+            .then(right.occurrences.cmp(&left.occurrences))
             .then(right.variants.cmp(&left.variants))
             .then(left.template.cmp(&right.template))
     });
@@ -498,10 +534,11 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
     let mut signal_items = Vec::new();
     let mut signal_builders = signals.into_values().collect::<Vec<_>>();
     signal_builders.sort_by(|left, right| {
-        right
-            .occurrences
-            .cmp(&left.occurrences)
-            .then(left.severity.cmp(&right.severity))
+        // Errors first so a high-occurrence warning can never crowd a distinct
+        // error out of the MAX_SIGNALS budget; then by occurrences, then message.
+        signal_severity_rank(&left.severity)
+            .cmp(&signal_severity_rank(&right.severity))
+            .then(right.occurrences.cmp(&left.occurrences))
             .then(left.message.cmp(&right.message))
     });
     let signal_groups = signal_builders.len();
@@ -843,18 +880,26 @@ fn normalize_line(line: &str) -> String {
 /// Accumulate a whitespace-normalized line into its near-duplicate family,
 /// keyed by the variable-token-stripped template. The first sample is pinned on
 /// first sight; the last sample tracks the most recent member in input order.
-fn record_line_family(families: &mut BTreeMap<String, LineFamilyBuilder>, normalized: &str) {
+fn record_line_family(
+    families: &mut BTreeMap<String, LineFamilyBuilder>,
+    normalized: &str,
+    is_error: bool,
+) {
     let template = templatize_line(normalized);
     let builder = families
         .entry(template)
         .or_insert_with(|| LineFamilyBuilder {
             occurrences: 0,
             variants: BTreeSet::new(),
+            error_variants: BTreeSet::new(),
             first_sample: normalized.to_string(),
             last_sample: normalized.to_string(),
         });
     builder.occurrences += 1;
     builder.variants.insert(normalized.to_string());
+    if is_error {
+        builder.error_variants.insert(normalized.to_string());
+    }
     builder.last_sample = normalized.to_string();
 }
 
@@ -1633,6 +1678,74 @@ this assertion about latency held under load
         assert!(
             errors.is_empty(),
             "benign lines must not be classified as errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn line_family_surfaces_distinct_error_count_when_failures_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut input = String::new();
+        for idx in 0..20 {
+            input.push_str(&format!("FAILED tests/test_{idx}.py::t - assert {idx} == 200\n"));
+        }
+        let report = compute(dir.path(), &input).unwrap();
+
+        // All 20 distinct failures templatize identically and fold into one family...
+        let family = report
+            .line_families
+            .iter()
+            .find(|family| family.template.contains("FAILED"))
+            .expect("expected a folded FAILED family");
+        assert_eq!(
+            family.variants, 20,
+            "all 20 distinct lines fold to one template"
+        );
+        // ...but the distinct-error count survives past first/last sampling, so the
+        // family is not mistaken for benign progress noise.
+        assert_eq!(
+            family.error_variants, 20,
+            "folded family must surface the hidden distinct-error count"
+        );
+
+        // The inline signal list is still bounded, but the total is countable and
+        // the raw artifact is recommended so the over-cap failures are not lost.
+        assert_eq!(report.signal_groups, 20);
+        assert!(report.signals.len() <= MAX_SIGNALS);
+        assert!(raw_log_artifact_recommended(&report, input.len()));
+
+        // The text projection names the hidden distinct-error count.
+        assert!(
+            digest_signal_text(&report).contains("distinct errors"),
+            "digest text should surface the distinct-error count"
+        );
+    }
+
+    #[test]
+    fn error_signals_are_not_crowded_out_by_high_occurrence_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut input = String::new();
+        // 15 repetitions of 13 distinct warnings (high occurrence) ...
+        for _ in 0..15 {
+            for idx in 0..13 {
+                input.push_str(&format!("warning: deprecated api {idx} in use\n"));
+            }
+        }
+        // ... plus a single, low-occurrence real error.
+        input.push_str("error[E0599]: no method named `foo` found\n");
+        let report = compute(dir.path(), &input).unwrap();
+
+        let kept_error = report
+            .signals
+            .iter()
+            .any(|signal| signal.severity == "error" && signal.message.contains("E0599"));
+        assert!(
+            kept_error,
+            "a single error must survive the cap ahead of high-occurrence warnings: {:?}",
+            report
+                .signals
+                .iter()
+                .map(|s| (&s.severity, &s.message))
+                .collect::<Vec<_>>()
         );
     }
 
