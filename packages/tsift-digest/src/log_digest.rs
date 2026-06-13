@@ -946,15 +946,24 @@ fn templatize_line(line: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     for token in line.split_whitespace() {
         let placeholder = templatize_token(token);
-        // Cargo/build progress is `<Verb> <crate> v<version>`; the crate name
-        // also varies, so fold the bare identifier immediately before a bare
-        // version token. Restricted to an exact `<ver>` placeholder so wrapped
-        // or `key=<ver>` tokens do not fold an unrelated preceding word.
-        if placeholder == "<ver>"
-            && let Some(prev) = out.last_mut()
-            && is_plain_name(prev)
-        {
-            *prev = "<name>".to_string();
+        // Cargo/build progress is exactly `<Verb> <crate> v<version>`; the crate
+        // name varies, so fold the bare identifier immediately before the
+        // version token. Restricted to (a) an exact `<ver>` placeholder so
+        // wrapped or `key=<ver>` tokens do not fold an unrelated word, and (b)
+        // the canonical 3-token shape — the version is the third token after a
+        // Title-case progress verb — so connectives in lines like
+        // `Downgrading serde from v1.0.0` / `Updating tokio to v2.0.0` are not
+        // mistaken for the crate name and folded away (#logfoldname).
+        if placeholder == "<ver>" && out.len() == 2 {
+            let verb_is_progress = out
+                .first()
+                .is_some_and(|verb| is_cargo_progress_verb(verb));
+            if verb_is_progress
+                && let Some(prev) = out.last_mut()
+                && is_plain_name(prev)
+            {
+                *prev = "<name>".to_string();
+            }
         }
         out.push(placeholder);
     }
@@ -1086,6 +1095,18 @@ fn is_plain_name(token: &str) -> bool {
         && token
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+}
+
+/// Cargo/build progress verbs are Title-case alphabetic words (Compiling,
+/// Checking, Updating, Downgrading, Downloading, ...). Used to restrict the
+/// `<name>` crate-fold to the canonical `<Verb> <crate> v<ver>` shape so
+/// connectives (`from`/`to`) before a version are not folded as crate names.
+fn is_cargo_progress_verb(token: &str) -> bool {
+    token
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase())
+        && token.chars().all(|ch| ch.is_ascii_alphabetic())
 }
 
 fn classify_signals(line: &str) -> Vec<(&'static str, String)> {
@@ -1531,6 +1552,38 @@ at src/lib.rs:1:1
         );
         assert_eq!(report.stack_traces.len(), 1);
         assert_eq!(report.stack_traces[0].occurrences, 2);
+    }
+
+    #[test]
+    fn templatize_line_folds_only_canonical_cargo_progress_shape() {
+        // Canonical `<Verb> <crate> v<ver>` folds the crate name.
+        assert_eq!(
+            templatize_line("Compiling serde v1.0.193"),
+            "Compiling <name> <ver>"
+        );
+        assert_eq!(
+            templatize_line("Checking syn v2.0.80"),
+            "Checking <name> <ver>"
+        );
+
+        // Connectives before a version are NOT mistaken for the crate name, so
+        // `from` / `to` survive and the two lines keep distinct templates
+        // (#logfoldname).
+        assert_eq!(
+            templatize_line("Downgrading serde from v1.0.0"),
+            "Downgrading serde from <ver>"
+        );
+        assert_eq!(
+            templatize_line("Updating tokio to v2.0.0"),
+            "Updating tokio to <ver>"
+        );
+        assert_ne!(
+            templatize_line("Downgrading serde from v1.0.0"),
+            templatize_line("Updating tokio to v2.0.0")
+        );
+
+        // A lowercase, non-progress 3-token line ending in a version does not fold.
+        assert_eq!(templatize_line("error in v1.0.0"), "error in <ver>");
     }
 
     #[test]
