@@ -3316,8 +3316,11 @@ fn prompt_cache_metadata(
     );
     let mut breakpoints = Vec::new();
     collect_prompt_cache_breakpoints(value, "$", &mut breakpoints);
-    breakpoints.sort();
-    breakpoints.dedup();
+    // Breakpoint identity is position-independent (array indices stripped in
+    // collection); collapse identical entries into a counted entry so multiple
+    // ephemeral breakpoints keep their cardinality without the per-position
+    // churn that read as false drift when a block was inserted (#pcachebp).
+    let mut breakpoints = aggregate_prompt_cache_breakpoint_counts(breakpoints);
     breakpoints.truncate(MAX_PROMPT_CACHE_BREAKPOINTS);
 
     let stable_prefix_fingerprint = explicit_fingerprint.unwrap_or_else(|| {
@@ -3407,7 +3410,7 @@ fn collect_prompt_cache_breakpoints(value: &Value, path: &str, breakpoints: &mut
                 ) {
                     breakpoints.push(format!(
                         "{}={}",
-                        child_path.trim_start_matches("$."),
+                        strip_json_array_indices(child_path.trim_start_matches("$.")),
                         describe_prompt_cache_breakpoint(child)
                     ));
                 }
@@ -3422,6 +3425,47 @@ fn collect_prompt_cache_breakpoints(value: &Value, path: &str, breakpoints: &mut
         }
         _ => {}
     }
+}
+
+/// Drop `[N]` array-index segments from a JSON path so a cache breakpoint's
+/// identity does not change when a non-cached block is inserted ahead of the
+/// cached one (e.g. `message.content[0].cache_control` and
+/// `message.content[1].cache_control` both become `message.content.cache_control`).
+fn strip_json_array_indices(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut in_index = false;
+    for ch in path.chars() {
+        match ch {
+            '[' => in_index = true,
+            ']' => in_index = false,
+            _ if !in_index => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Collapse identical position-independent breakpoints into a sorted list where
+/// repeated entries carry an `(xN)` count, so multiple breakpoints of the same
+/// shape keep their cardinality without re-introducing positional churn.
+fn aggregate_prompt_cache_breakpoint_counts(mut breakpoints: Vec<String>) -> Vec<String> {
+    breakpoints.sort();
+    let mut aggregated: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < breakpoints.len() {
+        let breakpoint = &breakpoints[index];
+        let mut count = 1;
+        while index + count < breakpoints.len() && breakpoints[index + count] == *breakpoint {
+            count += 1;
+        }
+        if count > 1 {
+            aggregated.push(format!("{breakpoint} (x{count})"));
+        } else {
+            aggregated.push(breakpoint.clone());
+        }
+        index += count;
+    }
+    aggregated
 }
 
 fn describe_prompt_cache_breakpoint(value: &Value) -> String {
@@ -3678,9 +3722,11 @@ mod tests {
         assert_eq!(first.provider, "anthropic");
         assert_eq!(first.cache_key.as_deref(), Some("agent-doc:tsift"));
         assert_eq!(first.routing_affinity.as_deref(), Some("replica-a"));
+        // Breakpoint identity is position-independent: array indices are stripped
+        // so an inserted block ahead of the cached one is not read as drift (#pcachebp).
         assert!(
             first.breakpoints.iter().any(|breakpoint| {
-                breakpoint == "message.content[0].cache_control=type:ephemeral"
+                breakpoint == "message.content.cache_control=type:ephemeral"
             })
         );
         assert!(first.stable_prefix_fingerprint.starts_with("spfx-"));
@@ -3901,6 +3947,56 @@ mod tests {
         // The fingerprint is the only reported change — no concrete sub-field moved.
         assert_eq!(drift.field_changes.len(), 1);
         assert_eq!(drift.field_changes[0].field, "stable_prefix_fingerprint");
+    }
+
+    #[test]
+    fn prompt_cache_breakpoint_identity_is_position_independent() {
+        let turn_a = serde_json::json!({
+            "message": { "content": [
+                { "type": "text", "text": "sys", "cache_control": { "type": "ephemeral" } }
+            ]}
+        });
+        // A non-cached block inserted ahead shifts content[0] -> content[1].
+        let turn_b = serde_json::json!({
+            "message": { "content": [
+                { "type": "thinking", "text": "..." },
+                { "type": "text", "text": "sys", "cache_control": { "type": "ephemeral" } }
+            ]}
+        });
+
+        let mut bp_a = Vec::new();
+        collect_prompt_cache_breakpoints(&turn_a, "$", &mut bp_a);
+        let bp_a = aggregate_prompt_cache_breakpoint_counts(bp_a);
+
+        let mut bp_b = Vec::new();
+        collect_prompt_cache_breakpoints(&turn_b, "$", &mut bp_b);
+        let bp_b = aggregate_prompt_cache_breakpoint_counts(bp_b);
+
+        assert_eq!(
+            bp_a,
+            vec!["message.content.cache_control=type:ephemeral".to_string()]
+        );
+        assert_eq!(
+            bp_a, bp_b,
+            "inserting a non-cached block must not change breakpoint identity (#pcachebp)"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_breakpoints_keep_count_of_repeated_shapes() {
+        let turn = serde_json::json!({
+            "message": { "content": [
+                { "type": "text", "cache_control": { "type": "ephemeral" } },
+                { "type": "text", "cache_control": { "type": "ephemeral" } }
+            ]}
+        });
+        let mut bp = Vec::new();
+        collect_prompt_cache_breakpoints(&turn, "$", &mut bp);
+        let bp = aggregate_prompt_cache_breakpoint_counts(bp);
+        assert_eq!(
+            bp,
+            vec!["message.content.cache_control=type:ephemeral (x2)".to_string()]
+        );
     }
 
     #[test]
