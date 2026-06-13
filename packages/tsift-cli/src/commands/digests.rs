@@ -1066,7 +1066,7 @@ pub(crate) fn cmd_session_cost(
                 }
                 for drift in &analytics.prefix_drift {
                     println!(
-                        "prompt-cache-prefix-drift {} {} {}->{} first_changed:{} changes:{} cache_ratio:{}->{} creation:{}",
+                        "prompt-cache-prefix-drift {} {} {}->{} first_changed:{} changes:{} cache_ratio:{}->{} creation:{} fix:{}",
                         drift.severity,
                         drift.trigger,
                         truncate_for_compact(&drift.previous_label, 60),
@@ -1075,7 +1075,8 @@ pub(crate) fn cmd_session_cost(
                         compact_prompt_cache_field_changes(&drift.field_changes),
                         drift.cached_input_ratio_before.as_deref().unwrap_or("-"),
                         drift.cached_input_ratio_after.as_deref().unwrap_or("-"),
-                        drift.cache_creation_ratio.as_deref().unwrap_or("-")
+                        drift.cache_creation_ratio.as_deref().unwrap_or("-"),
+                        truncate_for_compact(&drift.remediation, 120)
                     );
                 }
                 for turn in &analytics.timeline {
@@ -1329,6 +1330,7 @@ pub(crate) fn cmd_session_cost(
                         change.field, change.previous, change.current
                     );
                 }
+                println!("      fix: {}", drift.remediation);
             }
             if analytics.prefix_drift_truncated {
                 println!("    prefix drift truncated");

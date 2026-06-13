@@ -207,6 +207,11 @@ pub struct SessionCostPromptCachePrefixDrift {
     pub trigger: String,
     pub severity: String,
     pub first_changed_field: String,
+    /// Concrete, field-specific fix for the attributed drift cause: stabilize the
+    /// changed input or move the volatile field below the cache breakpoint. Always
+    /// populated so the report tells the agent what to *do*, not just what drifted
+    /// (#pcacheremediation).
+    pub remediation: String,
     pub field_changes: Vec<SessionCostPromptCacheFieldChange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_input_ratio_before: Option<String>,
@@ -1747,6 +1752,7 @@ fn derive_prompt_cache_prefix_drift(
             } else {
                 "info".to_string()
             },
+            remediation: prompt_cache_prefix_drift_remediation(&first_changed_field),
             first_changed_field,
             field_changes,
             cached_input_ratio_before: percent_ratio(
@@ -1770,6 +1776,24 @@ fn derive_prompt_cache_prefix_drift(
     let truncated = drift.len() > MAX_PROMPT_CACHE_PREFIX_DRIFT;
     drift.truncate(MAX_PROMPT_CACHE_PREFIX_DRIFT);
     (drift, truncated)
+}
+
+/// Map an attributed prefix-drift cause (`first_changed_field`) to a concrete,
+/// actionable fix. The diagnostics list already explains *what* invalidated the
+/// cache; this turns the named field into a specific remediation the agent can
+/// apply — stabilize the changed input, or move the volatile field below the
+/// cache breakpoint so the warm prefix is reused (#pcacheremediation, #0g7c).
+fn prompt_cache_prefix_drift_remediation(first_changed_field: &str) -> String {
+    match first_changed_field {
+        "cache_key" => "stabilize the prompt_cache_key: reuse the same thread/session id across turns so the provider serves the warm cached prefix instead of creating a cold one",
+        "breakpoints" => "keep cache breakpoint placement constant: move the volatile block below the cache breakpoint so the stable prefix above it stays byte-identical and cached",
+        "routing_affinity" => "pin routing/replica affinity: route every turn of the session to the same cache replica so the warm prefix is not lost to a cold replica",
+        "provider" => "avoid switching providers mid-session: a provider change discards the warm cached prefix, so keep the session on one provider",
+        "stable_prefix" => "stabilize the prefix bytes: move the volatile content that changed out of the stable prefix and below the cache breakpoint so the cached prefix stays byte-identical",
+        "stable_prefix_fingerprint" => "the provider rotated the stable-prefix fingerprint: audit the cached prefix material and move any volatile content below the cache breakpoint so the fingerprint stays stable",
+        _ => "stabilize the changed input or move the volatile field below the cache breakpoint so the cached prefix is reused",
+    }
+    .to_string()
 }
 
 fn prompt_cache_ratio_drop_triggered(
@@ -3949,6 +3973,13 @@ mod tests {
         assert_eq!(drift.severity, "warn");
         // Attribution names the real cause, not the derived composite.
         assert_eq!(drift.first_changed_field, "cache_key");
+        // Attribution carries a concrete, field-specific fix, not just the cause
+        // (#pcacheremediation / #0g7c).
+        assert!(
+            drift.remediation.contains("prompt_cache_key"),
+            "cache_key drift remediation should name the prompt_cache_key fix, got: {}",
+            drift.remediation
+        );
         assert_eq!(drift.cached_input_ratio_before.as_deref(), Some("90.00%"));
         assert_eq!(drift.cached_input_ratio_after.as_deref(), Some("10.00%"));
         assert_eq!(drift.cache_creation_ratio.as_deref(), Some("60.00%"));
@@ -4023,6 +4054,13 @@ mod tests {
         // leaving `stable_prefix` as the sole reported change.
         assert_eq!(drift.field_changes.len(), 1);
         assert_eq!(drift.field_changes[0].field, "stable_prefix");
+        // The remediation names the concrete prefix-bytes fix (move volatile
+        // content below the cache breakpoint), not a generic restatement.
+        assert!(
+            drift.remediation.contains("below the cache breakpoint"),
+            "stable_prefix drift remediation should suggest moving volatile content below the cache breakpoint, got: {}",
+            drift.remediation
+        );
         assert!(
             !drift
                 .field_changes
@@ -4030,6 +4068,32 @@ mod tests {
                 .any(|change| change.field == "stable_prefix_fingerprint"),
             "derived fingerprint echo must be suppressed when a sub-field changed"
         );
+    }
+
+    #[test]
+    fn prompt_cache_prefix_drift_remediation_is_field_specific() {
+        // Every attributed cause maps to a concrete fix the agent can act on,
+        // and the fallback still gives actionable guidance for unknown fields
+        // (#pcacheremediation / #0g7c).
+        assert!(prompt_cache_prefix_drift_remediation("cache_key").contains("prompt_cache_key"));
+        assert!(
+            prompt_cache_prefix_drift_remediation("breakpoints").contains("breakpoint placement")
+        );
+        assert!(
+            prompt_cache_prefix_drift_remediation("routing_affinity").contains("replica affinity")
+        );
+        assert!(prompt_cache_prefix_drift_remediation("provider").contains("provider"));
+        assert!(
+            prompt_cache_prefix_drift_remediation("stable_prefix").contains("prefix bytes")
+        );
+        assert!(
+            prompt_cache_prefix_drift_remediation("stable_prefix_fingerprint")
+                .contains("fingerprint")
+        );
+        // Unknown / future field falls back to actionable guidance, never empty.
+        let fallback = prompt_cache_prefix_drift_remediation("some_new_field");
+        assert!(fallback.contains("cache breakpoint"));
+        assert!(!fallback.is_empty());
     }
 
     #[test]

@@ -147,8 +147,11 @@ GitHub release assets are built by the `Release` workflow for:
 The crates.io package path lists every split Rust crate package during release
 verification, then the tagged publish job runs `cargo publish --locked --dry-run`
 immediately before each real publish in dependency order. The release workflow
-uses the `TSIFT_ENABLE_CRATES_PUBLISH=true` repository variable and
-`CARGO_REGISTRY_TOKEN` repository secret to turn on tagged crates.io publishes.
+uses the `TSIFT_ENABLE_CRATES_PUBLISH=true` repository variable to turn on tagged
+crates.io publishes and authenticates via OIDC trusted publishing — it exchanges
+a GitHub `id-token` for a short-lived crates.io token through
+`rust-lang/crates-io-auth-action`, so there is no long-lived `CARGO_REGISTRY_TOKEN`
+secret to expire (each crate must have a Trusted Publisher configured on crates.io).
 It skips crate versions that already exist on crates.io so interrupted releases
 can resume, and retries crates.io rate limits.
 The default lexical search adapter is maintained in-tree, so publishing no

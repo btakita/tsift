@@ -161,25 +161,35 @@ fn release_publish_gate_requires_secret_variable_and_dry_run() {
         workflow.contains("vars.TSIFT_ENABLE_CRATES_PUBLISH == 'true'"),
         "publish job should remain opt-in through the repo variable"
     );
+    // The publish job authenticates via OIDC trusted publishing (no long-lived
+    // CARGO_REGISTRY_TOKEN secret to expire — root-fix for #1td4); it requests an
+    // id-token, exchanges it through the crates.io auth action, and feeds the
+    // resulting short-lived token to cargo.
     assert!(
-        workflow.contains("CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}"),
-        "publish job should read the crates.io token from the repo secret"
+        workflow.contains("id-token: write")
+            && workflow.contains("rust-lang/crates-io-auth-action@v1")
+            && workflow.contains("CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}"),
+        "publish job should authenticate to crates.io via OIDC trusted publishing"
+    );
+    assert!(
+        !workflow.contains("secrets.CARGO_REGISTRY_TOKEN"),
+        "publish job must not depend on a long-lived CARGO_REGISTRY_TOKEN secret"
     );
     assert!(
         spec.contains("TSIFT_ENABLE_CRATES_PUBLISH=true")
-            && spec.contains("CARGO_REGISTRY_TOKEN")
+            && spec.contains("OIDC trusted publishing")
             && spec.contains("cargo package -p <crate> --locked --allow-dirty --list")
             && spec.contains("cargo publish -p <crate> --locked --dry-run")
             && spec.contains("skips crate versions that already exist on crates.io")
             && spec.contains("retries crates.io rate limits"),
-        "release spec should document the publish gate"
+        "release spec should document the OIDC publish gate"
     );
     assert!(
         readme.contains("TSIFT_ENABLE_CRATES_PUBLISH=true")
-            && readme.contains("CARGO_REGISTRY_TOKEN")
+            && readme.contains("OIDC trusted publishing")
             && readme.contains("skips crate versions that already exist on crates.io")
             && readme.contains("retries crates.io rate limits"),
-        "README should document the repo variable and secret"
+        "README should document the repo variable and OIDC publishing"
     );
 
     assert_release_package_order(&workflow, "      - name: Crate package file check");
