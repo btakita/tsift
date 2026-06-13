@@ -35,8 +35,11 @@ jobs:
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
 
+      # continue-on-error: a cache-service outage (not a cache miss) must not
+      # abort the suite — fall through to a cold build instead. See #cicacheguard.
       - name: Cache cargo registry + build
         uses: actions/cache@v4
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry
@@ -72,8 +75,11 @@ jobs:
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
 
+      # continue-on-error: a cache-service outage (not a cache miss) must not
+      # abort the suite — fall through to a cold build instead. See #cicacheguard.
       - name: Cache cargo registry + build
         uses: actions/cache@v4
+        continue-on-error: true
         with:
           path: |
             ~/.cargo/registry
