@@ -1,6 +1,6 @@
 [package]
 name = "tsift-index"
-version = "0.1.69"
+version = "0.1.70"
 edition = "2024"
 description = "Tsift index foundation — config loading, project walk, init/instructions, AST symbol index"
 license = "MIT"
@@ -21,8 +21,8 @@ fs4 = "0.13"
 ignore = "0.4"
 lazily = "0.10"
 tagpath = { version = "0.11.1", default-features = false, features = ["lang-rust", "lang-python", "lang-javascript", "lang-typescript"] }
-tsift-graph = { path = "../tsift-graph", version = "0.1.69" }
-tsift-sqlite = { path = "../tsift-sqlite", version = "0.1.69" }
+tsift-graph = { path = "../tsift-graph", version = "0.1.70" }
+tsift-sqlite = { path = "../tsift-sqlite", version = "0.1.70" }
 
 [dev-dependencies]
 tempfile = "3"

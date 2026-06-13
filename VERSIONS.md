@@ -8,6 +8,15 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.70
+
+- **`#cargoidxcov`**: `source-read`/`symbol-read` build the per-package cargo index on demand so symbol projection works for packages whose index had not yet been materialized.
+- **`#tsreviewcleanup`**: Three `session-cost`/`graph-db` review cleanups across the prompt-cache attribution and snapshot-export paths.
+- **prompt-cache fidelity**: track raw `stable_prefix` so explicit fingerprints don't bypass prefix-drift attribution; make breakpoint identity position-independent (`#pcachebp`); count read/create regression from the raw signal (`#pcacheregtrunc`); attribute prompt-cache drift to the concrete changed field (`#pcacheattr`).
+- **graph-db write safety**: serialize graph-db writes + snapshot-import with an advisory lock (`#gdbwritelock`); cover `compact --apply` and memory upsert under the write lock (`#gdblockcover`); map snapshot-export locked-db to the live-lock diagnostic (`#gdbexportlockdiag`); record WAL checkpoint outcome instead of swallowing it (`#gdbwalcheckpoint`).
+- **log-digest fidelity**: restrict cargo `<name>` fold to the canonical progress shape (`#logfoldname`); add a dropped-error fidelity guard to the gate (`#loggatefidelity`); surface distinct-error count when failures fold (`#logfoldloss`); classify canonical terminal-failure summary lines (`#logclassfn`).
+- **`#cicacheguard`**: make the CI cargo cache step non-fatal.
+
 ## 0.1.69
 
 - **`#lazilybump`**: Upgraded the `lazily` dependency requirement from `0.2` to `0.10` in `tsift-core`, `tsift-graph`, `tsift-index`, `tsift-status`, and `tsift-summarize`. The crates already build and lock against `lazily` 0.10.x locally via the superproject path patch; the published manifests now declare the matching `^0.10` requirement so crates.io consumers resolve the same line instead of the stale `0.2.x` series.
