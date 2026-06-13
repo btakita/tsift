@@ -1023,14 +1023,14 @@ impl SqliteGraphStore {
         self.assert_not_in_temp_table_section();
         self.temp_table_active.set(true);
         let scope = scope.into();
-        let result = self.replace_projection_with_version_fallible(
+        let mut result = self.replace_projection_with_version_fallible(
             scope,
             projection,
             projection_version,
             source_watermark,
         );
         self.temp_table_active.set(false);
-        if let Ok(ref refresh) = result {
+        if let Ok(ref mut refresh) = result {
             let total_rows = refresh.upserted_nodes + refresh.upserted_edges;
             let autocheckpoint = if total_rows > 10000 {
                 8192
@@ -1042,7 +1042,51 @@ impl SqliteGraphStore {
             let _ = self
                 .conn
                 .pragma_update(None, "wal_autocheckpoint", autocheckpoint);
-            let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+            // `PRAGMA wal_checkpoint(TRUNCATE)` reports its outcome in a result
+            // row `(busy, log_frames, checkpointed_frames)` rather than erroring:
+            // concurrent readers pin the WAL and yield `busy=1`, so the WAL is
+            // not truncated. The old `let _ = execute_batch(...)` discarded that
+            // row entirely, hiding unbounded `-wal` growth that later trips
+            // snapshot-export/import sidecar checks. Record the outcome in
+            // phase_timings instead of swallowing it (#gdbwalcheckpoint).
+            let checkpoint_started = Instant::now();
+            let checkpoint = self.conn.query_row(
+                "PRAGMA wal_checkpoint(TRUNCATE)",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            );
+            let (name, detail) = match checkpoint {
+                Ok((0, _log, _checkpointed)) => (
+                    "wal_checkpoint:ok",
+                    "wal_checkpoint(TRUNCATE) truncated the WAL".to_string(),
+                ),
+                Ok((_busy, log, checkpointed)) => (
+                    "wal_checkpoint:busy",
+                    format!(
+                        "wal_checkpoint(TRUNCATE) was blocked by concurrent readers \
+                         ({checkpointed}/{log} frames checkpointed, WAL not truncated); \
+                         the -wal file may grow until readers release and a writer truncates it"
+                    ),
+                ),
+                Err(err) => (
+                    "wal_checkpoint:error",
+                    format!(
+                        "wal_checkpoint(TRUNCATE) failed: {err}; \
+                         the -wal file may grow until a writer can checkpoint it"
+                    ),
+                ),
+            };
+            refresh.phase_timings.push(SqliteProjectionRefreshPhase {
+                name: name.to_string(),
+                duration_micros: checkpoint_started.elapsed().as_micros(),
+                detail,
+            });
         }
         result
     }
@@ -4473,6 +4517,73 @@ mod tests {
                 ("b".to_string(), "calls".to_string(), "c".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn wal_checkpoint_outcome_is_recorded_not_swallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let mut store = SqliteGraphStore::open(&db_path).unwrap();
+        let refresh = store
+            .replace_projection_with_version("root", &sample_projection(), Some("v1"), None)
+            .unwrap();
+        // With no concurrent reader the TRUNCATE checkpoint succeeds and the
+        // outcome is recorded as a phase instead of being silently discarded.
+        assert!(
+            refresh
+                .phase_timings
+                .iter()
+                .any(|phase| phase.name == "wal_checkpoint:ok"),
+            "expected a wal_checkpoint:ok phase: {:?}",
+            refresh
+                .phase_timings
+                .iter()
+                .map(|phase| &phase.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wal_checkpoint_records_busy_when_a_reader_blocks_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let mut store = SqliteGraphStore::open(&db_path).unwrap();
+        store
+            .replace_projection_with_version("root", &sample_projection(), Some("v1"), None)
+            .unwrap();
+
+        // A second connection holds an open read transaction, pinning the WAL so
+        // a TRUNCATE checkpoint cannot reset it (busy) — the path that previously
+        // grew the -wal file silently (#gdbwalcheckpoint).
+        let reader = rusqlite::Connection::open(&db_path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _pinned: i64 = reader
+            .query_row("SELECT count(*) FROM graph_operator_stats", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        let mut projection = sample_projection();
+        projection
+            .nodes
+            .push(GraphNode::new("topic:extra", "topic", "Extra"));
+        let refresh = store
+            .replace_projection_with_version("root", &projection, Some("v2"), None)
+            .unwrap();
+
+        assert!(
+            refresh
+                .phase_timings
+                .iter()
+                .any(|phase| phase.name == "wal_checkpoint:busy"),
+            "expected a wal_checkpoint:busy phase while a reader holds the WAL: {:?}",
+            refresh
+                .phase_timings
+                .iter()
+                .map(|phase| &phase.name)
+                .collect::<Vec<_>>()
+        );
+        drop(reader);
     }
 
     #[test]
