@@ -25188,6 +25188,45 @@ fn main() { api::handler(); }
     }
 
     #[test]
+    fn graph_db_snapshot_clean_export_maps_database_locked_to_live_lock_diagnostic() {
+        let dir = setup_traversal_project();
+        refresh_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
+        let graph_db = dir.path().join(".tsift/graph.db");
+
+        // Hold a plain EXCLUSIVE lock with no recovery sidecar so the export
+        // clears the recovery fail-closed gate and reaches VACUUM INTO, which
+        // then fails with a raw SQLite "database is locked".
+        let blocker = Connection::open(&graph_db).unwrap();
+        blocker
+            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        assert!(!substrate::rollback_journal_path(&graph_db).exists());
+
+        let clean_path = dir.path().join("graph-clean-export.db");
+        let err = match commands::infra::graph_db_snapshot_clean_export_copy(&graph_db, &clean_path) {
+            Ok(bytes) => panic!("expected export to fail under live lock, got {bytes} bytes"),
+            Err(err) => err,
+        };
+
+        let message = err.to_string();
+        assert!(
+            message.contains("concurrent graph-db refresh or snapshot-import is in progress"),
+            "expected actionable live-lock diagnostic, got {err:#}"
+        );
+        assert!(
+            message.contains("wait for it to finish before retrying"),
+            "expected retry guidance, got {err:#}"
+        );
+        // The raw SQLite phrasing must not leak as the surfaced top-level error.
+        assert!(
+            !message.contains("creating clean graph-db export copy"),
+            "live-lock case must not surface the generic VACUUM context, got {err:#}"
+        );
+
+        drop(blocker);
+    }
+
+    #[test]
     fn graph_db_evidence_uses_snapshot_fallback_when_graph_db_is_locked() {
         let dir = setup_traversal_project();
         let session = dir.path().join("tasks/software/tsift.md");

@@ -631,14 +631,31 @@ fn graph_db_snapshot_decompress_to_staged(artifact: &Path, staged: &Path) -> Res
         .len())
 }
 
-fn graph_db_snapshot_clean_export_copy(graph_db: &Path, clean_path: &Path) -> Result<u64> {
-    let conn =
-        substrate::open_graph_read_only_connection_resilient(graph_db).with_context(|| {
-            format!(
-                "opening graph db for snapshot export {}",
+pub(crate) fn graph_db_snapshot_clean_export_copy(graph_db: &Path, clean_path: &Path) -> Result<u64> {
+    // A concurrent graph-db refresh / snapshot-import can hold an exclusive
+    // database lock, which surfaces as a raw SQLite "database is locked" from
+    // either the read-only open below or the VACUUM INTO copy. Map that to the
+    // same actionable live-lock diagnostic the write-lock path emits instead of
+    // leaking the bare SQLite error to the operator.
+    let map_live_lock = |err: anyhow::Error, fallback: String| -> anyhow::Error {
+        if substrate::error_mentions_locked_db(&err) {
+            anyhow::anyhow!(
+                "graph-db snapshot-export could not read {}: a concurrent graph-db \
+                 refresh or snapshot-import is in progress (database is locked); \
+                 wait for it to finish before retrying the export",
                 graph_db.display()
             )
-        })?;
+        } else {
+            err.context(fallback)
+        }
+    };
+
+    let conn = substrate::open_graph_read_only_connection_resilient(graph_db).map_err(|err| {
+        map_live_lock(
+            err,
+            format!("opening graph db for snapshot export {}", graph_db.display()),
+        )
+    })?;
     if let Some(recovery) = conn.recovery() {
         bail!(
             "graph-db snapshot-export refused recovered read path: {}; resolve the live database lock before exporting a shareable artifact",
@@ -646,15 +663,19 @@ fn graph_db_snapshot_clean_export_copy(graph_db: &Path, clean_path: &Path) -> Re
         );
     }
     let clean_path_str = clean_path.to_string_lossy().to_string();
-    conn.conn()
+    if let Err(err) = conn
+        .conn()
         .execute("VACUUM INTO ?1", [clean_path_str.as_str()])
-        .with_context(|| {
+    {
+        return Err(map_live_lock(
+            anyhow::Error::new(err),
             format!(
                 "creating clean graph-db export copy {} from {}",
                 clean_path.display(),
                 graph_db.display()
-            )
-        })?;
+            ),
+        ));
+    }
     Ok(fs::metadata(clean_path)
         .with_context(|| format!("stat clean graph-db export copy {}", clean_path.display()))?
         .len())
