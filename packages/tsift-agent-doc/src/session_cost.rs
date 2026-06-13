@@ -1767,13 +1767,16 @@ fn prompt_cache_field_changes(
         return Vec::new();
     };
 
+    // Attribute the most specific concrete cause first. The
+    // `stable_prefix_fingerprint` is usually a *derived* composite of
+    // provider + cache_key + stable_prefix + breakpoints, so any sub-field
+    // change also flips the fingerprint; reporting the fingerprint first made
+    // `first_changed_field` always read `stable_prefix_fingerprint` and never
+    // named the real cause (#pcacheattr). With concrete fields ordered first,
+    // the fingerprint only becomes the first change when no tracked sub-field
+    // moved — i.e. the stable prefix content itself drifted — which is the
+    // correct residual attribution.
     let mut changes = Vec::new();
-    push_prompt_cache_field_change(
-        &mut changes,
-        "stable_prefix_fingerprint",
-        &previous.stable_prefix_fingerprint,
-        &current.stable_prefix_fingerprint,
-    );
     push_prompt_cache_field_change(
         &mut changes,
         "cache_key",
@@ -1797,6 +1800,12 @@ fn prompt_cache_field_changes(
         "provider",
         &previous.provider,
         &current.provider,
+    );
+    push_prompt_cache_field_change(
+        &mut changes,
+        "stable_prefix_fingerprint",
+        &previous.stable_prefix_fingerprint,
+        &current.stable_prefix_fingerprint,
     );
     changes
 }
@@ -3774,10 +3783,14 @@ mod tests {
 
     #[test]
     fn prompt_cache_prefix_drift_points_regressions_at_first_changed_field() {
+        // Only the cache_key changes between turns; provider, routing, prefix,
+        // and breakpoints are identical. The derived fingerprint flips too (it
+        // hashes the cache_key), but attribution must name the concrete cause —
+        // `cache_key` — not the composite fingerprint (#pcacheattr).
         let input = concat!(
             r#"{"timestamp":"2026-05-05T00:00:01Z","provider":"anthropic","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","message":{"id":"msg-1","role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}],"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":9000,"output_tokens":50}}}"#,
             "\n",
-            r#"{"timestamp":"2026-05-05T00:00:02Z","provider":"openai","prompt_cache_key":"agent-doc:tsift-cold","routing_affinity":"replica-b","stable_prefix":"agent-doc stable prefix v2","message":{"id":"msg-2","role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"persistent"}}],"usage":{"input_tokens":3000,"cache_creation_input_tokens":6000,"cache_read_input_tokens":1000,"output_tokens":50}}}"#,
+            r#"{"timestamp":"2026-05-05T00:00:02Z","provider":"anthropic","prompt_cache_key":"agent-doc:tsift-cold","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","message":{"id":"msg-2","role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}],"usage":{"input_tokens":3000,"cache_creation_input_tokens":6000,"cache_read_input_tokens":1000,"output_tokens":50}}}"#,
             "\n",
         );
 
@@ -3792,17 +3805,14 @@ mod tests {
         let drift = &analytics.prefix_drift[0];
         assert_eq!(drift.trigger, "cached_ratio_drop_and_cache_creation_spike");
         assert_eq!(drift.severity, "warn");
-        assert_eq!(drift.first_changed_field, "stable_prefix_fingerprint");
+        // Attribution names the real cause, not the derived composite.
+        assert_eq!(drift.first_changed_field, "cache_key");
         assert_eq!(drift.cached_input_ratio_before.as_deref(), Some("90.00%"));
         assert_eq!(drift.cached_input_ratio_after.as_deref(), Some("10.00%"));
         assert_eq!(drift.cache_creation_ratio.as_deref(), Some("60.00%"));
-        for field in [
-            "stable_prefix_fingerprint",
-            "cache_key",
-            "breakpoints",
-            "routing_affinity",
-            "provider",
-        ] {
+        // Only the changed concrete field and the derived fingerprint are
+        // reported; unchanged fields do not appear.
+        for field in ["cache_key", "stable_prefix_fingerprint"] {
             assert!(
                 drift
                     .field_changes
@@ -3811,18 +3821,55 @@ mod tests {
                 "expected drift field {field}"
             );
         }
+        for field in ["provider", "routing_affinity", "breakpoints"] {
+            assert!(
+                !drift
+                    .field_changes
+                    .iter()
+                    .any(|change| change.field == field),
+                "unchanged field {field} must not be reported as drift"
+            );
+        }
         assert!(analytics.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == "cached_ratio_drop"
                 && diagnostic
                     .message
-                    .contains("first changed prompt-cache field: stable_prefix_fingerprint")
+                    .contains("first changed prompt-cache field: cache_key")
         }));
         assert!(analytics.diagnostics.iter().any(|diagnostic| {
             diagnostic.kind == "cache_creation_spike"
-                && diagnostic.likely_causes.iter().any(|cause| {
-                    cause.contains("first changed prompt-cache field: stable_prefix_fingerprint")
-                })
+                && diagnostic
+                    .likely_causes
+                    .iter()
+                    .any(|cause| cause.contains("first changed prompt-cache field: cache_key"))
         }));
+    }
+
+    #[test]
+    fn prompt_cache_drift_attributes_pure_prefix_content_change_to_fingerprint() {
+        // Provider, cache_key, routing, and breakpoints are identical across
+        // turns; only the stable prefix *content* drifts. No concrete sub-field
+        // changed, so the derived fingerprint is the correct residual cause.
+        let input = concat!(
+            r#"{"timestamp":"2026-05-05T00:00:01Z","provider":"anthropic","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","message":{"id":"msg-1","role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}],"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":9000,"output_tokens":50}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:02Z","provider":"anthropic","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v2 with edits","message":{"id":"msg-2","role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}],"usage":{"input_tokens":3000,"cache_creation_input_tokens":6000,"cache_read_input_tokens":1000,"output_tokens":50}}}"#,
+            "\n",
+        );
+
+        let report = compute(input, Some("claude-jsonl")).unwrap();
+        let analytics = report
+            .prompt_cache_plan
+            .as_ref()
+            .and_then(|plan| plan.analytics.as_ref())
+            .expect("prompt cache analytics should be present");
+
+        assert_eq!(analytics.prefix_drift.len(), 1);
+        let drift = &analytics.prefix_drift[0];
+        assert_eq!(drift.first_changed_field, "stable_prefix_fingerprint");
+        // The fingerprint is the only reported change — no concrete sub-field moved.
+        assert_eq!(drift.field_changes.len(), 1);
+        assert_eq!(drift.field_changes[0].field, "stable_prefix_fingerprint");
     }
 
     #[test]

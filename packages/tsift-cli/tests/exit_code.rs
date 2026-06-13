@@ -9458,7 +9458,10 @@ fn session_cost_reports_prompt_cache_invalidation_diagnostics() {
         .unwrap();
     assert!(prefix_drift.iter().any(|drift| {
         drift["trigger"] == "cached_ratio_drop_and_cache_creation_spike"
-            && drift["first_changed_field"] == "stable_prefix_fingerprint"
+            // Attribution names the most specific concrete cause, not the derived
+            // composite fingerprint (#pcacheattr); cache_key is the first changed
+            // concrete field here.
+            && drift["first_changed_field"] == "cache_key"
             && drift["field_changes"]
                 .as_array()
                 .unwrap()
@@ -9473,7 +9476,7 @@ fn session_cost_reports_prompt_cache_invalidation_diagnostics() {
     assert!(
         scorecard[0]["suspected_invalidation_cause"]
             .as_str()
-            .is_some_and(|cause| cause.contains("stable_prefix_fingerprint"))
+            .is_some_and(|cause| cause.contains("cache_key"))
     );
 
     let compact = run_tsift_stdin(
