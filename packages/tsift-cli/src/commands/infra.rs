@@ -749,6 +749,11 @@ pub(crate) fn graph_db_snapshot_import_report(
             vec![],
         )?;
         graph_db_snapshot_fail_if_not_fresh("snapshot-import validation", &validation_operator)?;
+        // Hold the cross-process write lock across the whole rename window so a
+        // concurrent `graph-db refresh` cannot create -wal/-shm sidecars between
+        // the sidecar check and the rename and corrupt the imported db
+        // (#gdbwritelock). The sidecar check below now runs under the lock.
+        let _import_lock = crate::acquire_graph_db_write_lock(&graph_db)?;
         if graph_db.exists() {
             if !replace {
                 bail!(

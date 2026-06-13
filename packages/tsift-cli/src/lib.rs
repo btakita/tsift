@@ -14024,6 +14024,86 @@ fn build_traversal_graph_source(
     build_traversal_graph_source_with_options(root, path_hint, scope, false)
 }
 
+/// Bounded acquire deadline for the graph-db cross-process write lock. flock
+/// releases automatically if the holder dies, so a live writer is the only thing
+/// that can hold this; the bound serializes brief contention and fails closed
+/// with a clear diagnostic on a wedged holder rather than hanging forever.
+const GRAPH_DB_WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
+const GRAPH_DB_WRITE_LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// RAII guard for the graph-db advisory write lock; unlocks on drop.
+pub(crate) struct GraphDbWriteLock {
+    file: std::fs::File,
+}
+
+impl Drop for GraphDbWriteLock {
+    fn drop(&mut self) {
+        use fs4::fs_std::FileExt;
+        let _ = self.file.unlock();
+    }
+}
+
+pub(crate) fn graph_db_write_lock_path(graph_db: &Path) -> PathBuf {
+    let stem = graph_db
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("graph");
+    graph_db.with_file_name(format!("{stem}.write.lock"))
+}
+
+/// Acquire the cross-process advisory write lock guarding graph-db refresh/write
+/// and snapshot-import against concurrent agent processes. SQLite's busy_timeout
+/// alone left the write transaction and the snapshot-import rename window racing
+/// concurrent writers (#gdbwritelock): a refresh could create `-wal`/`-shm`
+/// sidecars mid-rename and corrupt the freshly imported db, and parallel
+/// refreshes spuriously failed `database is locked`. This serializes them.
+pub(crate) fn acquire_graph_db_write_lock(graph_db: &Path) -> Result<GraphDbWriteLock> {
+    acquire_graph_db_write_lock_with_timeout(graph_db, GRAPH_DB_WRITE_LOCK_TIMEOUT)
+}
+
+pub(crate) fn acquire_graph_db_write_lock_with_timeout(
+    graph_db: &Path,
+    timeout: Duration,
+) -> Result<GraphDbWriteLock> {
+    use fs4::fs_std::FileExt;
+
+    let lock_path = graph_db_write_lock_path(graph_db);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating graph-db lock dir: {}", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening graph-db write lock {}", lock_path.display()))?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(true) => return Ok(GraphDbWriteLock { file }),
+            Ok(false) => {
+                if Instant::now() >= deadline {
+                    bail!(
+                        "another tsift graph-db writer is active for {} (lock: {}); \
+                         a concurrent graph-db refresh or snapshot-import is in progress, \
+                         wait for it to finish before retrying",
+                        graph_db.display(),
+                        lock_path.display()
+                    );
+                }
+                std::thread::sleep(GRAPH_DB_WRITE_LOCK_POLL);
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("locking graph-db write lock {}", lock_path.display()));
+            }
+        }
+    }
+}
+
 pub(crate) fn write_traversal_graph_store_with_options(
     root: &Path,
     path_hint: &Path,
@@ -14034,6 +14114,8 @@ pub(crate) fn write_traversal_graph_store_with_options(
         build_traversal_graph_source_with_options(root, path_hint, scope, session_only)?;
     let projection = traversal_projection_from_graph(root, scope, &source_graph)?;
     let graph_db = graph_substrate_db_path(root, scope);
+    // Serialize the write against concurrent refresh/snapshot-import (#gdbwritelock).
+    let _write_lock = acquire_graph_db_write_lock(&graph_db)?;
     let mut store = SqliteGraphStore::open(&graph_db)?;
     let source_watermark = traversal_source_watermark(root, path_hint, scope, session_only)
         .ok()
@@ -21048,6 +21130,31 @@ mod tests {
 
     use std::cell::RefCell;
     use substrate::{ConvexEdgeRow, ConvexGraphClient, ConvexGraphStore, ConvexNodeRow};
+
+    #[test]
+    fn graph_db_write_lock_serializes_concurrent_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_db = dir.path().join(".tsift/graph.db");
+        let short = Duration::from_millis(150);
+
+        let first = acquire_graph_db_write_lock_with_timeout(&graph_db, short)
+            .expect("first writer acquires the lock");
+        // A second acquire fails (bounded) while the first guard is held — this is
+        // the cross-process mutual exclusion that protects refresh/snapshot-import.
+        let second = acquire_graph_db_write_lock_with_timeout(&graph_db, short);
+        assert!(
+            second.is_err(),
+            "a second writer must not acquire the graph-db write lock while it is held"
+        );
+        drop(first);
+        // After release the lock is re-acquirable.
+        let third = acquire_graph_db_write_lock_with_timeout(&graph_db, short);
+        assert!(
+            third.is_ok(),
+            "graph-db write lock must be re-acquirable after release"
+        );
+    }
+
     fn parse_cli<I, T>(itr: I) -> Cli
     where
         I: IntoIterator<Item = T> + Send + 'static,
