@@ -127,6 +127,8 @@ pub(crate) struct SessionReviewNextContextBudgetReport {
     pub(crate) next_token_actions: Vec<SessionReviewNextTokenAction>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) agent_doc_queue: Option<SessionReviewAgentDocQueueBudgetProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_cache_health: Option<session_review::SessionReviewPromptCacheHealth>,
     pub(crate) next_digest_commands: Vec<String>,
 }
 
@@ -354,6 +356,7 @@ pub(crate) fn build_session_review_next_context_budget_report(
             .collect(),
         next_token_actions,
         agent_doc_queue,
+        prompt_cache_health: report.next_context.prompt_cache_health.clone(),
         next_digest_commands: report
             .next_context
             .next_digest_commands
@@ -810,6 +813,9 @@ pub(crate) fn print_session_review_next_context_budget_human(
         report.unresolved_failures.len(),
         report.unresolved_failure_total
     );
+    if let Some(health) = &report.prompt_cache_health {
+        println!("{}", health.summary_line);
+    }
     for prompt in &report.prompt_targets {
         println!("prompt {prompt}");
     }

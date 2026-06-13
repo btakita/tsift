@@ -1447,6 +1447,9 @@ pub(crate) fn print_context_pack_human(report: &ContextPackReport, compact: bool
         for reminder in &report.status_reminders {
             println!("reminder {reminder}");
         }
+        if let Some(health) = &report.next_context.prompt_cache_health {
+            println!("prompt-cache {}", health.summary_line);
+        }
         for prompt in &report.next_context.prompt_targets {
             println!("prompt {prompt}");
         }
@@ -1574,6 +1577,9 @@ pub(crate) fn print_context_pack_human(report: &ContextPackReport, compact: bool
         report.next_context.unresolved_failures.len(),
         report.next_context.unresolved_failure_total
     );
+    if let Some(health) = &report.next_context.prompt_cache_health {
+        println!("  prompt-cache health:    {}", health.summary_line);
+    }
     if !report.next_context.prompt_targets.is_empty() {
         for prompt in &report.next_context.prompt_targets {
             println!("  - prompt: {prompt}");

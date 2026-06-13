@@ -30685,6 +30685,7 @@ fn sample() {}
                         },
                     ],
                 }),
+                prompt_cache_health: None,
                 next_digest_commands: vec![
                     "tsift session-review --next-context tasks/software/tsift.md".to_string(),
                     "tsift diff-digest .".to_string(),

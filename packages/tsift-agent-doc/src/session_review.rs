@@ -175,6 +175,34 @@ impl SessionReviewAgentDocQueueProfile {
     }
 }
 
+/// Inline prompt-cache health for the resumable handoff (#wwm1): surfaces
+/// caching effectiveness + top prefix-drift attribution so an agent sees cache
+/// health in `session-review --next-context` / `context-pack` without running
+/// the `session-cost --fixture` gate.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SessionReviewPromptCacheHealth {
+    /// `healthy` | `watch` | `regressed`.
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_cached_read_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_create_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trend: Option<String>,
+    /// Top prefix-drift attribution (the latest session's suspected prompt-cache
+    /// invalidation cause).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_drift_attribution: Option<String>,
+    /// Cross-run regression detail lines, enriched by the CLI from the persisted
+    /// `.tsift/prompt-cache-history` comparison (#avbq) when available.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub cross_run_regressions: Vec<String>,
+    /// One-line human summary for compact/human renderings.
+    pub summary_line: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionReviewNextContext {
     pub target: String,
@@ -185,7 +213,107 @@ pub struct SessionReviewNextContext {
     pub unresolved_failures: Vec<SessionReviewFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_doc_queue: Option<SessionReviewAgentDocQueueProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_health: Option<SessionReviewPromptCacheHealth>,
     pub next_digest_commands: Vec<String>,
+}
+
+/// Build the base prompt-cache health summary from data available at compute
+/// time: the aggregate cached-input ratio and the latest matched session's ROI
+/// scorecard row (which carries net cached-read tokens, read/create ratio,
+/// trend, and the suspected prompt-cache invalidation cause = top drift
+/// attribution). Cross-run regression flags are layered on later by the CLI.
+pub fn build_prompt_cache_health(
+    cached_input_ratio: Option<f64>,
+    top_roi: Option<&SessionCostPromptCacheRoiScorecard>,
+) -> Option<SessionReviewPromptCacheHealth> {
+    if cached_input_ratio.is_none() && top_roi.is_none() {
+        return None;
+    }
+
+    let net_cached_read_tokens = top_roi.map(|row| row.net_cached_read_tokens);
+    let read_create_ratio = top_roi.map(|row| row.read_create_ratio.clone());
+    let trend = top_roi.map(|row| row.trend.clone());
+    let top_drift_attribution = top_roi.and_then(|row| {
+        let cause = row.suspected_invalidation_cause.trim();
+        (!cause.is_empty() && cause != "none").then(|| cause.to_string())
+    });
+
+    // Base status from the per-run signals: a negative net cached-read balance
+    // means cache creation now outweighs reads; a known invalidation cause means
+    // the prefix keeps drifting. Cross-run regressions can escalate this later.
+    let status = if net_cached_read_tokens.is_some_and(|net| net < 0) {
+        "regressed"
+    } else if top_drift_attribution.is_some() {
+        "watch"
+    } else {
+        "healthy"
+    }
+    .to_string();
+
+    let mut parts = Vec::new();
+    if let Some(ratio) = cached_input_ratio {
+        parts.push(format!("ratio {ratio:.2}%"));
+    }
+    if let Some(net) = net_cached_read_tokens {
+        parts.push(format!("net_cached {net:+}"));
+    }
+    if let Some(ratio) = &read_create_ratio {
+        parts.push(format!("read/create {ratio}"));
+    }
+    if let Some(trend) = &trend {
+        parts.push(format!("trend {trend}"));
+    }
+    if let Some(cause) = &top_drift_attribution {
+        parts.push(format!("drift: {cause}"));
+    }
+    let summary_line = format!("prompt-cache {status}: {}", parts.join(" "));
+
+    Some(SessionReviewPromptCacheHealth {
+        status,
+        cached_input_ratio,
+        net_cached_read_tokens,
+        read_create_ratio,
+        trend,
+        top_drift_attribution,
+        cross_run_regressions: Vec::new(),
+        summary_line,
+    })
+}
+
+/// Fold persisted cross-run regression detail lines (#avbq) into a base health
+/// summary, escalating status to `regressed` when any cross-run regression is
+/// present. Returns the (possibly newly-created) health summary.
+pub fn enrich_prompt_cache_health_with_cross_run(
+    base: Option<SessionReviewPromptCacheHealth>,
+    cross_run_regressions: &[String],
+) -> Option<SessionReviewPromptCacheHealth> {
+    if cross_run_regressions.is_empty() {
+        return base;
+    }
+    let mut health = base.unwrap_or_else(|| SessionReviewPromptCacheHealth {
+        status: "regressed".to_string(),
+        cached_input_ratio: None,
+        net_cached_read_tokens: None,
+        read_create_ratio: None,
+        trend: None,
+        top_drift_attribution: None,
+        cross_run_regressions: Vec::new(),
+        summary_line: String::new(),
+    });
+    health.status = "regressed".to_string();
+    health.cross_run_regressions = cross_run_regressions.to_vec();
+    let base_line = if health.summary_line.is_empty() {
+        "prompt-cache regressed".to_string()
+    } else {
+        // Re-stamp the leading status token to `regressed`.
+        match health.summary_line.split_once(": ") {
+            Some((_, rest)) => format!("prompt-cache regressed: {rest}"),
+            None => "prompt-cache regressed".to_string(),
+        }
+    };
+    health.summary_line = format!("{base_line}; cross-run: {}", cross_run_regressions.join("; "));
+    Some(health)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -351,6 +479,8 @@ struct NextContextBuildInput<'a> {
     guardrails: &'a [SessionCostGuardrail],
     last_verification: SessionReviewVerificationState,
     agent_doc_queue: Option<SessionReviewAgentDocQueueProfile>,
+    cached_input_ratio: Option<f64>,
+    top_prompt_cache_roi: Option<&'a SessionCostPromptCacheRoiScorecard>,
 }
 
 #[derive(Debug, Clone)]
@@ -899,6 +1029,8 @@ pub fn compute_with_options_and_phases(
             detail: "no verification closeout found in matched sessions".to_string(),
         }),
         agent_doc_queue: document_active_context.agent_doc_queue,
+        cached_input_ratio,
+        top_prompt_cache_roi: prompt_cache_roi_scorecard.first(),
     });
     warnings.sort();
     warnings.truncate(MAX_WARNINGS);
@@ -1046,7 +1178,10 @@ fn build_next_context(input: NextContextBuildInput<'_>) -> SessionReviewNextCont
         guardrails,
         last_verification,
         agent_doc_queue,
+        cached_input_ratio,
+        top_prompt_cache_roi,
     } = input;
+    let prompt_cache_health = build_prompt_cache_health(cached_input_ratio, top_prompt_cache_roi);
     let target = context
         .relative_target
         .clone()
@@ -1100,6 +1235,7 @@ fn build_next_context(input: NextContextBuildInput<'_>) -> SessionReviewNextCont
             .collect(),
         unresolved_failures,
         agent_doc_queue,
+        prompt_cache_health,
         next_digest_commands,
     }
 }
@@ -3147,5 +3283,91 @@ Prior summary without active failures.
                 .iter()
                 .any(|warning| warning.contains("skipping malformed Codex transcript jsonl line 1"))
         );
+    }
+
+    fn roi_row(
+        net: i64,
+        ratio: &str,
+        trend: &str,
+        cause: &str,
+    ) -> SessionCostPromptCacheRoiScorecard {
+        SessionCostPromptCacheRoiScorecard {
+            session_source: Some("codex_jsonl".to_string()),
+            session_path: Some("/proj/session.jsonl".to_string()),
+            provider: "anthropic".to_string(),
+            sample_count: 3,
+            net_cached_read_tokens: net,
+            read_create_ratio: ratio.to_string(),
+            trend: trend.to_string(),
+            suspected_invalidation_cause: cause.to_string(),
+            next_command: "tsift session-cost --source codex --input s.jsonl --json".to_string(),
+        }
+    }
+
+    #[test]
+    fn prompt_cache_health_none_without_any_signal() {
+        assert!(build_prompt_cache_health(None, None).is_none());
+    }
+
+    #[test]
+    fn prompt_cache_health_healthy_from_ratio_only() {
+        let health = build_prompt_cache_health(Some(72.5), None).unwrap();
+        assert_eq!(health.status, "healthy");
+        assert!(health.summary_line.contains("ratio 72.50%"));
+        assert!(health.top_drift_attribution.is_none());
+    }
+
+    #[test]
+    fn prompt_cache_health_watch_when_drift_cause_present() {
+        let roi = roi_row(5_000, "5.00", "steady", "stable_prefix changed");
+        let health = build_prompt_cache_health(Some(60.0), Some(&roi)).unwrap();
+        assert_eq!(health.status, "watch");
+        assert_eq!(
+            health.top_drift_attribution.as_deref(),
+            Some("stable_prefix changed")
+        );
+        assert!(health.summary_line.contains("drift: stable_prefix changed"));
+    }
+
+    #[test]
+    fn prompt_cache_health_regressed_when_net_negative() {
+        let roi = roi_row(-2_000, "0.50", "declining", "none");
+        let health = build_prompt_cache_health(Some(20.0), Some(&roi)).unwrap();
+        assert_eq!(health.status, "regressed");
+        // "none" cause is suppressed as attribution.
+        assert!(health.top_drift_attribution.is_none());
+        assert!(health.summary_line.contains("net_cached -2000"));
+    }
+
+    #[test]
+    fn enrich_with_cross_run_escalates_to_regressed() {
+        let base = build_prompt_cache_health(Some(60.0), None);
+        let enriched = enrich_prompt_cache_health_with_cross_run(
+            base,
+            &["cached_input_ratio fell 8.00 points (68.00% -> 60.00%)".to_string()],
+        )
+        .unwrap();
+        assert_eq!(enriched.status, "regressed");
+        assert_eq!(enriched.cross_run_regressions.len(), 1);
+        assert!(enriched.summary_line.starts_with("prompt-cache regressed:"));
+        assert!(enriched.summary_line.contains("cross-run: cached_input_ratio fell"));
+    }
+
+    #[test]
+    fn enrich_with_no_cross_run_is_passthrough() {
+        let base = build_prompt_cache_health(Some(60.0), None);
+        let enriched = enrich_prompt_cache_health_with_cross_run(base.clone(), &[]);
+        assert_eq!(enriched, base);
+    }
+
+    #[test]
+    fn enrich_with_cross_run_creates_health_when_base_missing() {
+        let enriched = enrich_prompt_cache_health_with_cross_run(
+            None,
+            &["net_cached_input_tokens went negative (100 -> -50)".to_string()],
+        )
+        .unwrap();
+        assert_eq!(enriched.status, "regressed");
+        assert!(enriched.summary_line.contains("cross-run: net_cached_input_tokens went negative"));
     }
 }

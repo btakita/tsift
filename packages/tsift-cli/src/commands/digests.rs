@@ -1392,7 +1392,20 @@ fn record_session_review_prompt_cache_history(report: &mut session_review::Sessi
     );
     let root = Path::new(&report.root);
     match prompt_cache_history::record_prompt_cache_sample(root, sample) {
-        Ok(comparison) => report.prompt_cache_cross_run = Some(comparison),
+        Ok(comparison) => {
+            // Surface the persisted cross-run regressions inline in the
+            // resumable handoff health summary (#wwm1) so they show without
+            // re-reading the raw `prompt_cache_cross_run` block.
+            let regression_lines: Vec<String> = comparison
+                .regressions
+                .iter()
+                .map(|regression| regression.detail.clone())
+                .collect();
+            let base = report.next_context.prompt_cache_health.take();
+            report.next_context.prompt_cache_health =
+                session_review::enrich_prompt_cache_health_with_cross_run(base, &regression_lines);
+            report.prompt_cache_cross_run = Some(comparison);
+        }
         Err(error) => {
             eprintln!("session-review: prompt-cache history not recorded: {error:#}");
         }
@@ -1525,6 +1538,9 @@ pub(crate) fn cmd_session_review_with_budget(
             "  verification detail:    {}",
             report.next_context.last_verification.detail
         );
+        if let Some(health) = &report.next_context.prompt_cache_health {
+            println!("  {}", health.summary_line);
+        }
 
         if !report.next_context.active_prompt_targets.is_empty() {
             println!();
