@@ -67,6 +67,12 @@ pub struct SessionCostPromptCacheMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_key: Option<String>,
     pub stable_prefix_fingerprint: String,
+    // Raw stable-prefix content, tracked independently of the fingerprint so
+    // prefix-content drift is attributed even when a provider supplies an
+    // explicit `stable_prefix_fingerprint` that bypasses the derived material
+    // (#pcacheexplattr).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stable_prefix: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub breakpoints: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1832,6 +1838,20 @@ fn prompt_cache_field_changes(
         &previous.provider,
         &current.provider,
     );
+    // Raw stable-prefix content is ordered *before* the fingerprint. When a
+    // provider supplies an explicit `stable_prefix_fingerprint`, the derived
+    // material (which folds in `stable_prefix`) is bypassed, so a real prefix
+    // CONTENT drift would otherwise change nothing tracked and go unattributed.
+    // Tracking the raw prefix as its own field attributes that drift regardless
+    // of explicit-vs-derived fingerprint; and because it precedes the
+    // fingerprint, a derived-path prefix change is named `stable_prefix` (the
+    // concrete cause) rather than the composite fingerprint (#pcacheexplattr).
+    push_prompt_cache_field_change(
+        &mut changes,
+        "stable_prefix",
+        &prompt_cache_optional_value(previous.stable_prefix.as_deref()),
+        &prompt_cache_optional_value(current.stable_prefix.as_deref()),
+    );
     push_prompt_cache_field_change(
         &mut changes,
         "stable_prefix_fingerprint",
@@ -3341,6 +3361,7 @@ fn prompt_cache_metadata(
         provider,
         cache_key,
         stable_prefix_fingerprint,
+        stable_prefix,
         breakpoints,
         routing_affinity,
     }
@@ -3923,10 +3944,12 @@ mod tests {
     }
 
     #[test]
-    fn prompt_cache_drift_attributes_pure_prefix_content_change_to_fingerprint() {
+    fn prompt_cache_drift_attributes_pure_prefix_content_change_to_stable_prefix() {
         // Provider, cache_key, routing, and breakpoints are identical across
-        // turns; only the stable prefix *content* drifts. No concrete sub-field
-        // changed, so the derived fingerprint is the correct residual cause.
+        // turns; only the stable prefix *content* drifts. The raw `stable_prefix`
+        // is now tracked as its own field ordered before the fingerprint, so the
+        // drift is attributed to the concrete `stable_prefix` cause rather than
+        // the derived composite fingerprint (#pcacheexplattr).
         let input = concat!(
             r#"{"timestamp":"2026-05-05T00:00:01Z","provider":"anthropic","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix":"agent-doc stable prefix v1","message":{"id":"msg-1","role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}],"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":9000,"output_tokens":50}}}"#,
             "\n",
@@ -3943,10 +3966,51 @@ mod tests {
 
         assert_eq!(analytics.prefix_drift.len(), 1);
         let drift = &analytics.prefix_drift[0];
-        assert_eq!(drift.first_changed_field, "stable_prefix_fingerprint");
-        // The fingerprint is the only reported change — no concrete sub-field moved.
+        // The concrete `stable_prefix` content change is the first (most
+        // specific) attributed cause, ahead of the derived fingerprint.
+        assert_eq!(drift.first_changed_field, "stable_prefix");
+        // On the derived path the fingerprint folds in the prefix, so it also
+        // changes — but `stable_prefix` precedes it in the ordered list.
+        assert_eq!(drift.field_changes.len(), 2);
+        assert_eq!(drift.field_changes[0].field, "stable_prefix");
+        assert_eq!(drift.field_changes[1].field, "stable_prefix_fingerprint");
+    }
+
+    #[test]
+    fn prompt_cache_drift_attributes_prefix_change_under_explicit_fingerprint() {
+        // A provider supplies an explicit `stable_prefix_fingerprint` that stays
+        // CONSTANT across turns while the raw `stable_prefix` content drifts.
+        // Before #pcacheexplattr the explicit fingerprint bypassed the derived
+        // material, so nothing tracked changed and the prefix drift went
+        // unattributed. The raw `stable_prefix` field now captures it.
+        let input = concat!(
+            r#"{"timestamp":"2026-05-05T00:00:01Z","provider":"anthropic","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix_fingerprint":"provider-fpr-constant","stable_prefix":"agent-doc stable prefix v1","message":{"id":"msg-1","role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}],"usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":9000,"output_tokens":50}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T00:00:02Z","provider":"anthropic","prompt_cache_key":"agent-doc:tsift","routing_affinity":"replica-a","stable_prefix_fingerprint":"provider-fpr-constant","stable_prefix":"agent-doc stable prefix v2 with edits","message":{"id":"msg-2","role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}],"usage":{"input_tokens":3000,"cache_creation_input_tokens":6000,"cache_read_input_tokens":1000,"output_tokens":50}}}"#,
+            "\n",
+        );
+
+        let report = compute(input, Some("claude-jsonl")).unwrap();
+        let analytics = report
+            .prompt_cache_plan
+            .as_ref()
+            .and_then(|plan| plan.analytics.as_ref())
+            .expect("prompt cache analytics should be present");
+
+        assert_eq!(analytics.prefix_drift.len(), 1);
+        let drift = &analytics.prefix_drift[0];
+        // The explicit fingerprint is unchanged, so the ONLY attributed cause is
+        // the raw prefix content — which would have been invisible before.
+        assert_eq!(drift.first_changed_field, "stable_prefix");
         assert_eq!(drift.field_changes.len(), 1);
-        assert_eq!(drift.field_changes[0].field, "stable_prefix_fingerprint");
+        assert_eq!(drift.field_changes[0].field, "stable_prefix");
+        assert!(
+            !drift
+                .field_changes
+                .iter()
+                .any(|change| change.field == "stable_prefix_fingerprint"),
+            "constant explicit fingerprint must not be reported as drift"
+        );
     }
 
     #[test]
