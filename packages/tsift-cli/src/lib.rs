@@ -31282,6 +31282,7 @@ fn sample() {}
             total_lines: 12,
             non_empty_lines: 10,
             signal_groups: 2,
+            error_signal_groups: 1,
             repeated_line_groups: 2,
             repeated_line_occurrences: 3,
             line_family_groups: 0,

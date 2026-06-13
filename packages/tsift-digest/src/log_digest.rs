@@ -136,6 +136,10 @@ pub struct LogDigestReport {
     pub total_lines: usize,
     pub non_empty_lines: usize,
     pub signal_groups: usize,
+    /// Distinct error-severity signal groups before the inline cap. Lets the
+    /// token-savings gate detect when distinct failures were dropped past the
+    /// cap rather than only proving the digest is small (#loggatefidelity).
+    pub error_signal_groups: usize,
     pub repeated_line_groups: usize,
     pub repeated_line_occurrences: usize,
     pub line_family_groups: usize,
@@ -258,6 +262,14 @@ pub struct LogDigestFixtureCase {
     /// Optional noise guard: each substring must NOT appear in the digest text.
     #[serde(default)]
     pub forbidden_signals: Vec<String>,
+    /// Fidelity guard: the maximum number of distinct error-severity signal
+    /// groups allowed to be dropped past the inline cap. Defaults to 0, so a
+    /// case that produces more distinct errors than the digest can inline fails
+    /// unless it explicitly acknowledges the overflow — the savings-only gate
+    /// could not catch this because a capped digest always reports high savings
+    /// regardless of how much signal was dropped (#loggatefidelity).
+    #[serde(default)]
+    pub maximum_dropped_error_signals: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -271,6 +283,9 @@ pub struct LogDigestFixtureCaseReport {
     pub savings_ok: bool,
     pub missing_required_signals: Vec<String>,
     pub present_forbidden_signals: Vec<String>,
+    pub dropped_error_signals: usize,
+    pub maximum_dropped_error_signals: usize,
+    pub dropped_error_signals_ok: bool,
     pub passed: bool,
 }
 
@@ -319,8 +334,21 @@ pub fn evaluate_fixture(root: &Path, fixture: &LogDigestFixture) -> Result<LogDi
             .filter(|needle| signal_text.contains(needle.as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        let passed =
-            savings_ok && missing_required_signals.is_empty() && present_forbidden_signals.is_empty();
+        // Fidelity guard: how many distinct error groups the inline cap dropped.
+        // Errors sort first, so shown errors == min(error_signal_groups, cap);
+        // the remainder is the silently-dropped count the savings gate misses.
+        let shown_error_signals = report
+            .signals
+            .iter()
+            .filter(|signal| signal.severity == "error")
+            .count();
+        let dropped_error_signals = report.error_signal_groups.saturating_sub(shown_error_signals);
+        let dropped_error_signals_ok =
+            dropped_error_signals <= case.maximum_dropped_error_signals;
+        let passed = savings_ok
+            && missing_required_signals.is_empty()
+            && present_forbidden_signals.is_empty()
+            && dropped_error_signals_ok;
         if !passed {
             failed_cases += 1;
         }
@@ -334,6 +362,9 @@ pub fn evaluate_fixture(root: &Path, fixture: &LogDigestFixture) -> Result<LogDi
             savings_ok,
             missing_required_signals,
             present_forbidden_signals,
+            dropped_error_signals,
+            maximum_dropped_error_signals: case.maximum_dropped_error_signals,
+            dropped_error_signals_ok,
             passed,
         });
     }
@@ -542,6 +573,10 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
             .then(left.message.cmp(&right.message))
     });
     let signal_groups = signal_builders.len();
+    let error_signal_groups = signal_builders
+        .iter()
+        .filter(|builder| builder.severity == "error")
+        .count();
     for signal in signal_builders.into_iter().take(MAX_SIGNALS) {
         let (summary_state, current_summaries) = match signal.path.as_deref() {
             Some(display_path) => collect_current_file_summaries(
@@ -645,6 +680,7 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
         total_lines,
         non_empty_lines,
         signal_groups,
+        error_signal_groups,
         repeated_line_groups,
         repeated_line_occurrences,
         line_family_groups,
@@ -1772,6 +1808,7 @@ this assertion about latency held under load
                 minimum_savings_percent: 50.0,
                 required_signals: vec!["error[E0277]".to_string()],
                 forbidden_signals: vec![],
+                maximum_dropped_error_signals: 0,
             }],
         };
         let report = evaluate_fixture(dir.path(), &pass).unwrap();
@@ -1790,6 +1827,7 @@ this assertion about latency held under load
                 minimum_savings_percent: 50.0,
                 required_signals: vec!["this signal is never emitted".to_string()],
                 forbidden_signals: vec![],
+                maximum_dropped_error_signals: 0,
             }],
         };
         let report = evaluate_fixture(dir.path(), &fail).unwrap();
@@ -1799,6 +1837,57 @@ this assertion about latency held under load
             report.cases[0].missing_required_signals,
             vec!["this signal is never emitted".to_string()]
         );
+    }
+
+    #[test]
+    fn fixture_gate_flags_distinct_errors_dropped_past_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let input_lines: Vec<String> = (0..20)
+            .map(|idx| format!("error: distinct failure {idx} in module m{idx}"))
+            .collect();
+
+        // Default maximum_dropped_error_signals = 0 → the gate must FAIL: 20
+        // distinct errors cannot all inline under the 12-signal cap, even though
+        // the capped digest reports high token savings (#loggatefidelity).
+        let strict = LogDigestFixture {
+            schema_version: 1,
+            description: String::new(),
+            cases: vec![LogDigestFixtureCase {
+                name: "many-distinct-errors".to_string(),
+                ecosystem: "cargo".to_string(),
+                input_lines: input_lines.clone(),
+                minimum_savings_percent: -1000.0,
+                required_signals: vec![],
+                forbidden_signals: vec![],
+                maximum_dropped_error_signals: 0,
+            }],
+        };
+        let report = evaluate_fixture(dir.path(), &strict).unwrap();
+        assert!(
+            !report.passed,
+            "gate must flag silently dropped distinct errors: {:?}",
+            report.cases
+        );
+        assert!(report.cases[0].dropped_error_signals > 0);
+        assert!(!report.cases[0].dropped_error_signals_ok);
+
+        // Acknowledging the overflow lets the case pass (the raw-log artifact
+        // carries the dropped errors).
+        let lenient = LogDigestFixture {
+            schema_version: 1,
+            description: String::new(),
+            cases: vec![LogDigestFixtureCase {
+                name: "many-distinct-errors".to_string(),
+                ecosystem: "cargo".to_string(),
+                input_lines,
+                minimum_savings_percent: -1000.0,
+                required_signals: vec![],
+                forbidden_signals: vec![],
+                maximum_dropped_error_signals: 100,
+            }],
+        };
+        let report = evaluate_fixture(dir.path(), &lenient).unwrap();
+        assert!(report.cases[0].dropped_error_signals_ok);
     }
 
     #[test]
@@ -1826,6 +1915,7 @@ this assertion about latency held under load
                 minimum_savings_percent: -1000.0,
                 required_signals: vec!["npm ERR!".to_string()],
                 forbidden_signals: vec!["err_pnpmish".to_string()],
+                maximum_dropped_error_signals: 0,
             }],
         };
         let report = evaluate_fixture(dir.path(), &fixture).unwrap();
