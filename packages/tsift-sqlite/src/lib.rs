@@ -25,6 +25,16 @@ pub use tsift_core::{
     shortest_path_using_outgoing, stable_graph_edge_id,
 };
 
+fn row_usize(row: &Row<'_>, idx: usize) -> rusqlite::Result<usize> {
+    let value: i64 = row.get(idx)?;
+    usize::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, value))
+}
+
+fn row_u64(row: &Row<'_>, idx: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(idx)?;
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, value))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadOnlyRecovery {
@@ -1050,17 +1060,15 @@ impl SqliteGraphStore {
             // snapshot-export/import sidecar checks. Record the outcome in
             // phase_timings instead of swallowing it (#gdbwalcheckpoint).
             let checkpoint_started = Instant::now();
-            let checkpoint = self.conn.query_row(
-                "PRAGMA wal_checkpoint(TRUNCATE)",
-                [],
-                |row| {
+            let checkpoint = self
+                .conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                     ))
-                },
-            );
+                });
             let (name, detail) = match checkpoint {
                 Ok((0, _log, _checkpointed)) => (
                     "wal_checkpoint:ok",
@@ -1373,7 +1381,7 @@ impl SqliteGraphStore {
                 WHERE g.row_hash = n.row_hash
                 "#,
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )?
         } else {
             skipped_nodes
@@ -1388,7 +1396,7 @@ impl SqliteGraphStore {
                 WHERE g.row_hash = n.row_hash
                 "#,
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )?
         } else {
             skipped_edges
@@ -1403,7 +1411,7 @@ impl SqliteGraphStore {
                 WHERE c.id IS NULL
                 "#,
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )?
         } else {
             tx.query_row(
@@ -1415,7 +1423,7 @@ impl SqliteGraphStore {
                 WHERE c.id IS NULL
                 "#,
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )?
         };
         let reused_owner_edge_properties: usize = if force_refresh_writes {
@@ -1428,7 +1436,7 @@ impl SqliteGraphStore {
                 WHERE c.edge_key IS NULL
                 "#,
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )?
         } else {
             tx.query_row(
@@ -1440,7 +1448,7 @@ impl SqliteGraphStore {
                 WHERE c.edge_key IS NULL
                 "#,
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )?
         };
         let unchanged_changed_node_properties: usize = tx.query_row(
@@ -1452,7 +1460,7 @@ impl SqliteGraphStore {
             WHERE g.value = n.value
             "#,
             [],
-            |row| row.get(0),
+            |row| row_usize(row, 0),
         )?;
         let unchanged_changed_edge_properties: usize = tx.query_row(
             r#"
@@ -1463,7 +1471,7 @@ impl SqliteGraphStore {
             WHERE g.value = n.value
             "#,
             [],
-            |row| row.get(0),
+            |row| row_usize(row, 0),
         )?;
         let unchanged_properties = reused_owner_node_properties
             + reused_owner_edge_properties
@@ -1738,12 +1746,12 @@ impl SqliteGraphStore {
         let tombstone_node_count: usize = tx.query_row(
             "SELECT COUNT(*) FROM graph_tombstones WHERE row_kind = 'node'",
             [],
-            |row| row.get(0),
+            |row| row_usize(row, 0),
         )?;
         let tombstone_edge_count: usize = tx.query_row(
             "SELECT COUNT(*) FROM graph_tombstones WHERE row_kind = 'edge'",
             [],
-            |row| row.get(0),
+            |row| row_usize(row, 0),
         )?;
         tx.execute(
             r#"
@@ -2502,12 +2510,12 @@ SELECT id, kind, label, properties_json, provenance_json, freshness_json
         let nodes = self
             .conn
             .query_row("SELECT COUNT(*) FROM graph_nodes", [], |row| {
-                row.get::<_, usize>(0)
+                row_usize(row, 0)
             })?;
         let edges = self
             .conn
             .query_row("SELECT COUNT(*) FROM graph_edges", [], |row| {
-                row.get::<_, usize>(0)
+                row_usize(row, 0)
             })?;
         Ok((nodes, edges))
     }
@@ -2928,7 +2936,7 @@ ORDER BY score DESC, edge_key ASC
                 WHERE key = ?1 AND value = ?2
                 "#,
                 (&filter.key, &filter.value),
-                |row| row.get::<_, usize>(0),
+                |row| row_usize(row, 0),
             )?)
         } else {
             None
@@ -3752,7 +3760,7 @@ GROUP BY walk.id
         let rows = collect_rows(stmt.query_map(params_from_iter(values.iter()), |row| {
             let node = node_from_row(row)?;
             let path: String = row.get(6)?;
-            let hops: usize = row.get(7)?;
+            let hops = row_usize(row, 7)?;
             Ok((
                 node,
                 GraphPath {
@@ -3964,14 +3972,14 @@ fn unix_now() -> i64 {
 }
 
 fn sqlite_database_size_bytes(conn: &Connection) -> Result<u64> {
-    let page_count: u64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-    let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let page_count = conn.query_row("PRAGMA page_count", [], |row| row_u64(row, 0))?;
+    let page_size = conn.query_row("PRAGMA page_size", [], |row| row_u64(row, 0))?;
     Ok(page_count.saturating_mul(page_size))
 }
 
 fn sqlite_database_freelist_bytes(conn: &Connection) -> Result<u64> {
-    let freelist_count: u64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
-    let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let freelist_count = conn.query_row("PRAGMA freelist_count", [], |row| row_u64(row, 0))?;
+    let page_size = conn.query_row("PRAGMA page_size", [], |row| row_u64(row, 0))?;
     Ok(freelist_count.saturating_mul(page_size))
 }
 
@@ -4162,7 +4170,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM graph_edge_properties WHERE key = 'confidence'",
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )
             .unwrap();
         assert_eq!(property_rows, 2);
@@ -4350,7 +4358,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM graph_node_properties WHERE key = 'domain' AND value = 'livekit'",
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )
             .unwrap();
         let updated_page = store
@@ -4372,7 +4380,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM graph_edge_properties WHERE key = 'confidence'",
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )
             .unwrap();
         assert_eq!(edge_property_count, 1);
@@ -4411,7 +4419,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM graph_node_semantic_vectors",
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )
             .unwrap();
         assert_eq!(vector_rows, 2);
@@ -4435,7 +4443,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM graph_node_semantic_vectors WHERE node_id = 'concept:graph'",
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )
             .unwrap();
         assert_eq!(vector_rows_after_update, 0);
@@ -4658,7 +4666,14 @@ mod tests {
                 WHERE scope = 'root'
                 "#,
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row_usize(row, 0)?,
+                        row_usize(row, 1)?,
+                        row_usize(row, 2)?,
+                        row_usize(row, 3)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(cached_counts, (3, 1, 1, 1));
@@ -4696,7 +4711,14 @@ mod tests {
                 WHERE scope = 'root'
                 "#,
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row_usize(row, 0)?,
+                        row_usize(row, 1)?,
+                        row_usize(row, 2)?,
+                        row_usize(row, 3)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(cached_counts, (3, 1, 0, 0));
@@ -4851,7 +4873,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM graph_node_properties WHERE key = 'domain'",
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )
             .unwrap();
         assert_eq!(property_rows, 2);
@@ -4860,7 +4882,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM graph_edge_properties WHERE key = 'confidence'",
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )
             .unwrap();
         assert_eq!(edge_property_rows, 1);
@@ -4869,7 +4891,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM graph_node_semantic_vectors WHERE model = 'fixture-v1'",
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )
             .unwrap();
         assert_eq!(semantic_vector_rows, 1);
@@ -5039,7 +5061,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM temp.next_graph_node_properties",
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )
             .unwrap();
         let staged_edge_properties: usize = store
@@ -5047,7 +5069,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM temp.next_graph_edge_properties",
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )
             .unwrap();
         assert_eq!(staged_node_properties, 0);

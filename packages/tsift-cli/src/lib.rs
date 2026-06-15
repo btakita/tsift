@@ -115,7 +115,7 @@ use output::{
     OutputFormat, ResponseBudget, ToolEnvelope, ToolEnvelopeMetric, ToolEnvelopeSummary,
     TranscriptArtifactRef,
 };
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use sift::{SearchInput, SearchOptions, Sift};
 #[cfg(test)]
@@ -6186,6 +6186,16 @@ fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool> {
     .map_err(Into::into)
 }
 
+fn row_usize(row: &Row<'_>, idx: usize) -> rusqlite::Result<usize> {
+    let value: i64 = row.get(idx)?;
+    usize::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, value))
+}
+
+fn row_u64(row: &Row<'_>, idx: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(idx)?;
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, value))
+}
+
 fn sqlite_known_table_count(conn: &Connection, table: &str) -> Result<usize> {
     let sql = match table {
         "graph_nodes" => "SELECT COUNT(*) FROM graph_nodes",
@@ -6193,7 +6203,7 @@ fn sqlite_known_table_count(conn: &Connection, table: &str) -> Result<usize> {
         "graph_tombstones" => "SELECT COUNT(*) FROM graph_tombstones",
         other => bail!("unsupported graph count table {other}"),
     };
-    conn.query_row(sql, [], |row| row.get::<_, usize>(0))
+    conn.query_row(sql, [], |row| row_usize(row, 0))
         .map_err(Into::into)
 }
 
@@ -6212,7 +6222,7 @@ fn sqlite_tombstone_counts(conn: &Connection) -> Result<GraphDbTombstoneCounts> 
     let mut edges = 0usize;
     while let Some(row) = rows.next()? {
         let row_kind: String = row.get(0)?;
-        let count: usize = row.get(1)?;
+        let count = row_usize(row, 1)?;
         match row_kind.as_str() {
             "node" => nodes = count,
             "edge" => edges = count,
@@ -6243,10 +6253,10 @@ fn sqlite_graph_counts_from_cache(
             [scope],
             |row| {
                 Ok((
-                    row.get::<_, usize>(0)?,
-                    row.get::<_, usize>(1)?,
-                    row.get::<_, usize>(2)?,
-                    row.get::<_, usize>(3)?,
+                    row_usize(row, 0)?,
+                    row_usize(row, 1)?,
+                    row_usize(row, 2)?,
+                    row_usize(row, 3)?,
                     row.get::<_, Option<i64>>(4)?,
                     row.get::<_, Option<i64>>(5)?,
                 ))
@@ -6367,14 +6377,14 @@ pub(crate) fn graph_db_compaction_policy(
 }
 
 fn sqlite_database_size_bytes(conn: &Connection) -> Result<u64> {
-    let page_count: u64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-    let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let page_count = conn.query_row("PRAGMA page_count", [], |row| row_u64(row, 0))?;
+    let page_size = conn.query_row("PRAGMA page_size", [], |row| row_u64(row, 0))?;
     Ok(page_count.saturating_mul(page_size))
 }
 
 fn sqlite_database_freelist_bytes(conn: &Connection) -> Result<u64> {
-    let freelist_count: u64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
-    let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let freelist_count = conn.query_row("PRAGMA freelist_count", [], |row| row_u64(row, 0))?;
+    let page_size = conn.query_row("PRAGMA page_size", [], |row| row_u64(row, 0))?;
     Ok(freelist_count.saturating_mul(page_size))
 }
 
@@ -14096,8 +14106,9 @@ pub(crate) fn acquire_graph_db_write_lock_with_timeout(
                 std::thread::sleep(GRAPH_DB_WRITE_LOCK_POLL);
             }
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("locking graph-db write lock {}", lock_path.display()));
+                return Err(err).with_context(|| {
+                    format!("locking graph-db write lock {}", lock_path.display())
+                });
             }
         }
     }
@@ -19645,10 +19656,7 @@ pub(crate) fn render_log_digest_from_input(
         "  repeated line instances:  {}",
         report.repeated_line_occurrences
     );
-    println!(
-        "  line families:            {}",
-        report.line_family_groups
-    );
+    println!("  line families:            {}", report.line_family_groups);
     println!("  file refs:                {}", report.file_ref_groups);
     println!("  symbol refs:              {}", report.symbol_ref_groups);
     println!("  stack groups:             {}", report.stack_groups);
@@ -24276,7 +24284,7 @@ fn main() { api::handler(); }
             .query_row(
                 "SELECT COUNT(*) FROM graph_node_semantic_vectors",
                 [],
-                |row| row.get(0),
+                |row| row_usize(row, 0),
             )
             .unwrap();
         assert!(semantic_vector_rows > 0);
@@ -25334,7 +25342,8 @@ fn main() { api::handler(); }
         assert!(!substrate::rollback_journal_path(&graph_db).exists());
 
         let clean_path = dir.path().join("graph-clean-export.db");
-        let err = match commands::infra::graph_db_snapshot_clean_export_copy(&graph_db, &clean_path) {
+        let err = match commands::infra::graph_db_snapshot_clean_export_copy(&graph_db, &clean_path)
+        {
             Ok(bytes) => panic!("expected export to fail under live lock, got {bytes} bytes"),
             Err(err) => err,
         };
@@ -31437,7 +31446,9 @@ fn sample() {}
         let bulky_input = "x".repeat(log_digest::LOG_DIGEST_RAW_ARTIFACT_MIN_BYTES) + "\n";
         let mut bulky = log_digest::compute(root, &bulky_input).unwrap();
         maybe_attach_log_digest_raw_artifact(root, &mut bulky, &bulky_input).unwrap();
-        let artifact = bulky.raw_log_artifact.expect("artifact attached for bulky log");
+        let artifact = bulky
+            .raw_log_artifact
+            .expect("artifact attached for bulky log");
         assert!(artifact.handle.starts_with("logdg-"));
         assert_eq!(artifact.bytes, bulky_input.len());
         assert!(artifact.expand.contains("tsift log-digest"));

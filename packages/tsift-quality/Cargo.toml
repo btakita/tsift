@@ -19,5 +19,5 @@ tsift-cache = { path = "../tsift-cache", version = "0.1.70" }
 tsift-index = { path = "../tsift-index", version = "0.1.70" }
 
 [dev-dependencies]
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"

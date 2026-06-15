@@ -10,6 +10,11 @@ pub struct TokensaveDb {
     db_path: PathBuf,
 }
 
+fn row_usize(row: &Row<'_>, idx: usize) -> rusqlite::Result<usize> {
+    let value: i64 = row.get(idx)?;
+    usize::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, value))
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TokensaveNode {
     pub id: String,
@@ -93,34 +98,26 @@ impl TokensaveDb {
     pub fn node_count(&self) -> Result<usize> {
         Ok(self
             .conn
-            .query_row("SELECT COUNT(*) FROM nodes", [], |row| {
-                row.get::<_, usize>(0)
-            })?)
+            .query_row("SELECT COUNT(*) FROM nodes", [], |row| row_usize(row, 0))?)
     }
 
     pub fn edge_count(&self) -> Result<usize> {
         Ok(self
             .conn
-            .query_row("SELECT COUNT(*) FROM edges", [], |row| {
-                row.get::<_, usize>(0)
-            })?)
+            .query_row("SELECT COUNT(*) FROM edges", [], |row| row_usize(row, 0))?)
     }
 
     pub fn file_count(&self) -> Result<usize> {
         Ok(self
             .conn
-            .query_row("SELECT COUNT(*) FROM files", [], |row| {
-                row.get::<_, usize>(0)
-            })?)
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row_usize(row, 0))?)
     }
 
     pub fn kinds(&self) -> Result<Vec<(String, usize)>> {
         let mut stmt = self
             .conn
             .prepare("SELECT kind, COUNT(*) FROM nodes GROUP BY kind ORDER BY COUNT(*) DESC")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
-        })?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row_usize(row, 1)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -128,9 +125,7 @@ impl TokensaveDb {
         let mut stmt = self
             .conn
             .prepare("SELECT kind, COUNT(*) FROM edges GROUP BY kind ORDER BY COUNT(*) DESC")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
-        })?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row_usize(row, 1)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 

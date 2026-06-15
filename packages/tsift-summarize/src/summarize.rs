@@ -378,9 +378,11 @@ impl SummaryDb {
     }
 
     pub fn stats(&self, root: &Path) -> Result<SummaryStats> {
-        let total_summaries: usize =
+        let total_summaries_raw: i64 =
             self.conn
                 .query_row("SELECT COUNT(*) FROM summaries", [], |row| row.get(0))?;
+        let total_summaries =
+            usize::try_from(total_summaries_raw).context("summary count out of range")?;
         let cached_file_paths = self.cached_file_paths()?;
         let total_files = cached_file_paths.len();
         let (stale_count, warnings) = self.stale_file_count(root, &cached_file_paths)?;

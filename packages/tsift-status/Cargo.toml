@@ -16,7 +16,7 @@ anyhow = "1"
 lazily = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tsift-index = { path = "../tsift-index", version = "0.1.70" }
 tsift-sqlite = { path = "../tsift-sqlite", version = "0.1.70" }
 tsift-summarize = { path = "../tsift-summarize", version = "0.1.70" }

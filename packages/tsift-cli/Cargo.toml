@@ -22,7 +22,7 @@ flate2 = "1"
 blake3 = "1"
 fs4 = "0.13"
 ignore = "0.4"
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -53,5 +53,5 @@ backend-surrealdb = ["dep:tsift-surrealdb"]
 
 [dev-dependencies]
 fs4 = "0.13"
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
