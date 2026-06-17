@@ -1,0 +1,16 @@
+[package]
+name = "tsift-local-model"
+version = "0.1.70"
+edition = "2024"
+description = "Local model profile, GPU probe, and lifecycle contracts for tsift Knowledge Graph extraction"
+license = "MIT"
+repository = "https://github.com/btakita/tsift"
+authors = ["Brian Takita <brian.takita@gmail.com>"]
+readme = "README.md"
+keywords = ["agent", "search", "rag", "cli", "context"]
+categories = ["command-line-utilities", "development-tools"]
+publish = true
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }

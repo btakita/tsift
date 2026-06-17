@@ -216,6 +216,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: MemoryCommand,
     },
+    /// Inspect local model support, GPU usage, and recommended KG model profiles
+    LocalModel {
+        #[command(subcommand)]
+        command: LocalModelCommand,
+    },
     /// Capture and query authored findings anchored to code (Findings Graph Layer)
     Finding {
         #[command(subcommand)]
@@ -1068,6 +1073,27 @@ pub enum FindingCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum LocalModelCommand {
+    /// Report GPU probe, RTX 5090 model ranking, and recommended local KG profiles
+    Status {
+        /// Skip nvidia-smi probing and report only static profile ranking
+        #[arg(long)]
+        no_probe: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+impl LocalModelCommand {
+    pub fn json_output(&self) -> bool {
+        match self {
+            Self::Status { json, .. } => *json,
+        }
+    }
 }
 
 #[derive(Subcommand)]

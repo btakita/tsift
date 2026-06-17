@@ -5208,6 +5208,7 @@ dependencies = [
  "tsift-graph",
  "tsift-index",
  "tsift-libsql",
+ "tsift-local-model",
  "tsift-memgraphrag",
  "tsift-memory",
  "tsift-quality",
@@ -5274,6 +5275,7 @@ dependencies = [
  "tsift-digest",
  "tsift-graph",
  "tsift-index",
+ "tsift-local-model",
  "tsift-memgraphrag",
  "tsift-memory",
  "tsift-quality",
@@ -5361,6 +5363,14 @@ dependencies = [
  "tempfile",
  "tokio",
  "tsift-core",
+]
+
+[[package]]
+name = "tsift-local-model"
+version = "0.1.70"
+dependencies = [
+ "anyhow",
+ "serde",
 ]
 
 [[package]]

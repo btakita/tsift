@@ -81,7 +81,10 @@ use token_savings::{
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use cli::{Cli, Commands, DispatchTraceFormat, GraphDbQuery, SemanticRelatedKind, SourceReadStyle};
+use cli::{
+    Cli, Commands, DispatchTraceFormat, GraphDbQuery, LocalModelCommand, SemanticRelatedKind,
+    SourceReadStyle,
+};
 #[cfg(test)]
 use cli::{GraphDbBackend, TraverseFormat};
 use commands::digests::{
@@ -585,6 +588,21 @@ pub fn run() -> Result<()> {
         Some(Commands::Memory { command }) => {
             let json = command.json_output();
             cmd_memory(
+                command,
+                OutputFormat {
+                    json_output: json || terse || schema || envelope,
+                    compact,
+                    pretty,
+                    terse,
+                    ultra_terse,
+                    schema,
+                    envelope,
+                },
+            )
+        }
+        Some(Commands::LocalModel { command }) => {
+            let json = command.json_output();
+            cmd_local_model(
                 command,
                 OutputFormat {
                     json_output: json || terse || schema || envelope,
@@ -1413,6 +1431,24 @@ pub fn run() -> Result<()> {
         None => {
             println!("tsift v{}", env!("CARGO_PKG_VERSION"));
             println!("Run `tsift --help` for usage.");
+            Ok(())
+        }
+    }
+}
+
+fn cmd_local_model(command: LocalModelCommand, output: OutputFormat) -> Result<()> {
+    match command {
+        LocalModelCommand::Status { no_probe, .. } => {
+            let report = tsift_local_model::build_status_report(!no_probe);
+            if output.json_output {
+                if output.pretty {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", serde_json::to_string(&report)?);
+                }
+            } else {
+                print!("{}", tsift_local_model::format_status_human(&report));
+            }
             Ok(())
         }
     }
@@ -31616,6 +31652,20 @@ fn sample() {}
                 assert!(autoindex || !no_autoindex);
             }
             _ => panic!("expected Search command"),
+        }
+    }
+
+    #[test]
+    fn cli_local_model_status_accepts_json_and_no_probe() {
+        let cli = parse_cli(["tsift", "local-model", "status", "--json", "--no-probe"]);
+        match cli.command {
+            Some(Commands::LocalModel {
+                command: LocalModelCommand::Status { json, no_probe },
+            }) => {
+                assert!(json);
+                assert!(no_probe);
+            }
+            _ => panic!("expected LocalModel status command"),
         }
     }
 
