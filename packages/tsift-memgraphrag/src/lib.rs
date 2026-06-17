@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use tsift_core::{GraphEdge, GraphFreshness, GraphNode, GraphProjection, GraphProvenance};
+use tsift_local_model::ProviderKind;
 use tsift_memory::{
     DEFAULT_MEMORY_CANDIDATE_LIMIT, MemoryEvent, MemoryReadPolicy, MemoryReadWatermark,
     estimate_tokens, memory_read_watermark, read_memory_event_candidates, read_memory_events,
@@ -11,12 +12,159 @@ use tsift_memory::{
 use tsift_sqlite::SqliteGraphStore;
 
 pub const MEMGRAPHRAG_CONTRACT_VERSION: &str = "tsift-memgraphrag-v1";
-pub const SEMANTIC_EMBEDDING_MODEL: &str = "tsift-local-hash-v1";
+pub const HASH_SEMANTIC_PROVIDER_ID: &str = "tsift-local-hash-v1";
+pub const SEMANTIC_EMBEDDING_MODEL: &str = HASH_SEMANTIC_PROVIDER_ID;
+pub const SEMANTIC_EXTRACTION_MODEL: &str = HASH_SEMANTIC_PROVIDER_ID;
 
 const SEMANTIC_EMBEDDING_DIM: usize = 32;
 const DEFAULT_TRAVERSAL_MEMORY_EVENT_LIMIT: usize = 600;
 const MEMORY_RANK_CANDIDATE_MULTIPLIER: usize = 8;
 const MEMORY_PROJECTION_NODE_ID: &str = "memory_projection:tsift-memory";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticProviderMetadata {
+    pub provider_id: String,
+    pub provider_kind: ProviderKind,
+    pub extraction_model: String,
+    pub embedding_model: String,
+}
+
+impl SemanticProviderMetadata {
+    pub fn hash_fallback() -> Self {
+        Self {
+            provider_id: HASH_SEMANTIC_PROVIDER_ID.to_string(),
+            provider_kind: ProviderKind::HashFallback,
+            extraction_model: SEMANTIC_EXTRACTION_MODEL.to_string(),
+            embedding_model: SEMANTIC_EMBEDDING_MODEL.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticProviderInput {
+    pub source_ref: String,
+    pub memory_kind: String,
+    pub label: String,
+    pub text: String,
+    pub semantic_text: String,
+    pub imported_from: String,
+    pub session_id: Option<String>,
+    pub observed_at_unix: Option<i64>,
+}
+
+impl SemanticProviderInput {
+    fn from_event(event: &MemoryEvent, label: String, imported_from: &str) -> Self {
+        let semantic_text = format!("{} {}", label, event.text);
+        Self {
+            source_ref: event.source_ref.clone(),
+            memory_kind: event.kind.as_str().to_string(),
+            label,
+            text: event.text.clone(),
+            semantic_text,
+            imported_from: imported_from.to_string(),
+            session_id: event.session_id.clone(),
+            observed_at_unix: event.observed_at_unix,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticConceptCandidate {
+    pub stable_key: String,
+    pub label: String,
+    pub detail: String,
+    pub embedding_text: String,
+}
+
+impl SemanticConceptCandidate {
+    pub fn new(
+        stable_key: impl Into<String>,
+        label: impl Into<String>,
+        detail: impl Into<String>,
+        embedding_text: impl Into<String>,
+    ) -> Self {
+        Self {
+            stable_key: stable_key.into(),
+            label: label.into(),
+            detail: detail.into(),
+            embedding_text: embedding_text.into(),
+        }
+    }
+
+    pub fn primary(
+        label: impl Into<String>,
+        detail: impl Into<String>,
+        embedding_text: impl Into<String>,
+    ) -> Self {
+        Self::new("primary", label, detail, embedding_text)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticEmbedding {
+    pub provider_id: String,
+    pub model: String,
+    pub values: Vec<f64>,
+}
+
+impl SemanticEmbedding {
+    pub fn new(provider_id: impl Into<String>, model: impl Into<String>, values: Vec<f64>) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            model: model.into(),
+            values,
+        }
+    }
+
+    pub fn dimensions(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn to_property(&self) -> String {
+        self.values
+            .iter()
+            .map(|value| format!("{value:.6}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+pub trait SemanticProvider {
+    fn metadata(&self) -> SemanticProviderMetadata;
+    fn extract_concepts(
+        &self,
+        input: &SemanticProviderInput,
+    ) -> Result<Vec<SemanticConceptCandidate>>;
+    fn embed(&self, input: &str) -> Result<SemanticEmbedding>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HashSemanticProvider;
+
+impl SemanticProvider for HashSemanticProvider {
+    fn metadata(&self) -> SemanticProviderMetadata {
+        SemanticProviderMetadata::hash_fallback()
+    }
+
+    fn extract_concepts(
+        &self,
+        input: &SemanticProviderInput,
+    ) -> Result<Vec<SemanticConceptCandidate>> {
+        Ok(vec![SemanticConceptCandidate::primary(
+            input.label.clone(),
+            "semantic row from tsift-memory hash fallback",
+            input.semantic_text.clone(),
+        )])
+    }
+
+    fn embed(&self, input: &str) -> Result<SemanticEmbedding> {
+        Ok(SemanticEmbedding::new(
+            HASH_SEMANTIC_PROVIDER_ID,
+            SEMANTIC_EMBEDDING_MODEL,
+            semantic_embedding(input),
+        ))
+    }
+}
 
 pub fn memory_graph_node_kinds() -> Vec<&'static str> {
     vec![
@@ -388,18 +536,34 @@ pub fn append_memory_events_as_traversal_rows(
     nodes: &mut Vec<GraphNode>,
     edges: &mut Vec<GraphEdge>,
 ) -> Result<()> {
+    append_memory_events_as_traversal_rows_with_provider(
+        root,
+        events,
+        nodes,
+        edges,
+        &HashSemanticProvider,
+    )
+}
+
+pub fn append_memory_events_as_traversal_rows_with_provider<P: SemanticProvider + ?Sized>(
+    root: &Path,
+    events: &[MemoryEvent],
+    nodes: &mut Vec<GraphNode>,
+    edges: &mut Vec<GraphEdge>,
+    semantic_provider: &P,
+) -> Result<()> {
     if events.is_empty() {
         return Ok(());
     }
 
     let mut seen_sessions = BTreeSet::new();
     let mut edge_map = BTreeMap::<(String, String, String), GraphEdge>::new();
+    let provider_metadata = semantic_provider.metadata();
 
     for event in events {
         let event_id = event.stable_id();
         let event_key = memory_event_key(event);
         let source_handle = stable_handle("tmemsrc", &event_key);
-        let semantic_handle = stable_handle("tmemsem", &event_key);
         let provenance = GraphProvenance::new("tsift-memory", &event.source_ref);
         let imported_from = event.imported_from.as_deref().unwrap_or("native");
 
@@ -514,35 +678,60 @@ pub fn append_memory_events_as_traversal_rows(
                 .with_provenance(provenance.clone()),
         );
 
-        let semantic_text = format!("{} {}", label, event.text);
-        let semantic_node =
-            GraphNode::new(semantic_handle.clone(), "semantic_concept", label.clone())
-                .with_property("handle", semantic_handle.clone())
-                .with_property("ref_id", event.source_ref.clone())
-                .with_property("detail", "semantic row from tsift-memory")
-                .with_property("source_ref", event.source_ref.clone())
-                .with_property("provider", "tsift-memory")
-                .with_property("memory_kind", event.kind.as_str())
-                .with_property("imported_from", imported_from)
-                .with_property("embedding_model", SEMANTIC_EMBEDDING_MODEL)
-                .with_property("embedding", semantic_embedding_property(&semantic_text))
-                .with_property(
-                    "expand",
-                    semantic_related_command(root, &label, SemanticRelatedKind::Concept),
-                )
-                .with_provenance(provenance.clone());
-        nodes.push(node_with_content_freshness(semantic_node)?);
-
-        insert_semantic_edge(
-            &mut edge_map,
-            GraphEdge::new(
-                source_handle.clone(),
+        let semantic_input = SemanticProviderInput::from_event(event, label.clone(), imported_from);
+        for (concept_index, concept) in semantic_provider
+            .extract_concepts(&semantic_input)?
+            .into_iter()
+            .enumerate()
+        {
+            let semantic_handle =
+                semantic_concept_handle(&event_key, concept_index, &concept.stable_key);
+            let embedding = semantic_provider.embed(&concept.embedding_text)?;
+            let semantic_node = GraphNode::new(
                 semantic_handle.clone(),
-                "mentions_concept",
+                "semantic_concept",
+                concept.label.clone(),
             )
-            .with_property("label", "tsift-memory semantic source")
-            .with_provenance(provenance.clone()),
-        );
+            .with_property("handle", semantic_handle.clone())
+            .with_property("ref_id", event.source_ref.clone())
+            .with_property("detail", concept.detail.clone())
+            .with_property("source_ref", event.source_ref.clone())
+            .with_property("provider", "tsift-memory")
+            .with_property("memory_kind", event.kind.as_str())
+            .with_property("imported_from", imported_from)
+            .with_property("semantic_provider", provider_metadata.provider_id.clone())
+            .with_property(
+                "semantic_provider_kind",
+                provider_kind_name(&provider_metadata.provider_kind),
+            )
+            .with_property(
+                "semantic_extraction_model",
+                provider_metadata.extraction_model.clone(),
+            )
+            .with_property("semantic_key", concept.stable_key.clone())
+            .with_property("embedding_provider", embedding.provider_id.clone())
+            .with_property("embedding_model", embedding.model.clone())
+            .with_property("embedding_dimensions", embedding.dimensions().to_string())
+            .with_property("embedding", embedding.to_property())
+            .with_property(
+                "expand",
+                semantic_related_command(root, &concept.label, SemanticRelatedKind::Concept),
+            )
+            .with_provenance(provenance.clone());
+            nodes.push(node_with_content_freshness(semantic_node)?);
+
+            insert_semantic_edge(
+                &mut edge_map,
+                GraphEdge::new(
+                    source_handle.clone(),
+                    semantic_handle.clone(),
+                    "mentions_concept",
+                )
+                .with_property("label", "tsift-memory semantic source")
+                .with_property("semantic_provider", provider_metadata.provider_id.clone())
+                .with_provenance(provenance.clone()),
+            );
+        }
     }
 
     for edge in edge_map.into_values() {
@@ -600,6 +789,23 @@ fn stable_handle(prefix: &str, key: &str) -> String {
     hasher.update(key.as_bytes());
     let hex = hasher.finalize().to_hex();
     format!("{prefix}-{}", &hex[..10])
+}
+
+fn semantic_concept_handle(event_key: &str, index: usize, stable_key: &str) -> String {
+    if index == 0 && stable_key == "primary" {
+        stable_handle("tmemsem", event_key)
+    } else {
+        stable_handle("tmemsem", &format!("{event_key}:{stable_key}"))
+    }
+}
+
+fn provider_kind_name(provider_kind: &ProviderKind) -> &'static str {
+    match provider_kind {
+        ProviderKind::LlamaCpp => "llama.cpp",
+        ProviderKind::Ollama => "ollama",
+        ProviderKind::Vllm => "vllm",
+        ProviderKind::HashFallback => "hash_fallback",
+    }
 }
 
 fn content_hash<T: Serialize>(value: &T) -> Result<String> {
@@ -666,14 +872,6 @@ fn semantic_embedding(input: &str) -> Vec<f64> {
         }
     }
     vector
-}
-
-fn semantic_embedding_property(input: &str) -> String {
-    semantic_embedding(input)
-        .iter()
-        .map(|value| format!("{value:.6}"))
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 fn traversal_tokens(input: &str) -> BTreeSet<String> {
@@ -948,7 +1146,111 @@ mod tests {
         assert!(nodes.iter().any(|node| {
             node.kind == "semantic_concept"
                 && node.properties.get("provider") == Some(&"tsift-memory".to_string())
+                && node.properties.get("semantic_provider")
+                    == Some(&HASH_SEMANTIC_PROVIDER_ID.to_string())
+                && node.properties.get("semantic_provider_kind")
+                    == Some(&"hash_fallback".to_string())
+                && node.properties.get("embedding_model")
+                    == Some(&SEMANTIC_EMBEDDING_MODEL.to_string())
+                && node.properties.get("embedding_dimensions") == Some(&"32".to_string())
         }));
         assert!(edges.iter().any(|edge| edge.kind == "mentions_concept"));
+    }
+
+    #[derive(Debug)]
+    struct FixtureSemanticProvider;
+
+    impl SemanticProvider for FixtureSemanticProvider {
+        fn metadata(&self) -> SemanticProviderMetadata {
+            SemanticProviderMetadata {
+                provider_id: "fixture-local-provider".to_string(),
+                provider_kind: ProviderKind::LlamaCpp,
+                extraction_model: "fixture-extractor".to_string(),
+                embedding_model: "fixture-embedder".to_string(),
+            }
+        }
+
+        fn extract_concepts(
+            &self,
+            input: &SemanticProviderInput,
+        ) -> Result<Vec<SemanticConceptCandidate>> {
+            assert_eq!(input.source_ref, "session.md");
+            Ok(vec![SemanticConceptCandidate::new(
+                "fixture-concept",
+                "provider extracted concept",
+                "semantic row from fixture provider",
+                "provider extracted concept embedding text",
+            )])
+        }
+
+        fn embed(&self, input: &str) -> Result<SemanticEmbedding> {
+            assert!(input.contains("embedding text"));
+            Ok(SemanticEmbedding::new(
+                "fixture-local-provider",
+                "fixture-embedder",
+                vec![1.0, 0.0, -1.0],
+            ))
+        }
+    }
+
+    #[test]
+    fn traversal_projection_uses_injected_semantic_provider() {
+        let dir = TempDir::new().unwrap();
+        let event = MemoryEvent::new(
+            MemoryEventKind::ResponseSummary,
+            "session.md",
+            "semantic provider graph",
+        )
+        .with_session_id("sess-1")
+        .with_observed_at_unix(1_700_000_000);
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        append_memory_events_as_traversal_rows_with_provider(
+            dir.path(),
+            &[event],
+            &mut nodes,
+            &mut edges,
+            &FixtureSemanticProvider,
+        )
+        .unwrap();
+
+        let semantic = nodes
+            .iter()
+            .find(|node| node.kind == "semantic_concept")
+            .expect("expected semantic concept from fixture provider");
+        assert_eq!(semantic.label, "provider extracted concept");
+        assert_eq!(
+            semantic.properties.get("semantic_provider"),
+            Some(&"fixture-local-provider".to_string())
+        );
+        assert_eq!(
+            semantic.properties.get("semantic_provider_kind"),
+            Some(&"llama.cpp".to_string())
+        );
+        assert_eq!(
+            semantic.properties.get("semantic_extraction_model"),
+            Some(&"fixture-extractor".to_string())
+        );
+        assert_eq!(
+            semantic.properties.get("embedding_provider"),
+            Some(&"fixture-local-provider".to_string())
+        );
+        assert_eq!(
+            semantic.properties.get("embedding_model"),
+            Some(&"fixture-embedder".to_string())
+        );
+        assert_eq!(
+            semantic.properties.get("embedding_dimensions"),
+            Some(&"3".to_string())
+        );
+        assert_eq!(
+            semantic.properties.get("embedding"),
+            Some(&"1.000000,0.000000,-1.000000".to_string())
+        );
+        assert!(edges.iter().any(|edge| {
+            edge.kind == "mentions_concept"
+                && edge.properties.get("semantic_provider")
+                    == Some(&"fixture-local-provider".to_string())
+        }));
     }
 }
