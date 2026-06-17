@@ -1,5 +1,9 @@
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -38,7 +42,7 @@ pub enum ConcurrencyClass {
     CpuOrHash,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LeaseMode {
     Exclusive,
     Shared,
@@ -864,14 +868,13 @@ fn matching_pre_process<'a>(
     pre_load_gpu_probe: &'a GpuProbe,
     post_process: &GpuProcess,
 ) -> Option<&'a GpuProcess> {
-    if let Some(pid) = post_process.pid {
-        if let Some(process) = pre_load_gpu_probe
+    if let Some(pid) = post_process.pid
+        && let Some(process) = pre_load_gpu_probe
             .processes
             .iter()
             .find(|candidate| candidate.pid == Some(pid))
-        {
-            return Some(process);
-        }
+    {
+        return Some(process);
     }
     pre_load_gpu_probe
         .processes
@@ -888,7 +891,7 @@ fn is_tsift_model_process(process: &GpuProcess) -> bool {
         || name.contains("ggml")
 }
 
-fn current_unix_seconds() -> u64 {
+pub fn current_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -955,6 +958,452 @@ fn format_optional_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+// ============================================================================
+// Cooperative GPU lease registry (#gctrl1)
+//
+// A file-backed registry of who currently holds a GPU-bound local model
+// profile. Cooperative (no daemon): producers check the file before probing
+// the GPU, prune stale leases (dead pid or past idle TTL), and either acquire
+// the slot or report a conflict with the live holder.
+//
+// The registry is keyed by `profile_id` and holds a list of `GpuLeaseRecord`
+// holders. `Exclusive` profiles allow at most one live holder; `Shared`
+// profiles allow many; `CpuOrHash` profiles bypass the registry entirely
+// because they do not consume GPU VRAM.
+// ============================================================================
+
+/// Cooperative GPU lease registry file format version.
+pub const LEASE_REGISTRY_VERSION: u32 = 1;
+/// Default idle TTL (0 = no TTL-based staleness, only pid-dead pruning).
+pub const DEFAULT_LEASE_TTL_SECONDS: u64 = 0;
+/// Environment variable override for the lease registry file path.
+pub const LEASE_FILE_ENV_VAR: &str = "TSIFT_LEASE_FILE";
+
+/// One held lease on a profile, written to the cooperative registry file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuLeaseRecord {
+    pub profile_id: String,
+    pub holder_pid: u32,
+    pub holder_command: String,
+    pub acquired_at_unix_seconds: u64,
+    pub lease_mode: LeaseMode,
+    pub vram_baseline_mib: u64,
+    pub idle_ttl_seconds: u64,
+    pub notes: Vec<String>,
+}
+
+/// File-backed cooperative registry: `{ version, leases: { profile_id: [record, ...] } }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuLeaseRegistry {
+    pub version: u32,
+    pub leases: BTreeMap<String, Vec<GpuLeaseRecord>>,
+}
+
+impl Default for GpuLeaseRegistry {
+    fn default() -> Self {
+        Self {
+            version: LEASE_REGISTRY_VERSION,
+            leases: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum GpuLeaseAcquisitionStatus {
+    /// Fresh acquire on a free slot.
+    Acquired,
+    /// Same holder pid already held the slot; timestamp/baseline refreshed.
+    Refreshed,
+    /// Previous holder was stale (pid gone or TTL expired); slot reclaimed.
+    ReclaimedStale,
+    /// Profile is `CpuOrHash`; no registry entry needed.
+    CpuOrHashBypass,
+    /// Another live holder owns the slot.
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GpuLeaseConflict {
+    pub profile_id: String,
+    pub holder_pid: u32,
+    pub holder_command: String,
+    pub acquired_at_unix_seconds: u64,
+    pub lease_mode: LeaseMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GpuLeaseAcquisition {
+    pub profile_id: String,
+    pub holder_pid: u32,
+    pub status: GpuLeaseAcquisitionStatus,
+    pub record: Option<GpuLeaseRecord>,
+    pub conflict: Option<GpuLeaseConflict>,
+    /// Stale records pruned during this acquire (cleared from the registry).
+    pub reclaimed: Vec<GpuLeaseRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum GpuLeaseReleaseOutcome {
+    /// This holder's lease was removed.
+    Released,
+    /// Profile exists but this pid was not among its holders.
+    NotHeld,
+    /// No entry for the profile at all.
+    ProfileAbsent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GpuLeaseRelease {
+    pub profile_id: String,
+    pub holder_pid: u32,
+    pub outcome: GpuLeaseReleaseOutcome,
+    /// Number of remaining live holders for the profile after release.
+    pub remaining_holders: u32,
+}
+
+/// Resolve the cooperative lease registry file path.
+///
+/// Order: explicit `override_path` → `$TSIFT_LEASE_FILE` →
+/// `$XDG_STATE_HOME/tsift/gpu-lease.json` → `~/.tsift/gpu-lease.json` →
+/// `./.tsift/gpu-lease.json` if no home directory can be resolved.
+pub fn resolve_lease_file(override_path: Option<&Path>) -> PathBuf {
+    if let Some(path) = override_path {
+        return path.to_path_buf();
+    }
+    if let Ok(path) = std::env::var(LEASE_FILE_ENV_VAR) {
+        return PathBuf::from(path);
+    }
+    if let Ok(state_dir) = std::env::var("XDG_STATE_HOME")
+        && !state_dir.is_empty()
+    {
+        return PathBuf::from(state_dir).join("tsift").join("gpu-lease.json");
+    }
+    if let Ok(home) = std::env::var("HOME") && !home.is_empty() {
+        return PathBuf::from(home).join(".tsift").join("gpu-lease.json");
+    }
+    PathBuf::from("./.tsift/gpu-lease.json")
+}
+
+/// Best-effort pid-liveness check via `kill -0`.
+///
+/// A pid equal to the current process is always considered alive. Pid 0 is
+/// treated as missing/unknown and reported as not alive so callers can use 0
+/// as a sentinel for "no pid recorded".
+pub fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+    match Command::new("kill").arg("-0").arg(pid.to_string()).output() {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
+}
+
+/// Read the lease registry, returning an empty default when the file is missing.
+pub fn read_lease_registry(path: &Path) -> Result<GpuLeaseRegistry> {
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            if contents.trim().is_empty() {
+                return Ok(GpuLeaseRegistry::default());
+            }
+            serde_json::from_str(&contents).context("parse gpu lease registry")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(GpuLeaseRegistry::default())
+        }
+        Err(error) => Err(error).context("read gpu lease registry"),
+    }
+}
+
+/// Atomically write the lease registry (temp file + rename).
+pub fn write_lease_registry(path: &Path, registry: &GpuLeaseRegistry) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).context("create lease registry parent")?;
+    }
+    let payload = serde_json::to_string_pretty(registry).context("serialize lease registry")?;
+    let temp_path = path.with_extension(format!(
+        "json.tmp.{}.{}",
+        std::process::id(),
+        current_unix_seconds()
+    ));
+    let mut handle = fs::File::create(&temp_path).context("create lease registry temp file")?;
+    handle
+        .write_all(payload.as_bytes())
+        .context("write lease registry temp file")?;
+    handle
+        .sync_all()
+        .context("sync lease registry temp file")?;
+    drop(handle);
+    fs::rename(&temp_path, path).context("rename lease registry into place")?;
+    Ok(())
+}
+
+/// Prune stale holders from the registry in place.
+///
+/// A holder is stale when its pid is no longer alive, or when its
+/// `idle_ttl_seconds > 0` and the lease age exceeds the TTL.
+///
+/// Returns the records that were pruned.
+pub fn prune_stale_leases(
+    registry: &mut GpuLeaseRegistry,
+    now: u64,
+    is_alive: impl Fn(u32) -> bool,
+) -> Vec<GpuLeaseRecord> {
+    let mut pruned = Vec::new();
+    let mut empty_keys = Vec::new();
+    for (profile_id, holders) in registry.leases.iter_mut() {
+        let mut kept = Vec::with_capacity(holders.len());
+        for record in holders.drain(..) {
+            let pid_dead = !is_alive(record.holder_pid);
+            let ttl_expired = record.idle_ttl_seconds > 0
+                && now.saturating_sub(record.acquired_at_unix_seconds) > record.idle_ttl_seconds;
+            if pid_dead || ttl_expired {
+                pruned.push(record);
+            } else {
+                kept.push(record);
+            }
+        }
+        if kept.is_empty() {
+            empty_keys.push(profile_id.clone());
+        }
+        *holders = kept;
+    }
+    for key in empty_keys {
+        registry.leases.remove(&key);
+    }
+    pruned
+}
+
+/// Apply an acquire to the registry in place.
+///
+/// Pure logic; the file I/O wrapper is `acquire_lease`. The `is_alive` closure
+/// lets tests inject a deterministic liveness check.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_acquire(
+    registry: &mut GpuLeaseRegistry,
+    profile: &ModelProfile,
+    holder_pid: u32,
+    holder_command: &str,
+    vram_baseline_mib: u64,
+    idle_ttl_seconds: u64,
+    now: u64,
+    is_alive: impl Fn(u32) -> bool,
+) -> GpuLeaseAcquisition {
+    if profile.concurrency == ConcurrencyClass::CpuOrHash {
+        return GpuLeaseAcquisition {
+            profile_id: profile.id.to_string(),
+            holder_pid,
+            status: GpuLeaseAcquisitionStatus::CpuOrHashBypass,
+            record: None,
+            conflict: None,
+            reclaimed: Vec::new(),
+        };
+    }
+
+    let reclaimed = prune_stale_leases(registry, now, &is_alive);
+    let mode = lease_mode_for_profile(profile);
+    let entry = registry.leases.entry(profile.id.to_string()).or_default();
+    let already_held = entry
+        .iter()
+        .position(|record| record.holder_pid == holder_pid);
+
+    let record = GpuLeaseRecord {
+        profile_id: profile.id.to_string(),
+        holder_pid,
+        holder_command: holder_command.to_string(),
+        acquired_at_unix_seconds: now,
+        lease_mode: mode.clone(),
+        vram_baseline_mib,
+        idle_ttl_seconds,
+        notes: Vec::new(),
+    };
+
+    let status = if let Some(index) = already_held {
+        entry[index] = record.clone();
+        GpuLeaseAcquisitionStatus::Refreshed
+    } else {
+        match mode {
+            LeaseMode::Exclusive => {
+                if let Some(blocker) = entry.first() {
+                    return GpuLeaseAcquisition {
+                        profile_id: profile.id.to_string(),
+                        holder_pid,
+                        status: GpuLeaseAcquisitionStatus::Conflict,
+                        record: None,
+                        conflict: Some(GpuLeaseConflict {
+                            profile_id: profile.id.to_string(),
+                            holder_pid: blocker.holder_pid,
+                            holder_command: blocker.holder_command.clone(),
+                            acquired_at_unix_seconds: blocker.acquired_at_unix_seconds,
+                            lease_mode: blocker.lease_mode.clone(),
+                        }),
+                        reclaimed,
+                    };
+                }
+                entry.push(record.clone());
+                if reclaimed
+                    .iter()
+                    .any(|pruned| pruned.profile_id == profile.id)
+                {
+                    GpuLeaseAcquisitionStatus::ReclaimedStale
+                } else {
+                    GpuLeaseAcquisitionStatus::Acquired
+                }
+            }
+            LeaseMode::Shared => {
+                entry.push(record.clone());
+                if reclaimed
+                    .iter()
+                    .any(|pruned| pruned.profile_id == profile.id)
+                {
+                    GpuLeaseAcquisitionStatus::ReclaimedStale
+                } else {
+                    GpuLeaseAcquisitionStatus::Acquired
+                }
+            }
+            LeaseMode::CpuOrHash => GpuLeaseAcquisitionStatus::CpuOrHashBypass,
+        }
+    };
+
+    GpuLeaseAcquisition {
+        profile_id: profile.id.to_string(),
+        holder_pid,
+        status,
+        record: Some(record),
+        conflict: None,
+        reclaimed,
+    }
+}
+
+/// Apply a release to the registry in place.
+pub fn apply_release(
+    registry: &mut GpuLeaseRegistry,
+    profile_id: &str,
+    holder_pid: u32,
+    now: u64,
+    is_alive: impl Fn(u32) -> bool,
+) -> GpuLeaseRelease {
+    let _ = prune_stale_leases(registry, now, &is_alive);
+    let Some(holders) = registry.leases.get_mut(profile_id) else {
+        return GpuLeaseRelease {
+            profile_id: profile_id.to_string(),
+            holder_pid,
+            outcome: GpuLeaseReleaseOutcome::ProfileAbsent,
+            remaining_holders: 0,
+        };
+    };
+    let before = holders.len();
+    holders.retain(|record| record.holder_pid != holder_pid);
+    let removed = before - holders.len();
+    let remaining = holders.len() as u32;
+    if holders.is_empty() {
+        // Borrow on `holders` ends here; safe to mutate the map again.
+        registry.leases.remove(profile_id);
+    }
+    let outcome = if removed == 0 {
+        GpuLeaseReleaseOutcome::NotHeld
+    } else {
+        GpuLeaseReleaseOutcome::Released
+    };
+    GpuLeaseRelease {
+        profile_id: profile_id.to_string(),
+        holder_pid,
+        outcome,
+        remaining_holders: remaining,
+    }
+}
+
+/// High-level acquire: read file, prune stale, apply, write file.
+pub fn acquire_lease(
+    profile_id: &str,
+    holder_pid: u32,
+    holder_command: &str,
+    vram_baseline_mib: u64,
+    idle_ttl_seconds: u64,
+    now: u64,
+    path: &Path,
+) -> Result<GpuLeaseAcquisition> {
+    let profile = profile_by_id(profile_id)
+        .with_context(|| format!("unknown local model profile {profile_id:?}"))?;
+    let mut registry = read_lease_registry(path)?;
+    let acquisition = apply_acquire(
+        &mut registry,
+        &profile,
+        holder_pid,
+        holder_command,
+        vram_baseline_mib,
+        idle_ttl_seconds,
+        now,
+        is_pid_alive,
+    );
+    // CpuOrHash bypass intentionally does not touch the registry file.
+    if acquisition.status != GpuLeaseAcquisitionStatus::CpuOrHashBypass {
+        write_lease_registry(path, &registry)?;
+    }
+    Ok(acquisition)
+}
+
+/// High-level release: read file, prune, drop this holder, write file.
+pub fn release_lease(
+    profile_id: &str,
+    holder_pid: u32,
+    now: u64,
+    path: &Path,
+) -> Result<GpuLeaseRelease> {
+    let mut registry = read_lease_registry(path)?;
+    let release = apply_release(&mut registry, profile_id, holder_pid, now, is_pid_alive);
+    write_lease_registry(path, &registry)?;
+    Ok(release)
+}
+
+/// Read the registry and return the pruned view. `include_stale` skips the
+/// pruning pass so the caller can inspect raw state for diagnostics.
+pub fn show_registry(path: &Path, now: u64, include_stale: bool) -> Result<GpuLeaseRegistry> {
+    let mut registry = read_lease_registry(path)?;
+    if !include_stale {
+        prune_stale_leases(&mut registry, now, is_pid_alive);
+    }
+    Ok(registry)
+}
+
+/// Human-readable summary of the lease registry.
+pub fn format_lease_show_human(registry: &GpuLeaseRegistry, now: u64) -> String {
+    let mut out = String::new();
+    out.push_str("GPU lease registry\n");
+    out.push_str(&format!("version: {}\n", registry.version));
+    if registry.leases.is_empty() {
+        out.push_str("leases: none\n");
+        return out;
+    }
+    out.push_str(&format!("profiles held: {}\n", registry.leases.len()));
+    for (profile_id, holders) in &registry.leases {
+        out.push_str(&format!("\n{profile_id} ({} holder(s)):\n", holders.len()));
+        for record in holders {
+            let age = now.saturating_sub(record.acquired_at_unix_seconds);
+            out.push_str(&format!(
+                "  pid={} cmd={} mode={:?} acquired={}s ago baseline={} MiB ttl={}s",
+                record.holder_pid,
+                record.holder_command,
+                record.lease_mode,
+                age,
+                record.vram_baseline_mib,
+                record.idle_ttl_seconds
+            ));
+            if record.notes.is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str(&format!(" notes={}\n", record.notes.join("; ")));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1116,5 +1565,355 @@ mod tests {
                     command == &vec!["kill".to_string(), "-TERM".to_string(), "1234".to_string()]
                 })
         }));
+    }
+
+    // ---- Cooperative GPU lease registry (#gctrl1) ----
+
+    fn all_alive(_pid: u32) -> bool {
+        true
+    }
+    fn alive_set(alive: &[u32]) -> impl Fn(u32) -> bool + '_ {
+        move |pid| alive.contains(&pid)
+    }
+
+    #[test]
+    fn resolve_lease_file_prefers_explicit_override() {
+        let path = resolve_lease_file(Some(Path::new("/custom/lease.json")));
+        assert_eq!(path, PathBuf::from("/custom/lease.json"));
+    }
+
+    #[test]
+    fn resolve_lease_file_returns_env_value_when_set() {
+        // SAFETY: env mutation is unsafe in edition 2024 because of potential
+        // data races in multi-threaded programs. Tests run single-threaded
+        // inside this test function and the value is restored afterwards.
+        unsafe {
+            std::env::set_var(LEASE_FILE_ENV_VAR, "/env/lease.json");
+        }
+        let path = resolve_lease_file(None);
+        unsafe {
+            std::env::remove_var(LEASE_FILE_ENV_VAR);
+        }
+        assert_eq!(path, PathBuf::from("/env/lease.json"));
+    }
+
+    #[test]
+    fn lease_registry_round_trips_through_json() {
+        let mut registry = GpuLeaseRegistry::default();
+        registry.leases.insert(
+            "qwen3-32b-q4".to_string(),
+            vec![GpuLeaseRecord {
+                profile_id: "qwen3-32b-q4".to_string(),
+                holder_pid: 4242,
+                holder_command: "tsift".to_string(),
+                acquired_at_unix_seconds: 100,
+                lease_mode: LeaseMode::Exclusive,
+                vram_baseline_mib: 200,
+                idle_ttl_seconds: 0,
+                notes: vec!["baseline".to_string()],
+            }],
+        );
+        let payload = serde_json::to_string(&registry).unwrap();
+        let back: GpuLeaseRegistry = serde_json::from_str(&payload).unwrap();
+        assert_eq!(registry, back);
+        assert_eq!(back.version, LEASE_REGISTRY_VERSION);
+    }
+
+    #[test]
+    fn acquire_exclusive_profile_succeeds_when_free() {
+        let profile = profile_by_id("qwen3-32b-q4").unwrap();
+        let mut registry = GpuLeaseRegistry::default();
+        let acquisition = apply_acquire(
+            &mut registry,
+            &profile,
+            100,
+            "tsift",
+            200,
+            0,
+            1_000,
+            all_alive,
+        );
+        assert_eq!(acquisition.status, GpuLeaseAcquisitionStatus::Acquired);
+        assert!(acquisition.conflict.is_none());
+        assert_eq!(registry.leases["qwen3-32b-q4"].len(), 1);
+        assert_eq!(registry.leases["qwen3-32b-q4"][0].holder_pid, 100);
+    }
+
+    #[test]
+    fn acquire_exclusive_profile_conflicts_with_live_holder() {
+        let profile = profile_by_id("qwen3-32b-q4").unwrap();
+        let mut registry = GpuLeaseRegistry::default();
+        apply_acquire(
+            &mut registry,
+            &profile,
+            100,
+            "tsift",
+            200,
+            0,
+            1_000,
+            all_alive,
+        );
+        let second = apply_acquire(
+            &mut registry,
+            &profile,
+            200,
+            "corky",
+            250,
+            0,
+            1_050,
+            alive_set(&[100, 200]),
+        );
+        assert_eq!(second.status, GpuLeaseAcquisitionStatus::Conflict);
+        let conflict = second.conflict.unwrap();
+        assert_eq!(conflict.holder_pid, 100);
+        assert_eq!(conflict.holder_command, "tsift");
+        // The conflict must not overwrite the existing holder.
+        assert_eq!(registry.leases["qwen3-32b-q4"].len(), 1);
+        assert_eq!(registry.leases["qwen3-32b-q4"][0].holder_pid, 100);
+    }
+
+    #[test]
+    fn acquire_exclusive_profile_reclaims_when_holder_pid_dead() {
+        let profile = profile_by_id("qwen3-32b-q4").unwrap();
+        let mut registry = GpuLeaseRegistry::default();
+        apply_acquire(
+            &mut registry,
+            &profile,
+            100,
+            "tsift",
+            200,
+            0,
+            1_000,
+            all_alive,
+        );
+        // pid 100 is gone now; only pid 200 is alive.
+        let reclaimed = apply_acquire(
+            &mut registry,
+            &profile,
+            200,
+            "corky",
+            250,
+            0,
+            1_050,
+            alive_set(&[200]),
+        );
+        assert_eq!(reclaimed.status, GpuLeaseAcquisitionStatus::ReclaimedStale);
+        assert_eq!(reclaimed.reclaimed.len(), 1);
+        assert_eq!(registry.leases["qwen3-32b-q4"].len(), 1);
+        assert_eq!(registry.leases["qwen3-32b-q4"][0].holder_pid, 200);
+    }
+
+    #[test]
+    fn acquire_shared_profile_allows_multiple_live_holders() {
+        let profile = profile_by_id("qwen3-embedding-0.6b").unwrap();
+        let mut registry = GpuLeaseRegistry::default();
+        apply_acquire(
+            &mut registry,
+            &profile,
+            100,
+            "tsift",
+            200,
+            0,
+            1_000,
+            all_alive,
+        );
+        let second = apply_acquire(
+            &mut registry,
+            &profile,
+            200,
+            "headroom",
+            250,
+            0,
+            1_050,
+            alive_set(&[100, 200]),
+        );
+        assert_eq!(second.status, GpuLeaseAcquisitionStatus::Acquired);
+        assert_eq!(registry.leases["qwen3-embedding-0.6b"].len(), 2);
+    }
+
+    #[test]
+    fn acquire_refreshes_when_same_holder_requests_again() {
+        let profile = profile_by_id("qwen3-32b-q4").unwrap();
+        let mut registry = GpuLeaseRegistry::default();
+        apply_acquire(
+            &mut registry,
+            &profile,
+            100,
+            "tsift",
+            200,
+            0,
+            1_000,
+            all_alive,
+        );
+        let again = apply_acquire(
+            &mut registry,
+            &profile,
+            100,
+            "tsift",
+            180,
+            0,
+            1_500,
+            all_alive,
+        );
+        assert_eq!(again.status, GpuLeaseAcquisitionStatus::Refreshed);
+        assert_eq!(registry.leases["qwen3-32b-q4"].len(), 1);
+        assert_eq!(registry.leases["qwen3-32b-q4"][0].acquired_at_unix_seconds, 1_500);
+        assert_eq!(registry.leases["qwen3-32b-q4"][0].vram_baseline_mib, 180);
+    }
+
+    #[test]
+    fn acquire_cpu_or_hash_profile_bypasses_registry() {
+        let profile = profile_by_id("tsift-local-hash-v1").unwrap();
+        let mut registry = GpuLeaseRegistry::default();
+        let bypass = apply_acquire(
+            &mut registry,
+            &profile,
+            100,
+            "tsift",
+            0,
+            0,
+            1_000,
+            all_alive,
+        );
+        assert_eq!(bypass.status, GpuLeaseAcquisitionStatus::CpuOrHashBypass);
+        assert!(registry.leases.is_empty());
+    }
+
+    #[test]
+    fn idle_ttl_expires_even_when_pid_still_alive() {
+        let profile = profile_by_id("qwen3-32b-q4").unwrap();
+        let mut registry = GpuLeaseRegistry::default();
+        apply_acquire(
+            &mut registry,
+            &profile,
+            100,
+            "tsift",
+            200,
+            60,
+            1_000,
+            all_alive,
+        );
+        // 120s later, the 60s TTL has expired; pid 100 is still alive but stale.
+        let reclaimed = apply_acquire(
+            &mut registry,
+            &profile,
+            200,
+            "corky",
+            250,
+            0,
+            1_120,
+            all_alive,
+        );
+        assert_eq!(reclaimed.status, GpuLeaseAcquisitionStatus::ReclaimedStale);
+        assert_eq!(registry.leases["qwen3-32b-q4"][0].holder_pid, 200);
+    }
+
+    #[test]
+    fn release_removes_holder_and_drops_empty_profile() {
+        let profile = profile_by_id("qwen3-32b-q4").unwrap();
+        let mut registry = GpuLeaseRegistry::default();
+        apply_acquire(
+            &mut registry,
+            &profile,
+            100,
+            "tsift",
+            200,
+            0,
+            1_000,
+            all_alive,
+        );
+        let release = apply_release(&mut registry, "qwen3-32b-q4", 100, 1_050, all_alive);
+        assert_eq!(release.outcome, GpuLeaseReleaseOutcome::Released);
+        assert_eq!(release.remaining_holders, 0);
+        assert!(registry.leases.is_empty());
+    }
+
+    #[test]
+    fn release_by_non_holder_reports_not_held() {
+        let profile = profile_by_id("qwen3-32b-q4").unwrap();
+        let mut registry = GpuLeaseRegistry::default();
+        apply_acquire(
+            &mut registry,
+            &profile,
+            100,
+            "tsift",
+            200,
+            0,
+            1_000,
+            all_alive,
+        );
+        let release = apply_release(&mut registry, "qwen3-32b-q4", 999, 1_050, all_alive);
+        assert_eq!(release.outcome, GpuLeaseReleaseOutcome::NotHeld);
+        assert_eq!(registry.leases["qwen3-32b-q4"].len(), 1);
+    }
+
+    #[test]
+    fn acquire_and_release_round_trip_through_file() {
+        let dir = tempfile_dir();
+        let path = dir.join("gpu-lease.json");
+        let profile = profile_by_id("qwen3-32b-q4").unwrap();
+
+        let mut registry = GpuLeaseRegistry::default();
+        let acquisition = apply_acquire(
+            &mut registry,
+            &profile,
+            4242,
+            "tsift",
+            220,
+            0,
+            1_000,
+            all_alive,
+        );
+        assert_eq!(acquisition.status, GpuLeaseAcquisitionStatus::Acquired);
+        write_lease_registry(&path, &registry).unwrap();
+
+        let read_back = read_lease_registry(&path).unwrap();
+        assert_eq!(read_back, registry);
+        assert_eq!(read_back.leases["qwen3-32b-q4"][0].holder_pid, 4242);
+
+        let release = apply_release(&mut registry, "qwen3-32b-q4", 4242, 1_050, all_alive);
+        assert_eq!(release.outcome, GpuLeaseReleaseOutcome::Released);
+        write_lease_registry(&path, &registry).unwrap();
+
+        let after = read_lease_registry(&path).unwrap();
+        assert!(after.leases.is_empty());
+    }
+
+    #[test]
+    fn read_lease_registry_returns_default_for_missing_file() {
+        let path = Path::new("/definitely/not/a/real/path/lease.json");
+        let registry = read_lease_registry(path).unwrap();
+        assert_eq!(registry, GpuLeaseRegistry::default());
+    }
+
+    #[test]
+    fn prune_stale_leaves_healthy_entries_alone() {
+        let mut registry = GpuLeaseRegistry::default();
+        registry.leases.insert(
+            "qwen3-32b-q4".to_string(),
+            vec![GpuLeaseRecord {
+                profile_id: "qwen3-32b-q4".to_string(),
+                holder_pid: 100,
+                holder_command: "tsift".to_string(),
+                acquired_at_unix_seconds: 1_000,
+                lease_mode: LeaseMode::Exclusive,
+                vram_baseline_mib: 200,
+                idle_ttl_seconds: 0,
+                notes: Vec::new(),
+            }],
+        );
+        let pruned = prune_stale_leases(&mut registry, 1_010, alive_set(&[100]));
+        assert!(pruned.is_empty());
+        assert!(registry.leases.contains_key("qwen3-32b-q4"));
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tsift-lease-test-{}-{}",
+            std::process::id(),
+            current_unix_seconds()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

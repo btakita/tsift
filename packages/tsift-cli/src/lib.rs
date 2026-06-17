@@ -82,8 +82,8 @@ use token_savings::{
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::{
-    Cli, Commands, DispatchTraceFormat, GraphDbQuery, LocalModelCommand, SemanticRelatedKind,
-    SourceReadStyle,
+    Cli, Commands, DispatchTraceFormat, GraphDbQuery, LeaseCommand, LocalModelCommand,
+    SemanticRelatedKind, SourceReadStyle,
 };
 #[cfg(test)]
 use cli::{GraphDbBackend, TraverseFormat};
@@ -1492,6 +1492,144 @@ fn cmd_local_model(command: LocalModelCommand, output: OutputFormat) -> Result<(
                     report.cleanup.reason
                 );
             }
+            Ok(())
+        }
+        LocalModelCommand::Lease { command } => cmd_local_model_lease(command, output),
+    }
+}
+
+fn cmd_local_model_lease(command: LeaseCommand, output: OutputFormat) -> Result<()> {
+    use tsift_local_model::{
+        acquire_lease, current_unix_seconds, format_lease_show_human, lease_mode_for_profile,
+        profile_by_id, release_lease, resolve_lease_file, show_registry,
+    };
+    let now = current_unix_seconds();
+    match command {
+        LeaseCommand::Acquire {
+            profile,
+            holder_pid,
+            holder_command,
+            idle_ttl_seconds,
+            vram_baseline_mib,
+            no_probe,
+            lease_file,
+            strict,
+            ..
+        } => {
+            let profile_lookup = profile_by_id(&profile)
+                .with_context(|| format!("unknown local model profile {profile:?}"))?;
+            // CpuOrHash profiles bypass the registry; confirm that upfront.
+            let _ = lease_mode_for_profile(&profile_lookup);
+            let pid = holder_pid.unwrap_or_else(std::process::id);
+            let baseline = match vram_baseline_mib {
+                Some(value) => value,
+                None => {
+                    if no_probe {
+                        0
+                    } else {
+                        let probe = tsift_local_model::probe_nvidia_smi();
+                        probe.used_vram_mib.unwrap_or(0)
+                    }
+                }
+            };
+            let path = resolve_lease_file(lease_file.as_deref());
+            let acquisition =
+                acquire_lease(&profile, pid, &holder_command, baseline, idle_ttl_seconds, now, &path)?;
+            if output.json_output {
+                if output.pretty {
+                    println!("{}", serde_json::to_string_pretty(&acquisition)?);
+                } else {
+                    println!("{}", serde_json::to_string(&acquisition)?);
+                }
+            } else {
+                println!(
+                    "lease {} for {} (pid={}): {:?}",
+                    match acquisition.status {
+                        tsift_local_model::GpuLeaseAcquisitionStatus::Acquired => "acquired",
+                        tsift_local_model::GpuLeaseAcquisitionStatus::Refreshed => "refreshed",
+                        tsift_local_model::GpuLeaseAcquisitionStatus::ReclaimedStale => {
+                            "reclaimed-stale"
+                        }
+                        tsift_local_model::GpuLeaseAcquisitionStatus::CpuOrHashBypass => {
+                            "bypass-cpu-or-hash"
+                        }
+                        tsift_local_model::GpuLeaseAcquisitionStatus::Conflict => "conflicted",
+                    },
+                    acquisition.profile_id,
+                    acquisition.holder_pid,
+                    acquisition.status
+                );
+                if let Some(conflict) = &acquisition.conflict {
+                    println!(
+                        "held by pid={} cmd={} acquired {}s ago",
+                        conflict.holder_pid,
+                        conflict.holder_command,
+                        now.saturating_sub(conflict.acquired_at_unix_seconds)
+                    );
+                }
+                println!("registry: {}", path.display());
+            }
+            if strict && acquisition.status == tsift_local_model::GpuLeaseAcquisitionStatus::Conflict
+            {
+                bail!(
+                    "gpu lease for {profile:?} is held by pid={}",
+                    acquisition
+                        .conflict
+                        .map(|conflict| conflict.holder_pid.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+            }
+            Ok(())
+        }
+        LeaseCommand::Release {
+            profile,
+            holder_pid,
+            lease_file,
+            ..
+        } => {
+            let pid = holder_pid.unwrap_or_else(std::process::id);
+            let path = resolve_lease_file(lease_file.as_deref());
+            let release = release_lease(&profile, pid, now, &path)?;
+            if output.json_output {
+                if output.pretty {
+                    println!("{}", serde_json::to_string_pretty(&release)?);
+                } else {
+                    println!("{}", serde_json::to_string(&release)?);
+                }
+            } else {
+                println!(
+                    "release {} for {} (pid={}): {:?} (remaining holders: {})",
+                    match release.outcome {
+                        tsift_local_model::GpuLeaseReleaseOutcome::Released => "ok",
+                        tsift_local_model::GpuLeaseReleaseOutcome::NotHeld => "not-held",
+                        tsift_local_model::GpuLeaseReleaseOutcome::ProfileAbsent => "absent",
+                    },
+                    release.profile_id,
+                    release.holder_pid,
+                    release.outcome,
+                    release.remaining_holders
+                );
+                println!("registry: {}", path.display());
+            }
+            Ok(())
+        }
+        LeaseCommand::Show {
+            lease_file,
+            include_stale,
+            ..
+        } => {
+            let path = resolve_lease_file(lease_file.as_deref());
+            let registry = show_registry(&path, now, include_stale)?;
+            if output.json_output {
+                if output.pretty {
+                    println!("{}", serde_json::to_string_pretty(&registry)?);
+                } else {
+                    println!("{}", serde_json::to_string(&registry)?);
+                }
+            } else {
+                print!("{}", format_lease_show_human(&registry, now));
+            }
+            println!("registry: {}", path.display());
             Ok(())
         }
     }
@@ -31764,6 +31902,122 @@ fn sample() {}
                 assert!(json);
             }
             _ => panic!("expected LocalModel unload command"),
+        }
+    }
+
+    #[test]
+    fn cli_local_model_lease_acquire_parses_flags() {
+        let cli = parse_cli([
+            "tsift",
+            "local-model",
+            "lease",
+            "acquire",
+            "--profile",
+            "qwen3-32b-q4",
+            "--holder-pid",
+            "4242",
+            "--holder-command",
+            "corky",
+            "--idle-ttl-seconds",
+            "120",
+            "--vram-baseline-mib",
+            "200",
+            "--lease-file",
+            "/tmp/tsift-lease.json",
+            "--strict",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::LocalModel {
+                command:
+                    LocalModelCommand::Lease {
+                        command:
+                            LeaseCommand::Acquire {
+                                profile,
+                                holder_pid,
+                                holder_command,
+                                idle_ttl_seconds,
+                                vram_baseline_mib,
+                                lease_file,
+                                strict,
+                                json,
+                                ..
+                            },
+                    },
+            }) => {
+                assert_eq!(profile, "qwen3-32b-q4");
+                assert_eq!(holder_pid, Some(4242));
+                assert_eq!(holder_command, "corky");
+                assert_eq!(idle_ttl_seconds, 120);
+                assert_eq!(vram_baseline_mib, Some(200));
+                assert_eq!(lease_file, Some(PathBuf::from("/tmp/tsift-lease.json")));
+                assert!(strict);
+                assert!(json);
+            }
+            _ => panic!("expected LocalModel lease acquire command"),
+        }
+    }
+
+    #[test]
+    fn cli_local_model_lease_release_parses_flags() {
+        let cli = parse_cli([
+            "tsift",
+            "local-model",
+            "lease",
+            "release",
+            "--profile",
+            "qwen3-embedding-0.6b",
+            "--holder-pid",
+            "999",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::LocalModel {
+                command:
+                    LocalModelCommand::Lease {
+                        command:
+                            LeaseCommand::Release {
+                                profile,
+                                holder_pid,
+                                json,
+                                ..
+                            },
+                    },
+            }) => {
+                assert_eq!(profile, "qwen3-embedding-0.6b");
+                assert_eq!(holder_pid, Some(999));
+                assert!(json);
+            }
+            _ => panic!("expected LocalModel lease release command"),
+        }
+    }
+
+    #[test]
+    fn cli_local_model_lease_show_parses_flags() {
+        let cli = parse_cli([
+            "tsift",
+            "local-model",
+            "lease",
+            "show",
+            "--include-stale",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::LocalModel {
+                command:
+                    LocalModelCommand::Lease {
+                        command:
+                            LeaseCommand::Show {
+                                include_stale,
+                                json,
+                                ..
+                            },
+                    },
+            }) => {
+                assert!(include_stale);
+                assert!(json);
+            }
+            _ => panic!("expected LocalModel lease show command"),
         }
     }
 

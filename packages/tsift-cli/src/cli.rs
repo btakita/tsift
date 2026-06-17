@@ -1119,6 +1119,72 @@ pub enum LocalModelCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Manage the cooperative GPU lease registry (#gctrl1)
+    Lease {
+        #[command(subcommand)]
+        command: LeaseCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum LeaseCommand {
+    /// Acquire a cooperative GPU lease for a profile (fails on conflict)
+    Acquire {
+        /// Model profile id to acquire a lease for
+        #[arg(long)]
+        profile: String,
+        /// Holder pid (defaults to the current process pid)
+        #[arg(long)]
+        holder_pid: Option<u32>,
+        /// Holder command label recorded in the registry
+        #[arg(long, default_value = "tsift")]
+        holder_command: String,
+        /// Idle TTL in seconds; 0 means no TTL-based staleness
+        #[arg(long, default_value_t = 0)]
+        idle_ttl_seconds: u64,
+        /// Synthetic VRAM baseline in MiB; omit to probe nvidia-smi
+        #[arg(long)]
+        vram_baseline_mib: Option<u64>,
+        /// Skip nvidia-smi probing for the baseline
+        #[arg(long)]
+        no_probe: bool,
+        /// Override the lease registry file path
+        #[arg(long)]
+        lease_file: Option<PathBuf>,
+        /// Exit non-zero when the acquire conflicts with a live holder
+        #[arg(long)]
+        strict: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Release a previously acquired GPU lease
+    Release {
+        /// Model profile id to release
+        #[arg(long)]
+        profile: String,
+        /// Holder pid (defaults to the current process pid)
+        #[arg(long)]
+        holder_pid: Option<u32>,
+        /// Override the lease registry file path
+        #[arg(long)]
+        lease_file: Option<PathBuf>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the current GPU lease registry (after pruning stale entries)
+    Show {
+        /// Override the lease registry file path
+        #[arg(long)]
+        lease_file: Option<PathBuf>,
+        /// Show stale entries instead of pruning them
+        #[arg(long)]
+        include_stale: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl LocalModelCommand {
@@ -1126,6 +1192,17 @@ impl LocalModelCommand {
         match self {
             Self::Status { json, .. } => *json,
             Self::Unload { json, .. } => *json,
+            Self::Lease { command } => command.json_output(),
+        }
+    }
+}
+
+impl LeaseCommand {
+    pub fn json_output(&self) -> bool {
+        match self {
+            Self::Acquire { json, .. }
+            | Self::Release { json, .. }
+            | Self::Show { json, .. } => *json,
         }
     }
 }
