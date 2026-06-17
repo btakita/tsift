@@ -15,3 +15,16 @@ This crate owns the graph/RAG side of first-party memory:
 
 `tsift-memory` remains the durable event database and import substrate. This
 crate depends on it; `tsift-memory` does not depend back on MemGraphRAG.
+
+## Local KG Model Contract
+
+`tsift-memgraphrag` consumes the shared local KG contract from
+[`../../specs/local-kg-model.md`](../../specs/local-kg-model.md). It must keep
+`tsift-local-hash-v1` as the deterministic fallback, but semantic extraction and
+embedding providers should plug in through `tsift-kg`/`tsift-local-model`
+contracts instead of hard-coding a model runtime in this crate.
+
+Projected KG facts must remain normal `GraphProjection` nodes and edges with
+`tsift-kg` provenance, source watermarks, content hashes, and run manifest
+references so repeated local model runs can be compared without duplicating
+unchanged graph facts.
