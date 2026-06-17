@@ -1451,7 +1451,64 @@ fn cmd_local_model(command: LocalModelCommand, output: OutputFormat) -> Result<(
             }
             Ok(())
         }
+        LocalModelCommand::Unload {
+            profile,
+            provider_endpoint,
+            provider_pid,
+            idle_ttl_seconds,
+            no_probe,
+            pre_used_mib,
+            post_used_mib,
+            tolerance_mib,
+            strict,
+            ..
+        } => {
+            let profile = tsift_local_model::profile_by_id(&profile)
+                .with_context(|| format!("unknown local model profile {profile:?}"))?;
+            let pre_probe = lifecycle_probe(no_probe, pre_used_mib, "pre-load GPU probe skipped");
+            let post_probe =
+                lifecycle_probe(no_probe, post_used_mib, "post-unload GPU probe skipped");
+            let report = tsift_local_model::build_lifecycle_report(
+                profile,
+                pre_probe,
+                post_probe,
+                provider_endpoint,
+                provider_pid,
+                idle_ttl_seconds,
+                tolerance_mib,
+            );
+            if output.json_output {
+                if output.pretty {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", serde_json::to_string(&report)?);
+                }
+            } else {
+                print!("{}", tsift_local_model::format_lifecycle_human(&report));
+            }
+            if strict && !report.cleanup.cleanup_proven {
+                bail!(
+                    "local model VRAM cleanup was not proven: {}",
+                    report.cleanup.reason
+                );
+            }
+            Ok(())
+        }
     }
+}
+
+fn lifecycle_probe(
+    no_probe: bool,
+    synthetic_used_mib: Option<u64>,
+    skipped_reason: &str,
+) -> tsift_local_model::GpuProbe {
+    if let Some(used_mib) = synthetic_used_mib {
+        return tsift_local_model::GpuProbe::synthetic_vram(used_mib);
+    }
+    if no_probe {
+        return tsift_local_model::GpuProbe::unavailable(skipped_reason);
+    }
+    tsift_local_model::probe_nvidia_smi()
 }
 
 /// Classify a task description into a model tier.
@@ -31666,6 +31723,47 @@ fn sample() {}
                 assert!(no_probe);
             }
             _ => panic!("expected LocalModel status command"),
+        }
+    }
+
+    #[test]
+    fn cli_local_model_unload_accepts_probe_and_strict_flags() {
+        let cli = parse_cli([
+            "tsift",
+            "local-model",
+            "unload",
+            "--profile",
+            "qwen3-32b-q4",
+            "--pre-used-mib",
+            "200",
+            "--post-used-mib",
+            "800",
+            "--provider-pid",
+            "42",
+            "--strict",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::LocalModel {
+                command:
+                    LocalModelCommand::Unload {
+                        profile,
+                        provider_pid,
+                        pre_used_mib,
+                        post_used_mib,
+                        strict,
+                        json,
+                        ..
+                    },
+            }) => {
+                assert_eq!(profile, "qwen3-32b-q4");
+                assert_eq!(provider_pid, Some(42));
+                assert_eq!(pre_used_mib, Some(200));
+                assert_eq!(post_used_mib, Some(800));
+                assert!(strict);
+                assert!(json);
+            }
+            _ => panic!("expected LocalModel unload command"),
         }
     }
 

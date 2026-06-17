@@ -1086,12 +1086,46 @@ pub enum LocalModelCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Plan provider unload actions and evaluate before/after VRAM cleanup
+    Unload {
+        /// Model profile id to unload or validate
+        #[arg(long, default_value = "qwen3-32b-q4")]
+        profile: String,
+        /// Provider API endpoint for unload/sleep hooks
+        #[arg(long)]
+        provider_endpoint: Option<String>,
+        /// Isolated provider worker pid for process-exit fallback
+        #[arg(long)]
+        provider_pid: Option<u32>,
+        /// Idle TTL to record in the lease report
+        #[arg(long, default_value_t = 0)]
+        idle_ttl_seconds: u64,
+        /// Skip live nvidia-smi probes and emit a plan unless synthetic MiB values are supplied
+        #[arg(long)]
+        no_probe: bool,
+        /// Synthetic pre-load used VRAM MiB for deterministic cleanup checks
+        #[arg(long)]
+        pre_used_mib: Option<u64>,
+        /// Synthetic post-unload used VRAM MiB for deterministic cleanup checks
+        #[arg(long)]
+        post_used_mib: Option<u64>,
+        /// Allowed post-unload VRAM delta above the pre-load baseline
+        #[arg(long, default_value_t = 768)]
+        tolerance_mib: u64,
+        /// Exit non-zero when cleanup is not proven
+        #[arg(long)]
+        strict: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl LocalModelCommand {
     pub fn json_output(&self) -> bool {
         match self {
             Self::Status { json, .. } => *json,
+            Self::Unload { json, .. } => *json,
         }
     }
 }
