@@ -1602,6 +1602,124 @@ pub fn resolve_profile_preference(
     }
 }
 
+// ============================================================================
+// Profile swap lifecycle (#gctrl3)
+//
+// `tsift local-model swap --from <id> --to <id>` is the one-command mid-run
+// downgrade path. It combines an unload cleanup proof for the source profile
+// with a `ProfileResolution` for the target against the post-unload probe, so
+// a caller can decide in one step whether it is safe to load the next profile
+// (typically qwen3-32b-q4 -> qwen3-embedding-0.6b or the hash fallback).
+//
+// Lease coordination stays the caller's job (they hold the holder-pid context
+// and can chain `lease release --from` -> `swap` -> `lease acquire --to`).
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwapStatus {
+    /// Source unload cleanup proven and target profile fits the post-unload probe.
+    Swapped,
+    /// Target was the CPU/hash profile; swap is always permitted once the
+    /// source unload is proven.
+    SwappedToHash,
+    /// Source unload cleanup proven but the target profile does not fit the
+    /// post-unload probe. Caller should fall back to a smaller profile or hash.
+    UnloadProvenTargetUnselectable,
+    /// Source unload cleanup NOT proven — caller MUST NOT load the target
+    /// because VRAM has not been returned to baseline.
+    UnloadNotProven,
+    /// Source and target are the same profile id; no-op.
+    NoOpSameProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocalModelSwapReport {
+    pub from_profile_id: String,
+    pub to_profile_id: String,
+    pub unload: LocalModelLifecycleReport,
+    pub target_resolution: ProfileResolution,
+    pub swap_status: SwapStatus,
+    pub notes: Vec<String>,
+}
+
+/// Build a combined swap report: source unload lifecycle + target resolution.
+///
+/// Reuses `build_lifecycle_report` for the unload proof and
+/// `resolve_profile_preference` for the target so semantics stay aligned with
+/// the rest of the substrate.
+#[allow(clippy::too_many_arguments)]
+pub fn build_swap_report(
+    from_profile: ModelProfile,
+    to_profile: ModelProfile,
+    pre_load_probe: GpuProbe,
+    post_unload_probe: GpuProbe,
+    provider_endpoint: Option<String>,
+    provider_pid: Option<u32>,
+    idle_ttl_seconds: u64,
+    tolerance_mib: u64,
+) -> LocalModelSwapReport {
+    let unload = build_lifecycle_report(
+        from_profile.clone(),
+        pre_load_probe,
+        post_unload_probe.clone(),
+        provider_endpoint,
+        provider_pid,
+        idle_ttl_seconds,
+        tolerance_mib,
+    );
+
+    let target_role = to_profile
+        .roles
+        .first()
+        .copied()
+        .unwrap_or(ModelRole::Extract);
+    let target_resolution = resolve_profile_preference(
+        &ProfilePreference::Pinned(to_profile.id.to_string()),
+        target_role,
+        &post_unload_probe,
+    );
+
+    let swap_status = if from_profile.id == to_profile.id {
+        SwapStatus::NoOpSameProfile
+    } else if !unload.cleanup.cleanup_proven {
+        SwapStatus::UnloadNotProven
+    } else if to_profile.concurrency == ConcurrencyClass::CpuOrHash {
+        SwapStatus::SwappedToHash
+    } else if target_resolution.selectable && target_resolution.profile.id == to_profile.id {
+        SwapStatus::Swapped
+    } else {
+        SwapStatus::UnloadProvenTargetUnselectable
+    };
+
+    let mut notes = vec![
+        format!("swapping from {} to {}", from_profile.id, to_profile.id),
+        format!("unload cleanup: {:?}", unload.cleanup.status),
+        format!("target resolution: {:?}", target_resolution.source),
+    ];
+    if swap_status == SwapStatus::UnloadNotProven {
+        notes.push(
+            "DO NOT load target — source unload did not prove VRAM cleanup"
+                .to_string(),
+        );
+    }
+    if swap_status == SwapStatus::UnloadProvenTargetUnselectable {
+        notes.push(format!(
+            "target {} is not selectable on the post-unload probe; consider the hash fallback or a smaller profile",
+            to_profile.id
+        ));
+    }
+
+    LocalModelSwapReport {
+        from_profile_id: from_profile.id.to_string(),
+        to_profile_id: to_profile.id.to_string(),
+        unload,
+        target_resolution,
+        swap_status,
+        notes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2238,5 +2356,114 @@ mod tests {
         );
         assert_eq!(resolution.profile.id, "tsift-local-hash-v1");
         assert!(resolution.reason.contains("unknown"));
+    }
+
+    // ---- Profile swap lifecycle (#gctrl3) ----
+
+    fn probe_pair(pre_used: u64, post_used: u64) -> (GpuProbe, GpuProbe) {
+        (probe_with_used_vram(pre_used), probe_with_used_vram(post_used))
+    }
+
+    #[test]
+    fn swap_to_same_profile_is_noop() {
+        let from = profile_by_id("qwen3-32b-q4").unwrap();
+        let to = profile_by_id("qwen3-32b-q4").unwrap();
+        let (pre, post) = probe_pair(200, 200);
+        let report = build_swap_report(
+            from, to, pre, post, None, None, DEFAULT_IDLE_TTL_SECONDS,
+            DEFAULT_VRAM_CLEANUP_TOLERANCE_MIB,
+        );
+        assert_eq!(report.swap_status, SwapStatus::NoOpSameProfile);
+    }
+
+    #[test]
+    fn swap_from_big_to_small_embedding_when_cleanup_proven_is_swapped() {
+        let from = profile_by_id("qwen3-32b-q4").unwrap();
+        let to = profile_by_id("qwen3-embedding-0.6b").unwrap();
+        // Source was using ~28 GiB; after unload it returns to ~200 MiB.
+        let (pre, post) = probe_pair(28_000, 200);
+        let report = build_swap_report(
+            from, to, pre, post, None, Some(42), DEFAULT_IDLE_TTL_SECONDS,
+            DEFAULT_VRAM_CLEANUP_TOLERANCE_MIB,
+        );
+        assert_eq!(report.swap_status, SwapStatus::Swapped);
+        assert!(report.unload.cleanup.cleanup_proven);
+        assert_eq!(report.target_resolution.profile.id, "qwen3-embedding-0.6b");
+    }
+
+    #[test]
+    fn swap_to_hash_fallback_is_swapped_to_hash_when_cleanup_proven() {
+        let from = profile_by_id("qwen3-32b-q4").unwrap();
+        let to = profile_by_id("tsift-local-hash-v1").unwrap();
+        let (pre, post) = probe_pair(28_000, 200);
+        let report = build_swap_report(
+            from, to, pre, post, None, Some(42), DEFAULT_IDLE_TTL_SECONDS,
+            DEFAULT_VRAM_CLEANUP_TOLERANCE_MIB,
+        );
+        assert_eq!(report.swap_status, SwapStatus::SwappedToHash);
+        assert!(report.unload.cleanup.cleanup_proven);
+    }
+
+    #[test]
+    fn swap_blocks_when_source_unload_not_proven() {
+        let from = profile_by_id("qwen3-32b-q4").unwrap();
+        let to = profile_by_id("qwen3-embedding-0.6b").unwrap();
+        // Baseline VRAM is ~200 MiB before load. Orphaned llama-server process
+        // holds ~7 GiB after "unload", so cleanup is NOT proven.
+        let pre = probe_with_used_vram(200);
+        let mut post = probe_with_used_vram(8_000);
+        post.processes.push(GpuProcess {
+            pid: Some(42),
+            process_name: "llama-server".to_string(),
+            used_memory_mib: Some(7_000),
+        });
+        let report = build_swap_report(
+            from, to, pre, post, None, Some(42), DEFAULT_IDLE_TTL_SECONDS,
+            DEFAULT_VRAM_CLEANUP_TOLERANCE_MIB,
+        );
+        assert_eq!(report.swap_status, SwapStatus::UnloadNotProven);
+        assert!(!report.unload.cleanup.cleanup_proven);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("DO NOT load target"))
+        );
+    }
+
+    #[test]
+    fn swap_reports_target_unselectable_when_post_unload_vram_still_high() {
+        let from = profile_by_id("qwen3-32b-q4").unwrap();
+        let to = profile_by_id("qwen3-32b-q4").unwrap();
+        // Source is qwen3-32b-q4 itself; after unload, only ~3 GiB free — the
+        // target 32B footprint (28.7 GiB) does not fit. Cleanup is proven
+        // (post <= pre + tolerance), but the target cannot reload.
+        let pre = probe_with_used_vram(29_500);
+        let post = probe_with_used_vram(29_600);
+        let report = build_swap_report(
+            from, to, pre, post, None, None, DEFAULT_IDLE_TTL_SECONDS,
+            DEFAULT_VRAM_CLEANUP_TOLERANCE_MIB,
+        );
+        // from == to is the NoOpSameProfile path; pick distinct ids instead.
+        assert_eq!(report.swap_status, SwapStatus::NoOpSameProfile);
+        // Re-run with a distinct target to exercise UnloadProvenTargetUnselectable.
+        let from = profile_by_id("qwen3-32b-q4").unwrap();
+        let to = profile_by_id("qwen3-embedding-8b").unwrap();
+        let pre = probe_with_used_vram(30_000);
+        let post = probe_with_used_vram(30_500);
+        let report = build_swap_report(
+            from, to, pre, post, None, None, DEFAULT_IDLE_TTL_SECONDS,
+            DEFAULT_VRAM_CLEANUP_TOLERANCE_MIB,
+        );
+        assert_eq!(
+            report.swap_status,
+            SwapStatus::UnloadProvenTargetUnselectable
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("not selectable on the post-unload probe"))
+        );
     }
 }

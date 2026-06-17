@@ -1539,6 +1539,80 @@ fn cmd_local_model(command: LocalModelCommand, output: OutputFormat) -> Result<(
             }
             Ok(())
         }
+        LocalModelCommand::Swap {
+            from,
+            to,
+            provider_endpoint,
+            provider_pid,
+            idle_ttl_seconds,
+            no_probe,
+            pre_used_mib,
+            post_used_mib,
+            tolerance_mib,
+            strict,
+            ..
+        } => {
+            let from_profile = tsift_local_model::profile_by_id(&from)
+                .with_context(|| format!("unknown source local model profile {from:?}"))?;
+            let to_profile = tsift_local_model::profile_by_id(&to)
+                .with_context(|| format!("unknown target local model profile {to:?}"))?;
+            let pre_probe = lifecycle_probe(no_probe, pre_used_mib, "pre-load GPU probe skipped");
+            let post_probe =
+                lifecycle_probe(no_probe, post_used_mib, "post-unload GPU probe skipped");
+            let report = tsift_local_model::build_swap_report(
+                from_profile,
+                to_profile,
+                pre_probe,
+                post_probe,
+                provider_endpoint,
+                provider_pid,
+                idle_ttl_seconds,
+                tolerance_mib,
+            );
+            if output.json_output {
+                if output.pretty {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", serde_json::to_string(&report)?);
+                }
+            } else {
+                println!(
+                    "swap: {} -> {} | status: {:?}",
+                    report.from_profile_id, report.to_profile_id, report.swap_status
+                );
+                println!(
+                    "unload cleanup: {:?} ({})",
+                    report.unload.cleanup.status, report.unload.cleanup.reason
+                );
+                println!(
+                    "target resolution: {:?} -> {} (selectable: {})",
+                    report.target_resolution.source,
+                    report.target_resolution.profile.id,
+                    report.target_resolution.selectable
+                );
+                for note in &report.notes {
+                    println!("note: {note}");
+                }
+            }
+            if strict {
+                match report.swap_status {
+                    tsift_local_model::SwapStatus::UnloadNotProven => {
+                        bail!(
+                            "swap blocked: source unload cleanup was not proven ({})",
+                            report.unload.cleanup.reason
+                        );
+                    }
+                    tsift_local_model::SwapStatus::UnloadProvenTargetUnselectable => {
+                        bail!(
+                            "swap blocked: target {} is not selectable on the post-unload probe",
+                            report.to_profile_id
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -31981,6 +32055,51 @@ fn sample() {}
                 assert!(json);
             }
             _ => panic!("expected LocalModel unload command"),
+        }
+    }
+
+    #[test]
+    fn cli_local_model_swap_parses_flags() {
+        let cli = parse_cli([
+            "tsift",
+            "local-model",
+            "swap",
+            "--from",
+            "qwen3-32b-q4",
+            "--to",
+            "qwen3-embedding-0.6b",
+            "--provider-pid",
+            "42",
+            "--pre-used-mib",
+            "200",
+            "--post-used-mib",
+            "180",
+            "--strict",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::LocalModel {
+                command:
+                    LocalModelCommand::Swap {
+                        from,
+                        to,
+                        provider_pid,
+                        pre_used_mib,
+                        post_used_mib,
+                        strict,
+                        json,
+                        ..
+                    },
+            }) => {
+                assert_eq!(from, "qwen3-32b-q4");
+                assert_eq!(to, "qwen3-embedding-0.6b");
+                assert_eq!(provider_pid, Some(42));
+                assert_eq!(pre_used_mib, Some(200));
+                assert_eq!(post_used_mib, Some(180));
+                assert!(strict);
+                assert!(json);
+            }
+            _ => panic!("expected LocalModel swap command"),
         }
     }
 

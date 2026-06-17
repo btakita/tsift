@@ -82,3 +82,26 @@ CLI surface:
   note on the response envelope (`profile preference <kind> -> <id> (<reason>)`)
   so a future provider seam can consume it. Until that seam lands, calls
   still use the existing cached/hash code paths.
+
+## Profile swap lifecycle (#gctrl3)
+
+`tsift local-model swap --from <id> --to <id>` is the one-command mid-run
+downgrade path. It combines a source unload cleanup proof with a target
+profile resolution against the post-unload probe, so a caller can decide in
+one step whether it is safe to load the next profile (typically
+`qwen3-32b-q4` → `qwen3-embedding-0.6b` or the hash fallback) without
+orchestrating `unload` + `status` separately.
+
+`SwapStatus` captures the combined outcome:
+
+- `Swapped` — source unload cleanup proven AND target profile fits the post-unload probe.
+- `SwappedToHash` — target is the CPU/hash profile; permitted once unload is proven.
+- `UnloadProvenTargetUnselectable` — unload ok but target does not fit; caller should pick a smaller profile or hash.
+- `UnloadNotProven` — source unload cleanup NOT proven; caller MUST NOT load the target. The report's `notes` include `DO NOT load target — source unload did not prove VRAM cleanup`.
+- `NoOpSameProfile` — source and target are the same id.
+
+Lease coordination stays the caller's job — they hold the holder-pid context
+and can chain `tsift local-model lease release --profile <from>` → `swap` →
+`tsift local-model lease acquire --profile <to>` in a script.
+
+CLI surface: `tsift local-model swap --from <id> --to <id> [--provider-endpoint URL] [--provider-pid PID] [--idle-ttl-seconds S] [--no-probe] [--pre-used-mib M] [--post-used-mib M] [--tolerance-mib M] [--strict] [--json]`. `--strict` exits non-zero on `UnloadNotProven` or `UnloadProvenTargetUnselectable` so caller scripts fail closed.

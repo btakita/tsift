@@ -1149,6 +1149,42 @@ pub enum LocalModelCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Swap from one local model profile to another in a single action (#gctrl3)
+    Swap {
+        /// Profile id to unload
+        #[arg(long)]
+        from: String,
+        /// Profile id to load after the source unload is proven
+        #[arg(long)]
+        to: String,
+        /// Provider API endpoint for unload/sleep hooks
+        #[arg(long)]
+        provider_endpoint: Option<String>,
+        /// Isolated provider worker pid for process-exit fallback
+        #[arg(long)]
+        provider_pid: Option<u32>,
+        /// Idle TTL to record in the lease report
+        #[arg(long, default_value_t = 0)]
+        idle_ttl_seconds: u64,
+        /// Skip live nvidia-smi probes and emit a plan unless synthetic MiB values are supplied
+        #[arg(long)]
+        no_probe: bool,
+        /// Synthetic baseline used VRAM MiB (before unload)
+        #[arg(long)]
+        pre_used_mib: Option<u64>,
+        /// Synthetic post-unload used VRAM MiB
+        #[arg(long)]
+        post_used_mib: Option<u64>,
+        /// Allowed post-unload VRAM delta above the pre-load baseline
+        #[arg(long, default_value_t = 768)]
+        tolerance_mib: u64,
+        /// Exit non-zero when cleanup is not proven or the target is unselectable
+        #[arg(long)]
+        strict: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
@@ -1236,6 +1272,7 @@ impl LocalModelCommand {
             Self::Unload { json, .. } => *json,
             Self::Lease { command } => command.json_output(),
             Self::Resolve { json, .. } => *json,
+            Self::Swap { json, .. } => *json,
         }
     }
 }
