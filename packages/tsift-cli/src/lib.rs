@@ -1031,6 +1031,7 @@ pub fn run() -> Result<()> {
             diff,
             stats,
             path,
+            profile,
             json,
         }) => cmd_summarize(
             symbol,
@@ -1044,6 +1045,7 @@ pub fn run() -> Result<()> {
             pretty,
             terse,
             schema,
+            profile,
         ),
         Some(Commands::Semantic {
             query,
@@ -1051,6 +1053,7 @@ pub fn run() -> Result<()> {
             scope,
             limit,
             kind,
+            profile,
             json,
         }) => cmd_semantic_related(
             &query,
@@ -1063,6 +1066,7 @@ pub fn run() -> Result<()> {
             pretty,
             terse,
             schema,
+            profile,
         ),
         Some(Commands::DiffDigest {
             path,
@@ -1495,6 +1499,46 @@ fn cmd_local_model(command: LocalModelCommand, output: OutputFormat) -> Result<(
             Ok(())
         }
         LocalModelCommand::Lease { command } => cmd_local_model_lease(command, output),
+        LocalModelCommand::Resolve {
+            profile,
+            role,
+            no_probe,
+            ..
+        } => {
+            let preference_value = profile.as_deref();
+            let preference = tsift_local_model::ProfilePreference::from_cli(preference_value);
+            let probe = if no_probe {
+                tsift_local_model::GpuProbe::unavailable("gpu probe skipped")
+            } else {
+                tsift_local_model::probe_nvidia_smi()
+            };
+            let resolution = tsift_local_model::resolve_profile_preference(
+                &preference,
+                role.to_model_role(),
+                &probe,
+            );
+            if output.json_output {
+                if output.pretty {
+                    println!("{}", serde_json::to_string_pretty(&resolution)?);
+                } else {
+                    println!("{}", serde_json::to_string(&resolution)?);
+                }
+            } else {
+                println!(
+                    "preference: {} | role: {:?}",
+                    preference.describe(),
+                    role.to_model_role()
+                );
+                println!(
+                    "selected: {} ({})",
+                    resolution.profile.id, resolution.profile.label
+                );
+                println!("selectable: {}", resolution.selectable);
+                println!("source: {:?}", resolution.source);
+                println!("reason: {}", resolution.reason);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -15295,6 +15339,7 @@ fn cmd_semantic_related(
     pretty: bool,
     terse: bool,
     schema: bool,
+    profile: Option<String>,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     write_traversal_graph_store(&root, path, scope)?;
@@ -15305,6 +15350,10 @@ fn cmd_semantic_related(
         report
             .warnings
             .push(graph_db_read_recovery_diagnostic(recovery));
+    }
+    if let Some(note) = profile_preference_note(profile.as_deref(), tsift_local_model::ModelRole::Embed)
+    {
+        report.warnings.push(note);
     }
 
     if json_output {
@@ -15343,6 +15392,28 @@ fn cmd_semantic_related(
     }
 
     Ok(())
+}
+
+/// Resolve a `--profile` CLI value into a one-line note for the response
+/// envelope. Records the caller's intent and the resolved profile id, so
+/// downstream readers see what would have been used even while the actual
+/// provider seam still falls back to the hash profile (#gctrl2).
+fn profile_preference_note(
+    profile: Option<&str>,
+    role: tsift_local_model::ModelRole,
+) -> Option<String> {
+    let preference = tsift_local_model::ProfilePreference::from_cli(profile);
+    if matches!(preference, tsift_local_model::ProfilePreference::Auto) {
+        return None;
+    }
+    let probe = tsift_local_model::probe_nvidia_smi();
+    let resolution = tsift_local_model::resolve_profile_preference(&preference, role, &probe);
+    Some(format!(
+        "profile preference {} -> {} ({})",
+        preference.describe(),
+        resolution.profile.id,
+        resolution.reason
+    ))
 }
 
 #[derive(Serialize)]
@@ -21990,6 +22061,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .unwrap();
 
@@ -22044,6 +22116,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .unwrap();
 
@@ -22091,6 +22164,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .unwrap();
 
@@ -22141,6 +22215,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .unwrap_err();
         let message = err.to_string();
@@ -22164,6 +22239,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .unwrap_err();
 
@@ -22210,6 +22286,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
 
         assert!(result.is_ok());
@@ -22251,6 +22328,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
 
         assert!(result.is_ok());
@@ -22293,6 +22371,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
 
         assert!(result.is_ok());
@@ -31902,6 +31981,84 @@ fn sample() {}
                 assert!(json);
             }
             _ => panic!("expected LocalModel unload command"),
+        }
+    }
+
+    #[test]
+    fn cli_local_model_resolve_parses_flags() {
+        use cli::ResolveRole;
+        let cli = parse_cli([
+            "tsift",
+            "local-model",
+            "resolve",
+            "--profile",
+            "hash",
+            "--role",
+            "embed",
+            "--no-probe",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::LocalModel {
+                command:
+                    LocalModelCommand::Resolve {
+                        profile,
+                        role,
+                        no_probe,
+                        json,
+                    },
+            }) => {
+                assert_eq!(profile.as_deref(), Some("hash"));
+                assert_eq!(role, ResolveRole::Embed);
+                assert!(no_probe);
+                assert!(json);
+            }
+            _ => panic!("expected LocalModel resolve command"),
+        }
+    }
+
+    #[test]
+    fn cli_semantic_command_accepts_profile_flag() {
+        let cli = parse_cli([
+            "tsift",
+            "semantic",
+            "auth",
+            "--profile",
+            "qwen3-embedding-0.6b",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::Semantic { profile, query, .. }) => {
+                assert_eq!(query, "auth");
+                assert_eq!(profile.as_deref(), Some("qwen3-embedding-0.6b"));
+            }
+            _ => panic!("expected Semantic command"),
+        }
+    }
+
+    #[test]
+    fn cli_summarize_command_accepts_profile_flag() {
+        let cli = parse_cli([
+            "tsift",
+            "summarize",
+            "--extract",
+            "src",
+            "--profile",
+            "hash",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::Summarize {
+                extract,
+                profile,
+                json,
+                ..
+            }) => {
+                assert_eq!(extract.as_deref(), Some(std::path::Path::new("src")));
+                assert_eq!(profile.as_deref(), Some("hash"));
+                assert!(json);
+            }
+            _ => panic!("expected Summarize command"),
         }
     }
 

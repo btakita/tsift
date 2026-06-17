@@ -651,6 +651,11 @@ pub enum Commands {
         /// Path to the indexed codebase (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
+        /// Pin or downgrade the local model for this extraction only (#gctrl2).
+        /// Pass a profile id, "hash" to force the CPU/hash fallback, or omit
+        /// for auto-rank. Informational until a real provider is wired in.
+        #[arg(long)]
+        profile: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -671,6 +676,11 @@ pub enum Commands {
         /// Which semantic node family to search
         #[arg(long, value_enum, default_value = "concept")]
         kind: SemanticRelatedKind,
+        /// Pin or downgrade the local model for this call only (#gctrl2).
+        /// Pass a profile id, "hash" to force the CPU/hash fallback, or omit
+        /// for auto-rank. Informational until a real provider is wired in.
+        #[arg(long)]
+        profile: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -1124,6 +1134,38 @@ pub enum LocalModelCommand {
         #[command(subcommand)]
         command: LeaseCommand,
     },
+    /// Resolve a `--profile` preference against the live GPU probe (#gctrl2)
+    Resolve {
+        /// Pin to a profile id, "hash" to force the CPU/hash fallback, or omit for auto-rank
+        #[arg(long)]
+        profile: Option<String>,
+        /// Role the resolved profile will be used for
+        #[arg(long, value_enum, default_value = "extract")]
+        role: ResolveRole,
+        /// Skip nvidia-smi probing
+        #[arg(long)]
+        no_probe: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq, Debug)]
+pub enum ResolveRole {
+    Extract,
+    Embed,
+    Rerank,
+}
+
+impl ResolveRole {
+    pub fn to_model_role(self) -> tsift_local_model::ModelRole {
+        match self {
+            ResolveRole::Extract => tsift_local_model::ModelRole::Extract,
+            ResolveRole::Embed => tsift_local_model::ModelRole::Embed,
+            ResolveRole::Rerank => tsift_local_model::ModelRole::Rerank,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -1193,6 +1235,7 @@ impl LocalModelCommand {
             Self::Status { json, .. } => *json,
             Self::Unload { json, .. } => *json,
             Self::Lease { command } => command.json_output(),
+            Self::Resolve { json, .. } => *json,
         }
     }
 }

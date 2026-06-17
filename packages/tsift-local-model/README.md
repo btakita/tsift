@@ -52,3 +52,33 @@ out to `kill -0`).
 
 CLI surface: `tsift local-model lease acquire|release|show`. `acquire --strict`
 exits non-zero on conflict so caller scripts can fail closed.
+
+## Per-call profile preference (#gctrl2)
+
+`ProfilePreference` lets a single call pin or downgrade the local model
+without mutating global state. It is the per-call dial an agent-doc cycle uses
+to request a small/hash profile during low-stakes phases of a long run.
+
+- `ProfilePreference::Auto` — rank by free VRAM (existing behavior).
+- `ProfilePreference::Pinned(id)` — pin to a specific profile id. The resolver
+  still checks VRAM fit; if the pinned profile does not fit or does not
+  support the requested role, the resolver falls back to the hash profile and
+  reports `PinnedUnselectable`.
+- `ProfilePreference::ForceHash` — force the deterministic CPU/hash fallback
+  even when a GPU profile would fit. Shortcut on the CLI: `--profile hash`.
+
+`resolve_profile_preference(preference, role, probe) -> ProfileResolution`
+returns the chosen profile, whether it is selectable, a `ProfileResolutionSource`
+(`auto_ranked` / `pinned` / `pinned_unselectable` / `forced_hash`), and a
+human-readable reason. The hash profile is always a guaranteed-selectable
+fallback so a call never has to abort because of a bad pin.
+
+CLI surface:
+- `tsift local-model resolve [--profile <id|hash>] [--role extract|embed|rerank] [--no-probe] [--json]`
+  — the decision seam. Callers run this once to learn which profile a
+  subsequent command would use.
+- `tsift semantic --profile <id|hash>` and `tsift summarize --extract --profile <id|hash>`
+  — informational plumbing. The resolved preference is recorded as a warning
+  note on the response envelope (`profile preference <kind> -> <id> (<reason>)`)
+  so a future provider seam can consume it. Until that seam lands, calls
+  still use the existing cached/hash code paths.

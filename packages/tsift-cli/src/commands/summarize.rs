@@ -26,12 +26,19 @@ pub(crate) fn cmd_summarize(
     pretty: bool,
     terse: bool,
     schema: bool,
+    profile: Option<String>,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     let db_path = root.join(".tsift/summaries.db");
 
     // --extract mode: run LLM extraction
     if let Some(extract_path) = extract {
+        if let Some(note) = crate::profile_preference_note(
+            profile.as_deref(),
+            tsift_local_model::ModelRole::Extract,
+        ) {
+            eprintln!("note: {note}");
+        }
         let extract_base = resolve_extract_base(path)?;
         let extract_scope = resolve_extract_scope(&extract_base, &extract_path)?;
         let cfg = load_summarize_config(&root);

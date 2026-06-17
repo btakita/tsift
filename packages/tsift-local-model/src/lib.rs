@@ -11,7 +11,7 @@ pub const DEFAULT_DESKTOP_RUNTIME_MARGIN_MIB: u64 = 4096;
 pub const DEFAULT_VRAM_CLEANUP_TOLERANCE_MIB: u64 = 768;
 pub const DEFAULT_IDLE_TTL_SECONDS: u64 = 0;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ModelRole {
     Extract,
     Embed,
@@ -1406,6 +1406,202 @@ pub fn format_lease_show_human(registry: &GpuLeaseRegistry, now: u64) -> String 
     out
 }
 
+// ============================================================================
+// Per-call profile preference (#gctrl2)
+//
+// Callers (agent-doc cycles, scripts) that want to pin or downgrade the local
+// model for a single call — without mutating global state — express that as a
+// `ProfilePreference`. The resolver turns the preference + the live GPU probe
+// into a concrete `ProfileSelection` plus a `ProfileResolutionSource` saying
+// how the choice was made. Commands that touch the local model accept the
+// preference via `--profile`, record it in their response envelope, and will
+// hand it to the real provider seam once one is wired in.
+// ============================================================================
+
+/// Caller-supplied preference for which local model profile a single call
+/// should use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ProfilePreference {
+    /// No pin — rank by free VRAM (existing behavior).
+    Auto,
+    /// Pin to a specific profile id. The resolver still checks VRAM fit and
+    /// reports `PinnedUnselectable` if the profile would not fit the probe.
+    Pinned(String),
+    /// Force the deterministic CPU/hash fallback even if a GPU profile would
+    /// fit. Use during low-stakes phases of a long agent-doc run.
+    ForceHash,
+}
+
+impl ProfilePreference {
+    /// Parse the `--profile <Option<String>>` CLI value.
+    ///
+    /// `None` / empty → `Auto`. The literal `"hash"` or the hash profile id
+    /// (`tsift-local-hash-v1`) → `ForceHash`. Anything else → `Pinned(id)`.
+    pub fn from_cli(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            None | Some("") => ProfilePreference::Auto,
+            Some("hash") | Some("tsift-local-hash-v1") => ProfilePreference::ForceHash,
+            Some(other) => ProfilePreference::Pinned(other.to_string()),
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            ProfilePreference::Auto => "auto".to_string(),
+            ProfilePreference::Pinned(id) => format!("pinned:{id}"),
+            ProfilePreference::ForceHash => "force-hash".to_string(),
+        }
+    }
+}
+
+/// How a resolved profile was chosen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileResolutionSource {
+    /// `Auto` preference; ranked against the live probe.
+    AutoRanked,
+    /// `Pinned` preference and the profile is selectable on this probe.
+    Pinned,
+    /// `Pinned` preference but the profile is not selectable (unknown id or
+    /// VRAM does not fit). Falls back to the hash profile so the call can
+    /// still proceed deterministically.
+    PinnedUnselectable,
+    /// `ForceHash` preference; hash fallback selected regardless of probe.
+    ForcedHash,
+}
+
+/// Result of resolving a `ProfilePreference` against the live GPU probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProfileResolution {
+    pub preference: ProfilePreference,
+    pub role: ModelRole,
+    pub source: ProfileResolutionSource,
+    pub profile: ModelProfile,
+    pub selectable: bool,
+    pub reason: String,
+}
+
+/// Resolve a caller preference to a concrete profile for a given role.
+///
+/// Pure function — pass a synthetic `GpuProbe` for tests. The hash profile is
+/// the guaranteed-selectable fallback for any non-`ForceHash` preference when
+/// the pinned/auto-ranked profile is not selectable.
+pub fn resolve_profile_preference(
+    preference: &ProfilePreference,
+    role: ModelRole,
+    probe: &GpuProbe,
+) -> ProfileResolution {
+    let profiles = default_model_profiles();
+    let hash_profile = profiles
+        .iter()
+        .find(|profile| profile.id == "tsift-local-hash-v1")
+        .cloned()
+        .expect("hash fallback profile is always present");
+
+    match preference {
+        ProfilePreference::ForceHash => ProfileResolution {
+            preference: preference.clone(),
+            role,
+            source: ProfileResolutionSource::ForcedHash,
+            profile: hash_profile,
+            selectable: true,
+            reason: "caller forced the CPU/hash fallback".to_string(),
+        },
+        ProfilePreference::Auto => {
+            let ranked = rank_profiles_for_role(&profiles, probe, role);
+            let pick = ranked
+                .iter()
+                .find(|selection| selection.selectable)
+                .cloned()
+                .or_else(|| {
+                    ranked.into_iter().next().map(|selection| ProfileSelection {
+                        selectable: false,
+                        ..selection
+                    })
+                });
+            match pick {
+                Some(selection) if selection.selectable => ProfileResolution {
+                    preference: preference.clone(),
+                    role,
+                    source: ProfileResolutionSource::AutoRanked,
+                    profile: selection.profile.clone(),
+                    selectable: true,
+                    reason: format!("auto-ranked: {}", selection.reason),
+                },
+                Some(selection) => ProfileResolution {
+                    preference: preference.clone(),
+                    role,
+                    source: ProfileResolutionSource::AutoRanked,
+                    profile: hash_profile,
+                    selectable: true,
+                    reason: format!(
+                        "auto-ranked but no GPU profile selectable ({}); using hash fallback",
+                        selection.reason
+                    ),
+                },
+                None => ProfileResolution {
+                    preference: preference.clone(),
+                    role,
+                    source: ProfileResolutionSource::AutoRanked,
+                    profile: hash_profile,
+                    selectable: true,
+                    reason: "no profile matches the requested role; using hash fallback"
+                        .to_string(),
+                },
+            }
+        }
+        ProfilePreference::Pinned(id) => {
+            match profile_by_id(id) {
+                Some(profile) if profile.supports_role(&role) => {
+                    let selection = selection_for_profile(&profile, probe);
+                    if selection.selectable {
+                        ProfileResolution {
+                            preference: preference.clone(),
+                            role,
+                            source: ProfileResolutionSource::Pinned,
+                            profile,
+                            selectable: true,
+                            reason: format!("pinned: {}", selection.reason),
+                        }
+                    } else {
+                        ProfileResolution {
+                            preference: preference.clone(),
+                            role,
+                            source: ProfileResolutionSource::PinnedUnselectable,
+                            profile: hash_profile,
+                            selectable: true,
+                            reason: format!(
+                                "pinned {} is not selectable ({}); using hash fallback",
+                                id, selection.reason
+                            ),
+                        }
+                    }
+                }
+                Some(_) => ProfileResolution {
+                    preference: preference.clone(),
+                    role,
+                    source: ProfileResolutionSource::PinnedUnselectable,
+                    profile: hash_profile,
+                    selectable: true,
+                    reason: format!(
+                        "pinned {id} does not support role {:?}; using hash fallback",
+                        role
+                    ),
+                },
+                None => ProfileResolution {
+                    preference: preference.clone(),
+                    role,
+                    source: ProfileResolutionSource::PinnedUnselectable,
+                    profile: hash_profile,
+                    selectable: true,
+                    reason: format!("pinned profile id {id:?} is unknown; using hash fallback"),
+                },
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1915,5 +2111,132 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ---- Per-call profile preference (#gctrl2) ----
+
+    #[test]
+    fn profile_preference_parses_cli_value() {
+        assert_eq!(ProfilePreference::from_cli(None), ProfilePreference::Auto);
+        assert_eq!(
+            ProfilePreference::from_cli(Some("")),
+            ProfilePreference::Auto
+        );
+        assert_eq!(
+            ProfilePreference::from_cli(Some("hash")),
+            ProfilePreference::ForceHash
+        );
+        assert_eq!(
+            ProfilePreference::from_cli(Some("tsift-local-hash-v1")),
+            ProfilePreference::ForceHash
+        );
+        assert_eq!(
+            ProfilePreference::from_cli(Some("qwen3-32b-q4")),
+            ProfilePreference::Pinned("qwen3-32b-q4".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_auto_picks_recommended_gpu_profile_on_clear_5090() {
+        let probe = rtx_5090_probe();
+        let resolution = resolve_profile_preference(
+            &ProfilePreference::Auto,
+            ModelRole::Extract,
+            &probe,
+        );
+        assert_eq!(resolution.source, ProfileResolutionSource::AutoRanked);
+        assert!(resolution.selectable);
+        assert_eq!(resolution.profile.id, "qwen3-32b-q4");
+    }
+
+    #[test]
+    fn resolve_auto_falls_back_to_hash_when_gpu_unavailable() {
+        let probe = GpuProbe::unavailable("missing");
+        let resolution = resolve_profile_preference(
+            &ProfilePreference::Auto,
+            ModelRole::Extract,
+            &probe,
+        );
+        assert_eq!(resolution.source, ProfileResolutionSource::AutoRanked);
+        assert_eq!(resolution.profile.id, "tsift-local-hash-v1");
+        assert!(resolution.selectable);
+        assert!(resolution.reason.contains("no GPU profile selectable"));
+    }
+
+    #[test]
+    fn resolve_pinned_selectable_profile_is_used_as_is() {
+        let probe = rtx_5090_probe();
+        let resolution = resolve_profile_preference(
+            &ProfilePreference::Pinned("qwen3-embedding-0.6b".to_string()),
+            ModelRole::Embed,
+            &probe,
+        );
+        assert_eq!(resolution.source, ProfileResolutionSource::Pinned);
+        assert_eq!(resolution.profile.id, "qwen3-embedding-0.6b");
+        assert!(resolution.selectable);
+    }
+
+    #[test]
+    fn resolve_pinned_profile_with_wrong_role_falls_back_to_hash() {
+        let probe = rtx_5090_probe();
+        let resolution = resolve_profile_preference(
+            &ProfilePreference::Pinned("qwen3-embedding-0.6b".to_string()),
+            ModelRole::Extract,
+            &probe,
+        );
+        assert_eq!(
+            resolution.source,
+            ProfileResolutionSource::PinnedUnselectable
+        );
+        assert_eq!(resolution.profile.id, "tsift-local-hash-v1");
+        assert!(resolution.reason.contains("does not support role"));
+    }
+
+    #[test]
+    fn resolve_pinned_profile_that_does_not_fit_vram_falls_back_to_hash() {
+        // 30 GiB used → only ~2.6 GiB free → qwen3-32b-q4 (~28 GiB) won't fit.
+        let probe = probe_with_used_vram(30_000);
+        let resolution = resolve_profile_preference(
+            &ProfilePreference::Pinned("qwen3-32b-q4".to_string()),
+            ModelRole::Extract,
+            &probe,
+        );
+        assert_eq!(
+            resolution.source,
+            ProfileResolutionSource::PinnedUnselectable
+        );
+        assert_eq!(resolution.profile.id, "tsift-local-hash-v1");
+        assert!(resolution.selectable);
+        assert!(resolution.reason.contains("not selectable"));
+    }
+
+    #[test]
+    fn resolve_force_hash_always_uses_hash_profile() {
+        let probe = rtx_5090_probe();
+        let resolution = resolve_profile_preference(
+            &ProfilePreference::ForceHash,
+            ModelRole::Extract,
+            &probe,
+        );
+        assert_eq!(resolution.source, ProfileResolutionSource::ForcedHash);
+        assert_eq!(resolution.profile.id, "tsift-local-hash-v1");
+        assert!(resolution.selectable);
+        assert!(resolution.reason.contains("forced"));
+    }
+
+    #[test]
+    fn resolve_pinned_unknown_profile_id_falls_back_to_hash() {
+        let probe = rtx_5090_probe();
+        let resolution = resolve_profile_preference(
+            &ProfilePreference::Pinned("not-a-real-profile".to_string()),
+            ModelRole::Embed,
+            &probe,
+        );
+        assert_eq!(
+            resolution.source,
+            ProfileResolutionSource::PinnedUnselectable
+        );
+        assert_eq!(resolution.profile.id, "tsift-local-hash-v1");
+        assert!(resolution.reason.contains("unknown"));
     }
 }
