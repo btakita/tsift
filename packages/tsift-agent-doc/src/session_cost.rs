@@ -3814,9 +3814,10 @@ mod tests {
         // Breakpoint identity is position-independent: array indices are stripped
         // so an inserted block ahead of the cached one is not read as drift (#pcachebp).
         assert!(
-            first.breakpoints.iter().any(|breakpoint| {
-                breakpoint == "message.content.cache_control=type:ephemeral"
-            })
+            first
+                .breakpoints
+                .iter()
+                .any(|breakpoint| { breakpoint == "message.content.cache_control=type:ephemeral" })
         );
         assert!(first.stable_prefix_fingerprint.starts_with("spfx-"));
         assert_eq!(
@@ -4083,9 +4084,7 @@ mod tests {
             prompt_cache_prefix_drift_remediation("routing_affinity").contains("replica affinity")
         );
         assert!(prompt_cache_prefix_drift_remediation("provider").contains("provider"));
-        assert!(
-            prompt_cache_prefix_drift_remediation("stable_prefix").contains("prefix bytes")
-        );
+        assert!(prompt_cache_prefix_drift_remediation("stable_prefix").contains("prefix bytes"));
         assert!(
             prompt_cache_prefix_drift_remediation("stable_prefix_fingerprint")
                 .contains("fingerprint")

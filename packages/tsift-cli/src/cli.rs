@@ -1280,9 +1280,9 @@ impl LocalModelCommand {
 impl LeaseCommand {
     pub fn json_output(&self) -> bool {
         match self {
-            Self::Acquire { json, .. }
-            | Self::Release { json, .. }
-            | Self::Show { json, .. } => *json,
+            Self::Acquire { json, .. } | Self::Release { json, .. } | Self::Show { json, .. } => {
+                *json
+            }
         }
     }
 }

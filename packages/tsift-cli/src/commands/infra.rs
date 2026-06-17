@@ -654,7 +654,10 @@ fn graph_db_snapshot_recovery_live_lock_error(
     )
 }
 
-pub(crate) fn graph_db_snapshot_clean_export_copy(graph_db: &Path, clean_path: &Path) -> Result<u64> {
+pub(crate) fn graph_db_snapshot_clean_export_copy(
+    graph_db: &Path,
+    clean_path: &Path,
+) -> Result<u64> {
     // A concurrent graph-db refresh / snapshot-import can hold an exclusive
     // database lock, which surfaces as a raw SQLite "database is locked" from
     // either the read-only open below or the VACUUM INTO copy. Map that to the
@@ -676,7 +679,10 @@ pub(crate) fn graph_db_snapshot_clean_export_copy(graph_db: &Path, clean_path: &
     let conn = substrate::open_graph_read_only_connection_resilient(graph_db).map_err(|err| {
         map_live_lock(
             err,
-            format!("opening graph db for snapshot export {}", graph_db.display()),
+            format!(
+                "opening graph db for snapshot export {}",
+                graph_db.display()
+            ),
         )
     })?;
     if let Some(recovery) = conn.recovery() {

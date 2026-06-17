@@ -312,7 +312,10 @@ pub fn enrich_prompt_cache_health_with_cross_run(
             None => "prompt-cache regressed".to_string(),
         }
     };
-    health.summary_line = format!("{base_line}; cross-run: {}", cross_run_regressions.join("; "));
+    health.summary_line = format!(
+        "{base_line}; cross-run: {}",
+        cross_run_regressions.join("; ")
+    );
     Some(health)
 }
 
@@ -3350,7 +3353,11 @@ Prior summary without active failures.
         assert_eq!(enriched.status, "regressed");
         assert_eq!(enriched.cross_run_regressions.len(), 1);
         assert!(enriched.summary_line.starts_with("prompt-cache regressed:"));
-        assert!(enriched.summary_line.contains("cross-run: cached_input_ratio fell"));
+        assert!(
+            enriched
+                .summary_line
+                .contains("cross-run: cached_input_ratio fell")
+        );
     }
 
     #[test]
@@ -3368,6 +3375,10 @@ Prior summary without active failures.
         )
         .unwrap();
         assert_eq!(enriched.status, "regressed");
-        assert!(enriched.summary_line.contains("cross-run: net_cached_input_tokens went negative"));
+        assert!(
+            enriched
+                .summary_line
+                .contains("cross-run: net_cached_input_tokens went negative")
+        );
     }
 }

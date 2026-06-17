@@ -202,13 +202,19 @@ pub fn digest_signal_text(report: &LogDigestReport) -> String {
                 family.occurrences, family.error_variants, family.template
             ));
         } else {
-            lines.push(format!("family x{}: {}", family.occurrences, family.template));
+            lines.push(format!(
+                "family x{}: {}",
+                family.occurrences, family.template
+            ));
         }
         lines.push(family.first_sample.clone());
         lines.push(family.last_sample.clone());
     }
     for repeated in &report.repeated_lines {
-        lines.push(format!("repeat x{}: {}", repeated.occurrences, repeated.line));
+        lines.push(format!(
+            "repeat x{}: {}",
+            repeated.occurrences, repeated.line
+        ));
     }
     for file_ref in &report.file_refs {
         match file_ref.line {
@@ -342,9 +348,10 @@ pub fn evaluate_fixture(root: &Path, fixture: &LogDigestFixture) -> Result<LogDi
             .iter()
             .filter(|signal| signal.severity == "error")
             .count();
-        let dropped_error_signals = report.error_signal_groups.saturating_sub(shown_error_signals);
-        let dropped_error_signals_ok =
-            dropped_error_signals <= case.maximum_dropped_error_signals;
+        let dropped_error_signals = report
+            .error_signal_groups
+            .saturating_sub(shown_error_signals);
+        let dropped_error_signals_ok = dropped_error_signals <= case.maximum_dropped_error_signals;
         let passed = savings_ok
             && missing_required_signals.is_empty()
             && present_forbidden_signals.is_empty()
@@ -450,7 +457,9 @@ pub fn compute(path: &Path, input: &str) -> Result<LogDigestReport> {
         let normalized = normalize_line(trimmed);
         *repeated_lines.entry(normalized.clone()).or_default() += 1;
         let line_signals = classify_signals(trimmed);
-        let line_is_error = line_signals.iter().any(|(severity, _)| *severity == "error");
+        let line_is_error = line_signals
+            .iter()
+            .any(|(severity, _)| *severity == "error");
         record_line_family(&mut line_families, &normalized, line_is_error);
 
         if is_stack_frame_line(trimmed) {
@@ -955,9 +964,7 @@ fn templatize_line(line: &str) -> String {
         // `Downgrading serde from v1.0.0` / `Updating tokio to v2.0.0` are not
         // mistaken for the crate name and folded away (#logfoldname).
         if placeholder == "<ver>" && out.len() == 2 {
-            let verb_is_progress = out
-                .first()
-                .is_some_and(|verb| is_cargo_progress_verb(verb));
+            let verb_is_progress = out.first().is_some_and(|verb| is_cargo_progress_verb(verb));
             if verb_is_progress
                 && let Some(prev) = out.last_mut()
                 && is_plain_name(prev)
@@ -972,7 +979,9 @@ fn templatize_line(line: &str) -> String {
 
 fn templatize_token(token: &str) -> String {
     // Bracketed epoch timestamps such as the `[1778646072]` agent-doc log prefix.
-    if let Some(inner) = token.strip_prefix('[').and_then(|tok| tok.strip_suffix(']'))
+    if let Some(inner) = token
+        .strip_prefix('[')
+        .and_then(|tok| tok.strip_suffix(']'))
         && !inner.is_empty()
         && inner.chars().all(|ch| ch.is_ascii_digit())
     {
@@ -1693,7 +1702,11 @@ downloaded err_pnpmish.tar to /tmp
 
         // Real npm/pnpm markers are still classified.
         assert!(error_messages.iter().any(|m| m.contains("npm ERR!")));
-        assert!(error_messages.iter().any(|m| m.contains("ERR_PNPM_RECURSIVE")));
+        assert!(
+            error_messages
+                .iter()
+                .any(|m| m.contains("ERR_PNPM_RECURSIVE"))
+        );
 
         // Benign lines that merely contain the fragments are NOT flagged.
         assert!(
@@ -1775,7 +1788,9 @@ this assertion about latency held under load
         let dir = tempfile::tempdir().unwrap();
         let mut input = String::new();
         for idx in 0..20 {
-            input.push_str(&format!("FAILED tests/test_{idx}.py::t - assert {idx} == 200\n"));
+            input.push_str(&format!(
+                "FAILED tests/test_{idx}.py::t - assert {idx} == 200\n"
+            ));
         }
         let report = compute(dir.path(), &input).unwrap();
 
@@ -1842,9 +1857,7 @@ this assertion about latency held under load
     fn evaluate_fixture_enforces_savings_and_false_negative_guards() {
         let dir = tempfile::tempdir().unwrap();
 
-        let mut input_lines = vec![
-            "error[E0277]: the trait bound is not satisfied".to_string(),
-        ];
+        let mut input_lines = vec!["error[E0277]: the trait bound is not satisfied".to_string()];
         // Pad with bulky near-duplicate progress so token savings are real.
         for idx in 0..60 {
             input_lines.push(format!("   Compiling crate_{idx} v0.1.{idx}"));
@@ -1972,7 +1985,11 @@ this assertion about latency held under load
             }],
         };
         let report = evaluate_fixture(dir.path(), &fixture).unwrap();
-        assert!(report.passed, "precision case should pass: {:?}", report.cases);
+        assert!(
+            report.passed,
+            "precision case should pass: {:?}",
+            report.cases
+        );
         assert!(report.cases[0].present_forbidden_signals.is_empty());
 
         // Sanity: the benign symbol token IS in the full projection (so a naive
@@ -1994,7 +2011,10 @@ this assertion about latency held under load
 
         // Small clean log: no artifact recommended.
         let small = compute(dir.path(), "Compiling serde v1.0.130\n").unwrap();
-        assert!(!raw_log_artifact_recommended(&small, "Compiling serde v1.0.130\n".len()));
+        assert!(!raw_log_artifact_recommended(
+            &small,
+            "Compiling serde v1.0.130\n".len()
+        ));
 
         // Same small report but a bulky byte count crosses the size threshold.
         assert!(raw_log_artifact_recommended(

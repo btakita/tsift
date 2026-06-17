@@ -10701,7 +10701,10 @@ fn log_digest_fixture_gate_passes_token_savings_and_false_negative_thresholds() 
             case["name"]
         );
         assert!(
-            case["missing_required_signals"].as_array().unwrap().is_empty(),
+            case["missing_required_signals"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
             "case {} dropped a required signal",
             case["name"]
         );

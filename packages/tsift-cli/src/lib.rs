@@ -1651,8 +1651,15 @@ fn cmd_local_model_lease(command: LeaseCommand, output: OutputFormat) -> Result<
                 }
             };
             let path = resolve_lease_file(lease_file.as_deref());
-            let acquisition =
-                acquire_lease(&profile, pid, &holder_command, baseline, idle_ttl_seconds, now, &path)?;
+            let acquisition = acquire_lease(
+                &profile,
+                pid,
+                &holder_command,
+                baseline,
+                idle_ttl_seconds,
+                now,
+                &path,
+            )?;
             if output.json_output {
                 if output.pretty {
                     println!("{}", serde_json::to_string_pretty(&acquisition)?);
@@ -1687,7 +1694,8 @@ fn cmd_local_model_lease(command: LeaseCommand, output: OutputFormat) -> Result<
                 }
                 println!("registry: {}", path.display());
             }
-            if strict && acquisition.status == tsift_local_model::GpuLeaseAcquisitionStatus::Conflict
+            if strict
+                && acquisition.status == tsift_local_model::GpuLeaseAcquisitionStatus::Conflict
             {
                 bail!(
                     "gpu lease for {profile:?} is held by pid={}",
@@ -15425,7 +15433,8 @@ fn cmd_semantic_related(
             .warnings
             .push(graph_db_read_recovery_diagnostic(recovery));
     }
-    if let Some(note) = profile_preference_note(profile.as_deref(), tsift_local_model::ModelRole::Embed)
+    if let Some(note) =
+        profile_preference_note(profile.as_deref(), tsift_local_model::ModelRole::Embed)
     {
         report.warnings.push(note);
     }

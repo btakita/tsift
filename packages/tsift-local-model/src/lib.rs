@@ -450,8 +450,7 @@ pub fn build_unload_actions(
 ) -> Vec<ProviderUnloadAction> {
     match profile.unload_strategy {
         UnloadStrategy::LlamaCppRouterUnload => {
-            let endpoint =
-                resolve_provider_endpoint(&profile.unload_strategy, provider_endpoint);
+            let endpoint = resolve_provider_endpoint(&profile.unload_strategy, provider_endpoint);
             let mut actions = vec![ProviderUnloadAction {
                 kind: UnloadActionKind::ProviderApi,
                 label: "llama.cpp router unload".to_string(),
@@ -500,8 +499,7 @@ pub fn build_unload_actions(
             },
         ],
         UnloadStrategy::VllmSleep => {
-            let endpoint =
-                resolve_provider_endpoint(&profile.unload_strategy, provider_endpoint);
+            let endpoint = resolve_provider_endpoint(&profile.unload_strategy, provider_endpoint);
             vec![ProviderUnloadAction {
                 kind: UnloadActionKind::Sleep,
                 label: "vLLM sleep mode".to_string(),
@@ -545,10 +543,7 @@ pub fn build_unload_actions(
 ///
 /// Returns an empty string for strategies that do not use an HTTP endpoint
 /// (`ProcessExit`, `None`); callers should not consult the value in those arms.
-pub fn resolve_provider_endpoint(
-    strategy: &UnloadStrategy,
-    explicit: Option<&str>,
-) -> String {
+pub fn resolve_provider_endpoint(strategy: &UnloadStrategy, explicit: Option<&str>) -> String {
     if let Some(explicit) = explicit
         && !explicit.trim().is_empty()
     {
@@ -558,9 +553,7 @@ pub fn resolve_provider_endpoint(
         UnloadStrategy::LlamaCppRouterUnload => {
             (LLAMA_CPP_ENDPOINT_ENV_VAR, DEFAULT_LLAMA_CPP_ENDPOINT)
         }
-        UnloadStrategy::OllamaKeepAliveZero => {
-            (OLLAMA_ENDPOINT_ENV_VAR, DEFAULT_OLLAMA_ENDPOINT)
-        }
+        UnloadStrategy::OllamaKeepAliveZero => (OLLAMA_ENDPOINT_ENV_VAR, DEFAULT_OLLAMA_ENDPOINT),
         UnloadStrategy::VllmSleep => (VLLM_ENDPOINT_ENV_VAR, DEFAULT_VLLM_ENDPOINT),
         UnloadStrategy::ProcessExit | UnloadStrategy::None => return String::new(),
     };
@@ -1129,9 +1122,13 @@ pub fn resolve_lease_file(override_path: Option<&Path>) -> PathBuf {
     if let Ok(state_dir) = std::env::var("XDG_STATE_HOME")
         && !state_dir.is_empty()
     {
-        return PathBuf::from(state_dir).join("tsift").join("gpu-lease.json");
+        return PathBuf::from(state_dir)
+            .join("tsift")
+            .join("gpu-lease.json");
     }
-    if let Ok(home) = std::env::var("HOME") && !home.is_empty() {
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
         return PathBuf::from(home).join(".tsift").join("gpu-lease.json");
     }
     PathBuf::from("./.tsift/gpu-lease.json")
@@ -1188,9 +1185,7 @@ pub fn write_lease_registry(path: &Path, registry: &GpuLeaseRegistry) -> Result<
     handle
         .write_all(payload.as_bytes())
         .context("write lease registry temp file")?;
-    handle
-        .sync_all()
-        .context("sync lease registry temp file")?;
+    handle.sync_all().context("sync lease registry temp file")?;
     drop(handle);
     fs::rename(&temp_path, path).context("rename lease registry into place")?;
     Ok(())
@@ -1602,54 +1597,52 @@ pub fn resolve_profile_preference(
                 },
             }
         }
-        ProfilePreference::Pinned(id) => {
-            match profile_by_id(id) {
-                Some(profile) if profile.supports_role(&role) => {
-                    let selection = selection_for_profile(&profile, probe);
-                    if selection.selectable {
-                        ProfileResolution {
-                            preference: preference.clone(),
-                            role,
-                            source: ProfileResolutionSource::Pinned,
-                            profile,
-                            selectable: true,
-                            reason: format!("pinned: {}", selection.reason),
-                        }
-                    } else {
-                        ProfileResolution {
-                            preference: preference.clone(),
-                            role,
-                            source: ProfileResolutionSource::PinnedUnselectable,
-                            profile: hash_profile,
-                            selectable: true,
-                            reason: format!(
-                                "pinned {} is not selectable ({}); using hash fallback",
-                                id, selection.reason
-                            ),
-                        }
+        ProfilePreference::Pinned(id) => match profile_by_id(id) {
+            Some(profile) if profile.supports_role(&role) => {
+                let selection = selection_for_profile(&profile, probe);
+                if selection.selectable {
+                    ProfileResolution {
+                        preference: preference.clone(),
+                        role,
+                        source: ProfileResolutionSource::Pinned,
+                        profile,
+                        selectable: true,
+                        reason: format!("pinned: {}", selection.reason),
+                    }
+                } else {
+                    ProfileResolution {
+                        preference: preference.clone(),
+                        role,
+                        source: ProfileResolutionSource::PinnedUnselectable,
+                        profile: hash_profile,
+                        selectable: true,
+                        reason: format!(
+                            "pinned {} is not selectable ({}); using hash fallback",
+                            id, selection.reason
+                        ),
                     }
                 }
-                Some(_) => ProfileResolution {
-                    preference: preference.clone(),
-                    role,
-                    source: ProfileResolutionSource::PinnedUnselectable,
-                    profile: hash_profile,
-                    selectable: true,
-                    reason: format!(
-                        "pinned {id} does not support role {:?}; using hash fallback",
-                        role
-                    ),
-                },
-                None => ProfileResolution {
-                    preference: preference.clone(),
-                    role,
-                    source: ProfileResolutionSource::PinnedUnselectable,
-                    profile: hash_profile,
-                    selectable: true,
-                    reason: format!("pinned profile id {id:?} is unknown; using hash fallback"),
-                },
             }
-        }
+            Some(_) => ProfileResolution {
+                preference: preference.clone(),
+                role,
+                source: ProfileResolutionSource::PinnedUnselectable,
+                profile: hash_profile,
+                selectable: true,
+                reason: format!(
+                    "pinned {id} does not support role {:?}; using hash fallback",
+                    role
+                ),
+            },
+            None => ProfileResolution {
+                preference: preference.clone(),
+                role,
+                source: ProfileResolutionSource::PinnedUnselectable,
+                profile: hash_profile,
+                selectable: true,
+                reason: format!("pinned profile id {id:?} is unknown; using hash fallback"),
+            },
+        },
     }
 }
 
@@ -1749,10 +1742,7 @@ pub fn build_swap_report(
         format!("target resolution: {:?}", target_resolution.source),
     ];
     if swap_status == SwapStatus::UnloadNotProven {
-        notes.push(
-            "DO NOT load target — source unload did not prove VRAM cleanup"
-                .to_string(),
-        );
+        notes.push("DO NOT load target — source unload did not prove VRAM cleanup".to_string());
     }
     if swap_status == SwapStatus::UnloadProvenTargetUnselectable {
         notes.push(format!(
@@ -2122,7 +2112,10 @@ mod tests {
         );
         assert_eq!(again.status, GpuLeaseAcquisitionStatus::Refreshed);
         assert_eq!(registry.leases["qwen3-32b-q4"].len(), 1);
-        assert_eq!(registry.leases["qwen3-32b-q4"][0].acquired_at_unix_seconds, 1_500);
+        assert_eq!(
+            registry.leases["qwen3-32b-q4"][0].acquired_at_unix_seconds,
+            1_500
+        );
         assert_eq!(registry.leases["qwen3-32b-q4"][0].vram_baseline_mib, 180);
     }
 
@@ -2308,11 +2301,8 @@ mod tests {
     #[test]
     fn resolve_auto_picks_recommended_gpu_profile_on_clear_5090() {
         let probe = rtx_5090_probe();
-        let resolution = resolve_profile_preference(
-            &ProfilePreference::Auto,
-            ModelRole::Extract,
-            &probe,
-        );
+        let resolution =
+            resolve_profile_preference(&ProfilePreference::Auto, ModelRole::Extract, &probe);
         assert_eq!(resolution.source, ProfileResolutionSource::AutoRanked);
         assert!(resolution.selectable);
         assert_eq!(resolution.profile.id, "qwen3-32b-q4");
@@ -2321,11 +2311,8 @@ mod tests {
     #[test]
     fn resolve_auto_falls_back_to_hash_when_gpu_unavailable() {
         let probe = GpuProbe::unavailable("missing");
-        let resolution = resolve_profile_preference(
-            &ProfilePreference::Auto,
-            ModelRole::Extract,
-            &probe,
-        );
+        let resolution =
+            resolve_profile_preference(&ProfilePreference::Auto, ModelRole::Extract, &probe);
         assert_eq!(resolution.source, ProfileResolutionSource::AutoRanked);
         assert_eq!(resolution.profile.id, "tsift-local-hash-v1");
         assert!(resolution.selectable);
@@ -2382,11 +2369,8 @@ mod tests {
     #[test]
     fn resolve_force_hash_always_uses_hash_profile() {
         let probe = rtx_5090_probe();
-        let resolution = resolve_profile_preference(
-            &ProfilePreference::ForceHash,
-            ModelRole::Extract,
-            &probe,
-        );
+        let resolution =
+            resolve_profile_preference(&ProfilePreference::ForceHash, ModelRole::Extract, &probe);
         assert_eq!(resolution.source, ProfileResolutionSource::ForcedHash);
         assert_eq!(resolution.profile.id, "tsift-local-hash-v1");
         assert!(resolution.selectable);
@@ -2422,8 +2406,7 @@ mod tests {
         ] {
             let resolved = resolve_provider_endpoint(&strategy, Some("http://custom:9999/path"));
             assert_eq!(
-                resolved,
-                "http://custom:9999/path",
+                resolved, "http://custom:9999/path",
                 "explicit override should win for {strategy:?}"
             );
         }
@@ -2467,8 +2450,7 @@ mod tests {
                 "http://127.0.0.1:8081/models/unload",
             );
         }
-        let resolved =
-            resolve_provider_endpoint(&UnloadStrategy::LlamaCppRouterUnload, None);
+        let resolved = resolve_provider_endpoint(&UnloadStrategy::LlamaCppRouterUnload, None);
         unsafe {
             std::env::remove_var(LLAMA_CPP_ENDPOINT_ENV_VAR);
         }
@@ -2481,8 +2463,7 @@ mod tests {
         unsafe {
             std::env::set_var(LLAMA_CPP_ENDPOINT_ENV_VAR, "   ");
         }
-        let resolved =
-            resolve_provider_endpoint(&UnloadStrategy::LlamaCppRouterUnload, None);
+        let resolved = resolve_provider_endpoint(&UnloadStrategy::LlamaCppRouterUnload, None);
         unsafe {
             std::env::remove_var(LLAMA_CPP_ENDPOINT_ENV_VAR);
         }
@@ -2516,7 +2497,10 @@ mod tests {
     // ---- Profile swap lifecycle (#gctrl3) ----
 
     fn probe_pair(pre_used: u64, post_used: u64) -> (GpuProbe, GpuProbe) {
-        (probe_with_used_vram(pre_used), probe_with_used_vram(post_used))
+        (
+            probe_with_used_vram(pre_used),
+            probe_with_used_vram(post_used),
+        )
     }
 
     #[test]
@@ -2525,7 +2509,13 @@ mod tests {
         let to = profile_by_id("qwen3-32b-q4").unwrap();
         let (pre, post) = probe_pair(200, 200);
         let report = build_swap_report(
-            from, to, pre, post, None, None, DEFAULT_IDLE_TTL_SECONDS,
+            from,
+            to,
+            pre,
+            post,
+            None,
+            None,
+            DEFAULT_IDLE_TTL_SECONDS,
             DEFAULT_VRAM_CLEANUP_TOLERANCE_MIB,
         );
         assert_eq!(report.swap_status, SwapStatus::NoOpSameProfile);
@@ -2538,7 +2528,13 @@ mod tests {
         // Source was using ~28 GiB; after unload it returns to ~200 MiB.
         let (pre, post) = probe_pair(28_000, 200);
         let report = build_swap_report(
-            from, to, pre, post, None, Some(42), DEFAULT_IDLE_TTL_SECONDS,
+            from,
+            to,
+            pre,
+            post,
+            None,
+            Some(42),
+            DEFAULT_IDLE_TTL_SECONDS,
             DEFAULT_VRAM_CLEANUP_TOLERANCE_MIB,
         );
         assert_eq!(report.swap_status, SwapStatus::Swapped);
@@ -2552,7 +2548,13 @@ mod tests {
         let to = profile_by_id("tsift-local-hash-v1").unwrap();
         let (pre, post) = probe_pair(28_000, 200);
         let report = build_swap_report(
-            from, to, pre, post, None, Some(42), DEFAULT_IDLE_TTL_SECONDS,
+            from,
+            to,
+            pre,
+            post,
+            None,
+            Some(42),
+            DEFAULT_IDLE_TTL_SECONDS,
             DEFAULT_VRAM_CLEANUP_TOLERANCE_MIB,
         );
         assert_eq!(report.swap_status, SwapStatus::SwappedToHash);
@@ -2573,7 +2575,13 @@ mod tests {
             used_memory_mib: Some(7_000),
         });
         let report = build_swap_report(
-            from, to, pre, post, None, Some(42), DEFAULT_IDLE_TTL_SECONDS,
+            from,
+            to,
+            pre,
+            post,
+            None,
+            Some(42),
+            DEFAULT_IDLE_TTL_SECONDS,
             DEFAULT_VRAM_CLEANUP_TOLERANCE_MIB,
         );
         assert_eq!(report.swap_status, SwapStatus::UnloadNotProven);
@@ -2596,7 +2604,13 @@ mod tests {
         let pre = probe_with_used_vram(29_500);
         let post = probe_with_used_vram(29_600);
         let report = build_swap_report(
-            from, to, pre, post, None, None, DEFAULT_IDLE_TTL_SECONDS,
+            from,
+            to,
+            pre,
+            post,
+            None,
+            None,
+            DEFAULT_IDLE_TTL_SECONDS,
             DEFAULT_VRAM_CLEANUP_TOLERANCE_MIB,
         );
         // from == to is the NoOpSameProfile path; pick distinct ids instead.
@@ -2607,7 +2621,13 @@ mod tests {
         let pre = probe_with_used_vram(30_000);
         let post = probe_with_used_vram(30_500);
         let report = build_swap_report(
-            from, to, pre, post, None, None, DEFAULT_IDLE_TTL_SECONDS,
+            from,
+            to,
+            pre,
+            post,
+            None,
+            None,
+            DEFAULT_IDLE_TTL_SECONDS,
             DEFAULT_VRAM_CLEANUP_TOLERANCE_MIB,
         );
         assert_eq!(
