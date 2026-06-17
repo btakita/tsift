@@ -239,6 +239,18 @@ pub struct KgSqliteUpsertReport {
     pub edges_upserted: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KgMultiRunVerificationReport {
+    pub first_node_count: usize,
+    pub second_node_count: usize,
+    pub first_edge_count: usize,
+    pub second_edge_count: usize,
+    pub stable_node_ids: usize,
+    pub stable_edge_ids: usize,
+    pub duplicate_node_ids: Vec<String>,
+    pub duplicate_edge_ids: Vec<String>,
+}
+
 pub fn chunk_documents(
     documents: &[KgInputDocument],
     config: ChunkingConfig,
@@ -337,6 +349,58 @@ pub fn upsert_kg_projection_sqlite(
         graph_db: graph_db.display().to_string(),
         nodes_upserted: projection.nodes.len(),
         edges_upserted: projection.edges.len(),
+    })
+}
+
+pub fn verify_projection_multi_run_stability(
+    first: &GraphProjection,
+    second: &GraphProjection,
+) -> Result<KgMultiRunVerificationReport> {
+    let first_node_ids = projection_node_ids(first);
+    let second_node_ids = projection_node_ids(second);
+    let first_edge_ids = projection_edge_ids(first);
+    let second_edge_ids = projection_edge_ids(second);
+    let duplicate_node_ids = duplicate_node_ids(first)
+        .into_iter()
+        .chain(duplicate_node_ids(second))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let duplicate_edge_ids = duplicate_edge_ids(first)
+        .into_iter()
+        .chain(duplicate_edge_ids(second))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    if !duplicate_node_ids.is_empty() {
+        bail!(
+            "KG projection contains duplicate node ids: {}",
+            duplicate_node_ids.join(", ")
+        );
+    }
+    if !duplicate_edge_ids.is_empty() {
+        bail!(
+            "KG projection contains duplicate edge ids: {}",
+            duplicate_edge_ids.join(", ")
+        );
+    }
+    if first_node_ids != second_node_ids {
+        bail!("KG projection node ids changed across identical runs");
+    }
+    if first_edge_ids != second_edge_ids {
+        bail!("KG projection edge ids changed across identical runs");
+    }
+
+    Ok(KgMultiRunVerificationReport {
+        first_node_count: first.nodes.len(),
+        second_node_count: second.nodes.len(),
+        first_edge_count: first.edges.len(),
+        second_edge_count: second.edges.len(),
+        stable_node_ids: first_node_ids.len(),
+        stable_edge_ids: first_edge_ids.len(),
+        duplicate_node_ids,
+        duplicate_edge_ids,
     })
 }
 
@@ -627,6 +691,41 @@ fn edge_with_content_freshness(mut edge: GraphEdge) -> Result<GraphEdge> {
     Ok(edge)
 }
 
+fn projection_node_ids(projection: &GraphProjection) -> BTreeSet<String> {
+    projection
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect()
+}
+
+fn projection_edge_ids(projection: &GraphProjection) -> BTreeSet<String> {
+    projection
+        .edges
+        .iter()
+        .map(|edge| edge.id.clone())
+        .collect()
+}
+
+fn duplicate_node_ids(projection: &GraphProjection) -> Vec<String> {
+    duplicate_ids(projection.nodes.iter().map(|node| node.id.as_str()))
+}
+
+fn duplicate_edge_ids(projection: &GraphProjection) -> Vec<String> {
+    duplicate_ids(projection.edges.iter().map(|edge| edge.id.as_str()))
+}
+
+fn duplicate_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut duplicates = BTreeSet::new();
+    for id in ids {
+        if !seen.insert(id.to_string()) {
+            duplicates.insert(id.to_string());
+        }
+    }
+    duplicates.into_iter().collect()
+}
+
 fn kg_provenance(chunk: &KgChunk, raw: &str) -> GraphProvenance {
     GraphProvenance::new("tsift-kg", &chunk.source_ref)
         .with_content_hash(blake3::hash(raw.as_bytes()).to_hex().to_string())
@@ -805,5 +904,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(semantic_entities, 2);
+    }
+
+    #[test]
+    fn two_sequential_runs_keep_stable_fact_ids_and_do_not_duplicate_sqlite_rows() {
+        let docs = vec![KgInputDocument::source(
+            "src/lib.rs",
+            "GraphProjection materializes SQLite semantic rows.",
+        )];
+        let config = ChunkingConfig {
+            max_chars: 120,
+            overlap_chars: 0,
+        };
+        let first = extract_documents_to_projection(&docs, &FixtureExtractor, config).unwrap();
+        let second = extract_documents_to_projection(&docs, &FixtureExtractor, config).unwrap();
+        let verification =
+            verify_projection_multi_run_stability(&first.projection, &second.projection).unwrap();
+
+        assert_eq!(
+            verification.first_node_count,
+            verification.second_node_count
+        );
+        assert_eq!(
+            verification.first_edge_count,
+            verification.second_edge_count
+        );
+        assert_eq!(verification.duplicate_node_ids, Vec::<String>::new());
+        assert_eq!(verification.duplicate_edge_ids, Vec::<String>::new());
+
+        let dir = TempDir::new().unwrap();
+        let graph_db = dir.path().join(".tsift/graph.db");
+        upsert_kg_projection_sqlite(&graph_db, &first.projection).unwrap();
+        upsert_kg_projection_sqlite(&graph_db, &second.projection).unwrap();
+
+        let conn = Connection::open(graph_db).unwrap();
+        let semantic_entities: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_nodes WHERE kind = 'semantic_entity'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let semantic_relations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_edges WHERE kind = 'semantic_relation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(semantic_entities, 2);
+        assert_eq!(semantic_relations, 1);
     }
 }

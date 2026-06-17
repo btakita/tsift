@@ -1085,4 +1085,36 @@ mod tests {
         );
         assert_eq!(cleanup.external_process_delta_mib, 1_600);
     }
+
+    #[test]
+    fn interrupted_run_cleanup_fails_with_orphaned_provider_process() {
+        let profile = profile_by_id("qwen3-32b-q4").unwrap();
+        let pre = probe_with_used_vram(200);
+        let mut post = probe_with_used_vram(8_000);
+        post.processes.push(GpuProcess {
+            pid: Some(1234),
+            process_name: "ollama runner".to_string(),
+            used_memory_mib: Some(7_000),
+        });
+
+        let report = build_lifecycle_report(
+            profile,
+            pre,
+            post,
+            None,
+            Some(1234),
+            DEFAULT_IDLE_TTL_SECONDS,
+            DEFAULT_VRAM_CLEANUP_TOLERANCE_MIB,
+        );
+
+        assert!(!report.cleanup.cleanup_proven);
+        assert_eq!(report.cleanup.status, VramCleanupStatus::NotProven);
+        assert_eq!(report.cleanup.blocking_processes.len(), 1);
+        assert!(report.lease.unload_actions.iter().any(|action| {
+            action.kind == UnloadActionKind::ProcessExit
+                && action.command.as_ref().is_some_and(|command| {
+                    command == &vec!["kill".to_string(), "-TERM".to_string(), "1234".to_string()]
+                })
+        }));
+    }
 }
