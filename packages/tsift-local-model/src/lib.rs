@@ -11,6 +11,25 @@ pub const DEFAULT_DESKTOP_RUNTIME_MARGIN_MIB: u64 = 4096;
 pub const DEFAULT_VRAM_CLEANUP_TOLERANCE_MIB: u64 = 768;
 pub const DEFAULT_IDLE_TTL_SECONDS: u64 = 0;
 
+/// Default llama.cpp router unload endpoint. Also the value llama-server
+/// listens on by default. Override via `--provider-endpoint` or the
+/// `TSIFT_LLAMA_CPP_ENDPOINT` env var when this port is taken (e.g. by a
+/// local WordPress instance at 8080).
+pub const DEFAULT_LLAMA_CPP_ENDPOINT: &str = "http://127.0.0.1:8080/models/unload";
+/// Default Ollama generate endpoint. Override via `--provider-endpoint` or
+/// the `TSIFT_OLLAMA_ENDPOINT` env var.
+pub const DEFAULT_OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434/api/generate";
+/// Default vLLM sleep endpoint. Override via `--provider-endpoint` or the
+/// `TSIFT_VLLM_ENDPOINT` env var.
+pub const DEFAULT_VLLM_ENDPOINT: &str = "http://127.0.0.1:8000/sleep";
+
+/// Env var override for the llama.cpp router unload endpoint.
+pub const LLAMA_CPP_ENDPOINT_ENV_VAR: &str = "TSIFT_LLAMA_CPP_ENDPOINT";
+/// Env var override for the Ollama generate endpoint.
+pub const OLLAMA_ENDPOINT_ENV_VAR: &str = "TSIFT_OLLAMA_ENDPOINT";
+/// Env var override for the vLLM sleep endpoint.
+pub const VLLM_ENDPOINT_ENV_VAR: &str = "TSIFT_VLLM_ENDPOINT";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ModelRole {
     Extract,
@@ -431,9 +450,8 @@ pub fn build_unload_actions(
 ) -> Vec<ProviderUnloadAction> {
     match profile.unload_strategy {
         UnloadStrategy::LlamaCppRouterUnload => {
-            let endpoint = provider_endpoint
-                .unwrap_or("http://127.0.0.1:8080/models/unload")
-                .to_string();
+            let endpoint =
+                resolve_provider_endpoint(&profile.unload_strategy, provider_endpoint);
             let mut actions = vec![ProviderUnloadAction {
                 kind: UnloadActionKind::ProviderApi,
                 label: "llama.cpp router unload".to_string(),
@@ -457,11 +475,10 @@ pub fn build_unload_actions(
                 label: "ollama keep_alive zero".to_string(),
                 command: None,
                 http_method: Some("POST".to_string()),
-                endpoint: Some(
-                    provider_endpoint
-                        .unwrap_or("http://127.0.0.1:11434/api/generate")
-                        .to_string(),
-                ),
+                endpoint: Some(resolve_provider_endpoint(
+                    &profile.unload_strategy,
+                    provider_endpoint,
+                )),
                 body_json: Some(format!(
                     r#"{{"model":"{}","prompt":"","keep_alive":0}}"#,
                     profile.model_ref
@@ -483,9 +500,8 @@ pub fn build_unload_actions(
             },
         ],
         UnloadStrategy::VllmSleep => {
-            let endpoint = provider_endpoint
-                .unwrap_or("http://127.0.0.1:8000/sleep")
-                .to_string();
+            let endpoint =
+                resolve_provider_endpoint(&profile.unload_strategy, provider_endpoint);
             vec![ProviderUnloadAction {
                 kind: UnloadActionKind::Sleep,
                 label: "vLLM sleep mode".to_string(),
@@ -519,6 +535,41 @@ pub fn build_unload_actions(
             required: false,
         }],
     }
+}
+
+/// Resolve a provider endpoint for a given unload strategy.
+///
+/// Precedence (highest first): explicit `--provider-endpoint` value →
+/// strategy-specific env var (`TSIFT_LLAMA_CPP_ENDPOINT` /
+/// `TSIFT_OLLAMA_ENDPOINT` / `TSIFT_VLLM_ENDPOINT`) → compile-time default.
+///
+/// Returns an empty string for strategies that do not use an HTTP endpoint
+/// (`ProcessExit`, `None`); callers should not consult the value in those arms.
+pub fn resolve_provider_endpoint(
+    strategy: &UnloadStrategy,
+    explicit: Option<&str>,
+) -> String {
+    if let Some(explicit) = explicit
+        && !explicit.trim().is_empty()
+    {
+        return explicit.to_string();
+    }
+    let (env_var, default): (&str, &str) = match strategy {
+        UnloadStrategy::LlamaCppRouterUnload => {
+            (LLAMA_CPP_ENDPOINT_ENV_VAR, DEFAULT_LLAMA_CPP_ENDPOINT)
+        }
+        UnloadStrategy::OllamaKeepAliveZero => {
+            (OLLAMA_ENDPOINT_ENV_VAR, DEFAULT_OLLAMA_ENDPOINT)
+        }
+        UnloadStrategy::VllmSleep => (VLLM_ENDPOINT_ENV_VAR, DEFAULT_VLLM_ENDPOINT),
+        UnloadStrategy::ProcessExit | UnloadStrategy::None => return String::new(),
+    };
+    if let Ok(value) = std::env::var(env_var)
+        && !value.trim().is_empty()
+    {
+        return value;
+    }
+    default.to_string()
 }
 
 pub fn build_lifecycle_report(
@@ -2356,6 +2407,110 @@ mod tests {
         );
         assert_eq!(resolution.profile.id, "tsift-local-hash-v1");
         assert!(resolution.reason.contains("unknown"));
+    }
+
+    // ---- Provider endpoint configurability (#portconf) ----
+
+    #[test]
+    fn resolve_endpoint_returns_explicit_override_for_any_strategy() {
+        for strategy in [
+            UnloadStrategy::LlamaCppRouterUnload,
+            UnloadStrategy::OllamaKeepAliveZero,
+            UnloadStrategy::VllmSleep,
+            UnloadStrategy::ProcessExit,
+            UnloadStrategy::None,
+        ] {
+            let resolved = resolve_provider_endpoint(&strategy, Some("http://custom:9999/path"));
+            assert_eq!(
+                resolved,
+                "http://custom:9999/path",
+                "explicit override should win for {strategy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_endpoint_uses_compile_time_default_when_no_env_no_explicit() {
+        // SAFETY: tests run single-threaded inside this function; the env is
+        // not consulted by other code paths while we hold this scope and the
+        // vars are cleared before returning.
+        unsafe {
+            std::env::remove_var(LLAMA_CPP_ENDPOINT_ENV_VAR);
+            std::env::remove_var(OLLAMA_ENDPOINT_ENV_VAR);
+            std::env::remove_var(VLLM_ENDPOINT_ENV_VAR);
+        }
+        assert_eq!(
+            resolve_provider_endpoint(&UnloadStrategy::LlamaCppRouterUnload, None),
+            DEFAULT_LLAMA_CPP_ENDPOINT
+        );
+        assert_eq!(
+            resolve_provider_endpoint(&UnloadStrategy::OllamaKeepAliveZero, None),
+            DEFAULT_OLLAMA_ENDPOINT
+        );
+        assert_eq!(
+            resolve_provider_endpoint(&UnloadStrategy::VllmSleep, None),
+            DEFAULT_VLLM_ENDPOINT
+        );
+        assert_eq!(
+            resolve_provider_endpoint(&UnloadStrategy::ProcessExit, None),
+            ""
+        );
+        assert_eq!(resolve_provider_endpoint(&UnloadStrategy::None, None), "");
+    }
+
+    #[test]
+    fn resolve_endpoint_env_var_overrides_default_for_llama_cpp() {
+        // SAFETY: see note in the previous test.
+        unsafe {
+            std::env::set_var(
+                LLAMA_CPP_ENDPOINT_ENV_VAR,
+                "http://127.0.0.1:8081/models/unload",
+            );
+        }
+        let resolved =
+            resolve_provider_endpoint(&UnloadStrategy::LlamaCppRouterUnload, None);
+        unsafe {
+            std::env::remove_var(LLAMA_CPP_ENDPOINT_ENV_VAR);
+        }
+        assert_eq!(resolved, "http://127.0.0.1:8081/models/unload");
+    }
+
+    #[test]
+    fn resolve_endpoint_blank_env_var_falls_back_to_default() {
+        // SAFETY: see note above.
+        unsafe {
+            std::env::set_var(LLAMA_CPP_ENDPOINT_ENV_VAR, "   ");
+        }
+        let resolved =
+            resolve_provider_endpoint(&UnloadStrategy::LlamaCppRouterUnload, None);
+        unsafe {
+            std::env::remove_var(LLAMA_CPP_ENDPOINT_ENV_VAR);
+        }
+        assert_eq!(resolved, DEFAULT_LLAMA_CPP_ENDPOINT);
+    }
+
+    #[test]
+    fn build_unload_actions_picks_up_env_var_for_llama_cpp_endpoint() {
+        let profile = profile_by_id("qwen3-32b-q4").unwrap();
+        // SAFETY: see note above.
+        unsafe {
+            std::env::set_var(
+                LLAMA_CPP_ENDPOINT_ENV_VAR,
+                "http://127.0.0.1:8081/models/unload",
+            );
+        }
+        let actions = build_unload_actions(&profile, None, Some(42));
+        unsafe {
+            std::env::remove_var(LLAMA_CPP_ENDPOINT_ENV_VAR);
+        }
+        let unload_action = actions
+            .iter()
+            .find(|action| action.kind == UnloadActionKind::ProviderApi)
+            .expect("provider api action present");
+        assert_eq!(
+            unload_action.endpoint.as_deref(),
+            Some("http://127.0.0.1:8081/models/unload")
+        );
     }
 
     // ---- Profile swap lifecycle (#gctrl3) ----

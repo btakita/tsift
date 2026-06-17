@@ -19,6 +19,44 @@ Lifecycle support is provider-neutral:
   reports cleanup failure when VRAM stays above the baseline tolerance without
   a known non-tsift GPU process accounting for the increase.
 
+## Provider endpoint configuration (#portconf)
+
+`build_unload_actions` resolves the unload/sleep endpoint with this precedence
+(highest first):
+
+1. Per-call explicit override (`--provider-endpoint URL` on
+   `tsift local-model unload|swap`).
+2. Strategy-specific env var:
+   - `TSIFT_LLAMA_CPP_ENDPOINT` (default `http://127.0.0.1:8080/models/unload`)
+   - `TSIFT_OLLAMA_ENDPOINT` (default `http://127.0.0.1:11434/api/generate`)
+   - `TSIFT_VLLM_ENDPOINT` (default `http://127.0.0.1:8000/sleep`)
+3. Compile-time default (the values above).
+
+Blank or whitespace-only env values fall back to the compile-time default so an
+empty `TSIFT_LLAMA_CPP_ENDPOINT=` cannot break a run.
+
+**WordPress / 8080 conflict recipe.** llama-server defaults to port 8080, which
+collides with a local WordPress instance on the same port. To move tsift's
+unload calls to a different port:
+
+```sh
+# Start llama-server on an alternate port
+llama-server --port 8081 --model Qwen3-32B-GGUF ...
+
+# Point tsift at the new endpoint for the whole shell
+export TSIFT_LLAMA_CPP_ENDPOINT="http://127.0.0.1:8081/models/unload"
+
+# Verify the resolved endpoint
+tsift local-model unload --profile qwen3-32b-q4 --no-probe \
+  --pre-used-mib 200 --post-used-mib 200 --json | \
+  python3 -c "import json,sys; print(json.load(sys.stdin)['lease']['unload_actions'][0]['endpoint'])"
+# -> http://127.0.0.1:8081/models/unload
+```
+
+A single call can still override the env value with
+`--provider-endpoint URL`. The same recipe works for Ollama (`TSIFT_OLLAMA_ENDPOINT`)
+and vLLM (`TSIFT_VLLM_ENDPOINT`).
+
 ## Cooperative GPU lease registry (#gctrl1)
 
 Single-machine cooperative (no daemon) registry that tracks who currently
