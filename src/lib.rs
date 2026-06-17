@@ -10,6 +10,7 @@ pub use tsift_algorithms as algorithms;
 pub use tsift_cache as cache;
 pub use tsift_digest::{diff_digest, log_digest, metric_digest, test_digest};
 pub use tsift_index::{config, index, init, walk};
+pub use tsift_kg as kg;
 pub use tsift_local_model as local_model;
 pub use tsift_memgraphrag as memgraphrag;
 pub use tsift_memory as memory;

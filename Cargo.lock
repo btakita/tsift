@@ -5207,6 +5207,7 @@ dependencies = [
  "tsift-digest",
  "tsift-graph",
  "tsift-index",
+ "tsift-kg",
  "tsift-libsql",
  "tsift-local-model",
  "tsift-memgraphrag",
@@ -5228,6 +5229,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tsift-kg",
  "tsift-quality",
 ]
 
@@ -5348,6 +5350,21 @@ dependencies = [
  "tempfile",
  "toml",
  "tsift-graph",
+ "tsift-sqlite",
+]
+
+[[package]]
+name = "tsift-kg"
+version = "0.1.70"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tsift-core",
+ "tsift-local-model",
  "tsift-sqlite",
 ]
 
