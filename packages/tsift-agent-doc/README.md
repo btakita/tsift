@@ -20,8 +20,12 @@ the `tsift` CLI or a `tsift-*` library boundary that returns validated
 
 ### Current state
 
-The activation work (a read-only `GraphStore`-backed evidence lookup helper
-for planning/orchestration) is tracked as `#kgadactivate`. Until that ships,
-this crate carries no `tsift-kg` or `tsift-sqlite` dependency: the previous
-`pub use tsift_kg as kg;` re-export was a dead dep with no call site and the
-wrong layer (extraction, not store-read), so it was removed in `#kgaduse`.
+`graph_evidence` (added in `#kgadactivate`) is the read seam: a typed,
+read-only `SqliteGraphStore::open_read_only_resilient` lookup that returns
+`GraphEvidenceReport` snapshots for a symbol/kind query. The
+`tsift kg evidence` CLI exposes it; library callers
+(`session_digest`/planning) are tracked as a separate design pass.
+
+Prior state: the dropped `pub use tsift_kg as kg;` re-export (`#kgaduse`)
+was a dead dep with no call site and the wrong layer (extraction, not
+store-read). It was removed before this seam landed.

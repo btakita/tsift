@@ -5229,7 +5229,9 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tsift-core",
  "tsift-quality",
+ "tsift-sqlite",
 ]
 
 [[package]]

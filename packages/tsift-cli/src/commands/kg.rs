@@ -245,6 +245,76 @@ fn emit_status(report: &KgStatusReport, json: bool) {
 }
 
 // =============================================================================
+// evidence (#kgadactivate — agent-doc's KG read seam per spec line 29-30)
+// =============================================================================
+
+pub(crate) fn cmd_kg_evidence(
+    symbol: Option<String>,
+    kind: Option<String>,
+    limit: usize,
+    graph_db: Option<PathBuf>,
+    json: bool,
+) -> Result<()> {
+    let db_path = graph_db
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_GRAPH_DB_RELATIVE));
+    let mut query = tsift_agent_doc::graph_evidence::GraphEvidenceQuery::default().with_limit(limit);
+    if let Some(symbol) = symbol {
+        query = query.with_symbol(symbol);
+    }
+    if let Some(kind) = kind {
+        query = query.with_kind(kind);
+    }
+    let report =
+        tsift_agent_doc::graph_evidence::read_graph_evidence_from_db(&db_path, &query)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("KG evidence");
+    println!("Graph DB: {}", report.graph_db);
+    if !report.exists {
+        println!("  (no graph.db at this path — run `tsift kg extract --graph-db <path>` to populate)");
+        return Ok(());
+    }
+    println!(
+        "Total: {} nodes / {} edges.  Matched: {} (limit {})",
+        report.total_nodes_in_db,
+        report.total_edges_in_db,
+        report.matched_nodes.len(),
+        report.query.limit,
+    );
+    if let Some(symbol) = &report.query.symbol {
+        println!("Symbol filter: {symbol}");
+    }
+    if let Some(kind) = &report.query.kind {
+        println!("Kind filter: {kind}");
+    }
+    if report.matched_nodes.is_empty() {
+        println!("(no matches)");
+        return Ok(());
+    }
+    for node in &report.matched_nodes {
+        let sources = if node.provenance_systems.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", node.provenance_systems.join(", "))
+        };
+        let refs = if node.source_refs.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", node.source_refs.join(", "))
+        };
+        println!(
+            "  - {} [{}]{} ({} edges){}",
+            node.label, node.kind, sources, node.incident_edge_count, refs,
+        );
+    }
+    Ok(())
+}
+
+// =============================================================================
 // unload (#kgunloadpost — build_unload_actions owns execution, called from CLI)
 // =============================================================================
 

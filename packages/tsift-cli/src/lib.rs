@@ -636,6 +636,19 @@ pub fn run() -> Result<()> {
             KgCommand::Status { graph_db, json } => {
                 commands::kg::cmd_kg_status(graph_db, json || terse || schema || envelope)
             }
+            KgCommand::Evidence {
+                symbol,
+                kind,
+                limit,
+                graph_db,
+                json,
+            } => commands::kg::cmd_kg_evidence(
+                symbol,
+                kind,
+                limit,
+                graph_db,
+                json || terse || schema || envelope,
+            ),
             KgCommand::Unload {
                 profile,
                 model,
