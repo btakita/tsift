@@ -17,3 +17,11 @@ must not own a separate local-model provider, prompt schema, or VRAM lifecycle.
 When agent-doc planning/orchestration needs semantic KG evidence, it should call
 the `tsift` CLI or a `tsift-*` library boundary that returns validated
 `GraphProjection`/`GraphStore` data.
+
+### Current state
+
+The activation work (a read-only `GraphStore`-backed evidence lookup helper
+for planning/orchestration) is tracked as `#kgadactivate`. Until that ships,
+this crate carries no `tsift-kg` or `tsift-sqlite` dependency: the previous
+`pub use tsift_kg as kg;` re-export was a dead dep with no call site and the
+wrong layer (extraction, not store-read), so it was removed in `#kgaduse`.
