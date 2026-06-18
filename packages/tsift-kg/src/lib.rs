@@ -6,6 +6,7 @@ use tsift_core::{GraphEdge, GraphFreshness, GraphNode, GraphProjection, GraphPro
 use tsift_local_model::ProviderKind;
 use tsift_sqlite::SqliteGraphStore;
 
+pub mod context_pack;
 pub mod ollama;
 
 pub use ollama::OllamaKgExtractor;

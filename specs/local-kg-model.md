@@ -222,6 +222,40 @@ signal it silently goes stale as sources change. The refresh trigger is
   interleaving per-source stdout. The pure `RefreshPlan::apply_targets` selector
   (needs-refresh AND file currently readable) has unit coverage.
 
+## GraphRAG Context Retrieval (`#kggraphscope` / `#kgctxretrieve`)
+
+`extract_documents_to_projection` extracts each chunk in isolation — the model
+re-invents `kgent-…` stable ids instead of reconciling against entities already
+in the graph, producing duplicate/variant entities and missed cross-chunk
+relations. The fix is GraphRAG: feed the model the relevant existing subgraph so
+it aligns to canonical entities. Full design (guards + phased plan):
+[`tasks/software/plan-tsift-kg-graphrag-context.md`](../../../tasks/software/plan-tsift-kg-graphrag-context.md).
+
+Phase 1 (`#kgctxretrieve`) ships a deterministic, bounded **known-entity pack**
+retrieval API in `tsift_kg::context_pack`, ready for Phase 2 (`#kgctxinject`) to
+inject into the extractor prompt:
+
+- **Bounded scan** — `collect_candidates_from_nodes` / `_from_projection` scan
+  at most `ContextPackConfig::max_candidate_scan` `semantic_entity` nodes and
+  compute each one's degree (incident edge count) from a single edge pass; they
+  never dump the full graph (same discipline as `#kgwiring`'s evidence cap) and
+  report `scan_truncated` when more eligible nodes existed beyond the cap.
+- **Deterministic ranking** — `build_context_pack` orders the bounded candidate
+  set by seed match (case-insensitive token overlap with the label) →
+  connectivity (degree, descending) → confidence (descending) → stable node-id
+  tiebreak (ascending). Every ordering input is totally ordered, so the Run
+  Manifest determinism contract holds.
+- **Confidence-gated + capped** — `min_confidence` excludes low-trust entities;
+  `max_entities` caps the pack and flags `truncated`.
+- **Pure** — the ranker takes already-loaded candidates; Phase 2 / the store
+  path owns loading and bounds the read. Unit-tested with a fixture graph.
+
+Phase 2 (`#kgctxinject`) will thread the pack into
+`OllamaKgExtractor::chat_request_body` (a context-aware prompt variant) with
+recency/provenance gating; Phase 3 (`#kgctxincremental`) will make graph-aware
+re-extraction reconcile against existing stable ids instead of duplicating
+(composes with `#kgextractrefresh`).
+
 ## Evidence Surfacing in Session Digest
 
 The `tsift-agent-doc` graph-evidence read seam must be wired into an active
