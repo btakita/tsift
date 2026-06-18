@@ -195,6 +195,23 @@ binary is the single arbiter — sessions never mutate the registry directly.
   path is the reference count's own reclamation, not a leak. An explicit
   `--model` (bypassing profile resolution) runs without lease coordination.
 
+## On-Demand Extraction Refresh
+
+`.tsift/graph.db` is a point-in-time extraction snapshot; without a refresh
+signal it silently goes stale as sources change. The refresh trigger is
+**on-demand staleness detection**:
+
+- Every `kg extract` records a `source_content_hash` (blake3 of the document
+  text) on the `kg_source` node.
+- `tsift kg refresh` reads each `kg_source`'s `source_ref` + recorded hash and
+  compares against the current file content, classifying each as `unchanged`,
+  `stale` (content differs), `missing` (no longer a readable file), or
+  `no_recorded_hash` (extracted before hashing — refresh recommended). It prints
+  the exact `kg extract` command to re-extract each source that needs it. The
+  check is read-only and model-free, so it is cheap to run on demand or from a
+  hook; re-extraction reuses the lease-aware `kg extract` path (#kgleasewire)
+  and stable fact ids reconcile rather than duplicate (Run Manifest contract).
+
 ## Evidence Surfacing in Session Digest
 
 The `tsift-agent-doc` graph-evidence read seam must be wired into an active

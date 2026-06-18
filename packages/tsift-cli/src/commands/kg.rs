@@ -199,6 +199,164 @@ pub(crate) fn cmd_kg_extract(args: KgExtractArgs) -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// refresh (#kgextractrefresh — on-demand staleness detection)
+// =============================================================================
+
+/// Staleness of one recorded `kg_source` against the current working tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RefreshStatus {
+    /// File content differs from the hash recorded at extraction.
+    Stale,
+    /// File content matches the recorded hash.
+    Unchanged,
+    /// `source_ref` is not a readable file (deleted, moved, or a non-path label).
+    Missing,
+    /// Extracted before `#kgextractrefresh` recorded content hashes; staleness
+    /// is unknown, so a refresh is recommended.
+    NoRecordedHash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RefreshEntry {
+    pub source_ref: String,
+    pub status: RefreshStatus,
+    pub recorded_hash: Option<String>,
+    pub current_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RefreshPlan {
+    pub entries: Vec<RefreshEntry>,
+}
+
+impl RefreshPlan {
+    /// Entries that warrant re-extraction (changed or unknown-staleness).
+    pub fn needs_refresh(&self) -> Vec<&RefreshEntry> {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e.status, RefreshStatus::Stale | RefreshStatus::NoRecordedHash))
+            .collect()
+    }
+}
+
+/// Pure staleness planner: classify each recorded `(source_ref, recorded_hash)`
+/// against the current content hash returned by `current_hash` (`None` when the
+/// source is not a readable file).
+pub(crate) fn plan_refresh(
+    recorded: &[(String, Option<String>)],
+    current_hash: impl Fn(&str) -> Option<String>,
+) -> RefreshPlan {
+    let mut entries = Vec::with_capacity(recorded.len());
+    for (source_ref, recorded_hash) in recorded {
+        let current = current_hash(source_ref);
+        let status = match (recorded_hash, &current) {
+            (None, _) => RefreshStatus::NoRecordedHash,
+            (Some(_), None) => RefreshStatus::Missing,
+            (Some(r), Some(c)) if r == c => RefreshStatus::Unchanged,
+            (Some(_), Some(_)) => RefreshStatus::Stale,
+        };
+        entries.push(RefreshEntry {
+            source_ref: source_ref.clone(),
+            status,
+            recorded_hash: recorded_hash.clone(),
+            current_hash: current,
+        });
+    }
+    RefreshPlan { entries }
+}
+
+/// Blake3 hash of a file's contents, or `None` when it is not a readable file
+/// (matches the recorded `source_content_hash` written at extraction).
+fn file_content_hash(source_ref: &str) -> Option<String> {
+    let path = Path::new(source_ref);
+    if !path.is_file() {
+        return None;
+    }
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+}
+
+pub(crate) fn cmd_kg_refresh(graph_db: Option<PathBuf>, json: bool) -> Result<()> {
+    let db_path = graph_db.unwrap_or_else(|| PathBuf::from(DEFAULT_GRAPH_DB_RELATIVE));
+    if !db_path.exists() {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "graph_db": db_path.display().to_string(),
+                    "exists": false,
+                    "entries": [],
+                }))?
+            );
+        } else {
+            println!(
+                "no graph.db at {} — run `tsift kg extract --graph-db <path>` first",
+                db_path.display()
+            );
+        }
+        return Ok(());
+    }
+
+    let store = tsift_sqlite::SqliteGraphStore::open_read_only_resilient(&db_path)
+        .with_context(|| format!("opening graph.db read-only at {}", db_path.display()))?;
+    let nodes = store
+        .all_nodes()
+        .with_context(|| "reading graph_nodes for kg refresh")?;
+    let recorded: Vec<(String, Option<String>)> = nodes
+        .iter()
+        .filter(|n| n.kind == "kg_source")
+        .map(|n| {
+            let source_ref = n
+                .properties
+                .get("source_ref")
+                .cloned()
+                .unwrap_or_else(|| n.label.clone());
+            let recorded_hash = n.properties.get("source_content_hash").cloned();
+            (source_ref, recorded_hash)
+        })
+        .collect();
+
+    let plan = plan_refresh(&recorded, file_content_hash);
+    let needs = plan.needs_refresh();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "graph_db": db_path.display().to_string(),
+                "exists": true,
+                "sources": plan.entries.len(),
+                "needs_refresh": needs.len(),
+                "entries": plan.entries,
+            }))?
+        );
+    } else {
+        println!("KG refresh plan ({})", db_path.display());
+        println!(
+            "Sources: {}  Needs refresh: {}",
+            plan.entries.len(),
+            needs.len()
+        );
+        for entry in &plan.entries {
+            println!("  - {} [{:?}]", entry.source_ref, entry.status);
+        }
+        if !needs.is_empty() {
+            println!("\nRe-extract stale/unknown sources with:");
+            for entry in &needs {
+                println!(
+                    "  tsift kg extract --input {0} --source-ref {0} --graph-db {1}",
+                    entry.source_ref,
+                    db_path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn read_input(input: Option<&Path>) -> Result<(String, String)> {
     match input {
         Some(path) => {
@@ -563,6 +721,38 @@ mod tests {
     use tempfile::TempDir;
     use tsift_core::{GraphEdge, GraphNode, GraphProjection};
     use tsift_sqlite::SqliteGraphStore;
+
+    #[test]
+    fn plan_refresh_classifies_each_source() {
+        let recorded = vec![
+            ("a.md".to_string(), Some("hash-a".to_string())), // unchanged
+            ("b.md".to_string(), Some("hash-b-old".to_string())), // stale
+            ("c.md".to_string(), Some("hash-c".to_string())), // missing (no current)
+            ("d.md".to_string(), None),                       // no recorded hash
+        ];
+        let current = |s: &str| match s {
+            "a.md" => Some("hash-a".to_string()),
+            "b.md" => Some("hash-b-new".to_string()),
+            "c.md" => None,
+            "d.md" => Some("hash-d".to_string()),
+            _ => None,
+        };
+        let plan = plan_refresh(&recorded, current);
+        assert_eq!(plan.entries[0].status, RefreshStatus::Unchanged);
+        assert_eq!(plan.entries[1].status, RefreshStatus::Stale);
+        assert_eq!(plan.entries[2].status, RefreshStatus::Missing);
+        assert_eq!(plan.entries[3].status, RefreshStatus::NoRecordedHash);
+        // Stale + NoRecordedHash warrant re-extraction; Unchanged + Missing do not.
+        let needs: Vec<_> = plan.needs_refresh().iter().map(|e| e.source_ref.clone()).collect();
+        assert_eq!(needs, vec!["b.md".to_string(), "d.md".to_string()]);
+    }
+
+    #[test]
+    fn plan_refresh_empty_when_no_sources() {
+        let plan = plan_refresh(&[], |_| None);
+        assert!(plan.entries.is_empty());
+        assert!(plan.needs_refresh().is_empty());
+    }
 
     #[test]
     fn resolve_lease_profile_id_defaults_when_no_profile_or_model() {

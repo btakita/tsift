@@ -1142,6 +1142,16 @@ pub enum KgCommand {
         #[arg(long, short)]
         json: bool,
     },
+    /// Report which extracted sources are stale (changed since extraction) so
+    /// `.tsift/graph.db` can be refreshed on demand (#kgextractrefresh).
+    Refresh {
+        /// Graph db path (defaults to `<cwd>/.tsift/graph.db`).
+        #[arg(long)]
+        graph_db: Option<PathBuf>,
+        /// Emit machine-readable JSON instead of a human summary.
+        #[arg(long, short)]
+        json: bool,
+    },
     /// Look up Knowledge Graph evidence for a symbol/kind in `.tsift/graph.db`
     /// (#kgadactivate — agent-doc's read seam per spec line 29-30).
     Evidence {

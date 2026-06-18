@@ -557,6 +557,12 @@ fn document_node(document: &KgInputDocument, metadata: &KgExtractorMetadata) -> 
     .with_property("contract", KG_CONTRACT_VERSION)
     .with_property("input_kind", document.kind.as_str())
     .with_property("source_ref", document.source_ref.clone())
+    // #kgextractrefresh: record the source content hash so `kg refresh` can
+    // detect when a source file changed since it was last extracted.
+    .with_property(
+        "source_content_hash",
+        blake3::hash(document.text.as_bytes()).to_hex().to_string(),
+    )
     .with_property("kg_provider", metadata.provider_id.clone())
     .with_property(
         "kg_provider_kind",
