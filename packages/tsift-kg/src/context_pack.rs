@@ -20,6 +20,8 @@ use std::collections::{BTreeSet, HashMap};
 use serde::Serialize;
 use tsift_core::{GraphEdge, GraphNode, GraphProjection};
 
+use crate::KgChunk;
+
 /// Configuration for context-pack retrieval. Every field bounds the result for
 /// cost and determinism.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -199,6 +201,61 @@ pub fn build_context_pack_from_projection(
 ) -> ContextPack {
     let (candidates, _) = collect_candidates_from_projection(projection, config);
     build_context_pack(seeds, &candidates, config)
+}
+
+/// Derive salient seed phrases from a chunk of text (`#kgctxinject`). Deterministic:
+/// alphanumeric tokens of length > 2, lower-cased and de-duplicated, ordered by
+/// first appearance, capped at `max_seeds`. These seeds drive the per-chunk
+/// known-entity retrieval so the extractor can reconcile against existing graph
+/// entities rather than re-inventing them.
+pub fn derive_seeds(chunk_text: &str, max_seeds: usize) -> Vec<String> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut seeds: Vec<String> = Vec::new();
+    for token in chunk_text.split(|c: char| !c.is_alphanumeric()) {
+        if token.len() <= 2 {
+            continue;
+        }
+        let lower = token.to_lowercase();
+        if seen.insert(lower.clone()) {
+            seeds.push(lower);
+            if seeds.len() >= max_seeds {
+                break;
+            }
+        }
+    }
+    seeds
+}
+
+/// Bounded per-chunk context source for graph-aware extraction (`#kgctxinject`).
+/// For each chunk it derives seeds from the chunk text, then builds a ranked
+/// known-entity pack from the supplied projection. Cheap to construct; the
+/// expensive work is bounded by the embedded [`ContextPackConfig`].
+pub struct ChunkContextSource<'a> {
+    pub projection: &'a GraphProjection,
+    pub config: ContextPackConfig,
+    pub max_seeds: usize,
+}
+
+impl<'a> ChunkContextSource<'a> {
+    pub fn new(projection: &'a GraphProjection, config: ContextPackConfig) -> Self {
+        Self {
+            projection,
+            config,
+            max_seeds: 16,
+        }
+    }
+
+    /// Override the default seed budget (16) for per-chunk seed derivation.
+    pub fn with_max_seeds(mut self, max_seeds: usize) -> Self {
+        self.max_seeds = max_seeds;
+        self
+    }
+
+    /// Build the known-entity pack for one chunk — deterministic and bounded.
+    pub fn context_for_chunk(&self, chunk: &KgChunk) -> ContextPack {
+        let seeds = derive_seeds(&chunk.text, self.max_seeds);
+        build_context_pack_from_projection(&seeds, self.projection, &self.config)
+    }
 }
 
 struct Ranked<'a> {
@@ -398,5 +455,65 @@ mod tests {
         assert_eq!(cand.confidence, 0.0);
         assert_eq!(cand.degree, 3);
         assert_eq!(cand.kind, "type");
+    }
+
+    fn chunk(text: &str) -> KgChunk {
+        KgChunk {
+            id: "chunk-0".to_string(),
+            document_id: "doc-0".to_string(),
+            kind: crate::KgInputKind::Source,
+            source_ref: "test.md".to_string(),
+            ordinal: 0,
+            byte_start: 0,
+            byte_end: text.len(),
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn derive_seeds_is_deterministic_lowercased_deduped_and_capped() {
+        // First-appearance order, lower-cased, deduped, tokens of length > 2,
+        // capped at max_seeds.
+        let seeds = derive_seeds("OllamaKgExtractor parses Ollama JSON; ok ok ok", 16);
+        assert_eq!(seeds, vec!["ollamakgextractor", "parses", "ollama", "json"]);
+        // "ok" is length 2 → skipped; duplicate "ok" never appears.
+        assert!(!seeds.iter().any(|s| s == "ok"));
+
+        let capped = derive_seeds("alpha beta gamma delta", 2);
+        assert_eq!(capped, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn chunk_context_source_retrieves_seed_matched_entities() {
+        // The chunk mentions "GraphProjection"; the source should surface that
+        // entity (seed match) ahead of an unrelated higher-degree entity.
+        let mut p = GraphProjection::default();
+        p.nodes.push(ent("kgent-gp", "GraphProjection", "type", 0.5));
+        p.nodes.push(ent("kgent-other", "UnrelatedThing", "type", 0.9));
+        for i in 0..5 {
+            p.edges
+                .push(GraphEdge::new("kgent-other", format!("x-{i}"), "related"));
+        }
+        let cfg = ContextPackConfig {
+            max_entities: 2,
+            ..Default::default()
+        };
+        let source = ChunkContextSource::new(&p, cfg);
+        let pack = source.context_for_chunk(&chunk("This chunk discusses the GraphProjection type."));
+        assert_eq!(pack.entities[0].node_id, "kgent-gp");
+        assert_eq!(
+            pack.entities[0].matched_seed.as_deref(),
+            Some("graphprojection")
+        );
+    }
+
+    #[test]
+    fn chunk_context_source_honors_max_seeds_override() {
+        let p = GraphProjection::default();
+        let source = ChunkContextSource::new(&p, ContextPackConfig::default()).with_max_seeds(3);
+        assert_eq!(source.max_seeds, 3);
+        // Empty graph yields an empty pack regardless of seeds.
+        let pack = source.context_for_chunk(&chunk("alpha beta gamma delta"));
+        assert!(pack.is_empty());
     }
 }

@@ -13,10 +13,12 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use tsift_core::GraphStore;
+use tsift_core::{GraphProjection, GraphStore};
+use tsift_kg::context_pack::{ChunkContextSource, ContextPackConfig};
 use tsift_kg::{
     ChunkingConfig, KgInputDocument, KgInputKind, KgSqliteUpsertReport, OllamaKgExtractor,
-    extract_documents_to_projection, upsert_kg_projection_sqlite,
+    extract_documents_to_projection, extract_documents_to_projection_with_context,
+    upsert_kg_projection_sqlite,
 };
 use tsift_local_model::profile_by_id;
 
@@ -49,6 +51,11 @@ pub(crate) struct KgExtractArgs {
     pub idle_ttl_seconds: u64,
     pub keep_loaded: bool,
     pub lease_file: Option<PathBuf>,
+    /// Skip graph-aware context injection (#kgctxinject). By default, when
+    /// `--graph-db` already holds `semantic_entity` nodes, a bounded
+    /// known-entity pack is injected into the extractor prompt so the model
+    /// reconciles against canonical stable ids instead of re-inventing them.
+    pub no_context: bool,
     pub json: bool,
 }
 
@@ -70,6 +77,10 @@ pub(crate) struct KgRefreshArgs {
     pub idle_ttl_seconds: u64,
     pub keep_loaded: bool,
     pub lease_file: Option<PathBuf>,
+    /// Skip graph-aware context injection during `--apply` re-extraction
+    /// (#kgctxincremental). By default re-extraction reconciles against the
+    /// existing graph's stable ids instead of duplicating them.
+    pub no_context: bool,
 }
 
 /// Resolve the profile id used for cooperative GPU leasing during an extract.
@@ -108,6 +119,10 @@ pub(crate) struct KgExtractOutcome {
     /// lease reference (reference-counted unload, #kgleasewire). `None` when the
     /// model was kept loaded or leasing was bypassed.
     pub unloaded: Option<String>,
+    /// Count of existing `semantic_entity` nodes offered to the extractor as
+    /// graph-aware context (#kgctxinject). `None` when no graph-db context was
+    /// injected (no `--graph-db`, an empty/new graph, or `--no-context`).
+    pub context_entities: Option<usize>,
 }
 
 /// Core extract pipeline with lease coordination (#kgleasewire). Acquires an
@@ -128,6 +143,7 @@ pub(crate) fn run_kg_extract(args: KgExtractArgs) -> Result<KgExtractOutcome> {
         idle_ttl_seconds,
         keep_loaded,
         lease_file,
+        no_context,
         json: _,
     } = args;
     let (text, default_source_ref) = read_input(input.as_deref())?;
@@ -174,9 +190,58 @@ pub(crate) fn run_kg_extract(args: KgExtractArgs) -> Result<KgExtractOutcome> {
         }
     }
 
+    // #kgctxinject: when extracting into a graph.db that already holds
+    // entities, build a bounded known-entity context pack from the current
+    // graph so the model reconciles against canonical stable ids instead of
+    // re-inventing them. Loading is read-only and bounded by ContextPackConfig.
+    // `kg refresh --apply` re-extracts changed files through this same path, so
+    // this seam also delivers graph-aware incremental re-extraction
+    // (#kgctxincremental) — the re-extract reconciles rather than duplicates.
+    let existing_projection = if no_context {
+        None
+    } else {
+        match graph_db.as_deref() {
+            Some(db) if db.exists() => {
+                let store = tsift_sqlite::SqliteGraphStore::open_read_only_resilient(db)
+                    .with_context(|| {
+                        format!(
+                            "opening graph.db read-only at {} for context pack",
+                            db.display()
+                        )
+                    })?;
+                let nodes = store
+                    .all_nodes()
+                    .context("reading graph_nodes for context pack")?;
+                // Only inject when the graph has entities to reconcile against;
+                // a fresh/empty graph has nothing to offer and stays byte-for-byte
+                // identical to the no-context prompt path.
+                if nodes.iter().any(|n| n.kind == "semantic_entity") {
+                    let edges = store
+                        .all_edges()
+                        .context("reading graph_edges for context pack")?;
+                    Some(GraphProjection { nodes, edges })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    };
+    let context_entities = existing_projection
+        .as_ref()
+        .map(|proj| proj.nodes.iter().filter(|n| n.kind == "semantic_entity").count());
+    let context_source = existing_projection
+        .as_ref()
+        .map(|proj| ChunkContextSource::new(proj, ContextPackConfig::default()));
+
     let document = KgInputDocument::new(KgInputKind::Source, &source_ref, &text);
-    let report = extract_documents_to_projection(&[document], &extractor, ChunkingConfig::default())
-        .context("KG extraction pipeline failed")?;
+    let report = extract_documents_to_projection_with_context(
+        &[document],
+        &extractor,
+        ChunkingConfig::default(),
+        context_source.as_ref(),
+    )
+    .context("KG extraction pipeline failed")?;
 
     let provider_id = report
         .extracted_chunks
@@ -237,6 +302,7 @@ pub(crate) fn run_kg_extract(args: KgExtractArgs) -> Result<KgExtractOutcome> {
         node_preview,
         node_total,
         unloaded,
+        context_entities,
     })
 }
 
@@ -258,6 +324,7 @@ fn emit_kg_extract_outcome(outcome: &KgExtractOutcome, json: bool) {
             "entities": outcome.entities,
             "relations": outcome.relations,
             "upsert": outcome.upsert,
+            "context_entities": outcome.context_entities,
         });
         println!(
             "{}",
@@ -271,6 +338,9 @@ fn emit_kg_extract_outcome(outcome: &KgExtractOutcome, json: bool) {
         "Chunks: {}  Entities: {}  Relations: {}",
         outcome.chunks, outcome.entities, outcome.relations
     );
+    if let Some(known) = outcome.context_entities {
+        println!("Context: {known} known entities injected (graph-aware reconciliation)");
+    }
     for (label, kind) in &outcome.node_preview {
         println!("  - {} [{}]", label, kind);
     }
@@ -392,6 +462,7 @@ pub(crate) fn cmd_kg_refresh(args: KgRefreshArgs) -> Result<()> {
         idle_ttl_seconds,
         keep_loaded,
         lease_file,
+        no_context,
     } = args;
     let db_path = graph_db.unwrap_or_else(|| PathBuf::from(DEFAULT_GRAPH_DB_RELATIVE));
     if !db_path.exists() {
@@ -520,6 +591,7 @@ pub(crate) fn cmd_kg_refresh(args: KgRefreshArgs) -> Result<()> {
             idle_ttl_seconds,
             keep_loaded,
             lease_file: lease_file.clone(),
+            no_context,
             json: false,
         };
         match run_kg_extract(extract_args) {

@@ -250,11 +250,35 @@ inject into the extractor prompt:
 - **Pure** — the ranker takes already-loaded candidates; Phase 2 / the store
   path owns loading and bounds the read. Unit-tested with a fixture graph.
 
-Phase 2 (`#kgctxinject`) will thread the pack into
-`OllamaKgExtractor::chat_request_body` (a context-aware prompt variant) with
-recency/provenance gating; Phase 3 (`#kgctxincremental`) will make graph-aware
-re-extraction reconcile against existing stable ids instead of duplicating
-(composes with `#kgextractrefresh`).
+Phase 2 (`#kgctxinject`) threads the pack into the extractor prompt:
+
+- **Context-aware prompt** — `OllamaKgExtractor::chat_request_body_with_context`
+  prepends a bounded `[KNOWN ENTITIES …]` block (`stable_id | label | kind |
+  confidence`, one line per ranked entity) ahead of the chunk under a `[CHUNK]`
+  marker, instructing the model to reuse those exact stable ids when the chunk
+  references a matching entity. The block size is bounded by the pack's
+  `max_entities`, which caps the prompt/context-window cost. When no pack (or an
+  empty pack) is supplied the request body is **byte-for-byte identical** to the
+  plain path, so a fresh/empty graph never changes extraction behavior.
+- **Per-chunk retrieval** — `ChunkContextSource` derives deterministic seeds
+  from each chunk's text (`derive_seeds`: alphanumeric tokens length > 2,
+  lower-cased, de-duped, first-appearance order, capped at `max_seeds`) and
+  builds the chunk's known-entity pack from the supplied projection.
+- **Extractor seam** — `KgExtractor::extract_json_with_context` defaults to the
+  plain `extract_json` (every existing extractor stays backward-compatible);
+  `OllamaKgExtractor` overrides it. `extract_documents_to_projection_with_context`
+  builds each chunk's pack and threads it through; `None` behaves exactly like
+  the plain path.
+- **CLI** — `tsift kg extract --graph-db <db>` injects context automatically
+  when the graph already holds `semantic_entity` nodes; `--no-context` opts out.
+  The outcome reports `context_entities` (the count of existing entities offered
+  for reconciliation).
+
+Phase 3 (`#kgctxincremental`) reuses that same seam for graph-aware
+re-extraction: `tsift kg refresh --apply` re-extracts each changed source
+(`#kgextractrefresh` staleness plan) through the shared `run_kg_extract` path, so
+the re-extract reconciles against the existing graph's stable ids instead of
+duplicating them. `--no-context` opts out of the reconciliation.
 
 ## Evidence Surfacing in Session Digest
 

@@ -6,6 +6,7 @@
 //! `OLLAMA_HOST` env var; the model tag is the ollama pull name (for example
 //! `hf.co/Qwen/Qwen3-32B-GGUF:Q4_K_M`).
 
+use crate::context_pack::{ContextEntity, ContextPack};
 use crate::{KgChunk, KgExtractionPayload, KgExtractor, KgExtractorMetadata};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -75,6 +76,30 @@ impl OllamaKgExtractor {
     /// Build the `/api/chat` request body for a chunk. Separated from the HTTP
     /// call so tests can assert the prompt + schema without a live model.
     pub fn chat_request_body(&self, chunk_text: &str) -> Value {
+        self.chat_request_body_with_context(chunk_text, None)
+    }
+
+    /// Context-aware prompt builder (`#kgctxinject`). Identical to
+    /// [`chat_request_body`](Self::chat_request_body) when `context` is `None`
+    /// or empty, so the no-context path stays byte-compatible. When a non-empty
+    /// known-entity pack is supplied, a bounded `[KNOWN ENTITIES]` block is
+    /// prepended to the user message directing the model to reuse those exact
+    /// stable ids when the chunk references a matching entity (capped by the
+    /// pack's `max_entities`, which bounds the prompt-size / context-window
+    /// cost — the same discipline as the bounded retrieval scan).
+    pub fn chat_request_body_with_context(
+        &self,
+        chunk_text: &str,
+        context: Option<&ContextPack>,
+    ) -> Value {
+        let user_content = match context {
+            Some(pack) if !pack.entities.is_empty() => format!(
+                "{}\n\n[CHUNK]\n{}",
+                format_known_entities(&pack.entities),
+                chunk_text
+            ),
+            _ => chunk_text.to_string(),
+        };
         json!({
             "model": self.model,
             "stream": false,
@@ -82,7 +107,7 @@ impl OllamaKgExtractor {
             "options": { "temperature": 0 },
             "messages": [
                 { "role": "system", "content": SYSTEM_PROMPT },
-                { "role": "user", "content": chunk_text },
+                { "role": "user", "content": user_content },
             ],
         })
     }
@@ -90,19 +115,10 @@ impl OllamaKgExtractor {
     fn chat_url(&self) -> String {
         format!("{}/api/chat", self.host.trim_end_matches('/'))
     }
-}
 
-impl KgExtractor for OllamaKgExtractor {
-    fn metadata(&self) -> KgExtractorMetadata {
-        KgExtractorMetadata {
-            provider_id: OLLAMA_PROVIDER_ID.to_string(),
-            provider_kind: ProviderKind::Ollama,
-            extraction_model: self.model.clone(),
-        }
-    }
-
-    fn extract_json(&self, chunk: &KgChunk) -> Result<String> {
-        let body = self.chat_request_body(&chunk.text);
+    /// Send a built `/api/chat` request body and return the repaired assistant
+    /// extraction JSON. Shared by the plain and context-aware extract paths.
+    fn send_chat_request(&self, body: &Value) -> Result<String> {
         let url = self.chat_url();
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
@@ -111,7 +127,7 @@ impl KgExtractor for OllamaKgExtractor {
             .new_agent();
         let mut response = agent
             .post(&url)
-            .send_json(&body)
+            .send_json(body)
             .with_context(|| format!("calling Ollama chat endpoint {url}"))?;
         let status = response.status();
         let content = response
@@ -128,6 +144,51 @@ impl KgExtractor for OllamaKgExtractor {
             .with_context(|| format!("parsing Ollama chat response JSON (HTTP {status})"))?;
         let assistant = parsed.message.content.as_deref().unwrap_or("");
         repair_extraction_payload(assistant)
+    }
+}
+
+/// Render the bounded known-entity pack as a compact instruction block. Each
+/// line is `stable_id | label | kind | confidence`. Deterministic ordering
+/// follows the pack's already-ranked entity list.
+fn format_known_entities(entities: &[ContextEntity]) -> String {
+    let mut lines = vec![
+        "[KNOWN ENTITIES — reuse these exact stable ids when the chunk references a matching entity; \
+         do not invent new ids for them. Omit a listed entity only if it does not actually appear in the text.]"
+            .to_string(),
+    ];
+    for e in entities {
+        lines.push(format!(
+            "- {} | {} | {} | {:.3}",
+            e.node_id, e.label, e.kind, e.confidence
+        ));
+    }
+    lines.join("\n")
+}
+
+impl KgExtractor for OllamaKgExtractor {
+    fn metadata(&self) -> KgExtractorMetadata {
+        KgExtractorMetadata {
+            provider_id: OLLAMA_PROVIDER_ID.to_string(),
+            provider_kind: ProviderKind::Ollama,
+            extraction_model: self.model.clone(),
+        }
+    }
+
+    fn extract_json(&self, chunk: &KgChunk) -> Result<String> {
+        let body = self.chat_request_body(&chunk.text);
+        self.send_chat_request(&body)
+    }
+
+    /// `#kgctxinject`: inject the known-entity pack into the prompt so the model
+    /// reconciles against canonical stable ids. Falls back to the plain path
+    /// when no pack is supplied.
+    fn extract_json_with_context(
+        &self,
+        chunk: &KgChunk,
+        context: Option<&ContextPack>,
+    ) -> Result<String> {
+        let body = self.chat_request_body_with_context(&chunk.text, context);
+        self.send_chat_request(&body)
     }
 }
 
@@ -432,5 +493,66 @@ mod tests {
             extract_documents_to_projection(&docs, &extractor, ChunkingConfig::default())
                 .expect("live Ollama extraction should succeed");
         assert!(!report.projection.nodes.is_empty());
+    }
+
+    fn known_entity(node_id: &str, label: &str, kind: &str, confidence: f64) -> ContextEntity {
+        ContextEntity {
+            node_id: node_id.to_string(),
+            label: label.to_string(),
+            kind: kind.to_string(),
+            confidence,
+            degree: 0,
+            matched_seed: None,
+        }
+    }
+
+    #[test]
+    fn context_aware_body_without_pack_is_byte_identical_to_plain() {
+        // #kgctxinject: the no-context path must stay byte-for-byte the plain
+        // prompt so an empty/new graph never changes extraction behavior.
+        let extractor = OllamaKgExtractor::new("m");
+        let plain = extractor.chat_request_body("some chunk text");
+        let none_ctx = extractor.chat_request_body_with_context("some chunk text", None);
+        assert_eq!(plain, none_ctx);
+
+        let empty_pack = ContextPack {
+            entities: vec![],
+            truncated: false,
+        };
+        let empty_ctx =
+            extractor.chat_request_body_with_context("some chunk text", Some(&empty_pack));
+        assert_eq!(plain, empty_ctx);
+    }
+
+    #[test]
+    fn context_aware_body_prepends_known_entities_block() {
+        // A non-empty pack prepends the bounded [KNOWN ENTITIES] block with the
+        // canonical stable id so the model reconciles instead of re-inventing.
+        let extractor = OllamaKgExtractor::new("m");
+        let pack = ContextPack {
+            entities: vec![known_entity("kgent-abc123", "OllamaKgExtractor", "type", 0.9)],
+            truncated: false,
+        };
+        let body = extractor.chat_request_body_with_context("describe OllamaKgExtractor", Some(&pack));
+        let content = body["messages"][1]["content"].as_str().unwrap();
+        assert!(content.contains("[KNOWN ENTITIES"));
+        assert!(content.contains("kgent-abc123"));
+        assert!(content.contains("OllamaKgExtractor"));
+        // The original chunk text follows the context block under a [CHUNK] marker.
+        assert!(content.contains("[CHUNK]\ndescribe OllamaKgExtractor"));
+        // System prompt + structured-output schema are unchanged.
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["format"]["type"], "object");
+    }
+
+    #[test]
+    fn format_known_entities_emits_one_line_per_entity() {
+        let block = format_known_entities(&[
+            known_entity("kgent-a", "Alpha", "concept", 0.80),
+            known_entity("kgent-b", "Beta", "type", 0.50),
+        ]);
+        assert!(block.starts_with("[KNOWN ENTITIES"));
+        assert!(block.contains("- kgent-a | Alpha | concept | 0.800"));
+        assert!(block.contains("- kgent-b | Beta | type | 0.500"));
     }
 }

@@ -627,6 +627,7 @@ pub fn run() -> Result<()> {
                 idle_ttl_seconds,
                 keep_loaded,
                 lease_file,
+                no_context,
                 json,
             } => commands::kg::cmd_kg_extract(commands::kg::KgExtractArgs {
                 profile,
@@ -639,6 +640,7 @@ pub fn run() -> Result<()> {
                 idle_ttl_seconds,
                 keep_loaded,
                 lease_file,
+                no_context,
                 json: json || terse || schema || envelope,
             }),
             KgCommand::Status { graph_db, json } => {
@@ -654,6 +656,7 @@ pub fn run() -> Result<()> {
                 idle_ttl_seconds,
                 keep_loaded,
                 lease_file,
+                no_context,
                 json,
             } => commands::kg::cmd_kg_refresh(commands::kg::KgRefreshArgs {
                 graph_db,
@@ -666,6 +669,7 @@ pub fn run() -> Result<()> {
                 idle_ttl_seconds,
                 keep_loaded,
                 lease_file,
+                no_context,
             }),
             KgCommand::Evidence {
                 symbol,

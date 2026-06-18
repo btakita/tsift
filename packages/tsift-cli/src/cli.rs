@@ -1129,6 +1129,12 @@ pub enum KgCommand {
         /// Override the cooperative lease registry file path.
         #[arg(long)]
         lease_file: Option<PathBuf>,
+        /// Skip graph-aware context injection (#kgctxinject). By default, when
+        /// `--graph-db` already holds entities, a bounded known-entity pack is
+        /// injected into the extractor prompt so the model reconciles against
+        /// existing canonical stable ids instead of re-inventing them.
+        #[arg(long)]
+        no_context: bool,
         /// Emit machine-readable JSON instead of a human summary.
         #[arg(long, short)]
         json: bool,
@@ -1178,6 +1184,11 @@ pub enum KgCommand {
         /// Override the cooperative lease registry file path for `--apply`.
         #[arg(long)]
         lease_file: Option<PathBuf>,
+        /// Skip graph-aware context injection during `--apply` re-extraction
+        /// (#kgctxincremental). By default re-extraction reconciles against the
+        /// existing graph's stable ids instead of duplicating them.
+        #[arg(long)]
+        no_context: bool,
         /// Emit machine-readable JSON instead of a human summary.
         #[arg(long, short)]
         json: bool,

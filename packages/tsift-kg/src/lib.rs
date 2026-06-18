@@ -133,6 +133,20 @@ impl KgExtractorMetadata {
 pub trait KgExtractor {
     fn metadata(&self) -> KgExtractorMetadata;
     fn extract_json(&self, chunk: &KgChunk) -> Result<String>;
+
+    /// Context-aware extraction (`#kgctxinject`). The default ignores the
+    /// context pack and delegates to [`extract_json`](Self::extract_json), so
+    /// every existing extractor (e.g. `HashKgExtractor`) is backward-compatible.
+    /// `OllamaKgExtractor` overrides it to inject the known-entity pack into the
+    /// prompt so the model reconciles against canonical stable ids.
+    fn extract_json_with_context(
+        &self,
+        chunk: &KgChunk,
+        context: Option<&context_pack::ContextPack>,
+    ) -> Result<String> {
+        let _ = context;
+        self.extract_json(chunk)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -318,11 +332,27 @@ pub fn extract_documents_to_projection<E: KgExtractor + ?Sized>(
     extractor: &E,
     config: ChunkingConfig,
 ) -> Result<KgExtractionReport> {
+    extract_documents_to_projection_with_context(documents, extractor, config, None)
+}
+
+/// Context-aware extraction (`#kgctxinject`). Like
+/// [`extract_documents_to_projection`], but when a [`ChunkContextSource`] is
+/// supplied each chunk's known-entity pack is built from the existing graph and
+/// passed to [`KgExtractor::extract_json_with_context`] so the model reuses
+/// canonical `kgent-…` stable ids instead of re-inventing them. `None` behaves
+/// exactly like the plain path.
+pub fn extract_documents_to_projection_with_context<E: KgExtractor + ?Sized>(
+    documents: &[KgInputDocument],
+    extractor: &E,
+    config: ChunkingConfig,
+    context_source: Option<&context_pack::ChunkContextSource<'_>>,
+) -> Result<KgExtractionReport> {
     let chunks = chunk_documents(documents, config)?;
     let mut extracted_chunks = Vec::new();
     for chunk in &chunks {
+        let pack = context_source.map(|src| src.context_for_chunk(chunk));
         let raw_json = extractor
-            .extract_json(chunk)
+            .extract_json_with_context(chunk, pack.as_ref())
             .with_context(|| format!("extracting KG JSON for chunk {}", chunk.id))?;
         let payload = parse_and_validate_extraction(&raw_json)
             .with_context(|| format!("validating KG JSON for chunk {}", chunk.id))?;
@@ -965,5 +995,92 @@ mod tests {
             .unwrap();
         assert_eq!(semantic_entities, 2);
         assert_eq!(semantic_relations, 1);
+    }
+
+    /// Records the context pack each chunk was extracted with, so the test can
+    /// assert that `extract_documents_to_projection_with_context` wired the
+    /// known-entity pack through to the extractor (#kgctxinject).
+    #[derive(Debug, Default)]
+    struct ContextRecordingExtractor {
+        seen_entity_ids: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl KgExtractor for ContextRecordingExtractor {
+        fn metadata(&self) -> KgExtractorMetadata {
+            KgExtractorMetadata {
+                provider_id: "ctx-recording".to_string(),
+                provider_kind: ProviderKind::LlamaCpp,
+                extraction_model: "ctx-model".to_string(),
+            }
+        }
+
+        fn extract_json(&self, _chunk: &KgChunk) -> Result<String> {
+            Ok(r#"{"entities":[],"relations":[]}"#.to_string())
+        }
+
+        fn extract_json_with_context(
+            &self,
+            chunk: &KgChunk,
+            context: Option<&context_pack::ContextPack>,
+        ) -> Result<String> {
+            if let Some(pack) = context {
+                self.seen_entity_ids
+                    .borrow_mut()
+                    .extend(pack.entities.iter().map(|e| e.node_id.clone()));
+            }
+            self.extract_json(chunk)
+        }
+    }
+
+    #[test]
+    fn none_context_source_behaves_like_plain_extract() {
+        // #kgctxinject: passing `None` must not invoke the context path.
+        let docs = vec![KgInputDocument::source("src/lib.rs", "GraphProjection rows")];
+        let extractor = ContextRecordingExtractor::default();
+        extract_documents_to_projection_with_context(
+            &docs,
+            &extractor,
+            ChunkingConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert!(extractor.seen_entity_ids.borrow().is_empty());
+    }
+
+    #[test]
+    fn context_source_threads_known_entity_pack_into_extractor() {
+        // The chunk mentions "GraphProjection"; the existing graph holds a
+        // matching `semantic_entity`, so its canonical stable id must be handed
+        // to the extractor for reconciliation.
+        let mut existing = GraphProjection::default();
+        existing.nodes.push(
+            tsift_core::GraphNode::new("kgent-canonical", "semantic_entity", "GraphProjection")
+                .with_property("entity_kind", "type")
+                .with_property("confidence", "0.900"),
+        );
+        let source = context_pack::ChunkContextSource::new(
+            &existing,
+            context_pack::ContextPackConfig::default(),
+        );
+
+        let docs = vec![KgInputDocument::source(
+            "src/lib.rs",
+            "This document discusses the GraphProjection type at length.",
+        )];
+        let extractor = ContextRecordingExtractor::default();
+        extract_documents_to_projection_with_context(
+            &docs,
+            &extractor,
+            ChunkingConfig::default(),
+            Some(&source),
+        )
+        .unwrap();
+        assert!(
+            extractor
+                .seen_entity_ids
+                .borrow()
+                .contains(&"kgent-canonical".to_string()),
+            "extractor should receive the canonical stable id for reconciliation"
+        );
     }
 }
