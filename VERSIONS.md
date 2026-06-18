@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **`#kgwiring`**: Wired the previously dormant `tsift-agent-doc` graph-evidence read seam into an active planning workflow. `session-digest` (and the digest-backed `session-review` / `context-pack` planning surfaces) now surface a bounded `graph_evidence` section from `.tsift/graph.db` — graph node/edge totals plus the most connected KG entities, scoped to the session's top touched symbol. A new `graph_evidence::read_graph_evidence_bounded` guards cost: it checks the cheap `graph_counts()` query first and reports `scanned: false` with totals only (no full `all_nodes()` scan) when the store exceeds `DEFAULT_EVIDENCE_MAX_SCAN_NODES` (50k), so a 418k-node workspace graph no longer loads into memory on every digest cycle. Missing `.tsift/graph.db` yields no section; KG read errors degrade to a digest `warnings` entry. Added a `scanned` flag to `GraphEvidenceReport` (additive in `tsift kg evidence` JSON). Spec: `specs/local-kg-model.md` § Evidence Surfacing in Session Digest.
+
 ## 0.1.70
 
 - **`#cargoidxcov`**: `source-read`/`symbol-read` build the per-package cargo index on demand so symbol projection works for packages whose index had not yet been materialized.

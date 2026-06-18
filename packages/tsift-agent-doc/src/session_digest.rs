@@ -13,6 +13,9 @@ const MAX_SYMBOLS: usize = 12;
 const MAX_FAILURES: usize = 12;
 const MAX_CLOSEOUT: usize = 10;
 const MAX_RUNTIME_EVENTS: usize = 10;
+/// Cap on KG entities surfaced into a digest's graph-evidence section. Kept
+/// small so the section stays a quick orientation pointer, not a graph dump.
+const MAX_GRAPH_EVIDENCE: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -95,6 +98,34 @@ pub struct SessionDigestRuntimeEvent {
     pub occurrences: usize,
 }
 
+/// One KG entity surfaced into the digest from `.tsift/graph.db` (#kgwiring).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionDigestGraphEntity {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub incident_edge_count: usize,
+}
+
+/// Knowledge-graph orientation pulled from `.tsift/graph.db` for the workspace
+/// the session ran in (#kgwiring). This is the active-workflow consumer of the
+/// `graph_evidence` read seam: every session digest that runs in a workspace
+/// with a populated graph now surfaces the most connected entities (optionally
+/// scoped to the session's top touched symbol) so planning has KG context
+/// without a separate `tsift kg evidence` call. `scanned: false` with a node
+/// total set means the graph exists but exceeded the bounded-scan cap, so only
+/// counts are reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionDigestGraphEvidence {
+    pub graph_db: String,
+    pub scanned: bool,
+    pub total_nodes: usize,
+    pub total_edges: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_filter: Option<String>,
+    pub entities: Vec<SessionDigestGraphEntity>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionDigestReport {
     pub root: String,
@@ -118,6 +149,8 @@ pub struct SessionDigestReport {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub restart_churn: Vec<RestartChurnSummary>,
     pub closeout: Vec<SessionDigestCloseout>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub graph_evidence: Option<SessionDigestGraphEvidence>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
 }
@@ -269,6 +302,12 @@ pub fn compute(path: &Path, input: &str, source_hint: Option<&str>) -> Result<Se
     let closeout_groups = closeout.len();
     closeout.truncate(MAX_CLOSEOUT);
 
+    // #kgwiring: surface KG orientation from the workspace graph.db, scoped to
+    // the session's most-touched symbol when one exists. Failures degrade to a
+    // warning — the digest must never fail because the KG is unreadable.
+    let top_symbol = touched_symbols.first().map(|s| s.symbol.clone());
+    let graph_evidence = collect_graph_evidence(&root, top_symbol, &mut state.warnings);
+
     Ok(SessionDigestReport {
         root: root.display().to_string(),
         source: source.as_str().to_string(),
@@ -290,7 +329,68 @@ pub fn compute(path: &Path, input: &str, source_hint: Option<&str>) -> Result<Se
         runtime_events,
         restart_churn,
         closeout,
+        graph_evidence,
         warnings: state.warnings,
+    })
+}
+
+/// Collect bounded KG evidence for a digest (#kgwiring). Returns `None` when the
+/// workspace has no `.tsift/graph.db` (the common case — no clutter), `Some`
+/// otherwise. A read error is downgraded to a `warnings` entry and `None`; the
+/// digest is best-effort orientation and must never fail on KG state. When the
+/// graph exceeds the bounded-scan cap the report is still returned with
+/// `scanned: false` and node/edge totals so callers know the KG is present.
+fn collect_graph_evidence(
+    root: &Path,
+    top_symbol: Option<String>,
+    warnings: &mut Vec<String>,
+) -> Option<SessionDigestGraphEvidence> {
+    use crate::graph_evidence::{
+        DEFAULT_EVIDENCE_MAX_SCAN_NODES, GraphEvidenceQuery, read_graph_evidence_bounded,
+        DEFAULT_GRAPH_DB_RELATIVE,
+    };
+
+    let db_path = root.join(DEFAULT_GRAPH_DB_RELATIVE);
+    if !db_path.exists() {
+        return None;
+    }
+
+    let mut query = GraphEvidenceQuery::default().with_limit(MAX_GRAPH_EVIDENCE);
+    if let Some(symbol) = top_symbol.as_deref() {
+        query = query.with_symbol(symbol);
+    }
+
+    let report =
+        match read_graph_evidence_bounded(&db_path, &query, DEFAULT_EVIDENCE_MAX_SCAN_NODES) {
+            Ok(report) => report,
+            Err(err) => {
+                warnings.push(format!("kg evidence skipped: {err}"));
+                return None;
+            }
+        };
+
+    if !report.exists {
+        return None;
+    }
+
+    let entities = report
+        .matched_nodes
+        .iter()
+        .map(|node| SessionDigestGraphEntity {
+            id: node.id.clone(),
+            kind: node.kind.clone(),
+            label: node.label.clone(),
+            incident_edge_count: node.incident_edge_count,
+        })
+        .collect();
+
+    Some(SessionDigestGraphEvidence {
+        graph_db: report.graph_db,
+        scanned: report.scanned,
+        total_nodes: report.total_nodes_in_db,
+        total_edges: report.total_edges_in_db,
+        symbol_filter: report.query.symbol.clone(),
+        entities,
     })
 }
 
@@ -1697,6 +1797,54 @@ do [#sessiondigest]. spec-test-build-install-commit-push
                 .any(|entry| entry.kind == "verification")
         );
         assert!(report.closeout.iter().any(|entry| entry.kind == "push"));
+        // No graph.db in this workspace → no KG evidence section (#kgwiring).
+        assert!(report.graph_evidence.is_none());
+    }
+
+    #[test]
+    fn markdown_digest_surfaces_graph_evidence_when_graph_db_present() {
+        use tsift_core::{GraphEdge, GraphNode, GraphProjection};
+        use tsift_sqlite::SqliteGraphStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn run_sync() {}\n").unwrap();
+
+        // Seed a populated workspace graph.db at the conventional path.
+        std::fs::create_dir_all(dir.path().join(".tsift")).unwrap();
+        let db_path = dir.path().join(".tsift/graph.db");
+        let mut store = SqliteGraphStore::open(&db_path).unwrap();
+        let mut projection = GraphProjection::default();
+        projection
+            .nodes
+            .push(GraphNode::new("n:run_sync", "function", "run_sync"));
+        projection
+            .nodes
+            .push(GraphNode::new("n:helper", "function", "helper"));
+        projection
+            .edges
+            .push(GraphEdge::new("n:run_sync", "n:helper", "calls"));
+        store.upsert_projection(&projection).unwrap();
+        drop(store);
+
+        let input = "\
+Error: tsift search timed out after 30s at src/lib.rs:7:9
+Symbol `run_sync` not found in index.
+";
+        let report = compute(dir.path(), input, None).unwrap();
+        let evidence = report
+            .graph_evidence
+            .expect("graph.db present → evidence section");
+        assert!(evidence.scanned);
+        assert_eq!(evidence.total_nodes, 2);
+        // Top touched symbol is run_sync → used as the evidence symbol filter.
+        assert_eq!(evidence.symbol_filter.as_deref(), Some("run_sync"));
+        assert!(
+            evidence
+                .entities
+                .iter()
+                .any(|entity| entity.label == "run_sync")
+        );
     }
 
     #[test]

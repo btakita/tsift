@@ -596,6 +596,23 @@ pub(crate) fn cmd_session_digest(
                 truncate_for_compact(&entry.detail, 100)
             );
         }
+        if let Some(evidence) = &report.graph_evidence {
+            println!(
+                "kg nodes:{} edges:{} scanned:{} matched:{}",
+                evidence.total_nodes,
+                evidence.total_edges,
+                evidence.scanned,
+                evidence.entities.len()
+            );
+            for entity in &evidence.entities {
+                println!(
+                    "kg-entity {} edges:{} {}",
+                    entity.kind,
+                    entity.incident_edge_count,
+                    truncate_for_compact(&entity.label, 80)
+                );
+            }
+        }
         for warning in &report.warnings {
             println!("warning: {warning}");
         }
@@ -688,6 +705,34 @@ pub(crate) fn cmd_session_digest(
             println!(
                 "  - [{}] {} ({})",
                 entry.kind, entry.detail, entry.occurrences
+            );
+        }
+    }
+
+    if let Some(evidence) = &report.graph_evidence {
+        println!();
+        println!("KG evidence ({}):", evidence.graph_db);
+        if evidence.scanned {
+            println!(
+                "  {} nodes / {} edges in graph",
+                evidence.total_nodes, evidence.total_edges
+            );
+            if let Some(symbol) = &evidence.symbol_filter {
+                println!("  symbol filter: {symbol}");
+            }
+            for entity in &evidence.entities {
+                println!(
+                    "  - [{}] {} ({} edges)",
+                    entity.kind, entity.label, entity.incident_edge_count
+                );
+            }
+            if evidence.entities.is_empty() {
+                println!("  (no matching entities)");
+            }
+        } else {
+            println!(
+                "  {} nodes / {} edges in graph — too large for inline scan, run `tsift kg evidence` for detail",
+                evidence.total_nodes, evidence.total_edges
             );
         }
     }

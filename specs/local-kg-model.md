@@ -153,3 +153,28 @@ The local model layer must prove cleanup for large model profiles:
 - serialize large extractor leases on a single RTX 5090,
 - fail the run if post-unload used VRAM remains materially above the pre-load
   baseline without a known non-tsift process accounting for the difference.
+
+## Evidence Surfacing in Session Digest
+
+The `tsift-agent-doc` graph-evidence read seam must be wired into an active
+planning workflow rather than reachable only from the `tsift kg evidence` CLI.
+The session digest (`tsift session-digest`, and the digest-backed
+`session-review` / `context-pack` planning surfaces) is that consumer:
+
+- Every digest computed in a workspace that has a `.tsift/graph.db` surfaces a
+  bounded `graph_evidence` section: the graph node/edge totals plus the most
+  connected KG entities, scoped to the session's top touched symbol when one
+  exists (its `incident_edge_count` is the connectivity rank).
+- A missing `.tsift/graph.db` yields no `graph_evidence` section — workspaces
+  that have not run KG extraction are not cluttered.
+- The lookup is guarded for cost. It checks the cheap `graph_counts()` query
+  first and, when the store exceeds the bounded-scan cap
+  (`DEFAULT_EVIDENCE_MAX_SCAN_NODES`), reports `scanned: false` with node/edge
+  totals only — it must not load hundreds of thousands of nodes into memory on
+  a per-cycle digest. Operators get full detail from `tsift kg evidence`.
+- KG read failures degrade to a digest `warnings` entry; a session digest must
+  never fail because the graph store is unreadable.
+
+This keeps agent-doc a read-only evidence consumer (it does not own extraction
+or a local-model lifecycle) while ensuring the seam runs on real planning
+cycles instead of staying dormant.

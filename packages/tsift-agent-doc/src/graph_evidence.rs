@@ -34,6 +34,15 @@ pub const DEFAULT_GRAPH_DB_RELATIVE: &str = ".tsift/graph.db";
 /// Cap on returned evidence nodes when the caller does not specify `limit`.
 pub const DEFAULT_EVIDENCE_LIMIT: usize = 20;
 
+/// Default cap on total `graph_nodes` before bounded evidence scanning is
+/// skipped. The evidence lookup loads every node into memory to rank by
+/// connectivity (see [`build_report`]); on large workspace graphs (hundreds of
+/// thousands of nodes) that is too expensive to run on every planning/digest
+/// cycle. [`read_graph_evidence_bounded`] checks the cheap `graph_counts()`
+/// first and returns a `scanned: false` report when the store exceeds this cap,
+/// so callers still learn the KG exists without paying the full scan.
+pub const DEFAULT_EVIDENCE_MAX_SCAN_NODES: usize = 50_000;
+
 /// Query parameters for an evidence lookup. All fields optional except
 /// `limit` (defaults to [`DEFAULT_EVIDENCE_LIMIT`]).
 #[derive(Debug, Clone, Serialize)]
@@ -128,6 +137,12 @@ impl GraphEvidenceNode {
 pub struct GraphEvidenceReport {
     pub graph_db: String,
     pub exists: bool,
+    /// Whether the full node/edge scan ran. `false` means either the store was
+    /// missing (`exists: false`) or it exceeded the bounded-scan cap (see
+    /// [`read_graph_evidence_bounded`]); in the latter case `total_nodes_in_db`
+    /// / `total_edges_in_db` are still populated from the cheap `graph_counts()`
+    /// query but `matched_nodes` is empty.
+    pub scanned: bool,
     pub total_nodes_in_db: usize,
     pub total_edges_in_db: usize,
     pub query: GraphEvidenceQuery,
@@ -156,6 +171,7 @@ pub fn read_graph_evidence_from_db(
         return Ok(GraphEvidenceReport {
             graph_db: db_display,
             exists: false,
+            scanned: false,
             total_nodes_in_db: 0,
             total_edges_in_db: 0,
             query: clone_query(query),
@@ -174,6 +190,61 @@ pub fn read_graph_evidence_from_db(
 
     let report = build_report(db_display, &all_nodes, &all_edges, query);
     Ok(report)
+}
+
+/// Read evidence with a node-count guard so large workspace graphs do not pay
+/// the full `all_nodes()` / `all_edges()` scan on every call. Intended for the
+/// planning/session-digest hot path (#kgwiring) where the lookup runs on every
+/// cycle but the graph may hold hundreds of thousands of nodes.
+///
+/// Behavior:
+/// - Missing store → `exists: false`, `scanned: false` (same as
+///   [`read_graph_evidence_from_db`]).
+/// - Store present but `total_nodes > max_scan_nodes` → `exists: true`,
+///   `scanned: false`, totals from the cheap `graph_counts()` query, and an
+///   empty `matched_nodes` (the caller learns the KG exists without the scan).
+/// - Otherwise → full scan via [`build_report`], `scanned: true`.
+pub fn read_graph_evidence_bounded(
+    db_path: &Path,
+    query: &GraphEvidenceQuery,
+    max_scan_nodes: usize,
+) -> Result<GraphEvidenceReport> {
+    let db_display = db_path.display().to_string();
+    if !db_path.exists() {
+        return Ok(GraphEvidenceReport {
+            graph_db: db_display,
+            exists: false,
+            scanned: false,
+            total_nodes_in_db: 0,
+            total_edges_in_db: 0,
+            query: clone_query(query),
+            matched_nodes: Vec::new(),
+        });
+    }
+
+    let store = tsift_sqlite::SqliteGraphStore::open_read_only_resilient(db_path)
+        .with_context(|| format!("opening graph.db read-only at {}", db_path.display()))?;
+    let (total_nodes, total_edges) = store
+        .graph_counts()
+        .with_context(|| "reading graph counts for bounded kg evidence")?;
+
+    if total_nodes > max_scan_nodes {
+        return Ok(GraphEvidenceReport {
+            graph_db: db_display,
+            exists: true,
+            scanned: false,
+            total_nodes_in_db: total_nodes,
+            total_edges_in_db: total_edges,
+            query: clone_query(query),
+            matched_nodes: Vec::new(),
+        });
+    }
+
+    let all_nodes = store
+        .all_nodes()
+        .with_context(|| "reading graph_nodes for bounded kg evidence")?;
+    let all_edges = store.all_edges().unwrap_or_default();
+    Ok(build_report(db_display, &all_nodes, &all_edges, query))
 }
 
 /// Pure projection from loaded nodes/edges to an evidence report. Separated
@@ -243,6 +314,7 @@ pub fn build_report(
     GraphEvidenceReport {
         graph_db: db_display,
         exists: true,
+        scanned: true,
         total_nodes_in_db: total_nodes,
         total_edges_in_db: total_edges,
         query: clone_query(query),
@@ -444,6 +516,85 @@ mod tests {
         assert_eq!(report.matched_nodes.len(), 1);
         assert_eq!(report.matched_nodes[0].id, "n:kg-1");
         assert_eq!(report.matched_nodes[0].source_refs, vec!["spec.md"]);
+    }
+
+    #[test]
+    fn build_report_sets_scanned_true() {
+        let report = build_report(
+            "test.db".to_string(),
+            &sample_nodes(),
+            &sample_edges(),
+            &GraphEvidenceQuery::default(),
+        );
+        assert!(report.scanned);
+    }
+
+    #[test]
+    fn read_graph_evidence_bounded_missing_db_is_unscanned() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("never-created.db");
+        let report = read_graph_evidence_bounded(
+            &missing,
+            &GraphEvidenceQuery::default(),
+            DEFAULT_EVIDENCE_MAX_SCAN_NODES,
+        )
+        .expect("missing db should not error");
+        assert!(!report.exists);
+        assert!(!report.scanned);
+        assert!(report.matched_nodes.is_empty());
+    }
+
+    #[test]
+    fn read_graph_evidence_bounded_scans_small_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let mut store = SqliteGraphStore::open(&db_path).unwrap();
+        let mut projection = GraphProjection::default();
+        projection
+            .nodes
+            .push(GraphNode::new("n:kg-1", "kg_source", "tsift-kg"));
+        projection
+            .nodes
+            .push(GraphNode::new("n:other", "concept", "lease"));
+        projection
+            .edges
+            .push(GraphEdge::new("n:kg-1", "n:other", "related_to"));
+        store.upsert_projection(&projection).unwrap();
+        drop(store);
+
+        let report = read_graph_evidence_bounded(
+            &db_path,
+            &GraphEvidenceQuery::default(),
+            DEFAULT_EVIDENCE_MAX_SCAN_NODES,
+        )
+        .expect("small db scans");
+        assert!(report.exists);
+        assert!(report.scanned);
+        assert_eq!(report.total_nodes_in_db, 2);
+        assert_eq!(report.matched_nodes.len(), 2);
+    }
+
+    #[test]
+    fn read_graph_evidence_bounded_skips_oversized_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let mut store = SqliteGraphStore::open(&db_path).unwrap();
+        let mut projection = GraphProjection::default();
+        for i in 0..5 {
+            projection
+                .nodes
+                .push(GraphNode::new(format!("n:{i}"), "concept", format!("c{i}")));
+        }
+        store.upsert_projection(&projection).unwrap();
+        drop(store);
+
+        // Cap of 2 < 5 nodes → totals reported from graph_counts, no scan.
+        let report = read_graph_evidence_bounded(&db_path, &GraphEvidenceQuery::default(), 2)
+            .expect("oversized db reports counts without scanning");
+        assert!(report.exists);
+        assert!(!report.scanned);
+        assert_eq!(report.total_nodes_in_db, 5);
+        assert!(report.matched_nodes.is_empty());
     }
 
     #[test]
