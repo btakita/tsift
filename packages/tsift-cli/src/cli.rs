@@ -1113,6 +1113,22 @@ pub enum KgCommand {
         /// Upsert the resulting projection into this graph.db path.
         #[arg(long)]
         graph_db: Option<PathBuf>,
+        /// Skip cooperative GPU lease coordination (#kgleasewire). By default an
+        /// extract acquires an exclusive lease for the profile so concurrent
+        /// extracts serialize on the GPU.
+        #[arg(long)]
+        no_lease: bool,
+        /// Idle TTL (seconds) recorded on the acquired lease; 0 means no
+        /// TTL-based staleness (pid-liveness still reclaims crashed holders).
+        #[arg(long, default_value_t = 0)]
+        idle_ttl_seconds: u64,
+        /// Keep the model resident after extraction instead of unloading it when
+        /// this extract released the last reference (reference-counted unload).
+        #[arg(long)]
+        keep_loaded: bool,
+        /// Override the cooperative lease registry file path.
+        #[arg(long)]
+        lease_file: Option<PathBuf>,
         /// Emit machine-readable JSON instead of a human summary.
         #[arg(long, short)]
         json: bool,

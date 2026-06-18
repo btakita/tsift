@@ -37,15 +37,50 @@ tsift-kg consumes the lease registry to serialize extractor runs on a single GPU
 OllamaKgExtractor posts to /api/chat with a structured-output JSON schema.";
 const SMOKE_SOURCE_REF: &str = "tsift-kg-smoke";
 
-pub(crate) fn cmd_kg_extract(
-    profile: Option<String>,
-    model: Option<String>,
-    host: Option<String>,
-    input: Option<PathBuf>,
-    source_ref: Option<String>,
-    graph_db: Option<PathBuf>,
-    json: bool,
-) -> Result<()> {
+/// Arguments for `tsift kg extract` (#kgleasewire adds lease coordination).
+pub(crate) struct KgExtractArgs {
+    pub profile: Option<String>,
+    pub model: Option<String>,
+    pub host: Option<String>,
+    pub input: Option<PathBuf>,
+    pub source_ref: Option<String>,
+    pub graph_db: Option<PathBuf>,
+    pub no_lease: bool,
+    pub idle_ttl_seconds: u64,
+    pub keep_loaded: bool,
+    pub lease_file: Option<PathBuf>,
+    pub json: bool,
+}
+
+/// Resolve the profile id used for cooperative GPU leasing during an extract.
+///
+/// An explicit `--model` bypasses profile resolution entirely, so there is no
+/// profile to lease (returns `None`). Otherwise the chosen profile — or the
+/// default — is leased so concurrent extracts serialize on the GPU.
+pub(crate) fn resolve_lease_profile_id(
+    profile: Option<&str>,
+    model: Option<&str>,
+) -> Option<String> {
+    if model.is_some() {
+        return None;
+    }
+    Some(profile.unwrap_or(DEFAULT_PROFILE_ID).to_string())
+}
+
+pub(crate) fn cmd_kg_extract(args: KgExtractArgs) -> Result<()> {
+    let KgExtractArgs {
+        profile,
+        model,
+        host,
+        input,
+        source_ref,
+        graph_db,
+        no_lease,
+        idle_ttl_seconds,
+        keep_loaded,
+        lease_file,
+        json,
+    } = args;
     let (text, default_source_ref) = read_input(input.as_deref())?;
     if text.trim().is_empty() {
         bail!("no source text to extract — provide --input <file> or pipe text on stdin");
@@ -57,6 +92,40 @@ pub(crate) fn cmd_kg_extract(
         Some(host) => OllamaKgExtractor::new(&resolved_model).with_host(host),
         None => OllamaKgExtractor::new(&resolved_model),
     };
+
+    // #kgleasewire: acquire an exclusive cooperative GPU lease before loading
+    // the model so concurrent extracts serialize on one GPU. A bailed extract
+    // leaves a pid-dead holder that `kg`/`lease reap` reclaims (crash-safe via
+    // #kgreflease), so we only release on the success path.
+    let lease_profile = if no_lease {
+        None
+    } else {
+        resolve_lease_profile_id(profile.as_deref(), model.as_deref())
+    };
+    let lease_path = tsift_local_model::resolve_lease_file(lease_file.as_deref());
+    let holder_pid = std::process::id();
+    if let Some(ref lease_id) = lease_profile {
+        let acquisition = tsift_local_model::acquire_lease(
+            lease_id,
+            holder_pid,
+            "tsift kg extract",
+            0,
+            idle_ttl_seconds,
+            tsift_local_model::current_unix_seconds(),
+            &lease_path,
+        )
+        .with_context(|| format!("acquiring GPU lease for {lease_id}"))?;
+        if acquisition.status == tsift_local_model::GpuLeaseAcquisitionStatus::Conflict {
+            let held_by = acquisition
+                .conflict
+                .map(|c| c.holder_pid.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            bail!(
+                "GPU lease for {lease_id} is held by pid {held_by}; another extractor is \
+                 running. Wait for it, or pass --no-lease to bypass coordination."
+            );
+        }
+    }
 
     let document = KgInputDocument::new(KgInputKind::Source, &source_ref, &text);
     let report = extract_documents_to_projection(&[document], &extractor, ChunkingConfig::default())
@@ -104,6 +173,29 @@ pub(crate) fn cmd_kg_extract(
             println!("Upserted into: {}", graph_db.display());
         }
     }
+
+    // #kgleasewire: release the lease; reference-counted unload when this
+    // extract dropped the last live reference (unless --keep-loaded).
+    if let Some(ref lease_id) = lease_profile {
+        let release = tsift_local_model::release_lease(
+            lease_id,
+            holder_pid,
+            tsift_local_model::current_unix_seconds(),
+            &lease_path,
+        )
+        .with_context(|| format!("releasing GPU lease for {lease_id}"))?;
+        if !keep_loaded && release.remaining_holders == 0 {
+            let endpoint = resolve_ollama_host_for_unload(host.as_deref());
+            let outcome = tsift_local_model::unload_model_at(&endpoint, &resolved_model);
+            if !json {
+                println!(
+                    "Unloaded {} (last lease reference released): {}",
+                    resolved_model, outcome.outcome
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -471,6 +563,33 @@ mod tests {
     use tempfile::TempDir;
     use tsift_core::{GraphEdge, GraphNode, GraphProjection};
     use tsift_sqlite::SqliteGraphStore;
+
+    #[test]
+    fn resolve_lease_profile_id_defaults_when_no_profile_or_model() {
+        assert_eq!(
+            resolve_lease_profile_id(None, None).as_deref(),
+            Some(DEFAULT_PROFILE_ID)
+        );
+    }
+
+    #[test]
+    fn resolve_lease_profile_id_uses_explicit_profile() {
+        assert_eq!(
+            resolve_lease_profile_id(Some("qwen3-32b-q4"), None).as_deref(),
+            Some("qwen3-32b-q4")
+        );
+    }
+
+    #[test]
+    fn resolve_lease_profile_id_none_when_explicit_model_bypasses_profiles() {
+        // An explicit --model bypasses profile resolution, so there is no
+        // profile to lease — extract proceeds without GPU lease coordination.
+        assert_eq!(resolve_lease_profile_id(None, Some("some-ollama-tag")), None);
+        assert_eq!(
+            resolve_lease_profile_id(Some("qwen3-32b-q4"), Some("some-ollama-tag")),
+            None
+        );
+    }
 
     #[test]
     fn kg_status_reports_missing_db_cleanly() {

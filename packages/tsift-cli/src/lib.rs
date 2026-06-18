@@ -623,16 +623,24 @@ pub fn run() -> Result<()> {
                 input,
                 source_ref,
                 graph_db,
+                no_lease,
+                idle_ttl_seconds,
+                keep_loaded,
+                lease_file,
                 json,
-            } => commands::kg::cmd_kg_extract(
+            } => commands::kg::cmd_kg_extract(commands::kg::KgExtractArgs {
                 profile,
                 model,
                 host,
                 input,
                 source_ref,
                 graph_db,
-                json || terse || schema || envelope,
-            ),
+                no_lease,
+                idle_ttl_seconds,
+                keep_loaded,
+                lease_file,
+                json: json || terse || schema || envelope,
+            }),
             KgCommand::Status { graph_db, json } => {
                 commands::kg::cmd_kg_status(graph_db, json || terse || schema || envelope)
             }

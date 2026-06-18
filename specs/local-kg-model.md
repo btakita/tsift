@@ -186,6 +186,14 @@ binary is the single arbiter — sessions never mutate the registry directly.
   --unload-empty` POST the provider-native `keep_alive:0` unload only for
   profiles that dropped to zero references, so VRAM is freed exactly when no
   session still references the model.
+- **Extraction consumes the lease.** `tsift kg extract` acquires an exclusive
+  lease for the resolved profile before loading the model (so concurrent
+  extracts serialize on one GPU; a conflict fails with the holding pid unless
+  `--no-lease` is passed), and on success releases it, unloading the model when
+  it dropped the last reference (unless `--keep-loaded`). An extract that bails
+  leaves a pid-dead holder reclaimed by the next acquire/`reap` — the crash
+  path is the reference count's own reclamation, not a leak. An explicit
+  `--model` (bypassing profile resolution) runs without lease coordination.
 
 ## Evidence Surfacing in Session Digest
 
