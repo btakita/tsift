@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use tsift_core::{GraphEdge, GraphFreshness, GraphNode, GraphProjection, GraphProvenance};
+use tsift_kg::{
+    ChunkingConfig, KgExtractor, KgInputDocument, KgInputKind, OllamaKgExtractor,
+    extract_documents_to_projection,
+};
 use tsift_local_model::ProviderKind;
 use tsift_memory::{
     DEFAULT_MEMORY_CANDIDATE_LIMIT, MemoryEvent, MemoryReadPolicy, MemoryReadWatermark,
@@ -158,6 +162,112 @@ impl SemanticProvider for HashSemanticProvider {
     }
 
     fn embed(&self, input: &str) -> Result<SemanticEmbedding> {
+        Ok(SemanticEmbedding::new(
+            HASH_SEMANTIC_PROVIDER_ID,
+            SEMANTIC_EMBEDDING_MODEL,
+            semantic_embedding(input),
+        ))
+    }
+}
+
+/// KG-backed semantic provider — routes `extract_concepts` through the
+/// `tsift-kg` extraction pipeline so memgraphrag consumes real model-backed
+/// entity extraction (spec line 27-28 of `specs/local-kg-model.md`).
+///
+/// Generic over `KgExtractor` so tests can drive the pipeline with a stub and
+/// production can use [`OllamaKgExtractor`] (default). The Ollama embedder is
+/// a `#lmlazy` follow-up; `embed` stays on the deterministic hash fallback
+/// until the ollama embedding profile lands, so memgraphrag's vector path
+/// remains online regardless of whether a GPU extractor is available.
+pub struct KgSemanticProvider<E: KgExtractor + ?Sized = OllamaKgExtractor> {
+    extractor: Box<E>,
+}
+
+impl KgSemanticProvider<OllamaKgExtractor> {
+    /// Build an Ollama-backed KG semantic provider for a specific model tag
+    /// (e.g. `hf.co/Qwen/Qwen3-32B-GGUF:Q4_K_M`). Honors `OLLAMA_HOST` via
+    /// the underlying extractor.
+    pub fn ollama(model: impl Into<String>) -> Self {
+        Self {
+            extractor: Box::new(OllamaKgExtractor::new(model)),
+        }
+    }
+}
+
+impl<E: KgExtractor> KgSemanticProvider<E> {
+    /// Build a KG semantic provider over an arbitrary extractor. Tests use this
+    /// to drive the pipeline deterministically without a live model.
+    pub fn with_extractor(extractor: E) -> Self {
+        Self {
+            extractor: Box::new(extractor),
+        }
+    }
+}
+
+impl<E: KgExtractor + ?Sized> SemanticProvider for KgSemanticProvider<E> {
+    fn metadata(&self) -> SemanticProviderMetadata {
+        let kg = self.extractor.metadata();
+        SemanticProviderMetadata {
+            provider_id: kg.provider_id,
+            provider_kind: kg.provider_kind,
+            extraction_model: kg.extraction_model,
+            // Ollama embedder is a #lmlazy follow-up; embed() uses the hash
+            // fallback path, so report its model id honestly here.
+            embedding_model: SEMANTIC_EMBEDDING_MODEL.to_string(),
+        }
+    }
+
+    fn extract_concepts(
+        &self,
+        input: &SemanticProviderInput,
+    ) -> Result<Vec<SemanticConceptCandidate>> {
+        let kind = match input.memory_kind.as_str() {
+            "session" => KgInputKind::Session,
+            "memory" => KgInputKind::Memory,
+            _ => KgInputKind::Source,
+        };
+        let document = KgInputDocument::new(kind, &input.source_ref, &input.text);
+        let report = extract_documents_to_projection(
+            &[document],
+            self.extractor.as_ref(),
+            ChunkingConfig::default(),
+        )
+        .context("tsift-kg extraction pipeline failed")?;
+
+        let mut candidates: Vec<SemanticConceptCandidate> = report
+            .extracted_chunks
+            .iter()
+            .flat_map(|chunk| chunk.payload.entities.iter())
+            .map(|entity| {
+                SemanticConceptCandidate::new(
+                    format!("kg:{}", entity.kind),
+                    entity.label.clone(),
+                    entity
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| entity.kind.clone()),
+                    format!("{} {}", entity.label, entity.kind),
+                )
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            // Degrade gracefully: a model that returned no entities must not
+            // erase the memory row's only concept. Mirror the hash fallback
+            // primary candidate so downstream traversal stays populated.
+            candidates.push(SemanticConceptCandidate::primary(
+                input.label.clone(),
+                "semantic row from tsift-kg (empty extraction)",
+                input.semantic_text.clone(),
+            ));
+        }
+
+        Ok(candidates)
+    }
+
+    fn embed(&self, input: &str) -> Result<SemanticEmbedding> {
+        // Ollama embedding profile is a #lmlazy follow-up; keep the
+        // deterministic hash fallback so the vector path stays online.
         Ok(SemanticEmbedding::new(
             HASH_SEMANTIC_PROVIDER_ID,
             SEMANTIC_EMBEDDING_MODEL,
@@ -1252,5 +1362,154 @@ mod tests {
                 && edge.properties.get("semantic_provider")
                     == Some(&"fixture-local-provider".to_string())
         }));
+    }
+
+    /// Stub `KgExtractor` returning a canned entity payload so the
+    /// KgSemanticProvider pipeline can be exercised without a live model.
+    struct StubKgExtractor {
+        payload_json: String,
+        metadata: tsift_kg::KgExtractorMetadata,
+    }
+
+    impl KgExtractor for StubKgExtractor {
+        fn metadata(&self) -> tsift_kg::KgExtractorMetadata {
+            self.metadata.clone()
+        }
+        fn extract_json(&self, _chunk: &tsift_kg::KgChunk) -> Result<String> {
+            Ok(self.payload_json.clone())
+        }
+    }
+
+    fn stub_extractor() -> StubKgExtractor {
+        StubKgExtractor {
+            payload_json: r#"{"entities":[
+                {"id":"e0","label":"tsift-kg","kind":"crate","description":"KG extraction crate","confidence":0.9},
+                {"id":"e1","label":"OllamaKgExtractor","kind":"struct","confidence":0.8}
+            ],"relations":[]}"#
+                .to_string(),
+            metadata: tsift_kg::KgExtractorMetadata {
+                provider_id: "stub-kg-provider".to_string(),
+                provider_kind: ProviderKind::Ollama,
+                extraction_model: "stub-model".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn kg_semantic_provider_metadata_propagates_extractor_metadata() {
+        let provider = KgSemanticProvider::with_extractor(stub_extractor());
+        let metadata = provider.metadata();
+        assert_eq!(metadata.provider_id, "stub-kg-provider");
+        assert_eq!(metadata.provider_kind, ProviderKind::Ollama);
+        assert_eq!(metadata.extraction_model, "stub-model");
+        // Embedder stays on the hash fallback until the #lmlazy ollama embedder
+        // follow-up ships.
+        assert_eq!(metadata.embedding_model, HASH_SEMANTIC_PROVIDER_ID);
+    }
+
+    #[test]
+    fn kg_semantic_provider_extracts_concepts_via_tsift_kg_pipeline() {
+        let provider = KgSemanticProvider::with_extractor(stub_extractor());
+        let input = SemanticProviderInput {
+            source_ref: "session.md".to_string(),
+            memory_kind: "source".to_string(),
+            label: "kg row".to_string(),
+            text: "tsift-kg extracts entities via OllamaKgExtractor.".to_string(),
+            semantic_text: "kg row tsift-kg extracts entities".to_string(),
+            imported_from: "test".to_string(),
+            session_id: None,
+            observed_at_unix: None,
+        };
+        let candidates = provider
+            .extract_concepts(&input)
+            .expect("KG pipeline should produce candidates");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].label, "tsift-kg");
+        assert_eq!(candidates[0].stable_key, "kg:crate");
+        assert_eq!(candidates[1].label, "OllamaKgExtractor");
+        assert_eq!(candidates[1].stable_key, "kg:struct");
+    }
+
+    #[test]
+    fn kg_semantic_provider_falls_back_when_extractor_returns_no_entities() {
+        let empty_stub = StubKgExtractor {
+            payload_json: r#"{"entities":[],"relations":[]}"#.to_string(),
+            metadata: tsift_kg::KgExtractorMetadata {
+                provider_id: "empty-stub".to_string(),
+                provider_kind: ProviderKind::Ollama,
+                extraction_model: "empty-stub-model".to_string(),
+            },
+        };
+        let provider = KgSemanticProvider::with_extractor(empty_stub);
+        let input = SemanticProviderInput {
+            source_ref: "session.md".to_string(),
+            memory_kind: "source".to_string(),
+            label: "ghost row".to_string(),
+            text: "no entities here".to_string(),
+            semantic_text: "ghost row no entities here".to_string(),
+            imported_from: "test".to_string(),
+            session_id: None,
+            observed_at_unix: None,
+        };
+        let candidates = provider
+            .extract_concepts(&input)
+            .expect("empty extraction must not fail the cycle");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].label, "ghost row");
+        assert_eq!(candidates[0].detail, "semantic row from tsift-kg (empty extraction)");
+    }
+
+    #[test]
+    fn kg_semantic_provider_embed_uses_hash_fallback() {
+        let provider = KgSemanticProvider::with_extractor(stub_extractor());
+        let embedding = provider.embed("tsift-kg ollama").expect("embed succeeds");
+        assert_eq!(embedding.provider_id, HASH_SEMANTIC_PROVIDER_ID);
+        assert_eq!(embedding.model, SEMANTIC_EMBEDDING_MODEL);
+        assert_eq!(embedding.dimensions(), SEMANTIC_EMBEDDING_DIM);
+    }
+
+    #[test]
+    fn kg_semantic_provider_drives_traversal_projection() {
+        // End-to-end: KgSemanticProvider feeds the same traversal path the
+        // FixtureSemanticProvider test exercises, proving memgraphrag now
+        // consumes tsift-kg extractors in the real graph-build flow.
+        let dir = TempDir::new().unwrap();
+        let event = MemoryEvent::new(
+            MemoryEventKind::ResponseSummary,
+            "session.md",
+            "kg semantic provider traversal",
+        )
+        .with_session_id("sess-kg")
+        .with_observed_at_unix(1_700_000_000);
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let provider = KgSemanticProvider::with_extractor(stub_extractor());
+        append_memory_events_as_traversal_rows_with_provider(
+            dir.path(),
+            &[event],
+            &mut nodes,
+            &mut edges,
+            &provider,
+        )
+        .unwrap();
+
+        let semantic = nodes
+            .iter()
+            .find(|node| node.kind == "semantic_concept")
+            .expect("expected semantic concept from KG provider");
+        assert_eq!(semantic.label, "tsift-kg");
+        assert_eq!(
+            semantic.properties.get("semantic_provider"),
+            Some(&"stub-kg-provider".to_string())
+        );
+        assert_eq!(
+            semantic.properties.get("semantic_provider_kind"),
+            Some(&"ollama".to_string())
+        );
+        assert_eq!(
+            semantic.properties.get("semantic_extraction_model"),
+            Some(&"stub-model".to_string())
+        );
+        assert!(edges.iter().any(|edge| edge.kind == "mentions_concept"));
     }
 }
