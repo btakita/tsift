@@ -6,6 +6,10 @@ use tsift_core::{GraphEdge, GraphFreshness, GraphNode, GraphProjection, GraphPro
 use tsift_local_model::ProviderKind;
 use tsift_sqlite::SqliteGraphStore;
 
+pub mod ollama;
+
+pub use ollama::OllamaKgExtractor;
+
 pub const KG_CONTRACT_VERSION: &str = "tsift-kg-v1";
 pub const HASH_KG_EXTRACTOR_ID: &str = "tsift-local-hash-v1";
 

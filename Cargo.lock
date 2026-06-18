@@ -5277,6 +5277,7 @@ dependencies = [
  "tsift-digest",
  "tsift-graph",
  "tsift-index",
+ "tsift-kg",
  "tsift-local-model",
  "tsift-memgraphrag",
  "tsift-memory",
@@ -5366,6 +5367,7 @@ dependencies = [
  "tsift-core",
  "tsift-local-model",
  "tsift-sqlite",
+ "ureq",
 ]
 
 [[package]]

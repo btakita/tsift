@@ -37,6 +37,7 @@ tsift-core = { path = "../tsift-core", version = "0.1.70" }
 tsift-digest = { path = "../tsift-digest", version = "0.1.70" }
 tsift-graph = { path = "../tsift-graph", version = "0.1.70" }
 tsift-index = { path = "../tsift-index", version = "0.1.70" }
+tsift-kg = { path = "../tsift-kg", version = "0.1.70" }
 tsift-local-model = { path = "../tsift-local-model", version = "0.1.70" }
 tsift-memory = { path = "../tsift-memory", version = "0.1.70" }
 tsift-memgraphrag = { path = "../tsift-memgraphrag", version = "0.1.70" }

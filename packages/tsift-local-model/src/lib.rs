@@ -330,6 +330,41 @@ pub fn default_model_profiles() -> Vec<ModelProfile> {
             unload_strategy: UnloadStrategy::None,
             notes: "deterministic fallback for tests and offline runs",
         },
+        // ---- Ollama-native profiles (#lmlazy) ----
+        // model_ref matches an `ollama pull` tag so the unload lifecycle targets
+        // the live Ollama instance (TSIFT_OLLAMA_ENDPOINT / OLLAMA_HOST) instead
+        // of a llama.cpp router endpoint. Estimated VRAM mirrors the llama.cpp
+        // equivalents; Ollama loads the same GGUF weights onto the GPU.
+        ModelProfile {
+            id: "qwen3-32b-q4-ollama",
+            label: "Qwen3-32B 4-bit (Ollama)",
+            provider: ProviderKind::Ollama,
+            model_ref: "hf.co/Qwen/Qwen3-32B-GGUF:Q4_K_M",
+            quantization: "q4",
+            roles: vec![ModelRole::Extract],
+            context_tokens: 32_768,
+            estimated_weights_mib: 20_500,
+            estimated_kv_mib: 4_096,
+            runtime_margin_mib: DEFAULT_DESKTOP_RUNTIME_MARGIN_MIB,
+            concurrency: ConcurrencyClass::ExclusiveLargeGpu,
+            unload_strategy: UnloadStrategy::OllamaKeepAliveZero,
+            notes: "default Ollama-served quality extractor (lazy: keep_alive:0 unloads VRAM)",
+        },
+        ModelProfile {
+            id: "qwen3-embedding-0.6b-ollama",
+            label: "Qwen3-Embedding-0.6B (Ollama)",
+            provider: ProviderKind::Ollama,
+            model_ref: "hf.co/Qwen/Qwen3-Embedding-0.6B-GGUF",
+            quantization: "q8_or_f16",
+            roles: vec![ModelRole::Embed, ModelRole::Rerank],
+            context_tokens: 32_768,
+            estimated_weights_mib: 1_200,
+            estimated_kv_mib: 512,
+            runtime_margin_mib: 1_024,
+            concurrency: ConcurrencyClass::SharedSmallGpu,
+            unload_strategy: UnloadStrategy::OllamaKeepAliveZero,
+            notes: "default low-pressure Ollama-served embedding companion",
+        },
     ]
 }
 

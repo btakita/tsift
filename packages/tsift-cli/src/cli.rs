@@ -221,6 +221,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: LocalModelCommand,
     },
+    /// Extract a local Knowledge Graph from source text via a local model (#lmlazy)
+    Kg {
+        #[command(subcommand)]
+        command: KgCommand,
+    },
     /// Capture and query authored findings anchored to code (Findings Graph Layer)
     Finding {
         #[command(subcommand)]
@@ -1081,6 +1086,35 @@ pub enum FindingCommand {
         path: PathBuf,
         /// Output as JSON
         #[arg(long)]
+        json: bool,
+     },
+}
+
+#[derive(Subcommand)]
+pub enum KgCommand {
+    /// Extract entities/relations from source text via an Ollama-served model
+    Extract {
+        /// Profile id (e.g. `qwen3-32b-q4-ollama`). Use `--model` to bypass
+        /// profile resolution entirely.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Explicit Ollama model tag; overrides the profile's `model_ref`.
+        #[arg(long)]
+        model: Option<String>,
+        /// Ollama host URL (defaults to `http://127.0.0.1:11434`, honors `OLLAMA_HOST`).
+        #[arg(long)]
+        host: Option<String>,
+        /// Read source text from this file instead of stdin.
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Source reference label used for KG provenance.
+        #[arg(long)]
+        source_ref: Option<String>,
+        /// Upsert the resulting projection into this graph.db path.
+        #[arg(long)]
+        graph_db: Option<PathBuf>,
+        /// Emit machine-readable JSON instead of a human summary.
+        #[arg(long, short)]
         json: bool,
     },
 }

@@ -82,7 +82,7 @@ use token_savings::{
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::{
-    Cli, Commands, DispatchTraceFormat, GraphDbQuery, LeaseCommand, LocalModelCommand,
+    Cli, Commands, DispatchTraceFormat, GraphDbQuery, KgCommand, LeaseCommand, LocalModelCommand,
     SemanticRelatedKind, SourceReadStyle,
 };
 #[cfg(test)]
@@ -615,6 +615,25 @@ pub fn run() -> Result<()> {
                 },
             )
         }
+        Some(Commands::Kg { command }) => match command {
+            KgCommand::Extract {
+                profile,
+                model,
+                host,
+                input,
+                source_ref,
+                graph_db,
+                json,
+            } => commands::kg::cmd_kg_extract(
+                profile,
+                model,
+                host,
+                input,
+                source_ref,
+                graph_db,
+                json || terse || schema || envelope,
+            ),
+        },
         Some(Commands::Finding { command }) => match command {
             cli::FindingCommand::Add {
                 path,
