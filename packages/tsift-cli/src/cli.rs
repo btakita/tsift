@@ -1143,11 +1143,41 @@ pub enum KgCommand {
         json: bool,
     },
     /// Report which extracted sources are stale (changed since extraction) so
-    /// `.tsift/graph.db` can be refreshed on demand (#kgextractrefresh).
+    /// `.tsift/graph.db` can be refreshed on demand (#kgextractrefresh), or —
+    /// with `--apply` — automatically re-extract them (#kgrefreshapply).
     Refresh {
         /// Graph db path (defaults to `<cwd>/.tsift/graph.db`).
         #[arg(long)]
         graph_db: Option<PathBuf>,
+        /// Re-extract every stale / no_recorded_hash source whose file is still
+        /// readable, reusing the lease-aware `kg extract` path (#kgrefreshapply).
+        /// Operator-gated: needs GPU + Ollama. Without this flag `refresh` is the
+        /// read-only staleness plan from #kgextractrefresh.
+        #[arg(long)]
+        apply: bool,
+        /// Profile id for `--apply` re-extraction (default qwen3-32b-q4-ollama).
+        #[arg(long)]
+        profile: Option<String>,
+        /// Explicit Ollama model tag for `--apply`; bypasses profile resolution.
+        #[arg(long)]
+        model: Option<String>,
+        /// Ollama host URL for `--apply` (defaults to http://127.0.0.1:11434).
+        #[arg(long)]
+        host: Option<String>,
+        /// Skip cooperative GPU lease coordination for `--apply` re-extraction.
+        #[arg(long)]
+        no_lease: bool,
+        /// Idle TTL (seconds) recorded on `--apply` acquired leases; 0 means no
+        /// TTL-based staleness (pid-liveness still reclaims crashed holders).
+        #[arg(long, default_value_t = 0)]
+        idle_ttl_seconds: u64,
+        /// Keep the model resident after `--apply` instead of unloading it when
+        /// an extract released the last reference.
+        #[arg(long)]
+        keep_loaded: bool,
+        /// Override the cooperative lease registry file path for `--apply`.
+        #[arg(long)]
+        lease_file: Option<PathBuf>,
         /// Emit machine-readable JSON instead of a human summary.
         #[arg(long, short)]
         json: bool,

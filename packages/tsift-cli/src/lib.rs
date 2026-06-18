@@ -644,9 +644,29 @@ pub fn run() -> Result<()> {
             KgCommand::Status { graph_db, json } => {
                 commands::kg::cmd_kg_status(graph_db, json || terse || schema || envelope)
             }
-            KgCommand::Refresh { graph_db, json } => {
-                commands::kg::cmd_kg_refresh(graph_db, json || terse || schema || envelope)
-            }
+            KgCommand::Refresh {
+                graph_db,
+                apply,
+                profile,
+                model,
+                host,
+                no_lease,
+                idle_ttl_seconds,
+                keep_loaded,
+                lease_file,
+                json,
+            } => commands::kg::cmd_kg_refresh(commands::kg::KgRefreshArgs {
+                graph_db,
+                json: json || terse || schema || envelope,
+                apply,
+                profile,
+                model,
+                host,
+                no_lease,
+                idle_ttl_seconds,
+                keep_loaded,
+                lease_file,
+            }),
             KgCommand::Evidence {
                 symbol,
                 kind,

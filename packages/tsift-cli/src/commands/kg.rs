@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 
 use tsift_core::GraphStore;
 use tsift_kg::{
-    ChunkingConfig, KgInputDocument, KgInputKind, OllamaKgExtractor, extract_documents_to_projection,
-    upsert_kg_projection_sqlite,
+    ChunkingConfig, KgInputDocument, KgInputKind, KgSqliteUpsertReport, OllamaKgExtractor,
+    extract_documents_to_projection, upsert_kg_projection_sqlite,
 };
 use tsift_local_model::profile_by_id;
 
@@ -52,6 +52,26 @@ pub(crate) struct KgExtractArgs {
     pub json: bool,
 }
 
+/// Arguments for `tsift kg refresh` (#kgrefreshapply adds `--apply`).
+///
+/// Without `apply`, refresh is the read-only staleness plan from
+/// `#kgextractrefresh`. With `apply`, every stale / no_recorded_hash source
+/// whose file is still readable is re-extracted through the lease-aware
+/// `kg extract` path; the extract pass-through fields configure that
+/// re-extraction.
+pub(crate) struct KgRefreshArgs {
+    pub graph_db: Option<PathBuf>,
+    pub json: bool,
+    pub apply: bool,
+    pub profile: Option<String>,
+    pub model: Option<String>,
+    pub host: Option<String>,
+    pub no_lease: bool,
+    pub idle_ttl_seconds: u64,
+    pub keep_loaded: bool,
+    pub lease_file: Option<PathBuf>,
+}
+
 /// Resolve the profile id used for cooperative GPU leasing during an extract.
 ///
 /// An explicit `--model` bypasses profile resolution entirely, so there is no
@@ -67,7 +87,36 @@ pub(crate) fn resolve_lease_profile_id(
     Some(profile.unwrap_or(DEFAULT_PROFILE_ID).to_string())
 }
 
-pub(crate) fn cmd_kg_extract(args: KgExtractArgs) -> Result<()> {
+/// Outcome of one KG extract. Returned by `run_kg_extract` so `kg extract`
+/// and `kg refresh --apply` share one lease-aware path and one print format;
+/// the `--apply` loop collects a `Vec<KgExtractOutcome>` to emit a unified
+/// summary instead of interleaving per-source stdout (#kgrefreshapply).
+#[derive(Debug, Serialize)]
+pub(crate) struct KgExtractOutcome {
+    pub provider_id: String,
+    pub model: String,
+    pub host: String,
+    pub source_ref: String,
+    pub chunks: usize,
+    pub entities: usize,
+    pub relations: usize,
+    pub upsert: Option<KgSqliteUpsertReport>,
+    /// Up to 20 `(label, kind)` pairs backing the `kg extract` human preview.
+    pub node_preview: Vec<(String, String)>,
+    pub node_total: usize,
+    /// Human-facing unload notice emitted when this extract dropped the last
+    /// lease reference (reference-counted unload, #kgleasewire). `None` when the
+    /// model was kept loaded or leasing was bypassed.
+    pub unloaded: Option<String>,
+}
+
+/// Core extract pipeline with lease coordination (#kgleasewire). Acquires an
+/// exclusive cooperative GPU lease, runs the KG pipeline, upserts the
+/// projection, then releases the lease (reference-counted unload on the success
+/// path). Returns the extraction outcome without printing. A bailed extract
+/// leaves a pid-dead holder reclaimed by the next acquire/reap (crash-safe via
+/// #kgreflease), so the lease is only released on the success path.
+pub(crate) fn run_kg_extract(args: KgExtractArgs) -> Result<KgExtractOutcome> {
     let KgExtractArgs {
         profile,
         model,
@@ -79,7 +128,7 @@ pub(crate) fn cmd_kg_extract(args: KgExtractArgs) -> Result<()> {
         idle_ttl_seconds,
         keep_loaded,
         lease_file,
-        json,
+        json: _,
     } = args;
     let (text, default_source_ref) = read_input(input.as_deref())?;
     if text.trim().is_empty() {
@@ -94,9 +143,7 @@ pub(crate) fn cmd_kg_extract(args: KgExtractArgs) -> Result<()> {
     };
 
     // #kgleasewire: acquire an exclusive cooperative GPU lease before loading
-    // the model so concurrent extracts serialize on one GPU. A bailed extract
-    // leaves a pid-dead holder that `kg`/`lease reap` reclaims (crash-safe via
-    // #kgreflease), so we only release on the success path.
+    // the model so concurrent extracts serialize on one GPU.
     let lease_profile = if no_lease {
         None
     } else {
@@ -131,51 +178,35 @@ pub(crate) fn cmd_kg_extract(args: KgExtractArgs) -> Result<()> {
     let report = extract_documents_to_projection(&[document], &extractor, ChunkingConfig::default())
         .context("KG extraction pipeline failed")?;
 
-    let entity_count: usize = report.projection.nodes.len();
-    let relation_count: usize = report.projection.edges.len();
+    let provider_id = report
+        .extracted_chunks
+        .first()
+        .map(|c| c.chunk.id.as_str())
+        .unwrap_or("")
+        .to_string();
+    let node_total = report.projection.nodes.len();
+    let node_preview: Vec<(String, String)> = report
+        .projection
+        .nodes
+        .iter()
+        .take(20)
+        .map(|n| (n.label.clone(), n.kind.clone()))
+        .collect();
+    let entity_count = node_total;
+    let relation_count = report.projection.edges.len();
 
     let upsert = if let Some(graph_db) = graph_db.as_deref() {
-        Some(upsert_kg_projection_sqlite(graph_db, &report.projection).context(
-            format!("upserting KG projection into {}", graph_db.display()),
-        )?)
+        Some(upsert_kg_projection_sqlite(graph_db, &report.projection).context(format!(
+            "upserting KG projection into {}",
+            graph_db.display()
+        ))?)
     } else {
         None
     };
 
-    if json {
-        let payload = serde_json::json!({
-            "provider_id": report.extracted_chunks.first().map(|c| c.chunk.id.as_str()).unwrap_or(""),
-            "model": extractor.model(),
-            "host": extractor.host(),
-            "source_ref": source_ref,
-            "chunks": report.chunks.len(),
-            "entities": entity_count,
-            "relations": relation_count,
-            "upsert": upsert,
-        });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else {
-        println!("KG extraction");
-        println!("Model: {} ({})", extractor.model(), extractor.host());
-        println!(
-            "Chunks: {}  Entities: {}  Relations: {}",
-            report.chunks.len(),
-            entity_count,
-            relation_count
-        );
-        for node in report.projection.nodes.iter().take(20) {
-            println!("  - {} [{}]", node.label, node.kind);
-        }
-        if report.projection.nodes.len() > 20 {
-            println!("  ... ({} more)", report.projection.nodes.len() - 20);
-        }
-        if let Some(graph_db) = graph_db.as_deref() {
-            println!("Upserted into: {}", graph_db.display());
-        }
-    }
-
     // #kgleasewire: release the lease; reference-counted unload when this
     // extract dropped the last live reference (unless --keep-loaded).
+    let mut unloaded = None;
     if let Some(ref lease_id) = lease_profile {
         let release = tsift_local_model::release_lease(
             lease_id,
@@ -187,16 +218,74 @@ pub(crate) fn cmd_kg_extract(args: KgExtractArgs) -> Result<()> {
         if !keep_loaded && release.remaining_holders == 0 {
             let endpoint = resolve_ollama_host_for_unload(host.as_deref());
             let outcome = tsift_local_model::unload_model_at(&endpoint, &resolved_model);
-            if !json {
-                println!(
-                    "Unloaded {} (last lease reference released): {}",
-                    resolved_model, outcome.outcome
-                );
-            }
+            unloaded = Some(format!(
+                "Unloaded {} (last lease reference released): {}",
+                resolved_model, outcome.outcome
+            ));
         }
     }
 
+    Ok(KgExtractOutcome {
+        provider_id,
+        model: extractor.model().to_string(),
+        host: extractor.host().to_string(),
+        source_ref,
+        chunks: report.chunks.len(),
+        entities: entity_count,
+        relations: relation_count,
+        upsert,
+        node_preview,
+        node_total,
+        unloaded,
+    })
+}
+
+pub(crate) fn cmd_kg_extract(args: KgExtractArgs) -> Result<()> {
+    let json = args.json;
+    let outcome = run_kg_extract(args)?;
+    emit_kg_extract_outcome(&outcome, json);
     Ok(())
+}
+
+fn emit_kg_extract_outcome(outcome: &KgExtractOutcome, json: bool) {
+    if json {
+        let payload = serde_json::json!({
+            "provider_id": outcome.provider_id,
+            "model": outcome.model,
+            "host": outcome.host,
+            "source_ref": outcome.source_ref,
+            "chunks": outcome.chunks,
+            "entities": outcome.entities,
+            "relations": outcome.relations,
+            "upsert": outcome.upsert,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
+        );
+        return;
+    }
+    println!("KG extraction");
+    println!("Model: {} ({})", outcome.model, outcome.host);
+    println!(
+        "Chunks: {}  Entities: {}  Relations: {}",
+        outcome.chunks, outcome.entities, outcome.relations
+    );
+    for (label, kind) in &outcome.node_preview {
+        println!("  - {} [{}]", label, kind);
+    }
+    if outcome.node_total > outcome.node_preview.len() {
+        println!(
+            "  ... ({} more)",
+            outcome.node_total - outcome.node_preview.len()
+        );
+    }
+    if let Some(ref upsert) = outcome.upsert {
+        println!("Upserted into: {}", upsert.graph_db);
+    }
+    if let Some(ref notice) = outcome.unloaded {
+        println!("{}", notice);
+    }
 }
 
 // =============================================================================
@@ -239,6 +328,18 @@ impl RefreshPlan {
             .filter(|e| matches!(e.status, RefreshStatus::Stale | RefreshStatus::NoRecordedHash))
             .collect()
     }
+
+    /// Entries that `refresh --apply` will actually re-extract: those that
+    /// need refresh AND whose `source_ref` is still a readable file (a current
+    /// content hash exists). Stale entries always qualify; a `NoRecordedHash`
+    /// entry qualifies only when the file is currently readable. Entries whose
+    /// file is missing are skipped (#kgrefreshapply).
+    pub fn apply_targets(&self) -> Vec<&RefreshEntry> {
+        self.needs_refresh()
+            .into_iter()
+            .filter(|e| e.current_hash.is_some())
+            .collect()
+    }
 }
 
 /// Pure staleness planner: classify each recorded `(source_ref, recorded_hash)`
@@ -279,7 +380,19 @@ fn file_content_hash(source_ref: &str) -> Option<String> {
         .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
 }
 
-pub(crate) fn cmd_kg_refresh(graph_db: Option<PathBuf>, json: bool) -> Result<()> {
+pub(crate) fn cmd_kg_refresh(args: KgRefreshArgs) -> Result<()> {
+    let KgRefreshArgs {
+        graph_db,
+        json,
+        apply,
+        profile,
+        model,
+        host,
+        no_lease,
+        idle_ttl_seconds,
+        keep_loaded,
+        lease_file,
+    } = args;
     let db_path = graph_db.unwrap_or_else(|| PathBuf::from(DEFAULT_GRAPH_DB_RELATIVE));
     if !db_path.exists() {
         if json {
@@ -288,6 +401,7 @@ pub(crate) fn cmd_kg_refresh(graph_db: Option<PathBuf>, json: bool) -> Result<()
                 serde_json::to_string_pretty(&serde_json::json!({
                     "graph_db": db_path.display().to_string(),
                     "exists": false,
+                    "apply": apply,
                     "entries": [],
                 }))?
             );
@@ -322,36 +436,140 @@ pub(crate) fn cmd_kg_refresh(graph_db: Option<PathBuf>, json: bool) -> Result<()
     let plan = plan_refresh(&recorded, file_content_hash);
     let needs = plan.needs_refresh();
 
+    // Read-only staleness plan (#kgextractrefresh) — the default when `--apply`
+    // is absent.
+    if !apply {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "graph_db": db_path.display().to_string(),
+                    "exists": true,
+                    "sources": plan.entries.len(),
+                    "needs_refresh": needs.len(),
+                    "entries": plan.entries,
+                }))?
+            );
+        } else {
+            println!("KG refresh plan ({})", db_path.display());
+            println!(
+                "Sources: {}  Needs refresh: {}",
+                plan.entries.len(),
+                needs.len()
+            );
+            for entry in &plan.entries {
+                println!("  - {} [{:?}]", entry.source_ref, entry.status);
+            }
+            if !needs.is_empty() {
+                println!("\nRe-extract stale/unknown sources with:");
+                println!(
+                    "  tsift kg refresh --apply --graph-db {}   (or per-source `tsift kg extract`)",
+                    db_path.display()
+                );
+                for entry in &needs {
+                    println!(
+                        "  tsift kg extract --input {0} --source-ref {0} --graph-db {1}",
+                        entry.source_ref,
+                        db_path.display()
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // #kgrefreshapply: auto re-extract every stale / no_recorded_hash source
+    // whose file is still readable, reusing the lease-aware `run_kg_extract`
+    // path. Per-source output is collected into a unified summary so JSON stays
+    // a single document and the human path stays readable.
+    let targets = plan.apply_targets();
+    let skipped: Vec<&RefreshEntry> = needs
+        .iter()
+        .copied()
+        .filter(|e| e.current_hash.is_none())
+        .collect();
+
+    if !json {
+        println!("KG refresh --apply ({})", db_path.display());
+        println!(
+            "Sources: {}  Needs refresh: {}  Re-extracting: {}  Skipping (no file): {}",
+            plan.entries.len(),
+            needs.len(),
+            targets.len(),
+            skipped.len()
+        );
+        for entry in &plan.entries {
+            println!("  - {} [{:?}]", entry.source_ref, entry.status);
+        }
+    }
+
+    let mut outcomes: Vec<KgExtractOutcome> = Vec::with_capacity(targets.len());
+    let mut errors: Vec<(String, String)> = Vec::new();
+    for entry in &targets {
+        if !json {
+            println!("\nRe-extracting {} ...", entry.source_ref);
+        }
+        let extract_args = KgExtractArgs {
+            profile: profile.clone(),
+            model: model.clone(),
+            host: host.clone(),
+            input: Some(PathBuf::from(&entry.source_ref)),
+            source_ref: Some(entry.source_ref.clone()),
+            graph_db: Some(db_path.clone()),
+            no_lease,
+            idle_ttl_seconds,
+            keep_loaded,
+            lease_file: lease_file.clone(),
+            json: false,
+        };
+        match run_kg_extract(extract_args) {
+            Ok(outcome) => {
+                if !json {
+                    emit_kg_extract_outcome(&outcome, false);
+                }
+                outcomes.push(outcome);
+            }
+            Err(err) => errors.push((entry.source_ref.clone(), format!("{err:#}"))),
+        }
+    }
+
     if json {
+        let errors_json: Vec<_> = errors
+            .iter()
+            .map(|(s, e)| serde_json::json!({ "source_ref": s, "error": e }))
+            .collect();
+        let skipped_json: Vec<_> = skipped
+            .iter()
+            .map(|e| serde_json::json!({ "source_ref": e.source_ref, "status": e.status }))
+            .collect();
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "graph_db": db_path.display().to_string(),
                 "exists": true,
+                "apply": true,
                 "sources": plan.entries.len(),
                 "needs_refresh": needs.len(),
+                "applied": outcomes.len(),
+                "failed": errors.len(),
                 "entries": plan.entries,
+                "results": outcomes,
+                "errors": errors_json,
+                "skipped": skipped_json,
             }))?
         );
     } else {
-        println!("KG refresh plan ({})", db_path.display());
         println!(
-            "Sources: {}  Needs refresh: {}",
-            plan.entries.len(),
-            needs.len()
+            "\nRefresh apply complete: {} re-extracted, {} failed, {} skipped",
+            outcomes.len(),
+            errors.len(),
+            skipped.len()
         );
-        for entry in &plan.entries {
-            println!("  - {} [{:?}]", entry.source_ref, entry.status);
+        for (src, err) in &errors {
+            println!("  FAILED {}: {}", src, err);
         }
-        if !needs.is_empty() {
-            println!("\nRe-extract stale/unknown sources with:");
-            for entry in &needs {
-                println!(
-                    "  tsift kg extract --input {0} --source-ref {0} --graph-db {1}",
-                    entry.source_ref,
-                    db_path.display()
-                );
-            }
+        for entry in &skipped {
+            println!("  SKIPPED {} (no readable file)", entry.source_ref);
         }
     }
     Ok(())
@@ -752,6 +970,39 @@ mod tests {
         let plan = plan_refresh(&[], |_| None);
         assert!(plan.entries.is_empty());
         assert!(plan.needs_refresh().is_empty());
+        assert!(plan.apply_targets().is_empty());
+    }
+
+    #[test]
+    fn apply_targets_filters_to_readable_needs_refresh_sources() {
+        // Stale (file present) + NoRecordedHash-with-file qualify for --apply;
+        // Missing and NoRecordedHash-without-file are skipped even though they
+        // "need refresh", because there is no readable file to re-extract.
+        let recorded = vec![
+            ("unchanged.md".to_string(), Some("h".to_string())),
+            ("stale.md".to_string(), Some("h-old".to_string())),
+            ("missing.md".to_string(), Some("h".to_string())),
+            ("nohash_present.md".to_string(), None),
+            ("nohash_gone.md".to_string(), None),
+        ];
+        let current = |s: &str| match s {
+            "unchanged.md" => Some("h".to_string()),
+            "stale.md" => Some("h-new".to_string()),
+            "missing.md" => None,
+            "nohash_present.md" => Some("h".to_string()),
+            "nohash_gone.md" => None,
+            _ => None,
+        };
+        let plan = plan_refresh(&recorded, current);
+        let targets: Vec<_> = plan
+            .apply_targets()
+            .into_iter()
+            .map(|e| e.source_ref.clone())
+            .collect();
+        assert_eq!(
+            targets,
+            vec!["stale.md".to_string(), "nohash_present.md".to_string()]
+        );
     }
 
     #[test]

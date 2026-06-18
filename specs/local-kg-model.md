@@ -211,6 +211,16 @@ signal it silently goes stale as sources change. The refresh trigger is
   check is read-only and model-free, so it is cheap to run on demand or from a
   hook; re-extraction reuses the lease-aware `kg extract` path (#kgleasewire)
   and stable fact ids reconcile rather than duplicate (Run Manifest contract).
+- `tsift kg refresh --apply` (#kgrefreshapply) performs that re-extraction
+  automatically for every stale / `no_recorded_hash` source whose file is still
+  readable, reusing the lease-aware `run_kg_extract` path (so concurrent
+  refresh-extracts still serialize on one GPU). Operator-gated because it loads
+  the local model (needs GPU + Ollama). Sources whose `source_ref` is no longer a
+  readable file are skipped (re-extraction would have nothing to read). The
+  per-source outcome is collected into a unified summary — a single JSON document
+  in `--json` mode and a readable per-source block in human mode — rather than
+  interleaving per-source stdout. The pure `RefreshPlan::apply_targets` selector
+  (needs-refresh AND file currently readable) has unit coverage.
 
 ## Evidence Surfacing in Session Digest
 
