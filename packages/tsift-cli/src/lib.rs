@@ -633,6 +633,33 @@ pub fn run() -> Result<()> {
                 graph_db,
                 json || terse || schema || envelope,
             ),
+            KgCommand::Status { graph_db, json } => {
+                commands::kg::cmd_kg_status(graph_db, json || terse || schema || envelope)
+            }
+            KgCommand::Unload {
+                profile,
+                model,
+                host,
+                json,
+            } => commands::kg::cmd_kg_unload(
+                profile,
+                model,
+                host,
+                json || terse || schema || envelope,
+            ),
+            KgCommand::Smoke {
+                profile,
+                model,
+                host,
+                unload,
+                json,
+            } => commands::kg::cmd_kg_smoke(
+                profile,
+                model,
+                host,
+                unload,
+                json || terse || schema || envelope,
+            ),
         },
         Some(Commands::Finding { command }) => match command {
             cli::FindingCommand::Add {

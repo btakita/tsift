@@ -1117,6 +1117,48 @@ pub enum KgCommand {
         #[arg(long, short)]
         json: bool,
     },
+    /// Report KG state in a `.tsift/graph.db` (spec local-kg-model.md line 31-32).
+    Status {
+        /// Graph db path (defaults to `<cwd>/.tsift/graph.db`).
+        #[arg(long)]
+        graph_db: Option<PathBuf>,
+        /// Emit machine-readable JSON instead of a human summary.
+        #[arg(long, short)]
+        json: bool,
+    },
+    /// Unload the active KG extractor model from the provider (#kgunloadpost).
+    Unload {
+        /// Profile id (e.g. `qwen3-32b-q4-ollama`).
+        #[arg(long)]
+        profile: Option<String>,
+        /// Explicit Ollama model tag; overrides the profile's `model_ref`.
+        #[arg(long)]
+        model: Option<String>,
+        /// Ollama host URL (defaults to `http://127.0.0.1:11434`, honors `OLLAMA_HOST`).
+        #[arg(long)]
+        host: Option<String>,
+        /// Emit machine-readable JSON instead of a human summary.
+        #[arg(long, short)]
+        json: bool,
+    },
+    /// Run a small end-to-end extraction against a live Ollama server (smoke test).
+    Smoke {
+        /// Profile id (e.g. `qwen3-32b-q4-ollama`).
+        #[arg(long)]
+        profile: Option<String>,
+        /// Explicit Ollama model tag; overrides the profile's `model_ref`.
+        #[arg(long)]
+        model: Option<String>,
+        /// Ollama host URL (defaults to `http://127.0.0.1:11434`, honors `OLLAMA_HOST`).
+        #[arg(long)]
+        host: Option<String>,
+        /// Unload the model after the smoke run (default: leave resident).
+        #[arg(long)]
+        unload: bool,
+        /// Emit machine-readable JSON instead of a human summary.
+        #[arg(long, short)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

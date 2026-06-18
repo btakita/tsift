@@ -4,20 +4,39 @@
 //! (by explicit `--model` tag or by `--profile`), runs it through the shared
 //! `tsift-kg` pipeline, and either prints a human summary or upserts the
 //! resulting `GraphProjection` into a `.tsift/graph.db`.
+//!
+//! `status` / `unload` / `smoke` complete the operational surface required by
+//! `specs/local-kg-model.md` line 31-32 (#kgcliext).
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use tsift_core::GraphStore;
 use tsift_kg::{
     ChunkingConfig, KgInputDocument, KgInputKind, OllamaKgExtractor, extract_documents_to_projection,
     upsert_kg_projection_sqlite,
 };
-use tsift_local_model::profile_by_id;
+use tsift_local_model::{ProviderUnloadAction, profile_by_id};
 
 /// Default extractor profile when neither `--model` nor `--profile` is given.
 /// Picked because it is the smallest GPU-resident extractor served by Ollama in
 /// the default profile set.
 const DEFAULT_PROFILE_ID: &str = "qwen3-32b-q4-ollama";
+
+/// Default `.tsift/graph.db` location for `tsift kg status` when `--graph-db`
+/// is not supplied. Resolves against the current working directory.
+const DEFAULT_GRAPH_DB_RELATIVE: &str = ".tsift/graph.db";
+
+/// Sample text used by `tsift kg smoke` to exercise the KG pipeline
+/// end-to-end against a live Ollama server.
+const SMOKE_SAMPLE_TEXT: &str = "\
+The tsift local-model crate owns GPU probing and the cooperative lease registry. \
+tsift-kg consumes the lease registry to serialize extractor runs on a single GPU. \
+OllamaKgExtractor posts to /api/chat with a structured-output JSON schema.";
+const SMOKE_SOURCE_REF: &str = "tsift-kg-smoke";
 
 pub(crate) fn cmd_kg_extract(
     profile: Option<String>,
@@ -128,4 +147,431 @@ fn list_profile_ids() -> Vec<String> {
         .into_iter()
         .map(|p| p.id.to_string())
         .collect()
+}
+
+// =============================================================================
+// status (#kgcliext — spec local-kg-model.md line 31-32)
+// =============================================================================
+
+#[derive(Debug, Serialize)]
+struct KgStatusReport {
+    graph_db: String,
+    exists: bool,
+    total_nodes: usize,
+    total_edges: usize,
+    nodes_by_kind: BTreeMap<String, usize>,
+    edges_by_kind: BTreeMap<String, usize>,
+}
+
+pub(crate) fn cmd_kg_status(graph_db: Option<PathBuf>, json: bool) -> Result<()> {
+    let db_path = graph_db
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_GRAPH_DB_RELATIVE));
+    let report = build_kg_status_report(&db_path)?;
+    emit_status(&report, json);
+    Ok(())
+}
+
+fn build_kg_status_report(db_path: &Path) -> Result<KgStatusReport> {
+    let db_display = db_path.display().to_string();
+    if !db_path.exists() {
+        return Ok(KgStatusReport {
+            graph_db: db_display,
+            exists: false,
+            total_nodes: 0,
+            total_edges: 0,
+            nodes_by_kind: BTreeMap::new(),
+            edges_by_kind: BTreeMap::new(),
+        });
+    }
+
+    let store = tsift_sqlite::SqliteGraphStore::open_read_only_resilient(db_path)
+        .with_context(|| format!("opening graph.db read-only at {}", db_path.display()))?;
+    let nodes = store
+        .all_nodes()
+        .with_context(|| "reading graph_nodes for kg status")?;
+    let edges = store
+        .all_edges()
+        .with_context(|| "reading graph_edges for kg status")?;
+
+    let mut nodes_by_kind = BTreeMap::new();
+    for node in &nodes {
+        *nodes_by_kind.entry(node.kind.clone()).or_insert(0) += 1;
+    }
+    let mut edges_by_kind = BTreeMap::new();
+    for edge in &edges {
+        *edges_by_kind.entry(edge.kind.clone()).or_insert(0) += 1;
+    }
+
+    Ok(KgStatusReport {
+        graph_db: db_display,
+        exists: true,
+        total_nodes: nodes.len(),
+        total_edges: edges.len(),
+        nodes_by_kind,
+        edges_by_kind,
+    })
+}
+
+fn emit_status(report: &KgStatusReport, json: bool) {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".into()));
+        return;
+    }
+    println!("KG status");
+    println!("Graph DB: {}", report.graph_db);
+    if !report.exists {
+        println!("  (no graph.db at this path — run `tsift kg extract --graph-db <path>` to populate)");
+        return;
+    }
+    println!(
+        "Nodes: {}   Edges: {}",
+        report.total_nodes, report.total_edges
+    );
+    if !report.nodes_by_kind.is_empty() {
+        println!("Nodes by kind (top 10):");
+        let mut node_kinds: Vec<_> = report.nodes_by_kind.iter().collect();
+        node_kinds.sort_by(|a, b| b.1.cmp(a.1));
+        for (kind, count) in node_kinds.into_iter().take(10) {
+            println!("  {kind}: {count}");
+        }
+    }
+    if !report.edges_by_kind.is_empty() {
+        println!("Edges by kind (top 10):");
+        let mut edge_kinds: Vec<_> = report.edges_by_kind.iter().collect();
+        edge_kinds.sort_by(|a, b| b.1.cmp(a.1));
+        for (kind, count) in edge_kinds.into_iter().take(10) {
+            println!("  {kind}: {count}");
+        }
+    }
+}
+
+// =============================================================================
+// unload (#kgunloadpost — build_unload_actions actually POSTs keep_alive:0)
+// =============================================================================
+
+#[derive(Debug, Serialize)]
+struct UnloadActionReport {
+    label: String,
+    executed: bool,
+    outcome: String,
+}
+
+#[derive(Debug, Serialize)]
+struct KgUnloadReport {
+    profile_id: String,
+    model_tag: String,
+    endpoint: String,
+    actions: Vec<UnloadActionReport>,
+}
+
+pub(crate) fn cmd_kg_unload(
+    profile: Option<String>,
+    model: Option<String>,
+    host: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let profile_id = profile.unwrap_or_else(|| DEFAULT_PROFILE_ID.to_string());
+    let profile_handle = profile_by_id(&profile_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown tsift local-model profile `{profile_id}`. Use --model <ollama-tag> or one of: {}",
+            list_profile_ids().join(", ")
+        )
+    })?;
+    let model_tag = model.unwrap_or_else(|| profile_handle.model_ref.to_string());
+    let endpoint = resolve_ollama_host_for_unload(host.as_deref());
+
+    // Build the canonical unload action plan, then actually execute it (#kgunloadpost).
+    let actions = tsift_local_model::build_unload_actions(
+        &profile_handle,
+        Some(endpoint.as_str()),
+        None,
+    );
+    let mut reports = Vec::with_capacity(actions.len());
+    for action in &actions {
+        reports.push(execute_unload_action(action, &model_tag, &endpoint));
+    }
+
+    let report = KgUnloadReport {
+        profile_id: profile_id.clone(),
+        model_tag: model_tag.clone(),
+        endpoint: endpoint.clone(),
+        actions: reports,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("KG unload");
+        println!("Profile: {} ({})", report.profile_id, report.model_tag);
+        println!("Endpoint: {}", report.endpoint);
+        for action in &report.actions {
+            println!(
+                "  - {}: {} ({})",
+                action.label,
+                if action.executed { "executed" } else { "skipped" },
+                action.outcome
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_ollama_host_for_unload(host_override: Option<&str>) -> String {
+    if let Some(host) = host_override
+        && !host.trim().is_empty()
+    {
+        return host.trim_end_matches('/').to_string();
+    }
+    tsift_local_model::resolve_provider_endpoint(
+        &tsift_local_model::UnloadStrategy::OllamaKeepAliveZero,
+        None,
+    )
+    .trim_end_matches('/')
+    .to_string()
+}
+
+fn execute_unload_action(
+    action: &ProviderUnloadAction,
+    model_tag: &str,
+    endpoint: &str,
+) -> UnloadActionReport {
+    // Prefer the provider-API path (POST keep_alive:0) — closes the gap noted
+    // in #lmlazy where build_unload_actions planned but did not POST. Command
+    // fallback is tried only if the HTTP path fails.
+    if action.kind == tsift_local_model::UnloadActionKind::ProviderApi {
+        let body = action
+            .body_json
+            .clone()
+            .map(|b| b.replace("{model}", model_tag))
+            .unwrap_or_else(|| format!(r#"{{"model":"{model_tag}","prompt":"","keep_alive":0}}"#));
+        let url = format!(
+            "{}/api/generate",
+            endpoint.trim_end_matches('/').trim_end_matches("/api/generate")
+        );
+        match post_unload(&url, &body) {
+            Ok(status_summary) => UnloadActionReport {
+                label: action.label.clone(),
+                executed: true,
+                outcome: format!("HTTP {status_summary}"),
+            },
+            Err(err) => {
+                // Try the command fallback if one is attached (ollama stop).
+                if let Some(cmd) = &action.command {
+                    let _ = std::process::Command::new(&cmd[0])
+                        .args(&cmd[1..])
+                        .status()
+                        .map_err(|e| {
+                            eprintln!("kg unload: fallback command failed: {e}");
+                        });
+                    return UnloadActionReport {
+                        label: action.label.clone(),
+                        executed: true,
+                        outcome: format!("POST failed ({err}); ran fallback `{:?}`", cmd),
+                    };
+                }
+                UnloadActionReport {
+                    label: action.label.clone(),
+                    executed: false,
+                    outcome: format!("POST failed ({err}); no fallback"),
+                }
+            }
+        }
+    } else {
+        // Non-API actions (e.g. process-exit fallback) are informational only here.
+        UnloadActionReport {
+            label: action.label.clone(),
+            executed: false,
+            outcome: "skipped: non-API action".to_string(),
+        }
+    }
+}
+
+fn post_unload(url: &str, body: &str) -> Result<String> {
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build()
+        .new_agent();
+    let payload = serde_json::from_str::<serde_json::Value>(body)
+        .unwrap_or(serde_json::Value::Null);
+    let mut response = agent
+        .post(url)
+        .send_json(payload)
+        .with_context(|| format!("posting unload to {url}"))?;
+    let status = response.status();
+    let text = response
+        .body_mut()
+        .read_to_string()
+        .with_context(|| format!("reading unload response (HTTP {status})"))?;
+    if !status.is_success() {
+        bail!(
+            "unload HTTP {status}: {}",
+            truncate_str(&text, 200)
+        );
+    }
+    Ok(format!("{status}"))
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max])
+    }
+}
+
+// =============================================================================
+// smoke (spec local-kg-model.md line 31-32)
+// =============================================================================
+
+#[derive(Debug, Serialize)]
+struct KgSmokeReport {
+    profile_id: Option<String>,
+    model_tag: String,
+    host: String,
+    chunks: usize,
+    entities: usize,
+    relations: usize,
+    unloaded: bool,
+}
+
+pub(crate) fn cmd_kg_smoke(
+    profile: Option<String>,
+    model: Option<String>,
+    host: Option<String>,
+    unload_after: bool,
+    json: bool,
+) -> Result<()> {
+    let resolved_model = resolve_model_tag(profile.as_deref(), model.as_deref())?;
+    let extractor = match host.as_deref() {
+        Some(host) => OllamaKgExtractor::new(&resolved_model).with_host(host),
+        None => OllamaKgExtractor::new(&resolved_model),
+    };
+    let document =
+        KgInputDocument::new(KgInputKind::Source, SMOKE_SOURCE_REF, SMOKE_SAMPLE_TEXT);
+    let report = extract_documents_to_projection(&[document], &extractor, ChunkingConfig::default())
+        .context("KG smoke extraction failed — is the Ollama server running and the model pulled?")?;
+    let entities = report.projection.nodes.len();
+    let relations = report.projection.edges.len();
+
+    let mut unloaded = false;
+    if unload_after {
+        let body = format!(
+            r#"{{"model":"{resolved_model}","prompt":"","keep_alive":0}}"#
+        );
+        let url = format!(
+            "{}/api/generate",
+            extractor.host().trim_end_matches('/').trim_end_matches("/api/generate")
+        );
+        match post_unload(&url, &body) {
+            Ok(_) => unloaded = true,
+            Err(err) => eprintln!("kg smoke: unload after run failed: {err}"),
+        }
+    }
+
+    let summary = KgSmokeReport {
+        profile_id: profile.clone(),
+        model_tag: extractor.model().to_string(),
+        host: extractor.host().to_string(),
+        chunks: report.chunks.len(),
+        entities,
+        relations,
+        unloaded,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!("KG smoke");
+        println!(
+            "Model: {} ({})",
+            summary.model_tag, summary.host
+        );
+        println!(
+            "Chunks: {}   Entities: {}   Relations: {}",
+            summary.chunks, summary.entities, summary.relations
+        );
+        if summary.unloaded {
+            println!("Unloaded: yes");
+        }
+        println!("OK");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use tsift_core::{GraphEdge, GraphNode, GraphProjection};
+    use tsift_sqlite::SqliteGraphStore;
+
+    #[test]
+    fn kg_status_reports_missing_db_cleanly() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("does-not-exist.db");
+        let report = build_kg_status_report(&missing).expect("missing db should not error");
+        assert!(!report.exists);
+        assert_eq!(report.total_nodes, 0);
+        assert_eq!(report.total_edges, 0);
+        assert!(report.nodes_by_kind.is_empty());
+        assert!(report.edges_by_kind.is_empty());
+        assert!(report.graph_db.contains("does-not-exist.db"));
+    }
+
+    #[test]
+    fn kg_status_counts_nodes_and_edges_by_kind() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("graph.db");
+        let mut store = SqliteGraphStore::open(&db_path).expect("open writable store");
+
+        let mut projection = GraphProjection::default();
+        projection.nodes.push(
+            GraphNode::new("n:kg-1", "kg_source", "tsift-kg")
+                .with_property("provider", "tsift-kg"),
+        );
+        projection.nodes.push(
+            GraphNode::new("n:kg-2", "kg_source", "OllamaKgExtractor")
+                .with_property("provider", "tsift-kg"),
+        );
+        projection.nodes.push(GraphNode::new("n:other", "concept", "lease"));
+        projection.edges.push(GraphEdge::new("n:kg-1", "n:kg-2", "calls"));
+        projection.edges.push(GraphEdge::new("n:kg-1", "n:other", "related_to"));
+        store
+            .upsert_projection(&projection)
+            .expect("upsert projection");
+
+        let report = build_kg_status_report(&db_path).expect("populated db status");
+        assert!(report.exists);
+        assert_eq!(report.total_nodes, 3);
+        assert_eq!(report.total_edges, 2);
+        assert_eq!(report.nodes_by_kind.get("kg_source"), Some(&2));
+        assert_eq!(report.nodes_by_kind.get("concept"), Some(&1));
+        assert_eq!(report.edges_by_kind.get("calls"), Some(&1));
+        assert_eq!(report.edges_by_kind.get("related_to"), Some(&1));
+    }
+
+    #[test]
+    fn resolve_ollama_host_for_unload_uses_explicit_override() {
+        let host = resolve_ollama_host_for_unload(Some("http://192.168.1.17:11434"));
+        assert_eq!(host, "http://192.168.1.17:11434");
+    }
+
+    #[test]
+    fn resolve_ollama_host_for_unload_falls_back_when_blank() {
+        let host = resolve_ollama_host_for_unload(Some("   "));
+        // Resolves to the default ollama endpoint exposed by tsift-local-model.
+        assert!(!host.is_empty());
+        assert!(host.starts_with("http"));
+    }
+
+    #[test]
+    fn truncate_str_shortens_long_payloads() {
+        let s = "x".repeat(300);
+        let truncated = truncate_str(&s, 10);
+        // 10 ascii chars + the ellipsis (1 char, 3 bytes in UTF-8).
+        assert_eq!(truncated.chars().count(), 11);
+        assert!(truncated.ends_with('…'));
+        assert_eq!(truncate_str("short", 10), "short");
+    }
 }
