@@ -154,6 +154,39 @@ The local model layer must prove cleanup for large model profiles:
 - fail the run if post-unload used VRAM remains materially above the pre-load
   baseline without a known non-tsift process accounting for the difference.
 
+## Multi-Session Reference-Counted Lease Lifetime
+
+A KG extractor model loaded into VRAM is a shared resource that may be
+referenced by several concurrent sessions. The cooperative GPU lease registry
+(`gpu-lease.json`, resolved via `resolve_lease_file`) is the reference count: a
+profile stays "loaded" while at least one live holder references it, and is a
+candidate for unload once the last reference is gone. The deterministic `tsift`
+binary is the single arbiter — sessions never mutate the registry directly.
+
+- **Robust read-modify-write.** Every acquire / release / renew / reap holds an
+  OS advisory file lock on the registry's sidecar (`<registry>.lock`, via
+  `registry_lock_path`) for the whole read → apply → write cycle. The atomic
+  temp-file + rename write keeps each write atomic; the advisory lock prevents
+  concurrent processes from interleaving and losing an update (TOCTOU). The
+  kernel releases the lock if a holder dies mid-cycle, so a crash cannot wedge
+  the registry.
+- **Crash reclamation (primary).** Holders record `holder_pid`; a holder whose
+  pid is no longer alive (`kill -0`) is reclaimed. This is the primary liveness
+  signal — a crashed session that never released its lease is unclaimed on the
+  next acquire/reap with no false positives.
+- **Heartbeat / timeout (backstop).** `acquired_at_unix_seconds` doubles as the
+  last-heartbeat timestamp. A live session slides it forward with `renew`
+  (`tsift lease renew`); a holder whose `idle_ttl_seconds > 0` and whose age
+  since its last heartbeat exceeds the TTL is reclaimed as stale even if a pid
+  check is unavailable or ambiguous.
+- **Reference-counted unload.** `release` reports `remaining_holders`; when it
+  reaches zero the model is no longer referenced. `reap` reports
+  `emptied_profiles` — profiles whose last live holder was just reclaimed.
+  `tsift lease release --unload-on-last-release` and `tsift lease reap
+  --unload-empty` POST the provider-native `keep_alive:0` unload only for
+  profiles that dropped to zero references, so VRAM is freed exactly when no
+  session still references the model.
+
 ## Evidence Surfacing in Session Digest
 
 The `tsift-agent-doc` graph-evidence read seam must be wired into an active

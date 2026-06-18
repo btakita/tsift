@@ -1675,10 +1675,30 @@ fn cmd_local_model(command: LocalModelCommand, output: OutputFormat) -> Result<(
     }
 }
 
+/// Resolve a profile's Ollama model tag and POST a `keep_alive:0` unload.
+///
+/// Used by the reference-counted lease paths (`release --unload-on-last-release`,
+/// `reap --unload-empty`) once a profile's live holder count reaches zero. An
+/// unknown profile or unreachable provider degrades to a non-fatal
+/// `UnloadActionResult` so reaping never fails on unload.
+fn unload_profile_model(
+    profile_id: &str,
+    host: Option<&str>,
+) -> tsift_local_model::UnloadActionResult {
+    let endpoint = tsift_local_model::resolve_provider_endpoint(
+        &tsift_local_model::UnloadStrategy::OllamaKeepAliveZero,
+        host,
+    );
+    match tsift_local_model::profile_by_id(profile_id) {
+        Some(profile) => tsift_local_model::unload_model_at(&endpoint, profile.model_ref),
+        None => tsift_local_model::unload_model_at(&endpoint, profile_id),
+    }
+}
+
 fn cmd_local_model_lease(command: LeaseCommand, output: OutputFormat) -> Result<()> {
     use tsift_local_model::{
         acquire_lease, current_unix_seconds, format_lease_show_human, lease_mode_for_profile,
-        profile_by_id, release_lease, resolve_lease_file, show_registry,
+        profile_by_id, reap_leases, release_lease, renew_lease, resolve_lease_file, show_registry,
     };
     let now = current_unix_seconds();
     match command {
@@ -1770,16 +1790,32 @@ fn cmd_local_model_lease(command: LeaseCommand, output: OutputFormat) -> Result<
             profile,
             holder_pid,
             lease_file,
+            unload_on_last_release,
+            host,
             ..
         } => {
             let pid = holder_pid.unwrap_or_else(std::process::id);
             let path = resolve_lease_file(lease_file.as_deref());
             let release = release_lease(&profile, pid, now, &path)?;
+            // Reference-counted unload: when this release drops the live holder
+            // count to zero, the model is no longer referenced by any session.
+            let unloaded = if unload_on_last_release
+                && release.outcome == tsift_local_model::GpuLeaseReleaseOutcome::Released
+                && release.remaining_holders == 0
+            {
+                Some(unload_profile_model(&profile, host.as_deref()))
+            } else {
+                None
+            };
             if output.json_output {
+                let payload = serde_json::json!({
+                    "release": release,
+                    "unloaded": unloaded,
+                });
                 if output.pretty {
-                    println!("{}", serde_json::to_string_pretty(&release)?);
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
                 } else {
-                    println!("{}", serde_json::to_string(&release)?);
+                    println!("{}", serde_json::to_string(&payload)?);
                 }
             } else {
                 println!(
@@ -1794,6 +1830,85 @@ fn cmd_local_model_lease(command: LeaseCommand, output: OutputFormat) -> Result<
                     release.outcome,
                     release.remaining_holders
                 );
+                if let Some(result) = &unloaded {
+                    println!("unloaded {} (last reference released): {}", profile, result.outcome);
+                }
+                println!("registry: {}", path.display());
+            }
+            Ok(())
+        }
+        LeaseCommand::Renew {
+            profile,
+            holder_pid,
+            lease_file,
+            ..
+        } => {
+            let pid = holder_pid.unwrap_or_else(std::process::id);
+            let path = resolve_lease_file(lease_file.as_deref());
+            let renew = renew_lease(&profile, pid, now, &path)?;
+            if output.json_output {
+                if output.pretty {
+                    println!("{}", serde_json::to_string_pretty(&renew)?);
+                } else {
+                    println!("{}", serde_json::to_string(&renew)?);
+                }
+            } else {
+                println!(
+                    "renew {} (pid={}): {:?}",
+                    renew.profile_id, renew.holder_pid, renew.outcome
+                );
+                println!("registry: {}", path.display());
+            }
+            Ok(())
+        }
+        LeaseCommand::Reap {
+            lease_file,
+            unload_empty,
+            host,
+            ..
+        } => {
+            let path = resolve_lease_file(lease_file.as_deref());
+            let reap = reap_leases(now, &path)?;
+            // Reference-counted unload for every profile whose last reference
+            // was reclaimed (a crashed session left a dead-pid holder).
+            let unloaded: Vec<_> = if unload_empty {
+                reap.emptied_profiles
+                    .iter()
+                    .filter_map(|profile_id| {
+                        profile_by_id(profile_id).map(|profile| {
+                            serde_json::json!({
+                                "profile": profile_id,
+                                "outcome": unload_profile_model(profile_id, host.as_deref()).outcome,
+                                "model": profile.model_ref,
+                            })
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if output.json_output {
+                let payload = serde_json::json!({
+                    "reap": reap,
+                    "unloaded": unloaded,
+                });
+                if output.pretty {
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
+                } else {
+                    println!("{}", serde_json::to_string(&payload)?);
+                }
+            } else {
+                println!(
+                    "reaped {} stale holder(s); {} profile(s) dropped to zero references",
+                    reap.reclaimed.len(),
+                    reap.emptied_profiles.len()
+                );
+                for profile_id in &reap.emptied_profiles {
+                    println!("  emptied: {profile_id}");
+                }
+                if !unloaded.is_empty() {
+                    println!("unloaded {} unreferenced model(s)", unloaded.len());
+                }
                 println!("registry: {}", path.display());
             }
             Ok(())

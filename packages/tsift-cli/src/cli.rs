@@ -1342,6 +1342,48 @@ pub enum LeaseCommand {
         /// Override the lease registry file path
         #[arg(long)]
         lease_file: Option<PathBuf>,
+        /// Unload the profile's model (Ollama keep_alive:0) when this release
+        /// drops the live holder count to zero — reference-counted unload.
+        #[arg(long)]
+        unload_on_last_release: bool,
+        /// Provider host/endpoint for the unload POST (defaults to the resolved
+        /// Ollama endpoint)
+        #[arg(long)]
+        host: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Heartbeat: slide a held lease's TTL window forward so a long-lived
+    /// session is not reclaimed as stale
+    Renew {
+        /// Model profile id to renew
+        #[arg(long)]
+        profile: String,
+        /// Holder pid (defaults to the current process pid)
+        #[arg(long)]
+        holder_pid: Option<u32>,
+        /// Override the lease registry file path
+        #[arg(long)]
+        lease_file: Option<PathBuf>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reap stale leases (dead pids or expired TTL) and report which profiles
+    /// dropped to zero references
+    Reap {
+        /// Override the lease registry file path
+        #[arg(long)]
+        lease_file: Option<PathBuf>,
+        /// Unload the model (Ollama keep_alive:0) for each profile whose last
+        /// reference was reclaimed this reap
+        #[arg(long)]
+        unload_empty: bool,
+        /// Provider host/endpoint for the unload POST (defaults to the resolved
+        /// Ollama endpoint)
+        #[arg(long)]
+        host: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -1375,9 +1417,11 @@ impl LocalModelCommand {
 impl LeaseCommand {
     pub fn json_output(&self) -> bool {
         match self {
-            Self::Acquire { json, .. } | Self::Release { json, .. } | Self::Show { json, .. } => {
-                *json
-            }
+            Self::Acquire { json, .. }
+            | Self::Release { json, .. }
+            | Self::Renew { json, .. }
+            | Self::Reap { json, .. }
+            | Self::Show { json, .. } => *json,
         }
     }
 }

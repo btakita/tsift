@@ -1277,6 +1277,10 @@ pub struct GpuLeaseRecord {
     pub profile_id: String,
     pub holder_pid: u32,
     pub holder_command: String,
+    /// Acquire time, which also serves as the last-heartbeat timestamp: a
+    /// re-acquire by the same pid or an explicit `renew` slides it forward, so
+    /// `idle_ttl_seconds`-based staleness is measured against the most recent
+    /// heartbeat rather than the original acquire.
     pub acquired_at_unix_seconds: u64,
     pub lease_mode: LeaseMode,
     pub vram_baseline_mib: u64,
@@ -1396,6 +1400,52 @@ pub fn is_pid_alive(pid: u32) -> bool {
         Ok(output) => output.status.success(),
         Err(_) => false,
     }
+}
+
+/// Sidecar advisory-lock path for a registry file (`<registry>.lock`).
+///
+/// A dedicated lock file (rather than locking the registry itself) keeps the
+/// lock independent of the atomic temp-file + rename write, which replaces the
+/// registry inode on every write.
+pub fn registry_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Run `op` while holding an exclusive advisory lock on the registry's sidecar
+/// lock file.
+///
+/// The cooperative registry is mutated with a read → apply → write cycle. The
+/// atomic temp-file + rename in [`write_lease_registry`] makes each *write*
+/// atomic, but two processes can still interleave read/apply/write and lose an
+/// update (TOCTOU). Holding an OS advisory lock across the whole cycle
+/// serializes concurrent acquire/release/renew/reap across processes, and the
+/// kernel releases the lock automatically if the holder dies mid-cycle — so a
+/// crashed holder can never wedge the registry.
+fn with_registry_lock<T>(path: &Path, op: impl FnOnce() -> Result<T>) -> Result<T> {
+    use fs4::fs_std::FileExt;
+    let lock_path = registry_lock_path(path);
+    if let Some(parent) = lock_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).context("create lease registry lock parent")?;
+    }
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open lease registry lock {}", lock_path.display()))?;
+    lock_file
+        .lock_exclusive()
+        .context("acquire exclusive lease registry lock")?;
+    let result = op();
+    // Best-effort unlock; the lock is also released when `lock_file` drops or
+    // the process exits.
+    let _ = FileExt::unlock(&lock_file);
+    result
 }
 
 /// Read the lease registry, returning an empty default when the file is missing.
@@ -1624,22 +1674,24 @@ pub fn acquire_lease(
 ) -> Result<GpuLeaseAcquisition> {
     let profile = profile_by_id(profile_id)
         .with_context(|| format!("unknown local model profile {profile_id:?}"))?;
-    let mut registry = read_lease_registry(path)?;
-    let acquisition = apply_acquire(
-        &mut registry,
-        &profile,
-        holder_pid,
-        holder_command,
-        vram_baseline_mib,
-        idle_ttl_seconds,
-        now,
-        is_pid_alive,
-    );
-    // CpuOrHash bypass intentionally does not touch the registry file.
-    if acquisition.status != GpuLeaseAcquisitionStatus::CpuOrHashBypass {
-        write_lease_registry(path, &registry)?;
-    }
-    Ok(acquisition)
+    with_registry_lock(path, || {
+        let mut registry = read_lease_registry(path)?;
+        let acquisition = apply_acquire(
+            &mut registry,
+            &profile,
+            holder_pid,
+            holder_command,
+            vram_baseline_mib,
+            idle_ttl_seconds,
+            now,
+            is_pid_alive,
+        );
+        // CpuOrHash bypass intentionally does not touch the registry file.
+        if acquisition.status != GpuLeaseAcquisitionStatus::CpuOrHashBypass {
+            write_lease_registry(path, &registry)?;
+        }
+        Ok(acquisition)
+    })
 }
 
 /// High-level release: read file, prune, drop this holder, write file.
@@ -1649,10 +1701,12 @@ pub fn release_lease(
     now: u64,
     path: &Path,
 ) -> Result<GpuLeaseRelease> {
-    let mut registry = read_lease_registry(path)?;
-    let release = apply_release(&mut registry, profile_id, holder_pid, now, is_pid_alive);
-    write_lease_registry(path, &registry)?;
-    Ok(release)
+    with_registry_lock(path, || {
+        let mut registry = read_lease_registry(path)?;
+        let release = apply_release(&mut registry, profile_id, holder_pid, now, is_pid_alive);
+        write_lease_registry(path, &registry)?;
+        Ok(release)
+    })
 }
 
 /// Read the registry and return the pruned view. `include_stale` skips the
@@ -1663,6 +1717,116 @@ pub fn show_registry(path: &Path, now: u64, include_stale: bool) -> Result<GpuLe
         prune_stale_leases(&mut registry, now, is_pid_alive);
     }
     Ok(registry)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum GpuLeaseRenewOutcome {
+    /// The holder's heartbeat timestamp was slid forward to `now`.
+    Renewed,
+    /// Profile exists but this pid was not among its holders.
+    NotHeld,
+    /// No entry for the profile at all.
+    ProfileAbsent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GpuLeaseRenew {
+    pub profile_id: String,
+    pub holder_pid: u32,
+    pub outcome: GpuLeaseRenewOutcome,
+    /// New heartbeat timestamp written for the holder (when renewed).
+    pub renewed_at_unix_seconds: Option<u64>,
+}
+
+/// Apply a heartbeat renewal in place: slide a live holder's heartbeat
+/// (`acquired_at_unix_seconds`) forward to `now` so its TTL window restarts.
+pub fn apply_renew(
+    registry: &mut GpuLeaseRegistry,
+    profile_id: &str,
+    holder_pid: u32,
+    now: u64,
+    is_alive: impl Fn(u32) -> bool,
+) -> GpuLeaseRenew {
+    let _ = prune_stale_leases(registry, now, &is_alive);
+    let Some(holders) = registry.leases.get_mut(profile_id) else {
+        return GpuLeaseRenew {
+            profile_id: profile_id.to_string(),
+            holder_pid,
+            outcome: GpuLeaseRenewOutcome::ProfileAbsent,
+            renewed_at_unix_seconds: None,
+        };
+    };
+    if let Some(record) = holders
+        .iter_mut()
+        .find(|record| record.holder_pid == holder_pid)
+    {
+        record.acquired_at_unix_seconds = now;
+        GpuLeaseRenew {
+            profile_id: profile_id.to_string(),
+            holder_pid,
+            outcome: GpuLeaseRenewOutcome::Renewed,
+            renewed_at_unix_seconds: Some(now),
+        }
+    } else {
+        GpuLeaseRenew {
+            profile_id: profile_id.to_string(),
+            holder_pid,
+            outcome: GpuLeaseRenewOutcome::NotHeld,
+            renewed_at_unix_seconds: None,
+        }
+    }
+}
+
+/// High-level heartbeat: read file, slide this holder's heartbeat, write file.
+///
+/// A long-lived session calls this periodically so its lease is held against
+/// `idle_ttl_seconds`-based reclamation without re-running probes.
+pub fn renew_lease(
+    profile_id: &str,
+    holder_pid: u32,
+    now: u64,
+    path: &Path,
+) -> Result<GpuLeaseRenew> {
+    with_registry_lock(path, || {
+        let mut registry = read_lease_registry(path)?;
+        let renew = apply_renew(&mut registry, profile_id, holder_pid, now, is_pid_alive);
+        write_lease_registry(path, &registry)?;
+        Ok(renew)
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GpuLeaseReap {
+    /// Stale records pruned this reap (pid dead or TTL expired).
+    pub reclaimed: Vec<GpuLeaseRecord>,
+    /// Profile ids whose last live holder was reclaimed this reap — the
+    /// reference count dropped to zero, so the model can be unloaded.
+    pub emptied_profiles: Vec<String>,
+}
+
+/// Sweep stale holders (crashed pids or expired TTL) out of the registry and
+/// report which profiles dropped to zero live holders.
+///
+/// This is the crash-reclamation entrypoint: a session that died without
+/// releasing leaves a pid-dead holder that `reap` clears, and when that was the
+/// last reference for a profile the profile appears in `emptied_profiles` so
+/// the caller can unload the now-unreferenced model.
+pub fn reap_leases(now: u64, path: &Path) -> Result<GpuLeaseReap> {
+    with_registry_lock(path, || {
+        let mut registry = read_lease_registry(path)?;
+        let before: std::collections::BTreeSet<String> =
+            registry.leases.keys().cloned().collect();
+        let reclaimed = prune_stale_leases(&mut registry, now, is_pid_alive);
+        let emptied_profiles: Vec<String> = before
+            .into_iter()
+            .filter(|profile_id| !registry.leases.contains_key(profile_id))
+            .collect();
+        write_lease_registry(path, &registry)?;
+        Ok(GpuLeaseReap {
+            reclaimed,
+            emptied_profiles,
+        })
+    })
 }
 
 /// Human-readable summary of the lease registry.
@@ -2491,6 +2655,103 @@ mod tests {
     }
 
     #[test]
+    fn registry_lock_path_appends_lock_suffix() {
+        assert_eq!(
+            registry_lock_path(Path::new("/tmp/x/gpu-lease.json")),
+            PathBuf::from("/tmp/x/gpu-lease.json.lock")
+        );
+    }
+
+    #[test]
+    fn acquire_lease_creates_sidecar_lock_file() {
+        let dir = tempfile_dir();
+        let path = dir.join("gpu-lease.json");
+        // acquire_lease runs under with_registry_lock, which opens/creates the
+        // sidecar lock used to serialize the read-modify-write across processes.
+        acquire_lease("qwen3-32b-q4", std::process::id(), "tsift", 0, 0, 1_000, &path).unwrap();
+        assert!(
+            registry_lock_path(&path).exists(),
+            "sidecar lock file should exist after a locked acquire"
+        );
+    }
+
+    #[test]
+    fn apply_renew_slides_heartbeat_so_ttl_holder_survives() {
+        let mut registry = GpuLeaseRegistry::default();
+        let profile = profile_by_id("qwen3-32b-q4").unwrap();
+        // Acquire with a 100s idle TTL at t=1_000.
+        apply_acquire(&mut registry, &profile, 100, "tsift", 200, 100, 1_000, all_alive);
+        // Heartbeat at t=1_050 (still within the TTL window) slides the anchor.
+        let renew = apply_renew(&mut registry, "qwen3-32b-q4", 100, 1_050, all_alive);
+        assert_eq!(renew.outcome, GpuLeaseRenewOutcome::Renewed);
+        assert_eq!(renew.renewed_at_unix_seconds, Some(1_050));
+        assert_eq!(
+            registry.leases["qwen3-32b-q4"][0].acquired_at_unix_seconds,
+            1_050
+        );
+        // At t=1_120 the age since the heartbeat (1_050) is 70s < 100s TTL, so
+        // it survives — whereas without the renewal (anchor 1_000) it would have
+        // expired at 1_100.
+        let pruned = prune_stale_leases(&mut registry, 1_120, all_alive);
+        assert!(pruned.is_empty());
+        assert!(registry.leases.contains_key("qwen3-32b-q4"));
+    }
+
+    #[test]
+    fn apply_renew_reports_profile_absent_for_unheld_profile() {
+        let mut registry = GpuLeaseRegistry::default();
+        let renew = apply_renew(&mut registry, "qwen3-32b-q4", 100, 1_000, all_alive);
+        assert_eq!(renew.outcome, GpuLeaseRenewOutcome::ProfileAbsent);
+        assert!(renew.renewed_at_unix_seconds.is_none());
+    }
+
+    #[test]
+    fn reap_leases_reclaims_dead_pid_and_reports_emptied_profile() {
+        let dir = tempfile_dir();
+        let path = dir.join("gpu-lease.json");
+        let mut registry = GpuLeaseRegistry::default();
+        registry.leases.insert(
+            "qwen3-32b-q4".to_string(),
+            vec![GpuLeaseRecord {
+                profile_id: "qwen3-32b-q4".to_string(),
+                // A pid far above any live process — `kill -0` reports it dead,
+                // simulating a session that crashed without releasing.
+                holder_pid: 4_000_000_000,
+                holder_command: "crashed-session".to_string(),
+                acquired_at_unix_seconds: 1_000,
+                lease_mode: LeaseMode::Exclusive,
+                vram_baseline_mib: 200,
+                idle_ttl_seconds: 0,
+                notes: Vec::new(),
+            }],
+        );
+        write_lease_registry(&path, &registry).unwrap();
+
+        let reap = reap_leases(2_000, &path).unwrap();
+        assert_eq!(reap.reclaimed.len(), 1);
+        assert_eq!(reap.emptied_profiles, vec!["qwen3-32b-q4".to_string()]);
+        let after = read_lease_registry(&path).unwrap();
+        assert!(after.leases.is_empty());
+    }
+
+    #[test]
+    fn renew_lease_round_trips_through_file() {
+        let dir = tempfile_dir();
+        let path = dir.join("gpu-lease.json");
+        let pid = std::process::id();
+        // ttl=0 → no TTL staleness; the live pid keeps the lease, so the renew
+        // exercises the file round-trip + timestamp slide without TTL timing.
+        acquire_lease("qwen3-32b-q4", pid, "tsift", 0, 0, 1_000, &path).unwrap();
+        let renew = renew_lease("qwen3-32b-q4", pid, 5_000, &path).unwrap();
+        assert_eq!(renew.outcome, GpuLeaseRenewOutcome::Renewed);
+        let registry = read_lease_registry(&path).unwrap();
+        assert_eq!(
+            registry.leases["qwen3-32b-q4"][0].acquired_at_unix_seconds,
+            5_000
+        );
+    }
+
+    #[test]
     fn prune_stale_leaves_healthy_entries_alone() {
         let mut registry = GpuLeaseRegistry::default();
         registry.leases.insert(
@@ -2511,11 +2772,25 @@ mod tests {
         assert!(registry.leases.contains_key("qwen3-32b-q4"));
     }
 
+    /// Serialize tests that mutate the shared process endpoint env vars so they
+    /// do not race under parallel `cargo test`.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn tempfile_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        // Per-test uniqueness: `current_unix_seconds()` collides when tests run
+        // within the same second in parallel, so include a monotonic counter.
         let dir = std::env::temp_dir().join(format!(
-            "tsift-lease-test-{}-{}",
+            "tsift-lease-test-{}-{}-{}",
             std::process::id(),
-            current_unix_seconds()
+            current_unix_seconds(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -2660,9 +2935,10 @@ mod tests {
 
     #[test]
     fn resolve_endpoint_uses_compile_time_default_when_no_env_no_explicit() {
-        // SAFETY: tests run single-threaded inside this function; the env is
-        // not consulted by other code paths while we hold this scope and the
-        // vars are cleared before returning.
+        // Serialize against sibling env-mutating tests (parallel `cargo test`).
+        let _env = env_lock();
+        // SAFETY: env-mutating tests are serialized via `env_lock`; the vars are
+        // cleared before returning.
         unsafe {
             std::env::remove_var(LLAMA_CPP_ENDPOINT_ENV_VAR);
             std::env::remove_var(OLLAMA_ENDPOINT_ENV_VAR);
@@ -2689,6 +2965,7 @@ mod tests {
 
     #[test]
     fn resolve_endpoint_env_var_overrides_default_for_llama_cpp() {
+        let _env = env_lock();
         // SAFETY: see note in the previous test.
         unsafe {
             std::env::set_var(
@@ -2705,6 +2982,7 @@ mod tests {
 
     #[test]
     fn resolve_endpoint_blank_env_var_falls_back_to_default() {
+        let _env = env_lock();
         // SAFETY: see note above.
         unsafe {
             std::env::set_var(LLAMA_CPP_ENDPOINT_ENV_VAR, "   ");
@@ -2718,6 +2996,7 @@ mod tests {
 
     #[test]
     fn build_unload_actions_picks_up_env_var_for_llama_cpp_endpoint() {
+        let _env = env_lock();
         let profile = profile_by_id("qwen3-32b-q4").unwrap();
         // SAFETY: see note above.
         unsafe {

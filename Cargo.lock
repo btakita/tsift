@@ -5390,6 +5390,7 @@ name = "tsift-local-model"
 version = "0.1.70"
 dependencies = [
  "anyhow",
+ "fs4",
  "serde",
  "serde_json",
  "ureq",
