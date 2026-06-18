@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -567,6 +567,217 @@ pub fn build_unload_actions(
             body_json: None,
             required: false,
         }],
+    }
+}
+
+/// Outcome of dispatching a single `ProviderUnloadAction`. The planner owns
+/// execution (#kgunloadpost) so any caller — `tsift kg unload`, a future
+/// lease-drop hook, or the lifecycle swap path — gets the same POST behavior
+/// without re-implementing the HTTP fallback chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnloadActionResult {
+    pub label: String,
+    pub executed: bool,
+    pub outcome: String,
+}
+
+/// Pure projection of a `ProviderUnloadAction` into the request that will be
+/// sent. Separated from `execute_unload_request` so the model-tag override
+/// and body-rewrite logic is fully testable without a live HTTP server.
+///
+/// Returns `None` for non-API actions (noop, process-exit, sleep-only) — those
+/// don't carry an HTTP request and are reported as skipped by the dispatcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedUnloadRequest {
+    pub label: String,
+    pub url: String,
+    pub body: String,
+    pub fallback_command: Option<Vec<String>>,
+}
+
+/// Rewrite the model field of an unload action body to honor an explicit
+/// `--model` override. `build_unload_actions` formats the body with the
+/// profile's `model_ref`, so without this rewrite the override would be
+/// silently ignored. Falls back to the original body if JSON parsing fails
+/// (defensive — the planner's body templates are always valid JSON).
+pub fn rewrite_unload_body_model(body_json: &str, resolved_model_tag: &str) -> String {
+    // Skip re-serialization entirely when there is nothing to rewrite so we
+    // preserve byte-for-byte input on the no-op path (avoids serde_json's
+    // alphabetical key reorder and keeps the empty-override case a true passthrough).
+    if resolved_model_tag.is_empty() {
+        return body_json.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(body_json) {
+        Ok(mut value) => {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(resolved_model_tag.to_string()),
+                );
+            }
+            serde_json::to_string(&value).unwrap_or_else(|_| body_json.to_string())
+        }
+        Err(_) => body_json.to_string(),
+    }
+}
+
+/// Project a planned action into a concrete HTTP request, rewriting the body
+/// with the resolved model tag. Returns `None` for non-API actions.
+pub fn prepare_unload_request(
+    action: &ProviderUnloadAction,
+    resolved_model_tag: &str,
+) -> Option<PreparedUnloadRequest> {
+    if action.kind != UnloadActionKind::ProviderApi {
+        return None;
+    }
+    let endpoint = action.endpoint.clone().unwrap_or_default();
+    let url = normalize_unload_url(&endpoint);
+    let body = match action.body_json.as_deref() {
+        Some(template) => rewrite_unload_body_model(template, resolved_model_tag),
+        None => format!(
+            r#"{{"model":"{resolved_model_tag}","prompt":"","keep_alive":0}}"#
+        ),
+    };
+    Some(PreparedUnloadRequest {
+        label: action.label.clone(),
+        url,
+        body,
+        fallback_command: action.command.clone(),
+    })
+}
+
+/// Normalize an unload endpoint into the canonical `/api/generate` path used
+/// by Ollama's `keep_alive:0` contract. Tolerates callers that supply the
+/// base host (`http://host:11434`) or the full generate URL.
+pub fn normalize_unload_url(endpoint: &str) -> String {
+    let trimmed = endpoint.trim_end_matches('/');
+    if trimmed.ends_with("/api/generate") {
+        return trimmed.to_string();
+    }
+    format!("{}/api/generate", trimmed)
+}
+
+/// Dispatch a single prepared request: POST the body, fall back to the
+/// subprocess command if the HTTP path fails. Impure — exercised end-to-end
+/// via the `tsift kg unload` smoke; unit tests cover `prepare_unload_request`
+/// and `rewrite_unload_body_model` instead.
+pub fn execute_unload_request(req: &PreparedUnloadRequest) -> UnloadActionResult {
+    match post_unload_http(&req.url, &req.body) {
+        Ok(status) => UnloadActionResult {
+            label: req.label.clone(),
+            executed: true,
+            outcome: format!("HTTP {status}"),
+        },
+        Err(err) => {
+            if let Some(cmd) = &req.fallback_command {
+                let _ = std::process::Command::new(&cmd[0])
+                    .args(&cmd[1..])
+                    .status()
+                    .map_err(|e| {
+                        eprintln!("tsift-local-model: unload fallback command failed: {e}");
+                    });
+                return UnloadActionResult {
+                    label: req.label.clone(),
+                    executed: true,
+                    outcome: format!("POST failed ({err}); ran fallback `{:?}`", cmd),
+                };
+            }
+            UnloadActionResult {
+                label: req.label.clone(),
+                executed: false,
+                outcome: format!("POST failed ({err}); no fallback"),
+            }
+        }
+    }
+}
+
+/// Fire-and-forget unload for callers that don't have a full action plan —
+/// used by `tsift kg smoke --unload` and any future lease-drop hook that just
+/// needs to push a single model out of VRAM. Builds a minimal Ollama
+/// `keep_alive:0` request and dispatches it.
+pub fn unload_model_at(host: &str, model_tag: &str) -> UnloadActionResult {
+    let req = PreparedUnloadRequest {
+        label: format!("ollama keep_alive zero for {model_tag}"),
+        url: normalize_unload_url(host),
+        body: format!(r#"{{"model":"{model_tag}","prompt":"","keep_alive":0}}"#),
+        fallback_command: Some(vec![
+            "ollama".to_string(),
+            "stop".to_string(),
+            model_tag.to_string(),
+        ]),
+    };
+    execute_unload_request(&req)
+}
+
+/// Plan + execute a full unload action chain in one call. The default path
+/// for callers that don't need to inspect the prepared request. Skips non-API
+/// actions (noop, process-exit) by reporting them as not executed.
+///
+/// Chain semantics: once a `required` action succeeds, subsequent actions are
+/// skipped (they are fallbacks that exist only for the case where the primary
+/// unload path failed). This prevents the redundant `ollama stop` fallback
+/// from running after a successful `keep_alive:0` POST.
+pub fn execute_unload_actions(
+    actions: &[ProviderUnloadAction],
+    resolved_model_tag: &str,
+) -> Vec<UnloadActionResult> {
+    let mut results = Vec::with_capacity(actions.len());
+    let mut required_succeeded = false;
+    for action in actions {
+        if required_succeeded {
+            results.push(UnloadActionResult {
+                label: action.label.clone(),
+                executed: false,
+                outcome: "skipped: prior required unload succeeded".to_string(),
+            });
+            continue;
+        }
+        let result = match prepare_unload_request(action, resolved_model_tag) {
+            Some(req) => execute_unload_request(&req),
+            None => UnloadActionResult {
+                label: action.label.clone(),
+                executed: false,
+                outcome: "skipped: non-API action".to_string(),
+            },
+        };
+        if result.executed && action.required {
+            required_succeeded = true;
+        }
+        results.push(result);
+    }
+    results
+}
+
+fn post_unload_http(url: &str, body: &str) -> anyhow::Result<String> {
+    use std::time::Duration;
+
+    let payload = serde_json::from_str::<serde_json::Value>(body)
+        .unwrap_or(serde_json::Value::Null);
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build()
+        .new_agent();
+    let mut response = agent
+        .post(url)
+        .send_json(payload)
+        .with_context(|| format!("posting unload to {url}"))?;
+    let status = response.status();
+    let text = response
+        .body_mut()
+        .read_to_string()
+        .with_context(|| format!("reading unload response (HTTP {status})"))?;
+    if !status.is_success() {
+        bail!("unload HTTP {status}: {}", truncate_str_local(&text, 200));
+    }
+    Ok(format!("{status}"))
+}
+
+fn truncate_str_local(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max])
     }
 }
 
@@ -2675,5 +2886,131 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("not selectable on the post-unload probe"))
         );
+    }
+
+    // =========================================================================
+    // #kgunloadpost: build_unload_actions owns execution — pure helper tests
+    // =========================================================================
+
+    #[test]
+    fn rewrite_unload_body_model_replaces_model_field() {
+        let original = r#"{"model":"qwen3-32b-q4-ollama-default","prompt":"","keep_alive":0}"#;
+        let rewritten = rewrite_unload_body_model(original, "hf.co/Qwen/Qwen3-32B-GGUF:Q4_K_M");
+        let value: serde_json::Value =
+            serde_json::from_str(&rewritten).expect("rewritten body is valid JSON");
+        assert_eq!(
+            value["model"].as_str(),
+            Some("hf.co/Qwen/Qwen3-32B-GGUF:Q4_K_M")
+        );
+        // Other fields preserved.
+        assert_eq!(value["keep_alive"].as_i64(), Some(0));
+        assert_eq!(value["prompt"].as_str(), Some(""));
+    }
+
+    #[test]
+    fn rewrite_unload_body_model_preserves_body_when_override_is_empty() {
+        let original = r#"{"model":"default-tag","keep_alive":0}"#;
+        let rewritten = rewrite_unload_body_model(original, "");
+        // Empty override must not blank out the model field — falls through.
+        assert_eq!(rewritten, original);
+    }
+
+    #[test]
+    fn rewrite_unload_body_model_falls_back_on_invalid_json() {
+        let original = "not valid json {{{";
+        let rewritten = rewrite_unload_body_model(original, "any-tag");
+        assert_eq!(rewritten, original);
+    }
+
+    #[test]
+    fn normalize_unload_url_appends_generate_path_for_bare_host() {
+        let url = normalize_unload_url("http://127.0.0.1:11434");
+        assert_eq!(url, "http://127.0.0.1:11434/api/generate");
+    }
+
+    #[test]
+    fn normalize_unload_url_idempotent_for_full_generate_url() {
+        let url = normalize_unload_url("http://127.0.0.1:11434/api/generate");
+        assert_eq!(url, "http://127.0.0.1:11434/api/generate");
+    }
+
+    #[test]
+    fn normalize_unload_url_strips_trailing_slash() {
+        let url = normalize_unload_url("http://127.0.0.1:11434/");
+        assert_eq!(url, "http://127.0.0.1:11434/api/generate");
+    }
+
+    #[test]
+    fn prepare_unload_request_returns_none_for_non_api_actions() {
+        let noop = ProviderUnloadAction {
+            kind: UnloadActionKind::Noop,
+            label: "noop".to_string(),
+            command: None,
+            http_method: None,
+            endpoint: None,
+            body_json: None,
+            required: false,
+        };
+        assert!(prepare_unload_request(&noop, "any-tag").is_none());
+    }
+
+    #[test]
+    fn prepare_unload_request_applies_model_override_to_body() {
+        // Mirrors the OllamaKeepAliveZero action shape produced by
+        // build_unload_actions: body carries the profile's model_ref, and the
+        // resolved override must replace it (the bug fixed by #kgunloadpost).
+        let action = ProviderUnloadAction {
+            kind: UnloadActionKind::ProviderApi,
+            label: "ollama keep_alive zero".to_string(),
+            command: Some(vec!["ollama".to_string(), "stop".to_string()]),
+            http_method: Some("POST".to_string()),
+            endpoint: Some("http://127.0.0.1:11434".to_string()),
+            body_json: Some(
+                r#"{"model":"profile-default-tag","prompt":"","keep_alive":0}"#.to_string(),
+            ),
+            required: true,
+        };
+        let req = prepare_unload_request(&action, "override-tag")
+            .expect("ProviderApi action prepares a request");
+        assert_eq!(req.url, "http://127.0.0.1:11434/api/generate");
+        assert!(req.body.contains("\"model\":\"override-tag\""));
+        assert!(!req.body.contains("profile-default-tag"));
+        assert_eq!(
+            req.fallback_command,
+            Some(vec!["ollama".to_string(), "stop".to_string()])
+        );
+    }
+
+    #[test]
+    fn prepare_unload_request_synthesizes_body_when_plan_has_none() {
+        let action = ProviderUnloadAction {
+            kind: UnloadActionKind::ProviderApi,
+            label: "synthesized".to_string(),
+            command: None,
+            http_method: Some("POST".to_string()),
+            endpoint: Some("http://host:11434".to_string()),
+            body_json: None,
+            required: true,
+        };
+        let req = prepare_unload_request(&action, "synth-tag").unwrap();
+        assert!(req.body.contains("\"model\":\"synth-tag\""));
+        assert!(req.body.contains("\"keep_alive\":0"));
+    }
+
+    #[test]
+    fn execute_unload_actions_reports_non_api_as_skipped() {
+        let actions = vec![ProviderUnloadAction {
+            kind: UnloadActionKind::Noop,
+            label: "no GPU unload required".to_string(),
+            command: None,
+            http_method: None,
+            endpoint: None,
+            body_json: None,
+            required: false,
+        }];
+        let results = execute_unload_actions(&actions, "any-tag");
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].executed);
+        assert_eq!(results[0].outcome, "skipped: non-API action");
     }
 }

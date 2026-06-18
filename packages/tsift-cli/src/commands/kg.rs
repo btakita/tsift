@@ -12,14 +12,13 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use tsift_core::GraphStore;
 use tsift_kg::{
     ChunkingConfig, KgInputDocument, KgInputKind, OllamaKgExtractor, extract_documents_to_projection,
     upsert_kg_projection_sqlite,
 };
-use tsift_local_model::{ProviderUnloadAction, profile_by_id};
+use tsift_local_model::profile_by_id;
 
 /// Default extractor profile when neither `--model` nor `--profile` is given.
 /// Picked because it is the smallest GPU-resident extractor served by Ollama in
@@ -246,22 +245,15 @@ fn emit_status(report: &KgStatusReport, json: bool) {
 }
 
 // =============================================================================
-// unload (#kgunloadpost — build_unload_actions actually POSTs keep_alive:0)
+// unload (#kgunloadpost — build_unload_actions owns execution, called from CLI)
 // =============================================================================
-
-#[derive(Debug, Serialize)]
-struct UnloadActionReport {
-    label: String,
-    executed: bool,
-    outcome: String,
-}
 
 #[derive(Debug, Serialize)]
 struct KgUnloadReport {
     profile_id: String,
     model_tag: String,
     endpoint: String,
-    actions: Vec<UnloadActionReport>,
+    actions: Vec<tsift_local_model::UnloadActionResult>,
 }
 
 pub(crate) fn cmd_kg_unload(
@@ -280,22 +272,21 @@ pub(crate) fn cmd_kg_unload(
     let model_tag = model.unwrap_or_else(|| profile_handle.model_ref.to_string());
     let endpoint = resolve_ollama_host_for_unload(host.as_deref());
 
-    // Build the canonical unload action plan, then actually execute it (#kgunloadpost).
+    // The planner owns execution (#kgunloadpost): build_unload_actions still
+    // plans, and execute_unload_actions POSTs the ollama keep_alive:0 with
+    // the resolved model tag (so --model override actually takes effect).
     let actions = tsift_local_model::build_unload_actions(
         &profile_handle,
         Some(endpoint.as_str()),
         None,
     );
-    let mut reports = Vec::with_capacity(actions.len());
-    for action in &actions {
-        reports.push(execute_unload_action(action, &model_tag, &endpoint));
-    }
+    let results = tsift_local_model::execute_unload_actions(&actions, &model_tag);
 
     let report = KgUnloadReport {
-        profile_id: profile_id.clone(),
-        model_tag: model_tag.clone(),
-        endpoint: endpoint.clone(),
-        actions: reports,
+        profile_id,
+        model_tag,
+        endpoint,
+        actions: results,
     };
 
     if json {
@@ -328,96 +319,6 @@ fn resolve_ollama_host_for_unload(host_override: Option<&str>) -> String {
     )
     .trim_end_matches('/')
     .to_string()
-}
-
-fn execute_unload_action(
-    action: &ProviderUnloadAction,
-    model_tag: &str,
-    endpoint: &str,
-) -> UnloadActionReport {
-    // Prefer the provider-API path (POST keep_alive:0) — closes the gap noted
-    // in #lmlazy where build_unload_actions planned but did not POST. Command
-    // fallback is tried only if the HTTP path fails.
-    if action.kind == tsift_local_model::UnloadActionKind::ProviderApi {
-        let body = action
-            .body_json
-            .clone()
-            .map(|b| b.replace("{model}", model_tag))
-            .unwrap_or_else(|| format!(r#"{{"model":"{model_tag}","prompt":"","keep_alive":0}}"#));
-        let url = format!(
-            "{}/api/generate",
-            endpoint.trim_end_matches('/').trim_end_matches("/api/generate")
-        );
-        match post_unload(&url, &body) {
-            Ok(status_summary) => UnloadActionReport {
-                label: action.label.clone(),
-                executed: true,
-                outcome: format!("HTTP {status_summary}"),
-            },
-            Err(err) => {
-                // Try the command fallback if one is attached (ollama stop).
-                if let Some(cmd) = &action.command {
-                    let _ = std::process::Command::new(&cmd[0])
-                        .args(&cmd[1..])
-                        .status()
-                        .map_err(|e| {
-                            eprintln!("kg unload: fallback command failed: {e}");
-                        });
-                    return UnloadActionReport {
-                        label: action.label.clone(),
-                        executed: true,
-                        outcome: format!("POST failed ({err}); ran fallback `{:?}`", cmd),
-                    };
-                }
-                UnloadActionReport {
-                    label: action.label.clone(),
-                    executed: false,
-                    outcome: format!("POST failed ({err}); no fallback"),
-                }
-            }
-        }
-    } else {
-        // Non-API actions (e.g. process-exit fallback) are informational only here.
-        UnloadActionReport {
-            label: action.label.clone(),
-            executed: false,
-            outcome: "skipped: non-API action".to_string(),
-        }
-    }
-}
-
-fn post_unload(url: &str, body: &str) -> Result<String> {
-    let agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(30)))
-        .build()
-        .new_agent();
-    let payload = serde_json::from_str::<serde_json::Value>(body)
-        .unwrap_or(serde_json::Value::Null);
-    let mut response = agent
-        .post(url)
-        .send_json(payload)
-        .with_context(|| format!("posting unload to {url}"))?;
-    let status = response.status();
-    let text = response
-        .body_mut()
-        .read_to_string()
-        .with_context(|| format!("reading unload response (HTTP {status})"))?;
-    if !status.is_success() {
-        bail!(
-            "unload HTTP {status}: {}",
-            truncate_str(&text, 200)
-        );
-    }
-    Ok(format!("{status}"))
-}
-
-fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
-    }
 }
 
 // =============================================================================
@@ -456,16 +357,11 @@ pub(crate) fn cmd_kg_smoke(
 
     let mut unloaded = false;
     if unload_after {
-        let body = format!(
-            r#"{{"model":"{resolved_model}","prompt":"","keep_alive":0}}"#
-        );
-        let url = format!(
-            "{}/api/generate",
-            extractor.host().trim_end_matches('/').trim_end_matches("/api/generate")
-        );
-        match post_unload(&url, &body) {
-            Ok(_) => unloaded = true,
-            Err(err) => eprintln!("kg smoke: unload after run failed: {err}"),
+        let outcome = tsift_local_model::unload_model_at(extractor.host(), &resolved_model);
+        if outcome.executed {
+            unloaded = true;
+        } else {
+            eprintln!("kg smoke: unload after run failed: {}", outcome.outcome);
         }
     }
 
@@ -563,15 +459,5 @@ mod tests {
         // Resolves to the default ollama endpoint exposed by tsift-local-model.
         assert!(!host.is_empty());
         assert!(host.starts_with("http"));
-    }
-
-    #[test]
-    fn truncate_str_shortens_long_payloads() {
-        let s = "x".repeat(300);
-        let truncated = truncate_str(&s, 10);
-        // 10 ascii chars + the ellipsis (1 char, 3 bytes in UTF-8).
-        assert_eq!(truncated.chars().count(), 11);
-        assert!(truncated.ends_with('…'));
-        assert_eq!(truncate_str("short", 10), "short");
     }
 }
