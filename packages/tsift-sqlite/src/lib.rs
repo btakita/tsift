@@ -1993,6 +1993,31 @@ impl SqliteGraphStore {
         Ok(())
     }
 
+    /// #kgrefreshdup: delete every node previously projected from `source_ref` by
+    /// `provider`, so a re-extraction REPLACES that source's subgraph instead of
+    /// accumulating duplicate canonical entities across refresh cycles. Incident
+    /// edges, node/edge properties, and semantic vectors are removed automatically
+    /// via the `ON DELETE CASCADE` foreign keys. The `provider` scope keeps the
+    /// delete from touching non-KG nodes (e.g. AST symbols) that may share a
+    /// `source_ref` path in the same graph database. Returns the node count deleted.
+    pub fn delete_source_projection(&mut self, source_ref: &str, provider: &str) -> Result<usize> {
+        let deleted = self.conn.execute(
+            r#"
+            DELETE FROM graph_nodes
+            WHERE id IN (
+                SELECT node_id FROM graph_node_properties
+                WHERE key = 'source_ref' AND value = ?1
+            )
+            AND id IN (
+                SELECT node_id FROM graph_node_properties
+                WHERE key = 'provider' AND value = ?2
+            )
+            "#,
+            (source_ref, provider),
+        )?;
+        Ok(deleted)
+    }
+
     pub fn projection_version(&self, scope: &str) -> Result<Option<SqliteProjectionVersion>> {
         self.conn
             .query_row(
@@ -5172,5 +5197,70 @@ mod tests {
         assert!(onto2.nodes.iter().all(|n| n.kind == "ontology_type"));
         assert_eq!(onto2.nodes.len(), onto.nodes.len());
         assert_eq!(onto2.edges.len(), onto.edges.len());
+    }
+
+    /// #kgrefreshdup: delete_source_projection removes a provider's nodes for a
+    /// source (cascading to edges/properties) but must NOT touch nodes from a
+    /// different provider that happen to share the same `source_ref` path.
+    #[test]
+    fn delete_source_projection_is_scoped_by_provider_and_cascades() {
+        let mut store = SqliteGraphStore::in_memory().unwrap();
+        let seed = GraphProjection {
+            nodes: vec![
+                // KG nodes for src/a.rs.
+                GraphNode::new("kg:a:1", "semantic_entity", "Alpha")
+                    .with_property("provider", "tsift-kg")
+                    .with_property("source_ref", "src/a.rs"),
+                GraphNode::new("kg:a:2", "semantic_entity", "Beta")
+                    .with_property("provider", "tsift-kg")
+                    .with_property("source_ref", "src/a.rs"),
+                // KG node for a different source.
+                GraphNode::new("kg:b:1", "semantic_entity", "Gamma")
+                    .with_property("provider", "tsift-kg")
+                    .with_property("source_ref", "src/b.rs"),
+                // A non-KG (e.g. AST) node sharing the src/a.rs source_ref.
+                GraphNode::new("ast:a:1", "function", "fn_in_a")
+                    .with_property("provider", "tsift-ast")
+                    .with_property("source_ref", "src/a.rs"),
+            ],
+            edges: vec![
+                GraphEdge::new("kg:a:1", "kg:a:2", "semantic_relation")
+                    .with_property("provider", "tsift-kg"),
+                GraphEdge::new("ast:a:1", "kg:a:1", "references"),
+            ],
+        };
+        store.upsert_projection(&seed).unwrap();
+
+        let deleted = store
+            .delete_source_projection("src/a.rs", "tsift-kg")
+            .unwrap();
+        assert_eq!(deleted, 2, "only the two KG nodes for src/a.rs are deleted");
+
+        // KG nodes for src/a.rs are gone.
+        assert!(store.node("kg:a:1").unwrap().is_none());
+        assert!(store.node("kg:a:2").unwrap().is_none());
+        // KG node for the other source survives.
+        assert!(store.node("kg:b:1").unwrap().is_some());
+        // The non-KG node sharing the source_ref is untouched.
+        assert!(store.node("ast:a:1").unwrap().is_some());
+
+        // The semantic_relation edge between deleted nodes cascaded away; the
+        // edge touching the surviving AST node + a deleted KG node also cascades.
+        let edge_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM graph_edges", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(edge_count, 0);
+
+        // Properties for the deleted nodes cascaded too.
+        let orphan_props: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_node_properties WHERE node_id IN ('kg:a:1','kg:a:2')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_props, 0);
     }
 }

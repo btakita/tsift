@@ -13,6 +13,9 @@ pub use ollama::OllamaKgExtractor;
 
 pub const KG_CONTRACT_VERSION: &str = "tsift-kg-v1";
 pub const HASH_KG_EXTRACTOR_ID: &str = "tsift-local-hash-v1";
+/// `provider` property stamped on every KG-projected node/edge. Used to scope
+/// per-source replacement (#kgrefreshdup) so it never touches non-KG graph rows.
+pub const KG_PROVIDER: &str = "tsift-kg";
 
 /// #kgconf: neutral fallback confidence used when an extractor does not emit a
 /// per-entity/relation confidence. The projection always persists a `confidence`
@@ -392,6 +395,42 @@ pub fn upsert_kg_projection_sqlite(
         nodes_upserted: projection.nodes.len(),
         edges_upserted: projection.edges.len(),
     })
+}
+
+/// #kgrefreshdup: replace each source's KG subgraph instead of accumulating it.
+///
+/// `upsert_kg_projection_sqlite` is purely additive — re-extracting an edited
+/// source shifts chunk byte-ranges (so chunk + entity node ids change) and the
+/// non-deterministic model may relabel entities, leaving the prior nodes orphaned
+/// while new ones pile on (observed 9 → 18 entities for one source after a single
+/// `refresh`). This variant first deletes every prior KG node projected from each
+/// `source_ref` present in `projection` (scoped to the `tsift-kg` provider so it
+/// never touches AST nodes), then upserts the fresh projection — making
+/// per-source extraction idempotent. Distinct sources are untouched.
+pub fn replace_kg_source_projection_sqlite(
+    graph_db: &Path,
+    projection: &GraphProjection,
+) -> Result<KgSqliteUpsertReport> {
+    let mut store = SqliteGraphStore::open(graph_db)?;
+    for source_ref in projection_source_refs(projection) {
+        store.delete_source_projection(&source_ref, KG_PROVIDER)?;
+    }
+    store.upsert_projection(projection)?;
+    Ok(KgSqliteUpsertReport {
+        graph_db: graph_db.display().to_string(),
+        nodes_upserted: projection.nodes.len(),
+        edges_upserted: projection.edges.len(),
+    })
+}
+
+/// Distinct `source_ref` property values across the projection's nodes, in
+/// stable sorted order. Used to scope per-source replacement.
+fn projection_source_refs(projection: &GraphProjection) -> BTreeSet<String> {
+    projection
+        .nodes
+        .iter()
+        .filter_map(|node| node.properties.get("source_ref").cloned())
+        .collect()
 }
 
 pub fn verify_projection_multi_run_stability(
@@ -1067,6 +1106,71 @@ mod tests {
             relation.properties.get("confidence_source"),
             Some(&"default".to_string())
         );
+    }
+
+    /// #kgrefreshdup: re-extracting an edited source (which shifts chunk + node
+    /// ids) must REPLACE that source's prior subgraph, not accumulate duplicates,
+    /// and must leave other sources untouched.
+    #[test]
+    fn replace_source_projection_does_not_accumulate_duplicate_entities() {
+        let count_for = |conn: &Connection, src: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM graph_nodes n \
+                 JOIN graph_node_properties p ON p.node_id = n.id \
+                 WHERE n.kind = 'semantic_entity' \
+                   AND p.key = 'source_ref' AND p.value = ?1",
+                [src],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let extract = |source_ref: &str, text: &str| {
+            extract_documents_to_projection(
+                &[KgInputDocument::source(source_ref, text)],
+                &FixtureExtractor,
+                ChunkingConfig {
+                    max_chars: 500,
+                    overlap_chars: 0,
+                },
+            )
+            .unwrap()
+            .projection
+        };
+
+        let dir = TempDir::new().unwrap();
+        let graph_db = dir.path().join(".tsift/graph.db");
+
+        // Initial extraction of two distinct sources.
+        replace_kg_source_projection_sqlite(&graph_db, &extract("src/a.rs", "alpha source one"))
+            .unwrap();
+        replace_kg_source_projection_sqlite(&graph_db, &extract("src/b.rs", "bravo source two"))
+            .unwrap();
+        {
+            let conn = Connection::open(&graph_db).unwrap();
+            assert_eq!(count_for(&conn, "src/a.rs"), 2);
+            assert_eq!(count_for(&conn, "src/b.rs"), 2);
+        }
+
+        // Re-extract source A with EDITED text -> different chunk + entity node
+        // ids. A purely-additive upsert would now leave 4 entities for src/a.rs.
+        replace_kg_source_projection_sqlite(
+            &graph_db,
+            &extract("src/a.rs", "alpha source one EDITED with more words"),
+        )
+        .unwrap();
+
+        let conn = Connection::open(&graph_db).unwrap();
+        // Source A replaced (still 2, not 4); source B untouched; total 4, not 6.
+        assert_eq!(count_for(&conn, "src/a.rs"), 2);
+        assert_eq!(count_for(&conn, "src/b.rs"), 2);
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_nodes WHERE kind = 'semantic_entity'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 4);
     }
 
     #[test]

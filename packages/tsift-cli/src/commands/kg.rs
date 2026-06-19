@@ -18,7 +18,7 @@ use tsift_kg::context_pack::{ChunkContextSource, ContextPackConfig};
 use tsift_kg::{
     ChunkingConfig, KgInputDocument, KgInputKind, KgSqliteUpsertReport, OllamaKgExtractor,
     extract_documents_to_projection, extract_documents_to_projection_with_context,
-    upsert_kg_projection_sqlite,
+    replace_kg_source_projection_sqlite,
 };
 use tsift_local_model::profile_by_id;
 
@@ -261,10 +261,14 @@ pub(crate) fn run_kg_extract(args: KgExtractArgs) -> Result<KgExtractOutcome> {
     let relation_count = report.projection.edges.len();
 
     let upsert = if let Some(graph_db) = graph_db.as_deref() {
-        Some(upsert_kg_projection_sqlite(graph_db, &report.projection).context(format!(
-            "upserting KG projection into {}",
-            graph_db.display()
-        ))?)
+        // #kgrefreshdup: replace this source's prior subgraph instead of
+        // accumulating duplicates across re-extraction / refresh cycles.
+        Some(
+            replace_kg_source_projection_sqlite(graph_db, &report.projection).context(format!(
+                "upserting KG projection into {}",
+                graph_db.display()
+            ))?,
+        )
     } else {
         None
     };

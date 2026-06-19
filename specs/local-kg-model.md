@@ -219,8 +219,20 @@ signal it silently goes stale as sources change. The refresh trigger is
   `no_recorded_hash` (extracted before hashing — refresh recommended). It prints
   the exact `kg extract` command to re-extract each source that needs it. The
   check is read-only and model-free, so it is cheap to run on demand or from a
-  hook; re-extraction reuses the lease-aware `kg extract` path (#kgleasewire)
-  and stable fact ids reconcile rather than duplicate (Run Manifest contract).
+  hook; re-extraction reuses the lease-aware `kg extract` path (#kgleasewire).
+- **Per-source replacement (#kgrefreshdup).** Re-extraction is idempotent per
+  source: before upserting a freshly-extracted source the writer **deletes that
+  source's prior KG subgraph** (`replace_kg_source_projection_sqlite` →
+  `SqliteGraphStore::delete_source_projection`, scoped to the `tsift-kg`
+  provider). Without this, re-extracting an edited source shifts chunk
+  byte-ranges (so chunk + entity node ids change) and the non-deterministic model
+  may relabel entities, leaving the prior nodes orphaned while new ones pile on
+  (observed 9 → 18 entities for one source after a single refresh). Deletion
+  cascades to incident edges, properties, and semantic vectors via the graph's
+  `ON DELETE CASCADE` foreign keys; the provider scope keeps it from touching
+  non-KG (e.g. AST) nodes that share a `source_ref` path. Distinct sources are
+  untouched, so multi-source graphs accumulate across sources but never duplicate
+  within one source.
 - `tsift kg refresh --apply` (#kgrefreshapply) performs that re-extraction
   automatically for every stale / `no_recorded_hash` source whose file is still
   readable, reusing the lease-aware `run_kg_extract` path (so concurrent
