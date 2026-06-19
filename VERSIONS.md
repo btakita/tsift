@@ -8,6 +8,11 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.72
+
+- **release: publish-list completeness for `tsift-local-model` + `tsift-kg`.** The v0.1.71 crates.io publish failed (`no matching package named tsift-kg found`, required by `tsift-memgraphrag`) because the two new KG crates were never added to `release.yml`'s two `for package in` publish lists, so they were never published and the dependency-ordered publish of `tsift-memgraphrag` broke. Both `tsift-local-model` (leaf) and `tsift-kg` (depends on `tsift-core`/`tsift-local-model`/`tsift-sqlite`, consumed by `tsift-cli`/`tsift-memgraphrag`) are now listed before `tsift-memgraphrag` in both the package-file check and the crates.io publish loop. **Operator gate:** these two crate names have no crates.io Trusted Publishing config yet (only the prior 23 crates do), so the OIDC publish of a brand-new crate needs a Trusted Publishing config created for each name on crates.io before the `v0.1.72` tag is pushed.
+- **`kg` promotion into `tsift status` + `tsift workflow`** (`6af8a07`, previously unreleased): `tsift status` `use:` appends `kg` when a project `.tsift/graph.db` exists (omitted otherwise so agents extract before they read); new `tsift workflow kg` recipe (aliases `knowledge-graph`, `kg-workflow`) smoke → extract → status → refresh → evidence; unknown workflow topics fail closed listing `search, kg`. Spec: `specs/search-navigation.md`.
+
 ## 0.1.71
 
 - **`#kgconfgate`**: provenance-aware `min_confidence` gating in the GraphRAG context pack. `#kgconfrank` made *ranking* trust real scores over derived defaults, but the gate still filtered by raw confidence, so a derived `default 0.500` survived a `min_confidence=0.4` gate while a real model `0.300` was excluded. `ContextCandidate` now also carries `confidence_is_default` (set only when `confidence_source=default` explicitly, distinct from `confidence_is_model`); `passes_confidence_gate` excludes explicit derived defaults outright under any positive `min_confidence`, while model-sourced and untagged/legacy (pre-`#kgconf`) nodes keep raw gating and `min_confidence==0` admits everything. Spec: `specs/local-kg-model.md` § GraphRAG Context Retrieval.

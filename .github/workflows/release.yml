@@ -81,6 +81,8 @@ jobs:
             tsift-status \
             tsift-session \
             tsift-memory \
+            tsift-local-model \
+            tsift-kg \
             tsift-memgraphrag \
             tsift-surrealdb \
             tsift-cli \
@@ -288,6 +290,8 @@ jobs:
             tsift-status \
             tsift-session \
             tsift-memory \
+            tsift-local-model \
+            tsift-kg \
             tsift-memgraphrag \
             tsift-surrealdb \
             tsift-cli \
