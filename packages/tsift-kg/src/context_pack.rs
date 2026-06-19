@@ -55,11 +55,16 @@ pub struct ContextCandidate {
     pub confidence: f64,
     pub degree: usize,
     /// #kgconfrank: `true` when `confidence` came from the extractor model
-    /// (`confidence_source=model`), `false` when it is the derived neutral
-    /// default. Model-sourced confidence ranks above a derived default at equal
-    /// connectivity, so an unknown 0.500 default never outranks a real model
-    /// score.
+    /// (`confidence_source=model`). Model-sourced confidence ranks above a
+    /// derived default at equal connectivity, so an unknown 0.500 default never
+    /// outranks a real model score.
     pub confidence_is_model: bool,
+    /// #kgconfgate: `true` only when `confidence_source` is explicitly `default`
+    /// (a derived neutral default, not a measured score). A positive
+    /// `min_confidence` gate excludes these, so an unknown default never survives
+    /// a gate that would exclude a real low score. Untagged/legacy nodes (no
+    /// `confidence_source`) are neither model nor default and keep raw gating.
+    pub confidence_is_default: bool,
 }
 
 /// A ranked known entity in the resulting pack. `node_id` is the canonical
@@ -161,6 +166,18 @@ fn confidence_tier(cand: &ContextCandidate) -> u8 {
     if cand.confidence_is_model { 0 } else { 1 }
 }
 
+/// #kgconfgate: provenance-aware confidence gate. A positive `min_confidence`
+/// excludes explicit derived defaults outright — an unknown default is not a
+/// measured score, so it must not survive a gate that would drop a real low
+/// score. Model-sourced and untagged/legacy nodes gate by raw confidence; when
+/// `min_confidence` is `0.0` (no gate) everything passes as before.
+fn passes_confidence_gate(cand: &ContextCandidate, min_confidence: f64) -> bool {
+    if cand.confidence_is_default && min_confidence > 0.0 {
+        return false;
+    }
+    cand.confidence >= min_confidence
+}
+
 /// The canonical `kgent-…` identity an extractor reconciled this node to, if any.
 /// Only canonical ids (not the model's chunk-local `e0`/`e1` slugs) are merge
 /// keys, so distinct entities that happen to share a local slug stay separate.
@@ -217,7 +234,7 @@ pub fn build_context_pack(
     let seed_tokens: Vec<BTreeSet<String>> = seeds.iter().map(|s| tokenize(s)).collect();
     let mut ranked: Vec<Ranked> = candidates
         .iter()
-        .filter(|c| c.confidence >= config.min_confidence)
+        .filter(|c| passes_confidence_gate(c, config.min_confidence))
         .map(|c| {
             let matched_seed = best_seed_match(&c.label, &seed_tokens, seeds);
             let match_rank = if matched_seed.is_some() { 0u8 } else { 1u8 };
@@ -347,12 +364,11 @@ fn node_to_candidate(node: &GraphNode, degree: usize) -> ContextCandidate {
         .get("entity_kind")
         .cloned()
         .unwrap_or_else(|| node.kind.clone());
-    // #kgconfrank: only an explicit `confidence_source=model` counts as a real
-    // model score; absent/`default` is the derived neutral default.
-    let confidence_is_model = node
-        .properties
-        .get("confidence_source")
-        .is_some_and(|source| source == "model");
+    // #kgconfrank / #kgconfgate: distinguish model-sourced, explicit-default, and
+    // untagged (legacy) confidence provenance.
+    let confidence_source = node.properties.get("confidence_source");
+    let confidence_is_model = confidence_source.is_some_and(|source| source == "model");
+    let confidence_is_default = confidence_source.is_some_and(|source| source == "default");
     ContextCandidate {
         node_id: node.id.clone(),
         label: node.label.clone(),
@@ -360,6 +376,7 @@ fn node_to_candidate(node: &GraphNode, degree: usize) -> ContextCandidate {
         confidence,
         degree,
         confidence_is_model,
+        confidence_is_default,
     }
 }
 
@@ -453,6 +470,52 @@ mod tests {
         let pack = build_context_pack_from_projection(&[], &p, &cfg);
         assert_eq!(pack.entities.len(), 1);
         assert_eq!(pack.entities[0].node_id, "kgent-b");
+    }
+
+    /// #kgconfgate: a positive min_confidence gate excludes an explicit derived
+    /// default (even a high 0.9) but admits a real model score at/above the gate;
+    /// untagged/legacy nodes keep raw-confidence gating.
+    #[test]
+    fn confidence_gate_is_provenance_aware() {
+        let mut p = GraphProjection::default();
+        p.nodes.push(
+            ent("kgent-default-hi", "DefaultHigh", "type", 0.9)
+                .with_property("confidence_source", "default"),
+        );
+        p.nodes.push(
+            ent("kgent-model-mid", "ModelMid", "type", 0.5)
+                .with_property("confidence_source", "model"),
+        );
+        // Untagged/legacy node (no confidence_source) keeps raw gating.
+        p.nodes.push(ent("kgent-legacy", "Legacy", "type", 0.7));
+        let cfg = ContextPackConfig {
+            max_entities: 10,
+            min_confidence: 0.4,
+            ..Default::default()
+        };
+        let pack = build_context_pack_from_projection(&[], &p, &cfg);
+        let ids: Vec<&str> = pack.entities.iter().map(|e| e.node_id.as_str()).collect();
+        assert!(ids.contains(&"kgent-model-mid"), "model 0.5 passes the 0.4 gate");
+        assert!(
+            ids.contains(&"kgent-legacy"),
+            "untagged legacy 0.7 keeps raw gating"
+        );
+        assert!(
+            !ids.contains(&"kgent-default-hi"),
+            "explicit derived default excluded by a positive gate despite 0.9"
+        );
+    }
+
+    /// #kgconfgate: with no gate (`min_confidence == 0`) derived defaults still
+    /// pass — the exclusion only applies to a positive threshold.
+    #[test]
+    fn confidence_gate_admits_defaults_when_threshold_is_zero() {
+        let mut p = GraphProjection::default();
+        p.nodes.push(
+            ent("kgent-default", "Def", "type", 0.5).with_property("confidence_source", "default"),
+        );
+        let pack = build_context_pack_from_projection(&[], &p, &ContextPackConfig::default());
+        assert_eq!(pack.entities.len(), 1);
     }
 
     #[test]

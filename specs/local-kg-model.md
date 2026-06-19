@@ -293,7 +293,13 @@ inject into the extractor prompt:
   decides. Every ordering input is totally ordered, so the Run Manifest
   determinism contract holds.
 - **Confidence-gated + capped** — `min_confidence` excludes low-trust entities;
-  `max_entities` caps the pack and flags `truncated`.
+  `max_entities` caps the pack and flags `truncated`. The gate is
+  **provenance-aware (#kgconfgate)**: a positive `min_confidence` excludes
+  explicit derived defaults (`confidence_source=default`) outright — an unknown
+  default is not a measured score, so it must not survive a gate that would drop a
+  real low score (this is the gating counterpart to `#kgconfrank`'s ranking tier).
+  Model-sourced and untagged/legacy (pre-`#kgconf`, no `confidence_source`) nodes
+  gate by raw confidence; at `min_confidence == 0` (no gate) everything passes.
 - **Pure** — the ranker takes already-loaded candidates; Phase 2 / the store
   path owns loading and bounds the read. Unit-tested with a fixture graph.
 
