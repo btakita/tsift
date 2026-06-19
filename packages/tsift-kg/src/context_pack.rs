@@ -54,6 +54,12 @@ pub struct ContextCandidate {
     pub kind: String,
     pub confidence: f64,
     pub degree: usize,
+    /// #kgconfrank: `true` when `confidence` came from the extractor model
+    /// (`confidence_source=model`), `false` when it is the derived neutral
+    /// default. Model-sourced confidence ranks above a derived default at equal
+    /// connectivity, so an unknown 0.500 default never outranks a real model
+    /// score.
+    pub confidence_is_model: bool,
 }
 
 /// A ranked known entity in the resulting pack. `node_id` is the canonical
@@ -148,6 +154,13 @@ pub fn collect_candidates_from_nodes(
     (out, scan_truncated)
 }
 
+/// #kgconfrank: ranking tier for a candidate's confidence provenance — `0` for a
+/// real model score (ranks first), `1` for a derived default. Used as a sort key
+/// ahead of raw confidence so defaults never outrank model scores.
+fn confidence_tier(cand: &ContextCandidate) -> u8 {
+    if cand.confidence_is_model { 0 } else { 1 }
+}
+
 /// The canonical `kgent-…` identity an extractor reconciled this node to, if any.
 /// Only canonical ids (not the model's chunk-local `e0`/`e1` slugs) are merge
 /// keys, so distinct entities that happen to share a local slug stay separate.
@@ -219,6 +232,10 @@ pub fn build_context_pack(
         a.match_rank
             .cmp(&b.match_rank)
             .then_with(|| b.cand.degree.cmp(&a.cand.degree))
+            // #kgconfrank: model-sourced confidence ranks above a derived default
+            // at equal connectivity, so an unknown 0.500 default never outranks a
+            // real model score (e.g. model 0.300 beats default 0.500).
+            .then_with(|| confidence_tier(a.cand).cmp(&confidence_tier(b.cand)))
             .then_with(|| {
                 b.cand
                     .confidence
@@ -330,12 +347,19 @@ fn node_to_candidate(node: &GraphNode, degree: usize) -> ContextCandidate {
         .get("entity_kind")
         .cloned()
         .unwrap_or_else(|| node.kind.clone());
+    // #kgconfrank: only an explicit `confidence_source=model` counts as a real
+    // model score; absent/`default` is the derived neutral default.
+    let confidence_is_model = node
+        .properties
+        .get("confidence_source")
+        .is_some_and(|source| source == "model");
     ContextCandidate {
         node_id: node.id.clone(),
         label: node.label.clone(),
         kind,
         confidence,
         degree,
+        confidence_is_model,
     }
 }
 
@@ -540,6 +564,51 @@ mod tests {
         let pack = build_context_pack_from_projection(&[], &p, &cfg);
         assert_eq!(pack.entities[0].node_id, "kgent-a");
         assert!(pack.entities[0].matched_seed.is_none());
+    }
+
+    /// #kgconfrank: a real model score (0.3) ranks above a higher *derived
+    /// default* (0.5) at equal connectivity — the default must not outrank it.
+    #[test]
+    fn model_confidence_outranks_derived_default() {
+        let mut p = GraphProjection::default();
+        p.nodes.push(
+            ent("kgent-model", "ModelScored", "type", 0.3)
+                .with_property("confidence_source", "model"),
+        );
+        p.nodes.push(
+            ent("kgent-default", "DefaultScored", "type", 0.5)
+                .with_property("confidence_source", "default"),
+        );
+        let cfg = ContextPackConfig {
+            max_entities: 2,
+            ..Default::default()
+        };
+        let pack = build_context_pack_from_projection(&[], &p, &cfg);
+        assert_eq!(
+            pack.entities[0].node_id, "kgent-model",
+            "model score ranks first despite lower raw confidence"
+        );
+        assert_eq!(pack.entities[1].node_id, "kgent-default");
+    }
+
+    /// #kgconfrank: within the same provenance tier, higher raw confidence still
+    /// wins (the tier only breaks model-vs-default ties, not model-vs-model).
+    #[test]
+    fn within_model_tier_higher_confidence_wins() {
+        let mut p = GraphProjection::default();
+        p.nodes.push(
+            ent("kgent-lo", "Lo", "type", 0.4).with_property("confidence_source", "model"),
+        );
+        p.nodes.push(
+            ent("kgent-hi", "Hi", "type", 0.9).with_property("confidence_source", "model"),
+        );
+        let cfg = ContextPackConfig {
+            max_entities: 2,
+            ..Default::default()
+        };
+        let pack = build_context_pack_from_projection(&[], &p, &cfg);
+        assert_eq!(pack.entities[0].node_id, "kgent-hi");
+        assert_eq!(pack.entities[1].node_id, "kgent-lo");
     }
 
     #[test]

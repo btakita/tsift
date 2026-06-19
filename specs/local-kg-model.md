@@ -274,9 +274,14 @@ inject into the extractor prompt:
   id) are never merge keys, so distinct entities that reuse a slug stay separate.
 - **Deterministic ranking** — `build_context_pack` orders the bounded candidate
   set by seed match (case-insensitive token overlap with the label) →
-  connectivity (degree, descending) → confidence (descending) → stable node-id
-  tiebreak (ascending). Every ordering input is totally ordered, so the Run
-  Manifest determinism contract holds.
+  connectivity (degree, descending) → **confidence provenance tier
+  (#kgconfrank: model-sourced before derived-default)** → confidence
+  (descending) → stable node-id tiebreak (ascending). The provenance tier reads
+  the `confidence_source` property (`#kgconf`): a real model score ranks above a
+  derived neutral default at equal connectivity, so an unknown `0.500` default
+  never outranks a real model `0.300`; within a tier raw confidence still
+  decides. Every ordering input is totally ordered, so the Run Manifest
+  determinism contract holds.
 - **Confidence-gated + capped** — `min_confidence` excludes low-trust entities;
   `max_entities` caps the pack and flags `truncated`.
 - **Pure** — the ranker takes already-loaded candidates; Phase 2 / the store
