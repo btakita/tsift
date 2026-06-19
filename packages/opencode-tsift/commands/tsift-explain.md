@@ -1,4 +1,4 @@
-<!-- tsift:opencode-command v=0.1.70 name=tsift-explain -->
+<!-- tsift:opencode-command v=0.1.71 name=tsift-explain -->
 ---
 description: Explain a symbol via callers, callees, and community preview
 ---
