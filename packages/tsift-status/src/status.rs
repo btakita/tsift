@@ -216,12 +216,14 @@ pub fn check_status_with_cache(root: &Path, cache: &StatusCheckCache) -> Result<
     let summaries = check_summaries(root, &summaries_db_path, &index, cache)?;
     let summarize_extract = recommended_summarize_extract_path(root, &index, &workspace_scopes);
     let instructions = init::check_instruction_version(root);
+    let kg_present = root.join(".tsift/graph.db").exists();
     let recommendations = build_recommendations(
         &index,
         &summaries,
         &instructions,
         workspace,
         &summarize_extract,
+        kg_present,
     );
     let reminders = build_reminders(&index, &summaries, &recommendations, &summarize_extract);
 
@@ -509,6 +511,7 @@ fn build_recommendations(
     instructions: &InstructionStatus,
     workspace: bool,
     summarize_extract: &str,
+    kg_present: bool,
 ) -> Recommendations {
     let refresh = !matches!(instructions, InstructionStatus::Current { .. });
     let index_cmd = if workspace {
@@ -548,6 +551,9 @@ fn build_recommendations(
                 "explain".to_string(),
                 "graph".to_string(),
             ];
+            if kg_present {
+                use_cmds.push("kg".to_string());
+            }
             if matches!(summaries, SummaryStatus::Available { .. }) {
                 use_cmds.push("summarize".to_string());
             }
@@ -568,6 +574,9 @@ fn build_recommendations(
                 "explain".to_string(),
                 "graph".to_string(),
             ];
+            if kg_present {
+                use_cmds.push("kg".to_string());
+            }
             let mut run = match summaries {
                 SummaryStatus::Available {
                     cached_files,
@@ -1370,6 +1379,35 @@ mod tests {
             report.recommendations.run.as_deref(),
             Some("tsift init && tsift summarize --extract .")
         );
+    }
+
+    #[test]
+    fn status_fresh_index_with_graph_db_recommends_kg() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+        // A present graph.db is the "KG in use" signal that promotes `kg`.
+        std::fs::write(dir.path().join(".tsift/graph.db"), b"").unwrap();
+
+        let report = check_status(dir.path()).unwrap();
+        let cmds = &report.recommendations.use_commands;
+        assert!(cmds.contains(&"kg".to_string()));
+        // kg follows graph in the ordering
+        let graph_idx = cmds.iter().position(|c| c == "graph").unwrap();
+        let kg_idx = cmds.iter().position(|c| c == "kg").unwrap();
+        assert!(kg_idx > graph_idx);
+    }
+
+    #[test]
+    fn status_fresh_index_without_graph_db_omits_kg() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+
+        let report = check_status(dir.path()).unwrap();
+        assert!(!report.recommendations.use_commands.contains(&"kg".to_string()));
     }
 
     #[test]

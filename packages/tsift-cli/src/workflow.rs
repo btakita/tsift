@@ -99,10 +99,70 @@ pub(crate) fn search_workflow_recipe() -> WorkflowRecipe {
     }
 }
 
+pub(crate) fn kg_workflow_recipe() -> WorkflowRecipe {
+    WorkflowRecipe {
+        topic: "kg",
+        summary: "Build, refresh, and query the local Knowledge Graph (`.tsift/graph.db`) so semantic entity/relation evidence augments search and explain without re-extracting on every read.",
+        handle_contract: vec![
+            "Extract once per source, then read with `kg evidence`/`kg status`; do not re-run `kg extract` to answer a read.",
+            "Keep the `--source-ref` you extracted under — `kg refresh` and `kg evidence` key off it.",
+            "Prefer --envelope plus --budget normal so entity/relation handles and follow_up commands stay machine-readable.",
+        ],
+        steps: vec![
+            WorkflowStep {
+                name: "smoke-check",
+                goal: "Confirm the Ollama-served extractor model is reachable before extracting.",
+                command: "tsift kg smoke --unload --json",
+                preserves: vec!["report.profile", "report.model"],
+                next: vec![
+                    "If smoke fails, start/point at the Ollama server before extracting; otherwise proceed to extract.",
+                ],
+            },
+            WorkflowStep {
+                name: "extract",
+                goal: "Extract semantic entities/relations from a source into the project graph.db.",
+                command: "tsift kg extract --input <file> --source-ref <file> --json",
+                preserves: vec!["report.entities[]", "report.relations[]", "kg_source"],
+                next: vec![
+                    "Re-run per source you want covered; entities/relations persist into .tsift/graph.db with model confidence.",
+                ],
+            },
+            WorkflowStep {
+                name: "status",
+                goal: "Report graph.db state — existence and node/edge counts by kind.",
+                command: "tsift kg status --json",
+                preserves: vec![
+                    "report.total_nodes",
+                    "report.total_edges",
+                    "report.nodes_by_kind",
+                ],
+                next: vec!["Use kg refresh to find sources that changed since extraction."],
+            },
+            WorkflowStep {
+                name: "refresh",
+                goal: "Detect (or with --apply, re-extract) sources that drifted since extraction.",
+                command: "tsift kg refresh --json   # add --apply to re-extract stale sources",
+                preserves: vec!["report.stale_sources[]"],
+                next: vec!["Run with --apply to refresh stale sources on demand."],
+            },
+            WorkflowStep {
+                name: "evidence",
+                goal: "Look up KG evidence for a symbol/kind — the agent-doc read seam over graph.db.",
+                command: "tsift --envelope kg evidence --symbol \"<symbol>\" --json",
+                preserves: vec!["matched semantic_entity nodes", "linked relation edges"],
+                next: vec![
+                    "Restrict with --kind (e.g. --kind semantic_entity); cite evidence alongside search/explain results and carry the source-ref forward.",
+                ],
+            },
+        ],
+    }
+}
+
 fn workflow_recipe(topic: &str) -> Result<WorkflowRecipe> {
     match topic {
         "search" | "search-handles" | "search-workflow" => Ok(search_workflow_recipe()),
-        other => bail!("unknown workflow `{other}`; available workflows: search"),
+        "kg" | "knowledge-graph" | "kg-workflow" => Ok(kg_workflow_recipe()),
+        other => bail!("unknown workflow `{other}`; available workflows: search, kg"),
     }
 }
 

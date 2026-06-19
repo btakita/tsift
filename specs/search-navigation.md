@@ -187,6 +187,10 @@ Additional semantic edit language support is contract-backed. A language executo
 
 The contract is to keep every emitted handle with its originating command, query, path, and strategy, then use each result's `expand`, `follow_up`, or `resume_commands` field for the next command while citing the parent handle. Search previews preserve `sfam-*` and `shit-*` handles, explain previews preserve `edef-*`, `ecall-*`, and `eces-*` handles, and digest/context-pack outputs preserve artifact and touched-symbol handles across diff, test, log, and session expansions.
 
+`tsift workflow kg` (aliases `knowledge-graph`, `kg-workflow`) prints the companion recipe for the local Knowledge Graph: smoke-check the Ollama extractor, `kg extract --input <file> --source-ref <file>`, `kg status`, `kg refresh` (with `--apply` to re-extract drifted sources), and `kg evidence --symbol "<symbol>"` as the agent-doc read seam over `.tsift/graph.db`. The contract is to extract once per source and answer reads with `kg status`/`kg evidence` rather than re-extracting; `kg evidence` takes `--symbol`/`--kind` (not a positional) and has no `--budget` flag. `tsift workflow <unknown>` fails closed listing the available recipes (`search, kg`).
+
+To make the Knowledge Graph discoverable, `tsift status` promotes `kg` into its `use:` recommendation list (after `graph`) whenever a project `.tsift/graph.db` is present; with no graph.db the `use:` list omits `kg` so agents extract before they read.
+
 When an index is present, the AST symbol-ranking prepass is now bounded: SQLite only pulls exact-name rows and overlapping-tag candidates, orders them by exact/tag overlap, and caps that candidate scan to the requested search `--limit` instead of loading the full `symbols` table into memory first.
 
 ## Index Quiet Mode

@@ -28938,6 +28938,28 @@ tier = "private"
         );
     }
 
+    #[test]
+    fn kg_workflow_recipe_covers_extract_to_evidence() {
+        let recipe = workflow::kg_workflow_recipe();
+        assert_eq!(recipe.topic, "kg");
+        let step_names: Vec<&str> = recipe.steps.iter().map(|step| step.name).collect();
+        assert_eq!(
+            step_names,
+            vec!["smoke-check", "extract", "status", "refresh", "evidence"]
+        );
+        // evidence uses --symbol (not a positional) and has no --budget flag
+        let evidence = recipe.steps.last().unwrap();
+        assert!(evidence.command.contains("kg evidence --symbol"));
+        assert!(!evidence.command.contains("--budget"));
+        // extract is the write step; reads should not re-extract
+        assert!(
+            recipe
+                .handle_contract
+                .iter()
+                .any(|item| item.contains("Extract once"))
+        );
+    }
+
     // --- JSON compact vs pretty ---
 
     #[test]
