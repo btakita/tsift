@@ -14,6 +14,13 @@ pub use ollama::OllamaKgExtractor;
 pub const KG_CONTRACT_VERSION: &str = "tsift-kg-v1";
 pub const HASH_KG_EXTRACTOR_ID: &str = "tsift-local-hash-v1";
 
+/// #kgconf: neutral fallback confidence used when an extractor does not emit a
+/// per-entity/relation confidence. The projection always persists a `confidence`
+/// property (tagged `confidence_source=default` here, `=model` when the value
+/// came from the extractor) so the confidence/recency gating (#kgctxinject) has
+/// data to act on instead of silently treating every entity as `0.0`.
+pub const DEFAULT_KG_CONFIDENCE: f64 = 0.5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KgInputKind {
@@ -650,9 +657,16 @@ fn entity_node(
     if let Some(description) = &entity.description {
         node = node.with_property("description", description.clone());
     }
-    if let Some(confidence) = entity.confidence {
-        node = node.with_property("confidence", format!("{confidence:.3}"));
-    }
+    // #kgconf: always persist a confidence score (model value when present, else a
+    // derived neutral default) plus its source, so downstream gating never sees a
+    // missing confidence and can weight model-emitted values above defaults.
+    let (confidence, confidence_source) = match entity.confidence {
+        Some(value) => (value, "model"),
+        None => (DEFAULT_KG_CONFIDENCE, "default"),
+    };
+    node = node
+        .with_property("confidence", format!("{confidence:.3}"))
+        .with_property("confidence_source", confidence_source);
     node
 }
 
@@ -679,9 +693,15 @@ fn relation_edge(
     if let Some(label) = &relation.label {
         edge = edge.with_property("label", label.clone());
     }
-    if let Some(confidence) = relation.confidence {
-        edge = edge.with_property("confidence", format!("{confidence:.3}"));
-    }
+    // #kgconf: persist confidence + source on every relation edge, mirroring the
+    // entity-node guarantee so relation gating is operable too.
+    let (confidence, confidence_source) = match relation.confidence {
+        Some(value) => (value, "model"),
+        None => (DEFAULT_KG_CONFIDENCE, "default"),
+    };
+    edge = edge
+        .with_property("confidence", format!("{confidence:.3}"))
+        .with_property("confidence_source", confidence_source);
     edge
 }
 
@@ -945,6 +965,108 @@ mod tests {
             )
             .unwrap();
         assert_eq!(semantic_entities, 2);
+    }
+
+    /// #kgconf: an extractor that emits a model confidence must have it persisted
+    /// (`confidence_source=model`); an extractor that omits confidence must still
+    /// yield a node carrying the derived default so gating always has data.
+    #[test]
+    fn projection_always_persists_confidence_with_source_tag() {
+        #[derive(Debug)]
+        struct MixedConfidenceExtractor;
+        impl KgExtractor for MixedConfidenceExtractor {
+            fn metadata(&self) -> KgExtractorMetadata {
+                KgExtractorMetadata {
+                    provider_id: "mixed-provider".to_string(),
+                    provider_kind: ProviderKind::LlamaCpp,
+                    extraction_model: "mixed-model".to_string(),
+                }
+            }
+            fn extract_json(&self, _chunk: &KgChunk) -> Result<String> {
+                // entity `a` carries a model confidence; entity `b` omits it.
+                Ok(serde_json::json!({
+                    "entities": [
+                        {"id": "a", "label": "WithConf", "kind": "concept", "confidence": 0.42},
+                        {"id": "b", "label": "NoConf", "kind": "concept"}
+                    ],
+                    "relations": [
+                        {"from": "a", "to": "b", "kind": "related_to"}
+                    ]
+                })
+                .to_string())
+            }
+        }
+
+        let docs = vec![KgInputDocument::source(
+            "src/lib.rs",
+            "WithConf relates to NoConf in the graph.",
+        )];
+        let report = extract_documents_to_projection(
+            &docs,
+            &MixedConfidenceExtractor,
+            ChunkingConfig {
+                max_chars: 120,
+                overlap_chars: 0,
+            },
+        )
+        .unwrap();
+
+        let entities: Vec<_> = report
+            .projection
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "semantic_entity")
+            .collect();
+        assert_eq!(entities.len(), 2);
+        // Every entity carries a parseable confidence + a source tag.
+        for entity in &entities {
+            let confidence = entity
+                .properties
+                .get("confidence")
+                .and_then(|c| c.parse::<f64>().ok())
+                .expect("every semantic_entity must persist a confidence");
+            assert!((0.0..=1.0).contains(&confidence));
+            assert!(entity.properties.contains_key("confidence_source"));
+        }
+
+        let with_conf = entities
+            .iter()
+            .find(|e| e.label == "WithConf")
+            .unwrap();
+        assert_eq!(
+            with_conf.properties.get("confidence"),
+            Some(&"0.420".to_string())
+        );
+        assert_eq!(
+            with_conf.properties.get("confidence_source"),
+            Some(&"model".to_string())
+        );
+
+        let no_conf = entities.iter().find(|e| e.label == "NoConf").unwrap();
+        assert_eq!(
+            no_conf.properties.get("confidence"),
+            Some(&format!("{DEFAULT_KG_CONFIDENCE:.3}"))
+        );
+        assert_eq!(
+            no_conf.properties.get("confidence_source"),
+            Some(&"default".to_string())
+        );
+
+        // The relation edge omits model confidence, so it gets the derived default.
+        let relation = report
+            .projection
+            .edges
+            .iter()
+            .find(|edge| edge.kind == "semantic_relation")
+            .unwrap();
+        assert_eq!(
+            relation.properties.get("confidence"),
+            Some(&format!("{DEFAULT_KG_CONFIDENCE:.3}"))
+        );
+        assert_eq!(
+            relation.properties.get("confidence_source"),
+            Some(&"default".to_string())
+        );
     }
 
     #[test]

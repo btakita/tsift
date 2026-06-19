@@ -237,7 +237,10 @@ fn payload_schema() -> Value {
                         "description": { "type": "string" },
                         "confidence": { "type": "number" }
                     },
-                    "required": ["id", "label", "kind"]
+                    // #kgconf: require `confidence` so the structured decoder emits a
+                    // real per-entity score instead of dropping the optional field
+                    // (which left every projected node confidence-less).
+                    "required": ["id", "label", "kind", "confidence"]
                 }
             },
             "relations": {
@@ -251,7 +254,8 @@ fn payload_schema() -> Value {
                         "label": { "type": "string" },
                         "confidence": { "type": "number" }
                     },
-                    "required": ["from", "to", "kind"]
+                    // #kgconf: require `confidence` on relations for the same reason.
+                    "required": ["from", "to", "kind", "confidence"]
                 }
             }
         },
@@ -376,6 +380,26 @@ mod tests {
         // Structured output schema constrains entities/relations.
         assert_eq!(body["format"]["type"], "object");
         assert_eq!(body["format"]["required"][0], "entities");
+        // #kgconf: confidence is a required field so the decoder emits a real
+        // per-entity/relation score instead of dropping the optional property.
+        let entity_required = &body["format"]["properties"]["entities"]["items"]["required"];
+        assert!(
+            entity_required
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "confidence"),
+            "entity schema must require confidence"
+        );
+        let relation_required = &body["format"]["properties"]["relations"]["items"]["required"];
+        assert!(
+            relation_required
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "confidence"),
+            "relation schema must require confidence"
+        );
     }
 
     #[test]

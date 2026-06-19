@@ -133,6 +133,16 @@ run manifest and metrics.
 KG nodes and edges must be emitted as normal `GraphProjection` rows:
 
 - extracted fact ids are stable by source fact, not by run id;
+- every projected `semantic_entity` node and `semantic_relation` edge **must
+  persist a `confidence` property** (`0.000..=1.000`, 3-decimal string) plus a
+  `confidence_source` tag of `model` (the extractor emitted a value) or `default`
+  (the extractor omitted one and the neutral derived default
+  `DEFAULT_KG_CONFIDENCE = 0.5` was applied). The projection never drops the
+  confidence field, so the confidence/recency gating in the context-pack
+  retrieval (`min_confidence`, confidence-descending ranking) always has data to
+  act on instead of treating every entity as `0.0`. The Ollama structured-output
+  schema lists `confidence` as a required field to elicit real model scores;
+  `confidence_source` lets gating weight model-emitted values above defaults;
 - each fact carries `GraphProvenance { source_system: "tsift-kg", source_ref }`;
 - `source_ref` points to the source handle and run manifest id;
 - `content_hash` covers schema version, model profile id, prompt hash, source
