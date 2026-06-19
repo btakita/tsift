@@ -262,6 +262,16 @@ inject into the extractor prompt:
   compute each one's degree (incident edge count) from a single edge pass; they
   never dump the full graph (same discipline as `#kgwiring`'s evidence cap) and
   report `scan_truncated` when more eligible nodes existed beyond the cap.
+- **Query-time identity merge (#kgentitycollapse)** — the extractor reconciles a
+  recurring entity to a canonical `kgent-…` id (recorded as the `entity_id`
+  property), but each chunk/source still projects a distinct node id for it, so
+  the graph holds multiple provenance-bearing nodes for one logical entity.
+  Candidate collection collapses nodes that share a canonical `entity_id` to a
+  single representative (highest confidence, then the group's max degree, then
+  smallest node id), so retrieval surfaces one logical entity. This is a
+  **read-side merge** — every node and its provenance stays in the graph; nothing
+  is deleted. Nodes carrying only a chunk-local slug (`e0`/`e1`, not a `kgent-`
+  id) are never merge keys, so distinct entities that reuse a slug stay separate.
 - **Deterministic ranking** — `build_context_pack` orders the bounded candidate
   set by seed match (case-insensitive token overlap with the label) →
   connectivity (degree, descending) → confidence (descending) → stable node-id

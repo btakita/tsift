@@ -106,18 +106,73 @@ pub fn collect_candidates_from_nodes(
     }
 
     let mut out: Vec<ContextCandidate> = Vec::new();
+    // #kgentitycollapse: query-time identity merge. The extractor reconciles
+    // recurring entities to a canonical `kgent-…` id (stored as the `entity_id`
+    // property), but each chunk/source still projects its own distinct node id.
+    // Collapsing candidates that share a canonical entity_id makes retrieval
+    // surface ONE representative per logical entity (the graph keeps every
+    // provenance-bearing node — this is a read-side merge, no deletion). Nodes
+    // without a canonical id (label-local `e0`/`e1` slugs) stay distinct.
+    let mut canonical_slot: HashMap<String, usize> = HashMap::new();
+    let mut scanned = 0usize;
     let mut scan_truncated = false;
     for node in nodes {
         if node.kind != "semantic_entity" {
             continue;
         }
-        if out.len() >= config.max_candidate_scan {
+        if scanned >= config.max_candidate_scan {
             scan_truncated = true;
             break;
         }
-        out.push(node_to_candidate(node, degree.get(node.id.as_str()).copied().unwrap_or(0)));
+        scanned += 1;
+        let cand = node_to_candidate(node, degree.get(node.id.as_str()).copied().unwrap_or(0));
+        match canonical_entity_id(node) {
+            Some(canon) => match canonical_slot.get(&canon).copied() {
+                Some(idx) => {
+                    // Keep the strongest representative but never understate the
+                    // logical entity's connectivity — carry the max degree.
+                    let merged_degree = out[idx].degree.max(cand.degree);
+                    if candidate_supersedes(&cand, &out[idx]) {
+                        out[idx] = cand;
+                    }
+                    out[idx].degree = merged_degree;
+                }
+                None => {
+                    canonical_slot.insert(canon, out.len());
+                    out.push(cand);
+                }
+            },
+            None => out.push(cand),
+        }
     }
     (out, scan_truncated)
+}
+
+/// The canonical `kgent-…` identity an extractor reconciled this node to, if any.
+/// Only canonical ids (not the model's chunk-local `e0`/`e1` slugs) are merge
+/// keys, so distinct entities that happen to share a local slug stay separate.
+fn canonical_entity_id(node: &GraphNode) -> Option<String> {
+    node.properties
+        .get("entity_id")
+        .filter(|id| id.starts_with("kgent-"))
+        .cloned()
+}
+
+/// Total order for choosing the representative of a merged canonical group:
+/// higher confidence, then higher degree, then smaller node id (deterministic).
+fn candidate_supersedes(new: &ContextCandidate, current: &ContextCandidate) -> bool {
+    (
+        new.confidence,
+        new.degree,
+        std::cmp::Reverse(new.node_id.as_str()),
+    )
+        .partial_cmp(&(
+            current.confidence,
+            current.degree,
+            std::cmp::Reverse(current.node_id.as_str()),
+        ))
+        .map(|ord| ord == Ordering::Greater)
+        .unwrap_or(false)
 }
 
 /// Collect candidates from a [`GraphProjection`] — the natural integration
@@ -428,6 +483,46 @@ mod tests {
         let (cands, _) = collect_candidates_from_projection(&p, &ContextPackConfig::default());
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].node_id, "kgent-a");
+    }
+
+    /// #kgentitycollapse: candidates reconciled to the same canonical entity_id
+    /// collapse to one representative (highest confidence, max degree); distinct
+    /// canonical ids and local-slug ids stay separate.
+    #[test]
+    fn collapses_candidates_sharing_canonical_entity_id() {
+        let mut p = GraphProjection::default();
+        p.nodes.push(
+            ent("kgent-chunkA", "GraphProjection", "type", 0.4)
+                .with_property("entity_id", "kgent-canon"),
+        );
+        p.nodes.push(
+            ent("kgent-chunkB", "GraphProjection", "type", 0.8)
+                .with_property("entity_id", "kgent-canon"),
+        );
+        p.nodes.push(
+            ent("kgent-chunkC", "SqliteGraphStore", "type", 0.6)
+                .with_property("entity_id", "kgent-other"),
+        );
+        // A local-slug id ("e0") is NOT a merge key — stays distinct.
+        p.nodes.push(
+            ent("kgent-chunkD", "GraphProjection", "type", 0.9).with_property("entity_id", "e0"),
+        );
+        // chunkA has higher degree; the merged representative must carry it.
+        p.edges.push(GraphEdge::new("kgent-chunkA", "x", "related"));
+        p.edges.push(GraphEdge::new("kgent-chunkA", "y", "related"));
+
+        let (cands, _) = collect_candidates_from_projection(&p, &ContextPackConfig::default());
+        assert_eq!(cands.len(), 3, "canon merged + other + local-slug = 3");
+        let canon = cands
+            .iter()
+            .find(|c| c.node_id == "kgent-chunkB")
+            .expect("higher-confidence node is the representative");
+        assert_eq!(canon.confidence, 0.8);
+        assert_eq!(canon.degree, 2, "representative carries the group's max degree");
+        assert!(
+            cands.iter().all(|c| c.node_id != "kgent-chunkA"),
+            "merged-away node id is gone"
+        );
     }
 
     #[test]
