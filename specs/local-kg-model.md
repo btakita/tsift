@@ -272,6 +272,16 @@ inject into the extractor prompt:
   **read-side merge** — every node and its provenance stays in the graph; nothing
   is deleted. Nodes carrying only a chunk-local slug (`e0`/`e1`, not a `kgent-`
   id) are never merge keys, so distinct entities that reuse a slug stay separate.
+- **Durable `same_as` links (#kgsameas)** — the query-time merge only dedups the
+  context-pack retrieval surface. For graph-level consumers (`tsift
+  graph`/`explain`/`summarize`, the SurrealDB projection) `kg extract` also writes
+  durable `same_as` edges via `link_canonical_entities_sqlite` →
+  `SqliteGraphStore::link_nodes_by_shared_property`: every `semantic_entity` node
+  sharing a canonical `entity_id` (`kgent-` prefixed) is starred to its group's
+  smallest node id. No node is deleted (provenance preserved) and the edges key on
+  `(from, to, kind)`, so re-extraction re-links idempotently. Together the two
+  mechanisms give one logical entity to both the retrieval pack and direct graph
+  traversal.
 - **Deterministic ranking** — `build_context_pack` orders the bounded candidate
   set by seed match (case-insensitive token overlap with the label) →
   connectivity (degree, descending) → **confidence provenance tier

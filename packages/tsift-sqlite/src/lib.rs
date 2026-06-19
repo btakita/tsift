@@ -2018,6 +2018,65 @@ impl SqliteGraphStore {
         Ok(deleted)
     }
 
+    /// #kgsameas: link nodes of `kind` that share the same `id_key` property value
+    /// (restricted to values starting with `id_prefix`) using star `edge_kind`
+    /// edges — each group's members point at its lexicographically-smallest node
+    /// id. This collapses duplicate logical entities for ALL graph consumers (not
+    /// just the context pack), without deleting any node, so per-source provenance
+    /// is preserved. Idempotent: edges key on (from,to,kind), so re-running upserts
+    /// the same set. Returns the number of link edges written.
+    pub fn link_nodes_by_shared_property(
+        &mut self,
+        kind: &str,
+        id_key: &str,
+        id_prefix: &str,
+        edge_kind: &str,
+        edge_properties: &[(&str, &str)],
+    ) -> Result<usize> {
+        // Read members grouped by shared id value (ordered so the representative
+        // is deterministic: the smallest node id within each group).
+        let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT p.value, n.id \
+                 FROM graph_nodes n \
+                 JOIN graph_node_properties p ON p.node_id = n.id \
+                 WHERE n.kind = ?1 AND p.key = ?2 AND p.value LIKE ?3 || '%' \
+                 ORDER BY p.value, n.id",
+            )?;
+            let rows = stmt.query_map((kind, id_key, id_prefix), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (shared, node_id) = row?;
+                groups.entry(shared).or_default().push(node_id);
+            }
+        }
+
+        let mut edges: Vec<GraphEdge> = Vec::new();
+        for members in groups.values() {
+            let Some((rep, rest)) = members.split_first() else {
+                continue;
+            };
+            for member in rest {
+                let mut edge = GraphEdge::new(member.clone(), rep.clone(), edge_kind);
+                for (key, value) in edge_properties {
+                    edge = edge.with_property(*key, *value);
+                }
+                edges.push(edge);
+            }
+        }
+
+        let count = edges.len();
+        if count > 0 {
+            self.upsert_projection(&GraphProjection {
+                nodes: Vec::new(),
+                edges,
+            })?;
+        }
+        Ok(count)
+    }
+
     pub fn projection_version(&self, scope: &str) -> Result<Option<SqliteProjectionVersion>> {
         self.conn
             .query_row(
@@ -5197,6 +5256,85 @@ mod tests {
         assert!(onto2.nodes.iter().all(|n| n.kind == "ontology_type"));
         assert_eq!(onto2.nodes.len(), onto.nodes.len());
         assert_eq!(onto2.edges.len(), onto.edges.len());
+    }
+
+    /// #kgsameas: link_nodes_by_shared_property stars duplicate nodes sharing a
+    /// prefixed property value to the group's smallest node id, is idempotent, and
+    /// ignores values without the prefix / singleton groups.
+    #[test]
+    fn link_nodes_by_shared_property_stars_duplicates_idempotently() {
+        let mut store = SqliteGraphStore::in_memory().unwrap();
+        let seed = GraphProjection {
+            nodes: vec![
+                // Three nodes reconciled to one canonical entity (kgent-canon).
+                GraphNode::new("kgent-z", "semantic_entity", "Dup")
+                    .with_property("entity_id", "kgent-canon"),
+                GraphNode::new("kgent-a", "semantic_entity", "Dup")
+                    .with_property("entity_id", "kgent-canon"),
+                GraphNode::new("kgent-m", "semantic_entity", "Dup")
+                    .with_property("entity_id", "kgent-canon"),
+                // A singleton canonical entity — no link.
+                GraphNode::new("kgent-solo", "semantic_entity", "Solo")
+                    .with_property("entity_id", "kgent-other"),
+                // A local-slug id — not a merge key (no kgent- prefix).
+                GraphNode::new("kgent-local", "semantic_entity", "Local")
+                    .with_property("entity_id", "e0"),
+            ],
+            edges: vec![],
+        };
+        store.upsert_projection(&seed).unwrap();
+
+        let written = store
+            .link_nodes_by_shared_property(
+                "semantic_entity",
+                "entity_id",
+                "kgent-",
+                "same_as",
+                &[("provider", "tsift-kg")],
+            )
+            .unwrap();
+        // 3-member group -> 2 star edges; singleton + local-slug contribute none.
+        assert_eq!(written, 2);
+
+        // Representative is the smallest node id (kgent-a); members star to it.
+        let same_as: Vec<(String, String)> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT from_id, to_id FROM graph_edges WHERE kind = 'same_as' ORDER BY from_id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            same_as,
+            vec![
+                ("kgent-m".to_string(), "kgent-a".to_string()),
+                ("kgent-z".to_string(), "kgent-a".to_string()),
+            ]
+        );
+
+        // Idempotent: a second run writes the same set, no duplicate edges.
+        let written2 = store
+            .link_nodes_by_shared_property(
+                "semantic_entity",
+                "entity_id",
+                "kgent-",
+                "same_as",
+                &[("provider", "tsift-kg")],
+            )
+            .unwrap();
+        assert_eq!(written2, 2);
+        let edge_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_edges WHERE kind = 'same_as'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge_count, 2, "re-run must not duplicate same_as edges");
     }
 
     /// #kgrefreshdup: delete_source_projection removes a provider's nodes for a

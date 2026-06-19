@@ -16,6 +16,10 @@ pub const HASH_KG_EXTRACTOR_ID: &str = "tsift-local-hash-v1";
 /// `provider` property stamped on every KG-projected node/edge. Used to scope
 /// per-source replacement (#kgrefreshdup) so it never touches non-KG graph rows.
 pub const KG_PROVIDER: &str = "tsift-kg";
+/// #kgsameas: edge kind linking duplicate `semantic_entity` nodes that share a
+/// canonical `entity_id`, so graph-level consumers collapse them to one logical
+/// entity (the durable counterpart to the context-pack query-time merge).
+pub const KG_SAME_AS_EDGE: &str = "same_as";
 
 /// #kgconf: neutral fallback confidence used when an extractor does not emit a
 /// per-entity/relation confidence. The projection always persists a `confidence`
@@ -421,6 +425,24 @@ pub fn replace_kg_source_projection_sqlite(
         nodes_upserted: projection.nodes.len(),
         edges_upserted: projection.edges.len(),
     })
+}
+
+/// #kgsameas: link canonical-entity duplicates across the whole graph with
+/// durable `same_as` edges so graph-level consumers (graph/explain/summarize,
+/// SurrealDB) see one logical entity — the durable counterpart to the
+/// context-pack query-time merge (#kgentitycollapse). Groups `semantic_entity`
+/// nodes by canonical `entity_id` (`kgent-` prefixed) and stars each group's
+/// members to its smallest node id. No node is deleted (provenance preserved);
+/// idempotent. Returns the number of `same_as` edges written.
+pub fn link_canonical_entities_sqlite(graph_db: &Path) -> Result<usize> {
+    let mut store = SqliteGraphStore::open(graph_db)?;
+    store.link_nodes_by_shared_property(
+        "semantic_entity",
+        "entity_id",
+        "kgent-",
+        KG_SAME_AS_EDGE,
+        &[("provider", KG_PROVIDER), ("contract", KG_CONTRACT_VERSION)],
+    )
 }
 
 /// Distinct `source_ref` property values across the projection's nodes, in
@@ -1171,6 +1193,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(total, 4);
+    }
+
+    /// #kgsameas: link_canonical_entities_sqlite writes a same_as edge between
+    /// two nodes reconciled to the same canonical entity_id.
+    #[test]
+    fn link_canonical_entities_writes_same_as_edges() {
+        use tsift_core::GraphNode;
+        let dir = TempDir::new().unwrap();
+        let graph_db = dir.path().join(".tsift/graph.db");
+        let projection = GraphProjection {
+            nodes: vec![
+                GraphNode::new("kgent-1", "semantic_entity", "Dup")
+                    .with_property("provider", "tsift-kg")
+                    .with_property("entity_id", "kgent-canon"),
+                GraphNode::new("kgent-2", "semantic_entity", "Dup")
+                    .with_property("provider", "tsift-kg")
+                    .with_property("entity_id", "kgent-canon"),
+            ],
+            edges: vec![],
+        };
+        upsert_kg_projection_sqlite(&graph_db, &projection).unwrap();
+
+        let written = link_canonical_entities_sqlite(&graph_db).unwrap();
+        assert_eq!(written, 1);
+        let conn = Connection::open(&graph_db).unwrap();
+        let same_as: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_edges WHERE kind = 'same_as'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(same_as, 1);
     }
 
     #[test]
