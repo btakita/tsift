@@ -330,6 +330,20 @@ pub struct ReadOnlyInspectResult {
     pub recovery: Option<ReadOnlyRecovery>,
 }
 
+/// Per-file zone-map / min-max segment statistics (DuckDB row-group zonemap analog).
+/// Lets index.db-backed path/kind/scope queries skip whole files before scanning.
+/// `kinds` holds the distinct symbol kinds present in the file; a missing row means
+/// "unknown — cannot skip" so pruning stays sound (see plan-tsift-zonemap-segment-stats.md).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FileZonemap {
+    pub path: String,
+    pub min_line: u32,
+    pub max_line: u32,
+    pub symbol_count: u32,
+    pub kinds: Vec<String>,
+    pub content_hash: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StoredSymbol {
     pub name: String,
@@ -482,6 +496,14 @@ impl IndexDb {
                 mtime_secs INTEGER NOT NULL,
                 mtime_nanos INTEGER NOT NULL,
                 language TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS file_zonemap (
+                path TEXT PRIMARY KEY,
+                min_line INTEGER NOT NULL,
+                max_line INTEGER NOT NULL,
+                symbol_count INTEGER NOT NULL,
+                kinds TEXT NOT NULL,
+                content_hash TEXT
             );
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
@@ -925,6 +947,12 @@ impl IndexDb {
                 .conn
                 .prepare("DELETE FROM file_state WHERE path = ?1")?;
             let mut delete_symbols = self.conn.prepare("DELETE FROM symbols WHERE file = ?1")?;
+            let mut insert_zonemap = self.conn.prepare(
+                "INSERT OR REPLACE INTO file_zonemap (path, min_line, max_line, symbol_count, kinds, content_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            )?;
+            let mut delete_zonemap = self
+                .conn
+                .prepare("DELETE FROM file_zonemap WHERE path = ?1")?;
             let mut insert_symbol = self.conn.prepare(
                 "INSERT INTO symbols (name, kind, language, signature, file, line, end_line, node_kind, start_byte, end_byte, body_start_byte, body_end_byte, parent_module, visibility, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
             )?;
@@ -959,6 +987,7 @@ impl IndexDb {
                         ])?;
 
                         delete_symbols.execute(rusqlite::params![&path_str])?;
+                        delete_zonemap.execute(rusqlite::params![&path_str])?;
                         delete_edges.execute(rusqlite::params![&path_str])?;
                         delete_routes.execute(rusqlite::params![&path_str])?;
                         let lang = change
@@ -1006,6 +1035,35 @@ impl IndexDb {
                                         tags,
                                     ])?;
                                 }
+                            }
+                            if let Some(ref source) = source {
+                                // Zone-map: per-file min/max line span, symbol count, distinct
+                                // kinds, and content hash. `kinds` is comma-fenced
+                                // (",function,struct,") so a sound skip is `kinds NOT LIKE
+                                // '%,<kind>,%'`. Files without a recognized language get no row,
+                                // which readers treat as "cannot skip".
+                                let max_line =
+                                    source.iter().filter(|&&byte| byte == b'\n').count() as i64 + 1;
+                                let symbol_slice = symbols.as_deref().unwrap_or(&[]);
+                                let symbol_count = symbol_slice.len() as i64;
+                                let mut kind_set: Vec<&str> =
+                                    symbol_slice.iter().map(|sym| sym.kind.as_str()).collect();
+                                kind_set.sort_unstable();
+                                kind_set.dedup();
+                                let kinds = if kind_set.is_empty() {
+                                    ",".to_string()
+                                } else {
+                                    format!(",{},", kind_set.join(","))
+                                };
+                                let content_hash = graph::source_content_hash(source);
+                                insert_zonemap.execute(rusqlite::params![
+                                    &path_str,
+                                    1_i64,
+                                    max_line,
+                                    symbol_count,
+                                    kinds,
+                                    content_hash,
+                                ])?;
                             }
                             if let Some(ref source) = source {
                                 let call_sites = warning_on_error(
@@ -1060,6 +1118,7 @@ impl IndexDb {
                     ChangeKind::Deleted => {
                         delete_file.execute(rusqlite::params![&path_str])?;
                         delete_symbols.execute(rusqlite::params![&path_str])?;
+                        delete_zonemap.execute(rusqlite::params![&path_str])?;
                         delete_edges.execute(rusqlite::params![&path_str])?;
                         delete_routes.execute(rusqlite::params![&path_str])?;
                     }
@@ -1103,6 +1162,7 @@ impl IndexDb {
         self.conn.execute_batch("SAVEPOINT sp_rebuild")?;
         let result: Result<IndexSummary> = (|| {
             self.conn.execute("DELETE FROM file_state", [])?;
+            self.conn.execute("DELETE FROM file_zonemap", [])?;
             self.conn.execute("DELETE FROM symbols", [])?;
             self.conn.execute("DELETE FROM call_edges", [])?;
             self.conn.execute("DELETE FROM route_nodes", [])?;
@@ -1135,6 +1195,54 @@ impl IndexDb {
             .conn
             .prepare("SELECT path FROM file_state ORDER BY path")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn zonemap_count(&self) -> Result<usize> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM file_zonemap", [], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
+    /// Per-file zone-map rows, ordered by path. See [`FileZonemap`].
+    pub fn file_zonemaps(&self) -> Result<Vec<FileZonemap>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, min_line, max_line, symbol_count, kinds, content_hash FROM file_zonemap ORDER BY path",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let kinds: String = row.get(4)?;
+            Ok(FileZonemap {
+                path: row.get(0)?,
+                min_line: row.get::<_, i64>(1)? as u32,
+                max_line: row.get::<_, i64>(2)? as u32,
+                symbol_count: row.get::<_, i64>(3)? as u32,
+                kinds: kinds
+                    .split(',')
+                    .filter(|piece| !piece.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                content_hash: row.get(5)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Sound zone-map prune for a kind-filtered scan: returns the indexed file paths
+    /// that **can** contain `kind`. Files with a zone-map row whose `kinds` lacks `kind`
+    /// are skipped; files without a row are conservatively retained (cannot prove absence),
+    /// preserving the invariant that the pruned set is a superset of the true match set.
+    pub fn files_possibly_containing_kind(&self, kind: &str) -> Result<Vec<String>> {
+        let needle = format!("%,{kind},%");
+        let mut stmt = self.conn.prepare(
+            "SELECT fs.path FROM file_state fs \
+             LEFT JOIN file_zonemap zm ON zm.path = fs.path \
+             WHERE zm.path IS NULL OR zm.kinds LIKE ?1 \
+             ORDER BY fs.path",
+        )?;
+        let rows = stmt.query_map([needle], |row| row.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
@@ -1755,6 +1863,108 @@ mod tests {
         assert_eq!(summary.deleted, 0);
         assert_eq!(summary.unchanged, 0);
         assert_eq!(summary.total_tracked, 3);
+    }
+
+    #[test]
+    fn zonemap_populated_for_code_files_only() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        // 3 recognized-language files get a zone-map row; readme.txt (no lang) does not,
+        // even though it has a file_state row.
+        assert_eq!(db.zonemap_count().unwrap(), 3);
+        let zonemaps = db.file_zonemaps().unwrap();
+        assert!(!zonemaps.iter().any(|zm| zm.path.ends_with("readme.txt")));
+
+        let main = zonemaps
+            .iter()
+            .find(|zm| zm.path.ends_with("main.rs"))
+            .expect("zonemap row for main.rs");
+        assert_eq!(main.min_line, 1);
+        assert_eq!(main.max_line, 1); // single-line "fn main() {}"
+        assert!(main.symbol_count >= 1);
+        assert!(!main.kinds.is_empty());
+        assert!(main.content_hash.is_some());
+    }
+
+    #[test]
+    fn zonemap_updated_on_modify_and_removed_on_delete() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        // Modify main.rs to span more lines — max_line must grow.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(
+            dir.path().join("main.rs"),
+            "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n",
+        )
+        .unwrap();
+        db.apply_changes(dir.path()).unwrap();
+        let main = db
+            .file_zonemaps()
+            .unwrap()
+            .into_iter()
+            .find(|zm| zm.path.ends_with("main.rs"))
+            .expect("zonemap row after modify");
+        assert!(main.max_line >= 4, "max_line should grow, got {}", main.max_line);
+
+        // Delete main.rs — its zone-map row must be removed.
+        fs::remove_file(dir.path().join("main.rs")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+        assert_eq!(db.zonemap_count().unwrap(), 2);
+        assert!(
+            !db.file_zonemaps()
+                .unwrap()
+                .iter()
+                .any(|zm| zm.path.ends_with("main.rs"))
+        );
+    }
+
+    #[test]
+    fn files_possibly_containing_kind_is_sound() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        // Use a kind actually present in main.rs (avoid hardcoding the extractor's label).
+        let main = db
+            .file_zonemaps()
+            .unwrap()
+            .into_iter()
+            .find(|zm| zm.path.ends_with("main.rs"))
+            .expect("zonemap row for main.rs");
+        let kind = main.kinds.first().expect("main.rs has a symbol kind").clone();
+
+        let present = db.files_possibly_containing_kind(&kind).unwrap();
+        assert!(present.iter().any(|p| p.ends_with("main.rs")));
+
+        // A kind no tracked file contains: every file has a zone-map row and none match,
+        // so all are pruned.
+        let bogus = db.files_possibly_containing_kind("zzz_nonexistent_kind").unwrap();
+        assert!(bogus.is_empty());
+
+        // Soundness: a file_state row WITHOUT a zone-map row (a legacy index not yet
+        // reindexed under this feature) is conservatively retained — pruning must never
+        // drop a file it cannot prove absent. Simulate by dropping main.rs's zone-map row.
+        db.conn
+            .execute("DELETE FROM file_zonemap WHERE path LIKE '%main.rs'", [])
+            .unwrap();
+        let retained = db.files_possibly_containing_kind("zzz_nonexistent_kind").unwrap();
+        assert!(
+            retained.iter().any(|p| p.ends_with("main.rs")),
+            "a file lacking a zone-map row must be retained (sound)"
+        );
+    }
+
+    #[test]
+    fn rebuild_repopulates_zonemap() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+        db.rebuild(dir.path()).unwrap();
+        assert_eq!(db.zonemap_count().unwrap(), 3);
     }
 
     #[test]

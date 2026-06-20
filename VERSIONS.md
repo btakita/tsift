@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- Added a per-file zone-map / min-max segment-statistics table (`file_zonemap`) to the index — the DuckDB row-group "zonemap" analog for pre-scan pruning. Each recognized-language file records its line span (`min_line`/`max_line`), `symbol_count`, the distinct symbol `kinds` present (comma-fenced for `LIKE`-based skip predicates), and `content_hash`. Populated incrementally at index time and on `rebuild`, cleared on modify, removed on delete.
+- New `IndexDb` read API: `zonemap_count`, `file_zonemaps`, and `files_possibly_containing_kind` — a **sound** kind-filter prune: files lacking a zone-map row (e.g. a legacy index not yet reindexed) are conservatively retained, so the pruned set is always a superset of the true match set.
+- Additive and behavior-preserving — no search path consults the zone-map yet. The lexical `Sift` search uses its own `TokenIndex` (not `index.db`), so live query-time pruning (plan Phase 3) is deferred pending a design that targets the index.db-backed path/kind/scope consumers. See `agent-loop/tasks/software/plan-tsift-zonemap-segment-stats.md`.
+
 ## 0.1.72
 
 - **release: publish-list completeness for `tsift-local-model` + `tsift-kg`.** The v0.1.71 crates.io publish failed (`no matching package named tsift-kg found`, required by `tsift-memgraphrag`) because the two new KG crates were never added to `release.yml`'s two `for package in` publish lists, so they were never published and the dependency-ordered publish of `tsift-memgraphrag` broke. Both `tsift-local-model` (leaf) and `tsift-kg` (depends on `tsift-core`/`tsift-local-model`/`tsift-sqlite`, consumed by `tsift-cli`/`tsift-memgraphrag`) are now listed before `tsift-memgraphrag` in both the package-file check and the crates.io publish loop. **Operator gate:** these two crate names have no crates.io Trusted Publishing config yet (only the prior 23 crates do), so the OIDC publish of a brand-new crate needs a Trusted Publishing config created for each name on crates.io before the `v0.1.72` tag is pushed.
