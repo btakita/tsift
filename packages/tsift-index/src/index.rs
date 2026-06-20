@@ -1292,6 +1292,31 @@ impl IndexDb {
             .collect())
     }
 
+    /// Like [`content_fts_search`](Self::content_fts_search) but also returns each
+    /// hit's stored `body` (#015t Phase 3b). The body is stored inline in
+    /// `content_fts`, so the CLI search path can pick a representative line +
+    /// snippet without re-reading the file from disk. Ordered by BM25 rank, same
+    /// as the base method.
+    pub fn content_fts_search_with_body(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, f64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, bm25(content_fts) AS score, body FROM content_fts \
+             WHERE content_fts MATCH ?1 ORDER BY score LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![query, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// Per-file zone-map rows, ordered by path. See [`FileZonemap`].
     pub fn file_zonemaps(&self) -> Result<Vec<FileZonemap>> {
         let mut stmt = self.conn.prepare(

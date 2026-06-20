@@ -28818,6 +28818,44 @@ tier = "private"
         assert!(path.extension().is_some_and(|ext| ext == "json"));
     }
 
+    #[test]
+    fn fts_search_flag_value_parses_truthy_values() {
+        // #015t Phase 3b gate parser: default-off, accepts common truthy spellings.
+        for truthy in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(
+                fts_flag_value_enabled(truthy),
+                "{truthy:?} should enable the FTS path"
+            );
+        }
+        for falsy in ["", "0", "false", "no", "off", "maybe"] {
+            assert!(
+                !fts_flag_value_enabled(falsy),
+                "{falsy:?} should keep the lexical default"
+            );
+        }
+    }
+
+    #[test]
+    fn run_sift_search_default_off_uses_lexical_path() {
+        // With the flag unset, run_sift_search must keep the TokenIndex/lexical
+        // strategy even when a root index.db exists (Phase 3b is opt-in).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("alpha.rs"), "fn alpha_handler() {}\n").unwrap();
+        index::IndexDb::open(&root.join(".tsift/index.db"))
+            .unwrap()
+            .apply_changes(root)
+            .unwrap();
+        let cache_dir = root.join(".tsift/search-cache");
+
+        // Guard against ambient flag contamination from a parallel test/env.
+        if fts_search_flag_enabled() {
+            return;
+        }
+        let response = run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical").unwrap();
+        assert_eq!(response.strategy, "lexical");
+    }
+
     // --- index quiet mode ---
 
     #[test]
@@ -34219,12 +34257,44 @@ pub(crate) fn run_sift_search(
     limit: usize,
     strategy: &str,
 ) -> Result<sift::SearchResponse> {
+    // #015t Phase 3b: opt-in, default-off `index.db` FTS5 search path. The JSON
+    // TokenIndex stays authoritative until the Phase 4 cutover proves top-K
+    // parity; this runs only when `TSIFT_FTS_SEARCH` is set truthy AND a real
+    // root index.db exists. A missing db (scoped/federated layouts, or an
+    // un-indexed root) falls back to the lexical path — sound: never worse than
+    // today. Both the in-process (timeout=0) and `__search-worker` subprocess
+    // routes pass through here, and the worker inherits the env flag.
+    if fts_search_flag_enabled() {
+        let db_path = search_path.join(".tsift/index.db");
+        if db_path.exists() {
+            return sift::fts_search(&db_path, search_path, query, limit)
+                .context("index.db FTS5 search failed");
+        }
+    }
+
     let engine = Sift::builder().with_cache_dir(cache_dir).build();
     let options = SearchOptions::default()
         .with_limit(limit)
         .with_strategy(strategy.to_string());
     let input = SearchInput::new(search_path, query).with_options(options);
     engine.search(input).context("sift search failed")
+}
+
+/// #015t Phase 3b — whether the experimental `index.db` FTS5 search path is
+/// enabled via `TSIFT_FTS_SEARCH` (`1`/`true`/`yes`/`on`). Default off.
+fn fts_search_flag_enabled() -> bool {
+    std::env::var("TSIFT_FTS_SEARCH")
+        .map(|value| fts_flag_value_enabled(&value))
+        .unwrap_or(false)
+}
+
+/// Pure parser for the `TSIFT_FTS_SEARCH` flag value (factored out so the
+/// truthiness rules can be unit-tested without mutating process env).
+fn fts_flag_value_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn exact_search_timeout_message(timeout_secs: u64) -> String {

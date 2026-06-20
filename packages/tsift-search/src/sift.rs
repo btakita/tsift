@@ -467,6 +467,99 @@ pub fn fts_match_query(query: &str) -> Option<String> {
     )
 }
 
+/// #015t Phase 3b — flag-gated `index.db`-backed search. Translates the query to
+/// an FTS5 `MATCH` (preserving the `TokenIndex` OR-union candidate semantics via
+/// [`fts_match_query`]), runs the BM25-ranked content search, and builds a
+/// [`SearchResponse`] whose **file ordering is BM25** and whose per-file line +
+/// snippet is chosen by the **same substring/token line scorer as the lexical
+/// path** ([`score_file`]) — the plan's "BM25-vs-substring top-K reconciliation".
+/// Each hit's body is read from the inline FTS column, so no file is re-read from
+/// disk. The JSON `TokenIndex` stays the default search path; this runs only when
+/// the caller opts in (`TSIFT_FTS_SEARCH`) and a real `index.db` exists.
+pub fn fts_search(
+    db_path: &Path,
+    root: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<SearchResponse> {
+    let empty = |indexed: usize| SearchResponse {
+        coverage: sealed_coverage(indexed),
+        hits: Vec::new(),
+        indexed_artifacts: indexed,
+        root: root.display().to_string(),
+        skipped_artifacts: 0,
+        strategy: "fts".to_string(),
+    };
+
+    if limit == 0 {
+        return Ok(empty(0));
+    }
+    let Some(fts_query) = fts_match_query(query) else {
+        return Ok(empty(0));
+    };
+
+    let db = tsift_index::index::IndexDb::open_read_only_resilient(db_path)
+        .with_context(|| format!("opening index db for FTS search: {}", db_path.display()))?;
+    let raw_hits = db.content_fts_search_with_body(&fts_query, limit)?;
+    let query_tokens = tokenize(query);
+    let indexed_artifacts = raw_hits.len();
+
+    let hits = raw_hits
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (path, _bm25, body))| {
+            let rank = idx + 1;
+            // BM25 (from `content_fts_search_with_body`) owns the file ranking;
+            // the substring/token scorer only picks the representative line +
+            // snippet within the matched body. When folding/tokenization matched
+            // a file no substring line covers, fall back to its first real line.
+            let (line, snippet) = score_file(Path::new(&path), &body, query, &query_tokens)
+                .map(|candidate| (candidate.line, candidate.snippet))
+                .unwrap_or_else(|| representative_line(&body));
+            // Descending score preserves BM25 order through any later merge step
+            // (mirrors the exact-search path's rank-derived score).
+            let score = (limit.saturating_sub(rank).saturating_add(1)) as f64;
+            SearchHit {
+                artifact_id: format!("fts:{}:{}:{}", path, line, rank),
+                artifact_kind: ContextArtifactKind::File,
+                budget: ArtifactBudget::from_text(&snippet, 1),
+                confidence: ScoreConfidence::High,
+                freshness: file_timestamp(Path::new(&path)),
+                location: Some(format!("line {}", line)),
+                path,
+                provenance: ArtifactProvenance {
+                    adapter: AcquisitionAdapterKind::FileSystem,
+                    source: "tsift index.db FTS5 adapter".to_string(),
+                    synthetic: false,
+                },
+                rank,
+                score,
+                snippet,
+            }
+        })
+        .collect();
+
+    Ok(SearchResponse {
+        coverage: sealed_coverage(indexed_artifacts),
+        hits,
+        indexed_artifacts,
+        root: root.display().to_string(),
+        skipped_artifacts: 0,
+        strategy: "fts".to_string(),
+    })
+}
+
+/// First non-empty line (1-based) of `body` and its trimmed text, used as the FTS
+/// snippet fallback when the substring/token scorer finds no covering line.
+fn representative_line(body: &str) -> (usize, String) {
+    for (idx, line) in body.lines().enumerate() {
+        if !line.trim().is_empty() {
+            return (idx + 1, line.trim().to_string());
+        }
+    }
+    (1, String::new())
+}
+
 fn score_file(
     path: &Path,
     contents: &str,
@@ -766,5 +859,97 @@ mod tests {
                 "FTS result set missing TokenIndex candidate {candidate}: fts={fts_hits:?}"
             );
         }
+    }
+
+    #[test]
+    fn fts_search_builds_search_response_from_index_db() {
+        // Phase 3b: fts_search turns the BM25 content hits into a SearchResponse
+        // with per-file line + snippet picked by the lexical scorer, strategy
+        // "fts", and BM25-preserving descending scores.
+        use tsift_index::index::IndexDb;
+
+        let src = tempfile::tempdir().unwrap();
+        let root = src.path();
+        fs::write(
+            root.join("alpha.rs"),
+            "fn unrelated() {}\nfn alpha_handler() { beta_call(); }\n",
+        )
+        .unwrap();
+        fs::write(root.join("noise.rs"), "fn nothing_here() {}\n").unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("index.db");
+        IndexDb::open(&db_path).unwrap().apply_changes(root).unwrap();
+
+        let response = fts_search(&db_path, root, "beta_call", 10).unwrap();
+        assert_eq!(response.strategy, "fts");
+        assert_eq!(response.hits.len(), 1, "only alpha.rs contains beta_call");
+
+        let hit = &response.hits[0];
+        assert!(hit.path.ends_with("alpha.rs"), "hit path: {}", hit.path);
+        assert_eq!(hit.rank, 1);
+        // The scorer must land on the line that actually mentions the query, not
+        // line 1 (the unrelated fn) — proves BM25-vs-substring reconciliation.
+        assert_eq!(hit.location.as_deref(), Some("line 2"));
+        assert!(
+            hit.snippet.contains("beta_call"),
+            "snippet should show the matching line: {}",
+            hit.snippet
+        );
+        assert!(hit.score > 0.0, "score should be positive/descending");
+        assert!(hit.artifact_id.starts_with("fts:"));
+    }
+
+    #[test]
+    fn fts_search_orders_files_by_bm25() {
+        // Two files match; BM25 ranks the denser-match file first and the
+        // SearchResponse ranks/scores must follow that order.
+        use tsift_index::index::IndexDb;
+
+        let src = tempfile::tempdir().unwrap();
+        let root = src.path();
+        fs::write(
+            root.join("dense.rs"),
+            "fn widget() {}\nfn widget_two() {}\nlet w = widget();\n",
+        )
+        .unwrap();
+        fs::write(root.join("sparse.rs"), "fn other() { /* widget */ }\n").unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("index.db");
+        IndexDb::open(&db_path).unwrap().apply_changes(root).unwrap();
+
+        let response = fts_search(&db_path, root, "widget", 10).unwrap();
+        assert_eq!(response.hits.len(), 2);
+        assert!(
+            response.hits[0].path.ends_with("dense.rs"),
+            "dense.rs should rank first by BM25, got {}",
+            response.hits[0].path
+        );
+        assert!(
+            response.hits[0].score >= response.hits[1].score,
+            "scores must be descending to preserve BM25 order"
+        );
+        assert_eq!(response.hits[0].rank, 1);
+        assert_eq!(response.hits[1].rank, 2);
+    }
+
+    #[test]
+    fn fts_search_empty_for_no_token_query_and_zero_limit() {
+        use tsift_index::index::IndexDb;
+
+        let src = tempfile::tempdir().unwrap();
+        let root = src.path();
+        fs::write(root.join("alpha.rs"), "fn alpha() {}\n").unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("index.db");
+        IndexDb::open(&db_path).unwrap().apply_changes(root).unwrap();
+
+        let no_tokens = fts_search(&db_path, root, "   ", 10).unwrap();
+        assert_eq!(no_tokens.strategy, "fts");
+        assert!(no_tokens.hits.is_empty());
+
+        let zero_limit = fts_search(&db_path, root, "alpha", 0).unwrap();
+        assert!(zero_limit.hits.is_empty());
     }
 }
