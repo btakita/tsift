@@ -180,7 +180,18 @@ impl SearchInput {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// In-memory lexical inversion used **only** as a live fallback for the FTS5
+/// `index.db` path (degraded/stale index held by a concurrent writer,
+/// `--no-autoindex` on an un-indexed root, or direct programmatic callers).
+///
+/// #015t Phase 4b: the JSON persistence (`token-index.json`) was deleted. That
+/// cache was keyed on file *existence* only — `load_or_build_token_index`
+/// returned it whenever the file merely existed, with no mtime/content
+/// invalidation, so once written it served stale matches forever (files added
+/// or modified afterward were silently missing). Because every site that
+/// reaches this type needs *live* results, caching it to disk was wrong by
+/// construction; the fallback now always rebuilds in-memory.
+#[derive(Debug, Clone, Default)]
 pub struct TokenIndex {
     token_to_files: HashMap<String, Vec<String>>,
     total_files: usize,
@@ -212,19 +223,6 @@ impl TokenIndex {
             token_to_files,
             total_files,
         })
-    }
-
-    pub fn load(path: &Path) -> Result<Self> {
-        let data = fs::read_to_string(path)
-            .with_context(|| format!("loading token index from {}", path.display()))?;
-        Ok(serde_json::from_str(&data)?)
-    }
-
-    pub fn save(&self, path: &Path) -> Result<()> {
-        let data = serde_json::to_string(self)?;
-        fs::write(path, data)
-            .with_context(|| format!("saving token index to {}", path.display()))?;
-        Ok(())
     }
 
     pub fn files_matching_any(&self, tokens: &[String]) -> HashSet<PathBuf> {
@@ -295,7 +293,12 @@ impl Sift {
         }
 
         let query_tokens = tokenize(&input.query);
-        let token_index = self.load_or_build_token_index(&input.root)?;
+        // #015t Phase 4b: always build the inversion live. This path is only
+        // reached as a fallback that must return current results, so it must not
+        // read a persisted `token-index.json` (the deleted, never-invalidated
+        // cache). The generic `cache_dir` hook above is retained for a future,
+        // properly-invalidated cache but no longer backs the token index.
+        let token_index = TokenIndex::build(&input.root)?;
 
         let filtered_files = if query_tokens.is_empty() {
             candidate_files(&input.root)?
@@ -347,20 +350,6 @@ impl Sift {
         })
     }
 
-    fn load_or_build_token_index(&self, root: &Path) -> Result<TokenIndex> {
-        if let Some(cache_dir) = &self.cache_dir {
-            let index_path = cache_dir.join("token-index.json");
-            if index_path.exists()
-                && let Ok(index) = TokenIndex::load(&index_path)
-            {
-                return Ok(index);
-            }
-            let index = TokenIndex::build(root)?;
-            let _ = index.save(&index_path);
-            return Ok(index);
-        }
-        TokenIndex::build(root)
-    }
 }
 
 #[derive(Debug)]
@@ -756,24 +745,6 @@ mod tests {
     }
 
     #[test]
-    fn token_index_save_and_load_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("a.rs"), "fn hello() {}\n").unwrap();
-
-        let index = TokenIndex::build(dir.path()).unwrap();
-        let cache_path = dir.path().join("token-index.json");
-        index.save(&cache_path).unwrap();
-
-        let loaded = TokenIndex::load(&cache_path).unwrap();
-        assert_eq!(loaded.total_files(), index.total_files());
-        assert_eq!(loaded.unique_tokens(), index.unique_tokens());
-
-        let orig_matching = index.files_matching_any(&["hello".to_string()]);
-        let loaded_matching = loaded.files_matching_any(&["hello".to_string()]);
-        assert_eq!(orig_matching.len(), loaded_matching.len());
-    }
-
-    #[test]
     fn search_uses_token_index_to_skip_unrelated_files() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
@@ -789,7 +760,44 @@ mod tests {
 
         assert_eq!(response.hits.len(), 1);
         assert!(response.hits[0].path.ends_with("target.rs"));
-        assert!(cache_dir.join("token-index.json").exists());
+        // #015t Phase 4b: the never-invalidated `token-index.json` cache is gone —
+        // the fallback builds live and persists nothing.
+        assert!(
+            !cache_dir.join("token-index.json").exists(),
+            "token-index.json persistence must be deleted"
+        );
+    }
+
+    #[test]
+    fn search_reflects_files_added_after_first_search() {
+        // #015t Phase 4b regression: the old `token-index.json` cache was keyed on
+        // file existence only — once written it was returned forever, so a file
+        // created after the first search was invisible to the lexical fallback.
+        // The fallback now rebuilds live on every call, so the new file is found.
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        fs::write(dir.path().join("first.rs"), "fn shared_token() {}\n").unwrap();
+
+        let engine = Sift::builder().with_cache_dir(&cache_dir).build();
+        let first = engine
+            .search(SearchInput::new(dir.path(), "shared_token"))
+            .unwrap();
+        assert_eq!(first.hits.len(), 1);
+        assert!(first.hits[0].path.ends_with("first.rs"));
+
+        // Add a second file with the same token AFTER the first search ran.
+        fs::write(dir.path().join("second.rs"), "fn shared_token() {}\n").unwrap();
+
+        let second = engine
+            .search(SearchInput::new(dir.path(), "shared_token"))
+            .unwrap();
+        let paths: Vec<_> = second.hits.iter().map(|h| h.path.clone()).collect();
+        assert_eq!(
+            second.hits.len(),
+            2,
+            "live fallback must see the newly added file: {paths:?}"
+        );
+        assert!(paths.iter().any(|p| p.ends_with("second.rs")));
     }
 
     #[test]
