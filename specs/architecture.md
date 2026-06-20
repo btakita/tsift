@@ -107,9 +107,10 @@ tsift (root crate — public package shim: lib.rs + graph/lang/resolution/substr
 │   ├── depends on tsift-graph (diff edges + Lang), tsift-quality (lint/runtime_churn), tsift-summarize (SummaryDb enrichment)
 │   └── re-exported via root `tsift` `pub use tsift_digest::{diff_digest, log_digest, metric_digest, test_digest};`
 ├── tsift-search crate (packages/tsift-search — search ranking, impact analysis, tagpath annotation)
-│   ├── sift module — local lexical search adapter (ranked BM25-ish lexical hits, cache serialization)
-│   │   ├── TokenIndex — inverted token→files index for pre-filtering; skips files with no matching query tokens; cached as token-index.json in cache_dir
-│   │   └── Sift::search builds/loads TokenIndex automatically; only reads+scores files in the token-match set
+│   ├── sift module — local lexical search adapter (ranked BM25 hits, index.db-backed)
+│   │   ├── fts_search — DEFAULT lexical path (#015t Phase 4): index.db `content_fts` FTS5 BM25 search; fts_match_query preserves OR-union candidate semantics; per-file line/snippet from the inline FTS body via score_file; strategy "fts"
+│   │   ├── TokenIndex — LEGACY fallback only (no root index.db, or `TSIFT_FTS_SEARCH=0/false/no/off`): inverted token→files index cached as token-index.json in cache_dir; staleness keyed on file existence (never rebuilt on content change — the weakness FTS5 fixes)
+│   │   └── run_sift_search (tsift-cli) routes to fts_search when `<root>/.tsift/index.db` exists (precheck+autoindex guarantees it in the normal flow), else Sift::search/TokenIndex
 │   ├── impact module — change-impact analysis (call-edge/route/import impacts; per-language import detection gated by lang-* features)
 │   ├── tagpath_adapter module — tagpath `.naming/index.json` family/member lookup + handle round-trip
 │   ├── depends on tsift-index (config/index/walk), tsift-digest (diff_digest), tsift-graph (Lang), tsift-quality (lint), tsift-summarize

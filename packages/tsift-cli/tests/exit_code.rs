@@ -8241,9 +8241,12 @@ fn search_timeout_zero_keeps_search_in_process() {
         !pid_file.exists(),
         "timeout=0 should not spawn the hidden search worker"
     );
+    // #015t Phase 4: lexical search now defaults to the FTS5 `index.db` path, so
+    // autoindex builds index.db in-process (the legacy `search-cache` token index
+    // is no longer written on the default path).
     assert!(
-        dir.path().join(".tsift/search-cache").exists(),
-        "timeout=0 should still populate the stable search cache dir"
+        dir.path().join(".tsift/index.db").exists(),
+        "timeout=0 in-process search should autoindex the root index.db"
     );
 }
 
@@ -11991,7 +11994,11 @@ fn search_worker_uses_stable_tsift_cache_dir() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
 
+    // #015t Phase 4: the stable `search-cache` token index is the LEGACY path; force
+    // it on (`TSIFT_FTS_SEARCH=0`) so this still validates the cache-dir reuse it
+    // was written for. The default FTS5 path does not use `search-cache`.
     let output = tsift_bin()
+        .env("TSIFT_FTS_SEARCH", "0")
         .args(["search", "--path", dir.path().to_str().unwrap(), "main"])
         .output()
         .unwrap();

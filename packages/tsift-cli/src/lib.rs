@@ -28819,26 +28819,26 @@ tier = "private"
     }
 
     #[test]
-    fn fts_search_flag_value_parses_truthy_values() {
-        // #015t Phase 3b gate parser: default-off, accepts common truthy spellings.
-        for truthy in ["1", "true", "TRUE", " yes ", "On"] {
+    fn fts_search_flag_value_parses_falsy_escape_hatch() {
+        // #015t Phase 4: FTS5 is the default; only falsy values force legacy.
+        for falsy in ["0", "false", "FALSE", " no ", "Off"] {
             assert!(
-                fts_flag_value_enabled(truthy),
-                "{truthy:?} should enable the FTS path"
+                fts_flag_value_disabled(falsy),
+                "{falsy:?} should force the legacy TokenIndex path"
             );
         }
-        for falsy in ["", "0", "false", "no", "off", "maybe"] {
+        for keeps_default in ["", "1", "true", "yes", "on", "maybe"] {
             assert!(
-                !fts_flag_value_enabled(falsy),
-                "{falsy:?} should keep the lexical default"
+                !fts_flag_value_disabled(keeps_default),
+                "{keeps_default:?} should keep the FTS5 default"
             );
         }
     }
 
     #[test]
-    fn run_sift_search_default_off_uses_lexical_path() {
-        // With the flag unset, run_sift_search must keep the TokenIndex/lexical
-        // strategy even when a root index.db exists (Phase 3b is opt-in).
+    fn run_sift_search_defaults_to_fts_when_index_db_present() {
+        // #015t Phase 4 cutover: with the flag unset and a root index.db present,
+        // run_sift_search uses the FTS5 path by default (strategy "fts").
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("alpha.rs"), "fn alpha_handler() {}\n").unwrap();
@@ -28848,10 +28848,24 @@ tier = "private"
             .unwrap();
         let cache_dir = root.join(".tsift/search-cache");
 
-        // Guard against ambient flag contamination from a parallel test/env.
-        if fts_search_flag_enabled() {
+        // Guard against an ambient escape-hatch env from a parallel test/shell.
+        if fts_search_forced_off() {
             return;
         }
+        let response = run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical").unwrap();
+        assert_eq!(response.strategy, "fts");
+        assert!(response.hits.iter().any(|h| h.path.ends_with("alpha.rs")));
+    }
+
+    #[test]
+    fn run_sift_search_falls_back_to_lexical_without_index_db() {
+        // No root index.db (e.g. un-indexed root reaching here directly): the
+        // legacy TokenIndex/lexical path still serves the query.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("alpha.rs"), "fn alpha_handler() {}\n").unwrap();
+        let cache_dir = root.join(".tsift/search-cache");
+
         let response = run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical").unwrap();
         assert_eq!(response.strategy, "lexical");
     }
@@ -34257,16 +34271,24 @@ pub(crate) fn run_sift_search(
     limit: usize,
     strategy: &str,
 ) -> Result<sift::SearchResponse> {
-    // #015t Phase 3b: opt-in, default-off `index.db` FTS5 search path. The JSON
-    // TokenIndex stays authoritative until the Phase 4 cutover proves top-K
-    // parity; this runs only when `TSIFT_FTS_SEARCH` is set truthy AND a real
-    // root index.db exists. A missing db (scoped/federated layouts, or an
-    // un-indexed root) falls back to the lexical path — sound: never worse than
-    // today. Both the in-process (timeout=0) and `__search-worker` subprocess
-    // routes pass through here, and the worker inherits the env flag.
-    if fts_search_flag_enabled() {
+    // #015t Phase 4 cutover: the `index.db` FTS5 path is now the DEFAULT for
+    // lexical search. The normal search flow runs `precheck_search_indexes` with
+    // autoindex first, so a fresh root `index.db` is guaranteed present before we
+    // get here; the FTS5 BM25 path supersedes the parallel JSON `TokenIndex`
+    // (which never rebuilt on content change — staleness was keyed on file
+    // existence only). Ranking shifts from substring-position to BM25 by design;
+    // the Phase 3 soundness gate proved candidate coverage (FTS ⊇ TokenIndex).
+    //
+    // The JSON `TokenIndex` is demoted to a FALLBACK for the only remaining cases
+    // that reach here without a root index.db: an un-indexed root reached with
+    // `--no-autoindex` (the normal precheck degrades a missing index to exact
+    // search, not lexical) and direct programmatic callers. `TSIFT_FTS_SEARCH=0`
+    // (`0`/`false`/`no`/`off`) forces that legacy path as a transition escape
+    // hatch. Both the in-process (timeout=0) and `__search-worker` subprocess
+    // routes pass through here; the worker inherits the env var.
+    if !fts_search_forced_off() {
         let db_path = search_path.join(".tsift/index.db");
-        if db_path.exists() {
+        if db_path.exists() && index_db_is_fresh_for_fts(&db_path, search_path) {
             return sift::fts_search(&db_path, search_path, query, limit)
                 .context("index.db FTS5 search failed");
         }
@@ -34280,20 +34302,39 @@ pub(crate) fn run_sift_search(
     engine.search(input).context("sift search failed")
 }
 
-/// #015t Phase 3b — whether the experimental `index.db` FTS5 search path is
-/// enabled via `TSIFT_FTS_SEARCH` (`1`/`true`/`yes`/`on`). Default off.
-fn fts_search_flag_enabled() -> bool {
+/// #015t Phase 4 — the FTS5 `index.db` path is trustworthy only when the index is
+/// **openable AND fresh** for the search root. A missing/corrupt index.db (e.g. an
+/// empty placeholder) or a **stale** one (e.g. held open by a concurrent writer so
+/// autoindex degraded to read-only) falls back to the live `TokenIndex` path — so a
+/// search never returns content the index has not caught up to. The normal flow's
+/// `precheck_search_indexes` + autoindex makes this true in the common case;
+/// re-inspecting here is a redundant tree-walk that #015t Phase 4b can replace by
+/// threading the precheck's freshness result through to this call.
+fn index_db_is_fresh_for_fts(db_path: &Path, search_path: &Path) -> bool {
+    match index::IndexDb::inspect_read_only(db_path, search_path, false) {
+        Ok(inspection) => {
+            inspection.summary.new + inspection.summary.modified + inspection.summary.deleted == 0
+        }
+        Err(_) => false,
+    }
+}
+
+/// #015t Phase 4 — whether the operator has forced lexical search back onto the
+/// legacy JSON `TokenIndex` path via `TSIFT_FTS_SEARCH` set to a falsy value
+/// (`0`/`false`/`no`/`off`). The FTS5 `index.db` path is the default; this is the
+/// transition escape hatch. Any other value (or unset) keeps the FTS5 default.
+fn fts_search_forced_off() -> bool {
     std::env::var("TSIFT_FTS_SEARCH")
-        .map(|value| fts_flag_value_enabled(&value))
+        .map(|value| fts_flag_value_disabled(&value))
         .unwrap_or(false)
 }
 
-/// Pure parser for the `TSIFT_FTS_SEARCH` flag value (factored out so the
-/// truthiness rules can be unit-tested without mutating process env).
-fn fts_flag_value_enabled(value: &str) -> bool {
+/// Pure parser for a falsy `TSIFT_FTS_SEARCH` value (factored out so the rules
+/// can be unit-tested without mutating process env).
+fn fts_flag_value_disabled(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
+        "0" | "false" | "no" | "off"
     )
 }
 
