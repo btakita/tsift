@@ -13,7 +13,7 @@ The **primary agent-facing instructions live in the tsift skill**, [`.claude/ski
 
 The Code Navigation block below is managed by `tsift init` (versioned markers) — do not hand-edit it; re-run `tsift init` to refresh.
 
-<!-- tsift:code-navigation v=0.1.72 -->
+<!-- tsift:code-navigation v=0.1.73 -->
 ## Code Navigation
 
 Keep this block self-contained for Codex/OpenCode prompt reuse. If this repository also ships current `.claude/skills/tsift/SKILL.md` or `runbooks/code-navigation.md`, use those deeper runbooks for command detail instead of expanding this block.

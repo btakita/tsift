@@ -426,6 +426,16 @@ pub(crate) fn cmd_search_with_budget(
     };
     let root = lint::resolve_project_root_or_canonical_path(&base_path)?;
     let search_cache_dir = root.join(".tsift/search-cache");
+    // #ve5f path-prune: when `--path` (base_path) narrows to a strict subdirectory of
+    // the project root, the FTS/lexical path still searches the *whole* project index
+    // (`content_fts` paths are absolute), so its hits were never scoped to the subdir —
+    // unlike exact search, where `rg` runs in `base_path`. Capture that sub-path so the
+    // non-exact result set can be pruned to it for parity. `None` when base_path is the
+    // project root (or above it), preserving the whole-index default.
+    let path_scope: Option<PathBuf> = base_path
+        .canonicalize()
+        .ok()
+        .filter(|canon| canon != &root && canon.starts_with(&root));
     let requested_strategy = resolve_search_strategy(&query, strategy);
     let requested_exact_search = requested_strategy == "exact";
     let precheck = if requested_exact_search {
@@ -546,7 +556,7 @@ pub(crate) fn cmd_search_with_budget(
     symbol_hits = apply_search_facet_filters(&root, symbol_hits, &facet_filters);
     symbol_hits.truncate(limit);
 
-    let response = if exact_search {
+    let mut response = if exact_search {
         if federated && scope.is_none() {
             federated_exact_search(&root, &query, limit, timeout_secs)?
         } else {
@@ -579,6 +589,16 @@ pub(crate) fn cmd_search_with_budget(
             fts_index_fresh,
         )?
     };
+
+    // #ve5f: prune the result set to the requested `--path` sub-scope. Exact search is
+    // already scoped (rg runs in base_path) so this is a no-op there; federated search
+    // spans multiple repos so a single sub-path must not drop cross-repo hits. The FTS/
+    // lexical path searches the whole index, so this is where sub-path narrowing lands.
+    if let Some(scope_dir) = path_scope.as_ref()
+        && !federated
+    {
+        prune_hits_to_path_scope(&mut response, scope_dir, &root);
+    }
 
     // #trt1p2b hot-path injection: fold trusted, fresh findings for the search
     // result-set nodes (matched symbol names and their files) into the envelope.
@@ -899,6 +919,31 @@ pub(crate) fn cmd_search_with_budget(
     Ok(())
 }
 
+/// #ve5f path-prune: narrow a non-exact search result set to the requested `--path`
+/// sub-scope. The FTS/lexical path searches the whole project index (`content_fts`
+/// stores absolute paths), so a `--path <subdir>` filter never reached its hits —
+/// unlike exact search, where `rg` already runs inside `base_path`. Retain only the
+/// hits whose path resolves under `scope_dir` (a canonical strict subdirectory of
+/// `root`). Relative hit paths are joined to `root` before the prefix test; absolute
+/// paths are tested directly. Each surviving hit keeps its original BM25 `rank` (and
+/// the matching `artifact_id`), so the result set stays a strict subsequence of the
+/// global ranking — narrowing changes which files appear, never their relative order.
+fn prune_hits_to_path_scope(
+    response: &mut tsift_search::sift::SearchResponse,
+    scope_dir: &Path,
+    root: &Path,
+) {
+    response.hits.retain(|hit| {
+        let raw = Path::new(&hit.path);
+        let abs = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            root.join(raw)
+        };
+        abs.starts_with(scope_dir)
+    });
+}
+
 pub(crate) fn cmd_search_worker(
     path: &Path,
     cache_dir: &Path,
@@ -923,4 +968,99 @@ pub(crate) fn cmd_search_worker(
     file.flush()
         .with_context(|| format!("flushing search worker output: {}", output.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod prune_path_scope_tests {
+    use super::*;
+    use tsift_search::sift::{
+        AcquisitionAdapterKind, ArtifactBudget, ArtifactFreshness, ArtifactProvenance,
+        ContextArtifactKind, ScoreConfidence, SearchCoverageMode, SearchCoverageSnapshot,
+        SearchHit, SearchResponse,
+    };
+
+    fn hit(path: &str, rank: usize) -> SearchHit {
+        SearchHit {
+            artifact_id: format!("fts:{path}:1:{rank}"),
+            artifact_kind: ContextArtifactKind::File,
+            budget: ArtifactBudget::from_text("x", 1),
+            confidence: ScoreConfidence::High,
+            freshness: ArtifactFreshness {
+                modified_unix_secs: None,
+                observed_unix_secs: 0,
+            },
+            location: Some("line 1".to_string()),
+            path: path.to_string(),
+            provenance: ArtifactProvenance {
+                adapter: AcquisitionAdapterKind::FileSystem,
+                source: "test".to_string(),
+                synthetic: false,
+            },
+            rank,
+            score: 1.0,
+            snippet: "x".to_string(),
+        }
+    }
+
+    fn response(hits: Vec<SearchHit>) -> SearchResponse {
+        SearchResponse {
+            coverage: SearchCoverageSnapshot {
+                active_rebuild: None,
+                completed_dirty_sector_count: 0,
+                dirty_sector_count: 0,
+                mode: SearchCoverageMode::Sealed,
+                mounted_sector_count: 0,
+                rebuilding_sector_count: 0,
+                resumed_sector_count: 0,
+                reused_sector_count: 0,
+                total_sector_count: 0,
+            },
+            hits,
+            indexed_artifacts: 0,
+            root: "/proj".to_string(),
+            skipped_artifacts: 0,
+            strategy: "fts".to_string(),
+        }
+    }
+
+    #[test]
+    fn prunes_absolute_hits_to_subdir_and_preserves_global_rank() {
+        let root = Path::new("/proj");
+        let scope = Path::new("/proj/src/foo");
+        let mut resp = response(vec![
+            hit("/proj/src/foo/a.rs", 1),
+            hit("/proj/src/bar/b.rs", 2),
+            hit("/proj/src/foo/nested/c.rs", 3),
+            // sibling whose string prefix matches but whose path component does not —
+            // component-based `starts_with` must NOT retain it.
+            hit("/proj/src/foobar/d.rs", 4),
+        ]);
+        prune_hits_to_path_scope(&mut resp, scope, root);
+        let paths: Vec<&str> = resp.hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["/proj/src/foo/a.rs", "/proj/src/foo/nested/c.rs"]);
+        // No renumber: survivors keep their original BM25 ranks (strict subsequence).
+        assert_eq!(
+            resp.hits.iter().map(|h| h.rank).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn joins_relative_hits_against_root_before_prefix_test() {
+        let root = Path::new("/proj");
+        let scope = Path::new("/proj/src/foo");
+        let mut resp = response(vec![hit("src/foo/a.rs", 1), hit("src/bar/b.rs", 2)]);
+        prune_hits_to_path_scope(&mut resp, scope, root);
+        let paths: Vec<&str> = resp.hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["src/foo/a.rs"]);
+    }
+
+    #[test]
+    fn empty_result_when_no_hit_under_scope() {
+        let root = Path::new("/proj");
+        let scope = Path::new("/proj/src/foo");
+        let mut resp = response(vec![hit("/proj/src/bar/b.rs", 1)]);
+        prune_hits_to_path_scope(&mut resp, scope, root);
+        assert!(resp.hits.is_empty());
+    }
 }
