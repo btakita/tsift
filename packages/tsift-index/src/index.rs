@@ -509,6 +509,11 @@ impl IndexDb {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(
+                path UNINDEXED,
+                body,
+                tokenize = 'unicode61'
+            );
             CREATE TABLE IF NOT EXISTS symbols (
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -566,6 +571,13 @@ impl IndexDb {
         let _ = conn.execute("ALTER TABLE symbols ADD COLUMN end_byte INTEGER", []);
         let _ = conn.execute("ALTER TABLE symbols ADD COLUMN body_start_byte INTEGER", []);
         let _ = conn.execute("ALTER TABLE symbols ADD COLUMN body_end_byte INTEGER", []);
+        // Schema-version stamp for the native FTS5 content index (#015t Phase 1).
+        // Written-but-unread in Phase 1/2: the lexical search path still uses the
+        // JSON TokenIndex until the Phase 3 parity gate flips the default.
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('content_fts_version', '1')",
+            [],
+        );
         Ok(Self {
             conn,
             _write_lock: Some(write_lock),
@@ -953,6 +965,15 @@ impl IndexDb {
             let mut delete_zonemap = self
                 .conn
                 .prepare("DELETE FROM file_zonemap WHERE path = ?1")?;
+            // Native FTS5 content index (#015t Phase 2). Maintained transactionally
+            // alongside the zone-map, mirroring its lifecycle exactly. Written-but-unread
+            // until the Phase 3 parity gate; the JSON TokenIndex stays authoritative.
+            let mut insert_fts = self
+                .conn
+                .prepare("INSERT INTO content_fts (path, body) VALUES (?1, ?2)")?;
+            let mut delete_fts = self
+                .conn
+                .prepare("DELETE FROM content_fts WHERE path = ?1")?;
             let mut insert_symbol = self.conn.prepare(
                 "INSERT INTO symbols (name, kind, language, signature, file, line, end_line, node_kind, start_byte, end_byte, body_start_byte, body_end_byte, parent_module, visibility, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
             )?;
@@ -988,6 +1009,7 @@ impl IndexDb {
 
                         delete_symbols.execute(rusqlite::params![&path_str])?;
                         delete_zonemap.execute(rusqlite::params![&path_str])?;
+                        delete_fts.execute(rusqlite::params![&path_str])?;
                         delete_edges.execute(rusqlite::params![&path_str])?;
                         delete_routes.execute(rusqlite::params![&path_str])?;
                         let lang = change
@@ -1064,6 +1086,15 @@ impl IndexDb {
                                     kinds,
                                     content_hash,
                                 ])?;
+                                // FTS5 content row mirrors the zone-map lifecycle: one row
+                                // per recognized-language file, body stored inline so BM25 +
+                                // snippets work without re-reading from disk. Non-code text
+                                // files (e.g. readme.txt) are not source-read here, so they
+                                // get no FTS row — a scope difference vs the TokenIndex that
+                                // the Phase 3 cutover must reconcile.
+                                let body = String::from_utf8_lossy(source);
+                                insert_fts
+                                    .execute(rusqlite::params![&path_str, body.as_ref()])?;
                             }
                             if let Some(ref source) = source {
                                 let call_sites = warning_on_error(
@@ -1119,6 +1150,7 @@ impl IndexDb {
                         delete_file.execute(rusqlite::params![&path_str])?;
                         delete_symbols.execute(rusqlite::params![&path_str])?;
                         delete_zonemap.execute(rusqlite::params![&path_str])?;
+                        delete_fts.execute(rusqlite::params![&path_str])?;
                         delete_edges.execute(rusqlite::params![&path_str])?;
                         delete_routes.execute(rusqlite::params![&path_str])?;
                     }
@@ -1163,6 +1195,7 @@ impl IndexDb {
         let result: Result<IndexSummary> = (|| {
             self.conn.execute("DELETE FROM file_state", [])?;
             self.conn.execute("DELETE FROM file_zonemap", [])?;
+            self.conn.execute("DELETE FROM content_fts", [])?;
             self.conn.execute("DELETE FROM symbols", [])?;
             self.conn.execute("DELETE FROM call_edges", [])?;
             self.conn.execute("DELETE FROM route_nodes", [])?;
@@ -1204,6 +1237,31 @@ impl IndexDb {
             self.conn
                 .query_row("SELECT COUNT(*) FROM file_zonemap", [], |row| row.get(0))?;
         Ok(count as usize)
+    }
+
+    /// Number of files in the native FTS5 content index (#015t Phase 1/2).
+    pub fn content_fts_count(&self) -> Result<usize> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM content_fts", [], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
+    /// FTS5 content search: file paths whose body matches `query`, ranked by BM25
+    /// (best match first). Phase 1/2 read API — maintained transactionally but **not
+    /// yet wired** into the lexical search path. The JSON `TokenIndex` remains
+    /// authoritative until the Phase 3 parity gate flips the default. `query` is a raw
+    /// FTS5 MATCH expression; Phase 3 owns caller-facing query sanitization.
+    pub fn content_fts_search(&self, query: &str, limit: usize) -> Result<Vec<(String, f64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, bm25(content_fts) AS score FROM content_fts \
+             WHERE content_fts MATCH ?1 ORDER BY score LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![query, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// Per-file zone-map rows, ordered by path. See [`FileZonemap`].
@@ -1965,6 +2023,72 @@ mod tests {
         db.apply_changes(dir.path()).unwrap();
         db.rebuild(dir.path()).unwrap();
         assert_eq!(db.zonemap_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn content_fts_populated_for_code_files_only() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        // 3 recognized-language files get an FTS row; readme.txt (no lang) does not,
+        // even though it has a file_state row. Same scope as the zone-map.
+        assert_eq!(db.content_fts_count().unwrap(), 3);
+
+        // A token from main.rs's body resolves to main.rs via MATCH + BM25.
+        let hits = db.content_fts_search("main", 10).unwrap();
+        assert!(
+            hits.iter().any(|(path, _)| path.ends_with("main.rs")),
+            "FTS MATCH 'main' should return main.rs, got {hits:?}"
+        );
+
+        // A token only present in lib.py resolves there, not to main.rs.
+        let hits = db.content_fts_search("hello", 10).unwrap();
+        assert!(hits.iter().any(|(path, _)| path.ends_with("lib.py")));
+        assert!(!hits.iter().any(|(path, _)| path.ends_with("main.rs")));
+
+        // readme.txt body ("not code") is not indexed.
+        let hits = db.content_fts_search("code", 10).unwrap();
+        assert!(!hits.iter().any(|(path, _)| path.ends_with("readme.txt")));
+    }
+
+    #[test]
+    fn content_fts_updated_on_modify_and_removed_on_delete() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        // Modify main.rs to contain a unique token — re-indexing must pick it up,
+        // and the old body must be gone (no stale rows).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(dir.path().join("main.rs"), "fn frobnicate() {}").unwrap();
+        db.apply_changes(dir.path()).unwrap();
+        assert_eq!(db.content_fts_count().unwrap(), 3, "modify must not duplicate rows");
+        let hits = db.content_fts_search("frobnicate", 10).unwrap();
+        assert!(hits.iter().any(|(path, _)| path.ends_with("main.rs")));
+        // The pre-modify token is gone.
+        assert!(db.content_fts_search("main", 10).unwrap().is_empty());
+
+        // Delete main.rs — its FTS row must be removed.
+        fs::remove_file(dir.path().join("main.rs")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+        assert_eq!(db.content_fts_count().unwrap(), 2);
+        assert!(db.content_fts_search("frobnicate", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rebuild_repopulates_content_fts() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+        db.rebuild(dir.path()).unwrap();
+        assert_eq!(db.content_fts_count().unwrap(), 3);
+        assert!(
+            db.content_fts_search("hello", 10)
+                .unwrap()
+                .iter()
+                .any(|(path, _)| path.ends_with("lib.py"))
+        );
     }
 
     #[test]
