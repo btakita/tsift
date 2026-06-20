@@ -141,6 +141,11 @@ pub enum Commands {
         strategy: String,
         #[arg(long)]
         output: PathBuf,
+        /// #015t Phase 4b — FTS index freshness verdict from the parent's
+        /// precheck (skips the worker's redundant freshness re-inspect). Absent
+        /// ⇒ the worker inspects on its own.
+        #[arg(long)]
+        fts_index_fresh: Option<bool>,
     },
     /// Run a shell command and emit a bounded, artifact-backed test/log digest envelope
     #[command(name = "digest-runner", alias = "__digest-runner")]

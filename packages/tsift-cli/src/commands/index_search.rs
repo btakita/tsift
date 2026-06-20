@@ -448,6 +448,14 @@ pub(crate) fn cmd_search_with_budget(
     } else {
         requested_strategy
     };
+    // #015t Phase 4b: forward the freshness verdict the precheck already computed
+    // so the FTS path skips its redundant `inspect_read_only` walk. Fresh = the
+    // precheck ran and the index was NOT degraded to read-only (a read-only
+    // degrade means a stale index held by a concurrent writer ⇒ `Some(false)` so
+    // the FTS path falls back to live `TokenIndex` results).
+    let fts_index_fresh = precheck
+        .as_ref()
+        .map(|_| degraded_mode != Some(DegradedSearchMode::ReadOnly));
     let search_targets = if requested_exact_search {
         Vec::new()
     } else if let Some(precheck) = precheck.as_ref() {
@@ -557,6 +565,7 @@ pub(crate) fn cmd_search_with_budget(
             limit,
             timeout_secs,
             &effective_strategy,
+            fts_index_fresh,
         )?
     } else {
         run_search_with_timeout(
@@ -567,6 +576,7 @@ pub(crate) fn cmd_search_with_budget(
             timeout_secs,
             &effective_strategy,
             &search_targets,
+            fts_index_fresh,
         )?
     };
 
@@ -896,9 +906,10 @@ pub(crate) fn cmd_search_worker(
     limit: usize,
     strategy: &str,
     output: &Path,
+    fts_index_fresh: Option<bool>,
 ) -> Result<()> {
     maybe_apply_search_worker_test_hooks()?;
-    let response = run_sift_search(path, cache_dir, query, limit, strategy)?;
+    let response = run_sift_search(path, cache_dir, query, limit, strategy, fts_index_fresh)?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }

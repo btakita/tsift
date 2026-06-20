@@ -489,7 +489,16 @@ pub fn run() -> Result<()> {
             limit,
             strategy,
             output,
-        }) => cmd_search_worker(&path, &cache_dir, &query, limit, &strategy, &output),
+            fts_index_fresh,
+        }) => cmd_search_worker(
+            &path,
+            &cache_dir,
+            &query,
+            limit,
+            &strategy,
+            &output,
+            fts_index_fresh,
+        ),
         Some(Commands::DigestRunner {
             kind,
             path,
@@ -26757,6 +26766,7 @@ tier = "isolated"
             10,
             0,
             "lexical",
+            None,
         )
         .unwrap();
 
@@ -26812,6 +26822,7 @@ tier = "private"
             10,
             0,
             "lexical",
+            None,
         )
         .unwrap();
 
@@ -28751,7 +28762,7 @@ tier = "private"
         let search_dir = dir.path().to_path_buf();
         let cache_dir = search_dir.join(".tsift/search-cache");
         std::fs::write(search_dir.join("test.rs"), "fn main() {}").unwrap();
-        let result = run_sift_search(&search_dir, &cache_dir, "main", 1, "lexical");
+        let result = run_sift_search(&search_dir, &cache_dir, "main", 1, "lexical", None);
         assert!(result.is_ok(), "direct search should succeed");
         assert!(
             cache_dir.exists(),
@@ -28765,7 +28776,8 @@ tier = "private"
         let search_dir = dir.path().to_path_buf();
         let cache_dir = search_dir.join(".tsift/search-cache");
         std::fs::write(search_dir.join("test.rs"), "fn main() {}").unwrap();
-        let result = run_search_with_timeout(&search_dir, &cache_dir, "main", 1, 0, "lexical", &[]);
+        let result =
+            run_search_with_timeout(&search_dir, &cache_dir, "main", 1, 0, "lexical", &[], None);
         assert!(result.is_ok(), "timeout=0 should still work (no timeout)");
         assert!(
             cache_dir.exists(),
@@ -28852,7 +28864,7 @@ tier = "private"
         if fts_search_forced_off() {
             return;
         }
-        let response = run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical").unwrap();
+        let response = run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", None).unwrap();
         assert_eq!(response.strategy, "fts");
         assert!(response.hits.iter().any(|h| h.path.ends_with("alpha.rs")));
     }
@@ -28866,8 +28878,34 @@ tier = "private"
         std::fs::write(root.join("alpha.rs"), "fn alpha_handler() {}\n").unwrap();
         let cache_dir = root.join(".tsift/search-cache");
 
-        let response = run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical").unwrap();
+        let response = run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", None).unwrap();
         assert_eq!(response.strategy, "lexical");
+    }
+
+    #[test]
+    fn run_sift_search_honors_threaded_freshness_verdict() {
+        // #015t Phase 4b: the caller's freshness verdict overrides the in-engine
+        // inspect. Some(true) ⇒ FTS without re-walking; Some(false) ⇒ legacy path
+        // even with a fresh index.db (the degraded-read-only live-results case).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("alpha.rs"), "fn alpha_handler() {}\n").unwrap();
+        index::IndexDb::open(&root.join(".tsift/index.db"))
+            .unwrap()
+            .apply_changes(root)
+            .unwrap();
+        let cache_dir = root.join(".tsift/search-cache");
+
+        if fts_search_forced_off() {
+            return;
+        }
+        let fresh =
+            run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", Some(true)).unwrap();
+        assert_eq!(fresh.strategy, "fts");
+
+        let stale =
+            run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", Some(false)).unwrap();
+        assert_eq!(stale.strategy, "lexical");
     }
 
     // --- index quiet mode ---
@@ -34140,6 +34178,7 @@ pub(crate) fn federated_sift_search(
     limit: usize,
     timeout_secs: u64,
     strategy: &str,
+    fts_index_fresh: Option<bool>,
 ) -> Result<sift::SearchResponse> {
     let targets = resolve_search_index_targets(root, root, None, true)?;
     if targets.is_empty() {
@@ -34152,6 +34191,7 @@ pub(crate) fn federated_sift_search(
                 timeout_secs,
                 strategy,
                 &[],
+                fts_index_fresh,
             );
         }
         return Ok(empty_search_response(root, strategy));
@@ -34167,6 +34207,7 @@ pub(crate) fn federated_sift_search(
             timeout_secs,
             strategy,
             std::slice::from_ref(target),
+            fts_index_fresh,
         )?;
         absolutize_search_hit_paths(&mut response, &target.source_root);
         response.root = root.display().to_string();
@@ -34270,6 +34311,15 @@ pub(crate) fn run_sift_search(
     query: &str,
     limit: usize,
     strategy: &str,
+    // #015t Phase 4b — the caller's already-known FTS index freshness:
+    //   `Some(true)`  — caller (cmd_search after precheck+autoindex) proved fresh;
+    //                   use FTS without re-walking the tree.
+    //   `Some(false)` — caller proved stale/degraded (e.g. read-only writer lock);
+    //                   skip FTS, serve live results via the TokenIndex fallback.
+    //   `None`        — unknown (direct programmatic callers); inspect here.
+    // This drops the redundant `inspect_read_only` walk on the normal CLI path,
+    // where `precheck_search_indexes` already established freshness.
+    fts_index_fresh: Option<bool>,
 ) -> Result<sift::SearchResponse> {
     // #015t Phase 4 cutover: the `index.db` FTS5 path is now the DEFAULT for
     // lexical search. The normal search flow runs `precheck_search_indexes` with
@@ -34280,15 +34330,20 @@ pub(crate) fn run_sift_search(
     // the Phase 3 soundness gate proved candidate coverage (FTS ⊇ TokenIndex).
     //
     // The JSON `TokenIndex` is demoted to a FALLBACK for the only remaining cases
-    // that reach here without a root index.db: an un-indexed root reached with
-    // `--no-autoindex` (the normal precheck degrades a missing index to exact
-    // search, not lexical) and direct programmatic callers. `TSIFT_FTS_SEARCH=0`
-    // (`0`/`false`/`no`/`off`) forces that legacy path as a transition escape
-    // hatch. Both the in-process (timeout=0) and `__search-worker` subprocess
-    // routes pass through here; the worker inherits the env var.
+    // that reach here without a fresh root index.db: an un-indexed root reached
+    // with `--no-autoindex` (the normal precheck degrades a missing index to exact
+    // search, not lexical), a stale/degraded index (live results via TokenIndex),
+    // and direct programmatic callers. `TSIFT_FTS_SEARCH=0` (`0`/`false`/`no`/`off`)
+    // forces that legacy path as a transition escape hatch. Both the in-process
+    // (timeout=0) and `__search-worker` subprocess routes pass through here; the
+    // worker inherits the env var and is handed the freshness verdict explicitly.
     if !fts_search_forced_off() {
         let db_path = search_path.join(".tsift/index.db");
-        if db_path.exists() && index_db_is_fresh_for_fts(&db_path, search_path) {
+        let use_fts = match fts_index_fresh {
+            Some(fresh) => fresh && db_path.exists(),
+            None => db_path.exists() && index_db_is_fresh_for_fts(&db_path, search_path),
+        };
+        if use_fts {
             return sift::fts_search(&db_path, search_path, query, limit)
                 .context("index.db FTS5 search failed");
         }
@@ -34515,6 +34570,7 @@ pub(crate) fn run_exact_search_with_timeout(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_search_with_timeout(
     search_path: &Path,
     cache_dir: &Path,
@@ -34523,33 +34579,41 @@ pub(crate) fn run_search_with_timeout(
     timeout_secs: u64,
     strategy: &str,
     search_targets: &[SearchIndexTarget],
+    // #015t Phase 4b — FTS index freshness verdict forwarded to the worker so it
+    // skips the redundant `inspect_read_only` walk (see `run_sift_search`).
+    fts_index_fresh: Option<bool>,
 ) -> Result<sift::SearchResponse> {
     if timeout_secs == 0 {
-        return run_sift_search(search_path, cache_dir, query, limit, strategy);
+        return run_sift_search(search_path, cache_dir, query, limit, strategy, fts_index_fresh);
     }
 
     let output_path = next_search_worker_output_path();
-    let mut child = Command::new(
+    let mut command = Command::new(
         std::env::current_exe().context("resolving tsift executable for timed search")?,
-    )
-    .arg("__search-worker")
-    .arg("--path")
-    .arg(search_path)
-    .arg("--cache-dir")
-    .arg(cache_dir)
-    .arg("--query")
-    .arg(query)
-    .arg("--limit")
-    .arg(limit.to_string())
-    .arg("--strategy")
-    .arg(strategy)
-    .arg("--output")
-    .arg(&output_path)
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::piped())
-    .spawn()
-    .context("spawning timed sift search worker")?;
+    );
+    command
+        .arg("__search-worker")
+        .arg("--path")
+        .arg(search_path)
+        .arg("--cache-dir")
+        .arg(cache_dir)
+        .arg("--query")
+        .arg(query)
+        .arg("--limit")
+        .arg(limit.to_string())
+        .arg("--strategy")
+        .arg(strategy)
+        .arg("--output")
+        .arg(&output_path);
+    if let Some(fresh) = fts_index_fresh {
+        command.arg("--fts-index-fresh").arg(fresh.to_string());
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning timed sift search worker")?;
 
     let timeout = Duration::from_secs(timeout_secs);
     let status =
