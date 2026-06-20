@@ -446,6 +446,27 @@ fn tokenize_iter(value: &str) -> impl Iterator<Item = String> + '_ {
         .map(|token| token.to_lowercase())
 }
 
+/// Translate a free-text query into an FTS5 `MATCH` expression with the **same
+/// candidate semantics as the [`TokenIndex`]** (#015t Phase 3). FTS5 treats a bare
+/// multi-token string as an adjacency *phrase*, but `TokenIndex::files_matching_any`
+/// is an **OR-union** over the query tokens — so the FTS path must OR the tokens to
+/// return a superset of the TokenIndex candidate set (the Phase 3 soundness gate).
+/// Each token is double-quoted (with `"` escaped) so identifiers can't be parsed as
+/// FTS5 operators. Returns `None` when the query has no indexable tokens.
+pub fn fts_match_query(query: &str) -> Option<String> {
+    let tokens = tokenize(query);
+    if tokens.is_empty() {
+        return None;
+    }
+    Some(
+        tokens
+            .iter()
+            .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+    )
+}
+
 fn score_file(
     path: &Path,
     contents: &str,
@@ -690,5 +711,60 @@ mod tests {
 
         assert_eq!(response.indexed_artifacts, 1);
         assert_eq!(response.hits.len(), 0);
+    }
+
+    #[test]
+    fn fts_match_query_ors_tokens() {
+        // Mirrors TokenIndex OR-union semantics, not an FTS phrase.
+        assert_eq!(fts_match_query("beta_call").as_deref(), Some("\"beta\" OR \"call\""));
+        assert_eq!(fts_match_query("Foo").as_deref(), Some("\"foo\""));
+        assert_eq!(fts_match_query("   ").as_deref(), None);
+    }
+
+    #[test]
+    fn fts_content_index_supersets_token_index_candidates() {
+        // Phase 3 soundness gate: the index.db FTS path must return every file the
+        // authoritative TokenIndex treats as a candidate (FTS ⊇ relevance set), so a
+        // future flagged cutover cannot silently drop a lexical hit. BM25 vs substring
+        // *ranking* may differ; candidate *coverage* may not. Uses fts_match_query to
+        // preserve the TokenIndex OR-union semantics.
+        use tsift_index::index::IndexDb;
+
+        let src = tempfile::tempdir().unwrap();
+        let root = src.path();
+        fs::write(root.join("alpha.rs"), "fn alpha_handler() { beta_call(); }\n").unwrap();
+        fs::write(root.join("beta.rs"), "fn beta_call() { gamma(); }\n").unwrap();
+        fs::write(root.join("noise.rs"), "fn unrelated_thing() {}\n").unwrap();
+
+        let basenames = |paths: HashSet<PathBuf>| -> HashSet<String> {
+            paths
+                .into_iter()
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect()
+        };
+
+        let query = "beta_call";
+        let token_index = TokenIndex::build(root).unwrap();
+        let ti_candidates = basenames(token_index.files_matching_any(&tokenize(query)));
+        assert!(!ti_candidates.is_empty(), "fixture should yield TokenIndex candidates");
+
+        // Build the index.db in a separate dir so it does not index itself.
+        let db_dir = tempfile::tempdir().unwrap();
+        let db = IndexDb::open(&db_dir.path().join("index.db")).unwrap();
+        db.apply_changes(root).unwrap();
+        let fts_query = fts_match_query(query).expect("query has tokens");
+        let fts_hits: HashSet<String> = db
+            .content_fts_search(&fts_query, 100)
+            .unwrap()
+            .into_iter()
+            .filter_map(|(p, _)| Path::new(&p).file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+
+        for candidate in &ti_candidates {
+            assert!(
+                fts_hits.contains(candidate),
+                "FTS result set missing TokenIndex candidate {candidate}: fts={fts_hits:?}"
+            );
+        }
     }
 }

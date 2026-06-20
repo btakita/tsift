@@ -1264,6 +1264,34 @@ impl IndexDb {
             .map_err(Into::into)
     }
 
+    /// Zone-map-**pruned** FTS5 content search (#015t Phase 3) — the consumer the
+    /// `file_zonemap` substrate was built for. Runs the BM25 MATCH, then, when a
+    /// `kind` filter is given, drops any hit the zone-map **proves** cannot contain
+    /// that symbol kind (`files_possibly_containing_kind`). The prune is **sound**:
+    /// a file lacking a zone-map row is conservatively retained, so the pruned set
+    /// is always a subset of the unpruned set and never drops a true match. Phase 3
+    /// is flag-gated; the JSON `TokenIndex` stays the default search path until the
+    /// Phase 4 cutover proves top-K parity.
+    pub fn content_fts_search_pruned(
+        &self,
+        query: &str,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, f64)>> {
+        let hits = self.content_fts_search(query, limit)?;
+        let Some(kind) = kind else {
+            return Ok(hits);
+        };
+        let allowed: std::collections::HashSet<String> = self
+            .files_possibly_containing_kind(kind)?
+            .into_iter()
+            .collect();
+        Ok(hits
+            .into_iter()
+            .filter(|(path, _)| allowed.contains(path))
+            .collect())
+    }
+
     /// Per-file zone-map rows, ordered by path. See [`FileZonemap`].
     pub fn file_zonemaps(&self) -> Result<Vec<FileZonemap>> {
         let mut stmt = self.conn.prepare(
@@ -2088,6 +2116,60 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|(path, _)| path.ends_with("lib.py"))
+        );
+    }
+
+    #[test]
+    fn content_fts_search_pruned_is_sound() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        // No kind filter == plain FTS search.
+        assert_eq!(
+            db.content_fts_search_pruned("main", None, 10).unwrap().len(),
+            db.content_fts_search("main", 10).unwrap().len()
+        );
+
+        // A kind actually present in main.rs (avoid hardcoding the extractor label).
+        let main = db
+            .file_zonemaps()
+            .unwrap()
+            .into_iter()
+            .find(|zm| zm.path.ends_with("main.rs"))
+            .expect("zonemap row for main.rs");
+        let kind = main.kinds.first().expect("main.rs has a symbol kind").clone();
+
+        let unpruned = db.content_fts_search("main", 10).unwrap();
+        assert!(unpruned.iter().any(|(p, _)| p.ends_with("main.rs")));
+
+        // Pruned by a kind main.rs HAS: it is retained, and the prune never adds
+        // (pruned ⊆ unpruned).
+        let kept = db.content_fts_search_pruned("main", Some(&kind), 10).unwrap();
+        assert!(kept.iter().any(|(p, _)| p.ends_with("main.rs")));
+        let unpruned_paths: std::collections::HashSet<_> =
+            unpruned.iter().map(|(p, _)| p.clone()).collect();
+        assert!(kept.iter().all(|(p, _)| unpruned_paths.contains(p)));
+
+        // Pruned by a kind NO file contains: every file has a zone-map row and none
+        // match, so the FTS hit is pruned away.
+        assert!(
+            db.content_fts_search_pruned("main", Some("zzz_nonexistent_kind"), 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Soundness: a file lacking a zone-map row is retained even under a bogus
+        // kind — the prune must never drop a file it cannot prove absent.
+        db.conn
+            .execute("DELETE FROM file_zonemap WHERE path LIKE '%main.rs'", [])
+            .unwrap();
+        let retained = db
+            .content_fts_search_pruned("main", Some("zzz_nonexistent_kind"), 10)
+            .unwrap();
+        assert!(
+            retained.iter().any(|(p, _)| p.ends_with("main.rs")),
+            "a file lacking a zone-map row must be retained (sound)"
         );
     }
 
