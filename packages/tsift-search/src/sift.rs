@@ -191,6 +191,18 @@ impl SearchInput {
 /// or modified afterward were silently missing). Because every site that
 /// reaches this type needs *live* results, caching it to disk was wrong by
 /// construction; the fallback now always rebuilds in-memory.
+///
+/// #015t Phase 4b(a) decision (operator, 2026-06-20): **keep this in-memory
+/// rebuild** as the degraded-read-only fallback rather than replacing the call
+/// site with a literal `rg -F` walk and deleting the type. Both are equally
+/// *live*, so the choice is not about freshness — it is about parity. This
+/// rebuild preserves the tokenized **OR-union** matching and token-overlap
+/// ranking of the FTS path (`fts_match_query` / `content_fts`), so the
+/// transient degraded window stays behaviorally indistinguishable from the
+/// healthy path. `rg -F` would silently switch the fallback to literal
+/// substring matching with no ranking — a hard-to-debug divergence in a path
+/// that is meant to be an invisible safety net. Do not "simplify" by deleting
+/// `TokenIndex` without re-opening that decision.
 #[derive(Debug, Clone, Default)]
 pub struct TokenIndex {
     token_to_files: HashMap<String, Vec<String>>,
