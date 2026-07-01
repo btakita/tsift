@@ -18,11 +18,11 @@ jobs:
         working-directory: tsift
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: tsift
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: btakita/tagpath
           path: tagpath
@@ -38,7 +38,7 @@ jobs:
       # continue-on-error: a cache-service outage (not a cache miss) must not
       # abort the suite — fall through to a cold build instead. See #cicacheguard.
       - name: Cache cargo registry + build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         continue-on-error: true
         with:
           path: |
@@ -60,11 +60,11 @@ jobs:
         working-directory: tsift
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: tsift
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: btakita/tagpath
           path: tagpath
@@ -78,7 +78,7 @@ jobs:
       # continue-on-error: a cache-service outage (not a cache miss) must not
       # abort the suite — fall through to a cold build instead. See #cicacheguard.
       - name: Cache cargo registry + build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         continue-on-error: true
         with:
           path: |

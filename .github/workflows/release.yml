@@ -26,7 +26,7 @@ jobs:
         working-directory: tsift
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: tsift
 
@@ -118,7 +118,7 @@ jobs:
             asset_name: tsift-x86_64-pc-windows-msvc.zip
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: tsift
 
@@ -201,7 +201,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') && vars.TSIFT_ENABLE_CRATES_PUBLISH == 'true'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: tsift
 
@@ -319,7 +319,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') && vars.TSIFT_ENABLE_NPM_PUBLISH == 'true'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: tsift
 
