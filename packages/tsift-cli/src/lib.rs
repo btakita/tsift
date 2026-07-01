@@ -27849,7 +27849,13 @@ tier = "private"
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("notes.txt"), "alpha\nclaudescore-3\nbeta\n").unwrap();
 
-        let response = run_exact_search_with_timeout(dir.path(), "claudescore-3", 5, 0).unwrap();
+        let response = run_exact_search_with_timeout(
+            std::slice::from_ref(&dir.path().to_path_buf()),
+            "claudescore-3",
+            5,
+            0,
+        )
+        .unwrap();
 
         assert_eq!(response.strategy, "exact");
         assert_eq!(response.hits.len(), 1);
@@ -34296,7 +34302,7 @@ pub(crate) fn federated_exact_search(
             continue;
         }
         let mut response =
-            run_exact_search_with_timeout(&scope.source_root, query, limit, timeout_secs)?;
+            run_exact_search_with_timeout(std::slice::from_ref(&scope.source_root), query, limit, timeout_secs)?;
         absolutize_search_hit_paths(&mut response, &scope.source_root);
         response.root = root.display().to_string();
         responses.push(response);
@@ -34401,7 +34407,7 @@ fn exact_search_timeout_message(timeout_secs: u64) -> String {
     )
 }
 
-fn exact_search_command(search_path: &Path, query: &str) -> Command {
+fn exact_search_command(search_paths: &[PathBuf], query: &str) -> Command {
     let mut command = Command::new("rg");
     command
         .arg("--json")
@@ -34409,8 +34415,12 @@ fn exact_search_command(search_path: &Path, query: &str) -> Command {
         .arg("--line-number")
         .arg("--hidden")
         .arg("--")
-        .arg(query)
-        .arg(search_path);
+        .arg(query);
+    if search_paths.is_empty() {
+        command.arg(Path::new("."));
+    } else {
+        command.args(search_paths);
+    }
     command
 }
 
@@ -34519,12 +34529,16 @@ fn exact_search_response_from_process(
     parse_exact_search_output(search_path, limit, &raw)
 }
 
-fn run_exact_search(search_path: &Path, query: &str, limit: usize) -> Result<sift::SearchResponse> {
-    let output = exact_search_command(search_path, query)
+fn run_exact_search(search_paths: &[PathBuf], query: &str, limit: usize) -> Result<sift::SearchResponse> {
+    let output = exact_search_command(search_paths, query)
         .output()
         .context("running exact search with ripgrep")?;
+    let root_display = search_paths
+        .first()
+        .map(|p| p.as_path())
+        .unwrap_or_else(|| Path::new("."));
     exact_search_response_from_process(
-        search_path,
+        root_display,
         limit,
         output.status,
         &output.stdout,
@@ -34533,16 +34547,16 @@ fn run_exact_search(search_path: &Path, query: &str, limit: usize) -> Result<sif
 }
 
 pub(crate) fn run_exact_search_with_timeout(
-    search_path: &Path,
+    search_paths: &[PathBuf],
     query: &str,
     limit: usize,
     timeout_secs: u64,
 ) -> Result<sift::SearchResponse> {
     if timeout_secs == 0 {
-        return run_exact_search(search_path, query, limit);
+        return run_exact_search(search_paths, query, limit);
     }
 
-    let mut child = exact_search_command(search_path, query)
+    let mut child = exact_search_command(search_paths, query)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -34561,8 +34575,12 @@ pub(crate) fn run_exact_search_with_timeout(
     let status = status.unwrap();
     let stdout = read_child_stdout(&mut child)?;
     let stderr = read_child_stderr(&mut child)?;
+    let root_display = search_paths
+        .first()
+        .map(|p| p.as_path())
+        .unwrap_or_else(|| Path::new("."));
     exact_search_response_from_process(
-        search_path,
+        root_display,
         limit,
         status,
         stdout.as_bytes(),

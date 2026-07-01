@@ -53,9 +53,11 @@ pub enum Commands {
     Search {
         /// Query string
         query: String,
-        /// Path to search (defaults to current directory)
+        /// Path to search (repeatable; defaults to current directory). With
+        /// multiple paths, exact search forwards them all to ripgrep and
+        /// indexed/lexical hits are pruned to their union.
         #[arg(short, long)]
-        path: Option<PathBuf>,
+        path: Vec<PathBuf>,
         /// Maximum number of results
         #[arg(short, long, default_value = "10")]
         limit: usize,

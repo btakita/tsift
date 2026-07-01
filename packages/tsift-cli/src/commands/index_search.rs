@@ -367,9 +367,10 @@ pub(crate) fn cmd_search(
     tabular: bool,
     schema: bool,
 ) -> Result<()> {
+    let paths = path.into_iter().collect::<Vec<_>>();
     cmd_search_with_budget(
         query,
-        path,
+        paths,
         limit,
         strategy,
         scope,
@@ -394,7 +395,7 @@ pub(crate) fn cmd_search(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_search_with_budget(
     query: String,
-    path: Option<PathBuf>,
+    paths: Vec<PathBuf>,
     limit: usize,
     strategy: Option<String>,
     scope: Option<String>,
@@ -414,7 +415,10 @@ pub(crate) fn cmd_search_with_budget(
     tagpath_opts: TagpathSearchOpts,
     facet_filters: SearchFacetFilters,
 ) -> Result<()> {
-    let base_path = path.unwrap_or_else(|| PathBuf::from("."));
+    let base_path = paths
+        .first()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("."));
     let format = OutputFormat {
         json_output,
         compact,
@@ -430,12 +434,15 @@ pub(crate) fn cmd_search_with_budget(
     // the project root, the FTS/lexical path still searches the *whole* project index
     // (`content_fts` paths are absolute), so its hits were never scoped to the subdir —
     // unlike exact search, where `rg` runs in `base_path`. Capture that sub-path so the
-    // non-exact result set can be pruned to it for parity. `None` when base_path is the
-    // project root (or above it), preserving the whole-index default.
-    let path_scope: Option<PathBuf> = base_path
-        .canonicalize()
-        .ok()
-        .filter(|canon| canon != &root && canon.starts_with(&root));
+    // non-exact result set can be pruned to it for parity. `--path` is repeatable, so
+    // collect every provided path that resolves to a strict subdir of the root; a hit is
+    // kept if it falls under any of them. Empty (no `--path`, or only the root itself)
+    // preserves the whole-index default.
+    let path_scopes: Vec<PathBuf> = paths
+        .iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .filter(|canon| canon != &root && canon.starts_with(&root))
+        .collect();
     let requested_strategy = resolve_search_strategy(&query, strategy);
     let requested_exact_search = requested_strategy == "exact";
     let precheck = if requested_exact_search {
@@ -560,12 +567,16 @@ pub(crate) fn cmd_search_with_budget(
         if federated && scope.is_none() {
             federated_exact_search(&root, &query, limit, timeout_secs)?
         } else {
-            let exact_path = if requested_exact_search && scope.is_none() {
-                &base_path
+            let exact_paths: Vec<PathBuf> = if requested_exact_search && scope.is_none() {
+                if paths.is_empty() {
+                    vec![PathBuf::from(".")]
+                } else {
+                    paths.clone()
+                }
             } else {
-                &sift_path
+                vec![sift_path.clone()]
             };
-            run_exact_search_with_timeout(exact_path, &query, limit, timeout_secs)?
+            run_exact_search_with_timeout(&exact_paths, &query, limit, timeout_secs)?
         }
     } else if federated && scope.is_none() {
         federated_sift_search(
@@ -590,14 +601,13 @@ pub(crate) fn cmd_search_with_budget(
         )?
     };
 
-    // #ve5f: prune the result set to the requested `--path` sub-scope. Exact search is
-    // already scoped (rg runs in base_path) so this is a no-op there; federated search
-    // spans multiple repos so a single sub-path must not drop cross-repo hits. The FTS/
-    // lexical path searches the whole index, so this is where sub-path narrowing lands.
-    if let Some(scope_dir) = path_scope.as_ref()
-        && !federated
-    {
-        prune_hits_to_path_scope(&mut response, scope_dir, &root);
+    // #ve5f: prune the result set to the requested `--path` sub-scopes. Exact search is
+    // already scoped (rg runs across every provided path) so this is a no-op there;
+    // federated search spans multiple repos so sub-paths must not drop cross-repo hits.
+    // The FTS/lexical path searches the whole index, so this is where sub-path
+    // narrowing lands — a hit is kept if it resolves under any provided scope.
+    if !path_scopes.is_empty() && !federated {
+        prune_hits_to_path_scope(&mut response, &path_scopes, &root);
     }
 
     // #trt1p2b hot-path injection: fold trusted, fresh findings for the search
@@ -930,7 +940,7 @@ pub(crate) fn cmd_search_with_budget(
 /// global ranking — narrowing changes which files appear, never their relative order.
 fn prune_hits_to_path_scope(
     response: &mut tsift_search::sift::SearchResponse,
-    scope_dir: &Path,
+    scope_dirs: &[PathBuf],
     root: &Path,
 ) {
     response.hits.retain(|hit| {
@@ -940,7 +950,7 @@ fn prune_hits_to_path_scope(
         } else {
             root.join(raw)
         };
-        abs.starts_with(scope_dir)
+        scope_dirs.iter().any(|scope_dir| abs.starts_with(scope_dir))
     });
 }
 
@@ -1035,7 +1045,7 @@ mod prune_path_scope_tests {
             // component-based `starts_with` must NOT retain it.
             hit("/proj/src/foobar/d.rs", 4),
         ]);
-        prune_hits_to_path_scope(&mut resp, scope, root);
+        prune_hits_to_path_scope(&mut resp, &[scope.to_path_buf()], root);
         let paths: Vec<&str> = resp.hits.iter().map(|h| h.path.as_str()).collect();
         assert_eq!(paths, vec!["/proj/src/foo/a.rs", "/proj/src/foo/nested/c.rs"]);
         // No renumber: survivors keep their original BM25 ranks (strict subsequence).
@@ -1050,7 +1060,7 @@ mod prune_path_scope_tests {
         let root = Path::new("/proj");
         let scope = Path::new("/proj/src/foo");
         let mut resp = response(vec![hit("src/foo/a.rs", 1), hit("src/bar/b.rs", 2)]);
-        prune_hits_to_path_scope(&mut resp, scope, root);
+        prune_hits_to_path_scope(&mut resp, &[scope.to_path_buf()], root);
         let paths: Vec<&str> = resp.hits.iter().map(|h| h.path.as_str()).collect();
         assert_eq!(paths, vec!["src/foo/a.rs"]);
     }
@@ -1060,7 +1070,29 @@ mod prune_path_scope_tests {
         let root = Path::new("/proj");
         let scope = Path::new("/proj/src/foo");
         let mut resp = response(vec![hit("/proj/src/bar/b.rs", 1)]);
-        prune_hits_to_path_scope(&mut resp, scope, root);
+        prune_hits_to_path_scope(&mut resp, &[scope.to_path_buf()], root);
         assert!(resp.hits.is_empty());
+    }
+
+    #[test]
+    fn keeps_hits_under_any_of_multiple_scopes() {
+        let root = Path::new("/proj");
+        let scopes = vec![
+            PathBuf::from("/proj/src/foo"),
+            PathBuf::from("/proj/lib/bar"),
+        ];
+        let mut resp = response(vec![
+            hit("/proj/src/foo/a.rs", 1),
+            hit("/proj/src/baz/b.rs", 2),
+            hit("/proj/lib/bar/c.rs", 3),
+            hit("/proj/lib/qux/d.rs", 4),
+        ]);
+        prune_hits_to_path_scope(&mut resp, &scopes, root);
+        let paths: Vec<&str> = resp.hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["/proj/src/foo/a.rs", "/proj/lib/bar/c.rs"]);
+        assert_eq!(
+            resp.hits.iter().map(|h| h.rank).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
     }
 }
