@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.75
+
+- **graph-db refresh CPU guard**: root-scale `tsift graph-db --path . --json refresh` no longer scans the entire indexed symbol table for every AST span. The traversal graph builder now pre-groups `all_symbols()` by file and passes only same-file symbols into AST parent/child and Markdown section metadata, removing the quadratic full-index walk that could peg one CPU indefinitely on large workspaces while still preserving AST navigation edges.
+
 ## 0.1.74
 
 - **ci: clear GitHub Actions Node.js 20 deprecation.** `actions/checkout@v4` and `actions/cache@v4` target the deprecated Node.js 20 runtime — CI runs emit a deprecation annotation and are force-upgraded to Node 24, which breaks once GitHub fully removes Node 20. Both are bumped to `@v5` (the first major shipping on Node 24) across `ci.yml` and `release.yml`. `actions/upload-artifact@v4` / `download-artifact@v4` (release.yml only) are intentionally left as-is — their `v5` still runs on Node 20, and they were not flagged.

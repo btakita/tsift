@@ -1,6 +1,6 @@
 [package]
 name = "tsift-surrealdb"
-version = "0.1.74"
+version = "0.1.75"
 edition = "2024"
 description = "Optional SurrealDB graph store backend spike for tsift"
 license = "MIT"
@@ -18,7 +18,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 surrealdb = { version = "2.3.10", default-features = false, features = ["kv-mem", "kv-surrealkv"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
-tsift-core = { path = "../tsift-core", version = "0.1.74" }
+tsift-core = { path = "../tsift-core", version = "0.1.75" }
 
 [dev-dependencies]
 tempfile = "3"

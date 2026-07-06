@@ -12585,9 +12585,9 @@ fn traversal_ast_span_node(
     root: &Path,
     symbol: &index::StoredSymbol,
     source: &[u8],
-    symbols: &[index::StoredSymbol],
+    symbols: &[&index::StoredSymbol],
 ) -> Option<(TraversalNode, TraversalAstSpanIndexEntry)> {
-    let span = stored_symbol_ast_span(symbol, source, symbols, usize::MAX)?;
+    let span = stored_symbol_ast_span_in_file(symbol, source, symbols, usize::MAX)?;
     let file = relativize(&symbol.file, root);
     let mut properties = BTreeMap::new();
     properties.insert("layer".to_string(), "ast_navigation".to_string());
@@ -14377,6 +14377,15 @@ fn build_traversal_graph_source_with_options(
                 }
 
                 let symbols = db.all_symbols()?;
+                // AST parent/child lookup is per-file; using the root symbol set
+                // here turns large graph refreshes into quadratic full-index scans.
+                let mut symbols_by_file = HashMap::<String, Vec<&index::StoredSymbol>>::new();
+                for symbol in &symbols {
+                    symbols_by_file
+                        .entry(symbol.file.clone())
+                        .or_default()
+                        .push(symbol);
+                }
                 let mut symbol_by_file_name_line = HashMap::new();
                 let mut span_by_file_name_line = HashMap::new();
                 let mut first_symbol_by_name = BTreeMap::<String, String>::new();
@@ -14421,7 +14430,15 @@ fn build_traversal_graph_source_with_options(
                     }
                     if let Some(Some(source)) = source_by_file.get(&symbol.file)
                         && let Some((ast_node, mut ast_entry)) =
-                            traversal_ast_span_node(root, symbol, source, &symbols)
+                            traversal_ast_span_node(
+                                root,
+                                symbol,
+                                source,
+                                symbols_by_file
+                                    .get(&symbol.file)
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]),
+                            )
                     {
                         ast_entry.symbol_handle = node.handle.clone();
                         ast_entry.file_handle = file_handle_by_path.get(&file).cloned();
@@ -16203,13 +16220,14 @@ fn same_stored_symbol_span(left: &index::StoredSymbol, right: &index::StoredSymb
         && stored_symbol_span_bounds(left) == stored_symbol_span_bounds(right)
 }
 
-fn stored_symbol_parent_span_handle(
+fn stored_symbol_parent_span_handle_in_file(
     symbol: &index::StoredSymbol,
-    symbols: &[index::StoredSymbol],
+    symbols: &[&index::StoredSymbol],
 ) -> Option<String> {
     let (start_byte, end_byte) = stored_symbol_span_bounds(symbol)?;
     symbols
         .iter()
+        .copied()
         .filter(|candidate| {
             if candidate.file != symbol.file || same_stored_symbol_span(candidate, symbol) {
                 return false;
@@ -16228,9 +16246,9 @@ fn stored_symbol_parent_span_handle(
         .and_then(stored_symbol_span_handle)
 }
 
-fn stored_symbol_child_span_handles(
+fn stored_symbol_child_span_handles_in_file(
     symbol: &index::StoredSymbol,
-    symbols: &[index::StoredSymbol],
+    symbols: &[&index::StoredSymbol],
     limit: usize,
 ) -> Vec<String> {
     let Some((start_byte, end_byte)) = stored_symbol_span_bounds(symbol) else {
@@ -16238,6 +16256,7 @@ fn stored_symbol_child_span_handles(
     };
     symbols
         .iter()
+        .copied()
         .filter(|candidate| {
             if candidate.file != symbol.file || same_stored_symbol_span(candidate, symbol) {
                 return false;
@@ -16284,14 +16303,15 @@ fn markdown_list_depth(source: &[u8], start_byte: usize) -> usize {
         / 2
 }
 
-fn markdown_enclosing_heading_symbols<'a>(
+fn markdown_enclosing_heading_symbols_in_file<'a>(
     file: &str,
     start_byte: usize,
     end_byte: usize,
-    symbols: &'a [index::StoredSymbol],
+    symbols: &[&'a index::StoredSymbol],
 ) -> Vec<&'a index::StoredSymbol> {
     let mut headings = symbols
         .iter()
+        .copied()
         .filter(|candidate| candidate.file == file && candidate.kind == "heading")
         .filter(|candidate| {
             let Some((candidate_start, candidate_end)) = stored_symbol_span_bounds(candidate)
@@ -16315,17 +16335,17 @@ fn markdown_enclosing_heading_symbols<'a>(
     headings
 }
 
-fn markdown_stored_symbol_metadata(
+fn markdown_stored_symbol_metadata_in_file(
     symbol: &index::StoredSymbol,
     source: &[u8],
-    symbols: &[index::StoredSymbol],
+    symbols: &[&index::StoredSymbol],
 ) -> Option<MarkdownSpanMetadata> {
     if symbol.language != "markdown" {
         return None;
     }
     let (start_byte, end_byte) = stored_symbol_span_bounds(symbol)?;
     let section_symbols =
-        markdown_enclosing_heading_symbols(&symbol.file, start_byte, end_byte, symbols);
+        markdown_enclosing_heading_symbols_in_file(&symbol.file, start_byte, end_byte, symbols);
     let section_path = section_symbols
         .iter()
         .map(|heading| heading.name.clone())
@@ -16993,6 +17013,16 @@ pub(crate) fn stored_symbol_ast_span(
     symbols: &[index::StoredSymbol],
     child_limit: usize,
 ) -> Option<AstSpanPreview> {
+    let file_symbols = symbols.iter().collect::<Vec<_>>();
+    stored_symbol_ast_span_in_file(symbol, source, &file_symbols, child_limit)
+}
+
+fn stored_symbol_ast_span_in_file(
+    symbol: &index::StoredSymbol,
+    source: &[u8],
+    symbols: &[&index::StoredSymbol],
+    child_limit: usize,
+) -> Option<AstSpanPreview> {
     let (start_byte, end_byte) = stored_symbol_span_bounds(symbol)?;
     let node_kind = symbol.node_kind.clone()?;
     let body_start_byte = symbol_span_byte(symbol.body_start_byte);
@@ -17014,9 +17044,9 @@ pub(crate) fn stored_symbol_ast_span(
         body_end_byte,
         body_start_line: body_start_byte.map(|byte| source_line_for_byte(source, byte)),
         body_end_line: body_end_byte.map(|byte| source_line_for_end_byte(source, byte)),
-        parent_handle: stored_symbol_parent_span_handle(symbol, symbols),
-        child_handles: stored_symbol_child_span_handles(symbol, symbols, child_limit),
-        markdown: markdown_stored_symbol_metadata(symbol, source, symbols),
+        parent_handle: stored_symbol_parent_span_handle_in_file(symbol, symbols),
+        child_handles: stored_symbol_child_span_handles_in_file(symbol, symbols, child_limit),
+        markdown: markdown_stored_symbol_metadata_in_file(symbol, source, symbols),
     })
 }
 
