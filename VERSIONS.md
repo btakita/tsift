@@ -8,6 +8,15 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.76
+
+- **Upgrade `lazily` 0.10 → 0.21.6.** All five lazily consumers (`tsift-core`,
+  `tsift-graph`, `tsift-index`, `tsift-status`, `tsift-summarize`) now build against
+  the current published `lazily` (0.21.6); the reactive core API (`Context`,
+  `CellHandle`, `SlotHandle`) is unchanged, so this is a dependency refresh with no
+  behavior change. Removes the stale `lazily 0.10.3` from the dependency tree for
+  downstream consumers (e.g. agent-doc).
+
 ## 0.1.75
 
 - **graph-db refresh CPU guard**: root-scale `tsift graph-db --path . --json refresh` no longer scans the entire indexed symbol table for every AST span. The traversal graph builder now pre-groups `all_symbols()` by file and passes only same-file symbols into AST parent/child and Markdown section metadata, removing the quadratic full-index walk that could peg one CPU indefinitely on large workspaces while still preserving AST navigation edges.

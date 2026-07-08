@@ -2377,13 +2377,24 @@ dependencies = [
 
 [[package]]
 name = "lazily"
-version = "0.10.3"
+version = "0.21.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7006d091eda7f35e3c9ecc605cad71e74e2f73b2c0680ef5321e205524e05166"
+checksum = "4ccd94e5de618919866159b7bc7df7322977a59b1b33c93c48488727f8b10702"
 dependencies = [
  "arc-swap",
- "parking_lot",
+ "lazily-macros",
  "smallvec",
+]
+
+[[package]]
+name = "lazily-macros"
+version = "0.21.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cda2df12d5eb57f3bedc028260abf7f0976ccd06095199814ad33cc578a7c6a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5198,7 +5209,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tsift"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "tsift-agent-doc",
  "tsift-algorithms",
@@ -5223,7 +5234,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-agent-doc"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "serde",
@@ -5236,7 +5247,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-algorithms"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "serde",
@@ -5245,7 +5256,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-cache"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "blake3",
  "filetime",
@@ -5256,7 +5267,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-cli"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5295,7 +5306,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-core"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5306,7 +5317,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-digest"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "serde",
@@ -5319,7 +5330,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-graph"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5339,7 +5350,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-index"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "fs4",
@@ -5357,7 +5368,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-kg"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5373,7 +5384,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-libsql"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5387,7 +5398,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-local-model"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "fs4",
@@ -5398,7 +5409,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-md-ast"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "serde",
  "tree-sitter",
@@ -5407,7 +5418,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-memgraphrag"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5424,7 +5435,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-memory"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5437,7 +5448,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-quality"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -5450,7 +5461,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-resolution"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "serde",
@@ -5459,7 +5470,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-search"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "ignore",
@@ -5476,14 +5487,14 @@ dependencies = [
 
 [[package]]
 name = "tsift-session"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "tsift-agent-doc",
 ]
 
 [[package]]
 name = "tsift-sim-world"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "tempfile",
  "tsift",
@@ -5493,7 +5504,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-sqlite"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5506,7 +5517,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-status"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "fs4",
@@ -5522,7 +5533,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-summarize"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5539,7 +5550,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-surrealdb"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5553,7 +5564,7 @@ dependencies = [
 
 [[package]]
 name = "tsift-tokensave"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "rusqlite",

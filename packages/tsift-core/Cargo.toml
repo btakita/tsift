@@ -1,6 +1,6 @@
 [package]
 name = "tsift-core"
-version = "0.1.75"
+version = "0.1.76"
 edition = "2024"
 description = "Provider-neutral graph types and GraphStore trait for tsift"
 license = "MIT"
@@ -14,6 +14,6 @@ publish = true
 [dependencies]
 anyhow = "1"
 blake3 = "1"
-lazily = "0.10"
+lazily = "0.21.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
