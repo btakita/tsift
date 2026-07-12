@@ -14,7 +14,7 @@ publish = true
 [dependencies]
 anyhow = "1"
 blake3 = "1"
-lazily = "0.21.6"
+lazily = "0.32.0"
 serde = { version = "1", features = ["derive"] }
 tsift-core = { path = "../tsift-core", version = "0.1.76" }
 tsift-md-ast = { path = "../tsift-md-ast", version = "0.1.76", optional = true }
