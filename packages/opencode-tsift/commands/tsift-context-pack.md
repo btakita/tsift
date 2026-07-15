@@ -1,4 +1,4 @@
-<!-- tsift:opencode-command v=0.1.75 name=tsift-context-pack -->
+<!-- tsift:opencode-command v=0.1.77 name=tsift-context-pack -->
 ---
 description: Build a bounded tsift context pack
 ---

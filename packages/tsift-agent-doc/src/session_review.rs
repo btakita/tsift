@@ -1129,7 +1129,20 @@ fn build_target_context(target: &Path) -> Result<TargetContext> {
     let canonical_target = target
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", target.display()))?;
-    let root = tsift_quality::lint::resolve_harness_root_or_canonical_path(target)?;
+    // A harness transcript normally lives under ~/.claude or ~/.codex, outside
+    // the project it describes. Treating the transcript's parent as the source
+    // root makes context-pack auto-index the user's entire home directory. Use
+    // the transcript-owned cwd as the root hint before any index/diff work.
+    let transcript_cwd = (canonical_target.is_file()
+        && canonical_target
+            .extension()
+            .and_then(|value| value.to_str())
+            == Some("jsonl"))
+    .then(|| extract_jsonl_target_cwd(&canonical_target))
+    .transpose()?
+    .flatten();
+    let root_hint = transcript_cwd.as_deref().unwrap_or(target);
+    let root = tsift_quality::lint::resolve_harness_root_or_canonical_path(root_hint)?;
     let kind = if canonical_target.is_dir() {
         TargetKind::Directory
     } else if canonical_target.is_file() {
@@ -1169,6 +1182,30 @@ fn build_target_context(target: &Path) -> Result<TargetContext> {
         path_aliases,
         session_aliases,
     })
+}
+
+fn extract_jsonl_target_cwd(path: &Path) -> Result<Option<PathBuf>> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("reading transcript header {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut header = String::new();
+    let mut line = String::new();
+    while header.len() < SESSION_HEADER_PROBE_BUDGET_BYTES {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .with_context(|| format!("reading transcript header {}", path.display()))?;
+        if bytes == 0 {
+            break;
+        }
+        header.push_str(&line);
+        if let Some(cwd) =
+            extract_claude_cwd_from_text(&header).or_else(|| extract_codex_cwd_from_text(&header))
+        {
+            return Ok(Some(cwd));
+        }
+    }
+    Ok(None)
 }
 
 fn build_next_context(input: NextContextBuildInput<'_>) -> SessionReviewNextContext {
@@ -2249,6 +2286,33 @@ fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_target_uses_embedded_cwd_project_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let sessions = dir.path().join("harness-sessions");
+        fs::create_dir_all(project.join(".git")).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        let transcript = sessions.join("session.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"user\",\"cwd\":{:?},\"message\":{{}}}}\n",
+                project.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let context = build_target_context(&transcript).unwrap();
+
+        assert_eq!(context.root, project.canonicalize().unwrap());
+        assert_eq!(context.canonical_target, transcript.canonicalize().unwrap());
+        assert!(
+            context.relative_target.is_none(),
+            "an external transcript remains an external target even though its cwd owns project context"
+        );
+    }
 
     #[test]
     fn collect_recent_files_with_extension_caps_and_sorts_by_mtime() {

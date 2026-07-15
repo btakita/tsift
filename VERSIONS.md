@@ -8,6 +8,11 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.77
+
+- **External JSONL transcript targets now inherit their project root from the transcript `cwd`.** `session-review` and `context-pack` probe the bounded transcript header for Claude's top-level `cwd` or Codex's `session_meta.payload.cwd` before resolving index, diff, status, and graph work. A transcript under `~/.claude` / `~/.codex` can no longer fall back to the home directory and auto-index it indefinitely; the exact 822KB Claude transcript that previously pegged one CPU for more than fourteen hours now completes against its actual `boost-client` project.
+- **Upgrade `lazily` 0.21.6 → 0.32.0.** The five reactive-core consumers use the current compatible dependency release included on main after 0.1.76.
+
 ## 0.1.76
 
 - **Upgrade `lazily` 0.10 → 0.21.6.** All five lazily consumers (`tsift-core`,
