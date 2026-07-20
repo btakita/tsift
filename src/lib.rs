@@ -7,6 +7,7 @@ pub mod substrate;
 
 pub use tsift_agent_doc::{session_cost, session_digest, session_review};
 pub use tsift_algorithms as algorithms;
+pub use tsift_astgrep as astgrep;
 pub use tsift_cache as cache;
 pub use tsift_digest::{diff_digest, log_digest, metric_digest, test_digest};
 pub use tsift_index::{config, index, init, walk};

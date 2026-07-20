@@ -35,6 +35,7 @@ tsift-algorithms = { path = "../tsift-algorithms", version = "0.1.77" }
 tsift-cache = { path = "../tsift-cache", version = "0.1.77" }
 tsift-core = { path = "../tsift-core", version = "0.1.77" }
 tsift-digest = { path = "../tsift-digest", version = "0.1.77" }
+tsift-astgrep = { path = "../tsift-astgrep", version = "0.1.77", features = ["all-languages"] }
 tsift-graph = { path = "../tsift-graph", version = "0.1.77" }
 tsift-index = { path = "../tsift-index", version = "0.1.77" }
 tsift-kg = { path = "../tsift-kg", version = "0.1.77" }

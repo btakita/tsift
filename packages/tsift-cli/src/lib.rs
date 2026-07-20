@@ -82,9 +82,11 @@ use token_savings::{
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::{
-    Cli, Commands, DispatchTraceFormat, GraphDbQuery, KgCommand, LeaseCommand, LocalModelCommand,
+    AstGrepCommand, Cli, Commands, DispatchTraceFormat, GraphDbQuery, KgCommand, LeaseCommand,
+    LocalModelCommand,
     SemanticRelatedKind, SourceReadStyle,
 };
+
 #[cfg(test)]
 use cli::{GraphDbBackend, TraverseFormat};
 use commands::digests::{
@@ -520,6 +522,73 @@ pub fn run() -> Result<()> {
                 envelope,
             },
         ),
+        Some(Commands::AstGrep { command }) => match command {
+            AstGrepCommand::Search {
+                pattern,
+                paths,
+                lang,
+                no_ignore,
+                json,
+                max_items,
+                max_bytes,
+                budget,
+            } => commands::astgrep::cmd_ast_grep_search(
+                &pattern,
+                paths,
+                lang.as_deref(),
+                no_ignore,
+                OutputFormat {
+                    json_output: json || terse || schema || envelope,
+                    compact,
+                    pretty,
+                    terse,
+                    ultra_terse,
+                    schema,
+                    envelope,
+                },
+                ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
+            ),
+            AstGrepCommand::Rewrite {
+                pattern,
+                rewrite,
+                paths,
+                lang,
+                no_ignore,
+                apply,
+                json,
+                max_items,
+                max_bytes,
+                budget,
+            } => commands::astgrep::cmd_ast_grep_rewrite(
+                &pattern,
+                &rewrite,
+                paths,
+                lang.as_deref(),
+                no_ignore,
+                apply,
+                OutputFormat {
+                    json_output: json || terse || schema || envelope,
+                    compact,
+                    pretty,
+                    terse,
+                    ultra_terse,
+                    schema,
+                    envelope,
+                },
+                ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
+            ),
+            AstGrepCommand::Languages { json } => {
+                commands::astgrep::cmd_ast_grep_languages(OutputFormat {
+                    json_output: json || terse || schema || envelope,
+                    compact,
+                    pretty,
+                    terse,
+                    ultra_terse,
+                    schema,
+                    envelope,
+                })
+            }
+        },
         Some(Commands::Edit { dry_run, file }) => {
             cmd_edit(dry_run, file, compact, pretty, terse, schema)
         }

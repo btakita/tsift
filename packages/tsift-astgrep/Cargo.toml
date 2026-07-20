@@ -1,0 +1,47 @@
+[package]
+name = "tsift-astgrep"
+version = "0.1.77"
+edition = "2024"
+description = "Structural (ast-grep) code search and rewrite engine for tsift"
+license = "MIT"
+repository = "https://github.com/btakita/tsift"
+authors = ["Brian Takita <brian.takita@gmail.com>"]
+keywords = ["ast", "search", "refactor", "codemod", "tsift"]
+categories = ["development-tools"]
+publish = true
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+
+ast-grep-core = "0.44"
+ast-grep-language = { version = "0.44", default-features = false }
+ignore = "0.4"
+
+[features]
+# Mirrors the tsift `lang-*` feature fan-out. `ast-grep-language` gates each
+# grammar independently, so an unlisted language is simply not resolvable
+# rather than a link-time cost.
+default = []
+lang-rust = ["ast-grep-language/tree-sitter-rust"]
+lang-python = ["ast-grep-language/tree-sitter-python"]
+lang-typescript = ["ast-grep-language/tree-sitter-typescript"]
+lang-javascript = ["ast-grep-language/tree-sitter-javascript"]
+lang-kotlin = ["ast-grep-language/tree-sitter-kotlin"]
+lang-bash = ["ast-grep-language/tree-sitter-bash"]
+lang-markdown = ["ast-grep-language/tree-sitter-md"]
+# `lang-zig` exists in tsift but ast-grep-language ships no Zig grammar, so the
+# tsift feature intentionally forwards nothing here.
+lang-zig = []
+all-languages = [
+    "lang-rust",
+    "lang-python",
+    "lang-typescript",
+    "lang-javascript",
+    "lang-kotlin",
+    "lang-bash",
+    "lang-markdown",
+]
+
+[dev-dependencies]
+tempfile = "3"

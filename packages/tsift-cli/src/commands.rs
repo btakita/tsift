@@ -1,3 +1,4 @@
+pub(crate) mod astgrep;
 pub(crate) mod digests;
 pub(crate) mod finding;
 pub(crate) mod graph;

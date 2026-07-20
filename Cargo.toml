@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-memory", "packages/tsift-local-model", "packages/tsift-kg", "packages/tsift-memgraphrag", "packages/tsift-md-ast", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-resolution", "packages/tsift-cache", "packages/tsift-quality", "packages/tsift-index", "packages/tsift-agent-doc", "packages/tsift-session", "packages/tsift-summarize", "packages/tsift-digest", "packages/tsift-search", "packages/tsift-status", "packages/tsift-surrealdb", "packages/tsift-cli", "packages/tsift-sim-world"]
+members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-memory", "packages/tsift-local-model", "packages/tsift-kg", "packages/tsift-memgraphrag", "packages/tsift-md-ast", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-astgrep", "packages/tsift-resolution", "packages/tsift-cache", "packages/tsift-quality", "packages/tsift-index", "packages/tsift-agent-doc", "packages/tsift-session", "packages/tsift-summarize", "packages/tsift-digest", "packages/tsift-search", "packages/tsift-status", "packages/tsift-surrealdb", "packages/tsift-cli", "packages/tsift-sim-world"]
 resolver = "3"
 
 [package]
@@ -26,6 +26,7 @@ required-features = ["cli"]
 # `cargo install tsift` continues to install the CLI.
 tsift-agent-doc = { path = "packages/tsift-agent-doc", version = "0.1.77" }
 tsift-algorithms = { path = "packages/tsift-algorithms", version = "0.1.77" }
+tsift-astgrep = { path = "packages/tsift-astgrep", version = "0.1.77" }
 tsift-cache = { path = "packages/tsift-cache", version = "0.1.77" }
 tsift-cli = { path = "packages/tsift-cli", version = "0.1.77", optional = true }
 tsift-digest = { path = "packages/tsift-digest", version = "0.1.77" }
@@ -50,14 +51,14 @@ default = ["cli", "lang-rust", "lang-python", "lang-typescript", "lang-javascrip
 backend-libsql = ["dep:tsift-libsql"]
 backend-surrealdb = ["cli", "tsift-cli/backend-surrealdb"]
 cli = ["dep:tsift-cli"]
-lang-rust = ["tsift-graph/lang-rust", "tsift-search/lang-rust"]
-lang-python = ["tsift-graph/lang-python", "tsift-search/lang-python"]
-lang-typescript = ["tsift-graph/lang-typescript", "tsift-search/lang-typescript"]
-lang-javascript = ["tsift-graph/lang-javascript", "tsift-search/lang-javascript"]
-lang-kotlin = ["tsift-graph/lang-kotlin", "tsift-search/lang-kotlin"]
+lang-rust = ["tsift-astgrep/lang-rust", "tsift-graph/lang-rust", "tsift-search/lang-rust"]
+lang-python = ["tsift-astgrep/lang-python", "tsift-graph/lang-python", "tsift-search/lang-python"]
+lang-typescript = ["tsift-astgrep/lang-typescript", "tsift-graph/lang-typescript", "tsift-search/lang-typescript"]
+lang-javascript = ["tsift-astgrep/lang-javascript", "tsift-graph/lang-javascript", "tsift-search/lang-javascript"]
+lang-kotlin = ["tsift-astgrep/lang-kotlin", "tsift-graph/lang-kotlin", "tsift-search/lang-kotlin"]
 lang-zig = ["tsift-graph/lang-zig", "tsift-search/lang-zig"]
-lang-bash = ["tsift-graph/lang-bash", "tsift-search/lang-bash"]
-lang-markdown = ["tsift-graph/lang-markdown", "tsift-search/lang-markdown"]
+lang-bash = ["tsift-astgrep/lang-bash", "tsift-graph/lang-bash", "tsift-search/lang-bash"]
+lang-markdown = ["tsift-astgrep/lang-markdown", "tsift-graph/lang-markdown", "tsift-search/lang-markdown"]
 all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]
 
 [dev-dependencies]

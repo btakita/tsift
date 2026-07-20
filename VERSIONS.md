@@ -8,6 +8,20 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **New `tsift ast-grep` structural search and rewrite (`tsift-astgrep`).** Adds
+  pattern-shaped code retrieval and codemods on top of the tree-sitter grammars
+  tsift already compiles: `tsift ast-grep search '<pattern>'`,
+  `tsift ast-grep rewrite '<pattern>' '<replacement>' [--apply]`, and
+  `tsift ast-grep languages`. Patterns use ast-grep metavariables (`$A`,
+  `$$$ARGS`) and report path, 1-based line/column, byte range, matched text, and
+  captures, in text, `--json`, or `--envelope` form. Rewrite **previews by
+  default** and refuses `--apply` under a preview budget so a capped scan can
+  never land a partial codemod and report it as complete. Language resolution is
+  gated per compiled grammar, so an uncompiled language fails up front instead of
+  panicking inside the engine; `lang-zig` intentionally forwards nothing because
+  `ast-grep-language` ships no Zig grammar. Spec:
+  [specs/structural-patterns.md](specs/structural-patterns.md).
+
 ## 0.1.77
 
 - **External JSONL transcript targets now inherit their project root from the transcript `cwd`.** `session-review` and `context-pack` probe the bounded transcript header for Claude's top-level `cwd` or Codex's `session_meta.payload.cwd` before resolving index, diff, status, and graph work. A transcript under `~/.claude` / `~/.codex` can no longer fall back to the home directory and auto-index it indefinitely; the exact 822KB Claude transcript that previously pegged one CPU for more than fourteen hours now completes against its actual `boost-client` project.

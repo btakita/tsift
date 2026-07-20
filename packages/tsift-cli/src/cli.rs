@@ -210,6 +210,11 @@ pub enum Commands {
         #[arg(long, value_enum)]
         budget: Option<ResponseBudgetPreset>,
     },
+    /// Structural (ast-grep) code search and rewrite over AST patterns
+    AstGrep {
+        #[command(subcommand)]
+        command: AstGrepCommand,
+    },
     /// Recommend a Claude model tier for a task (haiku/search, sonnet/edit, opus/architecture)
     Route {
         /// Task description to classify
@@ -1007,6 +1012,73 @@ pub enum Commands {
         /// Inspect a specific submodule index
         #[arg(long)]
         scope: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AstGrepCommand {
+    /// Find code matching a structural pattern (e.g. `foo($A)`, `if $C { $$$B }`)
+    Search {
+        /// ast-grep pattern to match
+        pattern: String,
+        /// Files or directories to scan (defaults to the current directory)
+        #[arg(long = "path")]
+        paths: Vec<PathBuf>,
+        /// Force a language instead of inferring it per file extension
+        #[arg(long)]
+        lang: Option<String>,
+        /// Include files excluded by .gitignore and hidden files
+        #[arg(long)]
+        no_ignore: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Preview-mode item cap
+        #[arg(long)]
+        max_items: Option<usize>,
+        /// Preview-mode per-field byte cap
+        #[arg(long)]
+        max_bytes: Option<usize>,
+        /// Named preview budget preset
+        #[arg(long, value_enum)]
+        budget: Option<ResponseBudgetPreset>,
+    },
+    /// Rewrite code matching a structural pattern; previews unless --apply
+    Rewrite {
+        /// ast-grep pattern to match
+        pattern: String,
+        /// Replacement template, reusing the pattern's metavariables
+        rewrite: String,
+        /// Files or directories to scan (defaults to the current directory)
+        #[arg(long = "path")]
+        paths: Vec<PathBuf>,
+        /// Force a language instead of inferring it per file extension
+        #[arg(long)]
+        lang: Option<String>,
+        /// Include files excluded by .gitignore and hidden files
+        #[arg(long)]
+        no_ignore: bool,
+        /// Write the rewrite to disk (default is a preview)
+        #[arg(long)]
+        apply: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Preview-mode item cap
+        #[arg(long)]
+        max_items: Option<usize>,
+        /// Preview-mode per-field byte cap
+        #[arg(long)]
+        max_bytes: Option<usize>,
+        /// Named preview budget preset
+        #[arg(long, value_enum)]
+        budget: Option<ResponseBudgetPreset>,
+    },
+    /// List the structural languages compiled into this build
+    Languages {
         /// Output as JSON
         #[arg(long)]
         json: bool,

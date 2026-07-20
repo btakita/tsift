@@ -251,6 +251,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "ast-grep-core"
+version = "0.44.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44135ff8104e5fbdcd5e0a8a8850b083694762530aa0212cac3a71158ac90a42"
+dependencies = [
+ "bit-set 0.10.0",
+ "regex",
+ "thiserror 2.0.18",
+ "tree-sitter",
+]
+
+[[package]]
+name = "ast-grep-language"
+version = "0.44.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f994c73a060c075a6a6a441fe6fc43b8c621116f60062df77d0899d5bee8d8df"
+dependencies = [
+ "ast-grep-core",
+ "ignore",
+ "serde",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-javascript",
+ "tree-sitter-kotlin-sg",
+ "tree-sitter-md",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+]
+
+[[package]]
 name = "async-channel"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -574,7 +605,16 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0700ddab506f33b20a03b13996eccd309a48e5ff77d0d95926aa0210fb4e95f1"
 dependencies = [
- "bit-vec",
+ "bit-vec 0.6.3",
+]
+
+[[package]]
+name = "bit-set"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ec2f926cc3060f09db9ebc5b52823d85268d24bb917e472c0c4bea35780a7d"
+dependencies = [
+ "bit-vec 0.9.1",
 ]
 
 [[package]]
@@ -582,6 +622,15 @@ name = "bit-vec"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "349f9b6a179ed607305526ca489b34ad0a41aed5f7980fa90eb03160b69598fb"
+
+[[package]]
+name = "bit-vec"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bitflags"
@@ -2351,7 +2400,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55cb077ad656299f160924eb2912aa147d7339ea7d69e1b5517326fdcec3c1ca"
 dependencies = [
  "ascii-canvas",
- "bit-set",
+ "bit-set 0.5.3",
  "ena",
  "itertools 0.11.0",
  "lalrpop-util",
@@ -5135,6 +5184,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-kotlin-sg"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c06ec43ae3c12165d4ac08afe4e1f5fc6757ffe274fa7bd5af9007ef11ba4319"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-language"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5213,6 +5272,7 @@ version = "0.1.77"
 dependencies = [
  "tsift-agent-doc",
  "tsift-algorithms",
+ "tsift-astgrep",
  "tsift-cache",
  "tsift-cli",
  "tsift-digest",
@@ -5255,6 +5315,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tsift-astgrep"
+version = "0.1.77"
+dependencies = [
+ "anyhow",
+ "ast-grep-core",
+ "ast-grep-language",
+ "ignore",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "tsift-cache"
 version = "0.1.77"
 dependencies = [
@@ -5284,6 +5356,7 @@ dependencies = [
  "tree-sitter",
  "tsift-agent-doc",
  "tsift-algorithms",
+ "tsift-astgrep",
  "tsift-cache",
  "tsift-core",
  "tsift-digest",
