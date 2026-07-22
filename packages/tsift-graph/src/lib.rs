@@ -1,5 +1,5 @@
 use anyhow::Result;
-use lazily::{CellHandle, Context as LazyContext, SlotHandle};
+use lazily::{Computed, Context as LazyContext, Source};
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -47,8 +47,8 @@ struct ResolveEdgesKey {
 
 #[derive(Clone, Copy)]
 struct ResolveEdgesSlot {
-    mtime: CellHandle<FileMtime>,
-    edges: SlotHandle<Vec<CallEdge>>,
+    mtime: Source<FileMtime>,
+    edges: Computed<Vec<CallEdge>>,
 }
 
 pub struct ResolveEdgesCache {
@@ -89,14 +89,14 @@ impl ResolveEdgesCache {
         let slot = {
             let mut slots = self.slots.borrow_mut();
             if let Some(slot) = slots.get(&key) {
-                self.ctx.set_cell(&slot.mtime, mtime);
+                self.ctx.set(&slot.mtime, mtime);
                 *slot
             } else {
-                let mtime_cell = self.ctx.cell(mtime);
+                let mtime_cell = self.ctx.source(mtime);
                 let symbols = symbols.to_vec();
                 let call_sites = call_sites.to_vec();
                 let edges = self.ctx.slot(move |ctx| {
-                    let _mtime = ctx.get_cell(&mtime_cell);
+                    let _mtime = ctx.get(&mtime_cell);
                     resolve_edges_uncached(&symbols, &call_sites)
                 });
                 let slot = ResolveEdgesSlot {

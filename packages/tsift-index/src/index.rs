@@ -1,7 +1,7 @@
 use crate::walk::{self, FileEntry, PruneStats};
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
-use lazily::{CellHandle, Context as LazyContext, SlotHandle};
+use lazily::{Computed, Context as LazyContext, Source};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 #[cfg(test)]
@@ -52,8 +52,8 @@ type CachedInspectResult = std::result::Result<ReadOnlyInspectResult, String>;
 
 struct InspectScopeState {
     ctx: LazyContext,
-    epoch: CellHandle<u64>,
-    slots: HashMap<InspectScopeKey, SlotHandle<CachedInspectResult>>,
+    epoch: Source<u64>,
+    slots: HashMap<InspectScopeKey, Computed<CachedInspectResult>>,
     hits: usize,
     misses: usize,
 }
@@ -61,7 +61,7 @@ struct InspectScopeState {
 impl InspectScopeState {
     fn new() -> Self {
         let ctx = LazyContext::new();
-        let epoch = ctx.cell(0u64);
+        let epoch = ctx.source(0u64);
         Self {
             ctx,
             epoch,
@@ -72,8 +72,8 @@ impl InspectScopeState {
     }
 
     fn invalidate_all(&self) {
-        let epoch = self.ctx.get_cell(&self.epoch);
-        self.ctx.set_cell(&self.epoch, epoch.wrapping_add(1));
+        let epoch = self.ctx.get(&self.epoch);
+        self.ctx.set(&self.epoch, epoch.wrapping_add(1));
     }
 }
 
@@ -152,7 +152,7 @@ fn inspect_scope_cache_get(
             let slot_key = key.clone();
             let epoch = state.epoch;
             let slot = state.ctx.slot(move |ctx| {
-                let _epoch = ctx.get_cell(&epoch);
+                let _epoch = ctx.get(&epoch);
                 IndexDb::inspect_read_only_uncached(&slot_key.0, &slot_key.1, slot_key.2)
                     .map_err(|err| format!("{err:#}"))
             });
@@ -1093,8 +1093,7 @@ impl IndexDb {
                                 // get no FTS row — a scope difference vs the TokenIndex that
                                 // the Phase 3 cutover must reconcile.
                                 let body = String::from_utf8_lossy(source);
-                                insert_fts
-                                    .execute(rusqlite::params![&path_str, body.as_ref()])?;
+                                insert_fts.execute(rusqlite::params![&path_str, body.as_ref()])?;
                             }
                             if let Some(ref source) = source {
                                 let call_sites = warning_on_error(
@@ -1233,17 +1232,17 @@ impl IndexDb {
     }
 
     pub fn zonemap_count(&self) -> Result<usize> {
-        let count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM file_zonemap", [], |row| row.get(0))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM file_zonemap", [], |row| row.get(0))?;
         Ok(count as usize)
     }
 
     /// Number of files in the native FTS5 content index (#015t Phase 1/2).
     pub fn content_fts_count(&self) -> Result<usize> {
-        let count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM content_fts", [], |row| row.get(0))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM content_fts", [], |row| row.get(0))?;
         Ok(count as usize)
     }
 
@@ -2019,7 +2018,11 @@ mod tests {
             .into_iter()
             .find(|zm| zm.path.ends_with("main.rs"))
             .expect("zonemap row after modify");
-        assert!(main.max_line >= 4, "max_line should grow, got {}", main.max_line);
+        assert!(
+            main.max_line >= 4,
+            "max_line should grow, got {}",
+            main.max_line
+        );
 
         // Delete main.rs — its zone-map row must be removed.
         fs::remove_file(dir.path().join("main.rs")).unwrap();
@@ -2046,14 +2049,20 @@ mod tests {
             .into_iter()
             .find(|zm| zm.path.ends_with("main.rs"))
             .expect("zonemap row for main.rs");
-        let kind = main.kinds.first().expect("main.rs has a symbol kind").clone();
+        let kind = main
+            .kinds
+            .first()
+            .expect("main.rs has a symbol kind")
+            .clone();
 
         let present = db.files_possibly_containing_kind(&kind).unwrap();
         assert!(present.iter().any(|p| p.ends_with("main.rs")));
 
         // A kind no tracked file contains: every file has a zone-map row and none match,
         // so all are pruned.
-        let bogus = db.files_possibly_containing_kind("zzz_nonexistent_kind").unwrap();
+        let bogus = db
+            .files_possibly_containing_kind("zzz_nonexistent_kind")
+            .unwrap();
         assert!(bogus.is_empty());
 
         // Soundness: a file_state row WITHOUT a zone-map row (a legacy index not yet
@@ -2062,7 +2071,9 @@ mod tests {
         db.conn
             .execute("DELETE FROM file_zonemap WHERE path LIKE '%main.rs'", [])
             .unwrap();
-        let retained = db.files_possibly_containing_kind("zzz_nonexistent_kind").unwrap();
+        let retained = db
+            .files_possibly_containing_kind("zzz_nonexistent_kind")
+            .unwrap();
         assert!(
             retained.iter().any(|p| p.ends_with("main.rs")),
             "a file lacking a zone-map row must be retained (sound)"
@@ -2116,7 +2127,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         fs::write(dir.path().join("main.rs"), "fn frobnicate() {}").unwrap();
         db.apply_changes(dir.path()).unwrap();
-        assert_eq!(db.content_fts_count().unwrap(), 3, "modify must not duplicate rows");
+        assert_eq!(
+            db.content_fts_count().unwrap(),
+            3,
+            "modify must not duplicate rows"
+        );
         let hits = db.content_fts_search("frobnicate", 10).unwrap();
         assert!(hits.iter().any(|(path, _)| path.ends_with("main.rs")));
         // The pre-modify token is gone.
@@ -2152,7 +2167,9 @@ mod tests {
 
         // No kind filter == plain FTS search.
         assert_eq!(
-            db.content_fts_search_pruned("main", None, 10).unwrap().len(),
+            db.content_fts_search_pruned("main", None, 10)
+                .unwrap()
+                .len(),
             db.content_fts_search("main", 10).unwrap().len()
         );
 
@@ -2163,14 +2180,20 @@ mod tests {
             .into_iter()
             .find(|zm| zm.path.ends_with("main.rs"))
             .expect("zonemap row for main.rs");
-        let kind = main.kinds.first().expect("main.rs has a symbol kind").clone();
+        let kind = main
+            .kinds
+            .first()
+            .expect("main.rs has a symbol kind")
+            .clone();
 
         let unpruned = db.content_fts_search("main", 10).unwrap();
         assert!(unpruned.iter().any(|(p, _)| p.ends_with("main.rs")));
 
         // Pruned by a kind main.rs HAS: it is retained, and the prune never adds
         // (pruned ⊆ unpruned).
-        let kept = db.content_fts_search_pruned("main", Some(&kind), 10).unwrap();
+        let kept = db
+            .content_fts_search_pruned("main", Some(&kind), 10)
+            .unwrap();
         assert!(kept.iter().any(|(p, _)| p.ends_with("main.rs")));
         let unpruned_paths: std::collections::HashSet<_> =
             unpruned.iter().map(|(p, _)| p.clone()).collect();

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use lazily::{CellHandle, Context as LazyContext, SlotHandle};
+use lazily::{Computed, Context as LazyContext, Source};
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -26,8 +26,8 @@ struct StatusInspectKey {
 
 pub struct StatusCheckCache {
     ctx: LazyContext,
-    epoch: CellHandle<u64>,
-    inspect_slots: RefCell<HashMap<StatusInspectKey, SlotHandle<CachedInspectResult>>>,
+    epoch: Source<u64>,
+    inspect_slots: RefCell<HashMap<StatusInspectKey, Computed<CachedInspectResult>>>,
 }
 
 impl Default for StatusCheckCache {
@@ -39,7 +39,7 @@ impl Default for StatusCheckCache {
 impl StatusCheckCache {
     pub fn new() -> Self {
         let ctx = LazyContext::new();
-        let epoch = ctx.cell(0u64);
+        let epoch = ctx.source(0u64);
         Self {
             ctx,
             epoch,
@@ -48,8 +48,8 @@ impl StatusCheckCache {
     }
 
     pub fn invalidate_all(&self) {
-        let epoch = self.ctx.get_cell(&self.epoch);
-        self.ctx.set_cell(&self.epoch, epoch.wrapping_add(1));
+        let epoch = self.ctx.get(&self.epoch);
+        self.ctx.set(&self.epoch, epoch.wrapping_add(1));
     }
 
     fn inspect_read_only(
@@ -71,7 +71,7 @@ impl StatusCheckCache {
                 let slot_key = key.clone();
                 let epoch = self.epoch;
                 let slot = self.ctx.slot(move |ctx| {
-                    let _epoch = ctx.get_cell(&epoch);
+                    let _epoch = ctx.get(&epoch);
                     IndexDb::inspect_read_only(&slot_key.db_path, &slot_key.root, slot_key.prune)
                         .map_err(|err| format!("{err:#}"))
                 });

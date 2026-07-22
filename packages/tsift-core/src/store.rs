@@ -1,5 +1,5 @@
 use anyhow::Result;
-use lazily::{Context as LazyContext, SlotHandle};
+use lazily::{Computed, Context as LazyContext};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -649,7 +649,7 @@ pub trait GraphStore {
             edges: BTreeMap::new(),
             frontier: vec![center_id.to_string()],
         };
-        let mut layer: SlotHandle<std::result::Result<NeighborhoodLayerState, String>> =
+        let mut layer: Computed<std::result::Result<NeighborhoodLayerState, String>> =
             ctx.slot(move |_| Ok(initial.clone()));
         let mut state = ctx.get(&layer).map_err(graph_cache_error)?;
 
@@ -875,7 +875,7 @@ pub trait GraphStore {
             total_discovered: 1,
             degree_map: BTreeMap::new(),
         };
-        let mut layer: SlotHandle<std::result::Result<RankedNeighborhoodLayerState, String>> =
+        let mut layer: Computed<std::result::Result<RankedNeighborhoodLayerState, String>> =
             ctx.slot(move |_| Ok(initial.clone()));
         let mut state = ctx.get(&layer).map_err(graph_cache_error)?;
         let options = options.clone();

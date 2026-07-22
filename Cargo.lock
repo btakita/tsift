@@ -2426,9 +2426,9 @@ dependencies = [
 
 [[package]]
 name = "lazily"
-version = "0.32.0"
+version = "0.48.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d029c206d2b184b1690574a4c3b811ea73b3d1eaa56c4aabdd1d1f9def0947d"
+checksum = "60e0a571e5346e21a702e09d6cfa8bdac6994aea4c3d904051689db9abe7ed04"
 dependencies = [
  "arc-swap",
  "lazily-macros",
@@ -2437,9 +2437,9 @@ dependencies = [
 
 [[package]]
 name = "lazily-macros"
-version = "0.22.0"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3e07e53899f332e931df5d90f0a03937db4e43630a0820cc77703b2d7631749"
+checksum = "7cde497d1471dd81ea14cd762e82f1b7bbe35e43858cc8b4066775fb387e42fa"
 dependencies = [
  "proc-macro2",
  "quote",

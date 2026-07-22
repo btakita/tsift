@@ -21,6 +21,9 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
   panicking inside the engine; `lang-zig` intentionally forwards nothing because
   `ast-grep-language` ships no Zig grammar. Spec:
   [specs/structural-patterns.md](specs/structural-patterns.md).
+- **Upgrade `lazily` 0.32.0 → 0.48.1.** All five reactive-core consumers now use
+  the Cell-kernel API (`Source` / `Computed` and unified `get` / `set`) from the
+  latest published dependency release.
 
 ## 0.1.77
 

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
-use lazily::{CellHandle, Context as LazyContext, SlotHandle};
+use lazily::{Computed, Context as LazyContext, Source};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
@@ -47,9 +47,9 @@ pub struct SummaryCacheLookup {
 
 #[derive(Clone, Copy)]
 struct SummaryFileSlot {
-    content_hash: CellHandle<Option<String>>,
-    epoch: CellHandle<u64>,
-    snapshot: SlotHandle<CachedSummaryFileSnapshot>,
+    content_hash: Source<Option<String>>,
+    epoch: Source<u64>,
+    snapshot: Computed<CachedSummaryFileSnapshot>,
 }
 
 pub struct SummaryCache {
@@ -586,16 +586,16 @@ impl SummaryCache {
             let mut slots = self.slots.borrow_mut();
             if let Some(slot) = slots.get(&normalized) {
                 self.ctx
-                    .set_cell(&slot.content_hash, requested_content_hash.clone());
+                    .set(&slot.content_hash, requested_content_hash.clone());
                 *slot
             } else {
                 let db = Rc::clone(&self.db);
                 let file_key = normalized.clone();
-                let content_hash_cell = self.ctx.cell(requested_content_hash.clone());
-                let epoch = self.ctx.cell(0u64);
+                let content_hash_cell = self.ctx.source(requested_content_hash.clone());
+                let epoch = self.ctx.source(0u64);
                 let snapshot = self.ctx.slot(move |ctx| {
-                    let requested_content_hash = ctx.get_cell(&content_hash_cell);
-                    let _epoch = ctx.get_cell(&epoch);
+                    let requested_content_hash = ctx.get(&content_hash_cell);
+                    let _epoch = ctx.get(&epoch);
                     let summaries = db
                         .get_by_file(&file_key)
                         .map_err(|err| format!("{err:#}"))?;
@@ -680,9 +680,9 @@ impl SummaryCache {
             return;
         };
         self.ctx
-            .set_cell(&slot.content_hash, content_hash.map(str::to_string));
-        let epoch = self.ctx.get_cell(&slot.epoch);
-        self.ctx.set_cell(&slot.epoch, epoch.wrapping_add(1));
+            .set(&slot.content_hash, content_hash.map(str::to_string));
+        let epoch = self.ctx.get(&slot.epoch);
+        self.ctx.set(&slot.epoch, epoch.wrapping_add(1));
     }
 }
 
