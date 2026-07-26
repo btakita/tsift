@@ -65,6 +65,7 @@ jobs:
           for package in \
             tsift-core \
             tsift-md-ast \
+            tsift-astgrep \
             tsift-graph \
             tsift-sqlite \
             tsift-algorithms \
@@ -274,6 +275,7 @@ jobs:
           for package in \
             tsift-core \
             tsift-md-ast \
+            tsift-astgrep \
             tsift-graph \
             tsift-sqlite \
             tsift-algorithms \
