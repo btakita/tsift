@@ -1,6 +1,6 @@
 [package]
 name = "tsift-sqlite"
-version = "0.1.77"
+version = "0.1.78"
 edition = "2024"
 description = "SQLite graph store backend for tsift"
 license = "MIT"
@@ -17,5 +17,5 @@ blake3 = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tsift-core = { path = "../tsift-core", version = "0.1.77" }
+tsift-core = { path = "../tsift-core", version = "0.1.78" }
 tempfile = "3"

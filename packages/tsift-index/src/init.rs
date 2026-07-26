@@ -59,6 +59,8 @@ pub enum InstructionStatus {
 
 const GITIGNORE_ENTRY: &str = ".tsift/";
 const CODEX_HOOK_STATUS: &str = "tsift auto-reindex";
+const CODEX_AUTOINDEX_HELPER: &str = "tsift-autoindex.sh";
+const CODEX_AUTOINDEX_HELPER_VERSION: u32 = 3;
 const OPENCODE_COMMAND_MARKER_PREFIX: &str = "<!-- tsift:opencode-command";
 
 pub struct InitResult {
@@ -218,7 +220,8 @@ pub fn init_with_integrations(
         } else {
             CodexHookScope::Project
         };
-        Some(ensure_codex_hooks(dir, scope)?)
+        let policy = resolve_codex_autoindex_policy(dir, scope)?;
+        Some(ensure_codex_hooks(dir, scope, &policy)?)
     } else {
         None
     };
@@ -280,10 +283,16 @@ fn ensure_instruction_file(file: &Path) -> Result<InitAction> {
     Ok(InitAction::Created)
 }
 
-fn ensure_codex_hooks(dir: &Path, scope: CodexHookScope) -> Result<CodexHooksResult> {
+fn ensure_codex_hooks(
+    dir: &Path,
+    scope: CodexHookScope,
+    policy: &CodexAutoindexPolicy,
+) -> Result<CodexHooksResult> {
     let codex_dir = dir.join(".codex");
+    std::fs::create_dir_all(&codex_dir)?;
+    let helper_changed = ensure_codex_autoindex_helper(dir, scope, policy)?;
     let hooks_path = codex_dir.join("hooks.json");
-    let tsift_hook = codex_hook_json(dir, scope);
+    let tsift_hook = codex_hook_json(dir);
 
     if hooks_path.exists() {
         let content = std::fs::read_to_string(&hooks_path)?;
@@ -357,15 +366,17 @@ fn ensure_codex_hooks(dir: &Path, scope: CodexHookScope) -> Result<CodexHooksRes
             );
         }
 
-        if action == CodexHookAction::AlreadyPresent {
+        if action == CodexHookAction::AlreadyPresent && !helper_changed {
             return Ok(CodexHooksResult { action, scope });
+        }
+        if action == CodexHookAction::AlreadyPresent {
+            action = CodexHookAction::Updated;
         }
 
         let formatted = serde_json::to_string_pretty(&doc)?;
         std::fs::write(&hooks_path, format!("{}\n", formatted))?;
         Ok(CodexHooksResult { action, scope })
     } else {
-        std::fs::create_dir_all(&codex_dir)?;
         let doc = serde_json::json!({"hooks": {"UserPromptSubmit": [{"hooks": [tsift_hook]}]}});
         let formatted = serde_json::to_string_pretty(&doc)?;
         std::fs::write(&hooks_path, format!("{}\n", formatted))?;
@@ -386,26 +397,180 @@ fn input_dir(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn codex_hook_json(dir: &Path, scope: CodexHookScope) -> serde_json::Value {
+fn codex_hook_json(dir: &Path) -> serde_json::Value {
     serde_json::json!({
-        "command": codex_hook_command(dir, scope),
+        "command": codex_hook_command(dir),
         "statusMessage": CODEX_HOOK_STATUS,
         "type": "command"
     })
 }
 
-fn codex_hook_command(dir: &Path, scope: CodexHookScope) -> String {
-    let quoted_dir = shell_quote(&dir.display().to_string());
-    match scope {
-        CodexHookScope::Project => format!(
-            "tsift index --check --exit-code {} >/dev/null 2>&1 || tsift index {} >/dev/null 2>&1",
-            quoted_dir, quoted_dir
-        ),
-        CodexHookScope::Workspace => format!(
-            "tsift index --check --exit-code --workspace {} >/dev/null 2>&1 || tsift index --workspace {} >/dev/null 2>&1",
-            quoted_dir, quoted_dir
-        ),
+fn codex_hook_command(dir: &Path) -> String {
+    shell_quote(
+        &dir.join(".codex")
+            .join(CODEX_AUTOINDEX_HELPER)
+            .display()
+            .to_string(),
+    )
+}
+
+#[derive(Debug, Default)]
+struct CodexAutoindexPolicy {
+    focus: Vec<String>,
+    cpu_affinity: Option<String>,
+}
+
+fn resolve_codex_autoindex_policy(
+    dir: &Path,
+    scope: CodexHookScope,
+) -> Result<CodexAutoindexPolicy> {
+    let configured = config::Config::load(dir)?.autoindex;
+    let cpu_affinity = configured
+        .cpu_affinity
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(value) = cpu_affinity.as_deref()
+        && !value
+            .chars()
+            .all(|character| character.is_ascii_digit() || matches!(character, ',' | '-'))
+    {
+        bail!(
+            "invalid autoindex.cpu_affinity {value:?}; expected a taskset CPU list such as \"16-31\""
+        );
     }
+
+    if scope != CodexHookScope::Workspace {
+        return Ok(CodexAutoindexPolicy {
+            focus: Vec::new(),
+            cpu_affinity,
+        });
+    }
+
+    let mut resolved = Vec::new();
+    for selector in configured.focus {
+        let scope = config::Config::resolve_submodule(dir, &selector)?;
+        if !resolved.contains(&scope.id) {
+            resolved.push(scope.id);
+        }
+    }
+    Ok(CodexAutoindexPolicy {
+        focus: resolved,
+        cpu_affinity,
+    })
+}
+
+fn ensure_codex_autoindex_helper(
+    dir: &Path,
+    scope: CodexHookScope,
+    policy: &CodexAutoindexPolicy,
+) -> Result<bool> {
+    let path = dir.join(".codex").join(CODEX_AUTOINDEX_HELPER);
+    let expected = codex_autoindex_helper(dir, scope, policy);
+    let mut changed = !path.exists() || std::fs::read_to_string(&path)? != expected;
+    if changed {
+        std::fs::write(&path, expected)?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = std::fs::metadata(&path)?;
+        let mut permissions = metadata.permissions();
+        if permissions.mode() & 0o777 != 0o755 {
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions)?;
+            changed = true;
+        }
+    }
+
+    Ok(changed)
+}
+
+fn codex_autoindex_helper(
+    dir: &Path,
+    scope: CodexHookScope,
+    policy: &CodexAutoindexPolicy,
+) -> String {
+    let root = shell_quote(&dir.display().to_string());
+    let cpu_affinity = shell_quote(policy.cpu_affinity.as_deref().unwrap_or(""));
+    let refresh_commands = match scope {
+        CodexHookScope::Project => vec![
+            "  run_tsift index --check --exit-code \"$root\" || run_tsift index \"$root\""
+                .to_string(),
+        ],
+        CodexHookScope::Workspace if policy.focus.is_empty() => vec![
+            "  run_tsift index --check --exit-code --workspace \"$root\" || run_tsift index --workspace \"$root\""
+                .to_string(),
+        ],
+        CodexHookScope::Workspace => policy
+            .focus
+            .iter()
+            .map(|scope| {
+                let scope = shell_quote(scope);
+                format!(
+                    "  run_tsift index --check --exit-code --submodule {scope} \"$root\" || run_tsift index --submodule {scope} \"$root\""
+                )
+            })
+            .collect(),
+    }
+    .join("\n");
+
+    format!(
+        r#"#!/usr/bin/env bash
+# tsift-autoindex-hook-version: {version}
+# The UI hook only starts this helper. The tsift binary runs after re-exec in a
+# detached, debounced, low-priority, workspace-single-flight worker.
+
+if [ "${{TSIFT_AUTOINDEX_WORKER:-0}}" != "1" ]; then
+  TSIFT_AUTOINDEX_WORKER=1 nohup "$0" </dev/null >/dev/null 2>&1 &
+  exit 0
+fi
+
+command -v tsift >/dev/null 2>&1 || exit 0
+root={root}
+cpu_affinity={cpu_affinity}
+max_runtime_seconds="${{TSIFT_AUTOINDEX_MAX_SECONDS:-120}}"
+case "$max_runtime_seconds" in
+''|*[!0-9]*) max_runtime_seconds=120 ;;
+esac
+worker_started_seconds=$SECONDS
+mkdir -p "$root/.tsift" || exit 0
+
+# Coalesce simultaneous prompts from multiple UI windows. On platforms without
+# flock, tsift's native index.lock still prevents competing heavy writers.
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$root/.tsift/autoindex-hook.lock"
+  flock -n 9 || exit 0
+fi
+
+sleep "${{TSIFT_AUTOINDEX_DEBOUNCE_SECONDS:-0.25}}"
+
+run_tsift() {{
+local -a runner=()
+local remaining_seconds="$max_runtime_seconds"
+if command -v nice >/dev/null 2>&1; then
+runner+=(nice -n 10)
+fi
+if [ "$max_runtime_seconds" != "0" ] && command -v timeout >/dev/null 2>&1; then
+remaining_seconds=$((max_runtime_seconds - (SECONDS - worker_started_seconds)))
+[ "$remaining_seconds" -gt 0 ] || return 124
+runner+=(timeout --signal=TERM --kill-after=5 "${{remaining_seconds}}s")
+fi
+if [ -n "$cpu_affinity" ] && command -v taskset >/dev/null 2>&1; then
+runner+=(taskset -c "$cpu_affinity")
+fi
+command "${{runner[@]}}" tsift "$@"
+}}
+
+refresh_indexes() {{
+{refresh_commands}
+}}
+
+refresh_indexes
+"#,
+        version = CODEX_AUTOINDEX_HELPER_VERSION,
+    )
 }
 
 struct OpenCodeCommandSpec {
@@ -843,9 +1008,19 @@ mod tests {
         let hooks = &doc["hooks"]["UserPromptSubmit"][0]["hooks"];
         let command = hooks[0]["command"].as_str().unwrap();
         assert_eq!(hooks[0]["statusMessage"], CODEX_HOOK_STATUS);
-        assert!(command.contains("tsift index --check --exit-code"));
-        assert!(command.contains(&dir.path().display().to_string()));
-        assert!(!command.contains("--workspace"));
+        assert!(command.contains(CODEX_AUTOINDEX_HELPER));
+        assert!(!command.contains("tsift index"));
+        let helper = std::fs::read_to_string(dir.path().join(".codex/tsift-autoindex.sh")).unwrap();
+        assert!(helper.contains("TSIFT_AUTOINDEX_WORKER=1 nohup"));
+        assert!(helper.contains("flock -n 9"));
+        assert!(helper.contains("runner+=(nice -n 10)"));
+        assert!(helper.contains("TSIFT_AUTOINDEX_MAX_SECONDS:-120"));
+        assert!(helper.contains("worker_started_seconds=$SECONDS"));
+        assert!(helper.contains("max_runtime_seconds - (SECONDS - worker_started_seconds)"));
+        assert!(helper.contains("timeout --signal=TERM --kill-after=5"));
+        assert!(helper.contains("tsift index --check --exit-code"));
+        assert!(helper.contains(&dir.path().display().to_string()));
+        assert!(!helper.contains("--workspace"));
     }
 
     #[test]
@@ -955,8 +1130,11 @@ mod tests {
         let command = doc["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        assert!(command.contains(&dir.path().display().to_string()));
-        assert!(!command.contains("--workspace"));
+        assert!(command.contains(CODEX_AUTOINDEX_HELPER));
+        assert!(!command.contains("tsift index"));
+        let helper = std::fs::read_to_string(dir.path().join(".codex/tsift-autoindex.sh")).unwrap();
+        assert!(helper.contains(&dir.path().display().to_string()));
+        assert!(!helper.contains("--workspace"));
     }
 
     #[test]
@@ -1066,8 +1244,11 @@ mod tests {
         let command = doc["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        assert!(command.contains("--workspace"));
-        assert!(command.contains(&dir.path().display().to_string()));
+        assert!(command.contains(CODEX_AUTOINDEX_HELPER));
+        assert!(!command.contains("tsift index"));
+        let helper = std::fs::read_to_string(dir.path().join(".codex/tsift-autoindex.sh")).unwrap();
+        assert!(helper.contains("--workspace"));
+        assert!(helper.contains(&dir.path().display().to_string()));
     }
 
     #[test]
@@ -1110,7 +1291,51 @@ mod tests {
         let command = doc["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        assert!(command.contains("--workspace"));
+        assert!(command.contains(CODEX_AUTOINDEX_HELPER));
+        let helper = std::fs::read_to_string(dir.path().join(".codex/tsift-autoindex.sh")).unwrap();
+        assert!(helper.contains("--workspace"));
+    }
+
+    #[test]
+    fn init_codex_workspace_hook_honors_autoindex_focus() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".gitmodules"),
+            "[submodule \"src/alpha\"]\n\tpath = src/alpha\n\n[submodule \"src/beta\"]\n\tpath = src/beta\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".tsift")).unwrap();
+        std::fs::write(
+            dir.path().join(".tsift/config.toml"),
+            "[autoindex]\nfocus = [\"alpha\"]\ncpu_affinity = \"4-7\"\n",
+        )
+        .unwrap();
+
+        init(dir.path(), true, true).unwrap();
+
+        let helper = std::fs::read_to_string(dir.path().join(".codex/tsift-autoindex.sh")).unwrap();
+        assert!(helper.contains("--submodule \"alpha\""));
+        assert!(!helper.contains("--submodule \"beta\""));
+        assert!(!helper.contains("--workspace"));
+        assert!(helper.contains("cpu_affinity=\"4-7\""));
+        assert!(helper.contains("runner+=(taskset -c \"$cpu_affinity\")"));
+    }
+
+    #[test]
+    fn init_codex_rejects_unsafe_autoindex_cpu_affinity() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".tsift")).unwrap();
+        std::fs::write(
+            dir.path().join(".tsift/config.toml"),
+            "[autoindex]\ncpu_affinity = \"0; shutdown\"\n",
+        )
+        .unwrap();
+
+        let error = init(dir.path(), true, false)
+            .err()
+            .expect("unsafe affinity should fail")
+            .to_string();
+        assert!(error.contains("invalid autoindex.cpu_affinity"));
     }
 
     #[test]

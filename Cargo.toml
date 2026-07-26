@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "tsift"
-version = "0.1.77"
+version = "0.1.78"
 edition = "2024"
 description = "Token-efficient CLI plugin for Claude Code — Sift-powered search + native tool routing"
 license = "MIT"
@@ -24,27 +24,27 @@ required-features = ["cli"]
 # Root `tsift` keeps the public package name. Its library remains a thin
 # re-export shim while the package binary delegates to `tsift-cli` so
 # `cargo install tsift` continues to install the CLI.
-tsift-agent-doc = { path = "packages/tsift-agent-doc", version = "0.1.77" }
-tsift-algorithms = { path = "packages/tsift-algorithms", version = "0.1.77" }
-tsift-astgrep = { path = "packages/tsift-astgrep", version = "0.1.77" }
-tsift-cache = { path = "packages/tsift-cache", version = "0.1.77" }
-tsift-cli = { path = "packages/tsift-cli", version = "0.1.77", optional = true }
-tsift-digest = { path = "packages/tsift-digest", version = "0.1.77" }
-tsift-graph = { path = "packages/tsift-graph", version = "0.1.77" }
-tsift-index = { path = "packages/tsift-index", version = "0.1.77" }
-tsift-kg = { path = "packages/tsift-kg", version = "0.1.77" }
-tsift-local-model = { path = "packages/tsift-local-model", version = "0.1.77" }
-tsift-memory = { path = "packages/tsift-memory", version = "0.1.77" }
-tsift-memgraphrag = { path = "packages/tsift-memgraphrag", version = "0.1.77" }
-tsift-quality = { path = "packages/tsift-quality", version = "0.1.77" }
-tsift-resolution = { path = "packages/tsift-resolution", version = "0.1.77" }
-tsift-search = { path = "packages/tsift-search", version = "0.1.77" }
-tsift-sqlite = { path = "packages/tsift-sqlite", version = "0.1.77" }
-tsift-status = { path = "packages/tsift-status", version = "0.1.77" }
-tsift-summarize = { path = "packages/tsift-summarize", version = "0.1.77" }
-tsift-tokensave = { path = "packages/tsift-tokensave", version = "0.1.77" }
+tsift-agent-doc = { path = "packages/tsift-agent-doc", version = "0.1.78" }
+tsift-algorithms = { path = "packages/tsift-algorithms", version = "0.1.78" }
+tsift-astgrep = { path = "packages/tsift-astgrep", version = "0.1.78" }
+tsift-cache = { path = "packages/tsift-cache", version = "0.1.78" }
+tsift-cli = { path = "packages/tsift-cli", version = "0.1.78", optional = true }
+tsift-digest = { path = "packages/tsift-digest", version = "0.1.78" }
+tsift-graph = { path = "packages/tsift-graph", version = "0.1.78" }
+tsift-index = { path = "packages/tsift-index", version = "0.1.78" }
+tsift-kg = { path = "packages/tsift-kg", version = "0.1.78" }
+tsift-local-model = { path = "packages/tsift-local-model", version = "0.1.78" }
+tsift-memory = { path = "packages/tsift-memory", version = "0.1.78" }
+tsift-memgraphrag = { path = "packages/tsift-memgraphrag", version = "0.1.78" }
+tsift-quality = { path = "packages/tsift-quality", version = "0.1.78" }
+tsift-resolution = { path = "packages/tsift-resolution", version = "0.1.78" }
+tsift-search = { path = "packages/tsift-search", version = "0.1.78" }
+tsift-sqlite = { path = "packages/tsift-sqlite", version = "0.1.78" }
+tsift-status = { path = "packages/tsift-status", version = "0.1.78" }
+tsift-summarize = { path = "packages/tsift-summarize", version = "0.1.78" }
+tsift-tokensave = { path = "packages/tsift-tokensave", version = "0.1.78" }
 
-tsift-libsql = { path = "packages/tsift-libsql", version = "0.1.77", optional = true }
+tsift-libsql = { path = "packages/tsift-libsql", version = "0.1.78", optional = true }
 
 [features]
 default = ["cli", "lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]

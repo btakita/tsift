@@ -310,6 +310,10 @@ tsift status <path>     # check a specific codebase directory
 tsift status --no-fix   # skip auto-fix, report raw status
 ```
 
+For a multi-scope workspace, automatic repair is lazy by scope: missing scopes
+are initialized and stale scopes are refreshed, while already-fresh scopes are
+not rescanned merely because another scope needs repair.
+
 ### Output
 
 Four sections: index state, instruction version, summary cache state, recommendations.

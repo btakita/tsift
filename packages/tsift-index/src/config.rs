@@ -19,7 +19,26 @@ pub struct Config {
     #[serde(default)]
     pub overrides: HashMap<String, SubmoduleOverride>,
     #[serde(default)]
+    pub autoindex: AutoindexConfig,
+    #[serde(default)]
     pub findings: FindingsConfig,
+}
+
+/// Prompt-hook indexing policy.
+///
+/// An empty focus preserves the workspace-wide default. Workspace users with
+/// many scopes can list only the scope ids (or relative submodule paths) that
+/// should be kept warm by the background prompt hook. Read commands still
+/// perform their own freshness check for any scope they actually consume.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AutoindexConfig {
+    #[serde(default)]
+    pub focus: Vec<String>,
+    /// Optional Linux `taskset -c` CPU list for background autoindex workers
+    /// (for example, `"16-31"`). This constrains tsift; reserving those CPUs
+    /// away from the UI remains an operating-system configuration concern.
+    #[serde(default)]
+    pub cpu_affinity: Option<String>,
 }
 
 /// Findings Graph Layer configuration (#trt1p4). Currently gates the passive
@@ -292,6 +311,10 @@ mod tests {
 federation = true
 tier = "shared"
 
+[autoindex]
+focus = ["agent-doc", "src/session-share"]
+cpu_affinity = "16-31"
+
 [overrides.mail]
 federation = false
 tier = "private"
@@ -314,6 +337,11 @@ federation = true
         assert!(cfg.federation_for("agent-doc"));
         assert_eq!(cfg.tier_for("unknown"), IsolationTier::Shared);
         assert!(cfg.federation_for("unknown"));
+        assert_eq!(
+            cfg.autoindex.focus,
+            vec!["agent-doc".to_string(), "src/session-share".to_string()]
+        );
+        assert_eq!(cfg.autoindex.cpu_affinity.as_deref(), Some("16-31"));
     }
 
     #[test]
@@ -354,6 +382,8 @@ tier = "private"
         let cfg = Config::load(dir.path()).unwrap();
         assert_eq!(cfg.defaults.tier, IsolationTier::Shared);
         assert!(cfg.defaults.federation);
+        assert!(cfg.autoindex.focus.is_empty());
+        assert!(cfg.autoindex.cpu_affinity.is_none());
     }
 
     #[test]

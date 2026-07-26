@@ -1,4 +1,4 @@
-<!-- tsift:opencode-command v=0.1.77 name=tsift-test-digest -->
+<!-- tsift:opencode-command v=0.1.78 name=tsift-test-digest -->
 ---
 description: Run tests through the bounded digest runner
 ---

@@ -8,6 +8,14 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.78
+
+- **lazily 0.49.0.** Picks up the `SourceMap` / `ComputedMap` keyed-collection
+  rename (`#lzcellkernel`): the map entry nodes are `Source<V>` and
+  `Computed<V>`, so `CellMap` / `SlotMap` were the pre-kernel names. This also
+  drops the last consumer of the ancient `lazily 0.10.3`, which the published
+  `tsift-core` had still been pulling into every downstream lockfile.
+
 - **New `tsift ast-grep` structural search and rewrite (`tsift-astgrep`).** Adds
   pattern-shaped code retrieval and codemods on top of the tree-sitter grammars
   tsift already compiles: `tsift ast-grep search '<pattern>'`,
@@ -16,11 +24,14 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
   `$$$ARGS`) and report path, 1-based line/column, byte range, matched text, and
   captures, in text, `--json`, or `--envelope` form. Rewrite **previews by
   default** and refuses `--apply` under a preview budget so a capped scan can
-  never land a partial codemod and report it as complete. Language resolution is
-  gated per compiled grammar, so an uncompiled language fails up front instead of
-  panicking inside the engine; `lang-zig` intentionally forwards nothing because
-  `ast-grep-language` ships no Zig grammar. Spec:
-  [specs/structural-patterns.md](specs/structural-patterns.md).
+never land a partial codemod and report it as complete. Language resolution is
+gated per compiled grammar, so an uncompiled language fails up front instead of
+panicking inside the engine; `lang-zig` intentionally forwards nothing because
+`ast-grep-language` ships no Zig grammar. Spec:
+[specs/structural-patterns.md](specs/structural-patterns.md).
+- **Workspace status auto-fix is scope-lazy.** A stale workspace now refreshes
+  only submodule scopes reported stale or missing instead of rescanning every
+  configured submodule because one scope changed.
 - **Upgrade `lazily` 0.32.0 → 0.48.1.** All five reactive-core consumers now use
   the Cell-kernel API (`Source` / `Computed` and unified `get` / `set`) from the
   latest published dependency release.

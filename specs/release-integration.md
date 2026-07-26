@@ -116,7 +116,22 @@ tsift lint README.md --json                       # structured output
 }
 ```
 
-The hook resolves the git root first, then runs `tsift index --check --exit-code <root>` silently on every prompt. If the repo root has `.gitmodules`, it automatically switches to `tsift index --check --exit-code --workspace <root>` so one root hook covers initialized submodules. When the index is stale, it runs the matching `tsift index ...` rebuild command. When the index is fresh, the check completes in ~50ms with no side effects.
+The UI hook itself must not run the `tsift` binary. It starts a detached helper and returns immediately; that helper debounces briefly, takes a non-blocking workspace-wide single-flight lock, and runs both the freshness check and any required refresh at reduced CPU priority. Native tsift `index.lock` coordination remains the fallback on platforms without `flock`.
+
+Workspace autoindex can be focused so large workspaces do not scan every scope on every prompt. Configure scope ids or relative submodule paths, then rerun `tsift init --codex --codex-workspace` to regenerate the helper:
+
+```toml
+[autoindex]
+focus = ["agent-doc", "tsift"]
+# Optional Linux taskset CPU list. Configure only CPUs reserved away from the UI.
+cpu_affinity = "16-31"
+```
+
+`cpu_affinity` constrains every thread in the detached tsift process with `taskset -c`. Affinity alone does not create a non-UI processor: for hard isolation, reserve that CPU set at the operating-system or cgroup level and exclude Xorg/the compositor from it. Leave the setting unset when no CPU set has been reserved; the helper still runs at low CPU priority.
+
+Each automatic refresh generation has one shared 120-second wall-clock budget by default (`TSIFT_AUTOINDEX_MAX_SECONDS`, with `0` disabling the budget). Every command receives only the generation's remaining time. GNU `timeout` first sends `TERM`, waits five seconds, then sends `KILL`. A timed-out worker releases both the hook `flock` and tsift's process-owned index lock; a later filesystem event or prompt can retry the incremental refresh.
+
+An empty focus preserves workspace-wide warming. Focus only limits proactive background warming: `search`, `source-read`, `symbol-read`, and graph reads retain their synchronous per-target freshness checks, so an unfocused scope is refreshed before it is consumed.
 
 ### Search Rewrite (`PreToolUse`)
 

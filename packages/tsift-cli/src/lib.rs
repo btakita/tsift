@@ -20963,6 +20963,31 @@ fn status_index_needs_fix(report: &status::StatusReport) -> bool {
     !matches!(report.index, status::IndexStatus::Fresh { .. })
 }
 
+fn status_workspace_scope_ids_needing_fix(
+    report: &status::StatusReport,
+) -> std::collections::HashSet<&str> {
+    let (workspace_scopes, missing_scopes) = match &report.index {
+        status::IndexStatus::Fresh {
+            workspace_scopes,
+            missing_scopes,
+            ..
+        }
+        | status::IndexStatus::Stale {
+            workspace_scopes,
+            missing_scopes,
+            ..
+        } => (workspace_scopes.as_slice(), missing_scopes.as_slice()),
+        status::IndexStatus::Missing { missing_scopes } => (&[][..], missing_scopes.as_slice()),
+    };
+
+    workspace_scopes
+        .iter()
+        .filter(|scope| scope.stale_files > 0)
+        .map(|scope| scope.scope.as_str())
+        .chain(missing_scopes.iter().map(|scope| scope.scope.as_str()))
+        .collect()
+}
+
 fn status_instructions_need_fix(report: &status::StatusReport) -> bool {
     !matches!(report.instructions, init::InstructionStatus::Current { .. })
 }
@@ -21005,7 +21030,11 @@ pub(crate) fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> 
     }
 
     let cfg = config::Config::load(root)?;
+    let scope_ids_needing_fix = status_workspace_scope_ids_needing_fix(report);
     for scope in scopes {
+        if !scope_ids_needing_fix.contains(scope.id.as_str()) {
+            continue;
+        }
         if !scope.source_root.exists() {
             eprintln!(
                 "status fix: skipping missing submodule `{}` ({})",
@@ -28191,6 +28220,45 @@ tier = "private"
 
         assert!(cfg.db_path_for(dir.path(), "alpha").exists());
         assert!(cfg.db_path_for(dir.path(), "beta").exists());
+        let report = status::check_status(dir.path()).unwrap();
+        assert!(matches!(report.index, status::IndexStatus::Fresh { .. }));
+    }
+
+    #[test]
+    fn status_fix_targets_only_stale_workspace_scopes() {
+        let dir = setup_workspace();
+        let cfg = config::Config::load(dir.path()).unwrap();
+        for scope_id in ["alpha", "beta"] {
+            let scope = config::Config::resolve_submodule(dir.path(), scope_id).unwrap();
+            let db = index::IndexDb::open(&cfg.db_path_for(dir.path(), scope_id)).unwrap();
+            db.apply_changes(&scope.source_root).unwrap();
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(
+            dir.path().join("src/alpha/lib.rs"),
+            "fn alpha_helper() { println!(\"updated\"); }\n",
+        )
+        .unwrap();
+
+        let report = status::check_status(dir.path()).unwrap();
+        let scope_ids = status_workspace_scope_ids_needing_fix(&report);
+        assert_eq!(scope_ids, std::collections::HashSet::from(["alpha"]));
+
+        cmd_status(
+            dir.path(),
+            StatusCommandOptions {
+                fix: false,
+                no_fix: false,
+                json_output: true,
+                compact: false,
+                pretty: false,
+                terse: false,
+                schema: false,
+            },
+        )
+        .unwrap();
+
         let report = status::check_status(dir.path()).unwrap();
         assert!(matches!(report.index, status::IndexStatus::Fresh { .. }));
     }
