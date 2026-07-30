@@ -6518,6 +6518,62 @@ fn status_fix_refreshes_stale_instructions_after_version_bump_in_json() {
         !agents.contains("v=0.1.41") && !agents.contains("Old guidance."),
         "AGENTS.md was: {agents}"
     );
+
+    // The refreshed block points at the runbook, so the fix must produce it.
+    let runbook = fs::read_to_string(dir.path().join("runbooks/code-navigation.md")).unwrap();
+    assert!(
+        runbook.contains(&format!(
+            "<!-- tsift:code-navigation-runbook v={} -->",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "runbook was: {runbook}"
+    );
+    assert!(runbook.contains("report.scale_guard"), "runbook was: {runbook}");
+}
+
+#[test]
+fn init_writes_the_runbook_and_does_not_duplicate_into_a_claude_md_that_imports_agents_md() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("AGENTS.md"), "# Agents\n").unwrap();
+    fs::write(
+        dir.path().join("CLAUDE.md"),
+        "@AGENTS.md\n\n<!-- tsift:code-navigation v=0.1.41 -->\n## Code Navigation\nOld duplicate.\n<!-- /tsift:code-navigation -->\n\n## Claude extras\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["init", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("duplicate tsift Code Navigation section removed"),
+        "stdout was: {stdout}"
+    );
+
+    let claude = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+    assert!(
+        !claude.contains("tsift:code-navigation"),
+        "CLAUDE.md still repeats what it imports: {claude}"
+    );
+    assert!(claude.contains("@AGENTS.md"), "CLAUDE.md was: {claude}");
+    assert!(claude.contains("## Claude extras"), "CLAUDE.md was: {claude}");
+
+    let agents = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+    assert!(
+        agents.contains("<!-- tsift:code-navigation v="),
+        "AGENTS.md was: {agents}"
+    );
+    assert!(
+        agents.contains("runbooks/code-navigation.md"),
+        "AGENTS.md was: {agents}"
+    );
+    assert!(dir.path().join("runbooks/code-navigation.md").exists());
 }
 
 #[test]

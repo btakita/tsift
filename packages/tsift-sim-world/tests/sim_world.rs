@@ -50,11 +50,12 @@ enum Step {
     StatusMissingInstructions,
     StatusStaleInstructions,
     StatusCurrentInstructions,
+    StatusMissingRunbook,
 }
 
 impl Step {
     fn from_index(index: u64) -> Self {
-        match index % 14 {
+        match index % 15 {
             0 => Self::SessionLivePrompt,
             1 => Self::SessionInstructionBallast,
             2 => Self::RewriteLongSessionRead,
@@ -68,7 +69,8 @@ impl Step {
             10 => Self::RewriteMetacharacterPassthrough,
             11 => Self::StatusMissingInstructions,
             12 => Self::StatusStaleInstructions,
-            _ => Self::StatusCurrentInstructions,
+            13 => Self::StatusCurrentInstructions,
+            _ => Self::StatusMissingRunbook,
         }
     }
 }
@@ -137,6 +139,7 @@ impl SimWorld {
             Step::StatusMissingInstructions => self.status_missing_instructions(),
             Step::StatusStaleInstructions => self.status_stale_instructions(),
             Step::StatusCurrentInstructions => self.status_current_instructions(),
+            Step::StatusMissingRunbook => self.status_missing_runbook(),
         }
     }
 
@@ -287,6 +290,25 @@ do [#t275]. spec-test-build-install-commit-push
         self.coverage.mark("status/current_instructions");
     }
 
+    /// The block points at the generated runbook, so a current marker with no
+    /// runbook on disk must still read as stale and recommend `tsift init`.
+    fn status_missing_runbook(&mut self) {
+        let dir = self.empty_project_dir("no-runbook");
+        write_instruction_file(&dir, init::TSIFT_VERSION);
+        fs::remove_file(dir.join(init::RUNBOOK_RELATIVE_PATH)).unwrap();
+        let report = status::check_status(&dir).unwrap();
+        assert!(
+            matches!(report.instructions, init::InstructionStatus::Stale { .. }),
+            "missing runbook did not make instructions stale: {:?}",
+            report.instructions
+        );
+        assert_eq!(
+            report.recommendations.run.as_deref(),
+            Some("tsift init && tsift index .")
+        );
+        self.coverage.mark("status/missing_runbook");
+    }
+
     fn write_session_file(&mut self, lines: usize) -> PathBuf {
         let path = self.next_path("session", "md");
         let mut body = String::from("---\nagent_doc_session: tsift-sim\n---\n\n## Exchange\n");
@@ -332,6 +354,15 @@ fn write_instruction_file(dir: &Path, version: &str) {
         ),
     )
     .unwrap();
+    let runbook = dir.join(init::RUNBOOK_RELATIVE_PATH);
+    fs::create_dir_all(runbook.parent().unwrap()).unwrap();
+    fs::write(
+        &runbook,
+        format!(
+            "<!-- tsift:code-navigation-runbook v={version} -->\n# Code Navigation\n<!-- /tsift:code-navigation-runbook -->\n"
+        ),
+    )
+    .unwrap();
 }
 
 fn required_coverage() -> &'static [&'static str] {
@@ -350,6 +381,7 @@ fn required_coverage() -> &'static [&'static str] {
         "status/missing_instructions",
         "status/stale_instructions",
         "status/current_instructions",
+        "status/missing_runbook",
     ]
 }
 
@@ -370,6 +402,7 @@ fn sim_world_named_edge_trace_covers_session_rewrite_status_edges() {
         Step::StatusMissingInstructions,
         Step::StatusStaleInstructions,
         Step::StatusCurrentInstructions,
+        Step::StatusMissingRunbook,
     ]);
     coverage.require(required_coverage());
 }

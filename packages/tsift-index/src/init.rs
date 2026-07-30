@@ -4,8 +4,14 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SECTION_MARKER_PREFIX: &str = "<!-- tsift:code-navigation";
+// Trailing space is load-bearing: without it this prefix also matches
+// `<!-- tsift:code-navigation-runbook ... -->`, and the block logic would
+// claim the runbook's marker as its own.
+const SECTION_MARKER_PREFIX: &str = "<!-- tsift:code-navigation ";
 const SECTION_END_MARKER: &str = "<!-- /tsift:code-navigation -->";
+const RUNBOOK_MARKER_PREFIX: &str = "<!-- tsift:code-navigation-runbook ";
+const RUNBOOK_END_MARKER: &str = "<!-- /tsift:code-navigation-runbook -->";
+pub const RUNBOOK_RELATIVE_PATH: &str = "runbooks/code-navigation.md";
 pub const TSIFT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn versioned_section() -> String {
@@ -13,11 +19,46 @@ fn versioned_section() -> String {
         r#"<!-- tsift:code-navigation v={version} -->
 ## Code Navigation
 
-Keep this block self-contained for Codex/OpenCode prompt reuse. If this repository also ships current `.claude/skills/tsift/SKILL.md` or `runbooks/code-navigation.md`, use those deeper runbooks for command detail instead of expanding this block.
+Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead.
 
-Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead. Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`; OpenCode projects can install per-project tsift command shortcuts with `tsift init --opencode`.
+Prefer tsift envelopes over raw reads:
+- `tsift --envelope search <query>` instead of `grep`/`rg`
+- `tsift --envelope source-read <file>` / `tsift --envelope symbol-read <symbol>` instead of `cat`/`head`
+- `tsift --envelope explain <symbol>` and `tsift graph <symbol> --callers` / `--callees` for call graphs
+- `tsift diff-digest [path]` instead of `git diff`, `git show`, or patch-style `git log`
+- `tsift --envelope session-review <path>` / `tsift --envelope context-pack <path>` instead of replaying long session docs, transcripts, or runtime logs
+- `tsift --envelope digest-runner --kind test|log --path . --shell-command '<command>'` instead of raw test/build output
 
-Use the commands listed in its `use:` output:
+Command detail lives in [`{runbook}`]({runbook}) — budgets, `tsift workflow search`, `report.scale_guard` handling, the harness rewrite path for `PreToolUse`-less harnesses, and Codex/OpenCode integration. `tsift init` writes and versions that runbook alongside this block, so it is present in every initialized checkout; read it before broad exploration instead of expanding this block. A repository that also ships a current `.claude/skills/tsift/SKILL.md` should use that skill as the deeper source.
+
+For local verification, run `make check` before committing. After local changes, check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1` and fix any failing tests before calling the work complete.
+
+Only read full source files when tsift results are insufficient.
+<!-- /tsift:code-navigation -->"#,
+        version = TSIFT_VERSION,
+        runbook = RUNBOOK_RELATIVE_PATH
+    )
+}
+
+fn versioned_runbook_section() -> String {
+    format!(
+        r#"<!-- tsift:code-navigation-runbook v={version} -->
+# Code Navigation
+
+Managed by `tsift init` (versioned markers) — do not hand-edit between the markers; re-run `tsift init` to refresh. Text outside the markers is preserved.
+
+This runbook is the detail behind the `Code Navigation` block in `AGENTS.md`. That block carries the hot path; everything below is the full command surface.
+
+## Session start
+
+Run `tsift status` from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead.
+
+Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`; OpenCode projects can install per-project tsift command shortcuts with `tsift init --opencode`.
+
+## Search, read, and graph
+
+Use the commands listed in `tsift status`'s `use:` output:
+
 - `tsift --envelope source-read <file> --budget normal` — AST-symbol projection with span metadata and source-window expansion commands (prefer over cat/head for source code files)
 - `tsift --envelope symbol-read <symbol> --budget normal` — token-budgeted symbol body, AST span metadata, child refs, and graph/source expansion commands
 - `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)
@@ -28,17 +69,25 @@ Use the commands listed in its `use:` output:
 
 When a search envelope includes `report.scale_guard`, run one of its `narrow_commands` before dispatching parallel agents. The guard means the original result set or corpus is broad enough that fan-out should start from a narrower cited handle, path, or exact query.
 
+## Bounded digests instead of raw output
+
 Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
+
 - `tsift --envelope session-review <path> --next-context --budget normal` or `tsift --envelope context-pack <path> --budget normal` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
 - `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
 - `tsift --envelope digest-runner --kind test --path . --shell-command '<test command>'` / `tsift --envelope digest-runner --kind log --path . --shell-command '<build command>'` for noisy test/build/install output, or let the rewrite/hooks create those artifact-backed envelopes for `cargo test`, `pytest`, and verbose cargo commands.
 - If RTK is installed, digest-runner delegates supported generic command families through `rtk rewrite` and records the chosen compact filter in `report.filter` while preserving tsift artifact handles.
-- Codex, OpenCode, and other harnesses without Claude-style `PreToolUse` hooks should run `tsift rewrite --run '<command>'` before broad `rg`/recursive grep, raw transcript/session/log reads, `git diff`/`git show`/single-patch `git log`, `cargo test`/`pytest`, and cargo build/check/clippy/install commands so the same search, session-digest, diff-digest, and digest-runner rewrites apply manually. OpenCode can install this path as `/tsift-rewrite-run` with `tsift init --opencode`.
+
+## Harnesses without `PreToolUse` hooks
+
+Codex, OpenCode, and other harnesses without Claude-style `PreToolUse` hooks should run `tsift rewrite --run '<command>'` before broad `rg`/recursive grep, raw transcript/session/log reads, `git diff`/`git show`/single-patch `git log`, `cargo test`/`pytest`, and cargo build/check/clippy/install commands so the same search, session-digest, diff-digest, and digest-runner rewrites apply manually. OpenCode can install this path as `/tsift-rewrite-run` with `tsift init --opencode`.
+
+## Verification
 
 For local verification, run `make check` before committing. After local changes, check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1` and fix any failing tests before calling the work complete.
 
 Only read full source files when tsift results are insufficient.
-<!-- /tsift:code-navigation -->"#,
+<!-- /tsift:code-navigation-runbook -->"#,
         version = TSIFT_VERSION
     )
 }
@@ -107,6 +156,11 @@ pub enum InitAction {
     Created,
     Updated,
     AlreadyPresent,
+    /// A duplicate managed section was found in a file that already defers to
+    /// `AGENTS.md`, and was removed rather than refreshed.
+    Removed,
+    /// The file defers to `AGENTS.md`, so no managed section was injected.
+    Deferred,
 }
 
 impl std::fmt::Display for InitAction {
@@ -115,6 +169,8 @@ impl std::fmt::Display for InitAction {
             InitAction::Created => write!(f, "created"),
             InitAction::Updated => write!(f, "updated"),
             InitAction::AlreadyPresent => write!(f, "already present"),
+            InitAction::Removed => write!(f, "removed"),
+            InitAction::Deferred => write!(f, "deferred"),
         }
     }
 }
@@ -203,11 +259,24 @@ pub fn init_with_integrations(
         action: ensure_instruction_file(&agents)?,
     });
 
+    let runbook = dir.join(RUNBOOK_RELATIVE_PATH);
+    updates.push(InstructionUpdate {
+        file: runbook.clone(),
+        action: ensure_runbook_file(&runbook)?,
+    });
+
     let claude = dir.join("CLAUDE.md");
     if claude.exists() {
+        let action = match claude_deference(&claude, &agents)? {
+            // A symlink to AGENTS.md is the same bytes; rewriting through it
+            // would strip the canonical section out of AGENTS.md itself.
+            Some(Deference::SameFile) => InitAction::Deferred,
+            Some(Deference::Import) => remove_instruction_section(&claude)?,
+            None => ensure_instruction_file(&claude)?,
+        };
         updates.push(InstructionUpdate {
             file: claude.clone(),
-            action: ensure_instruction_file(&claude)?,
+            action,
         });
     }
 
@@ -238,6 +307,108 @@ pub fn init_with_integrations(
         codex_hooks,
         opencode_commands,
     })
+}
+
+/// How `CLAUDE.md` defers to `AGENTS.md`, when it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Deference {
+    /// `CLAUDE.md` and `AGENTS.md` resolve to the same file (symlink or hardlink).
+    SameFile,
+    /// `CLAUDE.md` pulls `AGENTS.md` in with a Claude Code `@AGENTS.md` import.
+    Import,
+}
+
+fn claude_deference(claude: &Path, agents: &Path) -> Result<Option<Deference>> {
+    if let (Ok(a), Ok(c)) = (
+        std::fs::canonicalize(agents),
+        std::fs::canonicalize(claude),
+    ) && a == c
+    {
+        return Ok(Some(Deference::SameFile));
+    }
+
+    let content = std::fs::read_to_string(claude)?;
+    let imports_agents = content.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == "@AGENTS.md" || trimmed == "@./AGENTS.md"
+    });
+    Ok(imports_agents.then_some(Deference::Import))
+}
+
+/// Strip a managed Code Navigation section out of a file that already inherits
+/// it from `AGENTS.md`, so the same instructions are not repeated in both.
+fn remove_instruction_section(file: &Path) -> Result<InitAction> {
+    let content = std::fs::read_to_string(file)?;
+    let Some(start) = content.find(SECTION_MARKER_PREFIX) else {
+        return Ok(InitAction::Deferred);
+    };
+    let Some(end_rel) = content[start..].find(SECTION_END_MARKER) else {
+        bail!(
+            "Found {} in {} but no matching {} — fix manually",
+            SECTION_MARKER_PREFIX,
+            file.display(),
+            SECTION_END_MARKER
+        );
+    };
+    let end = start + end_rel + SECTION_END_MARKER.len();
+    let before = content[..start].trim_end();
+    let after = content[end..].trim_start_matches('\n');
+
+    let mut new_content = String::with_capacity(content.len());
+    new_content.push_str(before);
+    if !before.is_empty() {
+        new_content.push('\n');
+    }
+    if !after.is_empty() {
+        if !before.is_empty() {
+            new_content.push('\n');
+        }
+        new_content.push_str(after);
+    }
+    if !new_content.ends_with('\n') {
+        new_content.push('\n');
+    }
+    std::fs::write(file, new_content)?;
+    Ok(InitAction::Removed)
+}
+
+fn ensure_runbook_file(file: &Path) -> Result<InitAction> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let section = versioned_runbook_section();
+    if !file.exists() {
+        std::fs::write(file, format!("{}\n", section))?;
+        return Ok(InitAction::Created);
+    }
+
+    let content = std::fs::read_to_string(file)?;
+    let Some(start) = content.find(RUNBOOK_MARKER_PREFIX) else {
+        let mut new_content = content;
+        if !new_content.ends_with('\n') {
+            new_content.push('\n');
+        }
+        new_content.push('\n');
+        new_content.push_str(&section);
+        new_content.push('\n');
+        std::fs::write(file, new_content)?;
+        return Ok(InitAction::Created);
+    };
+    let Some(end_rel) = content[start..].find(RUNBOOK_END_MARKER) else {
+        bail!(
+            "Found {} in {} but no matching {} — fix manually",
+            RUNBOOK_MARKER_PREFIX,
+            file.display(),
+            RUNBOOK_END_MARKER
+        );
+    };
+    let end = start + end_rel + RUNBOOK_END_MARKER.len();
+    let new_content = format!("{}{}{}", &content[..start], section, &content[end..]);
+    if new_content == content {
+        return Ok(InitAction::AlreadyPresent);
+    }
+    std::fs::write(file, new_content)?;
+    Ok(InitAction::Updated)
 }
 
 fn ensure_instruction_file(file: &Path) -> Result<InitAction> {
@@ -729,6 +900,24 @@ pub fn extract_instruction_version(content: &str) -> Option<String> {
     tag_content.strip_prefix("v=").map(|v| v.to_string())
 }
 
+pub fn extract_runbook_version(content: &str) -> Option<String> {
+    let start = content.find(RUNBOOK_MARKER_PREFIX)?;
+    let rest = &content[start + RUNBOOK_MARKER_PREFIX.len()..];
+    let close = rest.find("-->")?;
+    let tag_content = rest[..close].trim();
+    tag_content.strip_prefix("v=").map(|v| v.to_string())
+}
+
+/// The instruction block points at the generated runbook, so a missing or
+/// out-of-date runbook makes the instruction surface stale even when the
+/// `AGENTS.md` marker itself is current.
+fn runbook_is_current(dir: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(dir.join(RUNBOOK_RELATIVE_PATH)) else {
+        return false;
+    };
+    extract_runbook_version(&content).is_some_and(|v| v == TSIFT_VERSION)
+}
+
 pub fn check_instruction_version(dir: &Path) -> InstructionStatus {
     let agents = dir.join("AGENTS.md");
     let file = if agents.exists() {
@@ -749,7 +938,16 @@ pub fn check_instruction_version(dir: &Path) -> InstructionStatus {
         return InstructionStatus::Missing;
     }
     match extract_instruction_version(&content) {
-        Some(v) if v == TSIFT_VERSION => InstructionStatus::Current { version: v },
+        Some(v) if v == TSIFT_VERSION => {
+            if runbook_is_current(dir) {
+                InstructionStatus::Current { version: v }
+            } else {
+                InstructionStatus::Stale {
+                    found: Some(v),
+                    expected: TSIFT_VERSION.to_string(),
+                }
+            }
+        }
         Some(v) => InstructionStatus::Stale {
             found: Some(v),
             expected: TSIFT_VERSION.to_string(),
@@ -766,19 +964,147 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// The action `init` recorded for a file, by path suffix.
+    fn action_for(result: &InitResult, suffix: &str) -> Option<InitAction> {
+        result
+            .updates
+            .iter()
+            .find(|u| u.file.to_string_lossy().replace('\\', "/").ends_with(suffix))
+            .map(|u| u.action)
+    }
+
     #[test]
     fn init_creates_agents_md_when_none_exists() {
         let dir = TempDir::new().unwrap();
         let result = init(dir.path(), false, false).unwrap();
-        assert_eq!(result.updates.len(), 1);
+        assert_eq!(result.updates.len(), 2);
         assert!(matches!(result.updates[0].action, InitAction::Created));
         assert_eq!(result.updates[0].file.file_name().unwrap(), "AGENTS.md");
         let content = std::fs::read_to_string(&result.updates[0].file).unwrap();
         assert!(content.contains(SECTION_MARKER_PREFIX));
-        assert!(content.contains("Keep this block self-contained for Codex/OpenCode prompt reuse"));
-        assert!(content.contains("runbooks/code-navigation.md"));
+        assert!(content.contains(RUNBOOK_RELATIVE_PATH));
         assert!(content.contains("tsift --envelope search"));
         assert!(content.contains("tsift status --fix"));
+    }
+
+    #[test]
+    fn init_writes_the_code_navigation_runbook_with_the_detail_the_block_defers_to() {
+        let dir = TempDir::new().unwrap();
+        let result = init(dir.path(), false, false).unwrap();
+        assert_eq!(
+            action_for(&result, RUNBOOK_RELATIVE_PATH),
+            Some(InitAction::Created)
+        );
+
+        let runbook = std::fs::read_to_string(dir.path().join(RUNBOOK_RELATIVE_PATH)).unwrap();
+        assert!(runbook.contains(RUNBOOK_MARKER_PREFIX));
+        assert!(runbook.contains(&format!("v={}", TSIFT_VERSION)));
+
+        // The detail the lean block explicitly hands off must actually be here,
+        // or the pointer sends agents to a file that answers nothing.
+        for detail in [
+            "tsift workflow search",
+            "report.scale_guard",
+            "tsift rewrite --run",
+            "tsift init --codex",
+            "tsift init --opencode",
+            "rtk rewrite",
+            "--budget normal",
+            "tsift summarize",
+        ] {
+            assert!(runbook.contains(detail), "runbook is missing {detail}");
+        }
+
+        // ...and the block must not still carry that detail inline. It may name
+        // a topic to say where it went; it must not restate the instruction.
+        let agents = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        for moved in [
+            "narrow_commands",
+            "tsift rewrite --run",
+            "rtk rewrite",
+            "--budget normal",
+            "tsift summarize",
+            "tsift init --codex",
+        ] {
+            assert!(
+                !agents.contains(moved),
+                "AGENTS.md still duplicates runbook detail: {moved}"
+            );
+        }
+        assert!(
+            agents.len() < runbook.len(),
+            "the block should be the hot path, not the bigger of the two \
+             (block {} bytes, runbook {} bytes)",
+            agents.len(),
+            runbook.len()
+        );
+    }
+
+    /// `<!-- tsift:code-navigation-runbook` begins with the block marker's
+    /// name. The block logic must not claim it.
+    #[test]
+    fn the_runbook_marker_is_not_mistaken_for_the_block_marker() {
+        let runbook_only = format!(
+            "{}v=1.2.3 -->\n# Code Navigation\n{}\n",
+            RUNBOOK_MARKER_PREFIX, RUNBOOK_END_MARKER
+        );
+        assert!(!runbook_only.contains(SECTION_MARKER_PREFIX));
+        assert_eq!(extract_instruction_version(&runbook_only), None);
+        assert_eq!(
+            extract_runbook_version(&runbook_only),
+            Some("1.2.3".to_string())
+        );
+
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), &runbook_only).unwrap();
+        assert!(matches!(
+            check_instruction_version(dir.path()),
+            InstructionStatus::Missing
+        ));
+
+        // The generated pair round-trips: each marker resolves to its own version.
+        let block = versioned_section();
+        assert_eq!(
+            extract_instruction_version(&block),
+            Some(TSIFT_VERSION.to_string())
+        );
+        assert_eq!(extract_runbook_version(&block), None);
+        assert_eq!(
+            extract_runbook_version(&versioned_runbook_section()),
+            Some(TSIFT_VERSION.to_string())
+        );
+    }
+
+    #[test]
+    fn init_refreshes_a_stale_runbook_in_place_and_keeps_surrounding_text() {
+        let dir = TempDir::new().unwrap();
+        let runbook = dir.path().join(RUNBOOK_RELATIVE_PATH);
+        std::fs::create_dir_all(runbook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &runbook,
+            format!(
+                "# Local preamble\n\n{} v=0.0.1 -->\nOld.\n{}\n\nLocal trailer.\n",
+                RUNBOOK_MARKER_PREFIX, RUNBOOK_END_MARKER
+            ),
+        )
+        .unwrap();
+
+        let result = init(dir.path(), false, false).unwrap();
+        assert_eq!(
+            action_for(&result, RUNBOOK_RELATIVE_PATH),
+            Some(InitAction::Updated)
+        );
+        let content = std::fs::read_to_string(&runbook).unwrap();
+        assert!(content.starts_with("# Local preamble"));
+        assert!(content.contains("Local trailer."));
+        assert!(!content.contains("Old."));
+        assert!(content.contains(&format!("{}v={} -->", RUNBOOK_MARKER_PREFIX, TSIFT_VERSION)));
+
+        let again = init(dir.path(), false, false).unwrap();
+        assert_eq!(
+            action_for(&again, RUNBOOK_RELATIVE_PATH),
+            Some(InitAction::AlreadyPresent)
+        );
     }
 
     #[test]
@@ -787,8 +1113,7 @@ mod tests {
         let agents = dir.path().join("AGENTS.md");
         std::fs::write(&agents, "# My Project\n\nSome instructions.\n").unwrap();
         let result = init(dir.path(), false, false).unwrap();
-        assert_eq!(result.updates.len(), 1);
-        assert!(matches!(result.updates[0].action, InitAction::Created));
+        assert_eq!(action_for(&result, "AGENTS.md"), Some(InitAction::Created));
         let content = std::fs::read_to_string(&agents).unwrap();
         assert!(content.starts_with("# My Project"));
         assert!(content.contains(SECTION_MARKER_PREFIX));
@@ -800,9 +1125,9 @@ mod tests {
         std::fs::write(dir.path().join("AGENTS.md"), "# Agents\n").unwrap();
         std::fs::write(dir.path().join("CLAUDE.md"), "# Claude\n").unwrap();
         let result = init(dir.path(), false, false).unwrap();
-        assert_eq!(result.updates.len(), 2);
+        assert_eq!(result.updates.len(), 3);
         assert_eq!(result.updates[0].file.file_name().unwrap(), "AGENTS.md");
-        assert_eq!(result.updates[1].file.file_name().unwrap(), "CLAUDE.md");
+        assert_eq!(result.updates[2].file.file_name().unwrap(), "CLAUDE.md");
         assert!(
             std::fs::read_to_string(dir.path().join("AGENTS.md"))
                 .unwrap()
@@ -821,15 +1146,91 @@ mod tests {
         let claude = dir.path().join("CLAUDE.md");
         std::fs::write(&claude, "# Claude\n").unwrap();
         let result = init(dir.path(), false, false).unwrap();
-        assert_eq!(result.updates.len(), 2);
+        assert_eq!(result.updates.len(), 3);
         assert_eq!(result.updates[0].file.file_name().unwrap(), "AGENTS.md");
         assert!(dir.path().join("AGENTS.md").exists());
-        assert!(matches!(result.updates[0].action, InitAction::Created));
-        assert!(matches!(result.updates[1].action, InitAction::Created));
+        assert_eq!(action_for(&result, "AGENTS.md"), Some(InitAction::Created));
+        assert_eq!(action_for(&result, "CLAUDE.md"), Some(InitAction::Created));
         assert!(
             std::fs::read_to_string(claude)
                 .unwrap()
                 .contains(SECTION_MARKER_PREFIX)
+        );
+    }
+
+    #[test]
+    fn init_does_not_inject_into_a_claude_md_that_imports_agents_md() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "# Agents\n").unwrap();
+        let claude = dir.path().join("CLAUDE.md");
+        std::fs::write(&claude, "@AGENTS.md\n\n# Claude extras\n").unwrap();
+
+        let result = init(dir.path(), false, false).unwrap();
+        assert_eq!(action_for(&result, "CLAUDE.md"), Some(InitAction::Deferred));
+
+        let content = std::fs::read_to_string(&claude).unwrap();
+        assert!(
+            !content.contains(SECTION_MARKER_PREFIX),
+            "CLAUDE.md must not repeat instructions it already imports"
+        );
+        assert!(content.contains("# Claude extras"));
+        // AGENTS.md, the canonical file, still gets it.
+        assert!(
+            std::fs::read_to_string(dir.path().join("AGENTS.md"))
+                .unwrap()
+                .contains(SECTION_MARKER_PREFIX)
+        );
+    }
+
+    #[test]
+    fn init_removes_a_duplicate_section_from_a_claude_md_that_imports_agents_md() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "# Agents\n").unwrap();
+        let claude = dir.path().join("CLAUDE.md");
+        std::fs::write(
+            &claude,
+            format!(
+                "@AGENTS.md\n\n{}v=0.0.1 -->\n## Code Navigation\nOld duplicate.\n{}\n\n## Claude extras\n",
+                SECTION_MARKER_PREFIX, SECTION_END_MARKER
+            ),
+        )
+        .unwrap();
+
+        let result = init(dir.path(), false, false).unwrap();
+        assert_eq!(action_for(&result, "CLAUDE.md"), Some(InitAction::Removed));
+
+        let content = std::fs::read_to_string(&claude).unwrap();
+        assert!(!content.contains(SECTION_MARKER_PREFIX));
+        assert!(!content.contains("Old duplicate."));
+        assert!(content.starts_with("@AGENTS.md"));
+        assert!(content.contains("## Claude extras"));
+
+        // Second run has nothing left to remove.
+        let again = init(dir.path(), false, false).unwrap();
+        assert_eq!(action_for(&again, "CLAUDE.md"), Some(InitAction::Deferred));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn init_leaves_a_claude_md_symlinked_to_agents_md_alone() {
+        let dir = TempDir::new().unwrap();
+        let agents = dir.path().join("AGENTS.md");
+        std::fs::write(&agents, "# Agents\n").unwrap();
+        let claude = dir.path().join("CLAUDE.md");
+        std::os::unix::fs::symlink("AGENTS.md", &claude).unwrap();
+
+        let result = init(dir.path(), false, false).unwrap();
+        assert_eq!(action_for(&result, "CLAUDE.md"), Some(InitAction::Deferred));
+
+        // Rewriting through the symlink would have stripped the section out of
+        // the canonical file it points at.
+        let content = std::fs::read_to_string(&agents).unwrap();
+        assert!(content.contains(SECTION_MARKER_PREFIX));
+        assert!(content.starts_with("# Agents"));
+        assert_eq!(
+            content.matches(SECTION_MARKER_PREFIX).count(),
+            1,
+            "the section must appear exactly once"
         );
     }
 
@@ -1487,12 +1888,17 @@ mod tests {
         let content = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
         let expected_marker = format!("<!-- tsift:code-navigation v={} -->", TSIFT_VERSION);
         assert!(content.contains(&expected_marker));
-        assert!(content.contains("tsift init --opencode"));
-        assert!(content.contains("tsift --envelope session-review <path> --next-context"));
+        assert!(content.contains("tsift --envelope session-review <path>"));
         assert!(content.contains("tsift --envelope context-pack <path>"));
         assert!(content.contains("tsift diff-digest [path]"));
-        assert!(content.contains("tsift --envelope digest-runner --kind test"));
-        assert!(content.contains("tsift --envelope digest-runner --kind log"));
+        assert!(content.contains("tsift --envelope digest-runner --kind test|log"));
+
+        // Codex/OpenCode integration detail lives in the runbook now.
+        let runbook = std::fs::read_to_string(dir.path().join(RUNBOOK_RELATIVE_PATH)).unwrap();
+        assert!(runbook.contains("tsift init --opencode"));
+        assert!(runbook.contains("tsift --envelope session-review <path> --next-context"));
+        assert!(runbook.contains("tsift --envelope digest-runner --kind test --path ."));
+        assert!(runbook.contains("tsift --envelope digest-runner --kind log --path ."));
     }
 
     #[test]

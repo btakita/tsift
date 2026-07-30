@@ -2812,6 +2812,10 @@ pub(crate) fn cmd_init(
                 init::InitAction::Created => "tsift Code Navigation section added",
                 init::InitAction::Updated => "tsift Code Navigation section updated to latest",
                 init::InitAction::AlreadyPresent => "no changes needed",
+                init::InitAction::Removed =>
+                    "duplicate tsift Code Navigation section removed — this file already inherits AGENTS.md",
+                init::InitAction::Deferred =>
+                    "defers to AGENTS.md — no tsift Code Navigation section added",
             }
         );
     }

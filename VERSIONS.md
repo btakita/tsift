@@ -8,6 +8,35 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **Code Navigation split into a router block plus a generated runbook, and no
+  longer duplicated into a `CLAUDE.md` that already imports `AGENTS.md`.**
+  `tsift init` used to inject one ~4 KB block and then inject the same block
+  again into `CLAUDE.md`. In the common Claude Code layout — `AGENTS.md`
+  canonical, `CLAUDE.md` consisting of `@AGENTS.md` plus local notes — that put
+  two verbatim copies of the same instructions into one prompt.
+
+  The block in `AGENTS.md` is now a hot path: session start, the
+  envelope-over-raw-read substitutions, verification. Everything else — budgets,
+  `tsift workflow search`, `report.scale_guard` handling, the
+  `tsift rewrite --run` path for harnesses without `PreToolUse` hooks, Codex and
+  OpenCode integration — moves to a generated `runbooks/code-navigation.md`
+  under its own `<!-- tsift:code-navigation-runbook v=X.Y.Z -->` markers. The
+  block roughly halves.
+
+  This does not reintroduce the runbook-only install hazard that kept the block
+  self-contained before: `tsift init` **writes** the runbook, so the pair always
+  ships together, and `tsift status` reports `instructions: stale` when the
+  runbook is missing or its marker version differs — a repository initialized by
+  an older tsift is repaired by the `tsift init` / `tsift status --fix` it
+  already recommends. Text outside the runbook markers is preserved.
+
+  De-duplication is deference-aware rather than unconditional. A `CLAUDE.md`
+  that imports `@AGENTS.md` gets no section, and an existing managed section
+  there is **removed**. A `CLAUDE.md` that is a symlink to `AGENTS.md` is left
+  untouched — rewriting through the link would have stripped the section out of
+  the canonical file it points at. A `CLAUDE.md` that stands alone still gets
+  the section as before.
+
 - **20 new structural languages (`tsift ast-grep`).** `ast-grep-language` ships
   28 grammars; tsift compiled 7 of them. Adds the remaining 20: c, cpp, csharp,
   css, dart, elixir, go, haskell, hcl, html, java, json, lua, nix, php, ruby,

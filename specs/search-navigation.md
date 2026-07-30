@@ -233,16 +233,18 @@ With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject
 
 1. Adds `.tsift/` to `.gitignore` (creates the file if needed, appends if entry missing, skips if already present)
 2. Ensures `AGENTS.md` exists with the section (creates it if needed)
-3. If `CLAUDE.md` exists, updates or appends the same section there too
-4. If the section already exists (detected by `<!-- tsift:code-navigation -->` markers), updates it in place
-5. Idempotent — running twice produces no changes on the second run
-6. With `--codex`: merges a `UserPromptSubmit` auto-reindex hook into `.codex/hooks.json` (creates the file and directory if needed, updates stale tsift commands in place, removes duplicate tsift hook entries, idempotent)
-7. With `--opencode`: installs marker-owned `.opencode/commands/tsift-*.md` command templates for status, session review, context pack, diff digest, test digest, log digest, rewrite-run, explain, symbol-read, and graph workflows. Existing marker-owned files are updated idempotently; unmanaged same-name command files fail closed instead of being overwritten. The same marker-owned templates ship in the publishable npm `opencode-tsift` package; after it is published, installing it with `opencode plugin opencode-tsift` gives OpenCode users a registry install path that does not require cloning the tsift repository.
-8. When the resolved target has `.gitmodules`, the Codex hook automatically uses `tsift index --check --exit-code --workspace <root>` / `tsift index --workspace <root>` so one root hook covers initialized submodules. `--workspace` makes that root resolution explicit from inside a submodule.
-9. The injected Code Navigation section explicitly tells harnesses to switch to the owning repo or submodule root before running tsift/build/test commands, so submodule work does not inherit the wider superproject instruction surface by accident.
-10. The injected section also steers harnesses toward envelope-backed `search`, `explain`, `session-review`, `context-pack`, and digest-runner artifacts instead of raw transcript replays, `git diff/show/log` patch dumps, or verbose build/test output reads.
-11. The injected section tells agents to run the local default suite with `make check`, then check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1`; deterministic simulation coverage runs in the default suite, and CI failures must be fixed before the work is complete.
-12. The injected section stays self-contained for Codex/OpenCode prompt reuse, while pointing repositories that ship current `.claude/skills/tsift/SKILL.md` or `runbooks/code-navigation.md` back to those deeper runbooks instead of duplicating them inline.
+3. Writes `runbooks/code-navigation.md` with the full command detail the section defers to, under its own `<!-- tsift:code-navigation-runbook -->` markers (creates the directory and file if needed, updates the marked region in place, preserves text outside the markers)
+4. If `CLAUDE.md` exists **and does not already defer to `AGENTS.md`**, updates or appends the same section there too
+5. If `CLAUDE.md` defers to `AGENTS.md` — it resolves to the same file (symlink), or it pulls it in with a Claude Code `@AGENTS.md` import — no section is injected. An already-present managed section in an `@AGENTS.md`-importing `CLAUDE.md` is **removed**, since that file already inherits the canonical copy. A `CLAUDE.md` symlinked to `AGENTS.md` is left untouched: rewriting through the link would strip the section out of the canonical file
+6. If the section already exists (detected by `<!-- tsift:code-navigation -->` markers), updates it in place
+7. Idempotent — running twice produces no changes on the second run
+8. With `--codex`: merges a `UserPromptSubmit` auto-reindex hook into `.codex/hooks.json` (creates the file and directory if needed, updates stale tsift commands in place, removes duplicate tsift hook entries, idempotent)
+9. With `--opencode`: installs marker-owned `.opencode/commands/tsift-*.md` command templates for status, session review, context pack, diff digest, test digest, log digest, rewrite-run, explain, symbol-read, and graph workflows. Existing marker-owned files are updated idempotently; unmanaged same-name command files fail closed instead of being overwritten. The same marker-owned templates ship in the publishable npm `opencode-tsift` package; after it is published, installing it with `opencode plugin opencode-tsift` gives OpenCode users a registry install path that does not require cloning the tsift repository.
+10. When the resolved target has `.gitmodules`, the Codex hook automatically uses `tsift index --check --exit-code --workspace <root>` / `tsift index --workspace <root>` so one root hook covers initialized submodules. `--workspace` makes that root resolution explicit from inside a submodule.
+11. The injected Code Navigation section explicitly tells harnesses to switch to the owning repo or submodule root before running tsift/build/test commands, so submodule work does not inherit the wider superproject instruction surface by accident.
+12. The injected section also steers harnesses toward envelope-backed `search`, `explain`, `session-review`, `context-pack`, and digest-runner artifacts instead of raw transcript replays, `git diff/show/log` patch dumps, or verbose build/test output reads.
+13. The injected section tells agents to run the local default suite with `make check`, then check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1`; deterministic simulation coverage runs in the default suite, and CI failures must be fixed before the work is complete.
+14. The injected section is a hot-path router, not a manual: it carries the session-start rule, the envelope-over-raw-read substitutions, and the verification rule, and defers budgets, `tsift workflow search`, `report.scale_guard` handling, the `tsift rewrite --run` path for harnesses without `PreToolUse` hooks, and Codex/OpenCode integration to `runbooks/code-navigation.md`. Because `tsift init` generates that runbook itself, the pair ships together in every initialized checkout — a standalone checkout is never left with a pointer to a file that does not exist. A repository that also ships a current `.claude/skills/tsift/SKILL.md` should use that skill as the deeper source.
 
 The OpenCode command shortcut set is intentionally prompt-template based rather than a background hook: OpenCode already reads project `AGENTS.md`, and the managed commands give operators explicit `/tsift-status`, `/tsift-session-review`, `/tsift-context-pack`, `/tsift-diff-digest`, `/tsift-test-digest`, `/tsift-log-digest`, `/tsift-rewrite-run`, `/tsift-explain`, `/tsift-symbol-read`, and `/tsift-graph` entrypoints that route common workflows through bounded tsift evidence without depending on raw terminal replay.
 
@@ -253,36 +255,48 @@ On plugin load and on the `installation.updated` lifecycle hook, the plugin runs
 ### Injected Section
 
 ```markdown
-<!-- tsift:code-navigation v=0.1.72 -->
+<!-- tsift:code-navigation v=0.1.79 -->
 ## Code Navigation
 
-Keep this block self-contained for Codex/OpenCode prompt reuse. If this repository also ships current `.claude/skills/tsift/SKILL.md` or `runbooks/code-navigation.md`, use those deeper runbooks for command detail instead of expanding this block.
+Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead.
 
-Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead. Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`; OpenCode projects can install per-project tsift command shortcuts with `tsift init --opencode`.
+Prefer tsift envelopes over raw reads:
+- `tsift --envelope search <query>` instead of `grep`/`rg`
+- `tsift --envelope source-read <file>` / `tsift --envelope symbol-read <symbol>` instead of `cat`/`head`
+- `tsift --envelope explain <symbol>` and `tsift graph <symbol> --callers` / `--callees` for call graphs
+- `tsift diff-digest [path]` instead of `git diff`, `git show`, or patch-style `git log`
+- `tsift --envelope session-review <path>` / `tsift --envelope context-pack <path>` instead of replaying long session docs, transcripts, or runtime logs
+- `tsift --envelope digest-runner --kind test|log --path . --shell-command '<command>'` instead of raw test/build output
 
-Use the commands listed in its `use:` output:
-- `tsift --envelope source-read <file> --budget normal` — AST-symbol projection with span metadata and source-window expansion commands (prefer over cat/head for source code files)
-- `tsift --envelope symbol-read <symbol> --budget normal` — token-budgeted symbol body, AST span metadata, child refs, and graph/source expansion commands
-- `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)
-- `tsift --envelope explain <symbol> --budget normal` — callers, callees, community preview
-- `tsift graph <symbol> --callers` / `--callees` — call graph navigation
-- `tsift summarize <symbol>` — cached summary (only when listed in `use:`)
-- `tsift workflow search` — ordered exact/search/explain/summarize/digest recipe that preserves result handles across expansions
-
-When a search envelope includes `report.scale_guard`, run one of its `narrow_commands` before dispatching parallel agents. The guard means the original result set or corpus is broad enough that fan-out should start from a narrower cited handle, path, or exact query.
-
-Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
-- `tsift --envelope session-review <path> --next-context --budget normal` or `tsift --envelope context-pack <path> --budget normal` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
-- `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
-- `tsift --envelope digest-runner --kind test --path . --shell-command '<test command>'` / `tsift --envelope digest-runner --kind log --path . --shell-command '<build command>'` for noisy test/build/install output, or let the rewrite/hooks create those artifact-backed envelopes for `cargo test`, `pytest`, and verbose cargo commands.
-- If RTK is installed, digest-runner delegates supported generic command families through `rtk rewrite` and records the chosen compact filter in `report.filter` while preserving tsift artifact handles.
-- Codex, OpenCode, and other harnesses without Claude-style `PreToolUse` hooks should run `tsift rewrite --run '<command>'` before broad `rg`/recursive grep, raw transcript/session/log reads, `git diff`/`git show`/single-patch `git log`, `cargo test`/`pytest`, and cargo build/check/clippy/install commands so the same search, session-digest, diff-digest, and digest-runner rewrites apply manually. OpenCode can install this path as `/tsift-rewrite-run` with `tsift init --opencode`.
+Command detail lives in [`runbooks/code-navigation.md`](runbooks/code-navigation.md) — budgets, `tsift workflow search`, `report.scale_guard` handling, the harness rewrite path for `PreToolUse`-less harnesses, and Codex/OpenCode integration. `tsift init` writes and versions that runbook alongside this block, so it is present in every initialized checkout; read it before broad exploration instead of expanding this block. A repository that also ships a current `.claude/skills/tsift/SKILL.md` should use that skill as the deeper source.
 
 For local verification, run `make check` before committing. After local changes, check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1` and fix any failing tests before calling the work complete.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->
 ```
+
+### Generated Runbook
+
+`runbooks/code-navigation.md` holds the detail the block defers to, under its own marker pair so the two surfaces version independently of any hand-written text around them:
+
+```markdown
+<!-- tsift:code-navigation-runbook v=0.1.79 -->
+# Code Navigation
+
+Managed by `tsift init` (versioned markers) — do not hand-edit between the markers; re-run `tsift init` to refresh. Text outside the markers is preserved.
+
+## Session start
+## Search, read, and graph
+## Bounded digests instead of raw output
+## Harnesses without `PreToolUse` hooks
+## Verification
+<!-- /tsift:code-navigation-runbook -->
+```
+
+The runbook marker name extends the block's, so the block's marker prefix is matched including its trailing space (`<!-- tsift:code-navigation `); otherwise the block logic would claim `<!-- tsift:code-navigation-runbook ... -->` as its own opening marker.
+
+The `AGENTS.md` block and the runbook are one instruction surface with two files. `tsift status` reports `instructions: stale` when either the block marker version or the runbook marker version differs from the installed tsift, or when the runbook is missing entirely — so a repository initialized before the split is refreshed by the same `tsift init` / `tsift status --fix` it already recommends.
 
 The HTML comment markers enable idempotent updates without parsing markdown structure.
 
@@ -293,6 +307,7 @@ The opening marker embeds the tsift version (`v=X.Y.Z`) that generated it. When 
 - `tsift status` reports `instructions: stale` and recommends `tsift init`
 - `tsift init` detects the older version marker and replaces the section with the current version's content
 - Pre-versioned markers (no `v=` attribute) are treated as stale
+- The generated runbook carries its own `<!-- tsift:code-navigation-runbook v=X.Y.Z -->` marker and is checked the same way; a current block marker with a stale or missing runbook still reports `instructions: stale`, because the block delegates to a file that must exist and match
 
 This ensures agent sessions always use instructions matching the installed binary.
 Release-bump regressions are covered through the compiled CLI path: a stale Code Navigation marker from the previous binary version must be rewritten by `tsift status --json`, and the final JSON report must show `instructions.state=current` for the installed version.
