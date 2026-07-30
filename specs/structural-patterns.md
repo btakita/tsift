@@ -148,8 +148,10 @@ earns the same proof a symbol-resolved one does.
 
 A pattern is parsed by the target grammar as a standalone fragment. Where a
 grammar cannot parse a bare expression, patterns must be spelled differently.
-These are upstream grammar properties, not tsift defects, and each is pinned by
-a test in `lang.rs` so an ast-grep bump cannot silently invalidate this table.
+These are upstream grammar properties, not tsift defects. Each is recorded as
+the `granularity` and `known_non_matching` fields of that language's row in the
+cross-language conformance table (`tests/conformance.rs`), so an ast-grep bump
+that removes a limit fails the suite instead of leaving a stale table behind.
 
 | Language | Quirk | Workaround |
 |---|---|---|
@@ -157,11 +159,13 @@ a test in `lang.rs` so an ast-grep bump cannot silently invalidate this table.
 | **CSS** | `color: $V` matches nothing | Add the trailing semicolon: `color: $V;` |
 | **Dart** | Expression- and statement-level patterns match nothing however they are spelled; the grammar cannot parse a bare expression fragment | Match at declaration granularity: `void main() { print($A); }`. Call-site codemods are **not** available in Dart |
 | **Solidity** | Same as Dart: statement-level patterns match nothing | Match whole declarations: `function f() public { $$$B }` |
+| **HCL** | `foo($A)` matches nothing — HCL has no expression statements, so a call exists only as the right-hand side of an attribute | Carry the binding: `$K = foo($A)` |
+| **JSON** | A literal key with a metavariable value (`"a": $V`) parses to two nodes and is **refused** | Make the pair metavariable-shaped: `$K: $V` |
 | **Rust** | Macro arguments are `token_tree`, so a call inside `assert_eq!(...)` is invisible | None; patterns aimed at macro-heavy code under-report |
 
 Everything else added in the structural-only tier — go, cpp, csharp, java,
-elixir, haskell, hcl, html, json, lua, nix, php, ruby, scala, swift, yaml —
-matches expression-level patterns directly with no special spelling.
+elixir, haskell, html, lua, nix, php, ruby, scala, swift, yaml — matches
+expression-level patterns directly with no special spelling.
 
 ### General
 
@@ -169,12 +173,46 @@ matches expression-level patterns directly with no special spelling.
   `token_tree`, so `AstGrepLang::from_name($X)` matches a real call but not the
   same call inside `assert_eq!(...)`. This is a grammar property, not a tsift
   defect; patterns aimed at macro-heavy code will under-report.
+- **An unparseable pattern is a refusal, never a panic.** `ast-grep-core`'s
+  `&str`-as-matcher path builds the pattern with `Pattern::new`, which
+  `unwrap()`s the parse — so a pattern that is merely invalid for the selected
+  grammar (two statements, an empty parse, a bare `$$$ARGS`) aborts the whole
+  process. The pattern comes straight from the user, so tsift compiles it with
+  `Pattern::try_new` up front and surfaces the grammar's own message. Every
+  language is affected, so this is a conformance invariant rather than a
+  per-language note.
 - Matching is non-reentrant: nested occurrences of a pattern inside its own
   match (`Some(Some($A))` against `Some($A)`) yield the outer match only.
 - There is no index involvement, so a structural scan is O(tree) and does not
   require `tsift index` to be fresh.
 
 ## Verification requirements
+
+### Cross-language conformance
+
+`packages/tsift-astgrep/tests/conformance.rs` holds one fixture row per
+`AstGrepLang` variant — sample path, source, pattern, expected match count,
+rewrite, granularity, and pinned non-matching patterns — and runs every row
+through the same invariants: extension and name round-trip, exact match count,
+every reported span being a real slice of its source, a rewrite that changes the
+buffer, an absent pattern leaving it byte-identical, an identity rewrite
+reporting `unchanged`, an empty pattern being refused, and each pinned limit
+still not matching.
+
+The table is the unit of coverage: a guard asserts that the fixture set and
+`AstGrepLang::all()` are the same set, so adding a grammar without a fixture
+fails. Rows must declare at least one match, and the suite asserts that the
+matches the library actually produced sum to what the table declares — a suite
+that iterates zero rows, or rows asserting nothing, cannot report green.
+
+`packages/tsift-graph/tests/conformance.rs` is the same shape for the indexed
+tier: one row per `Lang` variant, checking extension resolution, grammar load,
+symbol-query and call-query compilation, the declared symbol and its kind,
+span validity and UTF-8 boundaries, body spans nested inside their symbol,
+line-ordered output, an empty source yielding nothing, and broken syntax not
+panicking. Compiling the call query is what catches a query written against a
+different grammar generation: the indexer downgrades that error to a warning, so
+the only symptom is call edges that are silently always empty.
 
 - Rewrite coverage must include a growing replacement (proves reverse-apply),
   a multibyte source (proves UTF-8 boundary handling), and a multi-match file

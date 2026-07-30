@@ -2,7 +2,7 @@
 
 use crate::lang::AstGrepLang;
 use anyhow::{Result, bail};
-use ast_grep_core::AstGrep;
+use ast_grep_core::{AstGrep, Pattern};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -40,20 +40,38 @@ fn empty_pattern_error(pattern: &str) -> Result<()> {
     Ok(())
 }
 
+/// Compile a pattern against one grammar, as a refusal rather than a panic.
+///
+/// `ast-grep-core`'s `&str`-as-matcher path goes through `Pattern::new`, which
+/// `unwrap()`s the parse result — so a pattern that is merely invalid for the
+/// selected grammar (two statements, an empty parse, a bare `$$$ARGS`) aborts
+/// the whole process instead of returning an error. Every language is affected,
+/// and the pattern comes straight from the user. `try_new` is the same parse
+/// with the error preserved.
+fn compile_pattern(pattern: &str, lang: AstGrepLang) -> Result<Pattern> {
+    empty_pattern_error(pattern)?;
+    Pattern::try_new(pattern, lang.support_lang()).map_err(|err| {
+        anyhow::anyhow!(
+            "invalid structural pattern for {lang}: {err} (pattern: `{pattern}`)",
+            lang = lang.name()
+        )
+    })
+}
+
 /// Find every non-overlapping match of `pattern` in `source`.
 pub fn search_source(
     source: &str,
     lang: AstGrepLang,
     pattern: &str,
 ) -> Result<Vec<StructuralMatch>> {
-    empty_pattern_error(pattern)?;
+    let pattern = compile_pattern(pattern, lang)?;
     let grep = AstGrep::new(source, lang.support_lang());
-    Ok(collect_matches(&grep, pattern))
+    Ok(collect_matches(&grep, &pattern))
 }
 
 fn collect_matches(
     grep: &AstGrep<ast_grep_core::tree_sitter::StrDoc<ast_grep_language::SupportLang>>,
-    pattern: &str,
+    pattern: &Pattern,
 ) -> Vec<StructuralMatch> {
     let mut out = Vec::new();
     for matched in grep.root().find_all(pattern) {
@@ -99,12 +117,12 @@ pub fn rewrite_source(
     pattern: &str,
     rewrite: &str,
 ) -> Result<RewriteOutcome> {
-    empty_pattern_error(pattern)?;
+    let pattern = compile_pattern(pattern, lang)?;
     // One parse serves both the match report and the edit list; matching and
     // rewriting must never disagree about what the pattern hit.
     let grep = AstGrep::new(source, lang.support_lang());
-    let matches = collect_matches(&grep, pattern);
-    let edits = grep.root().replace_all(pattern, rewrite);
+    let matches = collect_matches(&grep, &pattern);
+    let edits = grep.root().replace_all(&pattern, rewrite);
 
     let mut buffer = source.to_string();
     for edit in edits.iter().rev() {

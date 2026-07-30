@@ -8,6 +8,41 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **Cross-language conformance suites, and the two defects they found.** Both
+  language tiers were covered by hand-written per-language tests, which can only
+  prove that the language someone remembered works — a new grammar could arrive
+  with no test at all, and no test checked the invariants that must hold
+  *identically* everywhere.
+
+  `packages/tsift-astgrep/tests/conformance.rs` now holds one fixture row per
+  `AstGrepLang` variant (28) and `packages/tsift-graph/tests/conformance.rs` one
+  per `Lang` variant (10), each run through a shared invariant set. A guard
+  asserts the fixture set equals the language set, so adding a grammar without a
+  fixture fails; rows must declare at least one match, and the suites assert the
+  results the library actually produced sum to what the tables declare, so a
+  suite over zero or vacuous rows cannot report green. Grammar quirks are row
+  data (`granularity`, `known_non_matching`) rather than prose, so a grammar
+  upgrade that removes a limit fails instead of leaving a stale note.
+
+  - **An unparseable pattern aborted the process, on every language.**
+    `ast-grep-core`'s `&str`-as-matcher path builds patterns with
+    `Pattern::new`, which `unwrap()`s the parse. A pattern that was merely
+    invalid for the selected grammar — two statements, `"a": $V` in JSON —
+    panicked the CLI instead of erroring, and the pattern comes straight from
+    the user. `search_source`/`rewrite_source` now compile with
+    `Pattern::try_new` up front and surface the grammar's own message.
+  - **Kotlin call edges were silently always empty.** `call_query()` named
+    `simple_identifier`, a node type from the older `tree-sitter-kotlin` grammar
+    that does not exist in `tree-sitter-kotlin-ng`. `Query::new` failed, the
+    indexer downgraded it to a warning, and every Kotlin file produced zero call
+    edges — so `graph --callers/--callees` and `explain` returned nothing for
+    Kotlin without ever failing. Fixed to `identifier` /
+    `navigation_expression`, with a behavioural regression test.
+
+  Two documented pattern quirks came out of the sweep as well: HCL has no
+  expression statements, so a call only matches as `$K = foo($A)`; JSON needs
+  both sides metavariable-shaped (`$K: $V`).
+
 - **Code Navigation split into a router block plus a generated runbook, and no
   longer duplicated into a `CLAUDE.md` that already imports `AGENTS.md`.**
   `tsift init` used to inject one ~4 KB block and then inject the same block

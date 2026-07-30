@@ -1189,6 +1189,25 @@ async fn submit_form() {}
         assert_eq!(routes[0].handler, "submit_form");
     }
 
+    #[cfg(feature = "lang-kotlin")]
+    #[test]
+    fn kotlin_direct_and_navigation_calls_resolve() {
+        // The query used to name `simple_identifier`, which does not exist in
+        // tree-sitter-kotlin-ng: `Query::new` failed, the indexer downgraded it
+        // to a warning, and every Kotlin file got zero call edges. Nothing
+        // failed — `graph --callers` was simply always empty.
+        let source = b"fun main() {\n    helper(1)\n    obj.method(2)\n}\n";
+        let sites = extract_call_sites(Lang::Kotlin, source).unwrap();
+        assert!(
+            sites.iter().any(|s| s.callee == "helper"),
+            "missing direct call, got: {sites:?}"
+        );
+        assert!(
+            sites.iter().any(|s| s.callee == "method"),
+            "missing navigation call, got: {sites:?}"
+        );
+    }
+
     #[cfg(feature = "lang-python")]
     #[test]
     fn python_direct_call() {

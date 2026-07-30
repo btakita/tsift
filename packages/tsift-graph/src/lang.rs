@@ -237,8 +237,13 @@ impl Lang {
             ),
             #[cfg(feature = "lang-kotlin")]
             Self::Kotlin => Some(
+                // tree-sitter-kotlin-ng names these `identifier` /
+                // `navigation_expression`; `simple_identifier` is from the
+                // older tree-sitter-kotlin grammar and does not compile here,
+                // which silently left every Kotlin file with zero call edges.
                 r#"
-                (call_expression (simple_identifier) @call.name)
+                (call_expression (identifier) @call.name)
+                (call_expression (navigation_expression (identifier) (identifier) @call.name))
             "#,
             ),
             _ => None,
