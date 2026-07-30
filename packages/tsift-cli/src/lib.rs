@@ -16531,6 +16531,7 @@ fn markdown_embedded_lang(language: &str) -> Option<graph::Lang> {
         "typescript" => "ts",
         "javascript" => "js",
         "kotlin" => "kt",
+        "gdscript" | "godot" => "gd",
         "shell" | "sh" | "zsh" => "bash",
         other => other,
     };
@@ -18487,7 +18488,7 @@ const TAGPATH_AUDIT_SOURCE_EXTENSIONS: &[&str] = &[
     "rs", "py", "ts", "js", "go", "java", "rb", "c", "cpp", "h", "hpp", "cs", "swift", "kt",
     "scala", "zig", "nim", "ex", "exs", "erl", "hs", "ml", "clj", "r", "lua", "php", "pl", "d",
     "cr", "dart", "jl", "v", "odin", "gleam", "rkt", "scm", "lisp", "lsp", "f", "fs", "fsi", "fsx",
-    "sh", "bash", "zsh", "sql", "css", "tsx",
+    "sh", "bash", "zsh", "sql", "css", "tsx", "gd",
 ];
 
 pub(crate) fn tagpath_audit_supported_extensions(root: &Path) -> BTreeSet<String> {
@@ -21865,6 +21866,7 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
                         | "kt"
                         | "kts"
                         | "zig"
+                        | "gd"
                         | "sh"
                         | "bash"
                         | "zsh"
@@ -23744,6 +23746,11 @@ fn fixtureNavZigHelper() i32 {
         )
         .unwrap();
         std::fs::write(
+            dir.path().join("gdscript.gd"),
+            "extends Node\n\nfunc fixture_nav_gdscript_entry():\n\treturn fixture_nav_gdscript_helper()\n\nfunc fixture_nav_gdscript_helper():\n\treturn 1\n",
+        )
+        .unwrap();
+        std::fs::write(
             dir.path().join("bash.sh"),
             r#"#!/usr/bin/env bash
 fixture_nav_bash_entry() {
@@ -24569,6 +24576,12 @@ fn main() { api::handler(); }
                 "kotlin.kt",
             ),
             ("zig", "fixture_nav_zig_entry", "function", "zig.zig"),
+            (
+                "gdscript",
+                "fixture_nav_gdscript_entry",
+                "function",
+                "gdscript.gd",
+            ),
             ("bash", "fixture_nav_bash_entry", "function", "bash.sh"),
             ("markdown", "Fixture Section", "heading", "README.md"),
             ("markdown", "Fixture step", "list_item", "README.md"),
@@ -24600,6 +24613,7 @@ fn main() { api::handler(); }
             ("fixture_nav_javascript_entry", "function", "javascript"),
             ("fixture_nav_kotlin_entry", "function", "kotlin"),
             ("fixture_nav_zig_entry", "function", "zig"),
+            ("fixture_nav_gdscript_entry", "function", "gdscript"),
             ("fixture_nav_bash_entry", "function", "bash"),
             ("Fixture Section", "heading", "markdown"),
             ("Fixture step", "list_item", "markdown"),

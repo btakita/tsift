@@ -1424,7 +1424,9 @@ fn looks_like_path(path: &str) -> bool {
         || path.contains('\\')
         || matches!(
             Path::new(path).extension().and_then(|ext| ext.to_str()),
-            Some("rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "kt" | "zig" | "java" | "md")
+            Some(
+                "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "kt" | "zig" | "gd" | "java" | "md"
+            )
         )
 }
 

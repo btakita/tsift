@@ -106,6 +106,18 @@ impl BuiltinExtractor {
                 (return_expression) @return
             "#,
             ),
+            #[cfg(feature = "lang-gdscript")]
+            Lang::GdScript => Some(
+                r#"
+                (if_statement) @branch
+                (elif_clause) @branch
+                (match_statement) @branch
+                (conditional_expression) @branch
+                (for_statement) @loop
+                (while_statement) @loop
+                (return_statement) @return
+            "#,
+            ),
             _ => None,
         }
     }

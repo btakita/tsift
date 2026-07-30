@@ -66,7 +66,7 @@ reaches is what it can actually do:
 | Fans out to | Meaning | Languages |
 |---|---|---|
 | `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, markdown |
-| `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig — `ast-grep-language` ships no Zig grammar |
+| `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, gdscript — `ast-grep-language` ships no Zig or GDScript grammar |
 | `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | c, cpp, csharp, css, dart, elixir, go, haskell, hcl, html, java, json, lua, nix, php, ruby, scala, solidity, swift, yaml |
 
 Structural-only is a deliberate tier, not an oversight. A tree-sitter grammar is

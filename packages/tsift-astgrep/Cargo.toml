@@ -30,9 +30,11 @@ lang-javascript = ["ast-grep-language/tree-sitter-javascript"]
 lang-kotlin = ["ast-grep-language/tree-sitter-kotlin"]
 lang-bash = ["ast-grep-language/tree-sitter-bash"]
 lang-markdown = ["ast-grep-language/tree-sitter-md"]
-# `lang-zig` exists in tsift but ast-grep-language ships no Zig grammar, so the
-# tsift feature intentionally forwards nothing here.
+# `lang-zig` and `lang-gdscript` exist in tsift but ast-grep-language ships no
+# Zig or GDScript grammar, so these tsift features intentionally forward
+# nothing here.
 lang-zig = []
+lang-gdscript = []
 # Structural-only languages: ast-grep can match and rewrite these, but
 # `tsift-graph`/`tsift-search` have no tag queries for them, so they are not
 # indexable and have no semantic-edit executor. See specs/structural-patterns.md.

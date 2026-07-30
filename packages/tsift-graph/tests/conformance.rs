@@ -104,6 +104,15 @@ const CASES: &[Case] = &[
         expect_kind: "function",
         truncated: "run_it( {\n echo",
     },
+    #[cfg(feature = "lang-gdscript")]
+    Case {
+        lang: Lang::GdScript,
+        extensions: &["gd"],
+        source: "extends Node\n\nfunc _ready():\n\tprint(\"hi\")\n",
+        expect_name: "_ready",
+        expect_kind: "function",
+        truncated: "func _ready(:\n\tprint(",
+    },
     #[cfg(feature = "lang-markdown")]
     Case {
         lang: Lang::Markdown,

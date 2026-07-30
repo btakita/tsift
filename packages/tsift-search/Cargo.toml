@@ -27,7 +27,7 @@ tsift-summarize = { path = "../tsift-summarize", version = "0.1.78" }
 # Language features gate the per-Lang match arms in `impact::is_import_line`
 # and forward to tsift-graph so the matching tree-sitter grammars + Lang
 # variants are available. Mirrors root tsift's language feature set.
-default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]
+default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-gdscript", "lang-markdown"]
 lang-rust = ["tsift-graph/lang-rust"]
 lang-python = ["tsift-graph/lang-python"]
 lang-typescript = ["tsift-graph/lang-typescript"]
@@ -35,8 +35,9 @@ lang-javascript = ["tsift-graph/lang-javascript"]
 lang-kotlin = ["tsift-graph/lang-kotlin"]
 lang-zig = ["tsift-graph/lang-zig"]
 lang-bash = ["tsift-graph/lang-bash"]
+lang-gdscript = ["tsift-graph/lang-gdscript"]
 lang-markdown = ["tsift-graph/lang-markdown"]
-all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]
+all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-gdscript", "lang-markdown"]
 
 [dev-dependencies]
 tempfile = "3"

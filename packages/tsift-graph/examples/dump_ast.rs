@@ -64,6 +64,14 @@ alias grep='grep --color=auto'
         4,
     );
 
+    #[cfg(feature = "lang-gdscript")]
+    dump(
+        "GDScript",
+        Lang::GdScript,
+        "class_name Player\nextends CharacterBody2D\n\nsignal died(cause)\nenum State { IDLE, RUNNING }\nconst SPEED = 300.0\n@export var health := 100\n\nfunc _ready():\n\tset_physics_process(true)\n\t$Sprite2D.play(\"walk\")\n",
+        4,
+    );
+
     #[cfg(feature = "lang-markdown")]
     dump(
         "Markdown",

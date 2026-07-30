@@ -35,6 +35,8 @@ pub enum Lang {
     Zig,
     #[cfg(feature = "lang-bash")]
     Bash,
+    #[cfg(feature = "lang-gdscript")]
+    GdScript,
     #[cfg(feature = "lang-markdown")]
     Markdown,
 }
@@ -61,6 +63,8 @@ impl Lang {
             "zig" => Some(Self::Zig),
             #[cfg(feature = "lang-bash")]
             "sh" | "bash" | "zsh" => Some(Self::Bash),
+            #[cfg(feature = "lang-gdscript")]
+            "gd" => Some(Self::GdScript),
             #[cfg(feature = "lang-markdown")]
             "md" | "mdx" => Some(Self::Markdown),
             _ => None,
@@ -87,6 +91,8 @@ impl Lang {
             Self::Zig => tree_sitter_zig::LANGUAGE.into(),
             #[cfg(feature = "lang-bash")]
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
+            #[cfg(feature = "lang-gdscript")]
+            Self::GdScript => tree_sitter_gdscript::LANGUAGE.into(),
             #[cfg(feature = "lang-markdown")]
             Self::Markdown => tsift_md_ast::markdown_language(),
         }
@@ -112,6 +118,8 @@ impl Lang {
             Self::Zig => "zig",
             #[cfg(feature = "lang-bash")]
             Self::Bash => "bash",
+            #[cfg(feature = "lang-gdscript")]
+            Self::GdScript => "gdscript",
             #[cfg(feature = "lang-markdown")]
             Self::Markdown => "markdown",
         }
@@ -188,6 +196,23 @@ impl Lang {
                 (function_definition name: (word) @function.name)
             "#
             }
+            #[cfg(feature = "lang-gdscript")]
+            Self::GdScript => {
+                // `class_name Foo` declares the script's own type and is the
+                // name every other script refers to it by, so it has to be a
+                // symbol even though it is a statement rather than a block.
+                r#"
+                (function_definition name: (name) @function.name)
+                (class_definition name: (name) @class.name)
+                (class_name_statement name: (name) @class.name)
+                (enum_definition name: (name) @enum.name)
+                (signal_statement name: (name) @signal.name)
+                (const_statement name: (name) @const.name)
+                (variable_statement name: (name) @variable.name)
+                (export_variable_statement name: (name) @variable.name)
+                (onready_variable_statement name: (name) @variable.name)
+            "#
+            }
             #[cfg(feature = "lang-markdown")]
             Self::Markdown => {
                 r#"
@@ -233,6 +258,17 @@ impl Lang {
                 r#"
                 (call_expression function: (identifier) @call.name)
                 (call_expression function: (member_expression property: (property_identifier) @call.name))
+            "#,
+            ),
+            #[cfg(feature = "lang-gdscript")]
+            Self::GdScript => Some(
+                // A bare `foo()` is `(call (identifier) ...)`, while `a.foo()`
+                // puts the callee in an `attribute_call` under `attribute`, and
+                // the Godot-1.x style `.foo()` super call is `base_call`.
+                r#"
+                (call (identifier) @call.name)
+                (attribute_call (identifier) @call.name)
+                (base_call (identifier) @call.name)
             "#,
             ),
             #[cfg(feature = "lang-kotlin")]
@@ -388,6 +424,8 @@ impl Lang {
             Self::Zig,
             #[cfg(feature = "lang-bash")]
             Self::Bash,
+            #[cfg(feature = "lang-gdscript")]
+            Self::GdScript,
             #[cfg(feature = "lang-markdown")]
             Self::Markdown,
         ]
@@ -482,6 +520,7 @@ mod tests {
             ("sh", "bash"),
             ("bash", "bash"),
             ("zsh", "bash"),
+            ("gd", "gdscript"),
             ("md", "markdown"),
             ("mdx", "markdown"),
         ];
@@ -593,6 +632,19 @@ mod tests {
             .parse("#!/bin/bash\nhello() { echo hi; }\n", None)
             .unwrap();
         assert_eq!(tree.root_node().kind(), "program");
+        assert!(!tree.root_node().has_error());
+    }
+
+    #[cfg(feature = "lang-gdscript")]
+    #[test]
+    fn test_parse_gdscript_snippet() {
+        let lang = Lang::GdScript;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang.tree_sitter_language()).unwrap();
+        let tree = parser
+            .parse("extends Node\n\nfunc _ready():\n\tprint(\"hi\")\n", None)
+            .unwrap();
+        assert_eq!(tree.root_node().kind(), "source");
         assert!(!tree.root_node().has_error());
     }
 
@@ -758,6 +810,46 @@ mod tests {
         assert_eq!(hello_sym.kind, "function");
         let ll_sym = symbols.iter().find(|s| s.name == "ll").unwrap();
         assert_eq!(ll_sym.kind, "alias");
+    }
+
+    #[cfg(feature = "lang-gdscript")]
+    #[test]
+    fn test_extract_gdscript_symbols() {
+        let source = b"class_name Player\nextends CharacterBody2D\n\nsignal died(cause)\n\nenum State { IDLE, RUNNING }\n\nconst SPEED = 300.0\n\n@export var health := 100\nvar velocity_scale := 1.0\n@onready var sprite = $Sprite2D\n\nclass Inventory:\n\tvar slots = []\n\nfunc _ready():\n\tset_physics_process(true)\n";
+        let symbols = Lang::GdScript.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        for expected in [
+            "Player",
+            "died",
+            "State",
+            "SPEED",
+            "health",
+            "velocity_scale",
+            "sprite",
+            "Inventory",
+            "_ready",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing {expected}, got {names:?}"
+            );
+        }
+        let kind_of = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .kind
+                .clone()
+        };
+        assert_eq!(kind_of("Player"), "class");
+        assert_eq!(kind_of("Inventory"), "class");
+        assert_eq!(kind_of("_ready"), "function");
+        assert_eq!(kind_of("died"), "signal");
+        assert_eq!(kind_of("State"), "enum");
+        assert_eq!(kind_of("SPEED"), "const");
+        assert_eq!(kind_of("health"), "variable");
+        assert_eq!(kind_of("sprite"), "variable");
     }
 
     #[cfg(feature = "lang-markdown")]

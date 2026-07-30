@@ -199,7 +199,7 @@ Each grammar is a compile-time feature. Default includes all priority languages.
 
 ```toml
 [features]
-default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]
+default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-gdscript", "lang-markdown"]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-python = ["dep:tree-sitter-python"]
 lang-typescript = ["dep:tree-sitter-typescript"]
@@ -207,8 +207,9 @@ lang-javascript = ["dep:tree-sitter-javascript"]
 lang-kotlin = ["dep:tree-sitter-kotlin"]
 lang-zig = ["dep:tree-sitter-zig"]
 lang-bash = ["dep:tree-sitter-bash"]
+lang-gdscript = ["dep:tree-sitter-gdscript"]
 lang-markdown = ["dep:tree-sitter-md"]
-all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]
+all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-gdscript", "lang-markdown"]
 ```
 
 ### Grammar Crates
@@ -224,6 +225,7 @@ all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript
 | Kotlin | `tree-sitter-kotlin-ng` | 1.1.0 | `LANGUAGE` | `.kt`, `.kts` |
 | Zig | `tree-sitter-zig` | 1.1.2 | `LANGUAGE` | `.zig` |
 | Bash | `tree-sitter-bash` | 0.25.1 | `LANGUAGE` | `.sh`, `.bash`, `.zsh` |
+| GDScript | `tree-sitter-gdscript` | 6.1.0 | `LANGUAGE` | `.gd` |
 | Markdown | `tree-sitter-md` | 0.5.3 | `LANGUAGE` + `LANGUAGE_INLINE` | `.md`, `.mdx` |
 
 Markdown parsing and heading/list/code-block extraction are owned by the dependency-light `tsift-md-ast` leaf crate. The crate exposes `parse()`, `reparse_incremental()` with serializable `MdTextEdit` source-range edits, `reparse_incremental_with_input_edit()` for callers that already have a tree-sitter edit, and `markdown_symbols_from_tree()` so `tsift-graph` and external live-document consumers share tree-sitter-md behavior without depending on the graph/index stack.
@@ -242,6 +244,7 @@ src/
     kotlin.rs       # Kotlin query patterns
     zig.rs          # Zig query patterns
     bash.rs         # Bash/Zsh/Shell query patterns
+    gdscript.rs     # GDScript query patterns
     markdown.rs     # Markdown heading/code block extraction
   queries/          # .scm tree-sitter query files (optional — can inline)
 ```
@@ -260,6 +263,7 @@ pub enum Language {
     #[cfg(feature = "lang-kotlin")]   Kotlin,
     #[cfg(feature = "lang-zig")]      Zig,
     #[cfg(feature = "lang-bash")]     Bash,
+    #[cfg(feature = "lang-gdscript")] GdScript,
     #[cfg(feature = "lang-markdown")] Markdown,
 }
 

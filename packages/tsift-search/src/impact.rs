@@ -420,6 +420,14 @@ fn is_import_line(lang: Lang, line: &str) -> bool {
         Lang::JavaScript | Lang::Jsx => {
             trimmed.starts_with("import ") || trimmed.contains("require(")
         }
+        // GDScript has no `import`: a script pulls in another script by
+        // extending it or by `preload`/`load`ing a `res://` path.
+        #[cfg(feature = "lang-gdscript")]
+        Lang::GdScript => {
+            trimmed.starts_with("extends ")
+                || trimmed.contains("preload(")
+                || trimmed.contains("load(\"res://")
+        }
         _ => false,
     }
 }
@@ -561,5 +569,22 @@ mod tests {
             &tokens,
         );
         assert_eq!(matched.into_iter().collect::<Vec<_>>(), vec!["api"]);
+    }
+
+    #[cfg(feature = "lang-gdscript")]
+    #[test]
+    fn gdscript_import_lines_are_extends_and_preload() {
+        assert!(is_import_line(Lang::GdScript, "extends \"res://player.gd\""));
+        assert!(is_import_line(
+            Lang::GdScript,
+            "const Bullet = preload(\"res://bullet.gd\")"
+        ));
+        assert!(is_import_line(
+            Lang::GdScript,
+            "\tvar scene = load(\"res://level.tscn\")"
+        ));
+        // A method that merely ends in `load` is not an import.
+        assert!(!is_import_line(Lang::GdScript, "\tdownloader.load(path)"));
+        assert!(!is_import_line(Lang::GdScript, "\tvar health = 100"));
     }
 }

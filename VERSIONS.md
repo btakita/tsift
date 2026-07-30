@@ -8,6 +8,29 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **GDScript joins the indexed tier.** `.gd` files are now walked, indexed,
+  searched, and graphed like any other indexed language, behind the default-on
+  `lang-gdscript` feature backed by `tree-sitter-gdscript` 6.1.0.
+
+  Symbol extraction covers the constructs a Godot script is navigated by:
+  `func` definitions, inner `class` definitions, the `class_name` statement
+  (the name every *other* script refers to the file by, so it has to be a
+  symbol even though it is a statement rather than a block), `enum`, `signal`,
+  `const`, and `var` — including the `@export` and `@onready` variable forms,
+  which the grammar gives distinct node kinds.
+
+  Call edges resolve for all three call shapes: a bare `foo()` (`call`), the
+  `node.foo()` member call (`attribute_call`, nested under `attribute`), and
+  the Godot-1.x `.foo()` super call (`base_call`). Complexity metrics get a
+  GDScript branch/loop/return query, and `is_import_line` recognizes GDScript's
+  actual dependency syntax — `extends`, `preload(...)`, and `load("res://...")`
+  — since the language has no `import`.
+
+  GDScript sits in the same tier as Zig: indexable but **not** structurally
+  matchable, because `ast-grep-language` ships no GDScript grammar. `tsift
+  ast-grep` and `structural_rewrite` do not reach `.gd`, and there is no
+  semantic-edit executor for it.
+
 - **All 20 structural-only languages are semantic-edit executors.** go, cpp,
   csharp, dart, java, swift, ruby, php, scala, lua, elixir, haskell, nix,
   solidity, css, html, json, yaml, hcl, and c now reach `tsift edit-intents`

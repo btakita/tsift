@@ -1208,6 +1208,20 @@ async fn submit_form() {}
         );
     }
 
+    #[cfg(feature = "lang-gdscript")]
+    #[test]
+    fn gdscript_direct_attribute_and_base_calls_resolve() {
+        let source =
+            b"func _ready():\n\thelper(1)\n\t$Sprite2D.play(\"walk\")\n\nfunc _init():\n\t.foo()\n";
+        let sites = extract_call_sites(Lang::GdScript, source).unwrap();
+        for callee in ["helper", "play", "foo"] {
+            assert!(
+                sites.iter().any(|s| s.callee == callee),
+                "missing {callee} call, got: {sites:?}"
+            );
+        }
+    }
+
     #[cfg(feature = "lang-python")]
     #[test]
     fn python_direct_call() {

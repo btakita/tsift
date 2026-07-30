@@ -27,9 +27,10 @@ tree-sitter-javascript = { version = "0.25", optional = true }
 tree-sitter-kotlin-ng = { version = "1", optional = true }
 tree-sitter-zig = { version = "1", optional = true }
 tree-sitter-bash = { version = "0.25", optional = true }
+tree-sitter-gdscript = { version = "6", optional = true }
 
 [features]
-default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]
+default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-gdscript", "lang-markdown"]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-python = ["dep:tree-sitter-python"]
 lang-typescript = ["dep:tree-sitter-typescript"]
@@ -37,5 +38,6 @@ lang-javascript = ["dep:tree-sitter-javascript"]
 lang-kotlin = ["dep:tree-sitter-kotlin-ng"]
 lang-zig = ["dep:tree-sitter-zig"]
 lang-bash = ["dep:tree-sitter-bash"]
+lang-gdscript = ["dep:tree-sitter-gdscript"]
 lang-markdown = ["dep:tsift-md-ast"]
-all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-markdown"]
+all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-gdscript", "lang-markdown"]
