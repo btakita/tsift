@@ -73,6 +73,10 @@ pub(crate) fn cmd_ast_grep_search(
                 envelope_metric("matches", report.match_count),
                 envelope_metric("files", report.files.len()),
                 envelope_metric("files_scanned", report.files_scanned),
+                envelope_metric(
+                    "files_skipped_pattern_unsupported",
+                    report.files_skipped_pattern_unsupported,
+                ),
             ],
         };
         return print_json_or_envelope(
@@ -118,7 +122,7 @@ fn print_search_text(report: &ScanReport) {
         }
     }
     println!(
-        "{} match(es) in {} of {} scanned file(s){}",
+        "{} match(es) in {} of {} scanned file(s){}{}",
         report.match_count,
         report.files.len(),
         report.files_scanned,
@@ -126,8 +130,23 @@ fn print_search_text(report: &ScanReport) {
             " [truncated by budget]"
         } else {
             ""
-        }
+        },
+        pattern_unsupported_note(
+            report.files_skipped_pattern_unsupported,
+            &report.pattern_unsupported_langs,
+        )
     );
+}
+
+/// A scan that silently skipped files reads as exhaustive unless it says so.
+fn pattern_unsupported_note(skipped: usize, langs: &[String]) -> String {
+    if skipped == 0 {
+        return String::new();
+    }
+    format!(
+        " [{skipped} file(s) skipped: pattern does not parse as {}]",
+        langs.join(", ")
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -161,6 +180,10 @@ pub(crate) fn cmd_ast_grep_rewrite(
                 envelope_metric("replacements", report.replacements),
                 envelope_metric("files", report.files.len()),
                 envelope_metric("applied", report.applied),
+                envelope_metric(
+                    "files_skipped_pattern_unsupported",
+                    report.files_skipped_pattern_unsupported,
+                ),
             ],
         };
         return print_json_or_envelope(
@@ -200,7 +223,7 @@ fn print_rewrite_text(report: &RewriteReport) {
         }
     }
     println!(
-        "{} replacement(s) in {} of {} scanned file(s) [{}]",
+        "{} replacement(s) in {} of {} scanned file(s) [{}]{}",
         report.replacements,
         report.files.len(),
         report.files_scanned,
@@ -208,7 +231,11 @@ fn print_rewrite_text(report: &RewriteReport) {
             "applied"
         } else {
             "preview — re-run with --apply to write"
-        }
+        },
+        pattern_unsupported_note(
+            report.files_skipped_pattern_unsupported,
+            &report.pattern_unsupported_langs,
+        )
     );
 }
 

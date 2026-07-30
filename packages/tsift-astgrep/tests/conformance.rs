@@ -11,7 +11,8 @@
 //! so a grammar upgrade that removes a limit is noticed instead of leaving a
 //! stale note behind.
 
-use tsift_astgrep::{AstGrepLang, rewrite_source, search_source};
+use std::path::{Path, PathBuf};
+use tsift_astgrep::{AstGrepLang, ScanOptions, codemod, rewrite_source, scan, search_source};
 
 /// How finely a grammar lets a standalone pattern select.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -622,4 +623,264 @@ fn an_unparseable_pattern_is_refused_on_every_language() {
         refused > 0,
         "no language refused a multi-node pattern — the guard is not reachable"
     );
+}
+
+
+// ---------------------------------------------------------------------------
+// File-scan tier: the same table, driven through the walk instead of a buffer.
+//
+// `search_source`/`rewrite_source` take a language as an argument. The CLI does
+// not: it walks a tree and picks a grammar per file extension. That dispatch,
+// and the preview/apply contract on top of it, were only covered for Rust.
+// ---------------------------------------------------------------------------
+
+/// Files that must never be parsed, whatever the pattern.
+const NON_SOURCE: &[(&str, &str)] = &[
+    ("notes.txt", "foo(1); foo(2);\n"),
+    ("nested/deep/data.log", "foo(3)\nfoo(4)\n"),
+];
+
+/// One tree holding every language's fixture, plus the non-source decoys.
+fn build_corpus() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for case in CASES {
+        let path = dir.path().join(case.sample_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, case.source).unwrap();
+    }
+    for (name, body) in NON_SOURCE {
+        let path = dir.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+    }
+    dir
+}
+
+fn options_for(paths: Vec<PathBuf>) -> ScanOptions {
+    ScanOptions {
+        paths,
+        // No `--lang`: extension dispatch is exactly what is under test.
+        lang: None,
+        max_files: None,
+        respect_ignore: false,
+    }
+}
+
+fn read(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap()
+}
+
+#[test]
+fn extension_dispatch_picks_each_language_grammar_across_one_mixed_tree() {
+    let dir = build_corpus();
+    let mut rows_checked = 0usize;
+
+    for case in CASES {
+        let name = case.lang.name();
+        let report = scan(case.pattern, &options_for(vec![dir.path().to_path_buf()]))
+            .unwrap_or_else(|err| panic!("{name}: tree scan failed: {err}"));
+
+        let own = report
+            .files
+            .iter()
+            .find(|file| file.path.ends_with(case.sample_path))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name}: {} is missing from the scan of a tree that contains it",
+                    case.sample_path
+                )
+            });
+        assert_eq!(
+            own.lang, case.lang,
+            "{name}: {} was parsed as {}",
+            case.sample_path, own.lang
+        );
+        assert_eq!(
+            own.matches.len(),
+            case.expected_matches,
+            "{name}: scanning the tree found {} match(es) in {}, buffer search found {}",
+            own.matches.len(),
+            case.sample_path,
+            case.expected_matches
+        );
+
+        // Non-source files are never parsed, whatever grammar the pattern suits.
+        for (decoy, _) in NON_SOURCE {
+            assert!(
+                !report.files.iter().any(|f| f.path.ends_with(decoy)),
+                "{name}: {decoy} was parsed"
+            );
+        }
+        rows_checked += 1;
+    }
+
+    assert_eq!(rows_checked, CASES.len(), "not every fixture row was scanned");
+}
+
+#[test]
+fn a_grammar_that_cannot_compile_the_pattern_is_skipped_not_fatal() {
+    let dir = build_corpus();
+
+    // `foo($A);` parses in C-family grammars and is `MultipleNode` in the ones
+    // with no statement terminator. Before the per-file skip, that single
+    // refusal aborted the entire walk — a mixed tree could not be scanned with
+    // any pattern that was not universally valid.
+    let report = scan("foo($A);", &options_for(vec![dir.path().to_path_buf()])).unwrap();
+    assert!(
+        report.files_skipped_pattern_unsupported > 0,
+        "expected some grammar to refuse `foo($A);` across {} scanned file(s)",
+        report.files_scanned
+    );
+    assert!(
+        report.match_count > 0,
+        "the refusals swallowed every result — the skip must be per file, not per scan"
+    );
+    assert!(
+        report.files_scanned > report.files_skipped_pattern_unsupported,
+        "a scan where every file was skipped should have failed instead"
+    );
+
+    let mut sorted = report.pattern_unsupported_langs.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        report.pattern_unsupported_langs, sorted,
+        "reported languages must be sorted and deduped"
+    );
+    assert!(
+        report.pattern_unsupported_langs.len() <= report.files_skipped_pattern_unsupported,
+        "more languages reported than files skipped"
+    );
+
+    // The counter is not simply always on: a pattern every grammar accepts
+    // must sweep the tree with no skips at all.
+    let clean = scan("foo($A)", &options_for(vec![dir.path().to_path_buf()])).unwrap();
+    assert_eq!(
+        clean.files_skipped_pattern_unsupported, 0,
+        "a universally valid pattern reported skips: {:?}",
+        clean.pattern_unsupported_langs
+    );
+    assert!(clean.pattern_unsupported_langs.is_empty());
+}
+
+#[test]
+fn a_pattern_no_language_can_compile_is_an_error_not_a_confident_zero() {
+    let dir = build_corpus();
+    // Two statements: `MultipleNode` in every grammar that has statements, and
+    // unparseable in the rest. A typo must not report "0 matches".
+    let err = scan(
+        "foo(1); foo(2); foo(3);",
+        &options_for(vec![dir.path().join("src/lib.rs")]),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("no scanned language could compile the pattern"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn preview_leaves_every_language_byte_identical() {
+    let dir = build_corpus();
+    let before: Vec<(PathBuf, String)> = CASES
+        .iter()
+        .map(|case| {
+            let path = dir.path().join(case.sample_path);
+            let body = read(&path);
+            (path, body)
+        })
+        .collect();
+
+    let mut previews = 0usize;
+    for case in CASES {
+        let report = codemod(
+            case.pattern,
+            case.rewrite,
+            &options_for(vec![dir.path().to_path_buf()]),
+            false,
+        )
+        .unwrap_or_else(|err| panic!("{}: preview failed: {err}", case.lang.name()));
+        assert!(!report.applied);
+        let own = report
+            .files
+            .iter()
+            .find(|file| file.path.ends_with(case.sample_path))
+            .unwrap_or_else(|| panic!("{}: own file missing from preview", case.lang.name()));
+        assert_eq!(own.replacements, case.expected_matches);
+        assert!(
+            own.new_source.contains(case.rewrite_marker),
+            "{}: preview buffer is missing `{}`",
+            case.lang.name(),
+            case.rewrite_marker
+        );
+        previews += 1;
+    }
+    assert_eq!(previews, CASES.len());
+
+    for (path, body) in &before {
+        assert_eq!(
+            &read(path),
+            body,
+            "preview wrote to {} — the whole contract is that it does not",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn apply_rewrites_the_targeted_file_and_leaves_the_other_languages_alone() {
+    let mut applied = 0usize;
+    for case in CASES {
+        // A fresh tree per row: applying in place would leave later rows
+        // reading a buffer an earlier row already rewrote.
+        let dir = build_corpus();
+        let name = case.lang.name();
+        let target = dir.path().join(case.sample_path);
+
+        // An explicitly named file still goes through `from_path`, with no
+        // `--lang` — the same dispatch, on the single-file branch of the walk.
+        let report = codemod(
+            case.pattern,
+            case.rewrite,
+            &options_for(vec![target.clone()]),
+            true,
+        )
+        .unwrap_or_else(|err| panic!("{name}: apply failed: {err}"));
+        assert!(report.applied, "{name}: report does not say applied");
+        assert_eq!(
+            report.replacements, case.expected_matches,
+            "{name}: applied {} replacement(s)",
+            report.replacements
+        );
+
+        let after = read(&target);
+        assert!(
+            after.contains(case.rewrite_marker),
+            "{name}: applied file is missing `{}`:\n{after}",
+            case.rewrite_marker
+        );
+        assert_ne!(after, case.source, "{name}: apply wrote nothing");
+
+        for other in CASES {
+            if other.lang == case.lang {
+                continue;
+            }
+            assert_eq!(
+                read(&dir.path().join(other.sample_path)),
+                other.source,
+                "{name}: apply touched {}",
+                other.sample_path
+            );
+        }
+        for (decoy, body) in NON_SOURCE {
+            assert_eq!(
+                read(&dir.path().join(decoy)),
+                *body,
+                "{name}: apply touched {decoy}"
+            );
+        }
+        applied += 1;
+    }
+    assert_eq!(applied, CASES.len(), "not every fixture row was applied");
 }

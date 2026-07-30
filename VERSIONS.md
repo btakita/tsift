@@ -8,6 +8,34 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **A mixed-language tree can be scanned with a pattern that is not valid
+  everywhere.** Extending the conformance table to drive `scan`/`codemod`
+  surfaced this immediately: a pattern is only ever valid for *some* grammars —
+  `foo($A);` parses in the C family and is `MultipleNode` in every language with
+  no statement terminator — and a walk picks a grammar per extension, so a mixed
+  repository is the normal case. One grammar's refusal aborted the entire scan
+  (and, before the `Pattern::try_new` fix below, panicked it), so a tree with a
+  single `.py` file could not be swept with a C-style pattern at all.
+
+  A file whose language cannot compile the pattern is now skipped and counted in
+  `files_skipped_pattern_unsupported`, with the languages in
+  `pattern_unsupported_langs`; both the human line and the JSON envelope report
+  it, so a partial sweep never reads as exhaustive. When *every* scanned file was
+  skipped that way the scan is an error rather than an empty result — a typo'd
+  pattern must not report a confident "0 matches".
+
+  ```
+  $ tsift ast-grep search 'foo($A);'
+  a.rs:2:4: foo(1);
+  1 match(es) in 1 of 3 scanned file(s) [2 file(s) skipped: pattern does not parse as go, python]
+  ```
+
+  The file-scan conformance rows also pin extension dispatch (each fixture
+  resolves to its own language with the same match count the buffer search
+  produced), that non-source files are never parsed, that preview leaves every
+  language byte-identical, and that `--apply` on one named file leaves the other
+  27 languages untouched.
+
 - **Cross-language conformance suites, and the two defects they found.** Both
   language tiers were covered by hand-written per-language tests, which can only
   prove that the language someone remembered works — a new grammar could arrive

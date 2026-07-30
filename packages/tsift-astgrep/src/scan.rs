@@ -48,6 +48,13 @@ pub struct ScanReport {
     pub files_scanned: usize,
     pub files_skipped_unsupported: usize,
     pub match_count: usize,
+    /// Files whose language could not compile this pattern. A mixed-language
+    /// tree is the normal case, and one grammar refusing a pattern must not
+    /// abort the scan — but the count is reported so a partial sweep never
+    /// reads as an exhaustive one.
+    pub files_skipped_pattern_unsupported: usize,
+    /// Languages behind `files_skipped_pattern_unsupported`, sorted and deduped.
+    pub pattern_unsupported_langs: Vec<String>,
     /// True when `max_files` cut the result short — never report a truncated
     /// scan as if it covered the tree.
     pub truncated: bool,
@@ -72,6 +79,9 @@ pub struct RewriteReport {
     pub files: Vec<FileRewrite>,
     pub files_scanned: usize,
     pub replacements: usize,
+    /// See `ScanReport::files_skipped_pattern_unsupported`.
+    pub files_skipped_pattern_unsupported: usize,
+    pub pattern_unsupported_langs: Vec<String>,
     pub applied: bool,
     pub truncated: bool,
 }
@@ -135,6 +145,35 @@ fn collect_candidates(options: &ScanOptions) -> Result<Vec<(PathBuf, AstGrepLang
     Ok(out)
 }
 
+/// Record that `lang` cannot compile the pattern, and keep going.
+///
+/// A pattern is only ever valid for some grammars. Scanning a mixed tree with
+/// `foo($A)` must not fail because one JSON file cannot parse it.
+fn note_pattern_unsupported(lang: AstGrepLang, skipped: &mut usize, langs: &mut Vec<String>) {
+    *skipped += 1;
+    let name = lang.name().to_string();
+    if let Err(idx) = langs.binary_search(&name) {
+        langs.insert(idx, name);
+    }
+}
+
+/// A pattern no candidate language could compile is a user error, not an empty
+/// result — otherwise a typo reports a confident "0 matches".
+fn fail_if_no_language_accepted_the_pattern(
+    pattern: &str,
+    files_scanned: usize,
+    skipped: usize,
+    langs: &[String],
+) -> Result<()> {
+    if files_scanned > 0 && skipped == files_scanned {
+        bail!(
+            "no scanned language could compile the pattern `{pattern}` (tried: {})",
+            langs.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn read_text(path: &Path) -> Option<String> {
     // Binary and non-UTF-8 files are skipped rather than failing the scan.
     std::fs::read(path)
@@ -151,6 +190,8 @@ pub fn scan(pattern: &str, options: &ScanOptions) -> Result<ScanReport> {
         files_scanned: 0,
         files_skipped_unsupported: 0,
         match_count: 0,
+        files_skipped_pattern_unsupported: 0,
+        pattern_unsupported_langs: Vec::new(),
         truncated: false,
     };
     for (path, lang) in candidates {
@@ -165,7 +206,17 @@ pub fn scan(pattern: &str, options: &ScanOptions) -> Result<ScanReport> {
             continue;
         };
         report.files_scanned += 1;
-        let matches = search_source(&source, lang, pattern)?;
+        let matches = match search_source(&source, lang, pattern) {
+            Ok(matches) => matches,
+            Err(_) => {
+                note_pattern_unsupported(
+                    lang,
+                    &mut report.files_skipped_pattern_unsupported,
+                    &mut report.pattern_unsupported_langs,
+                );
+                continue;
+            }
+        };
         if matches.is_empty() {
             continue;
         }
@@ -176,6 +227,12 @@ pub fn scan(pattern: &str, options: &ScanOptions) -> Result<ScanReport> {
             matches,
         });
     }
+    fail_if_no_language_accepted_the_pattern(
+        pattern,
+        report.files_scanned,
+        report.files_skipped_pattern_unsupported,
+        &report.pattern_unsupported_langs,
+    )?;
     Ok(report)
 }
 
@@ -196,6 +253,8 @@ pub fn codemod(
         files: Vec::new(),
         files_scanned: 0,
         replacements: 0,
+        files_skipped_pattern_unsupported: 0,
+        pattern_unsupported_langs: Vec::new(),
         applied: apply,
         truncated: false,
     };
@@ -210,12 +269,23 @@ pub fn codemod(
             continue;
         };
         report.files_scanned += 1;
+        let outcome = match rewrite_source(&source, lang, pattern, rewrite) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                note_pattern_unsupported(
+                    lang,
+                    &mut report.files_skipped_pattern_unsupported,
+                    &mut report.pattern_unsupported_langs,
+                );
+                continue;
+            }
+        };
         let RewriteOutcome {
             source: new_source,
             replacements,
             matches,
             unchanged,
-        } = rewrite_source(&source, lang, pattern, rewrite)?;
+        } = outcome;
         if replacements == 0 || unchanged {
             continue;
         }
@@ -233,6 +303,12 @@ pub fn codemod(
             applied: apply,
         });
     }
+    fail_if_no_language_accepted_the_pattern(
+        pattern,
+        report.files_scanned,
+        report.files_skipped_pattern_unsupported,
+        &report.pattern_unsupported_langs,
+    )?;
     Ok(report)
 }
 

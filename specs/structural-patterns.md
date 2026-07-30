@@ -173,6 +173,16 @@ expression-level patterns directly with no special spelling.
   `token_tree`, so `AstGrepLang::from_name($X)` matches a real call but not the
   same call inside `assert_eq!(...)`. This is a grammar property, not a tsift
   defect; patterns aimed at macro-heavy code will under-report.
+- **One grammar refusing a pattern does not abort a mixed-tree scan.** A pattern
+  is only ever valid for some grammars — `foo($A);` parses in the C family and is
+  `MultipleNode` in every language with no statement terminator. A tree walk
+  picks a grammar per extension, so a mixed repository is the normal case: a
+  file whose language cannot compile the pattern is skipped and counted in
+  `files_skipped_pattern_unsupported` (with the languages in
+  `pattern_unsupported_langs`), and both the human and JSON output report it, so
+  a partial sweep never reads as an exhaustive one. When *every* scanned file
+  was skipped that way, the scan is an **error** rather than an empty result —
+  a typo'd pattern must not report a confident "0 matches".
 - **An unparseable pattern is a refusal, never a panic.** `ast-grep-core`'s
   `&str`-as-matcher path builds the pattern with `Pattern::new`, which
   `unwrap()`s the parse — so a pattern that is merely invalid for the selected
@@ -204,6 +214,15 @@ The table is the unit of coverage: a guard asserts that the fixture set and
 fails. Rows must declare at least one match, and the suite asserts that the
 matches the library actually produced sum to what the table declares — a suite
 that iterates zero rows, or rows asserting nothing, cannot report green.
+
+The same table also drives the file-scan tier, because `search_source` takes a
+language as an argument and the CLI does not — it walks a tree and picks a
+grammar per extension. Every row's fixture is written into one mixed corpus,
+plus non-source decoys, and each row is checked through `scan`/`codemod`:
+extension dispatch resolves the row's own file to the row's own language with
+the same match count the buffer search produced, decoys are never parsed,
+preview leaves every file byte-identical, and `--apply` on a single named file
+changes that file and leaves all 27 other languages and the decoys untouched.
 
 `packages/tsift-graph/tests/conformance.rs` is the same shape for the indexed
 tier: one row per `Lang` variant, checking extension resolution, grammar load,
