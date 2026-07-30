@@ -12,7 +12,7 @@
 
 use crate::lang::Lang;
 use anyhow::Result;
-use tree_sitter::Parser;
+use tree_sitter::{Node, Parser};
 
 /// The byte span of one identifier occurrence, as a half-open range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +60,9 @@ pub fn identifier_node_kinds(lang: Lang) -> &'static [&'static str] {
         #[cfg(feature = "lang-zig")]
         Lang::Zig => &["identifier"],
         // Bash has no separate identifier node: a command name and a function
-        // name are both `word`, and an expansion is `variable_name`.
+        // name are both `word`, and an expansion is `variable_name`. `word` is
+        // also every unquoted argument, so kind alone is not enough here —
+        // `occurrence_is_renamable` narrows it to the name positions.
         #[cfg(feature = "lang-bash")]
         Lang::Bash => &["word", "variable_name"],
         // GDScript splits the two: `name` is the declared name of a statement
@@ -70,6 +72,35 @@ pub fn identifier_node_kinds(lang: Lang) -> &'static [&'static str] {
         // Markdown has headings, not identifiers; `rename_heading` is its kind.
         #[cfg(feature = "lang-markdown")]
         Lang::Markdown => &[],
+    }
+}
+
+/// Whether an identifier-kind node sits in a *naming* position.
+///
+/// For most grammars the node kind settles it, and this is unconditionally
+/// true. Bash is the exception that forces the check to exist: a bare `word`
+/// is the function name in `deploy() { … }`, the command name in `deploy`,
+/// **and** every unquoted argument, so `echo deploy` would otherwise have a
+/// rename rewrite an argument that is data. Restricting `word` to the
+/// declaration and command-name positions keeps arguments out, the same way
+/// the kind filter keeps strings and comments out for every other language.
+fn occurrence_is_renamable(lang: Lang, node: Node) -> bool {
+    match lang {
+        #[cfg(feature = "lang-bash")]
+        Lang::Bash => {
+            if node.kind() != "word" {
+                // `variable_name` is only ever a variable, in an assignment or
+                // an expansion.
+                return true;
+            }
+            node.parent().is_some_and(|parent| {
+                matches!(parent.kind(), "function_definition" | "command_name")
+            })
+        }
+        _ => {
+            let _ = node;
+            true
+        }
     }
 }
 
@@ -101,7 +132,10 @@ pub fn identifier_occurrences(
     loop {
         if descend {
             let node = cursor.node();
-            if kinds.contains(&node.kind()) && node.utf8_text(source).is_ok_and(|it| it == name) {
+            if kinds.contains(&node.kind())
+                && node.utf8_text(source).is_ok_and(|it| it == name)
+                && occurrence_is_renamable(lang, node)
+            {
                 occurrences.push(IdentifierOccurrence {
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
@@ -246,6 +280,83 @@ fn describe() -> String {
         assert!(out.contains("function gadgetCount()"));
         assert!(out.contains("// widgetCount comment"));
         assert!(out.contains("\"widgetCount\""));
+    }
+
+    #[cfg(feature = "lang-bash")]
+    const BASH_SOURCE: &str = r#"widget_count() {
+  echo widget_count
+  local label="widget_count"
+  # widget_count comment
+  echo "$widget_count"
+}
+widget_count
+"#;
+
+    #[cfg(feature = "lang-bash")]
+    #[test]
+    fn bash_renames_names_but_not_arguments_prose_or_data() {
+        let found =
+            identifier_occurrences(Lang::Bash, BASH_SOURCE.as_bytes(), "widget_count").unwrap();
+        // The definition, the `$widget_count` expansion, and the bare call —
+        // not the `echo widget_count` argument, the string, or the comment.
+        assert_eq!(found.len(), 3, "got {found:?}");
+        let (out, replaced) = replace_occurrences(BASH_SOURCE, &found, "gadget_count");
+        assert_eq!(replaced, 3);
+        assert!(out.contains("gadget_count() {"), "definition not renamed");
+        assert!(
+            out.contains("echo \"$gadget_count\""),
+            "expansion not renamed"
+        );
+        assert!(
+            out.contains("}\ngadget_count\n"),
+            "bare call not renamed:\n{out}"
+        );
+        assert!(
+            out.contains("echo widget_count\n"),
+            "an unquoted argument was renamed, which rewrites data:\n{out}"
+        );
+        assert!(out.contains("label=\"widget_count\""), "string was renamed");
+        assert!(
+            out.contains("# widget_count comment"),
+            "comment was renamed"
+        );
+    }
+
+    #[cfg(feature = "lang-zig")]
+    #[test]
+    fn zig_skips_strings_and_comments() {
+        let source = "// widget_count comment\npub fn widget_count() u32 {\n    const label = \"widget_count\";\n    _ = label;\n    return 3;\n}\npub fn caller() u32 { return widget_count(); }\n";
+        let found = identifier_occurrences(Lang::Zig, source.as_bytes(), "widget_count").unwrap();
+        assert_eq!(found.len(), 2, "got {found:?}");
+        let (out, replaced) = replace_occurrences(source, &found, "gadget_count");
+        assert_eq!(replaced, 2);
+        assert!(out.contains("pub fn gadget_count()"), "definition not renamed");
+        assert!(out.contains("return gadget_count();"), "call not renamed");
+        assert!(
+            out.contains("// widget_count comment"),
+            "comment was renamed"
+        );
+        assert!(out.contains("\"widget_count\""), "string was renamed");
+    }
+
+    #[cfg(feature = "lang-gdscript")]
+    #[test]
+    fn gdscript_renames_declaration_and_reference_but_not_prose() {
+        let source = "# widget_count comment\nfunc widget_count():\n\tvar label = \"widget_count\"\n\treturn label\n\nfunc caller():\n\treturn widget_count()\n";
+        let found =
+            identifier_occurrences(Lang::GdScript, source.as_bytes(), "widget_count").unwrap();
+        // GDScript names a declaration with `name` and every reference with
+        // `identifier`; the rename has to reach both kinds.
+        assert_eq!(found.len(), 2, "got {found:?}");
+        let (out, replaced) = replace_occurrences(source, &found, "gadget_count");
+        assert_eq!(replaced, 2);
+        assert!(out.contains("func gadget_count():"), "definition not renamed");
+        assert!(out.contains("return gadget_count()"), "call not renamed");
+        assert!(
+            out.contains("# widget_count comment"),
+            "comment was renamed"
+        );
+        assert!(out.contains("\"widget_count\""), "string was renamed");
     }
 
     #[test]

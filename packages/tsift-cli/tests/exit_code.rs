@@ -12254,10 +12254,12 @@ fn edit_intents_structural_rewrite_applies_pattern_codemod() {
 #[test]
 fn edit_intents_structural_rewrite_reaches_the_kotlin_and_bash_executors() {
     // Kotlin and Bash have an ast-grep grammar and graph symbol extraction, so
-    // structural_rewrite reaches them with the full planner contract. The
-    // symbol-resolved kinds do not: they need language-specific rewriting that
-    // no family implements for these two, and must be refused rather than fall
-    // through to the Rust implementations.
+    // structural_rewrite reaches them with the full planner contract, and so
+    // does `rename_symbol` (covered by
+    // `edit_intents_apply_renames_bash_zig_and_gdscript_symbols`). The kinds
+    // that still need language-specific rewriting — `replace_function_body`,
+    // `insert_import`, `add_method` — must be refused rather than fall through
+    // to the Rust implementations.
     for (file, body, pattern, replacement, expect_after, absent_after) in [
         (
             "Main.kt",
@@ -12331,7 +12333,8 @@ fn edit_intents_structural_rewrite_reaches_the_kotlin_and_bash_executors() {
         assert!(after.contains(expect_after), "{file}: {after}");
         assert!(!after.contains(absent_after), "{file}: {after}");
 
-        // A symbol-resolved kind is refused, and refused *without writing*.
+        // A kind this tier has no rewriting for is refused, and refused
+        // *without writing*.
         let before = after.clone();
         let refused = run_tsift_stdin(
             &[
@@ -12343,8 +12346,8 @@ fn edit_intents_structural_rewrite_reaches_the_kotlin_and_bash_executors() {
                 "--json",
             ],
             &format!(
-                r#"{{"intents": [{{"kind": "rename_symbol", "file": "{file}",
-                     "symbol": "main", "new_name": "main2"}}]}}"#
+                r#"{{"intents": [{{"kind": "replace_function_body", "file": "{file}",
+                     "symbol": "main", "replacement": "return 0"}}]}}"#
             ),
         );
         let combined = format!(
@@ -12632,5 +12635,226 @@ fn structural_only_language_rewrites_via_ast_grep_and_via_edit_intents() {
     assert!(
         applied.contains("bar(1)") && applied.contains("bar(2)"),
         "apply should rewrite every Go call site: {applied}"
+    );
+}
+
+/// Bash, Zig, and GDScript sources plus a GDScript caller in a second file.
+///
+/// The bash source carries the case that makes bash different from every other
+/// indexed language: `echo widget_count` is an unquoted argument, which the
+/// grammar spells with the same `word` node as a function name, and it is data.
+fn indexed_tier_rename_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("util.sh"),
+        "widget_count() {\n  echo widget_count\n  local label=\"widget_count\"\n  # widget_count comment\n  return 3\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("main.zig"),
+        "// widget_count comment\npub fn widget_count() u32 {\n    const label = \"widget_count\";\n    _ = label;\n    return 3;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("player.gd"),
+        "# widget_count comment\nfunc widget_count():\n\tvar label = \"widget_count\"\n\treturn label\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("caller.gd"),
+        "func total():\n\treturn widget_count() + 1\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    dir
+}
+
+#[test]
+fn edit_intents_apply_renames_bash_zig_and_gdscript_symbols() {
+    // `rename_symbol` used to exist for Rust, Python, and the JS-like family
+    // only, because each of those hand-rolled its own substring scan. Reading
+    // occurrences out of the grammar instead makes the kind language-general:
+    // these three languages were already indexed, and registration is now a
+    // per-language identifier-node set rather than another copy of the scan.
+    let dir = indexed_tier_rename_fixture();
+    for file in ["util.sh", "main.zig", "player.gd"] {
+        let input = format!(
+            r#"{{"intents":[{{"kind":"rename_symbol","symbol":"widget_count","file":"{file}","new_name":"gadget_count"}}]}}"#
+        );
+        let output = run_tsift_stdin(
+            &[
+                "--envelope",
+                "edit-intents",
+                "--path",
+                dir.path().to_str().unwrap(),
+                "--apply",
+                "--json",
+            ],
+            &input,
+        );
+        assert!(
+            output.status.success(),
+            "{file} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["report"]["applied_total"], 1, "{file}: {json}");
+    }
+
+    // Each position is asserted on its own. A test that only checked that the
+    // file changed would pass while renaming the comment and the string.
+    let bash = fs::read_to_string(dir.path().join("util.sh")).unwrap();
+    assert!(bash.contains("gadget_count() {"), "{bash}");
+    assert!(
+        bash.contains("echo widget_count\n"),
+        "an unquoted bash argument is data, not a name: {bash}"
+    );
+    assert!(bash.contains("label=\"widget_count\""), "{bash}");
+    assert!(bash.contains("# widget_count comment"), "{bash}");
+
+    let zig = fs::read_to_string(dir.path().join("main.zig")).unwrap();
+    assert!(zig.contains("pub fn gadget_count() u32"), "{zig}");
+    assert!(zig.contains("// widget_count comment"), "{zig}");
+    assert!(zig.contains("\"widget_count\""), "{zig}");
+
+    let gdscript = fs::read_to_string(dir.path().join("player.gd")).unwrap();
+    assert!(gdscript.contains("func gadget_count():"), "{gdscript}");
+    assert!(gdscript.contains("# widget_count comment"), "{gdscript}");
+    assert!(gdscript.contains("\"widget_count\""), "{gdscript}");
+
+    // The call-graph scoping added for the JS-like and Rust families is not
+    // per-family either: a GDScript caller in another file is rewritten with no
+    // GDScript-specific code, so the tree still resolves.
+    let caller = fs::read_to_string(dir.path().join("caller.gd")).unwrap();
+    assert!(
+        caller.contains("return gadget_count() + 1"),
+        "cross-file GDScript caller was left broken: {caller}"
+    );
+}
+
+#[test]
+fn edit_intents_refuses_structural_rewrite_for_an_indexed_language_with_no_grammar() {
+    // Zig and GDScript are renamable because renaming needs a grammar and an
+    // index, which they have; they are not structurally matchable, because this
+    // build compiles no ast-grep grammar for them. This is the executor-level
+    // "kind is not recognized" guard reaching the end-to-end path for the first
+    // time — before there was no executor that recognized one kind and refused
+    // another, so the guard was asserted in unit tests only.
+    let dir = indexed_tier_rename_fixture();
+    let input = r#"{"intents":[{"kind":"structural_rewrite","file":"main.zig","pattern":"foo($A)","replacement":"bar($A)"}]}"#;
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ],
+        input,
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = &json["report"]["plans"][0];
+    assert_eq!(plan["status"], "unsupported", "{json}");
+    assert_eq!(plan["apply_supported"], false, "{json}");
+    let message = plan["message"].as_str().unwrap();
+    assert!(
+        message.contains("Zig executor") && message.contains("not supported"),
+        "refusal should name the executor: {message}"
+    );
+}
+
+#[test]
+fn edit_intents_refuses_rename_symbol_for_markdown_by_name() {
+    // Markdown is indexed and stays deliberately out of the renamable set:
+    // `rename_heading` is its kind. It is the one executor that resolves a
+    // symbol and then refuses `rename_symbol`, so it proves the guard refuses
+    // by name rather than letting the family split route the edit into another
+    // language's rewriting rules.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("README.md"), "# widgetCount\n\nbody\n").unwrap();
+    let indexed = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(indexed.status.success());
+
+    let input = r#"{"intents":[{"kind":"rename_symbol","symbol":"widgetCount","file":"README.md","new_name":"gadgetCount"}]}"#;
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ],
+        input,
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = &json["report"]["plans"][0];
+    assert_eq!(plan["status"], "unsupported", "{json}");
+    let message = plan["message"].as_str().unwrap();
+    assert!(
+        message.contains("Markdown executor") && message.contains("not supported"),
+        "refusal should name the executor: {message}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("README.md")).unwrap(),
+        "# widgetCount\n\nbody\n",
+        "a refused rename must not write"
+    );
+}
+
+#[test]
+fn edit_intents_refuses_a_structural_only_rename_at_the_index_layer() {
+    // The plan for this phase expected the executor-level refusal of
+    // `rename_symbol` for structural-only languages to become reachable here.
+    // It does not: making every *indexed* language renamable leaves the
+    // structural-only tier defined by having no `tsift-graph` binding at all,
+    // so there is no symbol to resolve and the index layer refuses first. This
+    // records where the refusal actually comes from, so a later change that
+    // moves it is noticed instead of being read as a regression.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("main.go"),
+        "package main\n\nfunc widgetCount() int { return 3 }\n",
+    )
+    .unwrap();
+    let indexed = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(indexed.status.success());
+
+    let input = r#"{"intents":[{"kind":"rename_symbol","symbol":"widgetCount","file":"main.go","new_name":"gadgetCount"}]}"#;
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ],
+        input,
+    );
+    assert!(!output.status.success(), "a Go rename must not be planned");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no indexed symbol matched"),
+        "expected the index layer to refuse first: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("main.go")).unwrap(),
+        "package main\n\nfunc widgetCount() int { return 3 }\n",
+        "a refused rename must not write"
     );
 }

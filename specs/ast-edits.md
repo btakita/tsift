@@ -120,11 +120,10 @@ with the symbol-resolved kinds and is not re-specified for this kind.
 Because `structural_rewrite` needs only a grammar to match with and a grammar to
 reparse the result, a language can be a *structural-only* executor: registered,
 with `structural_rewrite` as its whole recognized-intent set, and no
-language-specific rewriting behind the symbol-resolved kinds. Every language
-with an ast-grep grammar is in that family: rewriting requires a **parser**, and
-indexing is what requires tag queries and symbol extraction. The two are
-independent capabilities, so a language that is not indexed, searchable, or
-graphable is still a semantic-edit executor for this one kind.
+language-specific rewriting behind the symbol-resolved kinds. Rewriting requires
+a **parser**; indexing is what requires tag queries and symbol extraction. The
+two are independent capabilities, so a language that is not indexed, searchable,
+or graphable is still a semantic-edit executor for this one kind.
 
 The reparse grammar therefore resolves in two steps, and an executor with
 neither is a registration bug refused by name rather than parsed with some other
@@ -135,34 +134,89 @@ language's rules:
 | has a `tsift-graph` binding | that binding's grammar — Markdown in particular parses through `tsift-md-ast`, not ast-grep's `tree-sitter-md` |
 | structural-only | the ast-grep grammar its pattern matched against |
 
-For every indexed executor those two grammars are currently the same object —
-even Kotlin, where ast-grep's `tree-sitter-kotlin` feature resolves to the same
-`-ng` grammar `tsift-graph` uses. That agreement is load-bearing and invisible,
-so it is asserted rather than assumed: a rewrite is *matched* with the ast-grep
-grammar, and validating its output against a different one would report a clean
-parse for source the matcher could never have produced, or refuse source it
-would have. A grammar bump that splits the two must fail the suite and force the
-choice explicitly.
+For every executor that has both, those two grammars are currently the same
+object — even Kotlin, where ast-grep's `tree-sitter-kotlin` feature resolves to
+the same `-ng` grammar `tsift-graph` uses. That agreement is load-bearing and
+invisible, so it is asserted rather than assumed: a rewrite is *matched* with
+the ast-grep grammar, and validating its output against a different one would
+report a clean parse for source the matcher could never have produced, or refuse
+source it would have. A grammar bump that splits the two must fail the suite and
+force the choice explicitly.
 
 An executor that does not recognize a kind must be **refused before the family
-split**, not carried into it. The split routes anything that is neither markdown
-nor script to the Rust implementations, so a Kotlin `rename_symbol` would
-otherwise be rewritten by Rust identifier rules and reported as "applied through
-the Kotlin executor" — plausible output produced by the wrong language's logic,
-which is worse than a refusal. The refusal names the executor and its supported
-kinds.
+split**, not carried into it. The split routes anything that is neither
+markdown, script, nor indexed-generic to the Rust implementations, so an
+unrecognized kind would otherwise be rewritten by Rust identifier rules and
+reported as applied through that language's executor — plausible output produced
+by the wrong language's logic, which is worse than a refusal. The refusal names
+the executor and its supported kinds.
 
-Every registered executor carries exactly one conformance fixture, and the
-mapping is exhaustive in both directions: an executor without a fixture is
-registered but never exercised, and a fixture without an executor has outlived
-what it claimed to cover. Each fixture drives the real planner path — match,
-rewrite, reparse — and the suite compares the sum of replacements *the planner
-returned* against the sum the table declares, so a runner counting its own
-iterations cannot report green over a table that rewrote nothing. Grammar quirks
-(C and CSS needing a statement terminator, Dart and Solidity matching only whole
-declarations, HCL matching only as an attribute, JSON needing both sides
-metavariable-shaped) are row data, so a grammar upgrade that lifts a limit fails
-the suite instead of leaving a stale note behind.
+### Indexed executors
+
+`rename_symbol` is not per-language work. Identifier occurrences come out of the
+grammar, and the rename's cross-file extent comes out of the call graph; both
+are things every indexed language already has. An *indexed executor* is
+therefore a language with a `tsift-graph` binding and no hand-written per-kind
+rewriting, whose recognized set is `rename_symbol` plus `structural_rewrite`
+where a grammar for the latter exists. Registration is a per-language
+identifier-node-kind set and a fixture row, not another copy of a rewriting
+implementation. The kinds that stay unrecognized for this tier —
+`replace_function_body`, `insert_import`, `add_method` — are the ones that
+genuinely do need language-specific rewriting.
+
+The two tiers are distinguished by what they lack, and the distinction is not
+cosmetic:
+
+| Tier | `tsift-graph` binding | ast-grep grammar | Recognized kinds |
+|---|---|---|---|
+| indexed | yes | yes | `rename_symbol`, `structural_rewrite` |
+| indexed, no grammar in this build | yes | no | `rename_symbol` |
+| structural-only | no | yes | `structural_rewrite` |
+
+An indexed executor with no ast-grep grammar must **not** advertise
+`structural_rewrite`: doing so plans an edit that can only fail at match time.
+Dropping it from the recognized set turns that into a refusal at registration,
+which is the difference between a plan that is declined and a plan that is
+accepted and then breaks.
+
+Rename scope is keyed per language, not per tier. `callers_of` and
+`symbol_info` match by *name*, so a rename must be told which languages could
+actually be referring to the same symbol: the JS-like executors are one family
+because they do call each other, and every language in the indexed and
+structural tiers is its own family, because a Bash `deploy` and a Zig `deploy`
+sharing a name is a coincidence. Keying scope on the tier instead would
+reintroduce the defect where a Python `beta` blocked renaming a JavaScript one.
+
+Bash is the one indexed language where the node kind alone does not identify a
+name. A bare `word` is the function name, the command name, **and** every
+unquoted argument, so `echo deploy` would otherwise have a rename rewrite an
+argument that is data — the same class of bug as renaming inside a string
+literal. `word` occurrences are therefore restricted to the declaration and
+command-name positions; `variable_name` needs no such guard, because it is only
+ever a variable.
+
+### Conformance fixtures
+
+Two tables, each exhaustive in both directions against the recognized-intent
+set: a structural fixture for every executor that recognizes
+`structural_rewrite`, and a rename fixture for every executor that recognizes
+`rename_symbol`. An executor without its fixture is registered but never
+exercised; a fixture without an executor has outlived what it claimed to cover.
+A `Lang` variant brought into the renamable tier with no rename row fails the
+suite, the same way `packages/tsift-graph/tests/conformance.rs` treats symbol
+extraction.
+
+Each fixture drives the real planner path, and the suite compares the sum of
+replacements *the planner returned* against the sum the table declares, so a
+runner counting its own iterations cannot report green over a table that
+rewrote nothing. Rename rows additionally declare the positions that must change
+**and** the positions that must survive byte for byte — comments, string
+literals, and data that merely shares the name — asserted individually, because
+a row that only counted replacements would pass while renaming the wrong ones.
+Grammar quirks (C and CSS needing a statement terminator, Dart and Solidity
+matching only whole declarations, HCL matching only as an attribute, JSON
+needing both sides metavariable-shaped) are row data, so a grammar upgrade that
+lifts a limit fails the suite instead of leaving a stale note behind.
 
 ## Promotion Order
 
@@ -174,6 +228,8 @@ For Rust, `insert_import` must parse the current source and anchor insertion aft
 
 Broader rename, move, call-site, and signature operations require additional graph/index proof and tests that cover comments, formatting preservation, unsupported parser states, macro or generated regions, syntax-error work-in-progress files, and verification failures.
 
-A language may therefore be registered as a structural-only executor as soon as it has an ast-grep grammar; graph symbol extraction is not a prerequisite, because reparsing is a parser-level need. The symbol-resolved kinds stay unrecognized for it until their per-language rewriting exists — and for a language with no index they stay unreachable anyway, since nothing resolves a symbol to target. Coverage for such an executor must include an applied structural codemod *and* a symbol-resolved kind refused without writing — a test that only checks the codemod would pass against a build that silently ran another family's implementation for everything else.
+A language may therefore be registered as a structural-only executor as soon as it has an ast-grep grammar; graph symbol extraction is not a prerequisite, because reparsing is a parser-level need. The symbol-resolved kinds stay unrecognized for it until their per-language rewriting exists — and for a language with no index they stay unreachable anyway, since nothing resolves a symbol to target. That unreachability is where the refusal for this tier actually comes from: the index layer answers `no indexed symbol matched` before any executor is consulted, so the executor-level refusal is a defence in depth for it rather than the path a caller hits. Coverage for such an executor must include an applied structural codemod *and* a symbol-resolved kind refused without writing — a test that only checks the codemod would pass against a build that silently ran another family's implementation for everything else.
 
-`structural_rewrite` is promoted across every registered executor at once rather than language by language, because its selection and mutation logic are language-independent: the grammar is a parameter, not a code path. What is language-specific — parser validation and formatter policy — is already owned by the executor contract. Coverage must therefore include at least one non-Rust executor and a drift guard asserting that every registered executor resolves an ast-grep grammar, so a newly added executor language cannot advertise structural support it has no parser for.
+`structural_rewrite` is promoted across every registered executor at once rather than language by language, because its selection and mutation logic are language-independent: the grammar is a parameter, not a code path. What is language-specific — parser validation and formatter policy — is already owned by the executor contract. Coverage must therefore include at least one non-Rust executor and a drift guard asserting that every executor advertising structural support resolves an ast-grep grammar, so a newly added executor language cannot advertise structural support it has no parser for.
+
+`rename_symbol` is promoted the same way and for the same reason: once occurrences come out of the grammar and extent comes out of the call graph, the language is a parameter. Bringing an indexed language into the renamable tier is a per-language identifier-node-kind set plus a rename fixture row, and both are enforced — a `Lang` variant with no identifier kinds, or a renamable executor with no fixture, fails the suite. Coverage must reach the end-to-end path, not the planner alone, and must include an executor that recognizes one kind while refusing another: an executor that refuses *everything* cannot distinguish a working guard from a broken family split.

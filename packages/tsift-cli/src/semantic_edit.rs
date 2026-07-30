@@ -407,13 +407,26 @@ pub(crate) const SEMANTIC_EDIT_SCRIPT_KINDS: &[&str] = &[
     "insert_import",
     "structural_rewrite",
 ];
-/// Languages with an ast-grep grammar and graph symbol extraction but no
-/// per-kind executor implementation. `structural_rewrite` needs neither: it is
+/// Languages with an ast-grep grammar and no `tsift-graph` binding.
+/// `structural_rewrite` needs neither an index nor a per-kind executor: it is
 /// dispatched ahead of the family split and only requires a grammar to match
-/// with and one to reparse the result. The symbol-resolved kinds do need
-/// language-specific rewriting, so they stay unrecognized rather than falling
-/// through to another family's implementation.
+/// with and one to reparse the result. The symbol-resolved kinds do need a
+/// resolvable symbol, so they stay unrecognized rather than falling through to
+/// another family's implementation.
 pub(crate) const SEMANTIC_EDIT_STRUCTURAL_KINDS: &[&str] = &["structural_rewrite"];
+/// Indexed languages with no per-kind executor of their own.
+///
+/// `rename_symbol` is here because it is not per-kind work at all: identifier
+/// occurrences come out of the grammar and the rename's extent comes out of the
+/// call graph, both of which every indexed language already has. The kinds that
+/// are absent — `replace_function_body`, `insert_import`, `add_method` — need
+/// language-specific rewriting that these executors genuinely do not have.
+pub(crate) const SEMANTIC_EDIT_INDEXED_KINDS: &[&str] = &["rename_symbol", "structural_rewrite"];
+/// The same tier for an indexed language this build compiled no ast-grep
+/// grammar for. Dropping `structural_rewrite` is a refusal by registration:
+/// advertising it would mean planning an edit that `preview_structural_rewrite`
+/// can only fail on.
+pub(crate) const SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS: &[&str] = &["rename_symbol"];
 pub(crate) const SEMANTIC_EDIT_MARKDOWN_KINDS: &[&str] = &[
     "rename_heading",
     "replace_section_body",
@@ -680,9 +693,9 @@ fn resolve_semantic_edit_call_refs(
 
 /// The executor family a file renames within. `None` means the file has no
 /// registered executor, which cannot match any target and so is excluded.
-fn semantic_edit_rename_family(file_abs: &Path) -> Option<SemanticEditLanguageFamily> {
+fn semantic_edit_rename_family(file_abs: &Path) -> Option<&'static str> {
     let language = semantic_edit_language_for_file(file_abs);
-    semantic_edit_executor_language(&language, file_abs).map(|executor| executor.contract().family)
+    semantic_edit_executor_language(&language, file_abs).map(|executor| executor.rename_family())
 }
 
 /// Which files a rename has to touch, and whether it is safe to touch them.
@@ -1128,6 +1141,10 @@ pub(crate) enum SemanticEditExecutorLanguage {
     Markdown,
     Kotlin,
     Bash,
+    // Indexed executors with no ast-grep grammar in this build: renamable
+    // through the `tsift-graph` binding, but not structurally matchable.
+    Zig,
+    GdScript,
     // Structural-only executors with no `tsift-graph` binding. Reparse goes
     // through the ast-grep grammar instead — see `reparse_language`.
     C,
@@ -1158,9 +1175,17 @@ pub(crate) enum SemanticEditLanguageFamily {
     Python,
     JsLike,
     Markdown,
+    /// Indexed by `tsift-graph` but with no per-kind executor of its own.
+    ///
+    /// `rename_symbol` is language-general — it reads identifier nodes out of
+    /// the tree and rewrites their spans — so it needs a grammar and an index,
+    /// not a hand-written per-family scan. Every other symbol-resolved kind
+    /// still does need language-specific rewriting and stays unrecognized here.
+    Indexed,
     /// A grammar and nothing else: no per-kind rewriting, structural patterns
-    /// only. Members may or may not also be indexed by `tsift-graph`; indexing
-    /// is what makes a language *searchable*, not what makes it rewritable.
+    /// only. These languages have no `tsift-graph` binding, so they are not
+    /// indexed, searchable, or graphable, and nothing can resolve a symbol in
+    /// them to rename.
     Structural,
 }
 
@@ -1292,9 +1317,9 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         temp_suffix: ".kt",
         aliases: &["kotlin", "kt", "kts"],
         extensions: &["kt", "kts"],
-        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
-        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
-        family: SemanticEditLanguageFamily::Structural,
+        recognized_intents: SEMANTIC_EDIT_INDEXED_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_INDEXED_KINDS,
+        family: SemanticEditLanguageFamily::Indexed,
         formatter: SemanticEditFormatterContract::None,
     },
     SemanticEditLanguageContract {
@@ -1305,9 +1330,37 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         temp_suffix: ".sh",
         aliases: &["bash", "sh", "shell"],
         extensions: &["sh", "bash"],
-        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
-        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
-        family: SemanticEditLanguageFamily::Structural,
+        recognized_intents: SEMANTIC_EDIT_INDEXED_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_INDEXED_KINDS,
+        family: SemanticEditLanguageFamily::Indexed,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    // Indexed, but with no ast-grep grammar compiled in this build, so the
+    // recognized set is `rename_symbol` alone.
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Zig,
+        id: "zig",
+        name: "Zig",
+        graph_lang: Some(graph::Lang::Zig),
+        temp_suffix: ".zig",
+        aliases: &["zig"],
+        extensions: &["zig"],
+        recognized_intents: SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS,
+        family: SemanticEditLanguageFamily::Indexed,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::GdScript,
+        id: "gdscript",
+        name: "GDScript",
+        graph_lang: Some(graph::Lang::GdScript),
+        temp_suffix: ".gd",
+        aliases: &["gdscript", "gd"],
+        extensions: &["gd"],
+        recognized_intents: SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS,
+        family: SemanticEditLanguageFamily::Indexed,
         formatter: SemanticEditFormatterContract::None,
     },
     // Structural-only tier: an ast-grep grammar and no `tsift-graph` binding.
@@ -1903,6 +1956,145 @@ const SEMANTIC_EDIT_EXECUTOR_FIXTURES: &[SemanticEditExecutorFixture] = &[
     },
 ];
 
+/// One rename conformance fixture per executor that recognizes `rename_symbol`.
+///
+/// A structural fixture proves an executor can *match and rewrite*; it cannot
+/// prove a rename lands on names rather than on prose and data. Every renamable
+/// language declares the positions that must change and the positions that must
+/// not, so a rename that rewrites a comment or a string literal fails here for
+/// that language specifically, rather than being caught only for the three
+/// languages someone happened to write a hand test for.
+#[cfg(test)]
+struct SemanticEditRenameFixture {
+    executor: SemanticEditExecutorLanguage,
+    alias: &'static str,
+    source: &'static str,
+    symbol: &'static str,
+    new_name: &'static str,
+    /// Must be non-zero: a fixture that renames nothing proves nothing.
+    expected_replacements: usize,
+    /// Substrings that must appear *after* the rename.
+    renamed: &'static [&'static str],
+    /// Substrings that must survive the rename byte for byte — comments,
+    /// string literals, and data that merely shares the name.
+    untouched: &'static [&'static str],
+}
+
+#[cfg(test)]
+const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
+    SemanticEditRenameFixture {
+        executor: SemanticEditExecutorLanguage::Rust,
+        alias: "rust",
+        source: "/// doc widget_count\nfn widget_count() -> usize { 3 }\nfn describe() -> String {\n    // widget_count comment\n    let label = \"widget_count\";\n    format!(\"{label}: {}\", widget_count())\n}\n",
+        symbol: "widget_count",
+        new_name: "gadget_count",
+        expected_replacements: 2,
+        renamed: &["fn gadget_count()", "gadget_count())"],
+        untouched: &[
+            "/// doc widget_count",
+            "// widget_count comment",
+            "\"widget_count\"",
+        ],
+    },
+    SemanticEditRenameFixture {
+        executor: SemanticEditExecutorLanguage::Python,
+        alias: "python",
+        source: "def widget_count():\n    # widget_count comment\n    return \"widget_count\"\n\nwidget_count()\n",
+        symbol: "widget_count",
+        new_name: "gadget_count",
+        expected_replacements: 2,
+        renamed: &["def gadget_count()", "gadget_count()\n"],
+        untouched: &["# widget_count comment", "\"widget_count\""],
+    },
+    SemanticEditRenameFixture {
+        executor: SemanticEditExecutorLanguage::TypeScript,
+        alias: "typescript",
+        source: "// widgetCount comment\nfunction widgetCount(): number { return 1; }\nconst label = \"widgetCount\";\nwidgetCount();\n",
+        symbol: "widgetCount",
+        new_name: "gadgetCount",
+        expected_replacements: 2,
+        renamed: &["function gadgetCount()", "gadgetCount();"],
+        untouched: &["// widgetCount comment", "\"widgetCount\""],
+    },
+    SemanticEditRenameFixture {
+        executor: SemanticEditExecutorLanguage::Tsx,
+        alias: "tsx",
+        source: "// widgetCount comment\nfunction widgetCount(): number { return 1; }\nconst label = \"widgetCount\";\nconst App = () => widgetCount();\n",
+        symbol: "widgetCount",
+        new_name: "gadgetCount",
+        expected_replacements: 2,
+        renamed: &["function gadgetCount()", "=> gadgetCount()"],
+        untouched: &["// widgetCount comment", "\"widgetCount\""],
+    },
+    SemanticEditRenameFixture {
+        executor: SemanticEditExecutorLanguage::JavaScript,
+        alias: "javascript",
+        source: "// widgetCount comment\nfunction widgetCount() { return 1; }\nconst label = \"widgetCount\";\nwidgetCount();\n",
+        symbol: "widgetCount",
+        new_name: "gadgetCount",
+        expected_replacements: 2,
+        renamed: &["function gadgetCount()", "gadgetCount();"],
+        untouched: &["// widgetCount comment", "\"widgetCount\""],
+    },
+    SemanticEditRenameFixture {
+        executor: SemanticEditExecutorLanguage::Jsx,
+        alias: "jsx",
+        source: "// widgetCount comment\nfunction widgetCount() { return 1; }\nconst label = \"widgetCount\";\nwidgetCount();\n",
+        symbol: "widgetCount",
+        new_name: "gadgetCount",
+        expected_replacements: 2,
+        renamed: &["function gadgetCount()", "gadgetCount();"],
+        untouched: &["// widgetCount comment", "\"widgetCount\""],
+    },
+    SemanticEditRenameFixture {
+        executor: SemanticEditExecutorLanguage::Kotlin,
+        alias: "kotlin",
+        source: "// widgetCount comment\nfun widgetCount(): Int { return 1 }\nval label = \"widgetCount\"\nfun caller(): Int { return widgetCount() }\n",
+        symbol: "widgetCount",
+        new_name: "gadgetCount",
+        expected_replacements: 2,
+        renamed: &["fun gadgetCount()", "return gadgetCount()"],
+        untouched: &["// widgetCount comment", "\"widgetCount\""],
+    },
+    SemanticEditRenameFixture {
+        executor: SemanticEditExecutorLanguage::Bash,
+        alias: "bash",
+        // `echo widget_count` is the case that makes bash different: an
+        // unquoted argument is the same `word` node as a command name, and it
+        // is data.
+        source: "widget_count() {\n  echo widget_count\n  local label=\"widget_count\"\n  # widget_count comment\n}\nwidget_count\n",
+        symbol: "widget_count",
+        new_name: "gadget_count",
+        expected_replacements: 2,
+        renamed: &["gadget_count() {", "}\ngadget_count\n"],
+        untouched: &[
+            "echo widget_count\n",
+            "label=\"widget_count\"",
+            "# widget_count comment",
+        ],
+    },
+    SemanticEditRenameFixture {
+        executor: SemanticEditExecutorLanguage::Zig,
+        alias: "zig",
+        source: "// widget_count comment\npub fn widget_count() u32 {\n    const label = \"widget_count\";\n    _ = label;\n    return 3;\n}\npub fn caller() u32 { return widget_count(); }\n",
+        symbol: "widget_count",
+        new_name: "gadget_count",
+        expected_replacements: 2,
+        renamed: &["pub fn gadget_count()", "return gadget_count();"],
+        untouched: &["// widget_count comment", "\"widget_count\""],
+    },
+    SemanticEditRenameFixture {
+        executor: SemanticEditExecutorLanguage::GdScript,
+        alias: "gdscript",
+        source: "# widget_count comment\nfunc widget_count():\n\tvar label = \"widget_count\"\n\treturn label\n\nfunc caller():\n\treturn widget_count()\n",
+        symbol: "widget_count",
+        new_name: "gadget_count",
+        expected_replacements: 2,
+        renamed: &["func gadget_count():", "return gadget_count()"],
+        untouched: &["# widget_count comment", "\"widget_count\""],
+    },
+];
+
 fn semantic_edit_language_contract_for_extension(
     ext: &str,
 ) -> Option<&'static SemanticEditLanguageContract> {
@@ -1978,6 +2170,26 @@ impl SemanticEditExecutorLanguage {
         self.contract().formatter
     }
 
+    /// The set of files whose symbols can genuinely reference this one's.
+    ///
+    /// `callers_of` and `symbol_info` match by *name*, not by resolved binding,
+    /// so a rename has to be told which languages could actually be referring
+    /// to the same symbol. The JS-like executors are one family because they do
+    /// call each other; every language in the indexed and structural tiers is
+    /// its own family, because a Bash `deploy` and a Zig `deploy` sharing a name
+    /// is a coincidence, and renaming one must never rewrite the other.
+    fn rename_family(self) -> &'static str {
+        match self.contract().family {
+            SemanticEditLanguageFamily::JsLike => "js-like",
+            SemanticEditLanguageFamily::Rust => "rust",
+            SemanticEditLanguageFamily::Python => "python",
+            SemanticEditLanguageFamily::Markdown => "markdown",
+            SemanticEditLanguageFamily::Indexed | SemanticEditLanguageFamily::Structural => {
+                self.contract().id
+            }
+        }
+    }
+
     fn is_script(self) -> bool {
         matches!(
             self.contract().family,
@@ -1987,6 +2199,10 @@ impl SemanticEditExecutorLanguage {
 
     fn is_markdown(self) -> bool {
         self.contract().family == SemanticEditLanguageFamily::Markdown
+    }
+
+    fn is_indexed_generic(self) -> bool {
+        self.contract().family == SemanticEditLanguageFamily::Indexed
     }
 
     fn is_python(self) -> bool {
@@ -2106,6 +2322,46 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             "markdown",
             SEMANTIC_EDIT_MARKDOWN_KINDS,
             SEMANTIC_EDIT_MARKDOWN_APPLY_KINDS,
+            SemanticEditFormatterContract::None,
+        ),
+        // The indexed tier is listed by hand rather than driven from the
+        // fixtures, because the two halves differ in exactly the way that
+        // matters: zig and gdscript have no ast-grep grammar in this build and
+        // so must *not* advertise `structural_rewrite`.
+        (
+            "kotlin",
+            "src/Main.kt",
+            SemanticEditExecutorLanguage::Kotlin,
+            "kotlin",
+            SEMANTIC_EDIT_INDEXED_KINDS,
+            SEMANTIC_EDIT_INDEXED_KINDS,
+            SemanticEditFormatterContract::None,
+        ),
+        (
+            "bash",
+            "scripts/deploy.sh",
+            SemanticEditExecutorLanguage::Bash,
+            "bash",
+            SEMANTIC_EDIT_INDEXED_KINDS,
+            SEMANTIC_EDIT_INDEXED_KINDS,
+            SemanticEditFormatterContract::None,
+        ),
+        (
+            "zig",
+            "src/main.zig",
+            SemanticEditExecutorLanguage::Zig,
+            "zig",
+            SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS,
+            SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS,
+            SemanticEditFormatterContract::None,
+        ),
+        (
+            "gdscript",
+            "player.gd",
+            SemanticEditExecutorLanguage::GdScript,
+            "gdscript",
+            SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS,
+            SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS,
             SemanticEditFormatterContract::None,
         ),
     ];
@@ -2323,6 +2579,60 @@ fn replace_script_identifier(
         rename_identifier_occurrences(content, old, new, lang, executor.name())?;
     parse_semantic_edit_source(&out, executor, "rename_symbol")?;
     Ok((out, replacements))
+}
+
+/// Rename in an indexed language that has no per-kind executor of its own.
+///
+/// The rewriting is the same AST splice every other family now uses; what is
+/// language-specific here is only the shape of a legal name. Bash is the one
+/// that differs: a function name is a `word`, and words admit `-` and `.`,
+/// which are ordinary in shell function names and illegal everywhere else.
+fn replace_indexed_identifier(
+    content: &str,
+    old: &str,
+    new: &str,
+    executor: SemanticEditExecutorLanguage,
+) -> Result<(String, usize)> {
+    validate_indexed_identifier(old, "symbol", executor)?;
+    validate_indexed_identifier(new, "new_name", executor)?;
+    if old == new {
+        bail!("old and new identifiers are identical");
+    }
+    parse_semantic_edit_source(content, executor, "rename_symbol input")?;
+    let Some(lang) = executor.contract().graph_lang else {
+        bail!(
+            "rename_symbol needs an indexed grammar; the {} executor has none",
+            executor.name()
+        );
+    };
+    let (out, replacements) =
+        rename_identifier_occurrences(content, old, new, lang, executor.name())?;
+    parse_semantic_edit_source(&out, executor, "rename_symbol")?;
+    Ok((out, replacements))
+}
+
+fn validate_indexed_identifier(
+    name: &str,
+    field: &str,
+    executor: SemanticEditExecutorLanguage,
+) -> Result<()> {
+    let shell = executor == SemanticEditExecutorLanguage::Bash;
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        bail!("{field} must not be empty");
+    };
+    // A leading `-` would let `--flag` be offered as a symbol; the first
+    // character stays strict for every language.
+    let rest_ok = |ch: char| {
+        ch == '_' || ch.is_ascii_alphanumeric() || (shell && matches!(ch, '-' | '.'))
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) || !chars.all(rest_ok) {
+        bail!(
+            "{field} {name:?} is not a supported {} identifier",
+            executor.name()
+        );
+    }
+    Ok(())
 }
 
 fn normalize_script_import(
@@ -4121,6 +4431,23 @@ fn preview_semantic_edit_content(
     }
     if executor.is_markdown() {
         return preview_markdown_edit_content(content, kind, intent, target_symbol);
+    }
+    if executor.is_indexed_generic() {
+        return match kind {
+            "rename_symbol" => replace_indexed_identifier(
+                content,
+                target_symbol_name(target_symbol, kind)?,
+                intent
+                    .new_name
+                    .as_deref()
+                    .context("rename_symbol requires new_name")?,
+                executor,
+            ),
+            _ => bail!(
+                "semantic edit kind {kind:?} is not supported by the {} executor yet",
+                executor.name()
+            ),
+        };
     }
     if executor.is_script() {
         return match kind {
@@ -6236,6 +6563,25 @@ mod structural_rewrite_tests {
         }
     }
 
+    fn rename_intent(new_name: &str) -> SemanticEditIntent {
+        SemanticEditIntent {
+            new_name: Some(new_name.to_string()),
+            ..intent("rename_symbol", None, None)
+        }
+    }
+
+    fn semantic_edit_symbol_target(name: &str) -> SemanticEditSymbolTarget {
+        SemanticEditSymbolTarget {
+            name: name.to_string(),
+            kind: "function".to_string(),
+            language: String::new(),
+            file: String::new(),
+            line: 1,
+            end_line: None,
+            span: None,
+        }
+    }
+
     #[test]
     fn rewrites_every_match_not_just_the_first() {
         let (out, replacements) = preview_structural_rewrite(
@@ -6319,13 +6665,18 @@ mod structural_rewrite_tests {
         // never exercised; without the second, a fixture can outlive the
         // executor it claims to cover.
         for contract in SEMANTIC_EDIT_LANGUAGE_CONTRACTS {
+            let expected = usize::from(
+                contract
+                    .recognized_intents
+                    .contains(&"structural_rewrite"),
+            );
             let rows = SEMANTIC_EDIT_EXECUTOR_FIXTURES
                 .iter()
                 .filter(|fixture| fixture.executor == contract.executor)
                 .count();
             assert_eq!(
-                rows, 1,
-                "executor {} has {rows} conformance fixtures, expected exactly 1",
+                rows, expected,
+                "executor {} has {rows} structural fixtures, expected exactly {expected}",
                 contract.id
             );
         }
@@ -6344,6 +6695,246 @@ mod structural_rewrite_tests {
             "the executor conformance table has collapsed to {} rows",
             SEMANTIC_EDIT_EXECUTOR_FIXTURES.len()
         );
+    }
+
+    #[test]
+    fn every_renamable_executor_has_exactly_one_rename_fixture() {
+        // The same both-directions guard as the structural table, keyed on the
+        // contract rather than on a hand-kept list: a `Lang` brought into the
+        // renamable tier with no rename row fails here, which is the only thing
+        // standing between "registered as renamable" and "proven to rename the
+        // right positions".
+        for contract in SEMANTIC_EDIT_LANGUAGE_CONTRACTS {
+            let expected = usize::from(contract.recognized_intents.contains(&"rename_symbol"));
+            let rows = SEMANTIC_EDIT_RENAME_FIXTURES
+                .iter()
+                .filter(|fixture| fixture.executor == contract.executor)
+                .count();
+            assert_eq!(
+                rows, expected,
+                "executor {} has {rows} rename fixtures, expected exactly {expected}",
+                contract.id
+            );
+        }
+        for fixture in SEMANTIC_EDIT_RENAME_FIXTURES {
+            assert!(
+                fixture
+                    .executor
+                    .recognized_intents()
+                    .contains(&"rename_symbol"),
+                "rename fixture {} covers an executor that does not recognize rename_symbol",
+                fixture.alias
+            );
+        }
+        // Every indexed language except Markdown, which renames headings
+        // instead. A collapsed table would satisfy both loops vacuously.
+        assert_eq!(
+            SEMANTIC_EDIT_RENAME_FIXTURES.len(),
+            10,
+            "the rename conformance table has {} rows",
+            SEMANTIC_EDIT_RENAME_FIXTURES.len()
+        );
+    }
+
+    #[test]
+    fn every_renamable_executor_renames_names_and_leaves_prose_and_data_alone() {
+        // The compared count is the sum of what the *planner* returned, not a
+        // loop counter, and each row asserts its untouched positions
+        // individually: a runner that counted replacements would report green
+        // while renaming a comment or a string literal.
+        let mut applied = 0usize;
+        let mut declared = 0usize;
+        for fixture in SEMANTIC_EDIT_RENAME_FIXTURES {
+            assert!(
+                fixture.expected_replacements > 0,
+                "rename fixture {} expects no rename, which proves nothing",
+                fixture.alias
+            );
+            assert!(
+                !fixture.untouched.is_empty(),
+                "rename fixture {} declares nothing that must survive",
+                fixture.alias
+            );
+            declared += fixture.expected_replacements;
+            let path = std::path::PathBuf::from(format!(
+                "fixture{}",
+                fixture.executor.contract().temp_suffix
+            ));
+            let target = semantic_edit_symbol_target(fixture.symbol);
+            let (out, replacements) = preview_semantic_edit_content(
+                fixture.source,
+                &path,
+                fixture.executor.contract().id,
+                "rename_symbol",
+                &rename_intent(fixture.new_name),
+                Some(&target),
+                SemanticEditCallRefContext {
+                    refs: &[],
+                    cross_file_total: 0,
+                },
+            )
+            .unwrap_or_else(|err| panic!("{} rename_symbol failed: {err:#}", fixture.alias));
+            assert_eq!(
+                replacements, fixture.expected_replacements,
+                "{}: renamed {replacements} occurrence(s), expected {}",
+                fixture.alias, fixture.expected_replacements
+            );
+            for renamed in fixture.renamed {
+                assert!(
+                    out.contains(renamed),
+                    "{}: expected {renamed:?} after the rename:\n{out}",
+                    fixture.alias
+                );
+            }
+            for untouched in fixture.untouched {
+                assert!(
+                    out.contains(untouched),
+                    "{}: rename rewrote {untouched:?}, which is prose or data:\n{out}",
+                    fixture.alias
+                );
+            }
+            applied += replacements;
+        }
+        assert_eq!(
+            applied, declared,
+            "the planner renamed {applied} occurrences but the table declares {declared}"
+        );
+    }
+
+    #[test]
+    fn every_renamable_executor_refuses_a_name_it_cannot_find() {
+        // A rename that quietly plans an empty edit is the failure mode that
+        // survives review, so the refusal belongs to every executor's contract.
+        for fixture in SEMANTIC_EDIT_RENAME_FIXTURES {
+            let path = std::path::PathBuf::from(format!(
+                "fixture{}",
+                fixture.executor.contract().temp_suffix
+            ));
+            let target = semantic_edit_symbol_target("zzNoSuchSymbolzz");
+            let err = preview_semantic_edit_content(
+                fixture.source,
+                &path,
+                fixture.executor.contract().id,
+                "rename_symbol",
+                &rename_intent("qqReplacementqq"),
+                Some(&target),
+                SemanticEditCallRefContext {
+                    refs: &[],
+                    cross_file_total: 0,
+                },
+            )
+            .unwrap_err();
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("was not found as a whole"),
+                "{}: expected a refusal, got {message}",
+                fixture.alias
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_executors_refuse_the_kinds_they_have_no_rewriting_for() {
+        // The family split routes anything that is neither markdown, script,
+        // nor indexed-generic to the Rust implementations. `rename_symbol` is
+        // the only symbol-resolved kind this tier implements; the rest must be
+        // refused by name rather than reach Rust's rewriting rules.
+        for contract in SEMANTIC_EDIT_LANGUAGE_CONTRACTS {
+            if contract.family != SemanticEditLanguageFamily::Indexed {
+                continue;
+            }
+            let fixture = SEMANTIC_EDIT_RENAME_FIXTURES
+                .iter()
+                .find(|fixture| fixture.executor == contract.executor)
+                .expect("checked by the rename fixture exhaustiveness guard");
+            let path = std::path::PathBuf::from(format!("fixture{}", contract.temp_suffix));
+            for kind in ["replace_function_body", "insert_import", "add_method"] {
+                let err = preview_semantic_edit_content(
+                    fixture.source,
+                    &path,
+                    contract.id,
+                    kind,
+                    &intent("structural_rewrite", None, Some("whatever")),
+                    None,
+                    SemanticEditCallRefContext {
+                        refs: &[],
+                        cross_file_total: 0,
+                    },
+                )
+                .unwrap_err();
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains(contract.name) && message.contains("not supported"),
+                    "executor {} should refuse {kind} by name, got {message}",
+                    contract.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_indexed_executor_without_an_ast_grep_grammar_refuses_structural_rewrite() {
+        // Zig and GDScript are renamable because renaming needs a grammar and
+        // an index, which they have. They are *not* structurally matchable,
+        // because this build compiles no ast-grep grammar for them. Advertising
+        // `structural_rewrite` there would plan an edit that can only fail.
+        for contract in SEMANTIC_EDIT_LANGUAGE_CONTRACTS {
+            if contract.executor.ast_grep_lang().is_some() {
+                continue;
+            }
+            assert_eq!(
+                contract.recognized_intents, SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS,
+                "executor {} has no ast-grep grammar but advertises {:?}",
+                contract.id, contract.recognized_intents
+            );
+            let path = std::path::PathBuf::from(format!("fixture{}", contract.temp_suffix));
+            let err = preview_semantic_edit_content(
+                "",
+                &path,
+                contract.id,
+                "structural_rewrite",
+                &intent("structural_rewrite", Some("foo($A)"), Some("bar($A)")),
+                None,
+                SemanticEditCallRefContext {
+                    refs: &[],
+                    cross_file_total: 0,
+                },
+            )
+            .unwrap_err();
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(contract.name) && message.contains("not supported"),
+                "executor {} should refuse structural_rewrite by name, got {message}",
+                contract.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_rename_family_covers_only_languages_that_can_reference_each_other() {
+        // Call edges are matched by name, so the rename scope is the only thing
+        // stopping a Zig `deploy` from blocking a rename of a Bash `deploy` —
+        // the same defect that once had a Python `beta` block a JavaScript one.
+        let family = |path: &str| {
+            semantic_edit_rename_family(std::path::Path::new(path))
+                .expect("fixture path resolves an executor")
+        };
+        assert_eq!(family("app.ts"), family("app.js"));
+        assert_eq!(family("App.tsx"), family("view.jsx"));
+        for (left, right) in [
+            ("deploy.sh", "main.zig"),
+            ("deploy.sh", "player.gd"),
+            ("main.zig", "player.gd"),
+            ("deploy.sh", "Main.kt"),
+            ("app.js", "script.py"),
+            ("main.zig", "lib.rs"),
+        ] {
+            assert_ne!(
+                family(left),
+                family(right),
+                "{left} and {right} share a rename family and cannot reference each other"
+            );
+        }
     }
 
     #[test]
@@ -6400,16 +6991,30 @@ mod structural_rewrite_tests {
         // another language's rules — which is worse, because it looks like it
         // worked.
         for contract in SEMANTIC_EDIT_LANGUAGE_CONTRACTS {
-            let fixture = SEMANTIC_EDIT_EXECUTOR_FIXTURES
+            // Structural fixture where there is one; otherwise the rename row,
+            // which is the only fixture an executor with no ast-grep grammar
+            // has. Every contract has at least one of the two — asserted here
+            // rather than in the exhaustiveness guards, which each see only
+            // their own table.
+            let source = SEMANTIC_EDIT_EXECUTOR_FIXTURES
                 .iter()
                 .find(|fixture| fixture.executor == contract.executor)
-                .expect("checked by the fixture exhaustiveness guard");
+                .map(|fixture| fixture.source)
+                .or_else(|| {
+                    SEMANTIC_EDIT_RENAME_FIXTURES
+                        .iter()
+                        .find(|fixture| fixture.executor == contract.executor)
+                        .map(|fixture| fixture.source)
+                })
+                .unwrap_or_else(|| {
+                    panic!("executor {} has no conformance fixture at all", contract.id)
+                });
             let language = contract.executor.reparse_language().unwrap_or_else(|err| {
                 panic!("executor {} has no reparse grammar: {err:#}", contract.id)
             });
             let mut parser = tree_sitter::Parser::new();
             parser.set_language(&language).unwrap();
-            let tree = parser.parse(fixture.source, None).unwrap();
+            let tree = parser.parse(source, None).unwrap();
             assert!(
                 !tree.root_node().has_error(),
                 "executor {} cannot parse its own fixture with its reparse grammar",
@@ -6422,17 +7027,21 @@ mod structural_rewrite_tests {
     fn an_indexed_executor_reparses_with_the_grammar_ast_grep_matched_with() {
         // `reparse_language` prefers the `tsift-graph` binding, but a
         // structural rewrite is *matched* with the ast-grep grammar. Those two
-        // agree today for all nine indexed executors — even Kotlin, where
-        // ast-grep's `tree-sitter-kotlin` feature resolves to the same
+        // agree today for every indexed executor that has both — even Kotlin,
+        // where ast-grep's `tree-sitter-kotlin` feature resolves to the same
         // `-ng` grammar tsift-graph uses. That agreement is load-bearing and
         // invisible: if a grammar bump ever splits them, the planner would
         // validate its output against a grammar the matcher never used and the
         // indexer will not use either. This fails at that moment rather than
-        // silently accepting the mismatch.
+        // silently accepting the mismatch. Zig and GDScript are skipped because
+        // they have no second grammar to disagree with.
         for contract in SEMANTIC_EDIT_LANGUAGE_CONTRACTS {
             let Some(graph_lang) = contract.graph_lang else {
                 continue;
             };
+            if !contract.recognized_intents.contains(&"structural_rewrite") {
+                continue;
+            }
             let indexed = graph_lang.tree_sitter_language();
             let matched = contract
                 .executor
@@ -6532,11 +7141,17 @@ mod structural_rewrite_tests {
 
     #[test]
     fn every_executor_language_resolves_an_ast_grep_grammar() {
-        // structural_rewrite is advertised as apply-supported by every executor
-        // contract, so every executor must actually have a grammar. A new
-        // executor language whose id ast-grep cannot resolve would otherwise
-        // only fail at plan time, in the field.
+        // An executor that advertises structural_rewrite must actually have a
+        // grammar. A new executor language whose id ast-grep cannot resolve
+        // would otherwise only fail at plan time, in the field. The converse —
+        // a grammar-less executor that advertises it anyway — is caught by
+        // `an_indexed_executor_without_an_ast_grep_grammar_refuses_structural_rewrite`.
+        let mut with_grammar = 0usize;
         for contract in SEMANTIC_EDIT_LANGUAGE_CONTRACTS {
+            if !contract.recognized_intents.contains(&"structural_rewrite") {
+                continue;
+            }
+            with_grammar += 1;
             assert!(
                 contract.executor.ast_grep_lang().is_some(),
                 "executor {} advertises structural_rewrite but has no ast-grep grammar",
@@ -6550,6 +7165,10 @@ mod structural_rewrite_tests {
                 contract.id
             );
         }
+        assert!(
+            with_grammar >= 20,
+            "only {with_grammar} executors advertise structural_rewrite"
+        );
     }
 
     #[test]

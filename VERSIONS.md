@@ -8,6 +8,56 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **`rename_symbol` is open to every indexed language.** Kotlin, Bash, Zig, and
+  GDScript can now be renamed. They could not before for no reason other than
+  the implementation: each family hand-rolled its own substring scan, so a
+  language without one was refused even though it was fully indexed.
+
+  Once occurrences come out of the grammar and extent comes out of the call
+  graph, the language is a parameter. Registration is a per-language
+  identifier-node-kind set plus a conformance fixture row — no new rewriting
+  code — and cross-file renames work for these languages with nothing
+  language-specific behind them.
+
+  Two things this exposed, neither of them cosmetic:
+
+  **Bash needed a position rule, not just a kind rule.** A bare `word` is the
+  function name, the command name, *and* every unquoted argument, so
+  `echo deploy` would have had a rename rewrite an argument that is data — the
+  same class of bug as renaming inside a string literal, arriving through a
+  different door. `word` occurrences are restricted to the declaration and
+  command-name positions.
+
+  **Rename scope is keyed per language, not per tier.** Name-matched call edges
+  meant a single "structural" family would have had a Zig `deploy` block a
+  rename of a Bash `deploy` — the defect that once had a Python `beta` block a
+  JavaScript one, reintroduced through the grouping. Each language in the
+  indexed and structural tiers is its own rename family; only the JS-like
+  executors share one, because they genuinely call each other.
+
+  Zig and GDScript recognize `rename_symbol` and **not** `structural_rewrite`:
+  this build compiles no ast-grep grammar for them, and advertising a kind that
+  can only fail at match time is worse than refusing it at registration. That
+  makes them the first executors that recognize one kind and refuse another, so
+  the executor-level refusal guard is now exercised end to end rather than in
+  unit tests alone.
+
+  Conformance is two exhaustive tables rather than one: a structural fixture per
+  executor that recognizes `structural_rewrite`, and a rename fixture per
+  executor that recognizes `rename_symbol`. A `Lang` brought into the renamable
+  tier with no rename row fails the suite. Rename rows declare the positions
+  that must change **and** the positions that must survive byte for byte, each
+  asserted individually — a row that only counted replacements would pass while
+  renaming a comment or a string literal.
+
+  Correction to the plan for this phase: it expected the *structural-only*
+  `rename_symbol` refusal to become reachable end to end here. It does not.
+  Making every indexed language renamable leaves the structural-only tier
+  defined by having no `tsift-graph` binding at all, so the index layer answers
+  `no indexed symbol matched` before any executor is consulted. That is now
+  pinned by a test, so a later change that moves the refusal is noticed rather
+  than read as a regression.
+
 - **`rename_symbol` renames through the grammar, and across files.** Two
   correctness defects, both reproduced before the fix and covered by tests
   after it.

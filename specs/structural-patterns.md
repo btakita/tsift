@@ -84,11 +84,13 @@ ungraphable. The distinction to hold onto is that indexing buys *navigation*,
 not *rewriting*.
 
 Promoting a structural-only language therefore means adding the graph/search
-side, which unlocks the symbol-resolved kinds (`rename_symbol`,
-`replace_function_body`, `insert_import`) once their per-language rewriting
-exists. Until then those kinds are refused by name, and for an unindexed
-language they are unreachable regardless, since nothing resolves a symbol to
-target.
+side. That unlocks `rename_symbol` immediately — it reads occurrences out of the
+grammar and extent out of the call graph, so it needs an index rather than
+per-language rewriting, and registration is an identifier-node-kind set plus a
+fixture row. The remaining symbol-resolved kinds (`replace_function_body`,
+`insert_import`, `add_method`) stay refused by name until their per-language
+rewriting exists, and for an unindexed language they are unreachable regardless,
+since nothing resolves a symbol to target.
 
 Resolution failure is asymmetric by design:
 
