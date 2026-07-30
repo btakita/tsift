@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{Read as _, Write as _};
@@ -146,6 +146,10 @@ pub(crate) struct SemanticEditIntentPlan {
     /// invites reading it as the extent of the change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) edited_range: Option<SourceRangePreview>,
+    /// Other files this rename rewrites, so the report names the full extent
+    /// rather than only the declaring file.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) rename_caller_files: Vec<String>,
     pub(crate) content_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) diff: Option<String>,
@@ -326,6 +330,8 @@ pub(crate) struct SemanticEditIntentDraft {
     pub(crate) file_abs: PathBuf,
     pub(crate) destination_file_abs: Option<PathBuf>,
     pub(crate) language: String,
+    /// Other files a `rename_symbol` must rewrite for the tree to still build.
+    pub(crate) rename_caller_files: Vec<PathBuf>,
 }
 
 struct SemanticEditResolvedHandleTarget {
@@ -670,6 +676,166 @@ fn resolve_semantic_edit_call_refs(
             .then(left.caller.cmp(&right.caller))
     });
     Ok((refs, cross_file))
+}
+
+/// The executor family a file renames within. `None` means the file has no
+/// registered executor, which cannot match any target and so is excluded.
+fn semantic_edit_rename_family(file_abs: &Path) -> Option<SemanticEditLanguageFamily> {
+    let language = semantic_edit_language_for_file(file_abs);
+    semantic_edit_executor_language(&language, file_abs).map(|executor| executor.contract().family)
+}
+
+/// Which files a rename has to touch, and whether it is safe to touch them.
+pub(crate) struct SemanticEditRenameScope {
+    /// Files other than the declaring file that reference the symbol.
+    pub(crate) caller_files: Vec<PathBuf>,
+    /// Files holding a second definition of the same name, in the same family.
+    pub(crate) ambiguous_definition_files: Vec<String>,
+}
+
+impl SemanticEditRenameScope {
+    /// A competing definition only makes a rename unsafe when there is a
+    /// cross-file reference to *attribute*. With no cross-file callers the
+    /// rename never leaves the declaring file, so another module defining the
+    /// same name is irrelevant — two independent modules each with their own
+    /// `beta` is ordinary, not ambiguous. Refusing there would block the common
+    /// case to guard one that cannot occur.
+    fn is_ambiguous(&self) -> bool {
+        !self.caller_files.is_empty() && !self.ambiguous_definition_files.is_empty()
+    }
+}
+
+/// Resolve the cross-file extent of a rename from the indexed call graph.
+///
+/// A rename used to edit one file and report success, leaving every caller in
+/// every other file referring to a name that no longer exists — a tree that
+/// does not compile, reported as `conflicts=0`. The index already knows which
+/// files call the symbol; this reads that out so the rename can either cover
+/// them or decline.
+///
+/// The ambiguity check is the reason this cannot just rename every file that
+/// mentions the name. Two definitions sharing a name (a method on an unrelated
+/// type, say) make each reference unattributable from call edges alone, and a
+/// rename that silently renames the wrong one is worse than a rename that
+/// refuses.
+fn resolve_semantic_edit_rename_scope(
+    root: &Path,
+    scope: Option<&str>,
+    symbol: &str,
+    target_file_abs: &Path,
+) -> Result<SemanticEditRenameScope> {
+    let db_path = resolve_query_db_path(root, target_file_abs, scope)?;
+    if !db_path.exists() {
+        bail!(
+            "index refs unavailable: no index found at {}",
+            db_path.display()
+        );
+    }
+    let db = index::IndexDb::open_read_only_resilient(&db_path)
+        .with_context(|| format!("opening symbol index {}", db_path.display()))?;
+
+    // Both lookups below are by name, and a name is not unique across
+    // languages: a Python `beta` and a JavaScript `beta` are unrelated symbols
+    // that no rename of one can affect. Scope everything to the target's
+    // executor family, which keeps `.ts`/`.tsx`/`.js`/`.jsx` together (they do
+    // call each other) while separating languages that cannot.
+    let target_family = semantic_edit_rename_family(target_file_abs);
+    let same_family = |file_abs: &Path| semantic_edit_rename_family(file_abs) == target_family;
+
+    let mut definition_files = BTreeSet::new();
+    let mut ambiguous_definition_files = Vec::new();
+    for definition in db
+        .symbol_info(symbol)
+        .with_context(|| format!("loading indexed definitions for {symbol:?}"))?
+    {
+        let definition_abs = resolve_source_file(root, Path::new(&definition.file))
+            .unwrap_or_else(|_| PathBuf::from(&definition.file));
+        if definition_abs != target_file_abs && same_family(&definition_abs) {
+            ambiguous_definition_files.push(semantic_edit_file_display(root, &definition_abs));
+            definition_files.insert(definition_abs);
+        }
+    }
+    ambiguous_definition_files.sort();
+    ambiguous_definition_files.dedup();
+
+    let mut caller_files = Vec::new();
+    for edge in db
+        .callers_of(symbol)
+        .with_context(|| format!("loading indexed call refs for {symbol:?}"))?
+    {
+        let caller_file_abs = resolve_source_file(root, Path::new(&edge.caller_file))
+            .with_context(|| format!("resolving indexed caller file {}", edge.caller_file))?;
+        if caller_file_abs == target_file_abs || !same_family(&caller_file_abs) {
+            continue;
+        }
+        // Call edges are matched by name, not by resolved binding, so a file
+        // that defines its own function of the same name looks like a caller of
+        // ours. Its own definition shadows any import, so it is calling itself.
+        // Renaming there would rewrite an unrelated function.
+        if definition_files.contains(&caller_file_abs) {
+            continue;
+        }
+        caller_files.push(caller_file_abs);
+    }
+    caller_files.sort();
+    caller_files.dedup();
+
+    Ok(SemanticEditRenameScope {
+        caller_files,
+        ambiguous_definition_files,
+    })
+}
+
+pub(crate) struct SemanticEditRenameFilePreview {
+    pub(crate) file_abs: PathBuf,
+    pub(crate) language: String,
+    pub(crate) before: String,
+    pub(crate) after: String,
+}
+
+/// Rename the symbol in every referencing file, so the patch proposal, the
+/// diff preview, and `--verify` all see the whole change rather than the
+/// declaring file alone.
+fn semantic_edit_rename_patch_inputs(
+    _root: &Path,
+    rename_scope: Option<&(String, SemanticEditRenameScope)>,
+    new_name: Option<&str>,
+) -> Result<Vec<SemanticEditRenameFilePreview>> {
+    let Some((symbol, scope)) = rename_scope else {
+        return Ok(Vec::new());
+    };
+    let Some(new_name) = new_name else {
+        return Ok(Vec::new());
+    };
+    let mut previews = Vec::new();
+    for file_abs in &scope.caller_files {
+        let language = semantic_edit_language_for_file(file_abs);
+        let Some(executor) = semantic_edit_executor_language(&language, file_abs) else {
+            continue;
+        };
+        let before = fs::read_to_string(file_abs)
+            .with_context(|| format!("reading rename caller file {}", file_abs.display()))?;
+        let Some(lang) = executor.contract().graph_lang else {
+            continue;
+        };
+        // A caller file that no longer mentions the symbol is not an error: the
+        // index can lag a deletion. It simply contributes no patch.
+        let Ok((after, replacements)) =
+            rename_identifier_occurrences(&before, symbol, new_name, lang, executor.name())
+        else {
+            continue;
+        };
+        if replacements == 0 {
+            continue;
+        }
+        previews.push(SemanticEditRenameFilePreview {
+            file_abs: file_abs.clone(),
+            language,
+            before,
+            after,
+        });
+    }
+    Ok(previews)
 }
 
 fn semantic_edit_handle_family(handle: &str) -> Option<(&'static str, &'static str)> {
@@ -4472,6 +4638,20 @@ fn plan_semantic_edit_intent(
     } else {
         (Vec::new(), 0)
     };
+
+    // A rename's blast radius is every file that references the symbol, not the
+    // file the declaration happens to live in.
+    let rename_scope = if kind == "rename_symbol" {
+        match target_symbol.as_ref() {
+            Some(symbol) => resolve_semantic_edit_rename_scope(root, scope, &symbol.name, &file_abs)
+                .ok()
+                .map(|scope| (symbol.name.clone(), scope)),
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let conflict = intent
         .expected_content_hash
         .as_deref()
@@ -4588,29 +4768,58 @@ fn plan_semantic_edit_intent(
                         ),
                     }
                 } else {
-                    match preview_semantic_edit_content(
-                        &source_text,
-                        &file_abs,
-                        &language,
-                        &kind,
-                        intent,
-                        target_symbol.as_ref(),
-                        SemanticEditCallRefContext {
-                            refs: &call_refs,
-                            cross_file_total: cross_file_call_ref_total,
-                        },
-                    ) {
-                        Ok((preview, _)) => match semantic_edit_patch_proposal(
+                    match rename_scope
+                        .as_ref()
+                        .filter(|(_, scope)| scope.is_ambiguous())
+                        .map(|(name, scope)| {
+                            anyhow::anyhow!(
+                                "rename_symbol refuses {name:?}: it is referenced from {}, and the index holds another definition of that name in {}; a call edge cannot say which definition those references belong to",
+                                scope
+                                    .caller_files
+                                    .iter()
+                                    .map(|file| semantic_edit_file_display(root, file))
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                scope.ambiguous_definition_files.join(", ")
+                            )
+                        })
+                        .map_or_else(
+                            || {
+                                preview_semantic_edit_content(
+                                    &source_text,
+                                    &file_abs,
+                                    &language,
+                                    &kind,
+                                    intent,
+                                    target_symbol.as_ref(),
+                                    SemanticEditCallRefContext {
+                                        refs: &call_refs,
+                                        cross_file_total: cross_file_call_ref_total,
+                                    },
+                                )
+                            },
+                            Err,
+                        ) {
+                        Ok((preview, _)) => match semantic_edit_rename_patch_inputs(
                             root,
-                            &kind,
-                            &[SemanticEditPatchFileInput {
+                            rename_scope.as_ref(),
+                            intent.new_name.as_deref(),
+                        )
+                        .and_then(|extra| {
+                            let mut inputs = vec![SemanticEditPatchFileInput {
                                 file_abs: &file_abs,
                                 language: &language,
                                 before: &source_text,
                                 after: &preview,
-                            }],
-                            budget,
-                        ) {
+                            }];
+                            inputs.extend(extra.iter().map(|file| SemanticEditPatchFileInput {
+                                file_abs: &file.file_abs,
+                                language: &file.language,
+                                before: &file.before,
+                                after: &file.after,
+                            }));
+                            semantic_edit_patch_proposal(root, &kind, &inputs, budget)
+                        }) {
                             Ok(patch_proposal) => (
                                 "planned".to_string(),
                                 true,
@@ -4674,6 +4883,16 @@ fn plan_semantic_edit_intent(
             // Filled in on the apply path, where both revisions of the file
             // exist; a planned-but-not-applied intent has no edited range yet.
             edited_range: None,
+            rename_caller_files: rename_scope
+                .as_ref()
+                .map(|(_, scope)| {
+                    scope
+                        .caller_files
+                        .iter()
+                        .map(|file| semantic_edit_file_display(root, file))
+                        .collect()
+                })
+                .unwrap_or_default(),
             content_hash,
             diff,
             patch_proposal,
@@ -4683,6 +4902,9 @@ fn plan_semantic_edit_intent(
         file_abs,
         destination_file_abs,
         language,
+        rename_caller_files: rename_scope
+            .map(|(_, scope)| scope.caller_files)
+            .unwrap_or_default(),
     })
 }
 
@@ -4791,6 +5013,58 @@ fn apply_semantic_edit_drafts(
                 budget.preview_bytes(),
             );
             continue;
+        }
+
+        // A rename that stops at the declaring file leaves every caller
+        // referring to a name that no longer exists. These buffers are written
+        // together at the end of the loop, so the whole rename lands or none of
+        // it does.
+        if draft.plan.kind == "rename_symbol" && !draft.rename_caller_files.is_empty() {
+            let symbol = draft
+                .plan
+                .target_symbol
+                .as_ref()
+                .map(|symbol| symbol.name.clone())
+                .context("rename_symbol requires a resolved target symbol")?;
+            let new_name = intents[idx]
+                .new_name
+                .clone()
+                .context("rename_symbol requires new_name")?;
+            for caller_file_abs in draft.rename_caller_files.clone() {
+                let caller_language = semantic_edit_language_for_file(&caller_file_abs);
+                let Some(executor) =
+                    semantic_edit_executor_language(&caller_language, &caller_file_abs)
+                else {
+                    continue;
+                };
+                let Some(lang) = executor.contract().graph_lang else {
+                    continue;
+                };
+                ensure_semantic_edit_file_buffer(
+                    &mut files,
+                    &caller_file_abs,
+                    caller_language.clone(),
+                )?;
+                let current = files
+                    .get(&caller_file_abs)
+                    .map(|buffer| buffer.current.clone())
+                    .context("missing caller buffer for rename_symbol")?;
+                // An indexed caller that no longer mentions the symbol is stale
+                // index state, not a failure: it contributes no edit.
+                let Ok((updated, replacements)) = rename_identifier_occurrences(
+                    &current,
+                    &symbol,
+                    &new_name,
+                    lang,
+                    executor.name(),
+                ) else {
+                    continue;
+                };
+                if let Some(buffer) = files.get_mut(&caller_file_abs) {
+                    buffer.current = updated;
+                    buffer.intents += replacements.max(1);
+                }
+            }
         }
 
         let file_abs = draft.file_abs.clone();
@@ -5350,6 +5624,12 @@ pub(crate) fn cmd_edit_intents(
             if let Some(range) = &plan.edited_range {
                 println!("    edited range: {}-{}", range.start, range.end);
             }
+            if !plan.rename_caller_files.is_empty() {
+                println!(
+                    "    also renamed in: {}",
+                    plan.rename_caller_files.join(", ")
+                );
+            }
             if let Some(formatter) = &plan.formatter {
                 println!("    formatter: {formatter}");
             }
@@ -5707,6 +5987,230 @@ pub fn describe() -> String {
     #[test]
     fn changed_line_range_is_none_when_nothing_changed() {
         assert!(changed_line_range(RUST_SRC, RUST_SRC, 8).is_none());
+    }
+
+    fn rename_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        for (name, body) in files {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+        }
+        let db = index::IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+        dir
+    }
+
+    fn run_rename(dir: &std::path::Path, intents: &str) -> Result<()> {
+        let intent_file = dir.join("intents.json");
+        std::fs::write(&intent_file, intents).unwrap();
+        cmd_edit_intents(
+            dir,
+            None,
+            Some(intent_file),
+            true,
+            SemanticEditVerifyOptions {
+                enabled: false,
+                command: None,
+            },
+            OutputFormat {
+                json_output: true,
+                compact: false,
+                pretty: false,
+                terse: false,
+                ultra_terse: false,
+                schema: false,
+                envelope: false,
+            },
+            ResponseBudget::default(),
+        )
+    }
+
+    /// The defect this phase exists for: a rename edited the declaring file,
+    /// reported `conflicts=0`, and left every caller in every other file
+    /// referring to a name that no longer exists.
+    #[test]
+    fn rename_reaches_callers_in_other_files() {
+        let dir = rename_fixture(&[
+            (
+                "src/lib.rs",
+                "pub mod caller;\npub fn widget_count() -> usize { 3 }\n",
+            ),
+            (
+                "src/caller.rs",
+                "use crate::widget_count;\npub fn total() -> usize { widget_count() + 1 }\n",
+            ),
+        ]);
+        run_rename(
+            dir.path(),
+            r#"{"intents":[{"kind":"rename_symbol","symbol":"widget_count","new_name":"gadget_count"}]}"#,
+        )
+        .expect("cross-file rename should apply");
+
+        let lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+        let caller = std::fs::read_to_string(dir.path().join("src/caller.rs")).unwrap();
+        assert!(lib.contains("gadget_count"), "declaration not renamed: {lib}");
+        assert!(
+            !caller.contains("widget_count"),
+            "caller still refers to the old name, so the tree does not build: {caller}"
+        );
+        assert!(
+            caller.contains("use crate::gadget_count;"),
+            "import not renamed: {caller}"
+        );
+        assert!(
+            caller.contains("gadget_count()"),
+            "call site not renamed: {caller}"
+        );
+    }
+
+    /// Both lookups behind a cross-file rename are by name, and a name is not
+    /// unique across languages. Scoping them to the file alone made a Python
+    /// `beta` block renaming a JavaScript `beta` — and would have let the
+    /// rename rewrite the unrelated Python file. Caught by the existing
+    /// `edit_intents_apply_mutates_javascript_executor_intents` suite.
+    #[test]
+    fn a_same_named_symbol_in_another_language_is_neither_ambiguous_nor_renamed() {
+        let python_before = "def beta():\n    return 1\n";
+        let dir = rename_fixture(&[
+            ("src/mod.js", "export function beta() { return 1; }\n"),
+            (
+                "src/use.js",
+                "import { beta } from './mod.js';\nexport function total() { return beta() + 1; }\n",
+            ),
+            ("src/script.py", python_before),
+        ]);
+        run_rename(
+            dir.path(),
+            r#"{"intents":[{"kind":"rename_symbol","symbol":"beta","new_name":"gamma","file":"src/mod.js"}]}"#,
+        )
+        .expect("a same-named Python function must not block a JavaScript rename");
+
+        assert!(
+            std::fs::read_to_string(dir.path().join("src/mod.js"))
+                .unwrap()
+                .contains("gamma"),
+            "javascript declaration not renamed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/script.py")).unwrap(),
+            python_before,
+            "an unrelated Python symbol of the same name was rewritten"
+        );
+    }
+
+    /// Two independent modules each defining `beta` and each calling their own
+    /// is ordinary, not ambiguous: with no cross-file reference to attribute,
+    /// the rename never leaves the declaring file. Refusing here would block
+    /// the common case to guard one that cannot occur.
+    #[test]
+    fn a_same_named_definition_elsewhere_is_fine_when_nothing_calls_across_files() {
+        let other_before = "function beta(value) { return value + 1; }\n";
+        let dir = rename_fixture(&[
+            (
+                "src/app.js",
+                "function alpha(value) { return beta(value); }\nfunction beta(value) { return value + 1; }\n",
+            ),
+            ("src/other.js", other_before),
+        ]);
+        run_rename(
+            dir.path(),
+            r#"{"intents":[{"kind":"rename_symbol","symbol":"beta","new_name":"betaRenamed","file":"src/app.js"}]}"#,
+        )
+        .expect("an unrelated module defining the same name must not block the rename");
+
+        let app = std::fs::read_to_string(dir.path().join("src/app.js")).unwrap();
+        assert!(app.contains("betaRenamed(value)"), "{app}");
+        assert!(!app.contains(" beta("), "{app}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/other.js")).unwrap(),
+            other_before,
+            "an unrelated module was rewritten"
+        );
+    }
+
+    /// Call edges are matched by name, not by resolved binding, so a file that
+    /// defines its own `beta` and calls it looks like a caller of *our* `beta`.
+    /// Renaming there rewrites an unrelated function. Its own definition
+    /// shadows any import, so it is calling itself and is not our caller.
+    /// Caught by `edit_intents_apply_mutates_javascript_executor_intents`.
+    #[test]
+    fn a_file_that_defines_its_own_same_named_function_is_not_our_caller() {
+        let other_before =
+            "function alpha(value) { return beta(value); }\nfunction beta(value) { return value + 1; }\n";
+        let dir = rename_fixture(&[
+            (
+                "src/app.js",
+                "function alpha(value) { return beta(value); }\nfunction beta(value) { return value + 1; }\n",
+            ),
+            ("src/other.js", other_before),
+        ]);
+        run_rename(
+            dir.path(),
+            r#"{"intents":[{"kind":"rename_symbol","symbol":"beta","new_name":"betaRenamed","file":"src/app.js"}]}"#,
+        )
+        .expect("a file calling its own same-named function must not block the rename");
+
+        assert!(
+            std::fs::read_to_string(dir.path().join("src/app.js"))
+                .unwrap()
+                .contains("betaRenamed(value)"),
+            "target file not renamed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/other.js")).unwrap(),
+            other_before,
+            "a file calling its own same-named function was rewritten"
+        );
+    }
+
+    /// Two definitions sharing a name make each reference unattributable from
+    /// call edges alone. Renaming the wrong one is worse than declining, so the
+    /// intent refuses and names the file that made it ambiguous — and nothing
+    /// on disk is touched.
+    #[test]
+    fn rename_refuses_when_a_second_definition_shares_the_name() {
+        let lib_before = "pub mod caller;\npub mod other;\npub fn widget_count() -> usize { 3 }\n";
+        let dir = rename_fixture(&[
+            ("src/lib.rs", lib_before),
+            (
+                "src/caller.rs",
+                "use crate::widget_count;\npub fn total() -> usize { widget_count() + 1 }\n",
+            ),
+            ("src/other.rs", "pub fn widget_count() -> usize { 99 }\n"),
+        ]);
+        let err = run_rename(
+            dir.path(),
+            r#"{"intents":[{"kind":"rename_symbol","symbol":"widget_count","new_name":"gadget_count","file":"src/lib.rs"}]}"#,
+        )
+        .expect_err("an ambiguous rename must refuse");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(r#"rename_symbol refuses "widget_count""#)
+                && message.contains("referenced from src/caller.rs"),
+            "refusal does not name the symbol and the reference it cannot attribute: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap(),
+            lib_before,
+            "a refused rename must not mutate anything"
+        );
+        assert!(
+            std::fs::read_to_string(dir.path().join("src/caller.rs"))
+                .unwrap()
+                .contains("widget_count"),
+            "a refused rename must not mutate anything"
+        );
     }
 }
 

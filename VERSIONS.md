@@ -8,6 +8,47 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **`rename_symbol` renames through the grammar, and across files.** Two
+  correctness defects, both reproduced before the fix and covered by tests
+  after it.
+
+  It was a `match_indices` scan with an identifier-boundary guard, duplicated
+  per language family. A boundary guard cannot tell an identifier from the same
+  characters inside a string literal or a comment, so the rename rewrote both —
+  and rewriting a string literal changes what a program does, not what it is
+  called. `tsift-graph::rename` now collects occurrences from the parse tree,
+  restricted to each grammar's identifier node kinds. Comments and string
+  bodies are different node kinds, so they drop out by construction; there is
+  no comment or string special case, and a new quoting or comment form cannot
+  reintroduce the bug. (tree-sitter parses Rust macro arguments as an opaque
+  `token_tree`, so this could have *lost* call sites inside `assert_eq!` that
+  the old scan found. Identifiers in there are still named `identifier` nodes,
+  so there is no regression, and that case has its own test.)
+
+  It also edited one file and reported `conflicts=0` while leaving every caller
+  in every other file referring to a name that no longer exists — a tree that
+  does not compile, reported as a success. The rename now resolves its extent
+  from the indexed call graph and rewrites every referencing file in the same
+  all-or-nothing buffer set.
+
+  Two things make that safe, and both came out of a red suite rather than
+  design. Call edges and definition lookups are matched **by name**, and a name
+  is not unique: scoping is per executor family, so a Python `beta` neither
+  blocks nor is rewritten by a JavaScript rename. And a file that defines its
+  own function of the same name looks like a caller of ours — its own
+  definition shadows any import, so it is calling itself and is excluded.
+
+  Where the graph genuinely cannot attribute a reference — a cross-file caller
+  plus a second same-family definition of the name — the intent **refuses and
+  names both**, rather than renaming one of them and hoping. An unrelated
+  module that defines the same name but is never called across files is not
+  ambiguous and does not trigger the refusal.
+
+  Reports gain `edited_range` (the lines the edit actually rewrote) and
+  `rename_caller_files`; the human printer's `range:` line is now
+  `target range:`, since `target_range` is the symbol's *declaration* span and
+  reading it as the extent of the change was the invitation.
+
 - **GDScript joins the indexed tier.** `.gd` files are now walked, indexed,
   searched, and graphed like any other indexed language, behind the default-on
   `lang-gdscript` feature backed by `tree-sitter-gdscript` 6.1.0.
