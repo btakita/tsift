@@ -82,6 +82,42 @@ Resolution failure is asymmetric by design:
    megabyte generated file costs more to parse than it can repay.
 7. Walking honours `.gitignore` and hidden-file rules unless `--no-ignore`.
 
+## Edit-intent integration
+
+`tsift ast-grep rewrite --apply` writes straight to the working tree. That is the
+right shape for an exploratory codemod and the wrong shape for one you intend to
+land: there is no reindex, no impact report, and no temp worktree to fail in.
+The `structural_rewrite` semantic edit intent routes the same engine through
+[specs/ast-edits.md](ast-edits.md)'s planning path so a pattern-driven codemod
+earns the same proof a symbol-resolved one does.
+
+```json
+{ "kind": "structural_rewrite", "file": "src/scan.rs",
+  "pattern": "$A.unwrap()", "replacement": "$A.expect(\"scan\")" }
+```
+
+- `pattern` is the ast-grep pattern; `replacement` is the rewrite template.
+  `pattern` is required by `structural_rewrite` and **refused on every other
+  intent kind**, so a pattern silently ignored by a symbol-resolved intent is
+  not representable.
+- The target is a file, not a symbol — this is the only intent kind that selects
+  by shape. `symbol` / `target_handle` are not used.
+- The executor is resolved from the file exactly as for any other intent, then
+  its ast-grep grammar is resolved from that executor's contract `id`. An
+  executor whose language has no grammar compiled into the build is a refusal
+  naming the structural languages that are, never a skip.
+- Input and rewritten buffer are both reparsed with the executor's tree-sitter
+  grammar. The rewrite template is raw text, so this reparse is the only thing
+  standing between a template typo and a syntactically broken file.
+- Both degenerate outcomes fail closed rather than planning an empty edit: a
+  pattern that matched nothing did not express what the caller meant, and a
+  template that reproduces its own match would report a no-op as completed work.
+  This is stricter than the `ast-grep rewrite` reporting contract above, which
+  merely flags `unchanged` — a plan that cannot mutate must not be applyable.
+- Everything downstream is unchanged: patch proposal, diff preview, `--verify`
+  in a detached temp worktree with reindex and `impact`, formatter policy,
+  `expected_content_hash` conflict detection, and batch rollback.
+
 ## Known limits
 
 - **Macro bodies are opaque.** tree-sitter parses Rust macro arguments as
@@ -101,3 +137,8 @@ Resolution failure is asymmetric by design:
   regression this guards).
 - CLI coverage must assert that preview leaves target files byte-identical and
   that `--apply` under a budget exits non-zero *without writing*.
+- `structural_rewrite` coverage must include a multi-match apply (proves the
+  codemod is not one-shot), a dry run that reports a diff and writes nothing, a
+  no-match refusal, and a `--verify` run that reaches `temp_applied_total > 0`
+  with the real tree byte-identical. A test asserting only that the intent kind
+  is *accepted* would pass against a dispatch that never reaches ast-grep.

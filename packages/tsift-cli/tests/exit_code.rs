@@ -12141,3 +12141,189 @@ fn explain_human_output_collapses_dense_edges_by_file() {
         "{stdout}"
     );
 }
+
+#[test]
+fn edit_intents_structural_rewrite_applies_pattern_codemod() {
+    let dir = git_indexed_cli_fixture();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "structural_rewrite",
+                "file": "main.rs",
+                "pattern": "alpha()",
+                "replacement": "alpha_v2()"
+            }
+        ]
+    }"#;
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ],
+        input,
+    );
+    assert!(
+        output.status.success(),
+        "structural_rewrite stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = &json["report"]["plans"][0];
+    assert_eq!(plan["kind"], "structural_rewrite");
+    assert_eq!(plan["status"], "applied");
+    assert_eq!(json["report"]["applied_total"], 1);
+    // The pattern-driven plan still carries the same patch contract as a
+    // symbol-resolved intent — that is the point of routing it through
+    // edit-intents instead of leaving it in `tsift ast-grep rewrite`.
+    assert!(
+        plan["patch_proposal"]["files"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty()),
+        "structural plan should carry a patch proposal: {plan}"
+    );
+
+    let source = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    // Every call site is rewritten, and the definition (a function_item, not a
+    // call_expression) is left alone.
+    assert_eq!(source.matches("alpha_v2();").count(), 3, "{source}");
+    assert!(source.contains("fn alpha() {"), "{source}");
+    assert!(!source.contains("    alpha();"), "{source}");
+}
+
+#[test]
+fn edit_intents_structural_rewrite_dry_run_reports_diff_without_writing() {
+    let dir = git_indexed_cli_fixture();
+    let before = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "structural_rewrite",
+                "file": "main.rs",
+                "pattern": "alpha()",
+                "replacement": "alpha_v2()"
+            }
+        ]
+    }"#;
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--budget",
+            "normal",
+        ],
+        input,
+    );
+    assert!(
+        output.status.success(),
+        "structural_rewrite dry-run stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = &json["report"]["plans"][0];
+    assert_eq!(plan["status"], "planned");
+    assert_eq!(plan["apply_supported"], true);
+    assert_eq!(plan["applied"], false);
+    assert!(
+        plan["diff"].as_str().is_some_and(|diff| !diff.is_empty()),
+        "dry run must show the mutation: {plan}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+        before,
+        "dry run must not touch the working tree"
+    );
+}
+
+#[test]
+fn edit_intents_structural_rewrite_refuses_a_pattern_with_no_match() {
+    let dir = git_indexed_cli_fixture();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "structural_rewrite",
+                "file": "main.rs",
+                "pattern": "nonexistent_call()",
+                "replacement": "still_nothing()"
+            }
+        ]
+    }"#;
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ],
+        input,
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = &json["report"]["plans"][0];
+    assert_eq!(plan["status"], "unsupported");
+    assert_eq!(plan["apply_supported"], false);
+    assert!(
+        plan["message"]
+            .as_str()
+            .unwrap()
+            .contains("matched nothing"),
+        "{plan}"
+    );
+}
+
+#[test]
+fn edit_intents_structural_rewrite_verify_uses_temp_worktree_without_mutating_source() {
+    // The whole reason this intent kind exists: a pattern-driven codemod that
+    // gets the temp-worktree reindex/impact proof the ad-hoc
+    // `tsift ast-grep rewrite --apply` path cannot offer.
+    let dir = git_indexed_cli_fixture();
+    let before = fs::read_to_string(dir.path().join("main.rs")).unwrap();
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "structural_rewrite",
+                "file": "main.rs",
+                "pattern": "alpha()",
+                "replacement": "alpha_v2()"
+            }
+        ]
+    }"#;
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "--verify",
+            "--budget",
+            "normal",
+        ],
+        input,
+    );
+    assert!(
+        output.status.success(),
+        "structural_rewrite --verify stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["report"]["mode"], "verify");
+    assert_eq!(json["report"]["applied_total"], 0);
+    assert_eq!(json["report"]["verification"]["status"], "passed");
+    assert_eq!(json["report"]["verification"]["temp_applied_total"], 1);
+    assert_eq!(json["report"]["verification"]["reindexed"], true);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("main.rs")).unwrap(),
+        before,
+        "verify must leave the real tree untouched"
+    );
+}

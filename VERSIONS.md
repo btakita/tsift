@@ -8,6 +8,41 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **New `structural_rewrite` semantic edit intent.** `tsift edit-intents` now
+  accepts a pattern-driven codemod kind that carries `file`, an ast-grep
+  `pattern`, and a `replacement` template instead of a resolved symbol. This is
+  the missing link between `tsift ast-grep rewrite` (which writes straight to
+  the working tree with no reindex, impact report, or temp worktree) and the
+  symbol-resolved intent kinds: a structural codemod now earns the same
+  `--verify` proof, patch proposal, bounded diff preview, formatter policy,
+  `expected_content_hash` conflict detection, and batch rollback that
+  `rename_symbol` does.
+
+  The kind is promoted across every registered executor at once — Rust, Python,
+  TypeScript, TSX, JavaScript, JSX, and Markdown — because its selection and
+  mutation logic are language-independent: the grammar is a parameter, not a
+  code path. Language resolution goes through the file's executor contract `id`
+  to an ast-grep grammar, so an executor with no grammar compiled into the build
+  is an up-front refusal that names the structural languages that are.
+
+  Fail-closed contract: `pattern` is required by `structural_rewrite` and
+  **refused on every other intent kind**, so it cannot be silently ignored by an
+  intent that does not read it; input and rewritten buffer are both reparsed
+  with the executor grammar (the rewrite template is raw text, so that output
+  reparse is the only guard against a template typo emitting unparseable
+  source); and both degenerate outcomes are refusals rather than empty plans — a
+  pattern that matched nothing, and a template that reproduces every match. The
+  standalone `ast-grep rewrite` surface merely flags the latter `unchanged`;
+  here a plan that cannot mutate must not be applyable.
+
+  Covered by 9 unit tests (multi-match, non-Rust executor, multibyte source,
+  both refusals, output-reparse refusal, validation symmetry, and a drift guard
+  asserting every registered executor resolves an ast-grep grammar) plus 4 CLI
+  integration tests (apply, dry-run-writes-nothing, no-match refusal, and
+  `--verify` reaching `temp_applied_total > 0` with the real tree byte-identical).
+  Spec: `specs/ast-edits.md` "Structural Intents" and
+  `specs/structural-patterns.md` "Edit-intent integration".
+
 ## 0.1.78
 
 - **lazily 0.49.0.** Picks up the `SourceMap` / `ComputedMap` keyed-collection

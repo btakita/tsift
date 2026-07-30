@@ -22,7 +22,7 @@ When `--apply` is requested, tsift composes per-file non-overlapping text edits,
 
 ## Edit Target Selection
 
-Semantic edit intents may identify a target with `symbol`/`file`, or with `target_handle` when a previous tsift read/navigation command already selected the node. The handle-selection prototype is read-only during dry run: it scans the current index, recomputes known concrete handle families, and maps the requested handle to one indexed AST span before patch planning begins.
+Semantic edit intents may identify a target with `symbol`/`file`, or with `target_handle` when a previous tsift read/navigation command already selected the node. The one exception is `structural_rewrite`, which selects by *shape*: it takes `file` plus an ast-grep `pattern` and has no resolved symbol at all. See the Structural Intents section below. The handle-selection prototype is read-only during dry run: it scans the current index, recomputes known concrete handle families, and maps the requested handle to one indexed AST span before patch planning begins.
 
 Supported concrete handle families:
 
@@ -82,6 +82,39 @@ Dry-run planning verifies target uniqueness, range extraction, parser support, b
 
 `--apply` may mutate the real tree only after the current files still match the planned content hashes or the caller has supplied an explicit fresh plan. The executor must reparse/validate after composing edits and after formatting. If the language contract has a formatter, formatter failure is a refusal unless the contract explicitly marks formatting optional for that language and intent.
 
+## Structural Intents
+
+`structural_rewrite` is the pattern-driven intent kind. It exists because the
+two selection mechanisms above both start from a name: an index row or a handle
+that already resolved to one symbol. A refactor usually starts from a *shape*
+instead — "every `.unwrap()` on this expression", "every call passing this
+argument" — which no symbol resolution can express. The matching engine is
+[specs/structural-patterns.md](structural-patterns.md); this section owns only
+how that engine enters the edit path.
+
+The intent carries `file`, `pattern` (an ast-grep pattern), and `replacement`
+(the rewrite template). `pattern` is required by `structural_rewrite` and
+refused on every other kind, so it can never be silently ignored by an intent
+that does not read it. The kind requires no `symbol` and no `target_handle`.
+
+Language resolution goes through the file's registered executor, then through
+that executor's contract `id` to an ast-grep grammar. An executor language with
+no grammar compiled into the build is a refusal naming the structural languages
+that are — never a skip, because the caller named this file explicitly.
+
+Planning is otherwise identical to any other intent. Both the input and the
+rewritten buffer are reparsed with the executor grammar; because the rewrite
+template is raw text, that output reparse is the only guard against a template
+typo producing unparseable source. Two outcomes that the standalone
+`ast-grep rewrite` surface merely reports are refusals here, since a plan that
+cannot mutate must not be applyable: a pattern matching nothing, and a template
+that reproduces every match unchanged.
+
+Everything downstream — patch proposal, bounded diff preview, formatter policy,
+`expected_content_hash` conflict detection, `--verify` in a detached temp
+worktree with reindex plus `impact`, `--apply`, and batch rollback — is shared
+with the symbol-resolved kinds and is not re-specified for this kind.
+
 ## Promotion Order
 
 New AST/CST edit operations are promoted narrowly. `insert_import` and `replace_function_body` are the baseline operations because their target ranges and expected diffs are easy to inspect.
@@ -91,3 +124,5 @@ For Rust, `replace_function_body` must select a parsed `function_item` body. Whe
 For Rust, `insert_import` must parse the current source and anchor insertion after the source-file prelude that can safely precede imports: shebangs, crate-level inner doc comments, inner attributes, `use` declarations, and `extern crate` declarations. The emitted mutation is still a minimal textual insertion and must reparse before planning or applying.
 
 Broader rename, move, call-site, and signature operations require additional graph/index proof and tests that cover comments, formatting preservation, unsupported parser states, macro or generated regions, syntax-error work-in-progress files, and verification failures.
+
+`structural_rewrite` is promoted across every registered executor at once rather than language by language, because its selection and mutation logic are language-independent: the grammar is a parameter, not a code path. What is language-specific — parser validation and formatter policy — is already owned by the executor contract. Coverage must therefore include at least one non-Rust executor and a drift guard asserting that every registered executor resolves an ast-grep grammar, so a newly added executor language cannot advertise structural support it has no parser for.

@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
 use tree_sitter::StreamingIterator as _;
+use tsift_astgrep::AstGrepLang;
 use tsift_graph as graph;
 use tsift_index::index;
 use tsift_quality::lint;
@@ -48,6 +49,9 @@ pub(crate) struct SemanticEditIntent {
     pub(crate) position: Option<String>,
     #[serde(default)]
     pub(crate) replacement: Option<String>,
+    /// ast-grep structural pattern, used by `structural_rewrite`.
+    #[serde(default)]
+    pub(crate) pattern: Option<String>,
     #[serde(default)]
     pub(crate) call_replacement: Option<String>,
     #[serde(default)]
@@ -383,9 +387,14 @@ pub(crate) const SEMANTIC_EDIT_RUST_KINDS: &[&str] = &[
     "update_call_signature",
     "move_declaration",
     "rewrite_call_sites",
+    "structural_rewrite",
 ];
-pub(crate) const SEMANTIC_EDIT_SCRIPT_KINDS: &[&str] =
-    &["rename_symbol", "replace_function_body", "insert_import"];
+pub(crate) const SEMANTIC_EDIT_SCRIPT_KINDS: &[&str] = &[
+    "rename_symbol",
+    "replace_function_body",
+    "insert_import",
+    "structural_rewrite",
+];
 pub(crate) const SEMANTIC_EDIT_MARKDOWN_KINDS: &[&str] = &[
     "rename_heading",
     "replace_section_body",
@@ -393,6 +402,7 @@ pub(crate) const SEMANTIC_EDIT_MARKDOWN_KINDS: &[&str] = &[
     "move_section",
     "insert_list_item",
     "rewrite_code_fence",
+    "structural_rewrite",
 ];
 pub(crate) const SEMANTIC_EDIT_MARKDOWN_APPLY_KINDS: &[&str] = &[
     "rename_heading",
@@ -401,6 +411,7 @@ pub(crate) const SEMANTIC_EDIT_MARKDOWN_APPLY_KINDS: &[&str] = &[
     "move_section",
     "insert_list_item",
     "rewrite_code_fence",
+    "structural_rewrite",
 ];
 pub(crate) const SEMANTIC_EDIT_KINDS: &[&str] = &[
     "rename_symbol",
@@ -416,6 +427,7 @@ pub(crate) const SEMANTIC_EDIT_KINDS: &[&str] = &[
     "move_section",
     "insert_list_item",
     "rewrite_code_fence",
+    "structural_rewrite",
 ];
 
 pub(crate) struct PlannedEdit {
@@ -472,7 +484,15 @@ fn semantic_edit_kind_requires_replacement(kind: &str) -> bool {
             | "insert_section"
             | "insert_list_item"
             | "rewrite_code_fence"
+            | "structural_rewrite"
     )
+}
+
+/// `structural_rewrite` is the only kind that selects its target by ast-grep
+/// pattern instead of by resolved symbol, so it is the only kind that both
+/// requires `pattern` and accepts it.
+fn semantic_edit_kind_requires_pattern(kind: &str) -> bool {
+    matches!(kind, "structural_rewrite")
 }
 
 fn semantic_edit_kind_requires_new_name(kind: &str) -> bool {
@@ -492,6 +512,7 @@ fn semantic_edit_kind_requires_file(kind: &str) -> bool {
             | "move_section"
             | "insert_list_item"
             | "rewrite_code_fence"
+            | "structural_rewrite"
     )
 }
 
@@ -535,6 +556,14 @@ fn validate_semantic_edit_intent(kind: &str, intent: &SemanticEditIntent) -> Res
             .is_none_or(str::is_empty)
     {
         bail!("semantic edit kind {kind:?} requires `destination_symbol`");
+    }
+    if semantic_edit_kind_requires_pattern(kind)
+        && intent.pattern.as_deref().is_none_or(str::is_empty)
+    {
+        bail!("semantic edit kind {kind:?} requires `pattern`");
+    }
+    if intent.pattern.is_some() && !semantic_edit_kind_requires_pattern(kind) {
+        bail!("semantic edit kind {kind:?} does not support `pattern`");
     }
     if let Some(position) = intent.position.as_deref() {
         if !matches!(position, "before" | "after") {
@@ -1068,6 +1097,17 @@ impl SemanticEditExecutorLanguage {
 
     fn graph_lang(self) -> graph::Lang {
         self.contract().graph_lang
+    }
+
+    /// The ast-grep grammar backing structural patterns for this executor.
+    ///
+    /// Resolved through the contract `id` rather than a second parallel match
+    /// so a newly registered executor language cannot silently claim structural
+    /// support it has no grammar for. Returns `None` when this build compiled
+    /// no ast-grep grammar for the language (for example a `lang-*` feature is
+    /// off), which callers must turn into a refusal, never a skip.
+    fn ast_grep_lang(self) -> Option<AstGrepLang> {
+        AstGrepLang::from_name(self.contract().id)
     }
 
     fn temp_suffix(self) -> &'static str {
@@ -3103,6 +3143,54 @@ fn preview_markdown_edit_content(
     }
 }
 
+/// Plan a pattern-driven codemod for one file.
+///
+/// This is the only intent kind whose target is a *shape* rather than a
+/// resolved symbol, so it selects through ast-grep instead of the index. It
+/// still crosses the same executor boundary as every other kind: the input and
+/// the rewritten buffer are both reparsed with the executor's tree-sitter
+/// grammar, so `--verify`, formatting, patch proposals, and rollback apply
+/// unchanged.
+///
+/// Both degenerate outcomes fail closed rather than planning an empty edit:
+/// a pattern that matches nothing did not express what the caller meant, and a
+/// template that reproduces its own match would report a no-op as completed
+/// work.
+fn preview_structural_rewrite(
+    content: &str,
+    executor: SemanticEditExecutorLanguage,
+    intent: &SemanticEditIntent,
+) -> Result<(String, usize)> {
+    let pattern = intent
+        .pattern
+        .as_deref()
+        .context("structural_rewrite requires pattern")?;
+    let rewrite = intent
+        .replacement
+        .as_deref()
+        .context("structural_rewrite requires replacement")?;
+    let lang = executor.ast_grep_lang().with_context(|| {
+        format!(
+            "structural_rewrite has no ast-grep grammar compiled for {}; structural languages in this build: {}",
+            executor.name(),
+            AstGrepLang::supported_names()
+        )
+    })?;
+    parse_semantic_edit_source(content, executor, "structural_rewrite input")?;
+
+    let outcome = tsift_astgrep::rewrite_source(content, lang, pattern, rewrite)?;
+    if outcome.replacements == 0 {
+        bail!("structural pattern {pattern:?} matched nothing in this file");
+    }
+    if outcome.unchanged {
+        bail!(
+            "structural_rewrite is a no-op: rewrite {rewrite:?} reproduces every match of pattern {pattern:?}"
+        );
+    }
+    parse_semantic_edit_source(&outcome.source, executor, "structural_rewrite")?;
+    Ok((outcome.source, outcome.replacements))
+}
+
 fn preview_semantic_edit_content(
     content: &str,
     file_abs: &Path,
@@ -3115,6 +3203,12 @@ fn preview_semantic_edit_content(
     let Some(executor) = semantic_edit_executor_language(language, file_abs) else {
         bail!("no executor registered for language {language:?}");
     };
+    // Structural patterns are language-agnostic by construction, so they are
+    // dispatched ahead of the per-family executor split rather than duplicated
+    // into each arm.
+    if kind == "structural_rewrite" {
+        return preview_structural_rewrite(content, executor, intent);
+    }
     if executor.is_markdown() {
         return preview_markdown_edit_content(content, kind, intent, target_symbol);
     }
@@ -4730,4 +4824,154 @@ where
     let results = ok_results_from_applied(&applied);
     cleanup_edit_backups(&applied);
     Ok(results)
+}
+
+#[cfg(test)]
+mod structural_rewrite_tests {
+    use super::*;
+
+    const RUST_SRC: &str = "fn main() {\n    foo(1);\n    foo(2);\n}\n";
+
+    fn intent(kind: &str, pattern: Option<&str>, replacement: Option<&str>) -> SemanticEditIntent {
+        SemanticEditIntent {
+            kind: kind.to_string(),
+            target_handle: None,
+            symbol: None,
+            file: Some(PathBuf::from("main.rs")),
+            destination_symbol: None,
+            position: None,
+            replacement: replacement.map(str::to_string),
+            pattern: pattern.map(str::to_string),
+            call_replacement: None,
+            new_name: None,
+            expected_content_hash: None,
+        }
+    }
+
+    #[test]
+    fn rewrites_every_match_not_just_the_first() {
+        let (out, replacements) = preview_structural_rewrite(
+            RUST_SRC,
+            SemanticEditExecutorLanguage::Rust,
+            &intent("structural_rewrite", Some("foo($A)"), Some("bar($A)")),
+        )
+        .unwrap();
+        assert_eq!(replacements, 2);
+        assert!(out.contains("bar(1)"), "{out}");
+        assert!(out.contains("bar(2)"), "{out}");
+        assert!(!out.contains("foo("), "{out}");
+    }
+
+    #[test]
+    fn a_pattern_that_matches_nothing_is_a_refusal_not_an_empty_plan() {
+        // An empty edit that reported "planned" would advertise a codemod the
+        // caller could apply and see nothing happen.
+        let err = preview_structural_rewrite(
+            RUST_SRC,
+            SemanticEditExecutorLanguage::Rust,
+            &intent("structural_rewrite", Some("nope($A)"), Some("yes($A)")),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("matched nothing"), "{err:#}");
+    }
+
+    #[test]
+    fn an_identity_template_is_a_refusal() {
+        let err = preview_structural_rewrite(
+            RUST_SRC,
+            SemanticEditExecutorLanguage::Rust,
+            &intent("structural_rewrite", Some("foo($A)"), Some("foo($A)")),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("no-op"), "{err:#}");
+    }
+
+    #[test]
+    fn output_that_does_not_reparse_is_refused_before_planning() {
+        // The rewrite template is raw text, so nothing but the output reparse
+        // stops a codemod from writing syntactically broken source.
+        let err = preview_structural_rewrite(
+            RUST_SRC,
+            SemanticEditExecutorLanguage::Rust,
+            &intent("structural_rewrite", Some("foo($A)"), Some("bar($A")),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("parse errors"), "{err:#}");
+    }
+
+    #[test]
+    fn rewrites_a_script_language_through_its_own_grammar() {
+        let src = "def main():\n    foo(1)\n    foo(2)\n";
+        let (out, replacements) = preview_structural_rewrite(
+            src,
+            SemanticEditExecutorLanguage::Python,
+            &intent("structural_rewrite", Some("foo($A)"), Some("bar($A)")),
+        )
+        .unwrap();
+        assert_eq!(replacements, 2);
+        assert!(out.contains("bar(1)") && out.contains("bar(2)"), "{out}");
+    }
+
+    #[test]
+    fn multibyte_source_survives_the_rewrite() {
+        let src = "fn main() {\n    let s = \"héllo → wörld\";\n    foo(s);\n}\n";
+        let (out, _) = preview_structural_rewrite(
+            src,
+            SemanticEditExecutorLanguage::Rust,
+            &intent("structural_rewrite", Some("foo($A)"), Some("bar($A)")),
+        )
+        .unwrap();
+        assert!(out.contains("héllo → wörld"), "{out}");
+        assert!(out.contains("bar(s)"), "{out}");
+    }
+
+    #[test]
+    fn every_executor_language_resolves_an_ast_grep_grammar() {
+        // structural_rewrite is advertised as apply-supported by every executor
+        // contract, so every executor must actually have a grammar. A new
+        // executor language whose id ast-grep cannot resolve would otherwise
+        // only fail at plan time, in the field.
+        for contract in SEMANTIC_EDIT_LANGUAGE_CONTRACTS {
+            assert!(
+                contract.executor.ast_grep_lang().is_some(),
+                "executor {} advertises structural_rewrite but has no ast-grep grammar",
+                contract.id
+            );
+            assert!(
+                contract
+                    .apply_supported_intents
+                    .contains(&"structural_rewrite"),
+                "executor {} should apply-support structural_rewrite",
+                contract.id
+            );
+        }
+    }
+
+    #[test]
+    fn pattern_is_required_here_and_rejected_everywhere_else() {
+        let missing = intent("structural_rewrite", None, Some("bar($A)"));
+        let err = validate_semantic_edit_intent("structural_rewrite", &missing).unwrap_err();
+        assert!(format!("{err:#}").contains("requires `pattern`"), "{err:#}");
+
+        let stray = intent("insert_import", Some("foo($A)"), Some("std::fmt"));
+        let err = validate_semantic_edit_intent("insert_import", &stray).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not support `pattern`"),
+            "{err:#}"
+        );
+
+        let ok = intent("structural_rewrite", Some("foo($A)"), Some("bar($A)"));
+        validate_semantic_edit_intent("structural_rewrite", &ok).unwrap();
+    }
+
+    #[test]
+    fn structural_rewrite_requires_a_file_and_no_symbol() {
+        assert!(semantic_edit_kind_requires_file("structural_rewrite"));
+        assert!(!semantic_edit_kind_requires_symbol("structural_rewrite"));
+        assert!(semantic_edit_kind_requires_replacement("structural_rewrite"));
+        let mut no_file = intent("structural_rewrite", Some("foo($A)"), Some("bar($A)"));
+        no_file.file = None;
+        let err = validate_semantic_edit_intent("structural_rewrite", &no_file).unwrap_err();
+        assert!(format!("{err:#}").contains("requires `file`"), "{err:#}");
+    }
 }
