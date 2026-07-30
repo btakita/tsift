@@ -545,6 +545,16 @@ fn every_supported_language_has_exactly_one_conformance_fixture() {
         "conformance fixtures and supported languages disagree — a language was \
          added or removed without its fixture row"
     );
+    // `tsift-astgrep`'s own `default` feature set is empty, so a bare
+    // `cargo test -p tsift-astgrep` compiles zero grammars and every row above
+    // vanishes. Saying so is better than reporting green over an empty table —
+    // build with `--features all-languages` (which is what the workspace build
+    // unifies to through `tsift-cli`).
+    assert!(
+        !fixtures.is_empty(),
+        "no structural languages compiled in; this suite would prove nothing — \
+         run with --features all-languages"
+    );
 }
 
 /// The workspace build enables `all-languages` through `tsift-cli`, so this is
