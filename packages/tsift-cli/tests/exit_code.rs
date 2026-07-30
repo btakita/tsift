@@ -12498,11 +12498,13 @@ fn edit_intents_structural_rewrite_verify_uses_temp_worktree_without_mutating_so
 }
 
 #[test]
-fn structural_only_language_rewrites_via_ast_grep_but_not_via_edit_intents() {
-    // The structural-only tier: ast-grep has a Go grammar, but tsift-graph /
-    // tsift-search have no Go tag queries, so Go has no semantic-edit executor.
-    // `ast-grep rewrite` must work; `structural_rewrite` must refuse rather
-    // than mutate a file it cannot reparse and validate.
+fn structural_only_language_rewrites_via_ast_grep_and_via_edit_intents() {
+    // The structural-only tier: Go has an ast-grep grammar but no tsift-graph
+    // tag queries, so it is not indexed or searchable. Reparsing a rewritten
+    // buffer needs a grammar and not an index, so it *is* a semantic-edit
+    // executor for `structural_rewrite` — both surfaces must rewrite it, and
+    // the planner path must additionally leave the file untouched until
+    // `--apply`.
     let dir = tempfile::tempdir().unwrap();
     let src = "package main\n\nfunc main() {\n\tfoo(1)\n\tfoo(2)\n}\n";
     fs::write(dir.path().join("main.go"), src).unwrap();
@@ -12559,15 +12561,76 @@ fn structural_only_language_rewrites_via_ast_grep_but_not_via_edit_intents() {
     );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let plan = &json["report"]["plans"][0];
-    assert_eq!(plan["status"], "unsupported", "{plan}");
-    assert_eq!(plan["apply_supported"], false, "{plan}");
+    assert_eq!(plan["status"], "planned", "{plan}");
+    assert_eq!(plan["apply_supported"], true, "{plan}");
     assert!(
-        plan["message"].as_str().unwrap().contains("executor"),
-        "refusal should name the missing executor: {plan}"
+        plan["message"].as_str().unwrap().contains("Go"),
+        "the plan should name the Go executor: {plan}"
     );
     assert_eq!(
         fs::read_to_string(dir.path().join("main.go")).unwrap(),
         src,
-        "a refused structural_rewrite must not write"
+        "a dry-run structural_rewrite must not write"
+    );
+
+    // A symbol-resolved kind stays refused end to end. Two independent layers
+    // stop it: Go has no tag queries, so nothing resolves the symbol, and the
+    // Go contract does not recognize the kind either — which is what keeps the
+    // family split from routing it into the Rust implementations. The
+    // executor-level refusal is asserted per language in the unit suite; here
+    // the point is that the CLI fails and writes nothing.
+    let rename = r#"{
+        "intents": [
+            {
+                "kind": "rename_symbol",
+                "file": "main.go",
+                "symbol": "main",
+                "new_name": "run"
+            }
+        ]
+    }"#;
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--apply",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ],
+        rename,
+    );
+    assert!(
+        !output.status.success(),
+        "rename_symbol on Go should fail, stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("main.go")).unwrap(),
+        src,
+        "a refused rename_symbol must not write"
+    );
+
+    // And apply actually mutates it.
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--apply",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ],
+        input,
+    );
+    assert!(
+        output.status.success(),
+        "apply on Go stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let applied = fs::read_to_string(dir.path().join("main.go")).unwrap();
+    assert!(
+        applied.contains("bar(1)") && applied.contains("bar(2)"),
+        "apply should rewrite every Go call site: {applied}"
     );
 }

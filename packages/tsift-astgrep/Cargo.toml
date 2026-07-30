@@ -88,3 +88,7 @@ all-languages = [
 
 [dev-dependencies]
 tempfile = "3"
+# Only the parser handle, to prove `tree_sitter_language()` yields a grammar a
+# `tree_sitter::Parser` actually accepts — the same thing external reparse
+# callers do with it.
+tree-sitter = "0.26"

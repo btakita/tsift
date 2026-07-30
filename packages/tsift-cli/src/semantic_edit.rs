@@ -956,6 +956,28 @@ pub(crate) enum SemanticEditExecutorLanguage {
     Markdown,
     Kotlin,
     Bash,
+    // Structural-only executors with no `tsift-graph` binding. Reparse goes
+    // through the ast-grep grammar instead — see `reparse_language`.
+    C,
+    Cpp,
+    CSharp,
+    Css,
+    Dart,
+    Elixir,
+    Go,
+    Haskell,
+    Hcl,
+    Html,
+    Java,
+    Json,
+    Lua,
+    Nix,
+    Php,
+    Ruby,
+    Scala,
+    Solidity,
+    Swift,
+    Yaml,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -964,8 +986,9 @@ pub(crate) enum SemanticEditLanguageFamily {
     Python,
     JsLike,
     Markdown,
-    /// Grammar + graph support, but no per-kind rewriting: structural patterns
-    /// only.
+    /// A grammar and nothing else: no per-kind rewriting, structural patterns
+    /// only. Members may or may not also be indexed by `tsift-graph`; indexing
+    /// is what makes a language *searchable*, not what makes it rewritable.
     Structural,
 }
 
@@ -982,7 +1005,12 @@ pub(crate) struct SemanticEditLanguageContract {
     pub(crate) executor: SemanticEditExecutorLanguage,
     pub(crate) id: &'static str,
     pub(crate) name: &'static str,
-    pub(crate) graph_lang: graph::Lang,
+    /// The `tsift-graph` binding for this language, when it has one.
+    ///
+    /// `None` is not a degraded state — it means the language is rewritable but
+    /// not indexed. Reparsing the planner's output needs a grammar, not an
+    /// index, so it falls back to the ast-grep grammar rather than refusing.
+    pub(crate) graph_lang: Option<graph::Lang>,
     pub(crate) temp_suffix: &'static str,
     pub(crate) aliases: &'static [&'static str],
     pub(crate) extensions: &'static [&'static str],
@@ -997,7 +1025,7 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         executor: SemanticEditExecutorLanguage::Rust,
         id: "rust",
         name: "Rust",
-        graph_lang: graph::Lang::Rust,
+        graph_lang: Some(graph::Lang::Rust),
         temp_suffix: ".rs",
         aliases: &["rust", "rs"],
         extensions: &["rs"],
@@ -1010,7 +1038,7 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         executor: SemanticEditExecutorLanguage::Python,
         id: "python",
         name: "Python",
-        graph_lang: graph::Lang::Python,
+        graph_lang: Some(graph::Lang::Python),
         temp_suffix: ".py",
         aliases: &["python", "py", "pyi"],
         extensions: &["py", "pyi"],
@@ -1023,7 +1051,7 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         executor: SemanticEditExecutorLanguage::TypeScript,
         id: "typescript",
         name: "TypeScript",
-        graph_lang: graph::Lang::TypeScript,
+        graph_lang: Some(graph::Lang::TypeScript),
         temp_suffix: ".ts",
         aliases: &["typescript", "ts"],
         extensions: &["ts"],
@@ -1036,7 +1064,7 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         executor: SemanticEditExecutorLanguage::Tsx,
         id: "tsx",
         name: "TSX",
-        graph_lang: graph::Lang::Tsx,
+        graph_lang: Some(graph::Lang::Tsx),
         temp_suffix: ".tsx",
         aliases: &["tsx"],
         extensions: &["tsx"],
@@ -1049,7 +1077,7 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         executor: SemanticEditExecutorLanguage::JavaScript,
         id: "javascript",
         name: "JavaScript",
-        graph_lang: graph::Lang::JavaScript,
+        graph_lang: Some(graph::Lang::JavaScript),
         temp_suffix: ".js",
         aliases: &["javascript", "js", "mjs", "cjs"],
         extensions: &["js", "mjs", "cjs"],
@@ -1062,7 +1090,7 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         executor: SemanticEditExecutorLanguage::Jsx,
         id: "jsx",
         name: "JSX",
-        graph_lang: graph::Lang::Jsx,
+        graph_lang: Some(graph::Lang::Jsx),
         temp_suffix: ".jsx",
         aliases: &["jsx"],
         extensions: &["jsx"],
@@ -1075,7 +1103,7 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         executor: SemanticEditExecutorLanguage::Markdown,
         id: "markdown",
         name: "Markdown",
-        graph_lang: graph::Lang::Markdown,
+        graph_lang: Some(graph::Lang::Markdown),
         temp_suffix: ".md",
         aliases: &["markdown", "md", "mdx"],
         extensions: &["md", "mdx"],
@@ -1088,7 +1116,7 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         executor: SemanticEditExecutorLanguage::Kotlin,
         id: "kotlin",
         name: "Kotlin",
-        graph_lang: graph::Lang::Kotlin,
+        graph_lang: Some(graph::Lang::Kotlin),
         temp_suffix: ".kt",
         aliases: &["kotlin", "kt", "kts"],
         extensions: &["kt", "kts"],
@@ -1101,7 +1129,7 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         executor: SemanticEditExecutorLanguage::Bash,
         id: "bash",
         name: "Bash",
-        graph_lang: graph::Lang::Bash,
+        graph_lang: Some(graph::Lang::Bash),
         temp_suffix: ".sh",
         aliases: &["bash", "sh", "shell"],
         extensions: &["sh", "bash"],
@@ -1109,6 +1137,597 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
         family: SemanticEditLanguageFamily::Structural,
         formatter: SemanticEditFormatterContract::None,
+    },
+    // Structural-only tier: an ast-grep grammar and no `tsift-graph` binding.
+    // They are not indexed, searchable, or graphable, and their recognized set
+    // is `structural_rewrite` alone — the one kind that selects by shape rather
+    // than by a resolved symbol, and so needs only a grammar.
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::C,
+        id: "c",
+        name: "C",
+        graph_lang: None,
+        temp_suffix: ".c",
+        aliases: &["c"],
+        extensions: &["c", "h"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Cpp,
+        id: "cpp",
+        name: "C++",
+        graph_lang: None,
+        temp_suffix: ".cpp",
+        aliases: &["cpp", "c++", "cc", "cxx"],
+        extensions: &["cc", "cpp", "cxx", "hpp", "hh", "hxx"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::CSharp,
+        id: "csharp",
+        name: "C#",
+        graph_lang: None,
+        temp_suffix: ".cs",
+        aliases: &["csharp", "cs", "c#"],
+        extensions: &["cs"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Css,
+        id: "css",
+        name: "CSS",
+        graph_lang: None,
+        temp_suffix: ".css",
+        aliases: &["css"],
+        extensions: &["css"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Dart,
+        id: "dart",
+        name: "Dart",
+        graph_lang: None,
+        temp_suffix: ".dart",
+        aliases: &["dart"],
+        extensions: &["dart"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Elixir,
+        id: "elixir",
+        name: "Elixir",
+        graph_lang: None,
+        temp_suffix: ".ex",
+        aliases: &["elixir", "ex"],
+        extensions: &["ex", "exs"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Go,
+        id: "go",
+        name: "Go",
+        graph_lang: None,
+        temp_suffix: ".go",
+        aliases: &["go", "golang"],
+        extensions: &["go"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Haskell,
+        id: "haskell",
+        name: "Haskell",
+        graph_lang: None,
+        temp_suffix: ".hs",
+        aliases: &["haskell", "hs"],
+        extensions: &["hs"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Hcl,
+        id: "hcl",
+        name: "HCL",
+        graph_lang: None,
+        temp_suffix: ".hcl",
+        aliases: &["hcl", "terraform", "tf"],
+        extensions: &["hcl", "tf", "tfvars"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Html,
+        id: "html",
+        name: "HTML",
+        graph_lang: None,
+        temp_suffix: ".html",
+        aliases: &["html", "htm"],
+        extensions: &["html", "htm"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Java,
+        id: "java",
+        name: "Java",
+        graph_lang: None,
+        temp_suffix: ".java",
+        aliases: &["java"],
+        extensions: &["java"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Json,
+        id: "json",
+        name: "JSON",
+        graph_lang: None,
+        temp_suffix: ".json",
+        aliases: &["json"],
+        extensions: &["json"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Lua,
+        id: "lua",
+        name: "Lua",
+        graph_lang: None,
+        temp_suffix: ".lua",
+        aliases: &["lua"],
+        extensions: &["lua"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Nix,
+        id: "nix",
+        name: "Nix",
+        graph_lang: None,
+        temp_suffix: ".nix",
+        aliases: &["nix"],
+        extensions: &["nix"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Php,
+        id: "php",
+        name: "PHP",
+        graph_lang: None,
+        temp_suffix: ".php",
+        aliases: &["php"],
+        extensions: &["php"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Ruby,
+        id: "ruby",
+        name: "Ruby",
+        graph_lang: None,
+        temp_suffix: ".rb",
+        aliases: &["ruby", "rb"],
+        extensions: &["rb"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Scala,
+        id: "scala",
+        name: "Scala",
+        graph_lang: None,
+        temp_suffix: ".scala",
+        aliases: &["scala"],
+        extensions: &["scala", "sc"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Solidity,
+        id: "solidity",
+        name: "Solidity",
+        graph_lang: None,
+        temp_suffix: ".sol",
+        aliases: &["solidity", "sol"],
+        extensions: &["sol"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Swift,
+        id: "swift",
+        name: "Swift",
+        graph_lang: None,
+        temp_suffix: ".swift",
+        aliases: &["swift"],
+        extensions: &["swift"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Yaml,
+        id: "yaml",
+        name: "YAML",
+        graph_lang: None,
+        temp_suffix: ".yaml",
+        aliases: &["yaml", "yml"],
+        extensions: &["yaml", "yml"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+];
+
+/// One conformance fixture per registered semantic-edit executor.
+///
+/// A contract row only declares that a language *is* an executor. These rows
+/// put every one of them through the real `structural_rewrite` path — match,
+/// rewrite, and reparse the result with that executor's own grammar — so a
+/// registration that cannot actually mutate its language fails here instead of
+/// in the field. Grammar quirks are row data, not prose, so a grammar upgrade
+/// that lifts a limit is noticed rather than leaving a stale note behind.
+#[cfg(test)]
+struct SemanticEditExecutorFixture {
+    executor: SemanticEditExecutorLanguage,
+    /// An alias that must resolve to `executor`.
+    alias: &'static str,
+    /// A path whose extension must resolve to `executor` on its own.
+    sample_path: &'static str,
+    source: &'static str,
+    pattern: &'static str,
+    replacement: &'static str,
+    /// Must be non-zero: a fixture that expects no rewrite proves nothing.
+    expected_replacements: usize,
+    /// Text that must appear in the rewritten buffer.
+    marker: &'static str,
+}
+
+#[cfg(test)]
+const SEMANTIC_EDIT_EXECUTOR_FIXTURES: &[SemanticEditExecutorFixture] = &[
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Rust,
+        alias: "rust",
+        sample_path: "src/lib.rs",
+        source: "fn main() {\n    foo(1);\n    foo(2);\n}\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Python,
+        alias: "python",
+        sample_path: "app.py",
+        source: "def main():\n    foo(1)\n    foo(2)\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::TypeScript,
+        alias: "typescript",
+        sample_path: "app.ts",
+        source: "function main(): void {\n  foo(1);\n  foo(2);\n}\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Tsx,
+        alias: "tsx",
+        sample_path: "App.tsx",
+        source: "const App = () => {\n  foo(1);\n  foo(2);\n  return null;\n};\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::JavaScript,
+        alias: "javascript",
+        sample_path: "app.js",
+        source: "function main() {\n  foo(1);\n  foo(2);\n}\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Jsx,
+        alias: "jsx",
+        sample_path: "view.jsx",
+        source: "function main() {\n  foo(1);\n  foo(2);\n}\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Markdown,
+        alias: "markdown",
+        sample_path: "README.md",
+        source: "# a\n\n# b\n",
+        pattern: "# $A",
+        replacement: "## $A",
+        expected_replacements: 2,
+        marker: "## a",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Kotlin,
+        alias: "kotlin",
+        sample_path: "Main.kt",
+        source: "fun main() {\n    foo(1)\n    foo(2)\n}\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Bash,
+        alias: "bash",
+        sample_path: "run.sh",
+        source: "foo 1\nfoo 2\n",
+        pattern: "foo $A",
+        replacement: "bar $A",
+        expected_replacements: 2,
+        marker: "bar 1",
+    },
+    // tree-sitter-c reads a bare call as a declaration, so the pattern needs
+        // the statement terminator.
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::C,
+        alias: "c",
+        sample_path: "main.c",
+        source: "int main(void) {\n  foo(1);\n  foo(2);\n  return 0;\n}\n",
+        pattern: "foo($A);",
+        replacement: "bar($A);",
+        expected_replacements: 2,
+        marker: "bar(1);",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Cpp,
+        alias: "cpp",
+        sample_path: "main.cpp",
+        source: "int main() {\n  foo(1);\n  foo(2);\n  return 0;\n}\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::CSharp,
+        alias: "csharp",
+        sample_path: "Program.cs",
+        source: "class C {\n  void M() {\n    Foo(1);\n    Foo(2);\n  }\n}\n",
+        pattern: "Foo($A)",
+        replacement: "Bar($A)",
+        expected_replacements: 2,
+        marker: "Bar(1)",
+    },
+    // CSS needs the declaration terminator for the same reason C does.
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Css,
+        alias: "css",
+        sample_path: "site.css",
+        source: "body { color: red; }\n.x { color: blue; }\n",
+        pattern: "color: $V;",
+        replacement: "background: $V;",
+        expected_replacements: 2,
+        marker: "background: red;",
+    },
+    // tree-sitter-dart cannot parse an expression fragment as a standalone
+        // pattern, so Dart selects at declaration granularity only.
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Dart,
+        alias: "dart",
+        sample_path: "main.dart",
+        source: "void main() { print(\"a\"); }\n",
+        pattern: "void main() { print($A); }",
+        replacement: "void main() { log($A); }",
+        expected_replacements: 1,
+        marker: "log(\"a\")",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Elixir,
+        alias: "elixir",
+        sample_path: "worker.ex",
+        source: "defmodule M do\n  def run do\n    foo(1)\n    foo(2)\n  end\nend\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Go,
+        alias: "go",
+        sample_path: "main.go",
+        source: "package main\n\nfunc main() {\n\tfoo(1)\n\tfoo(2)\n}\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Haskell,
+        alias: "haskell",
+        sample_path: "Main.hs",
+        source: "main = do\n  foo 1\n  foo 2\n",
+        pattern: "foo $A",
+        replacement: "bar $A",
+        expected_replacements: 2,
+        marker: "bar 1",
+    },
+    // HCL has no expression statements, so a call only matches as an attribute.
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Hcl,
+        alias: "hcl",
+        sample_path: "main.tf",
+        source: "resource \"a\" \"b\" {\n  x = foo(1)\n  y = foo(2)\n}\n",
+        pattern: "$K = foo($A)",
+        replacement: "$K = bar($A)",
+        expected_replacements: 2,
+        marker: "x = bar(1)",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Html,
+        alias: "html",
+        sample_path: "index.html",
+        source: "<div><span>a</span><span>b</span></div>\n",
+        pattern: "<span>$A</span>",
+        replacement: "<em>$A</em>",
+        expected_replacements: 2,
+        marker: "<em>a</em>",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Java,
+        alias: "java",
+        sample_path: "C.java",
+        source: "class C {\n  void m() {\n    foo(1);\n    foo(2);\n  }\n}\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    // A literal key with a metavariable value parses to two nodes, so both
+        // sides must be metavariable-shaped.
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Json,
+        alias: "json",
+        sample_path: "data.json",
+        source: "{\"a\": 1, \"b\": 1}\n",
+        pattern: "$K: $V",
+        replacement: "$K: 2",
+        expected_replacements: 2,
+        marker: "\"a\": 2",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Lua,
+        alias: "lua",
+        sample_path: "init.lua",
+        source: "foo(1)\nfoo(2)\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Nix,
+        alias: "nix",
+        sample_path: "default.nix",
+        source: "{ a = foo 1; b = foo 2; }\n",
+        pattern: "foo $A",
+        replacement: "bar $A",
+        expected_replacements: 2,
+        marker: "bar 1",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Php,
+        alias: "php",
+        sample_path: "index.php",
+        source: "<?php\nfoo(1);\nfoo(2);\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Ruby,
+        alias: "ruby",
+        sample_path: "app.rb",
+        source: "foo(1)\nfoo(2)\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Scala,
+        alias: "scala",
+        sample_path: "M.scala",
+        source: "object M {\n  def run(): Unit = {\n    foo(1)\n    foo(2)\n  }\n}\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    // Same declaration-only granularity as Dart.
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Solidity,
+        alias: "solidity",
+        sample_path: "C.sol",
+        source: "contract C {\n  function f() public { emit E(1); }\n}\n",
+        pattern: "function f() public { $$$B }",
+        replacement: "function g() public { $$$B }",
+        expected_replacements: 1,
+        marker: "function g() public",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Swift,
+        alias: "swift",
+        sample_path: "main.swift",
+        source: "func main() {\n    foo(1)\n    foo(2)\n}\n",
+        pattern: "foo($A)",
+        replacement: "bar($A)",
+        expected_replacements: 2,
+        marker: "bar(1)",
+    },
+    SemanticEditExecutorFixture {
+        executor: SemanticEditExecutorLanguage::Yaml,
+        alias: "yaml",
+        sample_path: "config.yaml",
+        source: "a: 1\nb: 1\n",
+        pattern: "$K: 1",
+        replacement: "$K: 2",
+        expected_replacements: 2,
+        marker: "a: 2",
     },
 ];
 
@@ -1133,8 +1752,31 @@ impl SemanticEditExecutorLanguage {
         self.contract().name
     }
 
-    fn graph_lang(self) -> graph::Lang {
+    fn graph_lang(self) -> Option<graph::Lang> {
         self.contract().graph_lang
+    }
+
+    /// The grammar used to reparse this executor's input and output.
+    ///
+    /// Validating a rewritten buffer is a parser-level need, so an executor
+    /// does not require a `tsift-graph` binding to have one. Indexed languages
+    /// keep using their `graph::Lang` grammar — Markdown in particular parses
+    /// through `tsift-md-ast`, not ast-grep's `tree-sitter-md` — and everything
+    /// else reparses with the same ast-grep grammar its pattern matched
+    /// against. An executor with neither is a registration bug, refused here by
+    /// name rather than silently parsed with some other language's rules.
+    fn reparse_language(self) -> Result<tree_sitter::Language> {
+        if let Some(graph_lang) = self.graph_lang() {
+            return Ok(graph_lang.tree_sitter_language());
+        }
+        let lang = self.ast_grep_lang().with_context(|| {
+            format!(
+                "no grammar is compiled for the {} executor; structural languages in this build: {}",
+                self.name(),
+                AstGrepLang::supported_names()
+            )
+        })?;
+        Ok(lang.tree_sitter_language())
     }
 
     /// The ast-grep grammar backing structural patterns for this executor.
@@ -1221,7 +1863,7 @@ fn semantic_edit_executor_name(language: &str, file_abs: &Path) -> String {
 #[cfg(test)]
 #[test]
 fn semantic_edit_language_contracts_resolve_current_executor_surface() {
-    let cases = [
+    let mut cases = vec![
         (
             "rust",
             "src/lib.rs",
@@ -1277,24 +1919,6 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             SemanticEditFormatterContract::Prettier,
         ),
         (
-            "kotlin",
-            "Main.kt",
-            SemanticEditExecutorLanguage::Kotlin,
-            "kotlin",
-            SEMANTIC_EDIT_STRUCTURAL_KINDS,
-            SEMANTIC_EDIT_STRUCTURAL_KINDS,
-            SemanticEditFormatterContract::None,
-        ),
-        (
-            "bash",
-            "run.sh",
-            SemanticEditExecutorLanguage::Bash,
-            "bash",
-            SEMANTIC_EDIT_STRUCTURAL_KINDS,
-            SEMANTIC_EDIT_STRUCTURAL_KINDS,
-            SemanticEditFormatterContract::None,
-        ),
-        (
             "markdown",
             "README.md",
             SemanticEditExecutorLanguage::Markdown,
@@ -1313,6 +1937,29 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             SemanticEditFormatterContract::None,
         ),
     ];
+
+    // The structural-only tier is 20+ languages whose contracts differ only in
+    // their names, so listing them again by hand would be a second table to
+    // drift. They are driven from the conformance fixtures instead, which ties
+    // "registered" and "actually exercised" to the same row.
+    cases.extend(
+        SEMANTIC_EDIT_EXECUTOR_FIXTURES
+            .iter()
+            .filter(|fixture| {
+                fixture.executor.contract().family == SemanticEditLanguageFamily::Structural
+            })
+            .map(|fixture| {
+                (
+                    fixture.alias,
+                    fixture.sample_path,
+                    fixture.executor,
+                    fixture.executor.contract().id,
+                    SEMANTIC_EDIT_STRUCTURAL_KINDS,
+                    SEMANTIC_EDIT_STRUCTURAL_KINDS,
+                    SemanticEditFormatterContract::None,
+                )
+            }),
+    );
 
     // Every registered contract must appear above: a new executor language
     // added without a case would otherwise be covered by nothing at all.
@@ -1446,7 +2093,7 @@ fn parse_semantic_edit_source(
     context: &str,
 ) -> Result<tree_sitter::Tree> {
     let mut parser = tree_sitter::Parser::new();
-    let language = executor.graph_lang().tree_sitter_language();
+    let language = executor.reparse_language()?;
     parser.set_language(&language)?;
     let tree = parser
         .parse(content.as_bytes(), None)
@@ -1623,7 +2270,7 @@ fn find_script_function_body_range(
 ) -> Result<(usize, usize, String)> {
     validate_script_identifier(symbol, "symbol", executor)?;
     let source = content.as_bytes();
-    let language = executor.graph_lang().tree_sitter_language();
+    let language = executor.reparse_language()?;
     let tree = parse_semantic_edit_source(content, executor, "replace_function_body input")?;
     let query = tree_sitter::Query::new(&language, script_function_body_query(executor))?;
     let capture_names = query.capture_names();
@@ -5000,6 +5647,223 @@ mod structural_rewrite_tests {
         .unwrap();
         assert!(out.contains("héllo → wörld"), "{out}");
         assert!(out.contains("bar(s)"), "{out}");
+    }
+
+    #[test]
+    fn every_registered_executor_has_exactly_one_conformance_fixture() {
+        // Both directions. Without the first, a language can be registered and
+        // never exercised; without the second, a fixture can outlive the
+        // executor it claims to cover.
+        for contract in SEMANTIC_EDIT_LANGUAGE_CONTRACTS {
+            let rows = SEMANTIC_EDIT_EXECUTOR_FIXTURES
+                .iter()
+                .filter(|fixture| fixture.executor == contract.executor)
+                .count();
+            assert_eq!(
+                rows, 1,
+                "executor {} has {rows} conformance fixtures, expected exactly 1",
+                contract.id
+            );
+        }
+        for fixture in SEMANTIC_EDIT_EXECUTOR_FIXTURES {
+            assert!(
+                SEMANTIC_EDIT_LANGUAGE_CONTRACTS
+                    .iter()
+                    .any(|contract| contract.executor == fixture.executor),
+                "fixture {} has no registered executor contract",
+                fixture.alias
+            );
+        }
+        // An empty table would satisfy every loop above vacuously.
+        assert!(
+            SEMANTIC_EDIT_EXECUTOR_FIXTURES.len() >= 20,
+            "the executor conformance table has collapsed to {} rows",
+            SEMANTIC_EDIT_EXECUTOR_FIXTURES.len()
+        );
+    }
+
+    #[test]
+    fn every_executor_rewrites_and_reparses_its_own_language() {
+        // The count compared at the end is the sum of what the *planner*
+        // returned, not a loop counter: a runner that summed its own
+        // bookkeeping would report green over a table that rewrote nothing.
+        let mut applied = 0usize;
+        let mut declared = 0usize;
+        for fixture in SEMANTIC_EDIT_EXECUTOR_FIXTURES {
+            assert!(
+                fixture.expected_replacements > 0,
+                "fixture {} expects no rewrite, which proves nothing",
+                fixture.alias
+            );
+            declared += fixture.expected_replacements;
+            let (out, replacements) = preview_structural_rewrite(
+                fixture.source,
+                fixture.executor,
+                &intent(
+                    "structural_rewrite",
+                    Some(fixture.pattern),
+                    Some(fixture.replacement),
+                ),
+            )
+            .unwrap_or_else(|err| {
+                panic!("{} structural_rewrite failed: {err:#}", fixture.alias)
+            });
+            assert_eq!(
+                replacements, fixture.expected_replacements,
+                "{}: rewrote {replacements} match(es), expected {}",
+                fixture.alias, fixture.expected_replacements
+            );
+            assert!(
+                out.contains(fixture.marker),
+                "{}: rewritten buffer is missing {:?}:\n{out}",
+                fixture.alias,
+                fixture.marker
+            );
+            assert_ne!(out, fixture.source, "{}: buffer is unchanged", fixture.alias);
+            applied += replacements;
+        }
+        assert_eq!(
+            applied, declared,
+            "the planner applied {applied} rewrites but the table declares {declared}"
+        );
+    }
+
+    #[test]
+    fn every_executor_resolves_a_reparse_grammar() {
+        // `structural_rewrite` reparses both its input and its output. An
+        // executor that cannot resolve a grammar would refuse every plan, and
+        // one registered with the *wrong* grammar would validate a file against
+        // another language's rules — which is worse, because it looks like it
+        // worked.
+        for contract in SEMANTIC_EDIT_LANGUAGE_CONTRACTS {
+            let fixture = SEMANTIC_EDIT_EXECUTOR_FIXTURES
+                .iter()
+                .find(|fixture| fixture.executor == contract.executor)
+                .expect("checked by the fixture exhaustiveness guard");
+            let language = contract.executor.reparse_language().unwrap_or_else(|err| {
+                panic!("executor {} has no reparse grammar: {err:#}", contract.id)
+            });
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&language).unwrap();
+            let tree = parser.parse(fixture.source, None).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "executor {} cannot parse its own fixture with its reparse grammar",
+                contract.id
+            );
+        }
+    }
+
+    #[test]
+    fn an_indexed_executor_reparses_with_the_grammar_ast_grep_matched_with() {
+        // `reparse_language` prefers the `tsift-graph` binding, but a
+        // structural rewrite is *matched* with the ast-grep grammar. Those two
+        // agree today for all nine indexed executors — even Kotlin, where
+        // ast-grep's `tree-sitter-kotlin` feature resolves to the same
+        // `-ng` grammar tsift-graph uses. That agreement is load-bearing and
+        // invisible: if a grammar bump ever splits them, the planner would
+        // validate its output against a grammar the matcher never used and the
+        // indexer will not use either. This fails at that moment rather than
+        // silently accepting the mismatch.
+        for contract in SEMANTIC_EDIT_LANGUAGE_CONTRACTS {
+            let Some(graph_lang) = contract.graph_lang else {
+                continue;
+            };
+            let indexed = graph_lang.tree_sitter_language();
+            let matched = contract
+                .executor
+                .ast_grep_lang()
+                .expect("checked by the ast-grep grammar drift guard")
+                .tree_sitter_language();
+            assert_eq!(
+                indexed.abi_version(),
+                matched.abi_version(),
+                "executor {} indexes and matches with different grammar ABIs",
+                contract.id
+            );
+            assert_eq!(
+                indexed.node_kind_count(),
+                matched.node_kind_count(),
+                "executor {} indexes and matches with different grammars",
+                contract.id
+            );
+            for id in 0..indexed.node_kind_count() as u16 {
+                assert_eq!(
+                    indexed.node_kind_for_id(id),
+                    matched.node_kind_for_id(id),
+                    "executor {} grammars disagree on node kind {id}",
+                    contract.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_executor_refuses_a_pattern_that_matched_nothing() {
+        // A structural language that quietly plans an empty edit is the one
+        // failure mode that survives review, so the refusal is part of every
+        // executor's contract rather than of the Rust path alone.
+        for fixture in SEMANTIC_EDIT_EXECUTOR_FIXTURES {
+            let err = preview_structural_rewrite(
+                fixture.source,
+                fixture.executor,
+                &intent(
+                    "structural_rewrite",
+                    Some("zzNoSuchSymbolzz($A)"),
+                    Some("qqReplacementqq($A)"),
+                ),
+            )
+            .unwrap_err();
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("matched nothing") || message.contains("invalid structural pattern"),
+                "{}: expected a refusal, got {message}",
+                fixture.alias
+            );
+        }
+    }
+
+    #[test]
+    fn every_structural_executor_refuses_the_symbol_resolved_kinds() {
+        // The family split routes anything that is neither markdown nor script
+        // to the Rust implementations, so an unrecognized kind must be refused
+        // before it reaches another language's rewriting rules.
+        for contract in SEMANTIC_EDIT_LANGUAGE_CONTRACTS {
+            if contract.family != SemanticEditLanguageFamily::Structural {
+                continue;
+            }
+            assert_eq!(
+                contract.recognized_intents, SEMANTIC_EDIT_STRUCTURAL_KINDS,
+                "executor {} advertises more than structural rewriting",
+                contract.id
+            );
+            let fixture = SEMANTIC_EDIT_EXECUTOR_FIXTURES
+                .iter()
+                .find(|fixture| fixture.executor == contract.executor)
+                .expect("checked by the fixture exhaustiveness guard");
+            let path = std::path::PathBuf::from(fixture.sample_path);
+            for kind in ["rename_symbol", "replace_function_body", "insert_import"] {
+                let err = preview_semantic_edit_content(
+                    fixture.source,
+                    &path,
+                    contract.id,
+                    kind,
+                    &intent("structural_rewrite", None, Some("whatever")),
+                    None,
+                    SemanticEditCallRefContext {
+                        refs: &[],
+                        cross_file_total: 0,
+                    },
+                )
+                .unwrap_err();
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains(contract.name) && message.contains("not supported"),
+                    "executor {} should refuse {kind} by name, got {message}",
+                    contract.id
+                );
+            }
+        }
     }
 
     #[test]

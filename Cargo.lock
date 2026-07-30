@@ -5544,6 +5544,7 @@ dependencies = [
  "ignore",
  "serde",
  "tempfile",
+ "tree-sitter",
 ]
 
 [[package]]

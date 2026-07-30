@@ -8,6 +8,45 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **All 20 structural-only languages are semantic-edit executors.** go, cpp,
+  csharp, dart, java, swift, ruby, php, scala, lua, elixir, haskell, nix,
+  solidity, css, html, json, yaml, hcl, and c now reach `tsift edit-intents`
+  through `structural_rewrite`, with the full planner contract: patch proposal,
+  bounded diff preview, `expected_content_hash` conflict detection, `--verify`
+  in a detached temp worktree, batch rollback. 29 registered executors, up
+  from 9.
+
+  The recorded blocker for this was "each needs per-language tag queries and
+  symbol extraction in `tsift-graph`/`tsift-search` first, because
+  `parse_semantic_edit_source` validates through `executor.graph_lang()`." The
+  first half of that sentence does not follow from the second. Reparsing a
+  rewritten buffer needs a **parser**; tag queries and symbol extraction are
+  what *indexing* needs. Routing the reparse through `graph::Lang` made a
+  navigation capability a precondition for a write capability that never
+  depended on it.
+
+  The contract's `graph_lang` is now `Option<graph::Lang>`, and the reparse
+  grammar resolves in two steps: an indexed language keeps using its
+  `tsift-graph` grammar (Markdown in particular parses through `tsift-md-ast`,
+  not ast-grep's `tree-sitter-md`), and everything else reparses with the same
+  ast-grep grammar its pattern matched against. `AstGrepLang::tree_sitter_language()`
+  exposes that grammar. An executor with neither is a registration bug, refused
+  by name rather than parsed with another language's rules.
+
+  These languages remain **unindexed, unsearchable, and ungraphable** — that
+  tier is unchanged, and the symbol-resolved kinds (`rename_symbol`,
+  `replace_function_body`, `insert_import`) stay unrecognized for them and are
+  refused before the family split, which is what keeps a Go `rename_symbol` from
+  being rewritten by Rust identifier rules.
+
+  Coverage is a conformance table with one fixture per registered executor,
+  exhaustive in both directions, driving the real planner path for all 29. The
+  suite compares the sum of replacements *the planner returned* against the sum
+  the table declares, so it cannot report green over a table that rewrote
+  nothing. Grammar quirks stay row data: C and CSS need a statement terminator,
+  Dart and Solidity match only whole declarations, HCL only as an attribute,
+  JSON needs both sides metavariable-shaped.
+
 - **Kotlin and Bash are semantic-edit executors (structural-only).**
   `structural_rewrite` needs only a grammar to match with and a grammar to
   reparse the result, so a language does not need per-kind rewriting to be a

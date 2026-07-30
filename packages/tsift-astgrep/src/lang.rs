@@ -7,8 +7,11 @@
 //! own enum at the type level means a disabled language fails resolution up
 //! front with a listable set of supported names.
 
+use ast_grep_core::tree_sitter::LanguageExt;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+pub use ast_grep_core::tree_sitter::TSLanguage;
 
 /// A language whose grammar is compiled into this build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -343,6 +346,18 @@ impl AstGrepLang {
             .join(", ")
     }
 
+    /// The tree-sitter grammar ast-grep uses for this language.
+    ///
+    /// Exposed because reparsing a rewritten buffer is a *grammar* need, not an
+    /// *index* need: a caller that must validate the output of a structural
+    /// rewrite requires only a parser, never tag queries or symbol extraction.
+    /// Routing that through the ast-grep grammar means the buffer is validated
+    /// with the same grammar the rewrite was matched against, and keeps
+    /// structural-tier languages usable without a `tsift-graph` binding.
+    pub fn tree_sitter_language(&self) -> TSLanguage {
+        self.support_lang().get_ts_language()
+    }
+
     #[allow(unused)]
     pub(crate) fn support_lang(&self) -> ast_grep_language::SupportLang {
         use ast_grep_language::SupportLang;
@@ -490,6 +505,39 @@ mod tests {
                 lang.name().replace('-', ""),
                 "language {lang} maps to ast-grep SupportLang::{support:?}"
             );
+        }
+    }
+
+    #[test]
+    fn every_listed_language_exposes_a_usable_tree_sitter_grammar() {
+        // `tree_sitter_language()` is what lets a caller outside this crate
+        // reparse a rewritten buffer without a `tsift-graph` binding. A grammar
+        // that resolves but cannot be handed to a `Parser` would push that
+        // failure out to plan time, in the field.
+        for lang in AstGrepLang::all() {
+            let ts_lang = lang.tree_sitter_language();
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&ts_lang)
+                .unwrap_or_else(|err| panic!("language {lang} grammar is unusable: {err}"));
+            assert!(
+                parser.parse("", None).is_some(),
+                "language {lang} grammar could not parse an empty buffer"
+            );
+        }
+
+        // Usable is not enough: a resolver that returned one constant grammar
+        // would satisfy the loop above while silently parsing every language
+        // with another language's rules. No two variants share a grammar, so
+        // the node-kind tables must all differ.
+        for (i, a) in AstGrepLang::all().iter().enumerate() {
+            for b in &AstGrepLang::all()[i + 1..] {
+                let (ta, tb) = (a.tree_sitter_language(), b.tree_sitter_language());
+                let same = ta.node_kind_count() == tb.node_kind_count()
+                    && (0..ta.node_kind_count() as u16)
+                        .all(|id| ta.node_kind_for_id(id) == tb.node_kind_for_id(id));
+                assert!(!same, "languages {a} and {b} resolve to the same grammar");
+            }
         }
     }
 }

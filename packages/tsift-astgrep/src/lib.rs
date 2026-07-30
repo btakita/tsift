@@ -20,7 +20,7 @@ mod lang;
 mod scan;
 
 pub use engine::{RewriteOutcome, StructuralMatch, rewrite_source, search_source};
-pub use lang::AstGrepLang;
+pub use lang::{AstGrepLang, TSLanguage};
 pub use scan::{
     FileMatches, FileRewrite, RewriteReport, ScanOptions, ScanReport, codemod, scan,
 };

@@ -65,21 +65,30 @@ reaches is what it can actually do:
 
 | Fans out to | Meaning | Languages |
 |---|---|---|
-| `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for a semantic-edit executor | rust, python, typescript, javascript, kotlin, bash, markdown |
+| `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, markdown |
 | `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig — `ast-grep-language` ships no Zig grammar |
-| `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` work, but the language is not indexed, not searchable, and has no semantic-edit executor | c, cpp, csharp, css, dart, elixir, go, haskell, hcl, html, java, json, lua, nix, php, ruby, scala, solidity, swift, yaml |
+| `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | c, cpp, csharp, css, dart, elixir, go, haskell, hcl, html, java, json, lua, nix, php, ruby, scala, solidity, swift, yaml |
 
 Structural-only is a deliberate tier, not an oversight. A tree-sitter grammar is
 enough to match and rewrite a shape, but indexing additionally needs per-language
 tag queries and symbol extraction — real work that has to be justified per
-language. Promoting a structural-only language means adding the graph/search
-side first; the `structural_rewrite` edit intent then follows for free, because
-it resolves its grammar through the executor contract.
+language.
 
-Consequence worth stating plainly: a structural-only language can be rewritten
-by `tsift ast-grep rewrite --apply` but **not** by `structural_rewrite`, since
-that intent needs a registered executor to reparse and validate the result. The
-refusal names the languages that do have executors.
+What the tier does **not** cost is the semantic write path. Every language with
+an ast-grep grammar is a registered `structural_rewrite` executor, because
+selecting by shape and reparsing the result need a parser and nothing else. So a
+structural-only language gets the full planner contract — patch proposal,
+bounded diff preview, `expected_content_hash` conflict detection, `--verify` in
+a detached temp worktree, batch rollback — while remaining unsearchable and
+ungraphable. The distinction to hold onto is that indexing buys *navigation*,
+not *rewriting*.
+
+Promoting a structural-only language therefore means adding the graph/search
+side, which unlocks the symbol-resolved kinds (`rename_symbol`,
+`replace_function_body`, `insert_import`) once their per-language rewriting
+exists. Until then those kinds are refused by name, and for an unindexed
+language they are unreachable regardless, since nothing resolves a symbol to
+target.
 
 Resolution failure is asymmetric by design:
 
