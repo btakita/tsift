@@ -12327,3 +12327,78 @@ fn edit_intents_structural_rewrite_verify_uses_temp_worktree_without_mutating_so
         "verify must leave the real tree untouched"
     );
 }
+
+#[test]
+fn structural_only_language_rewrites_via_ast_grep_but_not_via_edit_intents() {
+    // The structural-only tier: ast-grep has a Go grammar, but tsift-graph /
+    // tsift-search have no Go tag queries, so Go has no semantic-edit executor.
+    // `ast-grep rewrite` must work; `structural_rewrite` must refuse rather
+    // than mutate a file it cannot reparse and validate.
+    let dir = tempfile::tempdir().unwrap();
+    let src = "package main\n\nfunc main() {\n\tfoo(1)\n\tfoo(2)\n}\n";
+    fs::write(dir.path().join("main.go"), src).unwrap();
+
+    let rewrite = tsift_bin()
+        .args([
+            "ast-grep",
+            "rewrite",
+            "foo($A)",
+            "bar($A)",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        rewrite.status.success(),
+        "ast-grep rewrite on Go stderr: {}",
+        String::from_utf8_lossy(&rewrite.stderr)
+    );
+    let rewrite_json: serde_json::Value = serde_json::from_slice(&rewrite.stdout).unwrap();
+    let matched = rewrite_json.to_string();
+    assert!(
+        matched.contains("bar($A)") || matched.contains("bar(1)"),
+        "Go should be structurally rewritable: {rewrite_json}"
+    );
+
+    let index = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(index.status.success());
+
+    let input = r#"{
+        "intents": [
+            {
+                "kind": "structural_rewrite",
+                "file": "main.go",
+                "pattern": "foo($A)",
+                "replacement": "bar($A)"
+            }
+        ]
+    }"#;
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ],
+        input,
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = &json["report"]["plans"][0];
+    assert_eq!(plan["status"], "unsupported", "{plan}");
+    assert_eq!(plan["apply_supported"], false, "{plan}");
+    assert!(
+        plan["message"].as_str().unwrap().contains("executor"),
+        "refusal should name the missing executor: {plan}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("main.go")).unwrap(),
+        src,
+        "a refused structural_rewrite must not write"
+    );
+}

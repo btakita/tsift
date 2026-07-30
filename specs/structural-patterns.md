@@ -53,9 +53,33 @@ parser — handing one to the engine is a latent panic. The gated enum makes an
 uncompiled language an up-front resolution failure that names the supported set.
 
 - Language is inferred per file extension unless `--lang` forces one.
-- The tsift `lang-*` features fan out to `tsift-astgrep/lang-*`.
-- **`lang-zig` forwards nothing**: `ast-grep-language` ships no Zig grammar, so
-  Zig is indexable by tsift but not structurally matchable.
+- Aliases follow ast-grep's own `impl_aliases!` table, so a pattern written
+  against ast-grep's documentation resolves the same way here.
+- `.h` resolves to C, matching ripgrep and tree-sitter convention. C++ headers
+  also use `.h`; pass `--lang cpp` to force that.
+
+### Indexable vs structural-only
+
+A tsift `lang-*` feature fans out to up to three crates, and the set a language
+reaches is what it can actually do:
+
+| Fans out to | Meaning | Languages |
+|---|---|---|
+| `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for a semantic-edit executor | rust, python, typescript, javascript, kotlin, bash, markdown |
+| `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig — `ast-grep-language` ships no Zig grammar |
+| `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` work, but the language is not indexed, not searchable, and has no semantic-edit executor | c, cpp, csharp, css, dart, elixir, go, haskell, hcl, html, java, json, lua, nix, php, ruby, scala, solidity, swift, yaml |
+
+Structural-only is a deliberate tier, not an oversight. A tree-sitter grammar is
+enough to match and rewrite a shape, but indexing additionally needs per-language
+tag queries and symbol extraction — real work that has to be justified per
+language. Promoting a structural-only language means adding the graph/search
+side first; the `structural_rewrite` edit intent then follows for free, because
+it resolves its grammar through the executor contract.
+
+Consequence worth stating plainly: a structural-only language can be rewritten
+by `tsift ast-grep rewrite --apply` but **not** by `structural_rewrite`, since
+that intent needs a registered executor to reparse and validate the result. The
+refusal names the languages that do have executors.
 
 Resolution failure is asymmetric by design:
 
@@ -119,6 +143,27 @@ earns the same proof a symbol-resolved one does.
   `expected_content_hash` conflict detection, and batch rollback.
 
 ## Known limits
+
+### Per-grammar pattern quirks
+
+A pattern is parsed by the target grammar as a standalone fragment. Where a
+grammar cannot parse a bare expression, patterns must be spelled differently.
+These are upstream grammar properties, not tsift defects, and each is pinned by
+a test in `lang.rs` so an ast-grep bump cannot silently invalidate this table.
+
+| Language | Quirk | Workaround |
+|---|---|---|
+| **C** | `foo($A)` matches nothing — tree-sitter-c reads it as a *declaration* (`foo` a type, `$A` a declarator), not a call | Add the trailing semicolon: `foo($A);` |
+| **CSS** | `color: $V` matches nothing | Add the trailing semicolon: `color: $V;` |
+| **Dart** | Expression- and statement-level patterns match nothing however they are spelled; the grammar cannot parse a bare expression fragment | Match at declaration granularity: `void main() { print($A); }`. Call-site codemods are **not** available in Dart |
+| **Solidity** | Same as Dart: statement-level patterns match nothing | Match whole declarations: `function f() public { $$$B }` |
+| **Rust** | Macro arguments are `token_tree`, so a call inside `assert_eq!(...)` is invisible | None; patterns aimed at macro-heavy code under-report |
+
+Everything else added in the structural-only tier — go, cpp, csharp, java,
+elixir, haskell, hcl, html, json, lua, nix, php, ruby, scala, swift, yaml —
+matches expression-level patterns directly with no special spelling.
+
+### General
 
 - **Macro bodies are opaque.** tree-sitter parses Rust macro arguments as
   `token_tree`, so `AstGrepLang::from_name($X)` matches a real call but not the

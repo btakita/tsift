@@ -8,6 +8,51 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **20 new structural languages (`tsift ast-grep`).** `ast-grep-language` ships
+  28 grammars; tsift compiled 7 of them. Adds the remaining 20: c, cpp, csharp,
+  css, dart, elixir, go, haskell, hcl, html, java, json, lua, nix, php, ruby,
+  scala, solidity, swift, yaml. `tsift ast-grep search|rewrite` now works across
+  most of the lazily binding set (go, cpp, csharp, dart, java), which is exactly
+  the "same change in nine repos" shape structural patterns are good at.
+
+  These are a deliberate **structural-only** tier: their `lang-*` features fan
+  out to `tsift-astgrep` **only**, not to `tsift-graph`/`tsift-search`. A
+  tree-sitter grammar is enough to match and rewrite a shape, but indexing
+  additionally needs per-language tag queries and symbol extraction. So these
+  languages are matchable and rewritable but **not** indexed, not searchable,
+  and have no semantic-edit executor — which also means `structural_rewrite`
+  refuses them, since it needs an executor to reparse and validate its output.
+  `lang-zig` is the mirror image: indexable, but no ast-grep grammar. Promoting
+  a structural-only language means adding the graph/search side first; the edit
+  intent then follows for free.
+
+  Aliases follow ast-grep's own `impl_aliases!` table so a pattern written
+  against ast-grep's docs resolves identically here. `.h` resolves to C
+  (ripgrep/tree-sitter convention); pass `--lang cpp` to force C++ headers.
+
+  **Four grammars need patterns spelled differently, and this was found by
+  probing each new language live rather than assuming the tier was uniform.**
+  C and CSS need a trailing semicolon (`foo($A);`, `color: $V;`) — without it
+  tree-sitter reads the fragment as a declaration and matches nothing. Dart and
+  Solidity cannot parse a bare expression fragment at all, so they match only at
+  declaration granularity (`void main() { print($A); }`); **Dart therefore does
+  not support call-site codemods**, which is worth flagging because Dart was one
+  of the languages this tier was added for. The other 16 match expression-level
+  patterns directly. Each quirk is pinned by a test so an ast-grep bump cannot
+  silently invalidate the documented workaround, and a companion test asserts
+  go/cpp/java still match call expressions directly — the case the whole tier
+  exists to serve.
+
+  Two new drift guards, because the enum now has four parallel `match` arms and
+  28 variants: one asserts every listed language is reachable from some file
+  extension (a language added to `all()`/`from_name` but forgotten in
+  `from_path` would be `--lang`-selectable while every directory walk silently
+  skipped its files), and one asserts every variant maps to the correspondingly
+  named `SupportLang` (a mismap is a wrong-grammar parse, which is worse than a
+  refusal because it silently under-matches). Both were mutation-checked; the
+  pre-existing name round-trip test stays green under those mutations, which is
+  what shows the new guards cover arms it could not reach.
+
 - **New `structural_rewrite` semantic edit intent.** `tsift edit-intents` now
   accepts a pattern-driven codemod kind that carries `file`, an ast-grep
   `pattern`, and a `replacement` template instead of a resolved symbol. This is
