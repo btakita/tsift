@@ -12252,6 +12252,119 @@ fn edit_intents_structural_rewrite_applies_pattern_codemod() {
 }
 
 #[test]
+fn edit_intents_structural_rewrite_reaches_the_kotlin_and_bash_executors() {
+    // Kotlin and Bash have an ast-grep grammar and graph symbol extraction, so
+    // structural_rewrite reaches them with the full planner contract. The
+    // symbol-resolved kinds do not: they need language-specific rewriting that
+    // no family implements for these two, and must be refused rather than fall
+    // through to the Rust implementations.
+    for (file, body, pattern, replacement, expect_after, absent_after) in [
+        (
+            "Main.kt",
+            "fun main() {\n    foo(1)\n    foo(2)\n}\n",
+            "foo($A)",
+            "bar($A)",
+            "bar(1)",
+            "foo(1)",
+        ),
+        (
+            "run.sh",
+            // Wrapped in a function so `main` is an indexed symbol here too —
+            // the refusal below must come from the executor, not from symbol
+            // resolution failing first.
+            "main() {\n  foo 1\n  foo 2\n}\n",
+            "foo $A",
+            "bar $A",
+            "bar 1",
+            "foo 1",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        // The file has to exist before `init_git_repo` — it commits, and an
+        // empty tree has nothing to commit.
+        fs::write(dir.path().join(file), body).unwrap();
+        init_git_repo(dir.path());
+        // Symbol-resolved kinds need the index, so the refusal below has to be
+        // the executor's, not a missing-index error standing in for it.
+        let indexed = tsift_bin()
+            .args(["index", dir.path().to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            indexed.status.success(),
+            "{file} index stderr: {}",
+            String::from_utf8_lossy(&indexed.stderr)
+        );
+
+        let input = format!(
+            r#"{{"intents": [{{"kind": "structural_rewrite", "file": "{file}",
+                 "pattern": "{pattern}", "replacement": "{replacement}"}}]}}"#
+        );
+        let output = run_tsift_stdin(
+            &[
+                "--envelope",
+                "edit-intents",
+                "--path",
+                dir.path().to_str().unwrap(),
+                "--apply",
+                "--json",
+            ],
+            &input,
+        );
+        assert!(
+            output.status.success(),
+            "{file} structural_rewrite stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let plan = &json["report"]["plans"][0];
+        assert_eq!(plan["status"], "applied", "{file}: {plan}");
+        assert_eq!(json["report"]["applied_total"], 1, "{file}");
+        assert!(
+            plan["patch_proposal"]["files"]
+                .as_array()
+                .is_some_and(|files| !files.is_empty()),
+            "{file}: structural plan should carry a patch proposal: {plan}"
+        );
+
+        let after = fs::read_to_string(dir.path().join(file)).unwrap();
+        assert!(after.contains(expect_after), "{file}: {after}");
+        assert!(!after.contains(absent_after), "{file}: {after}");
+
+        // A symbol-resolved kind is refused, and refused *without writing*.
+        let before = after.clone();
+        let refused = run_tsift_stdin(
+            &[
+                "--envelope",
+                "edit-intents",
+                "--path",
+                dir.path().to_str().unwrap(),
+                "--apply",
+                "--json",
+            ],
+            &format!(
+                r#"{{"intents": [{{"kind": "rename_symbol", "file": "{file}",
+                     "symbol": "main", "new_name": "main2"}}]}}"#
+            ),
+        );
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&refused.stdout),
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert!(
+            combined.contains("is not supported by the"),
+            "{file}: expected an unsupported-kind refusal, got: {combined}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join(file)).unwrap(),
+            before,
+            "{file}: a refused intent must not write"
+        );
+    }
+}
+
+#[test]
 fn edit_intents_structural_rewrite_dry_run_reports_diff_without_writing() {
     let dir = git_indexed_cli_fixture();
     let before = fs::read_to_string(dir.path().join("main.rs")).unwrap();

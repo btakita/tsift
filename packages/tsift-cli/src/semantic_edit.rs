@@ -395,6 +395,13 @@ pub(crate) const SEMANTIC_EDIT_SCRIPT_KINDS: &[&str] = &[
     "insert_import",
     "structural_rewrite",
 ];
+/// Languages with an ast-grep grammar and graph symbol extraction but no
+/// per-kind executor implementation. `structural_rewrite` needs neither: it is
+/// dispatched ahead of the family split and only requires a grammar to match
+/// with and one to reparse the result. The symbol-resolved kinds do need
+/// language-specific rewriting, so they stay unrecognized rather than falling
+/// through to another family's implementation.
+pub(crate) const SEMANTIC_EDIT_STRUCTURAL_KINDS: &[&str] = &["structural_rewrite"];
 pub(crate) const SEMANTIC_EDIT_MARKDOWN_KINDS: &[&str] = &[
     "rename_heading",
     "replace_section_body",
@@ -947,6 +954,8 @@ pub(crate) enum SemanticEditExecutorLanguage {
     JavaScript,
     Jsx,
     Markdown,
+    Kotlin,
+    Bash,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -955,6 +964,9 @@ pub(crate) enum SemanticEditLanguageFamily {
     Python,
     JsLike,
     Markdown,
+    /// Grammar + graph support, but no per-kind rewriting: structural patterns
+    /// only.
+    Structural,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1070,6 +1082,32 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         recognized_intents: SEMANTIC_EDIT_MARKDOWN_KINDS,
         apply_supported_intents: SEMANTIC_EDIT_MARKDOWN_APPLY_KINDS,
         family: SemanticEditLanguageFamily::Markdown,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Kotlin,
+        id: "kotlin",
+        name: "Kotlin",
+        graph_lang: graph::Lang::Kotlin,
+        temp_suffix: ".kt",
+        aliases: &["kotlin", "kt", "kts"],
+        extensions: &["kt", "kts"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
+        formatter: SemanticEditFormatterContract::None,
+    },
+    SemanticEditLanguageContract {
+        executor: SemanticEditExecutorLanguage::Bash,
+        id: "bash",
+        name: "Bash",
+        graph_lang: graph::Lang::Bash,
+        temp_suffix: ".sh",
+        aliases: &["bash", "sh", "shell"],
+        extensions: &["sh", "bash"],
+        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
+        family: SemanticEditLanguageFamily::Structural,
         formatter: SemanticEditFormatterContract::None,
     },
 ];
@@ -1239,6 +1277,24 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             SemanticEditFormatterContract::Prettier,
         ),
         (
+            "kotlin",
+            "Main.kt",
+            SemanticEditExecutorLanguage::Kotlin,
+            "kotlin",
+            SEMANTIC_EDIT_STRUCTURAL_KINDS,
+            SEMANTIC_EDIT_STRUCTURAL_KINDS,
+            SemanticEditFormatterContract::None,
+        ),
+        (
+            "bash",
+            "run.sh",
+            SemanticEditExecutorLanguage::Bash,
+            "bash",
+            SEMANTIC_EDIT_STRUCTURAL_KINDS,
+            SEMANTIC_EDIT_STRUCTURAL_KINDS,
+            SemanticEditFormatterContract::None,
+        ),
+        (
             "markdown",
             "README.md",
             SemanticEditExecutorLanguage::Markdown,
@@ -1257,6 +1313,16 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             SemanticEditFormatterContract::None,
         ),
     ];
+
+    // Every registered contract must appear above: a new executor language
+    // added without a case would otherwise be covered by nothing at all.
+    for contract in SEMANTIC_EDIT_LANGUAGE_CONTRACTS {
+        assert!(
+            cases.iter().any(|case| case.2 == contract.executor),
+            "executor {} has no case in this contract test",
+            contract.id
+        );
+    }
 
     for (language, file, executor, canonical, recognized, apply_supported, formatter) in cases {
         let path = Path::new(file);
@@ -3203,6 +3269,17 @@ fn preview_semantic_edit_content(
     let Some(executor) = semantic_edit_executor_language(language, file_abs) else {
         bail!("no executor registered for language {language:?}");
     };
+    // The family split below routes anything that is not markdown or script to
+    // the Rust implementations. An executor whose contract does not recognize
+    // this kind must be refused here rather than reaching another family's
+    // rewriting by falling through.
+    if !executor.recognized_intents().contains(&kind) {
+        bail!(
+            "semantic edit kind {kind:?} is not supported by the {} executor (supported: {})",
+            executor.name(),
+            executor.recognized_intents().join(", ")
+        );
+    }
     // Structural patterns are language-agnostic by construction, so they are
     // dispatched ahead of the per-family executor split rather than duplicated
     // into each arm.

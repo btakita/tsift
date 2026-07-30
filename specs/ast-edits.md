@@ -115,6 +115,24 @@ Everything downstream — patch proposal, bounded diff preview, formatter policy
 worktree with reindex plus `impact`, `--apply`, and batch rollback — is shared
 with the symbol-resolved kinds and is not re-specified for this kind.
 
+### Structural-only executors
+
+Because `structural_rewrite` needs only a grammar to match with and a grammar to
+reparse the result, a language can be a *structural-only* executor: registered,
+with `structural_rewrite` as its whole recognized-intent set, and no
+language-specific rewriting behind the symbol-resolved kinds. Kotlin and Bash
+are that family today — both have an ast-grep grammar and graph symbol
+extraction, so they get the full planner contract for pattern-driven codemods
+without waiting on per-language rename/import/body implementations.
+
+An executor that does not recognize a kind must be **refused before the family
+split**, not carried into it. The split routes anything that is neither markdown
+nor script to the Rust implementations, so a Kotlin `rename_symbol` would
+otherwise be rewritten by Rust identifier rules and reported as "applied through
+the Kotlin executor" — plausible output produced by the wrong language's logic,
+which is worse than a refusal. The refusal names the executor and its supported
+kinds.
+
 ## Promotion Order
 
 New AST/CST edit operations are promoted narrowly. `insert_import` and `replace_function_body` are the baseline operations because their target ranges and expected diffs are easy to inspect.
@@ -124,5 +142,7 @@ For Rust, `replace_function_body` must select a parsed `function_item` body. Whe
 For Rust, `insert_import` must parse the current source and anchor insertion after the source-file prelude that can safely precede imports: shebangs, crate-level inner doc comments, inner attributes, `use` declarations, and `extern crate` declarations. The emitted mutation is still a minimal textual insertion and must reparse before planning or applying.
 
 Broader rename, move, call-site, and signature operations require additional graph/index proof and tests that cover comments, formatting preservation, unsupported parser states, macro or generated regions, syntax-error work-in-progress files, and verification failures.
+
+A language may therefore be registered as a structural-only executor as soon as it has an ast-grep grammar and graph symbol extraction; the symbol-resolved kinds stay unrecognized for it until their per-language rewriting exists. Coverage for such an executor must include an applied structural codemod *and* a symbol-resolved kind refused without writing — a test that only checks the codemod would pass against a build that silently ran another family's implementation for everything else.
 
 `structural_rewrite` is promoted across every registered executor at once rather than language by language, because its selection and mutation logic are language-independent: the grammar is a parameter, not a code path. What is language-specific — parser validation and formatter policy — is already owned by the executor contract. Coverage must therefore include at least one non-Rust executor and a drift guard asserting that every registered executor resolves an ast-grep grammar, so a newly added executor language cannot advertise structural support it has no parser for.

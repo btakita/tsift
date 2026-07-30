@@ -8,6 +8,26 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **Kotlin and Bash are semantic-edit executors (structural-only).**
+  `structural_rewrite` needs only a grammar to match with and a grammar to
+  reparse the result, so a language does not need per-kind rewriting to be a
+  useful executor. Kotlin and Bash already had both an ast-grep grammar and
+  graph symbol extraction, so `tsift edit-intents` now reaches them with the
+  full planner contract — patch proposal, bounded diff, `expected_content_hash`
+  conflict detection, `--verify` in a temp worktree, batch rollback. Their
+  recognized-intent set is `structural_rewrite` alone; the symbol-resolved kinds
+  stay unrecognized until their per-language rewriting exists.
+
+  This exposed a fall-through worth naming: the family split routes anything
+  that is neither markdown nor script to the **Rust** implementations, so a
+  Kotlin `rename_symbol` was rewritten by Rust identifier rules and reported as
+  "applied through the Kotlin executor" — plausible output from the wrong
+  language's logic, and the catch-all message even called it "the Rust executor
+  yet" on a Kotlin file. An executor that does not recognize a kind is now
+  refused *before* the split, naming the executor and its supported kinds. The
+  regression test asserts both halves: the codemod applies, and the
+  symbol-resolved kind is refused without writing.
+
 - **A mixed-language tree can be scanned with a pattern that is not valid
   everywhere.** Extending the conformance table to drive `scan`/`codemod`
   surfaced this immediately: a pattern is only ever valid for *some* grammars —
