@@ -140,6 +140,12 @@ pub(crate) struct SemanticEditIntentPlan {
     pub(crate) destination_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) target_range: Option<SourceRangePreview>,
+    /// The lines this edit actually rewrote. `target_range` is the *declaration
+    /// span of the resolved symbol* — for a rename it is one line, while the
+    /// edit reaches every call site in the file. Reporting only the former
+    /// invites reading it as the extent of the change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) edited_range: Option<SourceRangePreview>,
     pub(crate) content_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) diff: Option<String>,
@@ -2050,32 +2056,30 @@ fn replace_rust_identifier(content: &str, old: &str, new: &str) -> Result<(Strin
     if old == new {
         bail!("old and new identifiers are identical");
     }
+    rename_identifier_occurrences(content, old, new, graph::Lang::Rust, "Rust")
+}
 
-    let mut out = String::with_capacity(content.len());
-    let mut last = 0;
-    let mut replacements = 0;
-    for (idx, _) in content.match_indices(old) {
-        let before_is_ident = content[..idx]
-            .chars()
-            .next_back()
-            .is_some_and(rust_ident_char);
-        let after_idx = idx + old.len();
-        let after_is_ident = content[after_idx..]
-            .chars()
-            .next()
-            .is_some_and(rust_ident_char);
-        if before_is_ident || after_is_ident {
-            continue;
-        }
-        out.push_str(&content[last..idx]);
-        out.push_str(new);
-        last = after_idx;
-        replacements += 1;
+/// Rename through the grammar rather than through the characters.
+///
+/// This used to be a `match_indices` scan with an identifier-boundary guard in
+/// each family. A boundary guard cannot distinguish an identifier from the same
+/// characters inside a string literal or a comment, so a rename rewrote both —
+/// and rewriting a string literal changes what the program *does*, not what it
+/// is called. `graph::identifier_occurrences` only yields identifier nodes, so
+/// prose and data are excluded by construction.
+fn rename_identifier_occurrences(
+    content: &str,
+    old: &str,
+    new: &str,
+    lang: graph::Lang,
+    language_label: &str,
+) -> Result<(String, usize)> {
+    let occurrences = graph::identifier_occurrences(lang, content.as_bytes(), old)
+        .with_context(|| format!("collecting {language_label} identifier occurrences"))?;
+    if occurrences.is_empty() {
+        bail!("identifier {old:?} was not found as a whole {language_label} identifier");
     }
-    if replacements == 0 {
-        bail!("identifier {old:?} was not found as a whole Rust identifier");
-    }
-    out.push_str(&content[last..]);
+    let (out, replacements) = graph::replace_occurrences(content, &occurrences, new);
     Ok((out, replacements))
 }
 
@@ -2143,35 +2147,14 @@ fn replace_script_identifier(
         bail!("old and new identifiers are identical");
     }
     parse_semantic_edit_source(content, executor, "rename_symbol input")?;
-
-    let mut out = String::with_capacity(content.len());
-    let mut last = 0usize;
-    let mut replacements = 0usize;
-    for (idx, _) in content.match_indices(old) {
-        let before_is_ident = content[..idx]
-            .chars()
-            .next_back()
-            .is_some_and(|ch| script_ident_char(ch, executor));
-        let after_idx = idx + old.len();
-        let after_is_ident = content[after_idx..]
-            .chars()
-            .next()
-            .is_some_and(|ch| script_ident_char(ch, executor));
-        if before_is_ident || after_is_ident {
-            continue;
-        }
-        out.push_str(&content[last..idx]);
-        out.push_str(new);
-        last = after_idx;
-        replacements += 1;
-    }
-    if replacements == 0 {
+    let Some(lang) = executor.contract().graph_lang else {
         bail!(
-            "identifier {old:?} was not found as a whole {} identifier",
+            "rename_symbol needs an indexed grammar; the {} executor has none",
             executor.name()
         );
-    }
-    out.push_str(&content[last..]);
+    };
+    let (out, replacements) =
+        rename_identifier_occurrences(content, old, new, lang, executor.name())?;
     parse_semantic_edit_source(&out, executor, "rename_symbol")?;
     Ok((out, replacements))
 }
@@ -3904,6 +3887,43 @@ fn preview_structural_rewrite(
     Ok((outcome.source, outcome.replacements))
 }
 
+/// First and last line that differ between two revisions of one file.
+///
+/// Line-based rather than byte-based because that is what a reviewer scrolls
+/// to. Returns `None` when nothing changed.
+fn changed_line_range(before: &str, after: &str, total_lines: usize) -> Option<SourceRangePreview> {
+    if before == after {
+        return None;
+    }
+    let before_lines: Vec<&str> = before.lines().collect();
+    let after_lines: Vec<&str> = after.lines().collect();
+    let common_prefix = before_lines
+        .iter()
+        .zip(after_lines.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let max_suffix = before_lines
+        .len()
+        .min(after_lines.len())
+        .saturating_sub(common_prefix);
+    let common_suffix = before_lines
+        .iter()
+        .rev()
+        .zip(after_lines.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(max_suffix);
+    let start = common_prefix + 1;
+    let end = after_lines.len().saturating_sub(common_suffix).max(start);
+    Some(SourceRangePreview {
+        start,
+        end,
+        total_lines,
+        truncated_before: false,
+        truncated_after: false,
+    })
+}
+
 fn preview_semantic_edit_content(
     content: &str,
     file_abs: &Path,
@@ -4651,6 +4671,9 @@ fn plan_semantic_edit_intent(
             target_file,
             destination_file,
             target_range,
+            // Filled in on the apply path, where both revisions of the file
+            // exist; a planned-but-not-applied intent has no edited range yet.
+            edited_range: None,
             content_hash,
             diff,
             patch_proposal,
@@ -4786,6 +4809,16 @@ fn apply_semantic_edit_drafts(
             },
         )
         .with_context(|| format!("applying {}", draft.plan.handle))?;
+        draft.plan.edited_range = changed_line_range(
+            &buffer.current,
+            &updated,
+            draft
+                .plan
+                .target_range
+                .as_ref()
+                .map(|range| range.total_lines)
+                .unwrap_or_else(|| updated.lines().count()),
+        );
         buffer.current = updated;
         buffer.intents += replacements.max(1);
         draft.plan.status = "applied".to_string();
@@ -5312,7 +5345,10 @@ pub(crate) fn cmd_edit_intents(
                 plan.target_file
             );
             if let Some(range) = &plan.target_range {
-                println!("    range: {}-{}", range.start, range.end);
+                println!("    target range: {}-{}", range.start, range.end);
+            }
+            if let Some(range) = &plan.edited_range {
+                println!("    edited range: {}-{}", range.start, range.end);
             }
             if let Some(formatter) = &plan.formatter {
                 println!("    formatter: {formatter}");
@@ -5548,6 +5584,130 @@ where
     let results = ok_results_from_applied(&applied);
     cleanup_edit_backups(&applied);
     Ok(results)
+}
+
+#[cfg(test)]
+mod rename_symbol_tests {
+    use super::*;
+
+    const RUST_SRC: &str = r#"/// doc widget_count
+pub fn widget_count() -> usize { 3 }
+
+pub fn describe() -> String {
+    // widget_count comment
+    let label = "widget_count";
+    format!("{label}: {}", widget_count())
+}
+"#;
+
+    /// The rename used to be a substring scan, so it rewrote the doc comment,
+    /// the line comment, and the string literal too. The string literal is the
+    /// one that matters: that value is data, and renaming it changes behaviour.
+    /// Each position is asserted on its own — a test that only counted
+    /// replacements would pass while renaming the wrong three.
+    #[test]
+    fn rust_rename_leaves_comments_and_string_literals_alone() {
+        let (out, replacements) =
+            replace_rust_identifier(RUST_SRC, "widget_count", "gadget_count").unwrap();
+        assert_eq!(replacements, 2, "expected the definition and the call");
+        assert!(
+            out.contains("pub fn gadget_count()"),
+            "definition not renamed:\n{out}"
+        );
+        assert!(
+            out.contains("gadget_count())"),
+            "call inside format! not renamed:\n{out}"
+        );
+        assert!(
+            out.contains("/// doc widget_count"),
+            "doc comment was renamed:\n{out}"
+        );
+        assert!(
+            out.contains("// widget_count comment"),
+            "line comment was renamed:\n{out}"
+        );
+        assert!(
+            out.contains("let label = \"widget_count\";"),
+            "string literal was renamed:\n{out}"
+        );
+    }
+
+    /// tree-sitter parses Rust macro arguments as an opaque `token_tree`, which
+    /// is why structural patterns under-report inside `assert_eq!`. The
+    /// identifiers within it are still named `identifier` nodes, so an AST
+    /// rename must not regress against the old scan here.
+    #[test]
+    fn rust_rename_reaches_calls_inside_macro_arguments() {
+        let src = "fn f() { assert_eq!(widget_count(), 3); }\n";
+        let (out, replacements) = replace_rust_identifier(src, "widget_count", "gadget_count")
+            .expect("macro-argument call should be renamable");
+        assert_eq!(replacements, 1);
+        assert!(out.contains("assert_eq!(gadget_count(), 3)"), "{out}");
+    }
+
+    /// A name that appears only in prose is not a symbol, so the rename has
+    /// nothing to do and must say so rather than editing the prose.
+    #[test]
+    fn rust_rename_refuses_a_name_that_only_appears_in_prose() {
+        let src = "// widget_count is not defined here\nfn other() {}\n";
+        let err = replace_rust_identifier(src, "widget_count", "gadget_count")
+            .expect_err("a comment mention is not a rename target");
+        assert!(
+            err.to_string().contains("was not found"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn python_rename_leaves_comments_and_string_literals_alone() {
+        let src = "def widget_count():\n    # widget_count comment\n    return \"widget_count\"\n\nwidget_count()\n";
+        let (out, replacements) = replace_script_identifier(
+            src,
+            "widget_count",
+            "gadget_count",
+            SemanticEditExecutorLanguage::Python,
+        )
+        .unwrap();
+        assert_eq!(replacements, 2);
+        assert!(out.contains("def gadget_count():"), "{out}");
+        assert!(out.contains("\ngadget_count()"), "{out}");
+        assert!(out.contains("# widget_count comment"), "{out}");
+        assert!(out.contains("return \"widget_count\""), "{out}");
+    }
+
+    #[test]
+    fn typescript_rename_leaves_comments_and_string_literals_alone() {
+        let src = "// widgetCount comment\nexport function widgetCount(): number { return 1; }\nconst label = \"widgetCount\";\nwidgetCount();\n";
+        let (out, replacements) = replace_script_identifier(
+            src,
+            "widgetCount",
+            "gadgetCount",
+            SemanticEditExecutorLanguage::TypeScript,
+        )
+        .unwrap();
+        assert_eq!(replacements, 2);
+        assert!(out.contains("export function gadgetCount()"), "{out}");
+        assert!(out.contains("\ngadgetCount();"), "{out}");
+        assert!(out.contains("// widgetCount comment"), "{out}");
+        assert!(out.contains("const label = \"widgetCount\";"), "{out}");
+    }
+
+    /// `target_range` is the resolved symbol's declaration span, so for a
+    /// rename it is one line while the edit reaches every call site in the
+    /// file. `edited_range` is the one that describes the change.
+    #[test]
+    fn changed_line_range_spans_the_whole_edit_not_the_declaration() {
+        let (after, _) = replace_rust_identifier(RUST_SRC, "widget_count", "gadget_count").unwrap();
+        let range = changed_line_range(RUST_SRC, &after, RUST_SRC.lines().count())
+            .expect("the rename changed the file");
+        assert_eq!(range.start, 2, "declaration is on line 2");
+        assert_eq!(range.end, 7, "the call inside format! is on line 7");
+    }
+
+    #[test]
+    fn changed_line_range_is_none_when_nothing_changed() {
+        assert!(changed_line_range(RUST_SRC, RUST_SRC, 8).is_none());
+    }
 }
 
 #[cfg(test)]

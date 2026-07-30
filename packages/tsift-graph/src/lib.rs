@@ -13,6 +13,9 @@ pub use lang::{Lang, Symbol};
 pub mod complexity;
 pub use complexity::{ComplexityMetrics, LanguageExtractor, LanguageRegistry};
 
+pub mod rename;
+pub use rename::{IdentifierOccurrence, identifier_occurrences, replace_occurrences};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSite {
     pub callee: String,
