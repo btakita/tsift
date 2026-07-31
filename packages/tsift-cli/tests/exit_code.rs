@@ -12858,3 +12858,97 @@ fn edit_intents_refuses_a_structural_only_rename_at_the_index_layer() {
         "a refused rename must not write"
     );
 }
+
+#[test]
+fn edit_intents_rename_leaves_a_same_named_field_and_local_alone() {
+    // The grammar spells a Rust struct field and a method call the same way
+    // (`field_identifier`), and a GDScript `func` and a local `var` the same
+    // way (`name`). Without the resolved symbol kind the walk cannot tell them
+    // apart, so a rename rewrote all of them. This drives the real planner, not
+    // the occurrence walk, because the symbol kind has to survive the whole
+    // path from the index to the rewrite for the narrowing to be reachable.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("meter.rs"),
+        "pub struct Meter { pub widget_count: usize }\n\
+         pub fn widget_count() -> usize { 3 }\n\
+         impl Meter {\n\
+         \x20   pub fn widget_count(&self) -> usize { self.widget_count }\n\
+         }\n\
+         pub fn total(m: &Meter) -> usize { m.widget_count() + m.widget_count + widget_count() }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("player.gd"),
+        "func widget_count():\n\tvar widget_count = 1\n\treturn 2\n\nfunc caller():\n\treturn widget_count()\n",
+    )
+    .unwrap();
+    let indexed = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    for file in ["meter.rs", "player.gd"] {
+        let input = format!(
+            r#"{{"intents":[{{"kind":"rename_symbol","symbol":"widget_count","file":"{file}","new_name":"gadget_count"}}]}}"#
+        );
+        let output = run_tsift_stdin(
+            &[
+                "--envelope",
+                "edit-intents",
+                "--path",
+                dir.path().to_str().unwrap(),
+                "--apply",
+                "--json",
+            ],
+            &input,
+        );
+        assert!(
+            output.status.success(),
+            "{file} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["report"]["applied_total"], 1, "{file}: {json}");
+    }
+
+    let rust = fs::read_to_string(dir.path().join("meter.rs")).unwrap();
+    // Renamed: every callable position, including the method call, which the
+    // narrowing must not drop.
+    assert!(rust.contains("pub fn gadget_count() -> usize"), "{rust}");
+    assert!(rust.contains("pub fn gadget_count(&self)"), "{rust}");
+    assert!(rust.contains("m.gadget_count() +"), "{rust}");
+    assert!(rust.contains("+ gadget_count()"), "{rust}");
+    // Untouched: every field position.
+    // rustfmt reflows the applied buffer, so the field declaration is asserted
+    // on its own line rather than as the original one-liner.
+    assert!(
+        rust.contains("pub widget_count: usize,"),
+        "the field declaration was renamed: {rust}"
+    );
+    assert!(
+        !rust.contains("fn widget_count"),
+        "a callable position was left behind: {rust}"
+    );
+    assert!(
+        rust.contains("self.widget_count"),
+        "a field read was renamed: {rust}"
+    );
+    assert!(
+        rust.contains("+ m.widget_count +"),
+        "a field read was renamed: {rust}"
+    );
+
+    let gdscript = fs::read_to_string(dir.path().join("player.gd")).unwrap();
+    assert!(gdscript.contains("func gadget_count():"), "{gdscript}");
+    assert!(gdscript.contains("return gadget_count()"), "{gdscript}");
+    assert!(
+        gdscript.contains("var widget_count = 1"),
+        "the local var declaration was renamed: {gdscript}"
+    );
+}

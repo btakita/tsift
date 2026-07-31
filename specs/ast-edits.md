@@ -195,6 +195,53 @@ literal. `word` occurrences are therefore restricted to the declaration and
 command-name positions; `variable_name` needs no such guard, because it is only
 ever a variable.
 
+### Which symbol a rename is renaming
+
+A node-kind filter is coarser than the language. Several grammars spell two
+unrelated declarations identically: a Rust struct field and the method in
+`x.method()` are both `field_identifier`; a GDScript `func` and a local `var`
+are both `name`. Kind alone therefore has a rename of one rewrite the other.
+
+The resolved symbol's indexed kind is the missing input, and it is already
+available — the planner had to resolve the symbol before it could plan
+anything. It maps onto the small set a grammar can actually check (callable,
+signal, type, value), and the occurrence walk drops positions that cannot be
+that thing: a function rename skips `struct S { count: usize }`, `S { count: 1 }`,
+and `x.count` while keeping `x.count()`; a GDScript function rename skips
+`var count`, and a variable rename skips `func count`.
+
+Three rules bound this, and each is a refusal to guess rather than a
+convenience:
+
+- **Only unambiguous positions are dropped.** A bare GDScript `count`
+  reference, or a Rust `x.count()` that might be a trait method on an unrelated
+  type, stays. Under-renaming leaves a call site pointing at a name that no
+  longer exists, which is a worse failure than the over-renaming it avoids —
+  the caller sees a broken build either way, but only under-renaming reports
+  success.
+- **A dropped declaration that *shadows* the target is a refusal, not a
+  narrowing.** Keeping a GDScript local `var count` while still rewriting
+  `return count` would leave the declaration on the old name and its read on
+  the new one, which is incoherent in a way neither renaming both nor renaming
+  neither is. Where a rejected declaration shadows the target and an
+  unattributable reference to it survives, the rename refuses and names the
+  shadow's line — the same principle as refusing a cross-file reference the
+  call graph cannot attribute. A callee is never ambiguous: `count()` is the
+  function whatever else is in scope, so a shadow that is only ever called does
+  not trigger the refusal. Rust needs none of this, because a field and a
+  function are reached through different syntax and no reference between them
+  is ambiguous.
+- **An unresolved or unrecognized symbol kind narrows nothing.** A new capture
+  name added to `Lang::symbol_query` without a decision about what it is falls
+  through to the permissive answer; it must not silently start dropping
+  occurrences.
+- **Macro bodies are exempt by construction.** tree-sitter parses Rust macro
+  arguments as an opaque `token_tree`, so `m.count` inside `format!` is a bare
+  `identifier` with no `field_expression` around it and the position rule has
+  nothing to read. It is renamed. That is the same opacity that lets the walk
+  reach real call sites inside `assert_eq!`, so it is a known and tested
+  limitation rather than an oversight.
+
 ### Conformance fixtures
 
 Two tables, each exhaustive in both directions against the recognized-intent

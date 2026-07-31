@@ -14,7 +14,10 @@ pub mod complexity;
 pub use complexity::{ComplexityMetrics, LanguageExtractor, LanguageRegistry};
 
 pub mod rename;
-pub use rename::{IdentifierOccurrence, identifier_occurrences, replace_occurrences};
+pub use rename::{
+    IdentifierOccurrence, RenameTarget, identifier_occurrences, identifier_occurrences_for,
+    replace_occurrences,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSite {

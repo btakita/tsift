@@ -693,6 +693,19 @@ fn resolve_semantic_edit_call_refs(
 
 /// The executor family a file renames within. `None` means the file has no
 /// registered executor, which cannot match any target and so is excluded.
+/// What the index resolved this rename target to be, for the occurrence walk.
+///
+/// A grammar can tell a struct field from a function call only when it is told
+/// which of the two it is looking for. With no resolved symbol there is nothing
+/// to narrow by, and the walk keeps every identifier kind.
+fn semantic_edit_rename_target(
+    target_symbol: Option<&SemanticEditSymbolTarget>,
+) -> graph::RenameTarget {
+    target_symbol
+        .map(|symbol| graph::RenameTarget::from_indexed_kind(&symbol.kind))
+        .unwrap_or_default()
+}
+
 fn semantic_edit_rename_family(file_abs: &Path) -> Option<&'static str> {
     let language = semantic_edit_language_for_file(file_abs);
     semantic_edit_executor_language(&language, file_abs).map(|executor| executor.rename_family())
@@ -813,6 +826,7 @@ fn semantic_edit_rename_patch_inputs(
     _root: &Path,
     rename_scope: Option<&(String, SemanticEditRenameScope)>,
     new_name: Option<&str>,
+    target: graph::RenameTarget,
 ) -> Result<Vec<SemanticEditRenameFilePreview>> {
     let Some((symbol, scope)) = rename_scope else {
         return Ok(Vec::new());
@@ -834,7 +848,7 @@ fn semantic_edit_rename_patch_inputs(
         // A caller file that no longer mentions the symbol is not an error: the
         // index can lag a deletion. It simply contributes no patch.
         let Ok((after, replacements)) =
-            rename_identifier_occurrences(&before, symbol, new_name, lang, executor.name())
+            rename_identifier_occurrences(&before, symbol, new_name, lang, executor.name(), target)
         else {
             continue;
         };
@@ -1970,6 +1984,10 @@ struct SemanticEditRenameFixture {
     alias: &'static str,
     source: &'static str,
     symbol: &'static str,
+    /// The indexed symbol kind the planner would resolve, as a capture name
+    /// from `Lang::symbol_query`. Rows carry it rather than defaulting to
+    /// "unresolved" so the kind-directed narrowing is exercised, not bypassed.
+    symbol_kind: &'static str,
     new_name: &'static str,
     /// Must be non-zero: a fixture that renames nothing proves nothing.
     expected_replacements: usize,
@@ -1985,15 +2003,29 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
     SemanticEditRenameFixture {
         executor: SemanticEditExecutorLanguage::Rust,
         alias: "rust",
-        source: "/// doc widget_count\nfn widget_count() -> usize { 3 }\nfn describe() -> String {\n    // widget_count comment\n    let label = \"widget_count\";\n    format!(\"{label}: {}\", widget_count())\n}\n",
+        // A struct field, a field read, an inherent method, and a method call
+        // are all spelled `field_identifier` here. Only the callable positions
+        // can be the function being renamed, and the method call must stay —
+        // dropping it would leave a call site broken, which is the failure the
+        // narrowing must not trade for.
+        source: "/// doc widget_count\nstruct Meter { widget_count: usize }\nfn widget_count() -> usize { 3 }\nimpl Meter { fn widget_count(&self) -> usize { self.widget_count } }\nfn describe(m: &Meter) -> String {\n    // widget_count comment\n    let label = \"widget_count\";\n    let total = m.widget_count;\n    let called = m.widget_count();\n    let _ = (total, called);\n    format!(\"{label}: {}\", widget_count())\n}\n",
         symbol: "widget_count",
+        symbol_kind: "function",
         new_name: "gadget_count",
-        expected_replacements: 2,
-        renamed: &["fn gadget_count()", "gadget_count())"],
+        expected_replacements: 4,
+        renamed: &[
+            "fn gadget_count() -> usize",
+            "fn gadget_count(&self)",
+            "let called = m.gadget_count();",
+            "gadget_count())",
+        ],
         untouched: &[
             "/// doc widget_count",
             "// widget_count comment",
             "\"widget_count\"",
+            "struct Meter { widget_count: usize }",
+            "{ self.widget_count }",
+            "let total = m.widget_count;",
         ],
     },
     SemanticEditRenameFixture {
@@ -2001,6 +2033,7 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
         alias: "python",
         source: "def widget_count():\n    # widget_count comment\n    return \"widget_count\"\n\nwidget_count()\n",
         symbol: "widget_count",
+        symbol_kind: "function",
         new_name: "gadget_count",
         expected_replacements: 2,
         renamed: &["def gadget_count()", "gadget_count()\n"],
@@ -2011,6 +2044,7 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
         alias: "typescript",
         source: "// widgetCount comment\nfunction widgetCount(): number { return 1; }\nconst label = \"widgetCount\";\nwidgetCount();\n",
         symbol: "widgetCount",
+        symbol_kind: "function",
         new_name: "gadgetCount",
         expected_replacements: 2,
         renamed: &["function gadgetCount()", "gadgetCount();"],
@@ -2021,6 +2055,7 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
         alias: "tsx",
         source: "// widgetCount comment\nfunction widgetCount(): number { return 1; }\nconst label = \"widgetCount\";\nconst App = () => widgetCount();\n",
         symbol: "widgetCount",
+        symbol_kind: "function",
         new_name: "gadgetCount",
         expected_replacements: 2,
         renamed: &["function gadgetCount()", "=> gadgetCount()"],
@@ -2031,6 +2066,7 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
         alias: "javascript",
         source: "// widgetCount comment\nfunction widgetCount() { return 1; }\nconst label = \"widgetCount\";\nwidgetCount();\n",
         symbol: "widgetCount",
+        symbol_kind: "function",
         new_name: "gadgetCount",
         expected_replacements: 2,
         renamed: &["function gadgetCount()", "gadgetCount();"],
@@ -2041,6 +2077,7 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
         alias: "jsx",
         source: "// widgetCount comment\nfunction widgetCount() { return 1; }\nconst label = \"widgetCount\";\nwidgetCount();\n",
         symbol: "widgetCount",
+        symbol_kind: "function",
         new_name: "gadgetCount",
         expected_replacements: 2,
         renamed: &["function gadgetCount()", "gadgetCount();"],
@@ -2051,6 +2088,7 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
         alias: "kotlin",
         source: "// widgetCount comment\nfun widgetCount(): Int { return 1 }\nval label = \"widgetCount\"\nfun caller(): Int { return widgetCount() }\n",
         symbol: "widgetCount",
+        symbol_kind: "function",
         new_name: "gadgetCount",
         expected_replacements: 2,
         renamed: &["fun gadgetCount()", "return gadgetCount()"],
@@ -2064,6 +2102,7 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
         // is data.
         source: "widget_count() {\n  echo widget_count\n  local label=\"widget_count\"\n  # widget_count comment\n}\nwidget_count\n",
         symbol: "widget_count",
+        symbol_kind: "function",
         new_name: "gadget_count",
         expected_replacements: 2,
         renamed: &["gadget_count() {", "}\ngadget_count\n"],
@@ -2078,6 +2117,7 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
         alias: "zig",
         source: "// widget_count comment\npub fn widget_count() u32 {\n    const label = \"widget_count\";\n    _ = label;\n    return 3;\n}\npub fn caller() u32 { return widget_count(); }\n",
         symbol: "widget_count",
+        symbol_kind: "function",
         new_name: "gadget_count",
         expected_replacements: 2,
         renamed: &["pub fn gadget_count()", "return gadget_count();"],
@@ -2086,12 +2126,22 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
     SemanticEditRenameFixture {
         executor: SemanticEditExecutorLanguage::GdScript,
         alias: "gdscript",
-        source: "# widget_count comment\nfunc widget_count():\n\tvar label = \"widget_count\"\n\treturn label\n\nfunc caller():\n\treturn widget_count()\n",
+        // `func widget_count` and `var widget_count` are both `name` nodes;
+        // only the `func` can be the function being renamed.
+        source: "# widget_count comment\nfunc widget_count():\n\tvar widget_count = \"widget_count\"\n\treturn 1\n\nfunc caller():\n\treturn widget_count()\n",
         symbol: "widget_count",
+        symbol_kind: "function",
         new_name: "gadget_count",
+        // The `func` declaration and the call. The shadowing local's
+        // declaration is excluded; nothing reads it by name, so there is no
+        // ambiguous reference and the rename does not have to refuse.
         expected_replacements: 2,
         renamed: &["func gadget_count():", "return gadget_count()"],
-        untouched: &["# widget_count comment", "\"widget_count\""],
+        untouched: &[
+            "# widget_count comment",
+            "\"widget_count\"",
+            "var widget_count =",
+        ],
     },
 ];
 
@@ -2472,13 +2522,18 @@ fn validate_rust_identifier(name: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
-fn replace_rust_identifier(content: &str, old: &str, new: &str) -> Result<(String, usize)> {
+fn replace_rust_identifier(
+    content: &str,
+    old: &str,
+    new: &str,
+    target: graph::RenameTarget,
+) -> Result<(String, usize)> {
     validate_rust_identifier(old, "symbol")?;
     validate_rust_identifier(new, "new_name")?;
     if old == new {
         bail!("old and new identifiers are identical");
     }
-    rename_identifier_occurrences(content, old, new, graph::Lang::Rust, "Rust")
+    rename_identifier_occurrences(content, old, new, graph::Lang::Rust, "Rust", target)
 }
 
 /// Rename through the grammar rather than through the characters.
@@ -2495,8 +2550,9 @@ fn rename_identifier_occurrences(
     new: &str,
     lang: graph::Lang,
     language_label: &str,
+    target: graph::RenameTarget,
 ) -> Result<(String, usize)> {
-    let occurrences = graph::identifier_occurrences(lang, content.as_bytes(), old)
+    let occurrences = graph::identifier_occurrences_for(lang, content.as_bytes(), old, target)
         .with_context(|| format!("collecting {language_label} identifier occurrences"))?;
     if occurrences.is_empty() {
         bail!("identifier {old:?} was not found as a whole {language_label} identifier");
@@ -2562,6 +2618,7 @@ fn replace_script_identifier(
     old: &str,
     new: &str,
     executor: SemanticEditExecutorLanguage,
+    target: graph::RenameTarget,
 ) -> Result<(String, usize)> {
     validate_script_identifier(old, "symbol", executor)?;
     validate_script_identifier(new, "new_name", executor)?;
@@ -2576,7 +2633,7 @@ fn replace_script_identifier(
         );
     };
     let (out, replacements) =
-        rename_identifier_occurrences(content, old, new, lang, executor.name())?;
+        rename_identifier_occurrences(content, old, new, lang, executor.name(), target)?;
     parse_semantic_edit_source(&out, executor, "rename_symbol")?;
     Ok((out, replacements))
 }
@@ -2592,6 +2649,7 @@ fn replace_indexed_identifier(
     old: &str,
     new: &str,
     executor: SemanticEditExecutorLanguage,
+    target: graph::RenameTarget,
 ) -> Result<(String, usize)> {
     validate_indexed_identifier(old, "symbol", executor)?;
     validate_indexed_identifier(new, "new_name", executor)?;
@@ -2606,7 +2664,7 @@ fn replace_indexed_identifier(
         );
     };
     let (out, replacements) =
-        rename_identifier_occurrences(content, old, new, lang, executor.name())?;
+        rename_identifier_occurrences(content, old, new, lang, executor.name(), target)?;
     parse_semantic_edit_source(&out, executor, "rename_symbol")?;
     Ok((out, replacements))
 }
@@ -4442,6 +4500,7 @@ fn preview_semantic_edit_content(
                     .as_deref()
                     .context("rename_symbol requires new_name")?,
                 executor,
+                semantic_edit_rename_target(target_symbol),
             ),
             _ => bail!(
                 "semantic edit kind {kind:?} is not supported by the {} executor yet",
@@ -4459,6 +4518,7 @@ fn preview_semantic_edit_content(
                     .as_deref()
                     .context("rename_symbol requires new_name")?,
                 executor,
+                semantic_edit_rename_target(target_symbol),
             ),
             "replace_function_body" => replace_script_function_body(
                 content,
@@ -4505,6 +4565,7 @@ fn preview_semantic_edit_content(
                 .new_name
                 .as_deref()
                 .context("rename_symbol requires new_name")?,
+            semantic_edit_rename_target(target_symbol),
         ),
         "replace_function_body" => replace_rust_function_body(
             content,
@@ -5131,6 +5192,7 @@ fn plan_semantic_edit_intent(
                             root,
                             rename_scope.as_ref(),
                             intent.new_name.as_deref(),
+                            semantic_edit_rename_target(target_symbol.as_ref()),
                         )
                         .and_then(|extra| {
                             let mut inputs = vec![SemanticEditPatchFileInput {
@@ -5353,6 +5415,7 @@ fn apply_semantic_edit_drafts(
                 .as_ref()
                 .map(|symbol| symbol.name.clone())
                 .context("rename_symbol requires a resolved target symbol")?;
+            let rename_target = semantic_edit_rename_target(draft.plan.target_symbol.as_ref());
             let new_name = intents[idx]
                 .new_name
                 .clone()
@@ -5384,6 +5447,7 @@ fn apply_semantic_edit_drafts(
                     &new_name,
                     lang,
                     executor.name(),
+                    rename_target,
                 ) else {
                     continue;
                 };
@@ -6215,7 +6279,7 @@ pub fn describe() -> String {
     #[test]
     fn rust_rename_leaves_comments_and_string_literals_alone() {
         let (out, replacements) =
-            replace_rust_identifier(RUST_SRC, "widget_count", "gadget_count").unwrap();
+            replace_rust_identifier(RUST_SRC, "widget_count", "gadget_count", graph::RenameTarget::Callable).unwrap();
         assert_eq!(replacements, 2, "expected the definition and the call");
         assert!(
             out.contains("pub fn gadget_count()"),
@@ -6246,7 +6310,7 @@ pub fn describe() -> String {
     #[test]
     fn rust_rename_reaches_calls_inside_macro_arguments() {
         let src = "fn f() { assert_eq!(widget_count(), 3); }\n";
-        let (out, replacements) = replace_rust_identifier(src, "widget_count", "gadget_count")
+        let (out, replacements) = replace_rust_identifier(src, "widget_count", "gadget_count", graph::RenameTarget::Callable)
             .expect("macro-argument call should be renamable");
         assert_eq!(replacements, 1);
         assert!(out.contains("assert_eq!(gadget_count(), 3)"), "{out}");
@@ -6257,7 +6321,7 @@ pub fn describe() -> String {
     #[test]
     fn rust_rename_refuses_a_name_that_only_appears_in_prose() {
         let src = "// widget_count is not defined here\nfn other() {}\n";
-        let err = replace_rust_identifier(src, "widget_count", "gadget_count")
+        let err = replace_rust_identifier(src, "widget_count", "gadget_count", graph::RenameTarget::Callable)
             .expect_err("a comment mention is not a rename target");
         assert!(
             err.to_string().contains("was not found"),
@@ -6273,6 +6337,7 @@ pub fn describe() -> String {
             "widget_count",
             "gadget_count",
             SemanticEditExecutorLanguage::Python,
+            graph::RenameTarget::Callable,
         )
         .unwrap();
         assert_eq!(replacements, 2);
@@ -6290,6 +6355,7 @@ pub fn describe() -> String {
             "widgetCount",
             "gadgetCount",
             SemanticEditExecutorLanguage::TypeScript,
+            graph::RenameTarget::Callable,
         )
         .unwrap();
         assert_eq!(replacements, 2);
@@ -6304,7 +6370,7 @@ pub fn describe() -> String {
     /// file. `edited_range` is the one that describes the change.
     #[test]
     fn changed_line_range_spans_the_whole_edit_not_the_declaration() {
-        let (after, _) = replace_rust_identifier(RUST_SRC, "widget_count", "gadget_count").unwrap();
+        let (after, _) = replace_rust_identifier(RUST_SRC, "widget_count", "gadget_count", graph::RenameTarget::Callable).unwrap();
         let range = changed_line_range(RUST_SRC, &after, RUST_SRC.lines().count())
             .expect("the rename changed the file");
         assert_eq!(range.start, 2, "declaration is on line 2");
@@ -6570,10 +6636,10 @@ mod structural_rewrite_tests {
         }
     }
 
-    fn semantic_edit_symbol_target(name: &str) -> SemanticEditSymbolTarget {
+    fn semantic_edit_symbol_target(name: &str, kind: &str) -> SemanticEditSymbolTarget {
         SemanticEditSymbolTarget {
             name: name.to_string(),
-            kind: "function".to_string(),
+            kind: kind.to_string(),
             language: String::new(),
             file: String::new(),
             line: 1,
@@ -6760,7 +6826,7 @@ mod structural_rewrite_tests {
                 "fixture{}",
                 fixture.executor.contract().temp_suffix
             ));
-            let target = semantic_edit_symbol_target(fixture.symbol);
+            let target = semantic_edit_symbol_target(fixture.symbol, fixture.symbol_kind);
             let (out, replacements) = preview_semantic_edit_content(
                 fixture.source,
                 &path,
@@ -6810,7 +6876,7 @@ mod structural_rewrite_tests {
                 "fixture{}",
                 fixture.executor.contract().temp_suffix
             ));
-            let target = semantic_edit_symbol_target("zzNoSuchSymbolzz");
+            let target = semantic_edit_symbol_target("zzNoSuchSymbolzz", fixture.symbol_kind);
             let err = preview_semantic_edit_content(
                 fixture.source,
                 &path,

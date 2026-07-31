@@ -8,6 +8,46 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **A rename now knows which kind of symbol it is renaming.** Renaming a Rust
+  function also rewrote an identically-named struct field; renaming a GDScript
+  `func` also rewrote an identically-named local `var`. Both grammars spell the
+  two with the same node kind — `field_identifier` covers a struct field *and*
+  the method in `x.method()`, `name` covers every GDScript declaration from
+  `func` to `var` — so a kind filter alone cannot separate them.
+
+  The resolved symbol's indexed kind was the missing input, and it was already
+  in hand: the planner resolves the symbol before it plans anything. It now
+  reaches the occurrence walk, which drops positions that cannot be that thing.
+  A Rust function rename skips `struct S { count: usize }`, `S { count: 1 }`,
+  and `x.count` while keeping `x.count()`. A GDScript function rename skips
+  `var count` and parameter bindings; a variable rename skips `func count`.
+
+  Three limits, each a refusal to guess:
+
+  Only positions the grammar makes unambiguous are dropped. A bare GDScript
+  `count` reference stays, because under-renaming leaves a caller pointing at a
+  name that no longer exists — the same failure the cross-file work existed to
+  fix, and the one that reports success while breaking the build.
+
+  Where a dropped declaration *shadows* the target and an unattributable
+  reference to it survives, the rename **refuses and names the shadow's line**
+  rather than narrowing. Keeping `var count` while rewriting `return count`
+  would leave the declaration on the old name and its read on the new one,
+  which is incoherent in a way that neither renaming both nor renaming neither
+  is. A callee is never ambiguous, so a shadow that is only ever called does
+  not trigger it. This was found by reading the applied output of a live
+  rename, not by a failing test.
+
+  An unresolved or unrecognized symbol kind narrows nothing. A capture name
+  added to `Lang::symbol_query` without a decision about what it is falls
+  through to the permissive answer rather than silently dropping occurrences.
+
+  Rust macro bodies are exempt by construction: tree-sitter parses macro
+  arguments as an opaque `token_tree`, so `m.count` inside `format!` is a bare
+  `identifier` with no `field_expression` to read. It is still renamed. That is
+  the same opacity that lets the walk reach real call sites inside
+  `assert_eq!`, so it is now a tested limitation rather than folklore.
+
 - **`rename_symbol` is open to every indexed language.** Kotlin, Bash, Zig, and
   GDScript can now be renamed. They could not before for no reason other than
   the implementation: each family hand-rolled its own substring scan, so a
