@@ -12952,3 +12952,65 @@ fn edit_intents_rename_leaves_a_same_named_field_and_local_alone() {
         "the local var declaration was renamed: {gdscript}"
     );
 }
+
+#[test]
+fn edit_intents_rename_leaves_javascript_properties_alone() {
+    // `property_identifier` covers an object-literal key, a class method, and a
+    // member access, none of which is the module-level binding the planner
+    // resolved — `Lang::symbol_query` indexes only top-level declarations. The
+    // object-literal shorthand is the one token that is both a property name
+    // and a read of the binding, so it expands rather than being overwritten.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("app.js"),
+        "function beta(v) { return v; }\n\
+         const keyed = { beta: 1 };\n\
+         const shorthand = { beta };\n\
+         class Panel { beta() { return 2; } }\n\
+         const total = keyed.beta + beta(3);\n\
+         module.exports = { keyed, shorthand, total };\n",
+    )
+    .unwrap();
+    let indexed = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    let input = r#"{"intents":[{"kind":"rename_symbol","symbol":"beta","file":"app.js","new_name":"gamma"}]}"#;
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--apply",
+            "--json",
+        ],
+        input,
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["report"]["applied_total"], 1, "{json}");
+
+    let source = fs::read_to_string(dir.path().join("app.js")).unwrap();
+    assert!(source.contains("function gamma(v)"), "{source}");
+    assert!(source.contains("gamma(3)"), "{source}");
+    // The shorthand keeps its property name and follows the rename.
+    assert!(
+        source.contains("{ beta: gamma }"),
+        "shorthand was not expanded: {source}"
+    );
+    // Every other property position is untouched.
+    assert!(source.contains("{ beta: 1 }"), "object key: {source}");
+    assert!(source.contains("beta() { return 2; }"), "class method: {source}");
+    assert!(source.contains("keyed.beta"), "member read: {source}");
+}

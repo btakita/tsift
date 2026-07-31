@@ -242,6 +242,23 @@ convenience:
   reach real call sites inside `assert_eq!`, so it is a known and tested
   limitation rather than an oversight.
 
+The JS-like family needs one more move, because a shorthand is one token doing
+two jobs. `property_identifier` covers an object-literal key, a class method,
+and a member access, and none of those is the module-level binding a rename
+resolves to — the symbol query indexes `function_declaration`,
+`class_declaration`, and arrow-valued `variable_declarator`, nothing else — so
+a resolved rename drops all of them. But `{ beta }` is *both* the property name
+and a read of the binding: overwriting the span renames the property as a side
+effect, and skipping it leaves a read of a name that no longer exists. Neither
+is acceptable, so the occurrence expands to `beta: gamma`, which is exactly
+what the shorthand desugars to and keeps both correct.
+
+The destructuring form `const { beta } = mod` is deliberately *not* expanded.
+There the token reads a property off `mod` and declares a local of the same
+name, so the right rewrite depends on whether `mod` is the module whose export
+was renamed. That is the common case, and plain span renaming already gets it
+right; expanding would break it.
+
 ### Conformance fixtures
 
 Two tables, each exhaustive in both directions against the recognized-intent

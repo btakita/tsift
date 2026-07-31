@@ -48,6 +48,21 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
   the same opacity that lets the walk reach real call sites inside
   `assert_eq!`, so it is now a tested limitation rather than folklore.
 
+  The same narrowing now covers TypeScript, TSX, JavaScript, and JSX, where
+  `property_identifier` spans an object-literal key, a class method, and a
+  member access — none of which is the module-level binding a rename resolves
+  to. Renaming a top-level `beta` no longer rewrites `{ beta: 1 }`,
+  `class Panel { beta() {} }`, or `keyed.beta`.
+
+  The object-literal shorthand `{ beta }` is the case with no correct span
+  rewrite: it is both the property name and a read of the binding, so
+  overwriting it renames the property as a side effect and skipping it leaves a
+  dangling read. It now **expands to `{ beta: gamma }`**, which is what the
+  shorthand desugars to and keeps both correct. The destructuring form
+  `const { beta } = mod` is deliberately left as a span rename — there the
+  token reads a property off `mod`, and when `mod` is the module whose export
+  was renamed, which is the common case, renaming in place is already right.
+
 - **`rename_symbol` is open to every indexed language.** Kotlin, Bash, Zig, and
   GDScript can now be renamed. They could not before for no reason other than
   the implementation: each family hand-rolled its own substring scan, so a

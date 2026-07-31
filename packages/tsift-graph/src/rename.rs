@@ -73,6 +73,11 @@ impl RenameTarget {
 pub struct IdentifierOccurrence {
     pub start_byte: usize,
     pub end_byte: usize,
+    /// This occurrence is a JS-like object-literal shorthand (`{ beta }`),
+    /// where the one token is both the property name and a read of the binding.
+    /// Overwriting the span would silently rename the property too, so the
+    /// splice writes `beta: newName` and both survive.
+    pub expands_shorthand_key: bool,
 }
 
 /// Node kinds that carry a bare identifier in this language's grammar.
@@ -173,11 +178,64 @@ fn occurrence_matches_target(lang: Lang, node: Node, target: RenameTarget) -> bo
         Lang::Rust => rust_occurrence_matches_target(node, target),
         #[cfg(feature = "lang-gdscript")]
         Lang::GdScript => gdscript_occurrence_matches_target(node, target),
+        #[cfg(feature = "lang-typescript")]
+        Lang::TypeScript | Lang::Tsx => js_like_occurrence_matches_target(node, target),
+        #[cfg(feature = "lang-javascript")]
+        Lang::JavaScript | Lang::Jsx => js_like_occurrence_matches_target(node, target),
         _ => {
             let _ = node;
             true
         }
     }
+}
+
+/// The JS-like grammars spell every property `property_identifier`, whether it
+/// is an object-literal key, a class method, or a member access. None of those
+/// is the module-level binding a rename resolves to — `Lang::symbol_query`
+/// indexes `function_declaration`, `class_declaration`, and arrow-valued
+/// `variable_declarator`, and nothing else — so a resolved rename must leave
+/// them alone.
+#[cfg(any(feature = "lang-typescript", feature = "lang-javascript"))]
+fn js_like_occurrence_matches_target(node: Node, target: RenameTarget) -> bool {
+    match node.kind() {
+        "property_identifier" => false,
+        "type_identifier" => target == RenameTarget::Type,
+        _ => true,
+    }
+}
+
+/// Whether this occurrence must be written as `key: replacement`.
+///
+/// `{ beta }` is one token doing two jobs: it names the property *and* reads
+/// the binding. Overwriting the span renames the property as a side effect;
+/// skipping it leaves a read of a name that no longer exists. Expanding to
+/// `beta: gamma` is the only spelling where both stay correct, and it is
+/// exactly what the shorthand desugars to.
+#[allow(unused_variables)]
+fn occurrence_expands_shorthand_key(lang: Lang, node: Node, target: RenameTarget) -> bool {
+    if target == RenameTarget::Unresolved {
+        return false;
+    }
+    match lang {
+        #[cfg(feature = "lang-typescript")]
+        Lang::TypeScript | Lang::Tsx => js_like_shorthand_key(node),
+        #[cfg(feature = "lang-javascript")]
+        Lang::JavaScript | Lang::Jsx => js_like_shorthand_key(node),
+        _ => false,
+    }
+}
+
+/// An object-literal shorthand, and deliberately *not* a destructuring pattern.
+///
+/// `const { beta } = mod` is `shorthand_property_identifier_pattern`: there the
+/// token reads a property off `mod` and declares a local of the same name, so
+/// the correct rewrite depends on whether `mod` is the module whose export was
+/// renamed — which is the common case, and which plain span renaming already
+/// gets right. Expanding it would be wrong for that case, so it is left alone.
+#[cfg(any(feature = "lang-typescript", feature = "lang-javascript"))]
+fn js_like_shorthand_key(node: Node) -> bool {
+    node.kind() == "shorthand_property_identifier"
+        && node.parent().is_some_and(|parent| parent.kind() == "object")
 }
 
 /// Rust spells three unrelated things `field_identifier`: a struct field
@@ -298,6 +356,9 @@ pub fn identifier_occurrences_for(
                     occurrences.push(IdentifierOccurrence {
                         start_byte: node.start_byte(),
                         end_byte: node.end_byte(),
+                        expands_shorthand_key: occurrence_expands_shorthand_key(
+                            lang, node, target,
+                        ),
                     });
                     saw_ambiguous_reference |= occurrence_is_ambiguous_reference(lang, node, target);
                 } else if shadowing_declaration_line.is_none()
@@ -412,6 +473,12 @@ pub fn replace_occurrences(
             continue;
         }
         out.push_str(&source[last..occurrence.start_byte]);
+        if occurrence.expands_shorthand_key {
+            // `{ beta }` becomes `{ beta: gamma }`: the property keeps its name,
+            // the value follows the rename.
+            out.push_str(&source[occurrence.start_byte..occurrence.end_byte]);
+            out.push_str(": ");
+        }
         out.push_str(replacement);
         last = occurrence.end_byte;
         replaced += 1;
@@ -771,6 +838,117 @@ fn build() -> Meter { Meter { count: 1 } }
             out.contains("func caller(count):"),
             "a parameter declaration was renamed:\n{out}"
         );
+    }
+
+    #[cfg(feature = "lang-typescript")]
+    const TS_PROPERTY_SOURCE: &str = r#"function beta(v: number) { return v; }
+const keyed = { beta: 1 };
+const shorthand = { beta };
+class K { beta() { return 2; } }
+const k = new K();
+const read = k.beta() + keyed.beta + beta(3);
+export { beta };
+"#;
+
+    #[cfg(feature = "lang-typescript")]
+    #[test]
+    fn renaming_a_typescript_function_leaves_properties_alone() {
+        let found = identifier_occurrences_for(
+            Lang::TypeScript,
+            TS_PROPERTY_SOURCE.as_bytes(),
+            "beta",
+            RenameTarget::Callable,
+        )
+        .unwrap();
+        let (out, _) = replace_occurrences(TS_PROPERTY_SOURCE, &found, "gamma");
+        // Renamed: the declaration, the call, and the export specifier.
+        assert!(out.contains("function gamma(v: number)"), "declaration:
+{out}");
+        assert!(out.contains("+ gamma(3)"), "call:
+{out}");
+        assert!(out.contains("export { gamma };"), "export:
+{out}");
+        // Untouched: every property position.
+        assert!(out.contains("{ beta: 1 }"), "object key was renamed:
+{out}");
+        assert!(
+            out.contains("class K { beta()"),
+            "class method was renamed:
+{out}"
+        );
+        assert!(out.contains("k.beta()"), "member call was renamed:
+{out}");
+        assert!(out.contains("keyed.beta"), "member read was renamed:
+{out}");
+    }
+
+    #[cfg(feature = "lang-typescript")]
+    #[test]
+    fn a_javascript_object_shorthand_is_expanded_rather_than_overwritten() {
+        // `{ beta }` names the property and reads the binding. Overwriting the
+        // span would rename the property too; skipping it would leave a read of
+        // a name that no longer exists.
+        let found = identifier_occurrences_for(
+            Lang::TypeScript,
+            TS_PROPERTY_SOURCE.as_bytes(),
+            "beta",
+            RenameTarget::Callable,
+        )
+        .unwrap();
+        let (out, _) = replace_occurrences(TS_PROPERTY_SOURCE, &found, "gamma");
+        assert!(
+            out.contains("const shorthand = { beta: gamma };"),
+            "shorthand was not expanded:
+{out}"
+        );
+    }
+
+    #[cfg(feature = "lang-typescript")]
+    #[test]
+    fn a_destructuring_pattern_is_renamed_in_place_not_expanded() {
+        // `const { beta } = mod` reads a property off `mod`. When `mod` is the
+        // module whose export was renamed — the common case — renaming the span
+        // is exactly right, and expanding it would be wrong.
+        let source = "import * as mod from './mod';
+const { beta } = mod;
+beta();
+";
+        let found =
+            identifier_occurrences_for(Lang::TypeScript, source.as_bytes(), "beta", RenameTarget::Callable)
+                .unwrap();
+        let (out, _) = replace_occurrences(source, &found, "gamma");
+        assert!(out.contains("const { gamma } = mod;"), "{out}");
+        assert!(!out.contains("beta: gamma"), "pattern was expanded:
+{out}");
+    }
+
+    #[cfg(feature = "lang-typescript")]
+    #[test]
+    fn a_typescript_type_rename_keeps_type_identifiers_and_drops_properties() {
+        let source = "type Beta = number;
+const o = { Beta: 1 };
+const v: Beta = 1;
+export type { Beta };
+";
+        let callable = identifier_occurrences_for(
+            Lang::TypeScript,
+            source.as_bytes(),
+            "Beta",
+            RenameTarget::Callable,
+        )
+        .unwrap();
+        let typed =
+            identifier_occurrences_for(Lang::TypeScript, source.as_bytes(), "Beta", RenameTarget::Type)
+                .unwrap();
+        assert!(
+            typed.len() > callable.len(),
+            "a type rename must reach type_identifier positions a callable rename does not: {typed:?} vs {callable:?}"
+        );
+        let (out, _) = replace_occurrences(source, &typed, "Gamma");
+        assert!(out.contains("type Gamma = number;"), "{out}");
+        assert!(out.contains("const v: Gamma = 1;"), "{out}");
+        assert!(out.contains("{ Beta: 1 }"), "object key was renamed:
+{out}");
     }
 
     #[test]
