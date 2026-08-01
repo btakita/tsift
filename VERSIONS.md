@@ -60,11 +60,20 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
   dangling read. It now **expands to `{ beta: gamma }`**, which is what the
   shorthand desugars to and keeps both correct. The destructuring form
   `const { beta } = mod` is deliberately left as a span rename — there the
-  token reads a property off `mod`, and when `mod` is the module whose export
-  was renamed, which is the common case, renaming in place is already right.
+token reads a property off `mod`, and when `mod` is the module whose export
+was renamed, which is the common case, renaming in place is already right.
+
+Python and Kotlin now apply the same positional narrowing to their flat
+`identifier` node sets. A resolved callable rename leaves the member read in
+`panel.widget_count` / `panel.widgetCount` untouched, while still renaming the
+callee in `panel.widget_count()` / `panel.widgetCount()`. The call stays a
+target because both languages index methods as callables; the receiver stays a
+normal binding reference. Unit tests and the cross-language conformance table
+pin declarations, direct calls, method calls, and untouched member reads in
+both grammars.
 
 - **`rename_symbol` is open to every indexed language.** Kotlin, Bash, Zig, and
-  GDScript can now be renamed. They could not before for no reason other than
+GDScript can now be renamed. They could not before for no reason other than
   the implementation: each family hand-rolled its own substring scan, so a
   language without one was refused even though it was fully indexed.
 

@@ -259,6 +259,17 @@ name, so the right rewrite depends on whether `mod` is the module whose export
 was renamed. That is the common case, and plain span renaming already gets it
 right; expanding would break it.
 
+Python and Kotlin need the same positional distinction despite using only a
+flat `identifier` kind. Python's attribute name in `obj.count` is an
+`identifier` under `attribute`; Kotlin's member is a non-receiver `identifier`
+under `navigation_expression`. Neither position is the module-level binding a
+resolved rename selected, so a read such as `obj.count` stays untouched. Both
+languages also index methods as callables, however, so the member remains a
+valid callable target when that whole attribute/navigation expression is the
+callee of a call: `obj.count()` is renamed along with a same-named method
+declaration. The receiver identifier is still an ordinary binding reference and
+is never dropped by the member-position rule.
+
 ### Conformance fixtures
 
 Two tables, each exhaustive in both directions against the recognized-intent

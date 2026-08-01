@@ -176,17 +176,69 @@ fn occurrence_matches_target(lang: Lang, node: Node, target: RenameTarget) -> bo
     match lang {
         #[cfg(feature = "lang-rust")]
         Lang::Rust => rust_occurrence_matches_target(node, target),
+        #[cfg(feature = "lang-python")]
+        Lang::Python => python_occurrence_matches_target(node, target),
         #[cfg(feature = "lang-gdscript")]
         Lang::GdScript => gdscript_occurrence_matches_target(node, target),
         #[cfg(feature = "lang-typescript")]
         Lang::TypeScript | Lang::Tsx => js_like_occurrence_matches_target(node, target),
         #[cfg(feature = "lang-javascript")]
         Lang::JavaScript | Lang::Jsx => js_like_occurrence_matches_target(node, target),
+        #[cfg(feature = "lang-kotlin")]
+        Lang::Kotlin => kotlin_occurrence_matches_target(node, target),
         _ => {
             let _ = node;
             true
         }
     }
+}
+
+/// Python uses `identifier` for both a binding and the attribute in `obj.name`.
+/// The attribute cannot be a module-level binding, except that methods are
+/// indexed as callables and `obj.name()` is therefore a real rename target.
+#[cfg(feature = "lang-python")]
+fn python_occurrence_matches_target(node: Node, target: RenameTarget) -> bool {
+    let Some(attribute) = node.parent().filter(|parent| parent.kind() == "attribute") else {
+        return true;
+    };
+    if attribute
+        .child_by_field_name("attribute")
+        .is_none_or(|name| name.id() != node.id())
+    {
+        return true;
+    }
+
+    target == RenameTarget::Callable
+        && attribute.parent().is_some_and(|call| {
+            call.kind() == "call"
+                && call
+                    .child_by_field_name("function")
+                    .is_some_and(|function| function.id() == attribute.id())
+        })
+}
+
+/// Kotlin's first `navigation_expression` identifier is the receiver binding;
+/// every later identifier is a member. A member is a rename target only in the
+/// callee position because Kotlin indexes methods as callables.
+#[cfg(feature = "lang-kotlin")]
+fn kotlin_occurrence_matches_target(node: Node, target: RenameTarget) -> bool {
+    let Some(navigation) = node
+        .parent()
+        .filter(|parent| parent.kind() == "navigation_expression")
+    else {
+        return true;
+    };
+    if node.prev_named_sibling().is_none() {
+        return true;
+    }
+
+    target == RenameTarget::Callable
+        && navigation.parent().is_some_and(|call| {
+            call.kind() == "call_expression"
+                && call
+                    .named_child(0)
+                    .is_some_and(|function| function.id() == navigation.id())
+        })
 }
 
 /// The JS-like grammars spell every property `property_identifier`, whether it
@@ -567,6 +619,48 @@ fn describe() -> String {
         assert!(out.contains("gadget_count()\n"));
         assert!(out.contains("# widget_count comment"));
         assert!(out.contains("\"widget_count\""));
+    }
+
+    #[cfg(feature = "lang-python")]
+    #[test]
+    fn python_callable_narrowing_keeps_method_calls_but_skips_attribute_reads() {
+        let source = "def widget_count():\n    return 1\n\nclass Panel:\n    def widget_count(self):\n        return 2\n\nread = panel.widget_count\ncalled = panel.widget_count()\ndirect = widget_count()\n";
+        let found = identifier_occurrences_for(
+            Lang::Python,
+            source.as_bytes(),
+            "widget_count",
+            RenameTarget::Callable,
+        )
+        .unwrap();
+        let (out, replaced) = replace_occurrences(source, &found, "gadget_count");
+
+        assert_eq!(replaced, 4, "got {found:?}\n{out}");
+        assert!(out.contains("def gadget_count():"));
+        assert!(out.contains("def gadget_count(self):"));
+        assert!(out.contains("called = panel.gadget_count()"));
+        assert!(out.contains("direct = gadget_count()"));
+        assert!(out.contains("read = panel.widget_count\n"));
+    }
+
+    #[cfg(feature = "lang-kotlin")]
+    #[test]
+    fn kotlin_callable_narrowing_keeps_method_calls_but_skips_navigation_reads() {
+        let source = "fun widgetCount(): Int = 1\n\nclass Panel {\n    fun widgetCount(): Int = 2\n}\n\nval read = panel.widgetCount\nval called = panel.widgetCount()\nval direct = widgetCount()\n";
+        let found = identifier_occurrences_for(
+            Lang::Kotlin,
+            source.as_bytes(),
+            "widgetCount",
+            RenameTarget::Callable,
+        )
+        .unwrap();
+        let (out, replaced) = replace_occurrences(source, &found, "gadgetCount");
+
+        assert_eq!(replaced, 4, "got {found:?}\n{out}");
+        assert!(out.contains("fun gadgetCount(): Int = 1"));
+        assert!(out.contains("fun gadgetCount(): Int = 2"));
+        assert!(out.contains("val called = panel.gadgetCount()"));
+        assert!(out.contains("val direct = gadgetCount()"));
+        assert!(out.contains("val read = panel.widgetCount\n"));
     }
 
     #[cfg(feature = "lang-typescript")]
