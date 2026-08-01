@@ -1,3 +1,4 @@
 /target
+.agent-doc/
 .tsift/
 .tokensave
