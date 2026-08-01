@@ -2031,16 +2031,17 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
         SemanticEditRenameFixture {
             executor: SemanticEditExecutorLanguage::Python,
             alias: "python",
-            source: "def widget_count():\n    # widget_count comment\n    return \"widget_count\"\n\nclass Panel:\n    def widget_count(self):\n        return 2\n\nread = panel.widget_count\ncalled = panel.widget_count()\ndirect = widget_count()\n",
+            source: "import mod\n\ndef widget_count():\n    # widget_count comment\n    return \"widget_count\"\n\nclass Panel:\n    def widget_count(self):\n        return 2\n\nread = panel.widget_count\ncalled = panel.widget_count()\ndirect = widget_count()\nmodule_read = mod.widget_count\n",
             symbol: "widget_count",
             symbol_kind: "function",
             new_name: "gadget_count",
-            expected_replacements: 4,
+            expected_replacements: 5,
             renamed: &[
                 "def gadget_count()",
                 "def gadget_count(self)",
                 "called = panel.gadget_count()",
                 "direct = gadget_count()",
+                "module_read = mod.gadget_count",
             ],
             untouched: &[
                 "# widget_count comment",
@@ -2120,15 +2121,17 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
         SemanticEditRenameFixture {
             executor: SemanticEditExecutorLanguage::Kotlin,
             alias: "kotlin",
-            source: "// widgetCount comment\nfun widgetCount(): Int { return 1 }\nval label = \"widgetCount\"\nclass Panel {\n    fun widgetCount(): Int { return 2 }\n}\nval read = panel.widgetCount\nval called = panel.widgetCount()\nfun caller(): Int { return widgetCount() }\n",
+            source: "// widgetCount comment\nfun widgetCount(): Int { return 1 }\nval label = \"widgetCount\"\nclass Panel {\n    fun widgetCount(): Int { return 2 }\n}\nobject Registry {\n    fun widgetCount(): Int { return 3 }\n}\nval read = panel.widgetCount\nval called = panel.widgetCount()\nval qualified = Registry.widgetCount\nfun caller(): Int { return widgetCount() }\n",
             symbol: "widgetCount",
             symbol_kind: "function",
             new_name: "gadgetCount",
-            expected_replacements: 4,
+            expected_replacements: 6,
             renamed: &[
                 "fun gadgetCount(): Int { return 1 }",
                 "fun gadgetCount(): Int { return 2 }",
+                "fun gadgetCount(): Int { return 3 }",
                 "val called = panel.gadgetCount()",
+                "val qualified = Registry.gadgetCount",
                 "return gadgetCount()",
             ],
             untouched: &[
@@ -2158,13 +2161,25 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
     SemanticEditRenameFixture {
         executor: SemanticEditExecutorLanguage::Zig,
         alias: "zig",
-        source: "// widget_count comment\npub fn widget_count() u32 {\n    const label = \"widget_count\";\n    _ = label;\n    return 3;\n}\npub fn caller() u32 { return widget_count(); }\n",
+        // Zig reaches another file only through `@import`, and a container type
+        // is also a namespace, so both member forms have to survive; only a
+        // member read off a value receiver is a struct field.
+        source: "// widget_count comment\nconst m = @import(\"m.zig\");\npub fn widget_count() u32 {\n    const label = \"widget_count\";\n    _ = label;\n    return 3;\n}\nconst Panel = struct {\n    widget_count: u32 = 0,\n};\npub fn caller(p: Panel) u32 { return widget_count() + m.widget_count + p.widget_count; }\n",
         symbol: "widget_count",
         symbol_kind: "function",
         new_name: "gadget_count",
-        expected_replacements: 2,
-        renamed: &["pub fn gadget_count()", "return gadget_count();"],
-        untouched: &["// widget_count comment", "\"widget_count\""],
+        expected_replacements: 3,
+        renamed: &[
+            "pub fn gadget_count()",
+            "return gadget_count() +",
+            "m.gadget_count +",
+        ],
+        untouched: &[
+            "// widget_count comment",
+            "\"widget_count\"",
+            "    widget_count: u32 = 0,",
+            "p.widget_count;",
+        ],
     },
     SemanticEditRenameFixture {
         executor: SemanticEditExecutorLanguage::GdScript,

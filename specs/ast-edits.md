@@ -270,6 +270,43 @@ callee of a call: `obj.count()` is renamed along with a same-named method
 declaration. The receiver identifier is still an ordinary binding reference and
 is never dropped by the member-position rule.
 
+Kotlin keeps a member whose receiver names a `class`, `object`, or `interface`
+declared in the same file: `Panel.widgetCount` reaches a companion member and
+`Registry.widgetCount` an `object` member, both of which the index holds as
+declarations. A receiver declared in another file is not resolvable from one
+parse tree and falls back to the callee rule; Kotlin's ordinary cross-file
+reference is an `import` that binds the name into scope as a bare identifier,
+which the walk never drops, so what remains uncovered is qualified access to an
+imported type rather than the common path.
+
+Python has one more exception, for the same reason Zig below is narrowed by its
+receiver: `mod.name` *is* the module-level binding when `mod` is a module this
+file imported, and `import mod` is half of how Python spells a cross-module
+reference. A Python attribute is therefore kept, called or not, when its
+receiver chain roots in a name bound by an `import` statement — the alias when
+there is one, otherwise the first segment of the dotted path, since `import
+pkg.mod` binds `pkg`. `from mod import name` binds the name directly and never
+produces an attribute position, so it needs nothing. A local that shadows an
+imported module resolves to "module" and keeps the occurrence, which is the
+over-renaming direction this walk prefers.
+
+Zig has the same flat `identifier` kind and the same member node — the `member`
+field of `field_expression` — but the callee-only rule is **wrong** for it, and
+Zig is therefore narrowed by the receiver instead. Zig has no
+import-into-namespace form: `@import("m.zig").name` and `Type.name` are the only
+ways to name a declaration in another file, and both are member positions. A
+callee-only rule would drop every cross-file reference to a renamed `const`,
+type, or uncalled function while renaming the declaration, which reports success
+and breaks the build. So a Zig member is kept whenever its receiver chain roots
+in a namespace — an `@import` binding, or a binding whose initializer is a
+`struct`/`enum`/`union`/`opaque` declaration, since a Zig container type is also
+the namespace holding its declarations — and is dropped only when the receiver
+is an ordinary value, where the member is a struct field. The callee exception
+still applies to that value case, because Zig indexes methods as
+`function_declaration`. A `container_field` name is dropped for every resolved
+target: no capture in the Zig symbol query produces one, so a field declaration
+is never the symbol a rename selected.
+
 ### Conformance fixtures
 
 Two tables, each exhaustive in both directions against the recognized-intent

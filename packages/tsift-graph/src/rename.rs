@@ -169,7 +169,13 @@ fn occurrence_is_renamable(lang: Lang, node: Node) -> bool {
 /// tree cannot attribute — a bare `count` reference in GDScript, a Rust
 /// `x.count()` where `count` might be an inherent method or a trait method on
 /// something else — is kept, because dropping it silently breaks a caller.
-fn occurrence_matches_target(lang: Lang, node: Node, target: RenameTarget) -> bool {
+#[allow(unused_variables)]
+fn occurrence_matches_target(
+    lang: Lang,
+    node: Node,
+    source: &[u8],
+    target: RenameTarget,
+) -> bool {
     if target == RenameTarget::Unresolved {
         return true;
     }
@@ -177,7 +183,7 @@ fn occurrence_matches_target(lang: Lang, node: Node, target: RenameTarget) -> bo
         #[cfg(feature = "lang-rust")]
         Lang::Rust => rust_occurrence_matches_target(node, target),
         #[cfg(feature = "lang-python")]
-        Lang::Python => python_occurrence_matches_target(node, target),
+        Lang::Python => python_occurrence_matches_target(node, source, target),
         #[cfg(feature = "lang-gdscript")]
         Lang::GdScript => gdscript_occurrence_matches_target(node, target),
         #[cfg(feature = "lang-typescript")]
@@ -185,7 +191,9 @@ fn occurrence_matches_target(lang: Lang, node: Node, target: RenameTarget) -> bo
         #[cfg(feature = "lang-javascript")]
         Lang::JavaScript | Lang::Jsx => js_like_occurrence_matches_target(node, target),
         #[cfg(feature = "lang-kotlin")]
-        Lang::Kotlin => kotlin_occurrence_matches_target(node, target),
+        Lang::Kotlin => kotlin_occurrence_matches_target(node, source, target),
+        #[cfg(feature = "lang-zig")]
+        Lang::Zig => zig_occurrence_matches_target(node, source, target),
         _ => {
             let _ = node;
             true
@@ -194,10 +202,14 @@ fn occurrence_matches_target(lang: Lang, node: Node, target: RenameTarget) -> bo
 }
 
 /// Python uses `identifier` for both a binding and the attribute in `obj.name`.
-/// The attribute cannot be a module-level binding, except that methods are
-/// indexed as callables and `obj.name()` is therefore a real rename target.
+/// The attribute cannot be a module-level binding, except in two positions:
+/// methods are indexed as callables, so `obj.name()` is a real rename target,
+/// and `mod.name` is the module-level binding itself when `mod` is a module
+/// this file imported. Dropping that second case is a silent under-rename —
+/// `import mod` is half of how Python spells a cross-module reference, and the
+/// rename runs across files.
 #[cfg(feature = "lang-python")]
-fn python_occurrence_matches_target(node: Node, target: RenameTarget) -> bool {
+fn python_occurrence_matches_target(node: Node, source: &[u8], target: RenameTarget) -> bool {
     let Some(attribute) = node.parent().filter(|parent| parent.kind() == "attribute") else {
         return true;
     };
@@ -205,6 +217,9 @@ fn python_occurrence_matches_target(node: Node, target: RenameTarget) -> bool {
         .child_by_field_name("attribute")
         .is_none_or(|name| name.id() != node.id())
     {
+        return true;
+    }
+    if python_receiver_is_imported_module(attribute, source) {
         return true;
     }
 
@@ -217,11 +232,97 @@ fn python_occurrence_matches_target(node: Node, target: RenameTarget) -> bool {
         })
 }
 
+/// Whether the receiver of this `attribute` is a module bound by `import`.
+///
+/// Only `import mod` / `import pkg.mod as alias` bind a name that is reached
+/// with a dot; `from mod import name` binds `name` directly and never produces
+/// an attribute position. A chained receiver (`pkg.sub.name`) is resolved by
+/// walking to the root of the chain, which is the imported name.
+///
+/// A local variable that shadows an imported module resolves to "module" here
+/// and keeps the occurrence. That is the over-renaming direction, which this
+/// module prefers: an extra rename is visible, a dropped one is not.
+#[cfg(feature = "lang-python")]
+fn python_receiver_is_imported_module(attribute: Node, source: &[u8]) -> bool {
+    let Some(mut object) = attribute.child_by_field_name("object") else {
+        return false;
+    };
+    while object.kind() == "attribute" {
+        let Some(inner) = object.child_by_field_name("object") else {
+            return false;
+        };
+        object = inner;
+    }
+    if object.kind() != "identifier" {
+        return false;
+    }
+    let Ok(name) = object.utf8_text(source) else {
+        return false;
+    };
+    python_file_imports_module(attribute, name, source)
+}
+
+/// Whether the file holding `node` binds `name` with an `import` statement.
+#[cfg(feature = "lang-python")]
+fn python_file_imports_module(node: Node, name: &str, source: &[u8]) -> bool {
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut cursor = root.walk();
+    let mut descend = true;
+    loop {
+        if descend {
+            let current = cursor.node();
+            if current.kind() == "import_statement"
+                && python_import_binds(current, name, source)
+            {
+                return true;
+            }
+            if cursor.goto_first_child() {
+                continue;
+            }
+        }
+        if cursor.goto_next_sibling() {
+            descend = true;
+            continue;
+        }
+        if !cursor.goto_parent() {
+            return false;
+        }
+        descend = false;
+    }
+}
+
+/// The name one `import_statement` clause binds: the alias when there is one,
+/// otherwise the first segment of the dotted path — `import pkg.mod` binds
+/// `pkg`, not `mod`.
+#[cfg(feature = "lang-python")]
+fn python_import_binds(import: Node, name: &str, source: &[u8]) -> bool {
+    let mut cursor = import.walk();
+    import.named_children(&mut cursor).any(|clause| {
+        let bound = match clause.kind() {
+            "aliased_import" => clause.child_by_field_name("alias"),
+            "dotted_name" => clause.named_child(0),
+            _ => None,
+        };
+        bound.is_some_and(|bound| bound.utf8_text(source).is_ok_and(|text| text == name))
+    })
+}
+
 /// Kotlin's first `navigation_expression` identifier is the receiver binding;
-/// every later identifier is a member. A member is a rename target only in the
-/// callee position because Kotlin indexes methods as callables.
+/// every later identifier is a member. A member is a rename target in the callee
+/// position, because Kotlin indexes methods as callables, and whenever the
+/// receiver is a type declared in this file — `Panel.widgetCount` reaches a
+/// companion member and `Registry.widgetCount` an `object` member, both of which
+/// the index holds as declarations, so dropping them is an under-rename.
+///
+/// A receiver declared in another file is not resolvable here and falls to the
+/// callee rule. Kotlin's ordinary cross-file reference is an `import` that binds
+/// the name into scope as a bare identifier, which this walk never touches, so
+/// that residue is the qualified-access case rather than the common one.
 #[cfg(feature = "lang-kotlin")]
-fn kotlin_occurrence_matches_target(node: Node, target: RenameTarget) -> bool {
+fn kotlin_occurrence_matches_target(node: Node, source: &[u8], target: RenameTarget) -> bool {
     let Some(navigation) = node
         .parent()
         .filter(|parent| parent.kind() == "navigation_expression")
@@ -229,6 +330,9 @@ fn kotlin_occurrence_matches_target(node: Node, target: RenameTarget) -> bool {
         return true;
     };
     if node.prev_named_sibling().is_none() {
+        return true;
+    }
+    if kotlin_receiver_is_declared_type(navigation, source) {
         return true;
     }
 
@@ -239,6 +343,213 @@ fn kotlin_occurrence_matches_target(node: Node, target: RenameTarget) -> bool {
                     .named_child(0)
                     .is_some_and(|function| function.id() == navigation.id())
         })
+}
+
+/// Whether the receiver of this `navigation_expression` names a type declared in
+/// this file, which makes the member a declaration rather than a value's field.
+#[cfg(feature = "lang-kotlin")]
+fn kotlin_receiver_is_declared_type(navigation: Node, source: &[u8]) -> bool {
+    let mut receiver = navigation;
+    while receiver.kind() == "navigation_expression" {
+        let Some(inner) = receiver.named_child(0) else {
+            return false;
+        };
+        receiver = inner;
+    }
+    if receiver.kind() != "identifier" {
+        return false;
+    }
+    let Ok(name) = receiver.utf8_text(source) else {
+        return false;
+    };
+    kotlin_file_declares_type(navigation, name, source)
+}
+
+/// Whether the file holding `node` declares a class, interface, or object named
+/// `name`.
+#[cfg(feature = "lang-kotlin")]
+fn kotlin_file_declares_type(node: Node, name: &str, source: &[u8]) -> bool {
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut cursor = root.walk();
+    let mut descend = true;
+    loop {
+        if descend {
+            let current = cursor.node();
+            if matches!(
+                current.kind(),
+                "class_declaration" | "object_declaration" | "interface_declaration"
+            ) && current
+                .child_by_field_name("name")
+                .and_then(|declared| declared.utf8_text(source).ok())
+                == Some(name)
+            {
+                return true;
+            }
+            if cursor.goto_first_child() {
+                continue;
+            }
+        }
+        if cursor.goto_next_sibling() {
+            descend = true;
+            continue;
+        }
+        if !cursor.goto_parent() {
+            return false;
+        }
+        descend = false;
+    }
+}
+
+/// Zig spells a struct field declaration and every member access with the same
+/// flat `identifier` kind as a binding, so position is the only separator.
+///
+/// The member of `x.name` is *not* treated the way Python and Kotlin members
+/// are, because Zig has no import-into-namespace form: `@import("m.zig").name`
+/// and `Type.name` are the only ways to reach another declaration, and both are
+/// `field_expression` members. Dropping them by position would leave every
+/// cross-file reference of a renamed `const`, type, or non-called function
+/// pointing at a name that no longer exists. So a member is kept whenever its
+/// receiver chain roots in a *namespace* — an `@import` binding or a container
+/// type — and dropped only when the receiver is an ordinary value, where the
+/// member is a struct field. The callee exception applies there for the same
+/// reason it does elsewhere: Zig indexes methods as `function_declaration`.
+#[cfg(feature = "lang-zig")]
+fn zig_occurrence_matches_target(node: Node, source: &[u8], target: RenameTarget) -> bool {
+    let Some(parent) = node.parent() else {
+        return true;
+    };
+    match parent.kind() {
+        // `container_field` is a struct/enum/union field declaration. No
+        // capture in `Lang::symbol_query` produces one, so it can never be the
+        // symbol a resolved rename selected.
+        "container_field" => parent
+            .child_by_field_name("name")
+            .is_none_or(|name| name.id() != node.id()),
+        "field_expression" => {
+            if parent
+                .child_by_field_name("member")
+                .is_none_or(|member| member.id() != node.id())
+            {
+                return true;
+            }
+            if zig_receiver_is_namespace(parent, source) {
+                return true;
+            }
+            target == RenameTarget::Callable
+                && parent.parent().is_some_and(|call| {
+                    call.kind() == "call_expression"
+                        && call
+                            .child_by_field_name("function")
+                            .is_some_and(|function| function.id() == parent.id())
+                })
+        }
+        _ => true,
+    }
+}
+
+/// Whether the receiver of `field_expression` is a namespace rather than a value.
+///
+/// `@import("m.zig").name` is a namespace outright. An identifier receiver is a
+/// namespace when this file binds it to an `@import` or to a container type —
+/// `const m = @import("m.zig")`, `const Panel = struct { ... }` — because a Zig
+/// container type doubles as the namespace holding its declarations. A chained
+/// receiver (`m.Sub.name`) is resolved by walking to the root of the chain.
+///
+/// Anything this cannot prove is *not* a namespace, which is the conservative
+/// answer only because the caller's fallback for a value receiver still keeps
+/// the callee position. A receiver whose binding lives in another file resolves
+/// to `false` here; that case is the struct-field reading it is indistinguishable
+/// from, and the call site is still renamed.
+#[cfg(feature = "lang-zig")]
+fn zig_receiver_is_namespace(field_expression: Node, source: &[u8]) -> bool {
+    let Some(mut object) = field_expression.child_by_field_name("object") else {
+        return false;
+    };
+    while object.kind() == "field_expression" {
+        let Some(inner) = object.child_by_field_name("object") else {
+            return false;
+        };
+        object = inner;
+    }
+    match object.kind() {
+        "builtin_function" => zig_is_import_builtin(object, source),
+        "identifier" => object
+            .utf8_text(source)
+            .is_ok_and(|name| zig_file_binds_namespace(field_expression, name, source)),
+        _ => false,
+    }
+}
+
+/// Whether this `builtin_function` node is an `@import(...)` call.
+#[cfg(feature = "lang-zig")]
+fn zig_is_import_builtin(builtin: Node, source: &[u8]) -> bool {
+    let mut cursor = builtin.walk();
+    builtin.named_children(&mut cursor).any(|child| {
+        child.kind() == "builtin_identifier"
+            && child.utf8_text(source).is_ok_and(|text| text == "@import")
+    })
+}
+
+/// Whether the file holding `node` binds `name` to an `@import` or a container
+/// type declaration.
+///
+/// Only whole-file scanning can answer this, and it runs once per *matching*
+/// occurrence — the walk has already filtered to identifiers whose text is the
+/// symbol being renamed — so it is bounded by the number of member positions
+/// that spell the renamed name, not by the file's identifier count.
+#[cfg(feature = "lang-zig")]
+fn zig_file_binds_namespace(node: Node, name: &str, source: &[u8]) -> bool {
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut cursor = root.walk();
+    let mut descend = true;
+    loop {
+        if descend {
+            let current = cursor.node();
+            if current.kind() == "variable_declaration"
+                && zig_declaration_binds_namespace(current, name, source)
+            {
+                return true;
+            }
+            if cursor.goto_first_child() {
+                continue;
+            }
+        }
+        if cursor.goto_next_sibling() {
+            descend = true;
+            continue;
+        }
+        if !cursor.goto_parent() {
+            return false;
+        }
+        descend = false;
+    }
+}
+
+/// Whether one `variable_declaration` binds `name` to a namespace value.
+#[cfg(feature = "lang-zig")]
+fn zig_declaration_binds_namespace(declaration: Node, name: &str, source: &[u8]) -> bool {
+    let mut cursor = declaration.walk();
+    let children: Vec<Node> = declaration.named_children(&mut cursor).collect();
+    let binds_name = children.iter().any(|child| {
+        child.kind() == "identifier" && child.utf8_text(source).is_ok_and(|text| text == name)
+    });
+    if !binds_name {
+        return false;
+    }
+    children.iter().any(|child| match child.kind() {
+        "builtin_function" => zig_is_import_builtin(*child, source),
+        // A Zig container type is also the namespace holding its declarations,
+        // so `Panel.method` reaches a `function_declaration` the index has.
+        "struct_declaration" | "enum_declaration" | "union_declaration"
+        | "opaque_declaration" => true,
+        _ => false,
+    })
 }
 
 /// The JS-like grammars spell every property `property_identifier`, whether it
@@ -404,7 +715,7 @@ pub fn identifier_occurrences_for(
                 && node.utf8_text(source).is_ok_and(|it| it == name)
                 && occurrence_is_renamable(lang, node)
             {
-                if occurrence_matches_target(lang, node, target) {
+                if occurrence_matches_target(lang, node, source, target) {
                     occurrences.push(IdentifierOccurrence {
                         start_byte: node.start_byte(),
                         end_byte: node.end_byte(),
@@ -642,6 +953,39 @@ fn describe() -> String {
         assert!(out.contains("read = panel.widget_count\n"));
     }
 
+    /// The attribute rule must not swallow `mod.name`. `import mod` is half of
+    /// how Python spells a cross-module reference, and the rename is cross-file,
+    /// so dropping it renames the definition and leaves every reader broken.
+    #[cfg(feature = "lang-python")]
+    #[test]
+    fn python_narrowing_keeps_imported_module_attributes_including_bare_reads() {
+        let source = "import mod\nimport pkg.deep as aliased\n\ndef widget_count():\n    return 1\n\nread = panel.widget_count\nmodule_read = mod.widget_count\nmodule_call = mod.widget_count()\naliased_read = aliased.widget_count\n";
+        let found = identifier_occurrences_for(
+            Lang::Python,
+            source.as_bytes(),
+            "widget_count",
+            RenameTarget::Callable,
+        )
+        .unwrap();
+        let (out, replaced) = replace_occurrences(source, &found, "gadget_count");
+
+        assert_eq!(replaced, 4, "got {found:?}\n{out}");
+        assert!(out.contains("def gadget_count():"), "{out}");
+        assert!(
+            out.contains("module_read = mod.gadget_count\n"),
+            "an imported-module read was dropped:\n{out}"
+        );
+        assert!(out.contains("module_call = mod.gadget_count()"), "{out}");
+        assert!(
+            out.contains("aliased_read = aliased.gadget_count"),
+            "an aliased-import read was dropped:\n{out}"
+        );
+        assert!(
+            out.contains("read = panel.widget_count\n"),
+            "an instance attribute read was renamed:\n{out}"
+        );
+    }
+
     #[cfg(feature = "lang-kotlin")]
     #[test]
     fn kotlin_callable_narrowing_keeps_method_calls_but_skips_navigation_reads() {
@@ -661,6 +1005,39 @@ fn describe() -> String {
         assert!(out.contains("val called = panel.gadgetCount()"));
         assert!(out.contains("val direct = gadgetCount()"));
         assert!(out.contains("val read = panel.widgetCount\n"));
+    }
+
+    /// A receiver that names a declared type is a namespace, not a value, so its
+    /// member is a declaration the index holds. Dropping it renames the
+    /// companion/object declaration and leaves the qualified access behind.
+    #[cfg(feature = "lang-kotlin")]
+    #[test]
+    fn kotlin_narrowing_keeps_members_of_types_declared_in_the_file() {
+        let source = "class Panel {\n    companion object {\n        fun widgetCount(): Int = 2\n    }\n}\n\nobject Registry {\n    fun widgetCount(): Int = 3\n}\n\nval fromClass = Panel.widgetCount\nval fromObject = Registry.widgetCount()\nval fromValue = panel.widgetCount\n";
+        let found = identifier_occurrences_for(
+            Lang::Kotlin,
+            source.as_bytes(),
+            "widgetCount",
+            RenameTarget::Callable,
+        )
+        .unwrap();
+        let (out, replaced) = replace_occurrences(source, &found, "gadgetCount");
+
+        assert_eq!(replaced, 4, "got {found:?}\n{out}");
+        assert!(out.contains("fun gadgetCount(): Int = 2"), "{out}");
+        assert!(out.contains("fun gadgetCount(): Int = 3"), "{out}");
+        assert!(
+            out.contains("val fromClass = Panel.gadgetCount\n"),
+            "a companion member read was dropped:\n{out}"
+        );
+        assert!(
+            out.contains("val fromObject = Registry.gadgetCount()"),
+            "an object member call was dropped:\n{out}"
+        );
+        assert!(
+            out.contains("val fromValue = panel.widgetCount\n"),
+            "a value's member read was renamed:\n{out}"
+        );
     }
 
     #[cfg(feature = "lang-typescript")]
@@ -713,6 +1090,86 @@ widget_count
         assert!(
             out.contains("# widget_count comment"),
             "comment was renamed"
+        );
+    }
+
+    #[cfg(feature = "lang-zig")]
+    const ZIG_MEMBER_SOURCE: &str = "const m = @import(\"m.zig\");\n\npub fn widget_count() u32 { return 3; }\n\nconst Panel = struct {\n    widget_count: u32 = 0,\n\n    pub fn describe(self: Panel) u32 { return self.widget_count; }\n};\n\npub fn caller(p: Panel) u32 {\n    return widget_count() + p.widget_count + m.widget_count() + m.widget_count + Panel.widget_count;\n}\n";
+
+    /// The member positions Zig cannot narrow by the callee rule alone. A field
+    /// read off a value is dropped; a namespace member is kept whether or not
+    /// it is called, because `@import(...)` and a container type are the only
+    /// ways Zig reaches another declaration.
+    #[cfg(feature = "lang-zig")]
+    #[test]
+    fn zig_callable_narrowing_keeps_namespace_members_but_skips_field_reads() {
+        let found = identifier_occurrences_for(
+            Lang::Zig,
+            ZIG_MEMBER_SOURCE.as_bytes(),
+            "widget_count",
+            RenameTarget::Callable,
+        )
+        .unwrap();
+        let (out, replaced) = replace_occurrences(ZIG_MEMBER_SOURCE, &found, "gadget_count");
+
+        assert_eq!(replaced, 5, "got {found:?}\n{out}");
+        assert!(out.contains("pub fn gadget_count() u32"), "{out}");
+        assert!(out.contains("return gadget_count() +"), "{out}");
+        assert!(out.contains("m.gadget_count()"), "import call dropped:\n{out}");
+        assert!(
+            out.contains("m.gadget_count +"),
+            "import read dropped, which breaks every cross-file reference:\n{out}"
+        );
+        assert!(
+            out.contains("Panel.gadget_count;"),
+            "container-type member dropped:\n{out}"
+        );
+        assert!(
+            out.contains("    widget_count: u32 = 0,"),
+            "a struct field declaration was renamed:\n{out}"
+        );
+        assert!(
+            out.contains("p.widget_count +"),
+            "a field read off a value was renamed:\n{out}"
+        );
+        assert!(
+            out.contains("return self.widget_count;"),
+            "a field read off self was renamed:\n{out}"
+        );
+    }
+
+    /// A `const` rename keeps the namespace members — those name a module-level
+    /// declaration in another file — and drops the struct field: no capture in
+    /// `Lang::symbol_query` produces a `container_field`, so a field is never the
+    /// symbol a resolved rename selected, and a field read off a value receiver
+    /// is the one member position the grammar does attribute.
+    #[cfg(feature = "lang-zig")]
+    #[test]
+    fn zig_value_narrowing_keeps_namespace_members_and_drops_struct_fields() {
+        let found = identifier_occurrences_for(
+            Lang::Zig,
+            ZIG_MEMBER_SOURCE.as_bytes(),
+            "widget_count",
+            RenameTarget::Value,
+        )
+        .unwrap();
+        let (out, _) = replace_occurrences(ZIG_MEMBER_SOURCE, &found, "gadget_count");
+
+        assert!(
+            out.contains("m.gadget_count +"),
+            "an import-qualified const read was dropped:\n{out}"
+        );
+        assert!(
+            out.contains("Panel.gadget_count;"),
+            "a container-type const read was dropped:\n{out}"
+        );
+        assert!(
+            out.contains("p.widget_count +"),
+            "a struct field read was renamed by a const rename:\n{out}"
+        );
+        assert!(
+            out.contains("    widget_count: u32 = 0,"),
+            "the field declaration is not an indexed symbol and must not move:\n{out}"
         );
     }
 

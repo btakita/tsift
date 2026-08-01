@@ -72,6 +72,30 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
   conformance table pin declarations, direct calls, method calls, and
   untouched member reads in both grammars.
 
+  Kotlin keeps a member whose receiver names a `class`, `object`, or
+  `interface` declared in the same file, so a companion or `object` member
+  survives qualified access. A receiver declared in another file still falls to
+  the callee rule; Kotlin's usual cross-file reference is an `import` that binds
+  a bare identifier, which was never at risk.
+
+  Python keeps `mod.name` when `mod` is a module the file imported. The
+  attribute rule shipped without that exception and dropped it, which renamed
+  the definition and left every `import mod` reader pointing at a name that no
+  longer exists — a silent under-rename on a cross-file rename path. The alias
+  is used when there is one, and `import pkg.mod` binds `pkg`.
+
+  Zig is narrowed by the *receiver*, not by the callee position, because the
+  callee-only rule would be a silent under-rename there. Zig has no
+  import-into-namespace form, so `@import("m.zig").name` and `Type.name` are
+  the only ways to reach another file's declaration and both are member
+  positions — dropping them would rename a `const` or an uncalled function and
+  leave every cross-file reference behind. A Zig member is now kept when its
+  receiver roots in a namespace (an `@import` binding, or a binding whose
+  initializer is a container type, which in Zig is also a namespace) and
+  dropped when the receiver is an ordinary value, where the member is a struct
+  field. A `container_field` declaration is dropped for every resolved target:
+  the Zig symbol query never produces one.
+
 - **`rename_symbol` is open to every indexed language.** Kotlin, Bash, Zig, and
   GDScript can now be renamed. They could not before for no reason other than
   the implementation: each family hand-rolled its own substring scan, so a
