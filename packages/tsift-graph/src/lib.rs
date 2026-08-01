@@ -1214,6 +1214,22 @@ async fn submit_form() {}
         );
     }
 
+    #[cfg(feature = "lang-zig")]
+    #[test]
+    fn zig_direct_and_field_calls_resolve() {
+        let source =
+            b"pub fn main() void {\n    helper();\n    imported.Container.method();\n}\n";
+        let sites = extract_call_sites(Lang::Zig, source).unwrap();
+        assert!(
+            sites.iter().any(|site| site.callee == "helper"),
+            "missing direct call, got: {sites:?}"
+        );
+        assert!(
+            sites.iter().any(|site| site.callee == "method"),
+            "missing field call, got: {sites:?}"
+        );
+    }
+
     #[cfg(feature = "lang-gdscript")]
     #[test]
     fn gdscript_direct_attribute_and_base_calls_resolve() {

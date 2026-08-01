@@ -6525,6 +6525,63 @@ pub fn describe() -> String {
         );
     }
 
+    /// Zig used to have symbol extraction but no call query, so phase 2 could
+    /// never discover a `.zig` caller file even though the occurrence walker
+    /// knew how to rename an imported namespace member once given that file.
+    #[test]
+    fn zig_rename_reaches_imported_namespace_callers() {
+        let dir = rename_fixture(&[
+            (
+                "src/lib.zig",
+                "pub fn widgetCount() usize { return 3; }\n",
+            ),
+            (
+                "src/caller.zig",
+                "const lib = @import(\"lib.zig\");\npub fn total() usize { return lib.widgetCount() + 1; }\n",
+            ),
+        ]);
+        run_rename(
+            dir.path(),
+            r#"{"intents":[{"kind":"rename_symbol","symbol":"widgetCount","new_name":"gadgetCount","file":"src/lib.zig"}]}"#,
+        )
+        .expect("cross-file Zig rename should apply");
+
+        let library = std::fs::read_to_string(dir.path().join("src/lib.zig")).unwrap();
+        let caller = std::fs::read_to_string(dir.path().join("src/caller.zig")).unwrap();
+        assert!(library.contains("fn gadgetCount()"), "{library}");
+        assert!(caller.contains("lib.gadgetCount()"), "{caller}");
+        assert!(!caller.contains("widgetCount"), "{caller}");
+    }
+
+    /// A call edge selects the Kotlin caller file; import binding then proves
+    /// both the call and an uncalled qualified access in that file refer through
+    /// the external type namespace.
+    #[test]
+    fn kotlin_rename_keeps_qualified_imported_type_occurrences() {
+        let dir = rename_fixture(&[
+            (
+                "src/Panel.kt",
+                "package widgets\n\nclass Panel {\n    companion object {\n        fun widgetCount(): Int = 3\n    }\n}\n",
+            ),
+            (
+                "src/Caller.kt",
+                "package app\nimport widgets.Panel\nval ref = Panel.widgetCount\nfun total(): Int = Panel.widgetCount() + 1\n",
+            ),
+        ]);
+        run_rename(
+            dir.path(),
+            r#"{"intents":[{"kind":"rename_symbol","symbol":"widgetCount","new_name":"gadgetCount","file":"src/Panel.kt"}]}"#,
+        )
+        .expect("cross-file Kotlin rename should apply");
+
+        let panel = std::fs::read_to_string(dir.path().join("src/Panel.kt")).unwrap();
+        let caller = std::fs::read_to_string(dir.path().join("src/Caller.kt")).unwrap();
+        assert!(panel.contains("fun gadgetCount()"), "{panel}");
+        assert!(caller.contains("val ref = Panel.gadgetCount"), "{caller}");
+        assert!(caller.contains("Panel.gadgetCount()"), "{caller}");
+        assert!(!caller.contains("widgetCount"), "{caller}");
+    }
+
     /// Both lookups behind a cross-file rename are by name, and a name is not
     /// unique across languages. Scoping them to the file alone made a Python
     /// `beta` block renaming a JavaScript `beta` — and would have let the

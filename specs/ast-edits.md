@@ -273,11 +273,10 @@ is never dropped by the member-position rule.
 Kotlin keeps a member whose receiver names a `class`, `object`, or `interface`
 declared in the same file: `Panel.widgetCount` reaches a companion member and
 `Registry.widgetCount` an `object` member, both of which the index holds as
-declarations. A receiver declared in another file is not resolvable from one
-parse tree and falls back to the callee rule; Kotlin's ordinary cross-file
-reference is an `import` that binds the name into scope as a bare identifier,
-which the walk never drops, so what remains uncovered is qualified access to an
-imported type rather than the common path.
+declarations. It also recognizes names bound by explicit imports, including
+`as` aliases, so qualified access to a type or object declared in another file
+does not fall through to the callee-only rule. Wildcard imports remain
+unresolved because the parse tree cannot prove which declaration they bind.
 
 Python has one more exception, for the same reason Zig below is narrowed by its
 receiver: `mod.name` *is* the module-level binding when `mod` is a module this

@@ -278,9 +278,16 @@ impl Lang {
                 // older tree-sitter-kotlin grammar and does not compile here,
                 // which silently left every Kotlin file with zero call edges.
                 r#"
-                (call_expression (identifier) @call.name)
-                (call_expression (navigation_expression (identifier) (identifier) @call.name))
-            "#,
+(call_expression (identifier) @call.name)
+(call_expression (navigation_expression (identifier) (identifier) @call.name))
+"#,
+            ),
+            #[cfg(feature = "lang-zig")]
+            Self::Zig => Some(
+                r#"
+(call_expression function: (identifier) @call.name)
+(call_expression function: (field_expression member: (identifier) @call.name))
+"#,
             ),
             _ => None,
         }

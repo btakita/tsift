@@ -313,14 +313,10 @@ fn python_import_binds(import: Node, name: &str, source: &[u8]) -> bool {
 /// Kotlin's first `navigation_expression` identifier is the receiver binding;
 /// every later identifier is a member. A member is a rename target in the callee
 /// position, because Kotlin indexes methods as callables, and whenever the
-/// receiver is a type declared in this file — `Panel.widgetCount` reaches a
-/// companion member and `Registry.widgetCount` an `object` member, both of which
-/// the index holds as declarations, so dropping them is an under-rename.
-///
-/// A receiver declared in another file is not resolvable here and falls to the
-/// callee rule. Kotlin's ordinary cross-file reference is an `import` that binds
-/// the name into scope as a bare identifier, which this walk never touches, so
-/// that residue is the qualified-access case rather than the common one.
+/// receiver is a type declared in this file or a name bound by an import —
+/// `Panel.widgetCount` reaches a companion member and `Registry.widgetCount` an
+/// `object` member, both of which the index holds as declarations, so dropping
+/// them is an under-rename.
 #[cfg(feature = "lang-kotlin")]
 fn kotlin_occurrence_matches_target(node: Node, source: &[u8], target: RenameTarget) -> bool {
     let Some(navigation) = node
@@ -332,7 +328,7 @@ fn kotlin_occurrence_matches_target(node: Node, source: &[u8], target: RenameTar
     if node.prev_named_sibling().is_none() {
         return true;
     }
-    if kotlin_receiver_is_declared_type(navigation, source) {
+    if kotlin_receiver_is_namespace(navigation, source) {
         return true;
     }
 
@@ -345,10 +341,10 @@ fn kotlin_occurrence_matches_target(node: Node, source: &[u8], target: RenameTar
         })
 }
 
-/// Whether the receiver of this `navigation_expression` names a type declared in
-/// this file, which makes the member a declaration rather than a value's field.
+/// Whether the receiver of this `navigation_expression` is a namespace: a type
+/// declared in this file or a name bound by an import.
 #[cfg(feature = "lang-kotlin")]
-fn kotlin_receiver_is_declared_type(navigation: Node, source: &[u8]) -> bool {
+fn kotlin_receiver_is_namespace(navigation: Node, source: &[u8]) -> bool {
     let mut receiver = navigation;
     while receiver.kind() == "navigation_expression" {
         let Some(inner) = receiver.named_child(0) else {
@@ -363,6 +359,7 @@ fn kotlin_receiver_is_declared_type(navigation: Node, source: &[u8]) -> bool {
         return false;
     };
     kotlin_file_declares_type(navigation, name, source)
+        || kotlin_file_imports_name(navigation, name, source)
 }
 
 /// Whether the file holding `node` declares a class, interface, or object named
@@ -401,6 +398,60 @@ fn kotlin_file_declares_type(node: Node, name: &str, source: &[u8]) -> bool {
         }
         descend = false;
     }
+}
+
+/// Whether the file holding `node` imports a declaration under `name`.
+///
+/// A Kotlin import binds the last path segment unless an `as` alias is present.
+/// Wildcard imports do not prove which names they bind, so they remain
+/// deliberately unresolved.
+#[cfg(feature = "lang-kotlin")]
+fn kotlin_file_imports_name(node: Node, name: &str, source: &[u8]) -> bool {
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut cursor = root.walk();
+    let mut descend = true;
+    loop {
+        if descend {
+            let current = cursor.node();
+            if current.kind() == "import" && kotlin_import_binds(current, name, source) {
+                return true;
+            }
+            if cursor.goto_first_child() {
+                continue;
+            }
+        }
+        if cursor.goto_next_sibling() {
+            descend = true;
+            continue;
+        }
+        if !cursor.goto_parent() {
+            return false;
+        }
+        descend = false;
+    }
+}
+
+#[cfg(feature = "lang-kotlin")]
+fn kotlin_import_binds(import: Node, name: &str, source: &[u8]) -> bool {
+    let mut cursor = import.walk();
+    let children = import.named_children(&mut cursor).collect::<Vec<_>>();
+    if let Some(alias) = children
+        .get(1)
+        .filter(|child| child.kind() == "identifier")
+    {
+        return alias
+            .utf8_text(source)
+            .is_ok_and(|bound_name| bound_name == name);
+    }
+    children
+        .first()
+        .filter(|path| matches!(path.kind(), "identifier" | "qualified_identifier"))
+        .and_then(|path| path.utf8_text(source).ok())
+        .and_then(|path| path.rsplit('.').next())
+        .is_some_and(|bound_name| bound_name == name)
 }
 
 /// Zig spells a struct field declaration and every member access with the same
@@ -1038,6 +1089,39 @@ fn describe() -> String {
             out.contains("val fromValue = panel.widgetCount\n"),
             "a value's member read was renamed:\n{out}"
         );
+    }
+
+    /// Imports bind external declarations into the local namespace. Qualified
+    /// reads through the imported name or alias must survive callable narrowing,
+    /// even when they are not immediately called.
+    #[cfg(feature = "lang-kotlin")]
+    #[test]
+    fn kotlin_narrowing_keeps_members_of_imported_names() {
+        let source = "import widgets.Panel\n\
+import widgets.Registry as ExternalRegistry\n\
+\n\
+val fromClass = Panel.widgetCount\n\
+val fromAlias = ExternalRegistry.widgetCount()\n\
+val fromValue = panel.widgetCount\n";
+        let found = identifier_occurrences_for(
+            Lang::Kotlin,
+            source.as_bytes(),
+            "widgetCount",
+            RenameTarget::Callable,
+        )
+        .unwrap();
+        let (out, replaced) = replace_occurrences(source, &found, "gadgetCount");
+
+        assert_eq!(replaced, 2, "got {found:?}\n{out}");
+        assert!(
+            out.contains("val fromClass = Panel.gadgetCount\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("val fromAlias = ExternalRegistry.gadgetCount()\n"),
+            "{out}"
+        );
+        assert!(out.contains("val fromValue = panel.widgetCount\n"), "{out}");
     }
 
     #[cfg(feature = "lang-typescript")]
