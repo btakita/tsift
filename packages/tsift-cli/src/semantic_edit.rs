@@ -7088,6 +7088,47 @@ mod structural_rewrite_tests {
     }
 
     #[test]
+    fn an_extraction_out_of_a_method_lands_past_the_class() {
+        // The conformance table covers one module-level range per executor.
+        // This covers the *splice*, which is where a climbing insertion point
+        // can go wrong in a way no plan assertion would see: the new function
+        // has to land after the class's closing line, not inside its body,
+        // and the buffer has to still be the language it started as.
+        let python = "class Panel:\n    def outer(self, base):\n        acc = self.scale * base\n        return acc\n";
+        let (out, replacements) = preview_extract_function(
+            python,
+            SemanticEditExecutorLanguage::Python,
+            &extract_intent(3, 3, "double"),
+        )
+        .expect("planned");
+        assert_eq!(replacements, 1);
+        assert!(out.contains("        acc = double(self, base)\n"), "{out}");
+        // Column zero: a `def` at four spaces would be another method.
+        assert!(out.contains("\ndef double(self, base):"), "{out}");
+        assert!(out.contains("\n    acc = self.scale * base"), "{out}");
+        assert_eq!(out.matches("self.scale * base").count(), 1, "{out}");
+
+        let javascript =
+            "class Panel {\n  outer(base) {\n    let acc = base * 2;\n    return acc;\n  }\n}\n";
+        let (out, replacements) = preview_extract_function(
+            javascript,
+            SemanticEditExecutorLanguage::JavaScript,
+            &SemanticEditIntent {
+                file: Some(PathBuf::from("panel.js")),
+                ..extract_intent(3, 3, "double")
+            },
+        )
+        .expect("planned");
+        assert_eq!(replacements, 1);
+        assert!(out.contains("    let acc = double(base);\n"), "{out}");
+        // After the class's own closing brace, not inside its body — a
+        // `function` declaration is not a class member and would not parse
+        // there, which is what the reparse inside the planner is for.
+        assert!(out.contains("}\n\nfunction double(base) {"), "{out}");
+        assert_eq!(out.matches("base * 2").count(), 1, "{out}");
+    }
+
+    #[test]
     fn an_extraction_whose_control_flow_escapes_is_refused() {
         let err = preview_extract_function(
             PYTHON_SRC,

@@ -112,6 +112,10 @@ pub enum ExtractionRefusal {
     /// existed outside it. One call site cannot both declare and assign, and
     /// splitting it into two statements would change what a caller reads.
     MixedReturnDeclarations,
+    /// The range names the receiver the enclosing function was called on.
+    /// Unlike Python's `self`, `this` is not a name a derived signature can
+    /// carry, and it means something different inside a plain function.
+    ReferencesReceiver(&'static str),
     /// The range assigns a name it does not declare, and that name is not a
     /// local of the enclosing function either. Declaring it inside the new
     /// function would shadow an outer binding or turn a global into a local;
@@ -156,6 +160,9 @@ impl ExtractionRefusal {
             Self::MixedReturnDeclarations => {
                 "the range produces both newly declared and already declared names, which one call site cannot receive"
                     .to_string()
+            }
+            Self::ReferencesReceiver(keyword) => {
+                format!("the range uses `{keyword}`, which a derived signature cannot carry out of the method")
             }
             Self::AssignsUndeclaredName(name) => {
                 format!("the range assigns `{name}` without declaring it, and `{name}` is not a local of the enclosing function")
@@ -262,7 +269,40 @@ impl Dialect {
     fn is_class_kind(self, kind: &str) -> bool {
         match self.family {
             Family::Python | Family::GdScript => kind == "class_definition",
-            Family::JsLike => matches!(kind, "class_declaration" | "class" | "class_body"),
+            Family::JsLike => matches!(kind, "class_declaration" | "class"),
+        }
+    }
+
+    /// The node that holds a class's members, where it is spelled separately
+    /// from the class itself.
+    fn is_class_body_kind(self, kind: &str) -> bool {
+        match self.family {
+            // Python reuses its ordinary block node, so a Python class body is
+            // recognized through its parent instead.
+            Family::Python => false,
+            Family::GdScript | Family::JsLike => kind == "class_body",
+        }
+    }
+
+    /// Whether a new function extracted from a method belongs *outside* the
+    /// class rather than beside the method.
+    ///
+    /// Python and JavaScript resolve a bare call through the enclosing lexical
+    /// scope, never through the class, so the new function has to leave.
+    /// GDScript resolves a bare call against the script's own members, so it
+    /// has to stay.
+    fn hoists_out_of_class(self) -> bool {
+        !matches!(self.family, Family::GdScript)
+    }
+
+    /// Node kinds that name the receiver the enclosing function was called on.
+    ///
+    /// A `this` moved into a plain function stops meaning what it meant, and
+    /// unlike Python's `self` it is not a name a signature can carry.
+    fn receiver_kinds(self) -> &'static [&'static str] {
+        match self.family {
+            Family::Python | Family::GdScript => &[],
+            Family::JsLike => &["this", "super"],
         }
     }
 
@@ -353,11 +393,15 @@ pub fn plan_extraction(
     let block = selection[0]
         .parent()
         .ok_or(ExtractionRefusal::NotContiguousSiblings)?;
-    let function = hoistable_enclosing_function(dialect, block)?;
+    let function = enclosing_function(dialect, block)?;
+    let insertion_site = insertion_site(dialect, function)?;
 
     for statement in &selection {
         if let Some(kind) = escaping_control_flow(dialect, *statement) {
             return Err(ExtractionRefusal::ControlFlowEscapes(kind));
+        }
+        if let Some(kind) = receiver_reference(dialect, *statement) {
+            return Err(ExtractionRefusal::ReferencesReceiver(kind));
         }
     }
 
@@ -375,16 +419,33 @@ pub fn plan_extraction(
     let bound_outside_range =
         names_bound_in_function_outside(dialect, function, start_byte, end_byte, source);
     let read_after_range = names_read_after(dialect, function, end_byte, source);
-    let module_scope = module_scope_names(dialect, root, source);
+    let module_scope = scope_bindings(dialect, root, source);
+    // Where the new function actually lands, which is not module scope once it
+    // has climbed out of a class — or into a GDScript class alongside methods
+    // the root walk never sees.
+    let sibling_scope = insertion_site
+        .parent()
+        .map(|parent| scope_bindings(dialect, parent, source))
+        .unwrap_or_default();
 
-    if bound_outside_range.contains(new_name) || module_scope.contains(new_name) {
+    if bound_outside_range.contains(new_name)
+        || module_scope.contains(new_name)
+        || sibling_scope.contains(new_name)
+    {
         return Err(ExtractionRefusal::NameCollision(new_name.to_string()));
     }
 
-    let parameters = read_first_in_range
+    let mut parameters = read_first_in_range
         .intersection(&bound_outside_range)
         .cloned()
         .collect::<Vec<_>>();
+    // A receiver threaded out of a method reads as the first argument
+    // everywhere else in the language; alphabetical order would put it in the
+    // middle and make a correct signature look wrong.
+    if let Some(position) = parameters.iter().position(|name| name == "self") {
+        let receiver = parameters.remove(position);
+        parameters.insert(0, receiver);
+    }
     let returns = assigned_in_range
         .intersection(&read_after_range)
         .cloned()
@@ -425,8 +486,8 @@ pub fn plan_extraction(
         start_byte,
         end_byte,
         indent: line_indent(source, start_byte),
-        insert_byte: function.end_byte(),
-        enclosing_indent: line_indent(source, function.start_byte()),
+        insert_byte: insertion_site.end_byte(),
+        enclosing_indent: line_indent(source, insertion_site.start_byte()),
         indent_unit: indent_unit(dialect, function, source),
     })
 }
@@ -754,30 +815,61 @@ fn select_sibling_run(
 /// A method or a function expression fails here rather than later: hoisting out
 /// of a method would emit a sibling method, and the bare call left behind would
 /// not resolve to it — code that parses, formats, and does not run.
-fn hoistable_enclosing_function(
-    dialect: Dialect,
-    block: Node,
-) -> Result<Node, ExtractionRefusal> {
+fn enclosing_function(dialect: Dialect, block: Node) -> Result<Node, ExtractionRefusal> {
     let mut current = Some(block);
     while let Some(candidate) = current {
         if dialect.is_function_kind(candidate.kind()) {
-            let parent = candidate
-                .parent()
-                .ok_or(ExtractionRefusal::EnclosingFunctionNotHoistable)?;
-            if !dialect.is_block_kind(parent.kind()) && parent.kind() != dialect.root_kind() {
-                return Err(ExtractionRefusal::EnclosingFunctionNotHoistable);
-            }
-            if parent
-                .parent()
-                .is_some_and(|grand| dialect.is_class_kind(grand.kind()))
-            {
-                return Err(ExtractionRefusal::EnclosingFunctionNotHoistable);
-            }
             return Ok(candidate);
         }
         current = candidate.parent();
     }
     Err(ExtractionRefusal::NotInsideFunction)
+}
+
+/// The construct the new function is placed after.
+///
+/// Usually the enclosing function itself. Inside a method it is the *class*,
+/// because a `def` placed beside a method is another method and the bare call
+/// left behind does not resolve to it — so the extraction climbs out to where
+/// the call can see it. Climbing past a class body never costs the extracted
+/// body anything: a method could not read a class-body name unqualified in the
+/// first place, so nothing it closed over is left behind.
+///
+/// GDScript is the exception, and for the opposite reason: its methods *do*
+/// call each other bare, so a sibling `func` in the same class is exactly
+/// right and climbing out would break the call instead of fixing it.
+fn insertion_site(dialect: Dialect, function: Node) -> Result<Node, ExtractionRefusal> {
+    let mut node = function;
+    loop {
+        let Some(parent) = node.parent() else {
+            return Err(ExtractionRefusal::EnclosingFunctionNotHoistable);
+        };
+        // A class body holds declarations the same way a block holds
+        // statements, so both are places something can be put; what differs is
+        // whether staying there keeps the call resolvable.
+        let in_class_body = dialect.is_class_body_kind(parent.kind())
+            || (dialect.is_block_kind(parent.kind())
+                && parent
+                    .parent()
+                    .is_some_and(|grand| dialect.is_class_kind(grand.kind())));
+        if in_class_body {
+            if !dialect.hoists_out_of_class() {
+                return Ok(node);
+            }
+            let Some(class) = parent.parent() else {
+                return Err(ExtractionRefusal::EnclosingFunctionNotHoistable);
+            };
+            node = class;
+            continue;
+        }
+        if dialect.is_block_kind(parent.kind()) || parent.kind() == dialect.root_kind() {
+            return Ok(node);
+        }
+        // Everything else — an arrow function, a function expression, a class
+        // expression — is part of a larger expression, and there is no
+        // statement slot beside it to put anything in.
+        return Err(ExtractionRefusal::EnclosingFunctionNotHoistable);
+    }
 }
 
 /// A statement whose effect is defined by the block it sits in, and therefore
@@ -794,6 +886,26 @@ fn escaping_control_flow(dialect: Dialect, statement: Node) -> Option<&'static s
             return false;
         }
         found = dialect.escaping_kind(node.kind());
+        found.is_none()
+    });
+    found
+}
+
+/// The receiver keyword the range names, if it names one.
+fn receiver_reference(dialect: Dialect, statement: Node) -> Option<&'static str> {
+    let keywords = dialect.receiver_kinds();
+    if keywords.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    walk(statement, &mut |node| {
+        if found.is_some() {
+            return false;
+        }
+        found = keywords
+            .iter()
+            .find(|keyword| **keyword == node.kind())
+            .copied();
         found.is_none()
     });
     found
@@ -1023,10 +1135,15 @@ fn names_read_after(
     names
 }
 
-fn module_scope_names(dialect: Dialect, root: Node, source: &[u8]) -> BTreeSet<String> {
+/// The names bound directly by one scope's own statements.
+///
+/// Used twice, for two different scopes: the file root, whose names stay free
+/// references rather than becoming parameters, and the block the new function
+/// is inserted into, whose names it must not collide with.
+fn scope_bindings(dialect: Dialect, scope: Node, source: &[u8]) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-    let mut cursor = root.walk();
-    for statement in root.named_children(&mut cursor) {
+    let mut cursor = scope.walk();
+    for statement in scope.named_children(&mut cursor) {
         if dialect.is_nested_scope_kind(statement.kind()) {
             if let Some(name) = statement
                 .child_by_field_name("name")
@@ -1459,15 +1576,45 @@ mod python_tests {
     }
 
     #[test]
-    fn refuses_to_hoist_out_of_a_method() {
-        // A `def` placed beside a method becomes another method, and the bare
-        // call left in its place does not resolve to it. Refusing is the whole
-        // point: the alternative parses, formats, and raises at run time.
-        let source = "class Panel:\n    def outer(self, base):\n        acc = base * 2\n        return acc\n";
+    fn a_method_extraction_lands_past_the_class_with_self_as_a_parameter() {
+        // A `def` placed *beside* a method is another method, and the bare call
+        // left in its place does not resolve to it. Climbing past the class
+        // puts it where the call can see it, and `self` — a name like any
+        // other in Python — threads through the signature.
+        let source = "class Panel:\n    def outer(self, base):\n        acc = self.scale * base\n        return acc\n";
+        let plan =
+            plan_extraction(Lang::Python, source.as_bytes(), 2, 2, "double").expect("planned");
+        assert_eq!(plan.enclosing_function, "outer");
+        // Receiver first: alphabetical order would read as a mistake.
         assert_eq!(
-            plan_extraction(Lang::Python, source.as_bytes(), 2, 2, "double"),
-            Err(ExtractionRefusal::EnclosingFunctionNotHoistable)
+            plan.parameters,
+            vec!["self".to_string(), "base".to_string()]
         );
+        // Module scope, not class scope.
+        assert_eq!(plan.enclosing_indent, "");
+        assert_eq!(plan.insert_byte, source.len() - 1);
+        let (function, call) = render_extraction(&plan, source, "double");
+        assert!(function.contains("\ndef double(self, base):"), "{function}");
+        assert!(
+            function.contains("\n    acc = self.scale * base"),
+            "{function}"
+        );
+        assert_eq!(call, "        acc = double(self, base)");
+    }
+
+    #[test]
+    fn a_nested_function_extraction_stays_inside_its_enclosing_function() {
+        // Not every climb is out to module scope: a nested `def` closes over
+        // the outer function's locals, and hoisting past it would leave the
+        // extracted body reading names that are no longer in scope.
+        let source = "def outer(a):\n    scale = 2\n\n    def inner(b):\n        acc = scale * b\n        return acc\n    return inner\n";
+        let plan =
+            plan_extraction(Lang::Python, source.as_bytes(), 4, 4, "double").expect("planned");
+        assert_eq!(plan.enclosing_function, "inner");
+        assert_eq!(plan.enclosing_indent, "    ");
+        // `scale` belongs to `outer`, not to `inner`, so it stays a free
+        // reference the sibling `def` can still see.
+        assert_eq!(plan.parameters, vec!["b".to_string()]);
     }
 
     #[test]
@@ -1608,11 +1755,31 @@ mod gdscript_tests {
     }
 
     #[test]
-    fn refuses_to_hoist_out_of_an_inner_class() {
+    fn a_method_extraction_stays_inside_the_class_as_a_sibling_func() {
+        // The opposite of Python and JavaScript, and for the opposite reason:
+        // GDScript resolves a bare call against the script's own members, so a
+        // sibling `func` is exactly what the call left behind needs. Climbing
+        // out of the class would break the call rather than fix it.
         let source = "class Panel:\n\tfunc outer(base):\n\t\tvar acc = base * 2\n\t\treturn acc\n";
+        let plan =
+            plan_extraction(Lang::GdScript, source.as_bytes(), 2, 2, "double").expect("planned");
+        assert_eq!(plan.enclosing_function, "outer");
+        assert_eq!(plan.enclosing_indent, "\t");
+        let (function, call) = render_extraction(&plan, source, "double");
+        assert!(function.contains("\n\tfunc double(base):"), "{function}");
+        assert!(function.contains("\n\t\tvar acc = base * 2"), "{function}");
+        assert_eq!(call, "\t\tvar acc = double(base)");
+    }
+
+    #[test]
+    fn refuses_a_name_that_already_binds_as_a_sibling_method() {
+        // The new `func` lands inside the class, so the names it must not
+        // collide with are the class's own members — which a file-root scan
+        // never sees.
+        let source = "class Panel:\n\tfunc double(x):\n\t\treturn x\n\n\tfunc outer(base):\n\t\tvar acc = base * 2\n\t\treturn acc\n";
         assert_eq!(
-            plan_extraction(Lang::GdScript, source.as_bytes(), 2, 2, "double"),
-            Err(ExtractionRefusal::EnclosingFunctionNotHoistable)
+            plan_extraction(Lang::GdScript, source.as_bytes(), 5, 5, "double"),
+            Err(ExtractionRefusal::NameCollision("double".to_string()))
         );
     }
 
@@ -1736,11 +1903,31 @@ mod javascript_tests {
     }
 
     #[test]
-    fn refuses_to_hoist_out_of_a_method() {
-        let source = "class Panel {\n  outer(base) {\n    let acc = base * 2;\n    return acc;\n  }\n}\n";
+    fn a_method_extraction_lands_beside_the_class_declaration() {
+        let source =
+            "class Panel {\n  outer(base) {\n    let acc = base * 2;\n    return acc;\n  }\n}\n";
+        let plan =
+            plan_extraction(Lang::JavaScript, source.as_bytes(), 2, 2, "double").expect("planned");
+        assert_eq!(plan.enclosing_function, "outer");
+        // Beside the class, at the class's own indentation — not inside the
+        // class body, where `function double(...)` is not even legal.
+        assert_eq!(plan.enclosing_indent, "");
+        assert_eq!(plan.insert_byte, source.len() - 1);
+        let (function, call) = render_extraction(&plan, source, "double");
+        assert!(function.contains("\nfunction double(base) {"), "{function}");
+        assert_eq!(call, "    let acc = double(base);");
+    }
+
+    #[test]
+    fn refuses_a_method_extraction_that_uses_this() {
+        // `this` is not a name a derived signature can carry, and a plain
+        // function's `this` is not the method's. Threading it would take a
+        // body rewrite the derivation does not do, so it refuses instead of
+        // emitting a function that reads a different receiver.
+        let source = "class Panel {\n  outer(base) {\n    let acc = this.scale * base;\n    return acc;\n  }\n}\n";
         assert_eq!(
             plan_extraction(Lang::JavaScript, source.as_bytes(), 2, 2, "double"),
-            Err(ExtractionRefusal::EnclosingFunctionNotHoistable)
+            Err(ExtractionRefusal::ReferencesReceiver("this"))
         );
     }
 

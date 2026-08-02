@@ -47,7 +47,19 @@ The derivation, for a run `R` inside enclosing function `F`:
 - **Returns** are names `R` assigns that are read in `F` after `R`. None emits a bare call, one emits `name = call(...)`, several emit a destructuring, which is the only spelling that keeps the call site one statement.
 - A name bound at module scope is neither. Threading it through a parameter would compile and quietly change what the new function closes over, which is why module scope is classified explicitly rather than inferred from "not bound in `F`".
 
-Everything else refuses, and the refusal list is load-bearing: a rename that misses an occurrence breaks the build loudly, but an extraction with a wrong parameter list can compile and silently change behaviour. Refusals cover a range that is not a contiguous run of siblings in one block, a range outside any function, an enclosing function that is a method or an expression (there is nowhere beside it to put a new function without changing what the new function *is*), control flow that escapes the range (`return`, `break`, `continue`, `yield`), a range assigning a name `F` declared `global`/`nonlocal`, a new name that already binds in `F` or at module scope, several returned names in a language with no destructuring call site, a return set that mixes newly declared with already declared names, and a parameter whose type cannot be spelled.
+Everything else refuses, and the refusal list is load-bearing: a rename that misses an occurrence breaks the build loudly, but an extraction with a wrong parameter list can compile and silently change behaviour. Refusals cover a range that is not a contiguous run of siblings in one block, a range outside any function, an enclosing function that sits in an *expression* rather than a statement (an arrow function, a function expression, a class expression — there is no statement slot beside it), control flow that escapes the range (`return`, `break`, `continue`, `yield`), a range that names `this` or `super`, a range assigning a name `F` declared `global`/`nonlocal`, a new name that already binds in `F`, at module scope, or beside the insertion point, several returned names in a language with no destructuring call site, a return set that mixes newly declared with already declared names, and a parameter whose type cannot be spelled.
+
+### Where the new function goes
+
+Usually beside the enclosing function. Inside a **method** that is wrong: a `def` placed beside a method is another method, and the bare call left behind does not resolve to it. So the insertion point climbs to the nearest position where the call can still see it, which differs by language for a reason worth stating:
+
+| | insertion point | receiver |
+|---|---|---|
+| Python | past the class, at module scope | `self` is an ordinary name and threads through the signature, first in the parameter list |
+| JS / JSX / TS / TSX | beside the class declaration | `this` is not a name a signature can carry, so a range that uses it **refuses** |
+| GDScript | beside the method, inside the class | resolves bare against the script's own members, so staying is what keeps the call working |
+
+Climbing past a class body never costs the extracted body anything, because a method could not read a class-body name unqualified in the first place. Climbing past a *function* would — a nested function closes over its enclosing function's locals — so the climb stops at the first non-class statement position. Name collisions are checked against the block the new function actually lands in as well as against module scope, which is how a GDScript sibling method conflict is caught at all: a file-root scan never sees the members of a class.
 
 ### The untyped family
 

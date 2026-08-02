@@ -27,14 +27,28 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
   Everything else refuses by name: a selection that is not a contiguous run of
   siblings in one block, a range outside any function, an enclosing function
-  that is a method or an expression, control flow that escapes the range
-  (`return`, `break`, `continue`, `yield`), a range assigning a `global` or
-  `nonlocal` name, and a new name that already binds in scope. A rename that
-  misses an occurrence breaks the build loudly; an extraction with a wrong
-  parameter list does not, so under-refusing here is the expensive direction.
-  Hoisting out of a method is the sharpest case: a `def` placed beside a method
-  *is* another method, and the bare call left behind does not resolve to it —
-  code that parses, formats, and raises at run time.
+  that sits in an *expression* rather than a statement, control flow that
+  escapes the range (`return`, `break`, `continue`, `yield`), a range that names
+  `this` or `super`, a range assigning a `global` or `nonlocal` name, and a new
+  name that already binds in scope. A rename that misses an occurrence breaks
+  the build loudly; an extraction with a wrong parameter list does not, so
+  under-refusing here is the expensive direction.
+
+  **Where the new function goes** is the other half of that. A `def` placed
+  beside a method *is* another method, and the bare call left behind does not
+  resolve to it — code that parses, formats, and raises at run time. So the
+  insertion point climbs out of a class: past it to module scope in Python,
+  where `self` is an ordinary name and threads through the signature first in
+  the list; beside the class declaration in JavaScript and TypeScript; and for
+  GDScript deliberately nowhere, because its methods call each other bare and a
+  sibling `func` is exactly what the call needs. A JS/TS range that names `this`
+  refuses instead — unlike `self`, it is not a name a derived signature can
+  carry. The climb stops at the first non-class statement position, so a nested
+  function's extraction stays inside its enclosing function and keeps its
+  closure, and a function that sits in an expression still refuses because there
+  is no statement slot beside it. Collisions are checked against the block the
+  new function lands in as well as against module scope, which is the only way a
+  GDScript sibling-method conflict is seen at all.
 
   Registered for the untyped family: Python, GDScript, JavaScript, JSX,
   TypeScript, and TSX — the languages whose signature is derivable without type
