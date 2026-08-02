@@ -44,12 +44,32 @@ The output is not a rewrite of what was selected. It is two edits that must agre
 The derivation, for a run `R` inside enclosing function `F`:
 
 - **Parameters** are names read in `R` before `R` assigns them, that are bound in `F` outside `R` (including `F`'s own parameters). A name `R` assigns before reading is a local of the new function: passing the outer value in would feed the body a value it immediately overwrites.
-- **Returns** are names `R` assigns that are read in `F` after `R`. None emits a bare call, one emits `name = call(...)`, several emit a tuple destructuring, which is the only spelling that keeps the call site one statement.
+- **Returns** are names `R` assigns that are read in `F` after `R`. None emits a bare call, one emits `name = call(...)`, several emit a destructuring, which is the only spelling that keeps the call site one statement.
 - A name bound at module scope is neither. Threading it through a parameter would compile and quietly change what the new function closes over, which is why module scope is classified explicitly rather than inferred from "not bound in `F`".
 
-Everything else refuses, and the refusal list is load-bearing: a rename that misses an occurrence breaks the build loudly, but an extraction with a wrong parameter list can compile and silently change behaviour. Refusals cover a range that is not a contiguous run of siblings in one block, a range outside any function, control flow that escapes the range (`return`, `break`, `continue`, `yield`), a range assigning a name `F` declared `global`/`nonlocal`, and a new name that already binds in `F` or at module scope.
+Everything else refuses, and the refusal list is load-bearing: a rename that misses an occurrence breaks the build loudly, but an extraction with a wrong parameter list can compile and silently change behaviour. Refusals cover a range that is not a contiguous run of siblings in one block, a range outside any function, an enclosing function that is a method or an expression (there is nowhere beside it to put a new function without changing what the new function *is*), control flow that escapes the range (`return`, `break`, `continue`, `yield`), a range assigning a name `F` declared `global`/`nonlocal`, a new name that already binds in `F` or at module scope, several returned names in a language with no destructuring call site, a return set that mixes newly declared with already declared names, and a parameter whose type cannot be spelled.
 
-Registration is per language, not per family. The derivation is language-general, but a signature is only derivable without type information in languages that do not spell one, so Python carries the kind and the rest of the script family does not — advertising it for an executor with no emitter would be the same defect as advertising `structural_rewrite` for a language with no compiled grammar.
+### The untyped family
+
+Registration is per language, not per family, and the family that carries the kind is the set of languages whose signature is derivable without type information: **Python, GDScript, JavaScript, JSX, TypeScript, and TSX**. Rust is deliberately absent — choosing `T`, `&T`, or `&mut T` needs types `tsift-graph` does not have, and a guessed signature parses without building. Advertising the kind for an executor with no emitter would be the same defect as advertising `structural_rewrite` for a language with no compiled grammar.
+
+One analysis serves all six; what varies is a node-kind vocabulary and an emitter:
+
+| | block | new function | call site | several returns |
+|---|---|---|---|---|
+| Python | indentation | `def name(a, b):` | `x, y = name(a, b)` | tuple destructuring |
+| GDScript | indentation | `func name(a, b):` | `var x = name(a, b)` | **refused** — no destructuring assignment |
+| JS / JSX / TS / TSX | braces | `function name(a, b) {` | `let [x, y] = name(a, b);` | array destructuring |
+
+Two consequences follow from languages that *declare*:
+
+- The call site declares (`let`/`var`) only when the range carried the declaration away with it, and assigns when the name still exists outside. A return set that mixes the two refuses rather than splitting the call into statements the caller did not ask for.
+- The mirror of that rule applies inside the new function: a name the range only *assigns*, whose declaration stayed behind, is declared in a prologue — otherwise the emitted body writes a name that is not in scope, which TypeScript rejects and plain JavaScript turns into a global. A name that is not a local of the enclosing function refuses instead (`AssignsUndeclaredName`), because declaring it would shadow an outer binding and not declaring it would write to a scope the caller did not choose. Python is exempt by construction: there, assignment declares.
+- One level of indentation is measured from the enclosing function's own body, not assumed, so a tab-indented `.gd` file and a two-space `.py` file each get a new function indented the way they already are.
+
+TypeScript is in the family only because it can **copy** an annotation the file already has, from the parameter or the declaration that binds the name. Where it cannot, it refuses — `unknown` and an implicitly `any` parameter both type-check something other than what the code does, which is the failure this intent exists to avoid.
+
+Every registered executor carries one extraction conformance fixture asserting its emitted function and its call site individually, and the planner reparses its own spliced output with the executor's grammar before returning it.
 
 ## Minimal Textual Patch Output
 

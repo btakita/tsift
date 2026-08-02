@@ -8,7 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
-- **`extract_function`, the first range-selected edit intent (Python).** Every
+- **`extract_function`, the first range-selected edit intent.** Every
   other semantic edit selects a named thing — a symbol row, a heading, an
   ast-grep pattern — and rewrites at or around it. This one selects a run of
   sibling statements, which has no name, no symbol row, and no single AST node,
@@ -26,18 +26,42 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
   over, which is the failure mode this intent is organized against.
 
   Everything else refuses by name: a selection that is not a contiguous run of
-  siblings in one block, a range outside any function, control flow that escapes
-  it (`return`, `break`, `continue`, `yield`), a range assigning a `global` or
+  siblings in one block, a range outside any function, an enclosing function
+  that is a method or an expression, control flow that escapes the range
+  (`return`, `break`, `continue`, `yield`), a range assigning a `global` or
   `nonlocal` name, and a new name that already binds in scope. A rename that
   misses an occurrence breaks the build loudly; an extraction with a wrong
   parameter list does not, so under-refusing here is the expensive direction.
+  Hoisting out of a method is the sharpest case: a `def` placed beside a method
+  *is* another method, and the bare call left behind does not resolve to it —
+  code that parses, formats, and raises at run time.
 
-  Python only, deliberately. The derivation is language-general but the emitter
-  is not, and a signature is only derivable without type information in a
-  language that does not spell one. Rust cannot be done this way — choosing
-  `T`, `&T`, or `&mut T` needs types tsift does not have — so it is a separate
-  decision (caller-supplied signature, or a closure that infers) rather than a
-  registration entry. Plan: `tasks/software/plan-tsift-extract-function.md`.
+  Registered for the untyped family: Python, GDScript, JavaScript, JSX,
+  TypeScript, and TSX — the languages whose signature is derivable without type
+  information. One analysis serves all six; what varies is a node-kind
+  vocabulary and an emitter for the `def`/`func`/`function` spelling and the
+  indentation or brace block. Two things follow from the languages that
+  *declare*: the call site says `let`/`var` only when the range carried the
+  declaration away with it (and refuses a return set that mixes declared with
+  already-declared names, which one statement cannot receive), and the new
+  function declares, in a prologue, every name the range only *assigns* —
+  without that its body writes a name that is not in scope, which TypeScript
+  rejects and plain JavaScript turns into a global. A name that is not a local
+  of the enclosing function refuses instead. One level of indentation is
+  measured from the enclosing function's own body rather than assumed, so a
+  tab-indented `.gd` file stays tab-indented. GDScript refuses
+  more than one returned name outright: it has no destructuring assignment, and
+  an array plus two index reads would be three statements where the caller
+  wrote one.
+
+  TypeScript is in the family only because it can *copy* an annotation the file
+  already has. Where it cannot, it refuses — `unknown` and an implicitly `any`
+  parameter both type-check something other than what the code does.
+
+  Rust is still out. Choosing `T`, `&T`, or `&mut T` needs types tsift does not
+  have, so it is a separate decision (caller-supplied signature, or a closure
+  that infers) rather than a registration entry. Plan:
+  `tasks/software/plan-tsift-extract-function.md`.
 
 ## 0.1.79
 

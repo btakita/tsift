@@ -412,21 +412,21 @@ pub(crate) const SEMANTIC_EDIT_RUST_KINDS: &[&str] = &[
     "rewrite_call_sites",
     "structural_rewrite",
 ];
-pub(crate) const SEMANTIC_EDIT_SCRIPT_KINDS: &[&str] = &[
-    "rename_symbol",
-    "replace_function_body",
-    "insert_import",
-    "structural_rewrite",
-];
-/// Python is the script family plus `extract_function`.
+/// The script tier: Python and the JS-like grammars.
 ///
-/// The extraction derivation is language-general, but the *emitter* is not, and
-/// a signature is only derivable without type information in languages that do
-/// not spell one. Python is that case. Registering the kind for the whole script
-/// family would advertise an edit the JS-like emitters cannot yet produce, which
-/// is the refusal-by-registration rule `SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS`
-/// already applies to `structural_rewrite`.
-pub(crate) const SEMANTIC_EDIT_PYTHON_KINDS: &[&str] = &[
+/// `extract_function` is here rather than on Python alone because the family
+/// this tier describes *is* the family whose signature is derivable without
+/// type information — an untyped parameter list and an explicit `return`.
+/// Rust is deliberately absent: choosing `T`, `&T`, or `&mut T` needs types
+/// `tsift-graph` does not have, and a guessed signature parses without
+/// building.
+///
+/// TypeScript is in it only because it can *copy* an annotation the file
+/// already has. Where it cannot, the planner refuses rather than writing
+/// `unknown` or leaving a parameter implicitly `any`, so the registration
+/// advertises an edit that either lands correctly or declines by name — never
+/// one that type-checks something other than what the code does.
+pub(crate) const SEMANTIC_EDIT_SCRIPT_KINDS: &[&str] = &[
     "rename_symbol",
     "replace_function_body",
     "insert_import",
@@ -453,6 +453,15 @@ pub(crate) const SEMANTIC_EDIT_INDEXED_KINDS: &[&str] = &["rename_symbol", "stru
 /// advertising it would mean planning an edit that `preview_structural_rewrite`
 /// can only fail on.
 pub(crate) const SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS: &[&str] = &["rename_symbol"];
+/// The same tier for an indexed language that also has an extraction emitter.
+///
+/// GDScript is the one language in that position: no ast-grep grammar in this
+/// build, so no `structural_rewrite`, but an indentation-scoped block and an
+/// untyped `func` signature, so an extraction is derivable. Splitting the row
+/// keeps the two facts independent — a grammar arriving later changes one of
+/// them without silently changing the other.
+pub(crate) const SEMANTIC_EDIT_INDEXED_EXTRACT_KINDS: &[&str] =
+    &["rename_symbol", "extract_function"];
 pub(crate) const SEMANTIC_EDIT_MARKDOWN_KINDS: &[&str] = &[
     "rename_heading",
     "replace_section_body",
@@ -1301,8 +1310,8 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         temp_suffix: ".py",
         aliases: &["python", "py", "pyi"],
         extensions: &["py", "pyi"],
-        recognized_intents: SEMANTIC_EDIT_PYTHON_KINDS,
-        apply_supported_intents: SEMANTIC_EDIT_PYTHON_KINDS,
+        recognized_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
         family: SemanticEditLanguageFamily::Python,
         formatter: SemanticEditFormatterContract::PythonAuto,
     },
@@ -1420,8 +1429,8 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         temp_suffix: ".gd",
         aliases: &["gdscript", "gd"],
         extensions: &["gd"],
-        recognized_intents: SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS,
-        apply_supported_intents: SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS,
+        recognized_intents: SEMANTIC_EDIT_INDEXED_EXTRACT_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_INDEXED_EXTRACT_KINDS,
         family: SemanticEditLanguageFamily::Indexed,
         formatter: SemanticEditFormatterContract::None,
     },
@@ -2251,6 +2260,151 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
     },
 ];
 
+/// One extraction conformance fixture per executor that recognizes
+/// `extract_function`.
+///
+/// A rename fixture proves an executor can find every occurrence of a name it
+/// was *given*. An extraction is the opposite problem: nothing names the thing
+/// being moved, and the signature is derived rather than supplied. So each row
+/// asserts the emitted function and the call site it left behind
+/// *individually* — a runner that compared whole buffers would report green on
+/// a signature and a call that were both wrong in the same direction, which is
+/// the failure this intent is organized against.
+#[cfg(test)]
+struct SemanticEditExtractionFixture {
+    executor: SemanticEditExecutorLanguage,
+    alias: &'static str,
+    /// A path whose extension must resolve to `executor` on its own.
+    sample_path: &'static str,
+    source: &'static str,
+    /// One-based inclusive, as the intent spells it.
+    start_line: usize,
+    end_line: usize,
+    new_name: &'static str,
+    /// The call the caller is left with, byte for byte including indentation
+    /// and the language's statement terminator.
+    call_site: &'static str,
+    /// Substrings the emitted function must contain, each asserted on its own.
+    emitted: &'static [&'static str],
+    /// Text that must appear exactly once in the result: the range moved, it
+    /// was not copied.
+    hoisted_once: &'static str,
+}
+
+#[cfg(test)]
+const SEMANTIC_EDIT_EXTRACTION_FIXTURES: &[SemanticEditExtractionFixture] = &[
+    SemanticEditExtractionFixture {
+        executor: SemanticEditExecutorLanguage::Python,
+        alias: "python",
+        sample_path: "app.py",
+        source: "def outer(base, scale):\n    prefix = base * 2\n    acc = 0\n    for item in range(scale):\n        acc += item * prefix\n    return acc\n",
+        start_line: 3,
+        end_line: 5,
+        new_name: "accumulate",
+        call_site: "    acc = accumulate(prefix, scale)\n",
+        emitted: &[
+            "def accumulate(prefix, scale):",
+            "\n    acc = 0",
+            "\n        acc += item * prefix",
+            "\n    return acc",
+        ],
+        hoisted_once: "for item in range(scale):",
+    },
+    SemanticEditExtractionFixture {
+        executor: SemanticEditExecutorLanguage::TypeScript,
+        alias: "typescript",
+        // Both parameters carry an annotation, which is the only condition
+        // under which TypeScript is extractable at all.
+        sample_path: "tool.ts",
+        source: "function outer(base: number, scale: number) {\n  let acc = 0;\n  acc = base * scale;\n  return acc;\n}\n",
+        start_line: 3,
+        end_line: 3,
+        new_name: "combine",
+        call_site: "  acc = combine(base, scale);\n",
+        emitted: &[
+            "function combine(base: number, scale: number) {",
+            // `acc` was declared outside the range, so the new function has to
+            // declare it: without this line the body assigns a name that is
+            // not in scope.
+            "\n  let acc;\n  acc = base * scale;",
+            "\n  return acc;",
+        ],
+        hoisted_once: "base * scale",
+    },
+    SemanticEditExtractionFixture {
+        executor: SemanticEditExecutorLanguage::Tsx,
+        alias: "tsx",
+        sample_path: "View.tsx",
+        source: "function outer(rows: number[], scale: number) {\n  let total = 0;\n  total = rows.length * scale;\n  return total;\n}\n",
+        start_line: 3,
+        end_line: 3,
+        new_name: "measure",
+        call_site: "  total = measure(rows, scale);\n",
+        emitted: &[
+            "function measure(rows: number[], scale: number) {",
+            "\n  let total;\n  total = rows.length * scale;",
+            "\n  return total;",
+        ],
+        hoisted_once: "rows.length * scale",
+    },
+    SemanticEditExtractionFixture {
+        executor: SemanticEditExecutorLanguage::JavaScript,
+        alias: "javascript",
+        sample_path: "app.js",
+        // `acc` is declared inside the range, so the call site has to declare
+        // it rather than assign it — the one place a JS extraction differs
+        // from the Python one it shares a derivation with.
+        source: "function outer(base, scale) {\n  const prefix = base * 2;\n  let acc = 0;\n  for (const item of range(scale)) {\n    acc += item * prefix;\n  }\n  return acc;\n}\n",
+        start_line: 3,
+        end_line: 6,
+        new_name: "accumulate",
+        call_site: "  let acc = accumulate(prefix, scale);\n",
+        emitted: &[
+            "function accumulate(prefix, scale) {",
+            "\n  let acc = 0;",
+            "\n    acc += item * prefix;",
+            "\n  return acc;",
+        ],
+        hoisted_once: "for (const item of range(scale)) {",
+    },
+    SemanticEditExtractionFixture {
+        executor: SemanticEditExecutorLanguage::Jsx,
+        alias: "jsx",
+        sample_path: "view.jsx",
+        source: "function outer(items) {\n  let count = 0;\n  count = items.length;\n  return count;\n}\n",
+        start_line: 3,
+        end_line: 3,
+        new_name: "size",
+        call_site: "  count = size(items);\n",
+        emitted: &[
+            "function size(items) {",
+            "\n  let count;\n  count = items.length;",
+            "\n  return count;",
+        ],
+        hoisted_once: "items.length",
+    },
+    SemanticEditExtractionFixture {
+        executor: SemanticEditExecutorLanguage::GdScript,
+        alias: "gdscript",
+        sample_path: "player.gd",
+        // Tab-indented, and the emitted body has to match: an extraction that
+        // hard-coded four spaces would still parse and would leave a file that
+        // no longer agrees with itself.
+        source: "func outer(base, scale):\n\tvar prefix = base * 2\n\tvar acc = 0\n\tfor item in range(scale):\n\t\tacc += item * prefix\n\treturn acc\n",
+        start_line: 3,
+        end_line: 5,
+        new_name: "accumulate",
+        call_site: "\tvar acc = accumulate(prefix, scale)\n",
+        emitted: &[
+            "func accumulate(prefix, scale):",
+            "\n\tvar acc = 0",
+            "\n\t\tacc += item * prefix",
+            "\n\treturn acc",
+        ],
+        hoisted_once: "for item in range(scale):",
+    },
+];
+
 fn semantic_edit_language_contract_for_extension(
     ext: &str,
 ) -> Option<&'static SemanticEditLanguageContract> {
@@ -2422,8 +2576,8 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             "script.py",
             SemanticEditExecutorLanguage::Python,
             "python",
-            SEMANTIC_EDIT_PYTHON_KINDS,
-            SEMANTIC_EDIT_PYTHON_KINDS,
+            SEMANTIC_EDIT_SCRIPT_KINDS,
+            SEMANTIC_EDIT_SCRIPT_KINDS,
             SemanticEditFormatterContract::PythonAuto,
         ),
         (
@@ -2481,9 +2635,10 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             SemanticEditFormatterContract::None,
         ),
         // The indexed tier is listed by hand rather than driven from the
-        // fixtures, because the two halves differ in exactly the way that
-        // matters: zig and gdscript have no ast-grep grammar in this build and
-        // so must *not* advertise `structural_rewrite`.
+        // fixtures, because its halves differ in exactly the ways that matter:
+        // zig and gdscript have no ast-grep grammar in this build and so must
+        // *not* advertise `structural_rewrite`, and gdscript alone among them
+        // has an extraction emitter. Two independent facts, two rows.
         (
             "kotlin",
             "src/Main.kt",
@@ -2516,8 +2671,8 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             "player.gd",
             SemanticEditExecutorLanguage::GdScript,
             "gdscript",
-            SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS,
-            SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS,
+            SEMANTIC_EDIT_INDEXED_EXTRACT_KINDS,
+            SEMANTIC_EDIT_INDEXED_EXTRACT_KINDS,
             SemanticEditFormatterContract::None,
         ),
     ];
@@ -4488,6 +4643,9 @@ fn preview_markdown_edit_content(
 /// downgraded into a partial edit. The result is reparsed with the executor's
 /// grammar like every other kind, so `--verify`, formatting, and rollback apply
 /// unchanged.
+///
+/// The emitter is chosen from the plan's own language, not from this executor,
+/// so a `def` can never be spelled into a `.gd` file by a mismatched pair.
 fn preview_extract_function(
     content: &str,
     executor: SemanticEditExecutorLanguage,
@@ -4520,7 +4678,7 @@ fn preview_extract_function(
     )
     .map_err(|refusal| anyhow::anyhow!("extract_function refused: {}", refusal.message()))?;
 
-    let (function, call) = graph::render_python_extraction(&plan, content, new_name);
+    let (function, call) = graph::render_extraction(&plan, content, new_name);
     // Insert the new function first: splicing the call would move
     // `plan.insert_byte`, and the two edits are derived from one analysis of the
     // original bytes.
@@ -4530,6 +4688,10 @@ fn preview_extract_function(
     out.push_str(&content[plan.end_byte..plan.insert_byte]);
     out.push_str(&function);
     out.push_str(&content[plan.insert_byte..]);
+    // Two edits derived from one analysis still have to agree with the
+    // *grammar*: a signature and a call that match each other can still be
+    // spliced into a buffer that no longer parses.
+    parse_semantic_edit_source(&out, executor, "extract_function")?;
     Ok((out, 1))
 }
 
@@ -7068,6 +7230,113 @@ mod structural_rewrite_tests {
     }
 
     #[test]
+    fn every_extractable_executor_has_exactly_one_extraction_fixture() {
+        // Same both-directions guard as the other two tables. Registering
+        // `extract_function` for a language is a claim that its emitter exists;
+        // without this, the claim can be made in the kinds table and never
+        // tested, which is exactly how `structural_rewrite` would have shipped
+        // for a language with no grammar.
+        for contract in SEMANTIC_EDIT_LANGUAGE_CONTRACTS {
+            let expected = usize::from(contract.recognized_intents.contains(&"extract_function"));
+            let rows = SEMANTIC_EDIT_EXTRACTION_FIXTURES
+                .iter()
+                .filter(|fixture| fixture.executor == contract.executor)
+                .count();
+            assert_eq!(
+                rows, expected,
+                "executor {} has {rows} extraction fixtures, expected exactly {expected}",
+                contract.id
+            );
+        }
+        for fixture in SEMANTIC_EDIT_EXTRACTION_FIXTURES {
+            assert!(
+                fixture
+                    .executor
+                    .recognized_intents()
+                    .contains(&"extract_function"),
+                "extraction fixture {} covers an executor that does not recognize extract_function",
+                fixture.alias
+            );
+        }
+        // Python, the four JS-like grammars, and GDScript. A collapsed table
+        // would satisfy both loops vacuously.
+        assert_eq!(
+            SEMANTIC_EDIT_EXTRACTION_FIXTURES.len(),
+            6,
+            "the extraction conformance table has {} rows",
+            SEMANTIC_EDIT_EXTRACTION_FIXTURES.len()
+        );
+    }
+
+    #[test]
+    fn every_extractable_executor_emits_a_function_and_a_call_that_agree() {
+        // The row's `sample_path` resolves the executor on its own, so a
+        // fixture cannot be run against a language other than the one it
+        // claims — and every assertion below is per-row rather than a summed
+        // counter, so a runner that planned nothing cannot report green.
+        let mut checked = 0usize;
+        for fixture in SEMANTIC_EDIT_EXTRACTION_FIXTURES {
+            let resolved = semantic_edit_executor_language("", Path::new(fixture.sample_path))
+                .unwrap_or_else(|| {
+                    panic!("extraction fixture {} resolves no executor", fixture.alias)
+                });
+            assert_eq!(
+                resolved, fixture.executor,
+                "extraction fixture {} resolves to {resolved:?}",
+                fixture.alias
+            );
+
+            let intent = SemanticEditIntent {
+                new_name: Some(fixture.new_name.to_string()),
+                start_line: Some(fixture.start_line),
+                end_line: Some(fixture.end_line),
+                file: Some(PathBuf::from(fixture.sample_path)),
+                ..intent("extract_function", None, None)
+            };
+            let (out, replacements) =
+                preview_extract_function(fixture.source, fixture.executor, &intent)
+                    .unwrap_or_else(|err| {
+                        panic!("extraction fixture {} refused: {err:#}", fixture.alias)
+                    });
+
+            assert_eq!(
+                replacements, 1,
+                "extraction fixture {} planned {replacements} rewrites",
+                fixture.alias
+            );
+            assert!(
+                out.contains(fixture.call_site),
+                "extraction fixture {} left call site {:?} out of\n{out}",
+                fixture.alias,
+                fixture.call_site
+            );
+            for expected in fixture.emitted {
+                assert!(
+                    out.contains(expected),
+                    "extraction fixture {} emitted no {expected:?} in\n{out}",
+                    fixture.alias
+                );
+            }
+            assert_eq!(
+                out.matches(fixture.hoisted_once).count(),
+                1,
+                "extraction fixture {} did not move {:?} exactly once:\n{out}",
+                fixture.alias,
+                fixture.hoisted_once
+            );
+            // `preview_extract_function` reparses its own output, so reaching
+            // here means the result is still the language it started as.
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            SEMANTIC_EDIT_EXTRACTION_FIXTURES.len(),
+            "the runner exercised {checked} of {} extraction rows",
+            SEMANTIC_EDIT_EXTRACTION_FIXTURES.len()
+        );
+    }
+
+    #[test]
     fn every_renamable_executor_has_exactly_one_rename_fixture() {
         // The same both-directions guard as the structural table, keyed on the
         // contract rather than on a hand-kept list: a `Lang` brought into the
@@ -7252,10 +7521,18 @@ mod structural_rewrite_tests {
             if contract.executor.ast_grep_lang().is_some() {
                 continue;
             }
-            assert_eq!(
-                contract.recognized_intents, SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS,
+            // The invariant is about `structural_rewrite` specifically, not
+            // about the whole recognized set: GDScript also has an extraction
+            // emitter, which needs a tree-sitter grammar and no ast-grep one.
+            // Comparing whole tables here would tie two unrelated facts
+            // together and fail the next time either moves on its own.
+            assert!(
+                !contract
+                    .recognized_intents
+                    .contains(&"structural_rewrite"),
                 "executor {} has no ast-grep grammar but advertises {:?}",
-                contract.id, contract.recognized_intents
+                contract.id,
+                contract.recognized_intents
             );
             let path = std::path::PathBuf::from(format!("fixture{}", contract.temp_suffix));
             let err = preview_semantic_edit_content(
