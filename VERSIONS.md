@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.80
+
 - **`extract_function`, the first range-selected edit intent.** Every
   other semantic edit selects a named thing — a symbol row, a heading, an
   ast-grep pattern — and rewrites at or around it. This one selects a run of

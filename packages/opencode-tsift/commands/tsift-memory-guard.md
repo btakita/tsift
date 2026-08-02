@@ -1,4 +1,4 @@
-<!-- tsift:opencode-command v=0.1.79 name=tsift-memory-guard -->
+<!-- tsift:opencode-command v=0.1.80 name=tsift-memory-guard -->
 ---
 description: Guard a memory or tool payload before model handoff
 ---

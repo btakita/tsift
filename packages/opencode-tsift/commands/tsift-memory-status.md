@@ -1,4 +1,4 @@
-<!-- tsift:opencode-command v=0.1.79 name=tsift-memory-status -->
+<!-- tsift:opencode-command v=0.1.80 name=tsift-memory-status -->
 ---
 description: Inspect first-party tsift memory readiness
 ---
