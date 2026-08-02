@@ -1,6 +1,6 @@
 [package]
 name = "tsift-md-ast"
-version = "0.1.78"
+version = "0.1.79"
 edition = "2024"
 description = "Focused tree-sitter-md markdown AST + heading/section model — a leaf crate shared by tsift and other consumers (e.g. agent-doc) with no hard tsift dependency"
 license = "MIT"

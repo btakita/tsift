@@ -1,6 +1,6 @@
 [package]
 name = "tsift-graph"
-version = "0.1.78"
+version = "0.1.79"
 edition = "2024"
 description = "Language-aware graph extraction — call sites, routes, community detection, and path finding for tsift"
 license = "MIT"
@@ -16,8 +16,8 @@ anyhow = "1"
 blake3 = "1"
 lazily = "0.49.0"
 serde = { version = "1", features = ["derive"] }
-tsift-core = { path = "../tsift-core", version = "0.1.78" }
-tsift-md-ast = { path = "../tsift-md-ast", version = "0.1.78", optional = true }
+tsift-core = { path = "../tsift-core", version = "0.1.79" }
+tsift-md-ast = { path = "../tsift-md-ast", version = "0.1.79", optional = true }
 tree-sitter = "0.26"
 
 tree-sitter-rust = { version = "0.24", optional = true }

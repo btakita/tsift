@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.79
+
 - **A rename now knows which kind of symbol it is renaming.** Renaming a Rust
   function also rewrote an identically-named struct field; renaming a GDScript
   `func` also rewrote an identically-named local `var`. Both grammars spell the
