@@ -306,7 +306,10 @@ impl Dialect {
         }
     }
 
-    /// Kinds whose effect is defined by the block they sit in.
+    /// Kinds whose effect is defined by something outside themselves.
+    ///
+    /// `break` and `continue` are conditional — see `escaping_control_flow`,
+    /// which only counts them when the loop they bind to is outside the range.
     fn escaping_kind(self, kind: &str) -> Option<&'static str> {
         let escape = match (self.family, kind) {
             (_, "return_statement") => "return",
@@ -320,6 +323,22 @@ impl Dialect {
             _ => return None,
         };
         Some(escape)
+    }
+
+    /// A construct `break` and `continue` bind to.
+    fn is_loop_kind(self, kind: &str) -> bool {
+        match self.family {
+            Family::Python | Family::GdScript => matches!(kind, "for_statement" | "while_statement"),
+            Family::JsLike => matches!(
+                kind,
+                "for_statement" | "for_in_statement" | "while_statement" | "do_statement"
+            ),
+        }
+    }
+
+    /// A construct `break` alone binds to.
+    fn is_switch_kind(self, kind: &str) -> bool {
+        matches!(self.family, Family::JsLike) && kind == "switch_statement"
     }
 
     /// Kinds that group several binding positions into one target.
@@ -397,7 +416,7 @@ pub fn plan_extraction(
     let insertion_site = insertion_site(dialect, function)?;
 
     for statement in &selection {
-        if let Some(kind) = escaping_control_flow(dialect, *statement) {
+        if let Some(kind) = escaping_control_flow(dialect, *statement, source) {
             return Err(ExtractionRefusal::ControlFlowEscapes(kind));
         }
         if let Some(kind) = receiver_reference(dialect, *statement) {
@@ -872,23 +891,88 @@ fn insertion_site(dialect: Dialect, function: Node) -> Result<Node, ExtractionRe
     }
 }
 
-/// A statement whose effect is defined by the block it sits in, and therefore
+/// Control flow whose effect is defined outside the range, and which therefore
 /// cannot move into another function.
-fn escaping_control_flow(dialect: Dialect, statement: Node) -> Option<&'static str> {
+///
+/// `return` and `yield` always qualify: no signature can carry them. `break`
+/// and `continue` only qualify when the loop they bind to is *outside* the
+/// selection — a range containing a whole loop takes that loop's `break` with
+/// it, and refusing there would decline the most ordinary extraction there is.
+/// A labelled branch is checked against the labels the range itself carries.
+fn escaping_control_flow(
+    dialect: Dialect,
+    statement: Node,
+    source: &[u8],
+) -> Option<&'static str> {
+    let mut labels = Vec::new();
+    scan_control_flow(dialect, statement, source, true, 0, 0, &mut labels)
+}
+
+fn scan_control_flow(
+    dialect: Dialect,
+    node: Node,
+    source: &[u8],
+    is_root: bool,
+    loops: usize,
+    switches: usize,
+    labels: &mut Vec<String>,
+) -> Option<&'static str> {
+    // A nested function or lambda re-scopes these, so its body is not part of
+    // the range's control flow.
+    if !is_root && dialect.is_nested_scope_kind(node.kind()) {
+        return None;
+    }
+    match dialect.escaping_kind(node.kind()) {
+        Some(escape @ ("break" | "continue")) => {
+            let bound_here = match escape {
+                "break" => loops > 0 || switches > 0,
+                _ => loops > 0,
+            };
+            return match branch_label(node, source) {
+                // A labelled branch ignores the innermost loop and jumps to
+                // the label, so what matters is whether the label is inside
+                // the range.
+                Some(label) if !labels.contains(&label) => Some(escape),
+                Some(_) => None,
+                None if bound_here => None,
+                None => Some(escape),
+            };
+        }
+        Some(escape) => return Some(escape),
+        None => {}
+    }
+
+    let loops = loops + usize::from(dialect.is_loop_kind(node.kind()));
+    let switches = switches + usize::from(dialect.is_switch_kind(node.kind()));
+    let pushed = label_name(node, source).inspect(|label| labels.push(label.clone()));
+
     let mut found = None;
-    walk(statement, &mut |node| {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        found = scan_control_flow(dialect, child, source, false, loops, switches, labels);
         if found.is_some() {
-            return false;
+            break;
         }
-        // A nested function or lambda re-scopes these, so its body is not part
-        // of the range's control flow.
-        if node.id() != statement.id() && dialect.is_nested_scope_kind(node.kind()) {
-            return false;
-        }
-        found = dialect.escaping_kind(node.kind());
-        found.is_none()
-    });
+    }
+    if pushed.is_some() {
+        labels.pop();
+    }
     found
+}
+
+/// The label a `break`/`continue` names, where the language has them.
+fn branch_label(node: Node, source: &[u8]) -> Option<String> {
+    node.child_by_field_name("label")
+        .and_then(|label| label.utf8_text(source).ok())
+        .map(str::to_string)
+}
+
+/// The label this statement defines, if it defines one.
+fn label_name(node: Node, source: &[u8]) -> Option<String> {
+    if node.kind() != "labeled_statement" {
+        return None;
+    }
+    branch_label(node, source)
 }
 
 /// The receiver keyword the range names, if it names one.
@@ -1537,6 +1621,36 @@ mod python_tests {
     }
 
     #[test]
+    fn a_break_bound_to_a_loop_inside_the_range_does_not_escape() {
+        // The loop moves with the range, so its `break` still breaks the same
+        // loop. Refusing here declined the most ordinary extraction there is.
+        let source = "def outer(items, limit):\n    total = 0\n    for item in items:\n        if item > limit:\n            break\n        total += item\n    return total\n";
+        let plan =
+            plan_extraction(Lang::Python, source.as_bytes(), 1, 5, "sum_until").expect("planned");
+        assert_eq!(plan.parameters, vec!["items".to_string(), "limit".to_string()]);
+        assert_eq!(plan.returns, vec!["total".to_string()]);
+    }
+
+    #[test]
+    fn a_break_bound_to_a_loop_outside_the_range_still_escapes() {
+        // Same keyword, opposite answer: the loop stays behind, so hoisting the
+        // `break` changes which construct it leaves.
+        let source = "def outer(items, limit):\n    total = 0\n    for item in items:\n        if item > limit:\n            break\n        total += item\n    return total\n";
+        assert_eq!(
+            plan_extraction(Lang::Python, source.as_bytes(), 3, 5, "accumulate"),
+            Err(ExtractionRefusal::ControlFlowEscapes("break"))
+        );
+    }
+
+    #[test]
+    fn a_continue_bound_to_a_loop_inside_the_range_does_not_escape() {
+        let source = "def outer(items):\n    total = 0\n    for item in items:\n        if item < 0:\n            continue\n        total += item\n    return total\n";
+        let plan =
+            plan_extraction(Lang::Python, source.as_bytes(), 1, 5, "sum_positive").expect("planned");
+        assert_eq!(plan.returns, vec!["total".to_string()]);
+    }
+
+    #[test]
     fn refuses_a_range_outside_any_function() {
         assert_eq!(
             plan(0, 0, "setup"),
@@ -1916,6 +2030,40 @@ mod javascript_tests {
         let (function, call) = render_extraction(&plan, source, "double");
         assert!(function.contains("\nfunction double(base) {"), "{function}");
         assert_eq!(call, "    let acc = double(base);");
+    }
+
+    #[test]
+    fn a_break_bound_to_a_switch_inside_the_range_does_not_escape() {
+        // JavaScript's `break` binds to a `switch` as well as to a loop, so the
+        // loop-depth test alone would refuse a hoisted switch that is entirely
+        // self-contained.
+        let source = "function outer(kind) {\n  let label = \"\";\n  switch (kind) {\n    case 1:\n      label = \"one\";\n      break;\n    default:\n      label = \"other\";\n  }\n  return label;\n}\n";
+        let plan =
+            plan_extraction(Lang::JavaScript, source.as_bytes(), 2, 8, "describe").expect("planned");
+        assert_eq!(plan.parameters, vec!["kind".to_string()]);
+        assert_eq!(plan.returns, vec!["label".to_string()]);
+    }
+
+    #[test]
+    fn a_labelled_break_targeting_a_label_outside_the_range_escapes() {
+        // The inner loop moves with the range, so an unlabelled `break` would
+        // be fine — but this one jumps to a label that stays behind, and no
+        // signature carries a jump out of two loops.
+        let source = "function outer(rows) {\n  let hits = 0;\n  outer: for (const row of rows) {\n    for (const cell of row) {\n      if (cell) {\n        break outer;\n      }\n      hits += 1;\n    }\n  }\n  return hits;\n}\n";
+        assert_eq!(
+            plan_extraction(Lang::JavaScript, source.as_bytes(), 3, 8, "scan"),
+            Err(ExtractionRefusal::ControlFlowEscapes("break"))
+        );
+    }
+
+    #[test]
+    fn a_labelled_break_whose_label_is_inside_the_range_does_not_escape() {
+        let source = "function outer(rows) {\n  let hits = 0;\n  outer: for (const row of rows) {\n    for (const cell of row) {\n      if (cell) {\n        break outer;\n      }\n      hits += 1;\n    }\n  }\n  return hits;\n}\n";
+        let plan =
+            plan_extraction(Lang::JavaScript, source.as_bytes(), 1, 9, "scan").expect("planned");
+        assert_eq!(plan.parameters, vec!["rows".to_string()]);
+        assert_eq!(plan.returns, vec!["hits".to_string()]);
+        assert!(plan.returns_need_declaration);
     }
 
     #[test]

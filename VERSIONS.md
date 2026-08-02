@@ -28,9 +28,13 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
   Everything else refuses by name: a selection that is not a contiguous run of
   siblings in one block, a range outside any function, an enclosing function
   that sits in an *expression* rather than a statement, control flow that
-  escapes the range (`return`, `break`, `continue`, `yield`), a range that names
-  `this` or `super`, a range assigning a `global` or `nonlocal` name, and a new
-  name that already binds in scope. A rename that misses an occurrence breaks
+  escapes the range, a range that names `this` or `super`, a range assigning a
+  `global` or `nonlocal` name, and a new name that already binds in scope.
+  `return` and `yield` escape unconditionally; `break` and `continue` only when
+  the loop — or, in JavaScript, the `switch` — they bind to stays behind. A
+  range holding a whole loop takes that loop's `break` with it and nothing
+  changes, and refusing there would decline the most ordinary extraction there
+  is. A labelled branch is checked against the labels the range itself carries. A rename that misses an occurrence breaks
   the build loudly; an extraction with a wrong parameter list does not, so
   under-refusing here is the expensive direction.
 
