@@ -35,6 +35,22 @@ The resulting plan includes `target_selection` with the requested handle, matche
 
 Non-concrete search preview handles such as `sfam-*`, `srnk-*`, and lexical file-hit handles are not writable targets by themselves because their stable hashes intentionally omit enough reverse-mapping context to select a unique current AST node. They must fail closed with guidance to pass the nested `ast.span.handle` from the search result instead.
 
+## Range-Selected Intents
+
+`extract_function` is the only intent that selects a **range** rather than a named target. A run of sibling statements is not one AST node, so `target_handle` cannot express it; the intent takes `file` plus a one-based inclusive `start_line`/`end_line`, and those two fields are rejected for every other kind so a stray range cannot silently widen an edit that resolved its target by name. Like `structural_rewrite`, it is dispatched ahead of the per-family executor split because there is no symbol to resolve.
+
+The output is not a rewrite of what was selected. It is two edits that must agree: a new function whose signature is *derived* from the selection, and a call whose arguments come from the same derivation. Both are computed from one analysis of the original bytes, and the new function is spliced after the call so neither edit moves the other's offsets.
+
+The derivation, for a run `R` inside enclosing function `F`:
+
+- **Parameters** are names read in `R` before `R` assigns them, that are bound in `F` outside `R` (including `F`'s own parameters). A name `R` assigns before reading is a local of the new function: passing the outer value in would feed the body a value it immediately overwrites.
+- **Returns** are names `R` assigns that are read in `F` after `R`. None emits a bare call, one emits `name = call(...)`, several emit a tuple destructuring, which is the only spelling that keeps the call site one statement.
+- A name bound at module scope is neither. Threading it through a parameter would compile and quietly change what the new function closes over, which is why module scope is classified explicitly rather than inferred from "not bound in `F`".
+
+Everything else refuses, and the refusal list is load-bearing: a rename that misses an occurrence breaks the build loudly, but an extraction with a wrong parameter list can compile and silently change behaviour. Refusals cover a range that is not a contiguous run of siblings in one block, a range outside any function, control flow that escapes the range (`return`, `break`, `continue`, `yield`), a range assigning a name `F` declared `global`/`nonlocal`, and a new name that already binds in `F` or at module scope.
+
+Registration is per language, not per family. The derivation is language-general, but a signature is only derivable without type information in languages that do not spell one, so Python carries the kind and the rest of the script family does not — advertising it for an executor with no emitter would be the same defect as advertising `structural_rewrite` for a language with no compiled grammar.
+
 ## Minimal Textual Patch Output
 
 Semantic edits emit text patches, not synthetic whole-file rewrites. For every planned file, the report must expose:

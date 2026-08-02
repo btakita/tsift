@@ -8,6 +8,37 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **`extract_function`, the first range-selected edit intent (Python).** Every
+  other semantic edit selects a named thing — a symbol row, a heading, an
+  ast-grep pattern — and rewrites at or around it. This one selects a run of
+  sibling statements, which has no name, no symbol row, and no single AST node,
+  so it takes a one-based `start_line`/`end_line` instead of a `target_handle`.
+  Those fields are refused for every other kind, so a stray range cannot widen
+  an edit that resolved its target by name.
+
+  What comes out is two edits that have to agree: a new function whose signature
+  is *derived* from the selection, and a call whose arguments come from the same
+  derivation. Parameters are names read before the range assigns them that are
+  bound in the enclosing function; returns are names the range assigns that are
+  read after it; a module-scope name is neither, and stays a free reference.
+  That last rule is the one worth stating out loud — threading a module global
+  through a parameter compiles and quietly changes what the new function closes
+  over, which is the failure mode this intent is organized against.
+
+  Everything else refuses by name: a selection that is not a contiguous run of
+  siblings in one block, a range outside any function, control flow that escapes
+  it (`return`, `break`, `continue`, `yield`), a range assigning a `global` or
+  `nonlocal` name, and a new name that already binds in scope. A rename that
+  misses an occurrence breaks the build loudly; an extraction with a wrong
+  parameter list does not, so under-refusing here is the expensive direction.
+
+  Python only, deliberately. The derivation is language-general but the emitter
+  is not, and a signature is only derivable without type information in a
+  language that does not spell one. Rust cannot be done this way — choosing
+  `T`, `&T`, or `&mut T` needs types tsift does not have — so it is a separate
+  decision (caller-supplied signature, or a closure that infers) rather than a
+  registration entry. Plan: `tasks/software/plan-tsift-extract-function.md`.
+
 ## 0.1.79
 
 - **A rename now knows which kind of symbol it is renaming.** Renaming a Rust

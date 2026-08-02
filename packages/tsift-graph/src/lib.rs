@@ -13,6 +13,11 @@ pub use lang::{Lang, Symbol};
 pub mod complexity;
 pub use complexity::{ComplexityMetrics, LanguageExtractor, LanguageRegistry};
 
+pub mod extract;
+pub use extract::{
+    ExtractionPlan, ExtractionRefusal, plan_extraction, render_python_extraction,
+};
+
 pub mod rename;
 pub use rename::{
     IdentifierOccurrence, RenameTarget, identifier_occurrences, identifier_occurrences_for,

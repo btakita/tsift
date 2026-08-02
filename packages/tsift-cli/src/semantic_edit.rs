@@ -56,6 +56,17 @@ pub(crate) struct SemanticEditIntent {
     pub(crate) call_replacement: Option<String>,
     #[serde(default)]
     pub(crate) new_name: Option<String>,
+    /// One-based inclusive line range, used by `extract_function`.
+    ///
+    /// `target_handle` cannot express this: a run of sibling statements is not
+    /// one AST node, so there is no span to hand back. This is the only intent
+    /// field that selects by position rather than by identity, and it is
+    /// rejected for every other kind so a stray range cannot silently widen an
+    /// edit that resolved its target by name.
+    #[serde(default)]
+    pub(crate) start_line: Option<usize>,
+    #[serde(default)]
+    pub(crate) end_line: Option<usize>,
     #[serde(default)]
     pub(crate) expected_content_hash: Option<String>,
 }
@@ -407,6 +418,21 @@ pub(crate) const SEMANTIC_EDIT_SCRIPT_KINDS: &[&str] = &[
     "insert_import",
     "structural_rewrite",
 ];
+/// Python is the script family plus `extract_function`.
+///
+/// The extraction derivation is language-general, but the *emitter* is not, and
+/// a signature is only derivable without type information in languages that do
+/// not spell one. Python is that case. Registering the kind for the whole script
+/// family would advertise an edit the JS-like emitters cannot yet produce, which
+/// is the refusal-by-registration rule `SEMANTIC_EDIT_INDEXED_RENAME_ONLY_KINDS`
+/// already applies to `structural_rewrite`.
+pub(crate) const SEMANTIC_EDIT_PYTHON_KINDS: &[&str] = &[
+    "rename_symbol",
+    "replace_function_body",
+    "insert_import",
+    "structural_rewrite",
+    "extract_function",
+];
 /// Languages with an ast-grep grammar and no `tsift-graph` binding.
 /// `structural_rewrite` needs neither an index nor a per-kind executor: it is
 /// dispatched ahead of the family split and only requires a grammar to match
@@ -460,6 +486,7 @@ pub(crate) const SEMANTIC_EDIT_KINDS: &[&str] = &[
     "insert_list_item",
     "rewrite_code_fence",
     "structural_rewrite",
+    "extract_function",
 ];
 
 pub(crate) struct PlannedEdit {
@@ -528,7 +555,13 @@ fn semantic_edit_kind_requires_pattern(kind: &str) -> bool {
 }
 
 fn semantic_edit_kind_requires_new_name(kind: &str) -> bool {
-    matches!(kind, "rename_symbol" | "rename_heading")
+    matches!(kind, "rename_symbol" | "rename_heading" | "extract_function")
+}
+
+/// `extract_function` is the only kind that selects a range instead of a named
+/// target, so it is the only kind that both requires the range and accepts it.
+fn semantic_edit_kind_requires_line_range(kind: &str) -> bool {
+    matches!(kind, "extract_function")
 }
 
 fn semantic_edit_kind_requires_destination_symbol(kind: &str) -> bool {
@@ -545,6 +578,7 @@ fn semantic_edit_kind_requires_file(kind: &str) -> bool {
             | "insert_list_item"
             | "rewrite_code_fence"
             | "structural_rewrite"
+            | "extract_function"
     )
 }
 
@@ -596,6 +630,20 @@ fn validate_semantic_edit_intent(kind: &str, intent: &SemanticEditIntent) -> Res
     }
     if intent.pattern.is_some() && !semantic_edit_kind_requires_pattern(kind) {
         bail!("semantic edit kind {kind:?} does not support `pattern`");
+    }
+    let has_line_range = intent.start_line.is_some() || intent.end_line.is_some();
+    if semantic_edit_kind_requires_line_range(kind) {
+        let (Some(start), Some(end)) = (intent.start_line, intent.end_line) else {
+            bail!("semantic edit kind {kind:?} requires `start_line` and `end_line`");
+        };
+        if start == 0 {
+            bail!("semantic edit `start_line` is one-based, so 0 is not a line");
+        }
+        if end < start {
+            bail!("semantic edit `end_line` must not precede `start_line`");
+        }
+    } else if has_line_range {
+        bail!("semantic edit kind {kind:?} does not support `start_line`/`end_line`");
     }
     if let Some(position) = intent.position.as_deref() {
         if !matches!(position, "before" | "after") {
@@ -1253,8 +1301,8 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         temp_suffix: ".py",
         aliases: &["python", "py", "pyi"],
         extensions: &["py", "pyi"],
-        recognized_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
-        apply_supported_intents: SEMANTIC_EDIT_SCRIPT_KINDS,
+        recognized_intents: SEMANTIC_EDIT_PYTHON_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_PYTHON_KINDS,
         family: SemanticEditLanguageFamily::Python,
         formatter: SemanticEditFormatterContract::PythonAuto,
     },
@@ -2374,8 +2422,8 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             "script.py",
             SemanticEditExecutorLanguage::Python,
             "python",
-            SEMANTIC_EDIT_SCRIPT_KINDS,
-            SEMANTIC_EDIT_SCRIPT_KINDS,
+            SEMANTIC_EDIT_PYTHON_KINDS,
+            SEMANTIC_EDIT_PYTHON_KINDS,
             SemanticEditFormatterContract::PythonAuto,
         ),
         (
@@ -4431,6 +4479,60 @@ fn preview_markdown_edit_content(
     }
 }
 
+/// Plan an extraction: hoist a run of statements into a new function and leave
+/// a call in their place.
+///
+/// The signature is *derived*, not supplied, so the two edits this produces have
+/// to agree with each other — `tsift_graph::plan_extraction` computes both from
+/// one analysis, and a refusal from it is surfaced verbatim rather than being
+/// downgraded into a partial edit. The result is reparsed with the executor's
+/// grammar like every other kind, so `--verify`, formatting, and rollback apply
+/// unchanged.
+fn preview_extract_function(
+    content: &str,
+    executor: SemanticEditExecutorLanguage,
+    intent: &SemanticEditIntent,
+) -> Result<(String, usize)> {
+    let new_name = intent
+        .new_name
+        .as_deref()
+        .context("extract_function requires new_name")?;
+    let start_line = intent
+        .start_line
+        .context("extract_function requires start_line")?;
+    let end_line = intent
+        .end_line
+        .context("extract_function requires end_line")?;
+    let lang = executor.graph_lang().with_context(|| {
+        format!(
+            "extract_function has no grammar compiled for {}",
+            executor.name()
+        )
+    })?;
+    parse_semantic_edit_source(content, executor, "extract_function input")?;
+
+    let plan = graph::plan_extraction(
+        lang,
+        content.as_bytes(),
+        start_line.saturating_sub(1),
+        end_line.saturating_sub(1),
+        new_name,
+    )
+    .map_err(|refusal| anyhow::anyhow!("extract_function refused: {}", refusal.message()))?;
+
+    let (function, call) = graph::render_python_extraction(&plan, content, new_name);
+    // Insert the new function first: splicing the call would move
+    // `plan.insert_byte`, and the two edits are derived from one analysis of the
+    // original bytes.
+    let mut out = String::with_capacity(content.len() + function.len());
+    out.push_str(&content[..plan.start_byte]);
+    out.push_str(call.trim_start_matches(&plan.indent));
+    out.push_str(&content[plan.end_byte..plan.insert_byte]);
+    out.push_str(&function);
+    out.push_str(&content[plan.insert_byte..]);
+    Ok((out, 1))
+}
+
 /// Plan a pattern-driven codemod for one file.
 ///
 /// This is the only intent kind whose target is a *shape* rather than a
@@ -4544,6 +4646,12 @@ fn preview_semantic_edit_content(
     // into each arm.
     if kind == "structural_rewrite" {
         return preview_structural_rewrite(content, executor, intent);
+    }
+    // An extraction has no symbol to resolve, so like `structural_rewrite` it is
+    // dispatched before the family split rather than threaded through the
+    // symbol-resolved arms.
+    if kind == "extract_function" {
+        return preview_extract_function(content, executor, intent);
     }
     if executor.is_markdown() {
         return preview_markdown_edit_content(content, kind, intent, target_symbol);
@@ -6740,6 +6848,8 @@ mod structural_rewrite_tests {
             pattern: pattern.map(str::to_string),
             call_replacement: None,
             new_name: None,
+            start_line: None,
+            end_line: None,
             expected_content_hash: None,
         }
     }
@@ -6775,6 +6885,85 @@ mod structural_rewrite_tests {
         assert!(out.contains("bar(1)"), "{out}");
         assert!(out.contains("bar(2)"), "{out}");
         assert!(!out.contains("foo("), "{out}");
+    }
+
+    const PYTHON_SRC: &str =
+        "def outer(base, scale):\n    prefix = base * 2\n    acc = 0\n    for item in range(scale):\n        acc += item * prefix\n    return acc\n";
+
+    fn extract_intent(start_line: usize, end_line: usize, new_name: &str) -> SemanticEditIntent {
+        SemanticEditIntent {
+            new_name: Some(new_name.to_string()),
+            start_line: Some(start_line),
+            end_line: Some(end_line),
+            file: Some(PathBuf::from("script.py")),
+            ..intent("extract_function", None, None)
+        }
+    }
+
+    #[test]
+    fn an_extraction_emits_a_call_and_a_def_that_agree() {
+        // The signature is derived, not supplied, so the only assertion worth
+        // making is that the call the caller is left with matches the function
+        // it now calls — argument for argument, binding for binding.
+        let (out, replacements) = preview_extract_function(
+            PYTHON_SRC,
+            SemanticEditExecutorLanguage::Python,
+            &extract_intent(3, 5, "accumulate"),
+        )
+        .expect("planned");
+
+        assert_eq!(replacements, 1);
+        assert!(out.contains("    acc = accumulate(prefix, scale)\n"), "{out}");
+        assert!(out.contains("def accumulate(prefix, scale):"), "{out}");
+        assert!(out.contains("    acc = 0"), "{out}");
+        assert!(out.contains("        acc += item * prefix"), "{out}");
+        assert!(out.contains("    return acc"), "{out}");
+        // The hoisted statements are gone from `outer`, not duplicated into it.
+        assert_eq!(out.matches("for item in range(scale):").count(), 1, "{out}");
+        // And the result is still Python.
+        parse_semantic_edit_source(&out, SemanticEditExecutorLanguage::Python, "extracted")
+            .expect("reparses");
+    }
+
+    #[test]
+    fn an_extraction_whose_control_flow_escapes_is_refused() {
+        let err = preview_extract_function(
+            PYTHON_SRC,
+            SemanticEditExecutorLanguage::Python,
+            &extract_intent(6, 6, "finish"),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("`return`"), "{err:#}");
+    }
+
+    #[test]
+    fn a_line_range_is_rejected_for_every_other_kind() {
+        // A stray range must not silently widen an edit that resolved its
+        // target by name.
+        let err = validate_semantic_edit_intent(
+            "rename_symbol",
+            &SemanticEditIntent {
+                symbol: Some("alpha".to_string()),
+                start_line: Some(1),
+                end_line: Some(2),
+                ..rename_intent("beta")
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("does not support"), "{err:#}");
+    }
+
+    #[test]
+    fn an_extraction_without_a_range_is_rejected_before_planning() {
+        let err = validate_semantic_edit_intent(
+            "extract_function",
+            &SemanticEditIntent {
+                new_name: Some("accumulate".to_string()),
+                ..intent("extract_function", None, None)
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("requires `start_line`"), "{err:#}");
     }
 
     #[test]
