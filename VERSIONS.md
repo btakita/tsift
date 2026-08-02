@@ -76,10 +76,39 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
   already has. Where it cannot, it refuses — `unknown` and an implicitly `any`
   parameter both type-check something other than what the code does.
 
-  Rust is still out. Choosing `T`, `&T`, or `&mut T` needs types tsift does not
-  have, so it is a separate decision (caller-supplied signature, or a closure
-  that infers) rather than a registration entry. Plan:
-  `tasks/software/plan-tsift-extract-function.md`.
+  **Rust extracts by value, copying the types it can already see.** The
+  ownership qualifier and the type turn out to be separable questions with
+  different answers. The qualifier is derivable from use analysis. The type is
+  not — `let` bindings are idiomatically unannotated and inferring one needs
+  name resolution, trait resolution, and method return types, which is a type
+  checker rather than an AST, and tsift has no type information of any kind. So
+  Rust follows the TypeScript rule: copy an annotation from the `fn` parameter
+  or `let` that binds the name, or refuse.
+
+  The qualifier does not rescue it either, and that is the part worth stating.
+  A `&T` or `&mut T` parameter needs every use of the name in the extracted
+  body rewritten into a dereference — `acc += 1` becoming `*acc += 1` — and
+  rewriting bodies is precisely what this intent does not do. So parameters are
+  moved, and a name that would be moved in while the caller still reads it
+  refuses by name. A name the range both reads and reassigns is *threaded*:
+  moved in and handed back as part of the return, which covers the accumulator
+  shape with no borrow at all. The signature says `mut` on a parameter the range
+  assigns, and the return type is spelled from the returned names' own
+  annotations.
+
+  Three more refusals are Rust-specific because the constructs are: `?` and
+  `.await` leave the enclosing function through a channel the derived signature
+  does not declare, and a block's trailing expression *is* the function's return
+  value, so hoisting it would leave the caller returning nothing. `self` refuses
+  too — unlike Python's it is not a name a signature can carry.
+
+  The two alternatives were rejected on the record. A closure needs no types but
+  cannot be `pub`, cannot move to another module, cannot be tested on its own,
+  changes borrow behaviour through what it captures, and would *succeed* exactly
+  where the free function honestly declines. A caller-supplied signature is
+  honest but gives up the one property that makes the intent worth having: that
+  the signature and the call site come from one analysis and cannot disagree.
+  Plan: `tasks/software/plan-tsift-extract-function.md`.
 
 ## 0.1.79
 

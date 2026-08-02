@@ -67,15 +67,16 @@ Climbing past a class body never costs the extracted body anything, because a me
 
 ### The untyped family
 
-Registration is per language, not per family, and the family that carries the kind is the set of languages whose signature is derivable without type information: **Python, GDScript, JavaScript, JSX, TypeScript, and TSX**. Rust is deliberately absent — choosing `T`, `&T`, or `&mut T` needs types `tsift-graph` does not have, and a guessed signature parses without building. Advertising the kind for an executor with no emitter would be the same defect as advertising `structural_rewrite` for a language with no compiled grammar.
+Registration is per language, not per family, and the family that carries the kind is the set of languages whose signature is derivable from source tsift can already see: **Python, GDScript, JavaScript, JSX, TypeScript, TSX, and Rust**. Advertising the kind for an executor with no emitter would be the same defect as advertising `structural_rewrite` for a language with no compiled grammar.
 
-One analysis serves all six; what varies is a node-kind vocabulary and an emitter:
+One analysis serves all seven; what varies is a node-kind vocabulary and an emitter:
 
 | | block | new function | call site | several returns |
 |---|---|---|---|---|
 | Python | indentation | `def name(a, b):` | `x, y = name(a, b)` | tuple destructuring |
 | GDScript | indentation | `func name(a, b):` | `var x = name(a, b)` | **refused** — no destructuring assignment |
 | JS / JSX / TS / TSX | braces | `function name(a, b) {` | `let [x, y] = name(a, b);` | array destructuring |
+| Rust | braces | `fn name(a: A, mut b: B) -> R {` | `let (x, y) = name(a, b);` | tuple destructuring |
 
 Two consequences follow from languages that *declare*:
 
@@ -84,6 +85,16 @@ Two consequences follow from languages that *declare*:
 - One level of indentation is measured from the enclosing function's own body, not assumed, so a tab-indented `.gd` file and a two-space `.py` file each get a new function indented the way they already are.
 
 TypeScript is in the family only because it can **copy** an annotation the file already has, from the parameter or the declaration that binds the name. Where it cannot, it refuses — `unknown` and an implicitly `any` parameter both type-check something other than what the code does, which is the failure this intent exists to avoid.
+
+### Rust: by value, copy or refuse
+
+Rust is the one language whose signature carries *ownership* as well as a type, and the two split apart cleanly. The ownership qualifier is derivable from the use analysis the intent already does. The **type** is not: `let` bindings are idiomatically unannotated, and inferring one needs name resolution, trait resolution, and method return types — a type checker, not an AST. tsift has no type information of any kind, so Rust follows the TypeScript rule: copy an annotation from the `fn` parameter or `let` that binds the name, or refuse.
+
+That leaves the qualifier, and here the honest answer is that it does not help. `&T` and `&mut T` parameters require rewriting every use of the name in the extracted body into a dereference (`acc += 1` becomes `*acc += 1`), and rewriting bodies is exactly what this intent does not do. So **Rust extracts by value only**, and refuses a parameter that would be moved in while the caller still reads it (`MovedNameUsedAfterRange`). A name that is both read and reassigned in the range is threaded — moved in and handed back as part of the return — which covers the accumulator shape without any borrow at all. The signature says `mut` on a parameter the range assigns, and the return type is spelled from the returned names' own annotations.
+
+Two more refusals are Rust-specific because the constructs are: `?` and `.await` both leave the enclosing function through a channel the derived signature does not declare, and the block's **trailing expression** is the enclosing function's return value — hoisting it would hand that value to the new function and leave the caller returning nothing. `self` refuses as well: unlike Python's, it is not a name a signature can carry, and turning the new function into an inherent method needs an `impl` target no derivation can choose.
+
+The alternatives were weighed and rejected. A **closure** (`let extracted = |a, b| { … };`) needs no types at all, but it cannot be `pub`, cannot move to another module, cannot be documented or tested on its own, and changes borrow behaviour through what it captures — and it would *succeed* exactly where the free function honestly declines, which is the wrong direction for an intent whose refusal list is the feature. A **caller-supplied signature** is honest but gives up the one property that makes this intent worth having: that the signature and the call site come from one analysis and cannot disagree.
 
 Every registered executor carries one extraction conformance fixture asserting its emitted function and its call site individually, and the planner reparses its own spliced output with the executor's grammar before returning it.
 

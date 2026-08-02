@@ -48,6 +48,12 @@ pub struct ExtractionPlan {
     pub parameter_spellings: Vec<String>,
     /// Names assigned in the range and read after it, in the same order rule.
     pub returns: Vec<String>,
+    /// The new function's declared return type, where the language requires
+    /// one. `None` everywhere the return is inferred.
+    pub return_type: Option<String>,
+    /// Whether a call site that declares what it receives has to declare it
+    /// mutable, because something after the range assigns it.
+    pub returns_declared_mut: bool,
     /// Names the range only *assigns*, whose declaration stayed behind in the
     /// enclosing function. In a language where a bare assignment does not
     /// declare, the new function has to declare them itself or its body reads a
@@ -112,6 +118,15 @@ pub enum ExtractionRefusal {
     /// existed outside it. One call site cannot both declare and assign, and
     /// splitting it into two statements would change what a caller reads.
     MixedReturnDeclarations,
+    /// A name the range needs would have to be *moved* into the new function
+    /// and is still read afterwards. Passing it by reference instead would
+    /// mean rewriting every use in the body into a dereference, which is a
+    /// body rewrite this intent does not do.
+    MovedNameUsedAfterRange(String),
+    /// The range covers the block's trailing expression — the value the
+    /// enclosing function returns. Hoisting it would hand that value to the
+    /// new function and leave the caller returning nothing.
+    ReturnsThroughTailExpression,
     /// The range names the receiver the enclosing function was called on.
     /// Unlike Python's `self`, `this` is not a name a derived signature can
     /// carry, and it means something different inside a plain function.
@@ -161,6 +176,12 @@ impl ExtractionRefusal {
                 "the range produces both newly declared and already declared names, which one call site cannot receive"
                     .to_string()
             }
+            Self::MovedNameUsedAfterRange(name) => {
+                format!("`{name}` would have to move into the extracted function and is still read after the range")
+            }
+            Self::ReturnsThroughTailExpression => {
+                "the range covers the trailing expression the enclosing function returns".to_string()
+            }
             Self::ReferencesReceiver(keyword) => {
                 format!("the range uses `{keyword}`, which a derived signature cannot carry out of the method")
             }
@@ -168,7 +189,7 @@ impl ExtractionRefusal {
                 format!("the range assigns `{name}` without declaring it, and `{name}` is not a local of the enclosing function")
             }
             Self::UnspellableParameterType(name) => {
-                format!("`{name}` has no annotation to copy, and this language will not take an unannotated parameter")
+                format!("`{name}` has no annotation to copy, and this language will not spell a type it cannot see")
             }
         }
     }
@@ -193,6 +214,10 @@ enum Family {
     GdScript,
     /// `function`, brace blocks, `let` declarations, array destructuring.
     JsLike,
+    /// `fn`, brace blocks, `let` declarations, tuple returns — and the only
+    /// member of the family whose signature carries ownership as well as a
+    /// type. See `rust_move_only` for why that keeps it by-value.
+    Rust,
 }
 
 fn dialect_for(lang: Lang) -> Option<Dialect> {
@@ -217,6 +242,11 @@ fn dialect_for(lang: Lang) -> Option<Dialect> {
             family: Family::JsLike,
             annotates_parameters: true,
         },
+        #[cfg(feature = "lang-rust")]
+        Lang::Rust => Dialect {
+            family: Family::Rust,
+            annotates_parameters: true,
+        },
         _ => return None,
     };
     Some(dialect)
@@ -228,6 +258,7 @@ impl Dialect {
             Family::Python => "module",
             Family::GdScript => "source",
             Family::JsLike => "program",
+            Family::Rust => "source_file",
         }
     }
 
@@ -236,6 +267,7 @@ impl Dialect {
             Family::Python => kind == "block",
             Family::GdScript => kind == "body",
             Family::JsLike => kind == "statement_block",
+            Family::Rust => kind == "block",
         }
     }
 
@@ -252,6 +284,11 @@ impl Dialect {
                     | "arrow_function"
                     | "method_definition"
             ),
+            // `closure_expression` is listed so a range inside a closure
+            // resolves to the closure rather than to the `fn` around it, and
+            // then refuses at the insertion site — hoisting past a closure
+            // would strand everything it captured.
+            Family::Rust => matches!(kind, "function_item" | "closure_expression"),
         }
     }
 
@@ -263,6 +300,10 @@ impl Dialect {
                 Family::Python => matches!(kind, "lambda" | "class_definition"),
                 Family::GdScript => matches!(kind, "lambda" | "class_definition"),
                 Family::JsLike => matches!(kind, "class_declaration" | "class"),
+                Family::Rust => matches!(
+                    kind,
+                    "impl_item" | "trait_item" | "struct_item" | "enum_item" | "mod_item"
+                ),
             }
     }
 
@@ -270,6 +311,7 @@ impl Dialect {
         match self.family {
             Family::Python | Family::GdScript => kind == "class_definition",
             Family::JsLike => matches!(kind, "class_declaration" | "class"),
+            Family::Rust => matches!(kind, "impl_item" | "trait_item"),
         }
     }
 
@@ -281,6 +323,7 @@ impl Dialect {
             // recognized through its parent instead.
             Family::Python => false,
             Family::GdScript | Family::JsLike => kind == "class_body",
+            Family::Rust => kind == "declaration_list",
         }
     }
 
@@ -303,6 +346,7 @@ impl Dialect {
         match self.family {
             Family::Python | Family::GdScript => &[],
             Family::JsLike => &["this", "super"],
+            Family::Rust => &["self"],
         }
     }
 
@@ -317,6 +361,13 @@ impl Dialect {
             (_, "continue_statement") => "continue",
             (Family::Python, "yield") => "yield",
             (Family::JsLike, "yield_expression") => "yield",
+            (Family::Rust, "return_expression") => "return",
+            (Family::Rust, "break_expression") => "break",
+            (Family::Rust, "continue_expression") => "continue",
+            // `?` returns from the *enclosing* function, and `.await` needs a
+            // context the new function's signature does not say it has.
+            (Family::Rust, "try_expression") => "?",
+            (Family::Rust, "await_expression") => ".await",
             // `throw`/`raise` is deliberately absent: an exception propagates
             // through a call frame unchanged, so hoisting it does not move
             // where it is caught.
@@ -333,6 +384,9 @@ impl Dialect {
                 kind,
                 "for_statement" | "for_in_statement" | "while_statement" | "do_statement"
             ),
+            Family::Rust => {
+                matches!(kind, "for_expression" | "while_expression" | "loop_expression")
+            }
         }
     }
 
@@ -346,6 +400,14 @@ impl Dialect {
         match self.family {
             Family::Python => &["pattern_list", "tuple_pattern", "list_pattern"],
             Family::GdScript => &[],
+            Family::Rust => &[
+                "tuple_pattern",
+                "tuple_struct_pattern",
+                "struct_pattern",
+                "slice_pattern",
+                "ref_pattern",
+                "mut_pattern",
+            ],
             Family::JsLike => &[
                 "object_pattern",
                 "array_pattern",
@@ -363,16 +425,33 @@ impl Dialect {
         match self.family {
             Family::Python => None,
             Family::GdScript => Some("var"),
-            Family::JsLike => Some("let"),
+            Family::JsLike | Family::Rust => Some("let"),
         }
     }
 
     fn default_indent_unit(self) -> &'static str {
         match self.family {
-            Family::Python => "    ",
+            Family::Python | Family::Rust => "    ",
             Family::GdScript => "\t",
             Family::JsLike => "  ",
         }
+    }
+
+    /// Whether a parameter is moved rather than borrowed, so a name handed in
+    /// is gone from the caller unless it is handed back.
+    fn moves_parameters(self) -> bool {
+        matches!(self.family, Family::Rust)
+    }
+
+    /// Whether the signature spells mutability as well as a type.
+    fn annotates_mutability(self) -> bool {
+        matches!(self.family, Family::Rust)
+    }
+
+    /// Whether the language requires the new function to declare its return
+    /// type rather than inferring it.
+    fn annotates_return_type(self) -> bool {
+        matches!(self.family, Family::Rust)
     }
 
     /// How many values a single call-site statement can receive.
@@ -416,6 +495,9 @@ pub fn plan_extraction(
     let insertion_site = insertion_site(dialect, function)?;
 
     for statement in &selection {
+        if is_tail_expression(dialect, *statement) {
+            return Err(ExtractionRefusal::ReturnsThroughTailExpression);
+        }
         if let Some(kind) = escaping_control_flow(dialect, *statement, source) {
             return Err(ExtractionRefusal::ControlFlowEscapes(kind));
         }
@@ -485,10 +567,31 @@ pub fn plan_extraction(
     let local_declarations =
         resolve_local_declarations(dialect, &bindings, &parameters, &bound_outside_range)?;
 
+    // Rust passes every parameter by value, so a name that is moved in and not
+    // handed back cannot still be read afterwards. Passing it by reference
+    // would compile only after rewriting each use in the body into a
+    // dereference, and rewriting bodies is the one thing this intent does not
+    // do — so it refuses and says which name forced it.
+    if dialect.moves_parameters() {
+        for parameter in &parameters {
+            if read_after_range.contains(parameter) && !returns.contains(parameter) {
+                return Err(ExtractionRefusal::MovedNameUsedAfterRange(parameter.clone()));
+            }
+        }
+    }
+
     let mut parameter_spellings = Vec::with_capacity(parameters.len());
     for parameter in &parameters {
-        parameter_spellings.push(spell_parameter(dialect, function, parameter, source)?);
+        let mutable = dialect.annotates_mutability() && bindings.all().contains(parameter);
+        parameter_spellings.push(spell_parameter(
+            dialect, function, parameter, mutable, source,
+        )?);
     }
+    let return_type = spell_return_type(dialect, function, &returns, source)?;
+    let returns_declared_mut = returns_need_declaration
+        && returns
+            .iter()
+            .any(|name| names_assigned_after(dialect, function, end_byte, source).contains(name));
 
     Ok(ExtractionPlan {
         lang,
@@ -500,6 +603,8 @@ pub fn plan_extraction(
         parameters,
         parameter_spellings,
         returns,
+        return_type,
+        returns_declared_mut,
         local_declarations,
         returns_need_declaration,
         start_byte,
@@ -598,6 +703,47 @@ pub fn render_extraction(plan: &ExtractionPlan, source: &str, new_name: &str) ->
             };
             (function, call)
         }
+        Family::Rust => {
+            let returns = match &plan.return_type {
+                Some(spelled) => format!(" -> {spelled}"),
+                None => String::new(),
+            };
+            let mut function = format!(
+                "\n\n{}fn {new_name}({signature}){returns} {{\n{body}",
+                plan.enclosing_indent
+            );
+            if !plan.returns.is_empty() {
+                // A trailing expression, not `return`: the idiom the language
+                // reads as a value handed back rather than a jump.
+                function.push('\n');
+                function.push_str(&inner_indent);
+                function.push_str(&rust_return_target(&plan.returns));
+            }
+            function.push('\n');
+            function.push_str(&plan.enclosing_indent);
+            function.push_str("}\n");
+            let call = if plan.returns.is_empty() {
+                format!("{}{call_expression};", plan.indent)
+            } else {
+                format!(
+                    "{}{}{} = {call_expression};",
+                    plan.indent,
+                    declaration_prefix(&dialect, plan),
+                    rust_return_target(&plan.returns)
+                )
+            };
+            (function, call)
+        }
+    }
+}
+
+/// One returned name is itself; several are a tuple, which the call site
+/// destructures in the same shape.
+fn rust_return_target(returns: &[String]) -> String {
+    if returns.len() == 1 {
+        returns[0].clone()
+    } else {
+        format!("({})", returns.join(", "))
     }
 }
 
@@ -611,7 +757,7 @@ fn local_declaration_prologue(
     let Some(keyword) = dialect.declaration_keyword() else {
         return String::new();
     };
-    let terminator = if dialect.family == Family::JsLike {
+    let terminator = if matches!(dialect.family, Family::JsLike | Family::Rust) {
         ";"
     } else {
         ""
@@ -628,10 +774,17 @@ fn declaration_prefix(dialect: &Dialect, plan: &ExtractionPlan) -> String {
     if !plan.returns_need_declaration {
         return String::new();
     }
-    dialect
-        .declaration_keyword()
-        .map(|keyword| format!("{keyword} "))
-        .unwrap_or_default()
+    let Some(keyword) = dialect.declaration_keyword() else {
+        return String::new();
+    };
+    // Only where the binding spells mutability, and only when something after
+    // the range assigns it — an unconditional `mut` would compile and warn.
+    let mutable = if dialect.annotates_mutability() && plan.returns_declared_mut {
+        "mut "
+    } else {
+        ""
+    };
+    format!("{keyword} {mutable}")
 }
 
 /// One returned name is itself; several are an array, which is the only
@@ -705,30 +858,71 @@ fn spell_parameter(
     dialect: Dialect,
     function: Node,
     name: &str,
+    mutable: bool,
     source: &[u8],
 ) -> Result<String, ExtractionRefusal> {
     if !dialect.annotates_parameters {
         return Ok(name.to_string());
     }
-    match existing_type_annotation(function, name, source) {
-        Some(annotation) => Ok(format!("{name}{annotation}")),
-        None => Err(ExtractionRefusal::UnspellableParameterType(
-            name.to_string(),
-        )),
+    let annotation = existing_type_annotation(dialect, function, name, source)
+        .ok_or_else(|| ExtractionRefusal::UnspellableParameterType(name.to_string()))?;
+    Ok(match dialect.family {
+        // TypeScript's annotation node carries its own `: `.
+        Family::Rust => {
+            let prefix = if mutable { "mut " } else { "" };
+            format!("{prefix}{name}: {annotation}")
+        }
+        _ => format!("{name}{annotation}"),
+    })
+}
+
+/// The type the new function declares it returns, where the language makes it
+/// say so. Several returns are a tuple, which is also the shape the call site
+/// destructures.
+fn spell_return_type(
+    dialect: Dialect,
+    function: Node,
+    returns: &[String],
+    source: &[u8],
+) -> Result<Option<String>, ExtractionRefusal> {
+    if !dialect.annotates_return_type() || returns.is_empty() {
+        return Ok(None);
     }
+    let mut spelled = Vec::with_capacity(returns.len());
+    for name in returns {
+        spelled.push(
+            existing_type_annotation(dialect, function, name, source)
+                .ok_or_else(|| ExtractionRefusal::UnspellableParameterType(name.clone()))?,
+        );
+    }
+    Ok(Some(if spelled.len() == 1 {
+        spelled.remove(0)
+    } else {
+        format!("({})", spelled.join(", "))
+    }))
 }
 
 /// The annotation text (`": number"`) attached to `name`'s binding inside the
 /// enclosing function, if it has one.
-fn existing_type_annotation(function: Node, name: &str, source: &[u8]) -> Option<String> {
+fn existing_type_annotation(
+    dialect: Dialect,
+    function: Node,
+    name: &str,
+    source: &[u8],
+) -> Option<String> {
     let mut found = None;
     walk(function, &mut |node| {
         if found.is_some() {
             return false;
         }
-        let binder = match node.kind() {
-            "required_parameter" | "optional_parameter" => node.child_by_field_name("pattern"),
-            "variable_declarator" => node.child_by_field_name("name"),
+        let binder = match (dialect.family, node.kind()) {
+            (Family::JsLike, "required_parameter" | "optional_parameter") => {
+                node.child_by_field_name("pattern")
+            }
+            (Family::JsLike, "variable_declarator") => node.child_by_field_name("name"),
+            (Family::Rust, "parameter" | "let_declaration") => {
+                node.child_by_field_name("pattern")
+            }
             _ => None,
         };
         if let Some(binder) = binder
@@ -975,6 +1169,57 @@ fn label_name(node: Node, source: &[u8]) -> Option<String> {
     branch_label(node, source)
 }
 
+/// Whether this node is the block's trailing expression rather than a
+/// statement — the value its function hands back.
+///
+/// Only Rust has one. It is recognized structurally: a block's children are
+/// statements plus an optional final expression, so a last child that is not a
+/// statement kind is that expression.
+fn is_tail_expression(dialect: Dialect, node: Node) -> bool {
+    if !matches!(dialect.family, Family::Rust) {
+        return false;
+    }
+    if node.next_named_sibling().is_some() {
+        return false;
+    }
+    if !node
+        .parent()
+        .is_some_and(|parent| dialect.is_block_kind(parent.kind()))
+    {
+        return false;
+    }
+    !matches!(node.kind(), "expression_statement" | "let_declaration")
+        && !node.kind().ends_with("_item")
+        && node.kind() != "attribute_item"
+        && node.kind() != "macro_invocation"
+}
+
+/// Names something after the range assigns, so a call site that declares what
+/// it receives knows whether to declare it mutable.
+fn names_assigned_after(
+    dialect: Dialect,
+    function: Node,
+    end_byte: usize,
+    source: &[u8],
+) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    walk(function, &mut |node| {
+        if node.end_byte() <= end_byte {
+            return false;
+        }
+        if node.start_byte() >= end_byte
+            && node
+                .parent()
+                .is_some_and(|parent| is_assignment_kind(dialect, parent.kind()))
+            && let Some(name) = binding_name(dialect, node, source)
+        {
+            names.insert(name);
+        }
+        true
+    });
+    names
+}
+
 /// The receiver keyword the range names, if it names one.
 fn receiver_reference(dialect: Dialect, statement: Node) -> Option<&'static str> {
     let keywords = dialect.receiver_kinds();
@@ -1098,6 +1343,7 @@ fn is_assignment_kind(dialect: Dialect, kind: &str) -> bool {
             kind,
             "assignment_expression" | "augmented_assignment_expression"
         ),
+        Family::Rust => matches!(kind, "assignment_expression" | "compound_assignment_expr"),
     }
 }
 
@@ -1262,6 +1508,7 @@ fn is_written_after_evaluation(dialect: Dialect, kind: &str) -> bool {
         Family::Python => false,
         Family::GdScript => matches!(kind, "variable_statement" | "const_statement"),
         Family::JsLike => kind == "variable_declarator",
+        Family::Rust => kind == "let_declaration",
     }
 }
 
@@ -1269,6 +1516,7 @@ fn is_augmented_assignment(dialect: Dialect, kind: &str) -> bool {
     match dialect.family {
         Family::Python | Family::GdScript => kind == "augmented_assignment",
         Family::JsLike => kind == "augmented_assignment_expression",
+        Family::Rust => kind == "compound_assignment_expr",
     }
 }
 
@@ -1276,7 +1524,7 @@ fn is_augmented_assignment(dialect: Dialect, kind: &str) -> bool {
 /// the position reads or binds it.
 fn is_name_node(dialect: Dialect, node: Node) -> bool {
     match dialect.family {
-        Family::Python => node.kind() == "identifier",
+        Family::Python | Family::Rust => node.kind() == "identifier",
         Family::GdScript => matches!(node.kind(), "identifier" | "name"),
         Family::JsLike => matches!(
             node.kind(),
@@ -1292,6 +1540,12 @@ fn is_type_position(dialect: Dialect, node: Node) -> bool {
         Family::Python => matches!(node.kind(), "type"),
         Family::GdScript => matches!(node.kind(), "type" | "inferred_type"),
         Family::JsLike => matches!(node.kind(), "type_annotation" | "type_arguments"),
+        // Rust spells a type as the `type` field of whatever binds it, with no
+        // wrapper node of its own, so the field is the thing to recognize.
+        Family::Rust => node
+            .parent()
+            .and_then(|parent| parent.child_by_field_name("type"))
+            .is_some_and(|annotation| annotation.id() == node.id()),
     }
 }
 
@@ -1304,6 +1558,7 @@ fn binding_name(dialect: Dialect, node: Node, source: &[u8]) -> Option<String> {
         Family::Python => python_binds(dialect, node),
         Family::GdScript => gdscript_binds(node),
         Family::JsLike => js_binds(dialect, node),
+        Family::Rust => rust_binds(dialect, node),
     };
     if !is_binding {
         return None;
@@ -1413,6 +1668,70 @@ fn js_pattern_root_binds(dialect: Dialect, node: Node) -> bool {
     }
 }
 
+/// Rust binding positions.
+///
+/// Every one of them is a `pattern` or a `name` field, which is what makes the
+/// receiver case cheap to get right: `self` is its own node kind, never an
+/// `identifier`, so it can never be mistaken for a name a signature could
+/// carry.
+fn rust_binds(dialect: Dialect, node: Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        "let_declaration" | "for_expression" | "parameter" | "closure_parameters" => parent
+            .child_by_field_name("pattern")
+            .is_some_and(|pattern| pattern.id() == node.id())
+            || parent.kind() == "closure_parameters",
+        "assignment_expression" | "compound_assignment_expr" => parent
+            .child_by_field_name("left")
+            .is_some_and(|left| left.id() == node.id()),
+        "function_item" | "const_item" | "static_item" | "mod_item" => parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.id() == node.id()),
+        kind if dialect.pattern_kinds().contains(&kind) => rust_pattern_root_binds(dialect, parent),
+        _ => false,
+    }
+}
+
+fn rust_pattern_root_binds(dialect: Dialect, node: Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if dialect.pattern_kinds().contains(&parent.kind()) {
+        return rust_pattern_root_binds(dialect, parent);
+    }
+    match parent.kind() {
+        "let_declaration" | "for_expression" | "parameter" => parent
+            .child_by_field_name("pattern")
+            .is_some_and(|pattern| pattern.id() == node.id()),
+        "closure_parameters" => true,
+        _ => false,
+    }
+}
+
+fn rust_reads(dialect: Dialect, node: Node, parent: Node) -> bool {
+    match parent.kind() {
+        // `value.field` — the field is a `field_identifier`, so only the
+        // receiver reaches here.
+        "field_expression" => parent
+            .child_by_field_name("field")
+            .is_none_or(|field| field.id() != node.id()),
+        "let_declaration" | "for_expression" | "parameter" => parent
+            .child_by_field_name("pattern")
+            .is_none_or(|pattern| !covers(pattern, node)),
+        "assignment_expression" | "compound_assignment_expr" => parent
+            .child_by_field_name("left")
+            .is_none_or(|left| !covers(left, node)),
+        "function_item" | "const_item" | "static_item" | "mod_item" => parent
+            .child_by_field_name("name")
+            .is_none_or(|name| name.id() != node.id()),
+        "closure_parameters" => false,
+        kind if dialect.pattern_kinds().contains(&kind) => !rust_pattern_root_binds(dialect, parent),
+        _ => true,
+    }
+}
+
 /// Whether this identifier reads a binding, as opposed to naming a member, a
 /// keyword argument, or a binding position.
 fn is_read_identifier(dialect: Dialect, node: Node) -> bool {
@@ -1429,6 +1748,7 @@ fn is_read_identifier(dialect: Dialect, node: Node) -> bool {
         Family::Python => python_reads(dialect, node, parent),
         Family::GdScript => gdscript_reads(node, parent),
         Family::JsLike => js_reads(dialect, node, parent),
+        Family::Rust => rust_reads(dialect, node, parent),
     }
 }
 
@@ -2153,15 +2473,124 @@ mod typescript_tests {
 }
 
 #[cfg(all(test, feature = "lang-rust"))]
-mod unsupported_tests {
+mod rust_tests {
     use super::*;
 
+    // `rows` is moved in and never read again; `total` is threaded in and
+    // handed back, which is what keeps the extraction by-value.
+    const SOURCE: &str = "fn outer(rows: &[u32], limit: u32) -> u32 {\n    let mut total: u32 = 0;\n    for row in rows {\n        total += row * limit;\n    }\n    total\n}\n";
+
     #[test]
-    fn a_language_outside_the_untyped_family_is_refused_by_name() {
-        let source = "fn outer(base: i32) -> i32 {\n    let acc = base * 2;\n    acc\n}\n";
+    fn copies_annotations_and_threads_an_accumulator_by_value() {
+        let plan = plan_extraction(Lang::Rust, SOURCE.as_bytes(), 2, 4, "accumulate")
+            .expect("planned");
+        assert_eq!(plan.enclosing_function, "outer");
         assert_eq!(
-            plan_extraction(Lang::Rust, source.as_bytes(), 1, 1, "double"),
-            Err(ExtractionRefusal::UnsupportedLanguage("rust"))
+            plan.parameters,
+            vec!["limit".to_string(), "rows".to_string(), "total".to_string()]
         );
+        // `total` is assigned in the range, so the signature says `mut`; the
+        // other two are read-only and do not.
+        assert_eq!(
+            plan.parameter_spellings,
+            vec![
+                "limit: u32".to_string(),
+                "rows: &[u32]".to_string(),
+                "mut total: u32".to_string()
+            ]
+        );
+        assert_eq!(plan.returns, vec!["total".to_string()]);
+        assert_eq!(plan.return_type, Some("u32".to_string()));
+
+        let (function, call) = render_extraction(&plan, SOURCE, "accumulate");
+        assert!(
+            function.contains("fn accumulate(limit: u32, rows: &[u32], mut total: u32) -> u32 {"),
+            "{function}"
+        );
+        assert!(function.contains("\n    for row in rows {"), "{function}");
+        // A trailing expression, not `return`.
+        assert!(function.contains("\n    total\n"), "{function}");
+        assert!(!function.contains("return"), "{function}");
+        assert_eq!(call, "    total = accumulate(limit, rows, total);");
+    }
+
+    #[test]
+    fn refuses_a_name_it_would_move_and_the_caller_still_reads() {
+        // `rows` is read after the range, so moving it in would leave the
+        // caller reading a moved value. Borrowing instead would mean rewriting
+        // every use in the body into a dereference.
+        let source = "fn outer(rows: &[u32]) -> usize {\n    let mut total: usize = 0;\n    for row in rows {\n        total += *row as usize;\n    }\n    total + rows.len()\n}\n";
+        assert_eq!(
+            plan_extraction(Lang::Rust, source.as_bytes(), 2, 4, "accumulate"),
+            Err(ExtractionRefusal::MovedNameUsedAfterRange("rows".to_string()))
+        );
+    }
+
+    #[test]
+    fn refuses_an_unannotated_local() {
+        // Idiomatic Rust rarely annotates a local, which is exactly why this
+        // refuses rather than guessing: there is no type checker behind it,
+        // and a guessed `T` parses and does not build.
+        let source = "fn outer(base: u32) -> u32 {\n    let mut acc = 0;\n    acc += base;\n    acc\n}\n";
+        assert_eq!(
+            plan_extraction(Lang::Rust, source.as_bytes(), 2, 2, "bump"),
+            Err(ExtractionRefusal::UnspellableParameterType("acc".to_string()))
+        );
+    }
+
+    #[test]
+    fn refuses_the_trailing_expression() {
+        // The tail *is* the function's return. Hoisting it would hand the
+        // value to the new function and leave the caller returning nothing.
+        assert_eq!(
+            plan_extraction(Lang::Rust, SOURCE.as_bytes(), 5, 5, "finish"),
+            Err(ExtractionRefusal::ReturnsThroughTailExpression)
+        );
+    }
+
+    #[test]
+    fn refuses_the_question_mark_operator() {
+        // `?` returns from the *enclosing* function. In a new function whose
+        // return type is derived from names, there is nothing for it to return
+        // through.
+        let source = "fn outer(raw: &str) -> Result<u32, E> {\n    let n: u32 = parse(raw)?;\n    Ok(n)\n}\n";
+        assert_eq!(
+            plan_extraction(Lang::Rust, source.as_bytes(), 1, 1, "parsed"),
+            Err(ExtractionRefusal::ControlFlowEscapes("?"))
+        );
+    }
+
+    #[test]
+    fn refuses_an_await() {
+        let source = "async fn outer(id: u32) -> u32 {\n    let n: u32 = fetch(id).await;\n    n\n}\n";
+        assert_eq!(
+            plan_extraction(Lang::Rust, source.as_bytes(), 1, 1, "fetched"),
+            Err(ExtractionRefusal::ControlFlowEscapes(".await"))
+        );
+    }
+
+    #[test]
+    fn refuses_a_method_body_that_names_self() {
+        // Python threads `self` through the signature because it is an
+        // ordinary name. Rust's is not: the new function would have to become
+        // an inherent method, which needs an `impl` target and a receiver form
+        // no derivation can choose without types.
+        let source = "struct S { scale: u32 }\nimpl S {\n    fn outer(&self, base: u32) -> u32 {\n        let n: u32 = self.scale * base;\n        n\n    }\n}\n";
+        assert_eq!(
+            plan_extraction(Lang::Rust, source.as_bytes(), 3, 3, "scaled"),
+            Err(ExtractionRefusal::ReferencesReceiver("self"))
+        );
+    }
+
+    #[test]
+    fn a_method_extraction_without_self_lands_past_the_impl_block() {
+        let source = "struct S;\nimpl S {\n    fn outer(&self, base: u32) -> u32 {\n        let n: u32 = base * 2;\n        n\n    }\n}\n";
+        let plan =
+            plan_extraction(Lang::Rust, source.as_bytes(), 3, 3, "double").expect("planned");
+        assert_eq!(plan.enclosing_indent, "");
+        assert_eq!(plan.insert_byte, source.len() - 1);
+        let (function, call) = render_extraction(&plan, source, "double");
+        assert!(function.contains("\nfn double(base: u32) -> u32 {"), "{function}");
+        assert_eq!(call, "        let n = double(base);");
     }
 }

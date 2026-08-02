@@ -411,21 +411,25 @@ pub(crate) const SEMANTIC_EDIT_RUST_KINDS: &[&str] = &[
     "move_declaration",
     "rewrite_call_sites",
     "structural_rewrite",
+    // Rust extracts by value and copies the types it can already see. It is
+    // registered rather than refused because both halves of that are provable
+    // without a type checker: ownership comes from use analysis, and a type
+    // comes from an annotation or nowhere. Where a name has no annotation to
+    // copy, or would move out from under a caller that still reads it, the
+    // planner declines by name — which is the whole reason the kind can be
+    // advertised for a language `tsift-graph` cannot type-check.
+    "extract_function",
 ];
 /// The script tier: Python and the JS-like grammars.
 ///
-/// `extract_function` is here rather than on Python alone because the family
-/// this tier describes *is* the family whose signature is derivable without
-/// type information — an untyped parameter list and an explicit `return`.
-/// Rust is deliberately absent: choosing `T`, `&T`, or `&mut T` needs types
-/// `tsift-graph` does not have, and a guessed signature parses without
-/// building.
-///
-/// TypeScript is in it only because it can *copy* an annotation the file
-/// already has. Where it cannot, the planner refuses rather than writing
-/// `unknown` or leaving a parameter implicitly `any`, so the registration
-/// advertises an edit that either lands correctly or declines by name — never
-/// one that type-checks something other than what the code does.
+/// `extract_function` is here rather than on Python alone because one analysis
+/// serves every language whose signature is derivable from the source it can
+/// already see. TypeScript and Rust are in that set only because they can
+/// *copy* an annotation the file already has; where they cannot, the planner
+/// refuses rather than writing `unknown`, leaving a parameter implicitly
+/// `any`, or guessing a Rust `T`. The registration therefore advertises an
+/// edit that either lands correctly or declines by name — never one that
+/// type-checks something other than what the code does.
 pub(crate) const SEMANTIC_EDIT_SCRIPT_KINDS: &[&str] = &[
     "rename_symbol",
     "replace_function_body",
@@ -2293,6 +2297,31 @@ struct SemanticEditExtractionFixture {
 
 #[cfg(test)]
 const SEMANTIC_EDIT_EXTRACTION_FIXTURES: &[SemanticEditExtractionFixture] = &[
+    SemanticEditExtractionFixture {
+        executor: SemanticEditExecutorLanguage::Rust,
+        alias: "rust",
+        sample_path: "src/lib.rs",
+        // `rows` and `limit` are moved in and never read again, which is the
+        // only shape a by-value extraction can express. `total`'s declaration
+        // is inside the range, so it leaves with it and the call site declares
+        // what it receives.
+        source: "fn outer(rows: &[u32], limit: u32) -> u32 {\n    let mut total: u32 = 0;\n    for row in rows {\n        total += row * limit;\n    }\n    total\n}\n",
+        start_line: 2,
+        end_line: 4,
+        new_name: "accumulate",
+        call_site: "    let total = accumulate(limit, rows);\n",
+        emitted: &[
+            // Types copied from the parameters that already had them, and a
+            // declared return type copied from the local's own annotation.
+            "fn accumulate(limit: u32, rows: &[u32]) -> u32 {",
+            "\n    let mut total: u32 = 0;",
+            "\n    for row in rows {",
+            // A trailing expression, which is how the language spells a value
+            // handed back.
+            "\n    total\n}",
+        ],
+        hoisted_once: "total += row * limit;",
+    },
     SemanticEditExtractionFixture {
         executor: SemanticEditExecutorLanguage::Python,
         alias: "python",
@@ -7299,11 +7328,11 @@ mod structural_rewrite_tests {
                 fixture.alias
             );
         }
-        // Python, the four JS-like grammars, and GDScript. A collapsed table
-        // would satisfy both loops vacuously.
+        // Rust, Python, the four JS-like grammars, and GDScript. A collapsed
+        // table would satisfy both loops vacuously.
         assert_eq!(
             SEMANTIC_EDIT_EXTRACTION_FIXTURES.len(),
-            6,
+            7,
             "the extraction conformance table has {} rows",
             SEMANTIC_EDIT_EXTRACTION_FIXTURES.len()
         );
