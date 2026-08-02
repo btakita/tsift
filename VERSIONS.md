@@ -108,6 +108,22 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
   where the free function honestly declines. A caller-supplied signature is
   honest but gives up the one property that makes the intent worth having: that
   the signature and the call site come from one analysis and cannot disagree.
+  **One range per file per batch.** Being the only line-addressed intent has a
+  batch consequence: intents apply in order against one shared buffer, and every
+  named intent re-resolves itself against that buffer as it goes. A range
+  cannot — a line number carries no evidence of what it meant — so a
+  range-selected intent whose file an earlier intent already edits is addressing
+  lines that have moved. It now refuses at plan time with a **stale line range**
+  naming the earlier intent's handle, and the refusal blocks the whole batch, so
+  the earlier intent does not land either. The guard is scoped to the file, not
+  to the kind: an inserted import shifts every line below it exactly as an
+  extraction does. That is stricter than the bytes require — a rename changes no
+  line numbers — and deliberately so, because a stale range does not reliably
+  fail. It selects *some* run of statements, and extracting the wrong run still
+  parses and derives an honest signature for statements nobody asked to move;
+  when it does fail it fails for whatever the displaced lines trip over, naming
+  a property of the shifted range instead of the reason it shifted.
+
   Plan: `tasks/software/plan-tsift-extract-function.md`.
 
 ## 0.1.79

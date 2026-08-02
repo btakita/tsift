@@ -41,6 +41,12 @@ Non-concrete search preview handles such as `sfam-*`, `srnk-*`, and lexical file
 
 The output is not a rewrite of what was selected. It is two edits that must agree: a new function whose signature is *derived* from the selection, and a call whose arguments come from the same derivation. Both are computed from one analysis of the original bytes, and the new function is spliced after the call so neither edit moves the other's offsets.
 
+### One range per file per batch
+
+A batch applies its intents in order against one shared buffer, and every named intent re-resolves itself against that buffer as it goes. A range cannot: a line number carries no evidence of what it meant, so a range-selected intent whose file an earlier intent in the same batch already edits is addressing lines that have moved. Such an intent is refused at plan time with a **stale line range**, naming the earlier intent's handle and telling the caller to give the range-selected intent its own batch and re-read its line numbers. The refusal blocks the whole batch, so the earlier intent does not land either — a batch that refused only the later intent would still have rewritten the file, leaving the caller to re-measure against a file they were not told had changed.
+
+The guard is scoped to the file, so two extractions that cannot see each other's bytes both apply. It is not scoped to the *kind*: the invariant is that an earlier intent moved these bytes, not that the earlier intent was also an extraction, and an inserted import shifts every line below it exactly as an extraction does. This is deliberately stricter than the bytes require — a rename changes no line numbers — because a stale range does not reliably fail. It selects *some* run of statements, and extracting the wrong run still parses, still formats, and derives an honest signature for statements nobody asked to move. When it does fail, it fails for whatever the displaced lines happen to trip over, naming a property of the shifted range instead of the reason it shifted.
+
 The derivation, for a run `R` inside enclosing function `F`:
 
 - **Parameters** are names read in `R` before `R` assigns them, that are bound in `F` outside `R` (including `F`'s own parameters). A name `R` assigns before reading is a local of the new function: passing the outer value in would feed the body a value it immediately overwrites.

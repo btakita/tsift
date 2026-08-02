@@ -5654,6 +5654,61 @@ fn plan_semantic_edit_intent(
     })
 }
 
+/// `extract_function` is the only intent addressed by line number instead of by
+/// name, and a batch applies its intents in order against one shared buffer. So
+/// a range-selected intent whose file an earlier intent already edits is
+/// pointing at lines that have moved: its `start_line`/`end_line` were measured
+/// against the file on disk, and by the time it runs those bytes are somewhere
+/// else. Every named intent re-resolves itself against the current buffer; a
+/// range cannot, because a line number carries no evidence of what it meant.
+///
+/// The refusal is here rather than left to the executor because a stale range
+/// does not reliably fail. It selects *some* run of statements, and extracting
+/// the wrong run still parses, still formats, and derives an honest signature
+/// for statements nobody asked to move. When it does fail it fails for whatever
+/// the displaced lines happen to trip over — "range straddles a block boundary"
+/// — which names a property of the shifted range instead of the reason it
+/// shifted.
+fn mark_stale_range_selected_drafts(
+    drafts: &mut [SemanticEditIntentDraft],
+    budget: ResponseBudget,
+) {
+    let mut written = BTreeMap::<PathBuf, String>::new();
+    for draft in drafts.iter_mut() {
+        if semantic_edit_kind_requires_line_range(&draft.plan.kind)
+            && let Some(earlier) = written.get(&draft.file_abs)
+        {
+            draft.plan.status = "conflict".to_string();
+            draft.plan.apply_supported = false;
+            draft.plan.diff = None;
+            draft.plan.patch_proposal = None;
+            // The fix comes before the diagnosis because a plan message is
+            // truncated to the response budget, and the caller can read which
+            // handle collided off the plan itself.
+            draft.plan.message = truncate_for_budget(
+                &format!(
+                    "stale line range: give this intent its own batch and re-read its line \
+                     numbers; {earlier} already edits {} in this batch",
+                    draft.plan.target_file
+                ),
+                budget.preview_bytes(),
+            );
+            continue;
+        }
+        // Only a plan that will actually run moves bytes. A batch holding a
+        // refusal never mutates anything, so its files stay where they are.
+        if draft.plan.status == "planned" {
+            let writer = format!("{} ({})", draft.plan.handle, draft.plan.kind);
+            written
+                .entry(draft.file_abs.clone())
+                .or_insert_with(|| writer.clone());
+            if let Some(destination) = &draft.destination_file_abs {
+                written.entry(destination.clone()).or_insert(writer);
+            }
+        }
+    }
+}
+
 pub(crate) struct SemanticEditFileBuffer {
     pub(crate) original: String,
     pub(crate) current: String,
@@ -6154,6 +6209,7 @@ fn verify_semantic_edit_intents(
         .enumerate()
         .map(|(idx, intent)| plan_semantic_edit_intent(&verify_root, scope, intent, idx, budget))
         .collect::<Result<Vec<_>>>()?;
+    mark_stale_range_selected_drafts(&mut drafts, budget);
     let temp_formatted_total = apply_semantic_edit_drafts(&mut drafts, intents, budget)?;
     let temp_applied_total = drafts.iter().filter(|draft| draft.plan.applied).count();
     run_semantic_edit_verification_reindex(&verify_root)?;
@@ -6239,6 +6295,7 @@ pub(crate) fn cmd_edit_intents(
         .enumerate()
         .map(|(idx, intent)| plan_semantic_edit_intent(&root, scope, intent, idx, budget))
         .collect::<Result<Vec<_>>>()?;
+    mark_stale_range_selected_drafts(&mut drafts, budget);
     let verification = if verify.enabled {
         Some(verify_semantic_edit_intents(
             &root,
@@ -6739,7 +6796,7 @@ pub fn describe() -> String {
         assert!(changed_line_range(RUST_SRC, RUST_SRC, 8).is_none());
     }
 
-    fn rename_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+    pub(super) fn rename_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         for (name, body) in files {
@@ -6761,7 +6818,7 @@ pub fn describe() -> String {
         dir
     }
 
-    fn run_rename(dir: &std::path::Path, intents: &str) -> Result<()> {
+    pub(super) fn run_rename(dir: &std::path::Path, intents: &str) -> Result<()> {
         let intent_file = dir.join("intents.json");
         std::fs::write(&intent_file, intents).unwrap();
         cmd_edit_intents(
@@ -7023,6 +7080,7 @@ pub fn describe() -> String {
 
 #[cfg(test)]
 mod structural_rewrite_tests {
+    use super::rename_symbol_tests::{rename_fixture, run_rename};
     use super::*;
 
     const RUST_SRC: &str = "fn main() {\n    foo(1);\n    foo(2);\n}\n";
@@ -7166,6 +7224,78 @@ mod structural_rewrite_tests {
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("`return`"), "{err:#}");
+    }
+
+    const STALE_RANGE_SRC: &str = "def outer(scale):\n    prefix = 2\n    acc = 0\n    for item in range(scale):\n        acc += item * prefix\n    total = acc * 3\n    doubled = total + total\n    return doubled\n";
+
+    /// The defect: the second extraction's line numbers were measured against
+    /// the file on disk, and the first extraction has already moved those
+    /// lines. Nothing downstream can tell the difference between a stale range
+    /// and a range the caller meant, so the batch has to refuse before it
+    /// applies either one.
+    #[test]
+    fn a_second_extraction_against_one_file_refuses_by_stale_range() {
+        let dir = rename_fixture(&[("script.py", STALE_RANGE_SRC)]);
+        let err = run_rename(
+            dir.path(),
+            r#"{"intents":[
+                {"kind":"extract_function","file":"script.py","start_line":3,"end_line":5,"new_name":"accumulate"},
+                {"kind":"extract_function","file":"script.py","start_line":6,"end_line":7,"new_name":"combine"}
+            ]}"#,
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("stale line range"), "{message}");
+        assert!(message.contains("script.py"), "{message}");
+        assert!(message.contains("own batch"), "{message}");
+        // Fail closed: the first intent was applyable on its own, so a batch
+        // that refused only the second would still have rewritten the file.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("script.py")).unwrap(),
+            STALE_RANGE_SRC
+        );
+    }
+
+    /// The invariant is "an earlier intent moved these bytes", not "the earlier
+    /// intent was also an extraction" — any edit to the same file invalidates a
+    /// range measured before it.
+    #[test]
+    fn an_extraction_after_any_edit_to_the_same_file_refuses_by_stale_range() {
+        let dir = rename_fixture(&[("script.py", STALE_RANGE_SRC)]);
+        let err = run_rename(
+            dir.path(),
+            r#"{"intents":[
+                {"kind":"insert_import","file":"script.py","replacement":"import math"},
+                {"kind":"extract_function","file":"script.py","start_line":3,"end_line":5,"new_name":"accumulate"}
+            ]}"#,
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("stale line range"), "{message}");
+        assert!(message.contains("insert_import"), "{message}");
+    }
+
+    /// And the guard is scoped to the file, not to the batch: two extractions
+    /// that cannot see each other's bytes still both apply.
+    #[test]
+    fn extractions_against_separate_files_both_still_apply() {
+        let dir = rename_fixture(&[
+            ("script.py", STALE_RANGE_SRC),
+            ("other.py", STALE_RANGE_SRC),
+        ]);
+        run_rename(
+            dir.path(),
+            r#"{"intents":[
+                {"kind":"extract_function","file":"script.py","start_line":3,"end_line":5,"new_name":"accumulate"},
+                {"kind":"extract_function","file":"other.py","start_line":3,"end_line":5,"new_name":"accumulate"}
+            ]}"#,
+        )
+        .expect("both applied");
+        for name in ["script.py", "other.py"] {
+            let out = std::fs::read_to_string(dir.path().join(name)).unwrap();
+            assert!(out.contains("def accumulate(prefix, scale):"), "{name}: {out}");
+            assert!(out.contains("acc = accumulate(prefix, scale)"), "{name}: {out}");
+        }
     }
 
     #[test]
