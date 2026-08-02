@@ -8,6 +8,15 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **The crates.io publish job now says how many crates it actually uploaded.** A
+  crate already on the registry is skipped, so a release published by hand before
+  the tag was pushed made the whole job a no-op that still reported success —
+  which is how a single missing trusted publisher (`tsift-astgrep`, the one crate
+  of 26 that was never registered) went unnoticed across many releases and only
+  surfaced when v0.1.80 became the first release that gave the job real work. The
+  loop now counts uploads and skips, prints `published=N skipped=M`, and annotates
+  a run where it uploaded nothing as proving nothing about trusted publishing.
+
 ## 0.1.80
 
 - **`extract_function`, the first range-selected edit intent.** Every

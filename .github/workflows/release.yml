@@ -220,6 +220,13 @@ jobs:
         run: |
           release_version="${GITHUB_REF_NAME#v}"
           max_attempts=12
+          # A crate already on the registry is skipped, which means a release
+          # published by hand before the tag was pushed makes this whole job a
+          # no-op that still reports success. That is how a missing trusted
+          # publisher went unnoticed across many releases, so the counts are
+          # summarized at the end and an all-skip run is annotated.
+          published_total=0
+          skipped_total=0
 
           crate_version_exists() {
             local package="$1"
@@ -234,6 +241,7 @@ jobs:
 
             if crate_version_exists "$package"; then
               echo "$package v$release_version already exists on crates.io; skipping"
+              skipped_total=$((skipped_total + 1))
               return 0
             fi
 
@@ -247,12 +255,14 @@ jobs:
               printf '%s\n' "$output"
 
               if [ "$status" -eq 0 ]; then
+                published_total=$((published_total + 1))
                 sleep 20
                 return 0
               fi
 
               if crate_version_exists "$package"; then
                 echo "$package v$release_version is visible on crates.io after publish attempt; continuing"
+                published_total=$((published_total + 1))
                 sleep 20
                 return 0
               fi
@@ -302,6 +312,11 @@ jobs:
           do
             publish_package "$package"
           done
+
+          echo "crates.io publish summary: published=$published_total skipped=$skipped_total"
+          if [ "$published_total" -eq 0 ]; then
+            echo "::warning title=crates.io publish uploaded nothing::every crate for v$release_version was already on the registry, so this job proved nothing about OIDC trusted publishing. If the release was published by hand before the tag, the trusted-publisher configuration is still untested."
+          fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
