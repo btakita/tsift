@@ -22527,6 +22527,11 @@ mod tests {
                 tokens_output: Some(50),
             })
             .unwrap();
+        std::fs::write(
+            dir.path().join(".tsift/config.toml"),
+            "[summarize]\napi_key_env = \"PATH\"\nmax_file_tokens = 0\n",
+        )
+        .unwrap();
 
         let status = std::process::Command::new("git")
             .args(["mv", "src/old.rs", "src/new.rs"])

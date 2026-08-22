@@ -100,6 +100,7 @@ pub(crate) fn cmd_summarize(
             errors: Vec::new(),
         };
 
+        let mut pending_extractions = Vec::new();
         for file_path in &files_to_extract {
             let content = match std::fs::read(file_path) {
                 Ok(c) => c,
@@ -112,14 +113,28 @@ pub(crate) fn cmd_summarize(
             };
             let hash = summarize::content_hash(&content);
             let rel_path = summarize_relative_file_path(&root, file_path);
+            if summary_cache.current_by_file(&rel_path, &hash)?.is_none() {
+                pending_extractions.push((file_path, hash, rel_path));
+            }
+        }
 
+        let extraction_client = if pending_extractions.is_empty() {
+            None
+        } else {
+            Some(summarize::ExtractionClient::resolve(&cfg)?)
+        };
+
+        for (file_path, hash, rel_path) in pending_extractions {
             match summary_cache.get_or_extract_file(&rel_path, &hash, || {
                 let symbol_context = find_symbols_db_for_file(&root, file_path)?;
-                let mut summaries = summarize::extract_for_file(
+                let mut summaries = summarize::extract_for_file_with_client(
                     file_path,
                     symbol_context.as_ref().map(|ctx| ctx.db_path.as_path()),
                     symbol_context.as_ref().map(|ctx| ctx.source_root.as_path()),
                     &cfg,
+                    extraction_client
+                        .as_ref()
+                        .expect("pending_extractions is non-empty inside extraction loop"),
                 )?;
                 for summary in &mut summaries {
                     summary.file_path = rel_path.clone();

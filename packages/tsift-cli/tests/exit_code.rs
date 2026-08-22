@@ -1055,13 +1055,11 @@ fn create_summary_cache(dir: &Path) {
     .unwrap();
 }
 
-fn write_missing_summary_api_key_config(dir: &Path) {
-    fs::create_dir_all(dir.join(".tsift")).unwrap();
-    fs::write(
-        dir.join(".tsift/config.toml"),
-        "[summarize]\napi_key_env = \"TSIFT_TEST_NONEXISTENT_KEY\"\n",
+fn mock_anthropic_extraction(command: &mut Command) -> &mut Command {
+    command.env("ANTHROPIC_API_KEY", "test-key").env(
+        "TSIFT_TEST_ANTHROPIC_RESPONSE_JSON",
+        r#"{"summary":"ok","entities":[],"relationships":[],"concept_labels":[]}"#,
     )
-    .unwrap();
 }
 
 #[test]
@@ -6520,7 +6518,8 @@ fn status_fix_refreshes_stale_instructions_after_version_bump_in_json() {
     );
 
     // The refreshed block points at the runbook, so the fix must produce it.
-    let runbook = fs::read_to_string(dir.path().join("runbooks/code-navigation.md")).unwrap();
+    let runbook =
+        fs::read_to_string(dir.path().join(".agent/runbooks/code-navigation.md")).unwrap();
     assert!(
         runbook.contains(&format!(
             "<!-- tsift:code-navigation-runbook v={} -->",
@@ -6528,7 +6527,10 @@ fn status_fix_refreshes_stale_instructions_after_version_bump_in_json() {
         )),
         "runbook was: {runbook}"
     );
-    assert!(runbook.contains("report.scale_guard"), "runbook was: {runbook}");
+    assert!(
+        runbook.contains("report.scale_guard"),
+        "runbook was: {runbook}"
+    );
 }
 
 #[test]
@@ -6562,7 +6564,10 @@ fn init_writes_the_runbook_and_does_not_duplicate_into_a_claude_md_that_imports_
         "CLAUDE.md still repeats what it imports: {claude}"
     );
     assert!(claude.contains("@AGENTS.md"), "CLAUDE.md was: {claude}");
-    assert!(claude.contains("## Claude extras"), "CLAUDE.md was: {claude}");
+    assert!(
+        claude.contains("## Claude extras"),
+        "CLAUDE.md was: {claude}"
+    );
 
     let agents = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
     assert!(
@@ -6570,10 +6575,14 @@ fn init_writes_the_runbook_and_does_not_duplicate_into_a_claude_md_that_imports_
         "AGENTS.md was: {agents}"
     );
     assert!(
-        agents.contains("runbooks/code-navigation.md"),
+        agents.contains(".agent/runbooks/code-navigation.md"),
         "AGENTS.md was: {agents}"
     );
-    assert!(dir.path().join("runbooks/code-navigation.md").exists());
+    assert!(
+        dir.path()
+            .join(".agent/runbooks/code-navigation.md")
+            .exists()
+    );
 }
 
 #[test]
@@ -7590,14 +7599,13 @@ fn summarize_extract_resolves_relative_path_against_explicit_root() {
     let project = tempfile::tempdir().unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
     fs::write(project.path().join("src/main.rs"), "fn alpha_helper() {}\n").unwrap();
-    write_missing_summary_api_key_config(project.path());
 
     let caller = tempfile::tempdir().unwrap();
     fs::create_dir_all(caller.path().join("src")).unwrap();
 
-    let output = tsift_bin()
+    let mut command = tsift_bin();
+    let output = mock_anthropic_extraction(&mut command)
         .current_dir(caller.path())
-        .env_remove("ANTHROPIC_API_KEY")
         .args([
             "summarize",
             "--extract",
@@ -7619,14 +7627,16 @@ fn summarize_extract_resolves_relative_path_against_explicit_root() {
         !stdout.contains("No files to extract."),
         "stdout was: {stdout}"
     );
-    assert!(stdout.contains("errors:1"), "stdout was: {stdout}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("src/main.rs"), "stderr was: {stderr}");
+    assert!(stdout.contains("files:1"), "stdout was: {stdout}");
+    assert!(stdout.contains("errors:0"), "stdout was: {stdout}");
+    assert!(!caller.path().join(".tsift/summaries.db").exists());
+    assert!(project.path().join(".tsift/summaries.db").exists());
 }
 
 #[test]
 fn summarize_extract_uses_nested_path_as_relative_extract_anchor() {
     let project = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join(".tsift")).unwrap();
     fs::create_dir_all(project.path().join("src")).unwrap();
     fs::create_dir_all(project.path().join("src/nested")).unwrap();
     fs::write(project.path().join("src/main.rs"), "fn root_helper() {}\n").unwrap();
@@ -7635,12 +7645,11 @@ fn summarize_extract_uses_nested_path_as_relative_extract_anchor() {
         "fn nested_helper() {}\n",
     )
     .unwrap();
-    write_missing_summary_api_key_config(project.path());
 
     let nested = project.path().join("src/nested");
-    let output = tsift_bin()
+    let mut command = tsift_bin();
+    let output = mock_anthropic_extraction(&mut command)
         .current_dir(project.path())
-        .env_remove("ANTHROPIC_API_KEY")
         .args([
             "summarize",
             "--extract",
@@ -7662,15 +7671,168 @@ fn summarize_extract_uses_nested_path_as_relative_extract_anchor() {
         !stdout.contains("No files to extract."),
         "stdout was: {stdout}"
     );
-    assert!(stdout.contains("errors:1"), "stdout was: {stdout}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("src/nested/"), "stderr was: {stderr}");
-    assert!(
-        !stderr.contains("error: src/main.rs"),
-        "stderr was: {stderr}"
-    );
+    assert!(stdout.contains("files:1"), "stdout was: {stdout}");
+    assert!(stdout.contains("errors:0"), "stdout was: {stdout}");
     assert!(!nested.join(".tsift/summaries.db").exists());
     assert!(project.path().join(".tsift/summaries.db").exists());
+}
+
+#[test]
+fn summarize_extract_missing_credentials_fails_once_before_walking_files() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/one.rs"), "fn one() {}\n").unwrap();
+    fs::write(dir.path().join("src/two.rs"), "fn two() {}\n").unwrap();
+    fs::create_dir_all(dir.path().join(".tsift")).unwrap();
+    fs::write(
+        dir.path().join(".tsift/config.toml"),
+        "[summarize]\napi_key_env = \"TSIFT_TEST_NONEXISTENT_KEY\"\n",
+    )
+    .unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+
+    let output = tsift_bin()
+        .env("PATH", empty_path.path())
+        .env_remove("TSIFT_TEST_NONEXISTENT_KEY")
+        .env_remove("CLAUDE_CODE_USE_BEDROCK")
+        .env_remove("CLAUDE_CODE_USE_VERTEX")
+        .env_remove("CLAUDE_CODE_USE_FOUNDRY")
+        .args([
+            "summarize",
+            "--extract",
+            "src",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("no LLM credentials found").count(), 1);
+    assert!(stderr.contains("TSIFT_TEST_NONEXISTENT_KEY"));
+    assert!(!stderr.contains("src/one.rs"), "stderr was: {stderr}");
+    assert!(!stderr.contains("src/two.rs"), "stderr was: {stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("Extraction complete"));
+}
+
+#[cfg(unix)]
+#[test]
+fn summarize_extract_uses_claude_cli_for_bedrock_without_an_api_key() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/main.rs"),
+        "fn bedrock_summary_target() {}\n",
+    )
+    .unwrap();
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let claude = bin_dir.join("claude");
+    fs::write(
+        &claude,
+        r#"#!/bin/sh
+printf '%s\n' "$@" > "$TSIFT_TEST_CLAUDE_ARGS"
+prompt=$(/bin/cat)
+printf '%s' "$prompt" > "$TSIFT_TEST_CLAUDE_PROMPT"
+printf '%s\n' '{"summary":"bedrock works","entities":[],"relationships":[],"concept_labels":[]}'
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&claude).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&claude, permissions).unwrap();
+    let args_path = dir.path().join("claude-args.txt");
+    let prompt_path = dir.path().join("claude-prompt.txt");
+
+    let output = tsift_bin()
+        .env("PATH", &bin_dir)
+        .env("CLAUDE_CODE_USE_BEDROCK", "1")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env("TSIFT_TEST_CLAUDE_ARGS", &args_path)
+        .env("TSIFT_TEST_CLAUDE_PROMPT", &prompt_path)
+        .args([
+            "summarize",
+            "--extract",
+            "src",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--compact",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "summarize stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("files:1"), "stdout was: {stdout}");
+    assert!(stdout.contains("errors:0"), "stdout was: {stdout}");
+    let args = fs::read_to_string(args_path).unwrap();
+    assert!(args.lines().any(|arg| arg == "-p"), "args were: {args}");
+    assert!(
+        args.lines().any(|arg| arg == "--model"),
+        "args were: {args}"
+    );
+    assert!(
+        args.lines().any(|arg| arg == "--safe-mode"),
+        "args were: {args}"
+    );
+    let prompt = fs::read_to_string(prompt_path).unwrap();
+    assert!(prompt.contains("bedrock_summary_target"));
+}
+
+#[cfg(unix)]
+#[test]
+fn summarize_extract_rejects_an_unauthenticated_claude_cli_before_walking_files() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/one.rs"), "fn one() {}\n").unwrap();
+    fs::write(dir.path().join("src/two.rs"), "fn two() {}\n").unwrap();
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let claude = bin_dir.join("claude");
+    fs::write(
+        &claude,
+        r#"#!/bin/sh
+if [ "$1" = "auth" ]; then
+  printf '%s\n' 'not logged in' >&2
+  exit 1
+fi
+printf '%s' 'extraction unexpectedly started' > "$TSIFT_TEST_CLAUDE_EXTRACTED"
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&claude).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&claude, permissions).unwrap();
+    let extraction_marker = dir.path().join("extraction-started.txt");
+
+    let output = tsift_bin()
+        .env("PATH", &bin_dir)
+        .env("CLAUDE_CODE_USE_BEDROCK", "1")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env("TSIFT_TEST_CLAUDE_EXTRACTED", &extraction_marker)
+        .args([
+            "summarize",
+            "--extract",
+            "src",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("not a usable extraction backend").count(), 1);
+    assert!(stderr.contains("claude auth login"), "stderr was: {stderr}");
+    assert!(!stderr.contains("src/one.rs"), "stderr was: {stderr}");
+    assert!(!stderr.contains("src/two.rs"), "stderr was: {stderr}");
+    assert!(!extraction_marker.exists());
 }
 
 #[test]
@@ -7681,9 +7843,9 @@ fn summarize_diff_extract_includes_untracked_files() {
 
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/new.rs"), "fn alpha_helper() {}\n").unwrap();
-    write_missing_summary_api_key_config(dir.path());
 
-    let output = tsift_bin()
+    let mut command = tsift_bin();
+    let output = mock_anthropic_extraction(&mut command)
         .args([
             "summarize",
             "--extract",
@@ -7701,15 +7863,13 @@ fn summarize_diff_extract_includes_untracked_files() {
         "summarize stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("missing API key"), "stderr was: {stderr}");
-    assert!(stderr.contains("src/new.rs"), "stderr was: {stderr}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         !stdout.contains("No files to extract."),
         "stdout was: {stdout}"
     );
-    assert!(stdout.contains("errors:1"), "stdout was: {stdout}");
+    assert!(stdout.contains("files:1"), "stdout was: {stdout}");
+    assert!(stdout.contains("errors:0"), "stdout was: {stdout}");
 }
 
 #[test]
@@ -7724,9 +7884,9 @@ fn summarize_diff_extract_treats_unborn_head_as_untracked_only() {
 
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/new.rs"), "fn alpha_helper() {}\n").unwrap();
-    write_missing_summary_api_key_config(dir.path());
 
-    let output = tsift_bin()
+    let mut command = tsift_bin();
+    let output = mock_anthropic_extraction(&mut command)
         .args([
             "summarize",
             "--extract",
@@ -7744,15 +7904,13 @@ fn summarize_diff_extract_treats_unborn_head_as_untracked_only() {
         "summarize stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("missing API key"), "stderr was: {stderr}");
-    assert!(stderr.contains("src/new.rs"), "stderr was: {stderr}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         !stdout.contains("No files to extract."),
         "stdout was: {stdout}"
     );
-    assert!(stdout.contains("errors:1"), "stdout was: {stdout}");
+    assert!(stdout.contains("files:1"), "stdout was: {stdout}");
+    assert!(stdout.contains("errors:0"), "stdout was: {stdout}");
 }
 
 #[test]
@@ -7768,9 +7926,9 @@ fn summarize_diff_extract_normalizes_relative_scope_before_filtering() {
         "fn alpha_helper() {}\nfn beta_helper() {}\n",
     )
     .unwrap();
-    write_missing_summary_api_key_config(dir.path());
 
-    let output = tsift_bin()
+    let mut command = tsift_bin();
+    let output = mock_anthropic_extraction(&mut command)
         .args([
             "summarize",
             "--extract",
@@ -7793,14 +7951,8 @@ fn summarize_diff_extract_normalizes_relative_scope_before_filtering() {
         !stdout.contains("No files to extract."),
         "stdout was: {stdout}"
     );
-    assert!(stdout.contains("errors:1"), "stdout was: {stdout}");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("src/lib.rs"), "stderr was: {stderr}");
-    assert!(
-        !stderr.contains("src/../src/lib.rs"),
-        "stderr was: {stderr}"
-    );
+    assert!(stdout.contains("files:1"), "stdout was: {stdout}");
+    assert!(stdout.contains("errors:0"), "stdout was: {stdout}");
 }
 
 #[test]
@@ -9367,10 +9519,12 @@ fn session_cost_reads_codex_token_counts_from_stdin() {
         json["prompt_cache_plan"]["analytics"]["timeline"][1]["prompt_cache_metadata"]["provider"],
         "openai"
     );
-    assert!(json["prompt_cache_plan"]["analytics"]["timeline"][1]["prompt_cache_metadata"]
-        ["stable_prefix_fingerprint"]
-        .as_str()
-        .is_some_and(|value| value.starts_with("spfx-")));
+    assert!(
+        json["prompt_cache_plan"]["analytics"]["timeline"][1]["prompt_cache_metadata"]
+            ["stable_prefix_fingerprint"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("spfx-"))
+    );
     assert!(
         json["prompt_cache_plan"]["provider_adapters"]
             .as_array()
@@ -13011,6 +13165,9 @@ fn edit_intents_rename_leaves_javascript_properties_alone() {
     );
     // Every other property position is untouched.
     assert!(source.contains("{ beta: 1 }"), "object key: {source}");
-    assert!(source.contains("beta() { return 2; }"), "class method: {source}");
+    assert!(
+        source.contains("beta() { return 2; }"),
+        "class method: {source}"
+    );
     assert!(source.contains("keyed.beta"), "member read: {source}");
 }

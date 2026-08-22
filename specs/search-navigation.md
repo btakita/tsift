@@ -233,7 +233,7 @@ With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject
 
 1. Adds `.tsift/` to `.gitignore` (creates the file if needed, appends if entry missing, skips if already present)
 2. Ensures `AGENTS.md` exists with the section (creates it if needed)
-3. Writes `runbooks/code-navigation.md` with the full command detail the section defers to, under its own `<!-- tsift:code-navigation-runbook -->` markers (creates the directory and file if needed, updates the marked region in place, preserves text outside the markers)
+3. Writes `.agent/runbooks/code-navigation.md` with the full command detail the section defers to, under its own `<!-- tsift:code-navigation-runbook -->` markers (creates the directory and file if needed, updates the marked region in place, preserves text outside the markers). If the canonical path is absent but the legacy `runbooks/code-navigation.md` exists, init moves that file first so hand-written text outside the managed markers survives the migration.
 4. If `CLAUDE.md` exists **and does not already defer to `AGENTS.md`**, updates or appends the same section there too
 5. If `CLAUDE.md` defers to `AGENTS.md` — it resolves to the same file (symlink), or it pulls it in with a Claude Code `@AGENTS.md` import — no section is injected. An already-present managed section in an `@AGENTS.md`-importing `CLAUDE.md` is **removed**, since that file already inherits the canonical copy. A `CLAUDE.md` symlinked to `AGENTS.md` is left untouched: rewriting through the link would strip the section out of the canonical file
 6. If the section already exists (detected by `<!-- tsift:code-navigation -->` markers), updates it in place
@@ -243,8 +243,8 @@ With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject
 10. When the resolved target has `.gitmodules`, the Codex hook automatically uses `tsift index --check --exit-code --workspace <root>` / `tsift index --workspace <root>` so one root hook covers initialized submodules. `--workspace` makes that root resolution explicit from inside a submodule.
 11. The injected Code Navigation section explicitly tells harnesses to switch to the owning repo or submodule root before running tsift/build/test commands, so submodule work does not inherit the wider superproject instruction surface by accident.
 12. The injected section also steers harnesses toward envelope-backed `search`, `explain`, `session-review`, `context-pack`, and digest-runner artifacts instead of raw transcript replays, `git diff/show/log` patch dumps, or verbose build/test output reads.
-13. The injected section tells agents to run the local default suite with `make check`, then check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1`; deterministic simulation coverage runs in the default suite, and CI failures must be fixed before the work is complete.
-14. The injected section is a hot-path router, not a manual: it carries the session-start rule, the envelope-over-raw-read substitutions, and the verification rule, and defers budgets, `tsift workflow search`, `report.scale_guard` handling, the `tsift rewrite --run` path for harnesses without `PreToolUse` hooks, and Codex/OpenCode integration to `runbooks/code-navigation.md`. Because `tsift init` generates that runbook itself, the pair ships together in every initialized checkout — a standalone checkout is never left with a pointer to a file that does not exist. A repository that also ships a current `.claude/skills/tsift/SKILL.md` should use that skill as the deeper source.
+13. Verification guidance is capability-based. A Makefile contributes `make check` only when it defines a `check` target; otherwise a `justfile` contributes the first unambiguous `check`, `test`, or `verify` recipe. GitHub Actions contributes `gh run list --limit 1` only when `.github/workflows/` exists and `gh` is executable; GitLab contributes `glab ci status` only when `.gitlab-ci.yml` exists and `glab` is executable. Missing or ambiguous capabilities emit no verification sentence instead of a command that will fail.
+14. The injected section is a hot-path router, not a manual: it carries the session-start rule, the envelope-over-raw-read substitutions, and any detected verification rule, and defers budgets, `tsift workflow search`, `report.scale_guard` handling, the `tsift rewrite --run` path for harnesses without `PreToolUse` hooks, and Codex/OpenCode integration to `.agent/runbooks/code-navigation.md`. Because `tsift init` generates that runbook itself, the pair ships together in every initialized checkout — a standalone checkout is never left with a pointer to a file that does not exist. A repository that also ships a current `.claude/skills/tsift/SKILL.md` should use that skill as the deeper source.
 
 The OpenCode command shortcut set is intentionally prompt-template based rather than a background hook: OpenCode already reads project `AGENTS.md`, and the managed commands give operators explicit `/tsift-status`, `/tsift-session-review`, `/tsift-context-pack`, `/tsift-diff-digest`, `/tsift-test-digest`, `/tsift-log-digest`, `/tsift-rewrite-run`, `/tsift-explain`, `/tsift-symbol-read`, and `/tsift-graph` entrypoints that route common workflows through bounded tsift evidence without depending on raw terminal replay.
 
@@ -268,9 +268,9 @@ Prefer tsift envelopes over raw reads:
 - `tsift --envelope session-review <path>` / `tsift --envelope context-pack <path>` instead of replaying long session docs, transcripts, or runtime logs
 - `tsift --envelope digest-runner --kind test|log --path . --shell-command '<command>'` instead of raw test/build output
 
-Command detail lives in [`runbooks/code-navigation.md`](runbooks/code-navigation.md) — budgets, `tsift workflow search`, `report.scale_guard` handling, the harness rewrite path for `PreToolUse`-less harnesses, and Codex/OpenCode integration. `tsift init` writes and versions that runbook alongside this block, so it is present in every initialized checkout; read it before broad exploration instead of expanding this block. A repository that also ships a current `.claude/skills/tsift/SKILL.md` should use that skill as the deeper source.
+Command detail lives in [`.agent/runbooks/code-navigation.md`](.agent/runbooks/code-navigation.md) — budgets, `tsift workflow search`, `report.scale_guard` handling, the harness rewrite path for `PreToolUse`-less harnesses, and Codex/OpenCode integration. `tsift init` writes and versions that runbook alongside this block, so it is present in every initialized checkout; read it before broad exploration instead of expanding this block. A repository that also ships a current `.claude/skills/tsift/SKILL.md` should use that skill as the deeper source.
 
-For local verification, run `make check` before committing. After local changes, check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1` and fix any failing tests before calling the work complete.
+When detected, this position carries repository-valid local and CI verification commands. It is omitted when no supported command can be proven from the repository and current host.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->
@@ -278,7 +278,7 @@ Only read full source files when tsift results are insufficient.
 
 ### Generated Runbook
 
-`runbooks/code-navigation.md` holds the detail the block defers to, under its own marker pair so the two surfaces version independently of any hand-written text around them:
+`.agent/runbooks/code-navigation.md` holds the detail the block defers to, under its own marker pair so the two surfaces version independently of any hand-written text around them:
 
 ```markdown
 <!-- tsift:code-navigation-runbook v=0.1.80 -->
@@ -290,7 +290,7 @@ Managed by `tsift init` (versioned markers) — do not hand-edit between the mar
 ## Search, read, and graph
 ## Bounded digests instead of raw output
 ## Harnesses without `PreToolUse` hooks
-## Verification
+## Verification (present only when a supported command is detected)
 <!-- /tsift:code-navigation-runbook -->
 ```
 
@@ -440,7 +440,7 @@ tsift summarize --json              # structured output
 tsift summarize
 ├── extract (one-time, per file content hash)
 │   ├── reads source + AST symbols from index.db
-│   ├── calls Anthropic batch API (haiku for cost; non-2xx responses fail closed before content parsing)
+│   ├── resolves one extraction client before the file walk: Claude Code CLI for Bedrock/Vertex/Foundry hosts, direct Anthropic API when its configured key exists, otherwise an authenticated Claude Code CLI fallback
 │   ├── replaces each file's cached rows in one SQLite transaction
 │   └── stores: entities, relationships, summaries → summaries.db
 ├── query (instant, local SQLite)
@@ -478,12 +478,13 @@ CREATE INDEX idx_summaries_hash ON summaries(content_hash);
 ### Extraction Protocol
 
 1. Collect target files (from path arg or `--diff` against `git diff --name-only`; unborn HEAD falls back to untracked files only)
-2. Claim the coarse `summaries.lock` sidecar so only one extractor mutates a cache at a time
-3. For each file, load source + symbols from `index.db`
-4. Build extraction prompt: source snippet + symbol list + "extract entities, relationships, 2-sentence summary"
-5. Submit via Anthropic batch API (haiku-class model, 50% cost vs synchronous)
-6. On batch completion, parse responses and insert/update `summaries.db`
-7. Report: files processed, entities found, tokens spent, estimated savings
+2. Claim the coarse `summaries.lock` sidecar so only one extractor mutates a cache at a time, then classify files by content hash and remove stale rows. Fully cached runs require no model credentials.
+3. If at least one cache miss needs extraction, resolve the transport once before the extraction walk. Prefer `claude -p` when a Claude Code hosted-provider flag is active; otherwise use the configured direct Anthropic API key when present, then fall back to an executable, authenticated `claude` on `PATH`. If neither is usable, exit nonzero with one actionable credential error and no per-file duplicates.
+4. For each cache miss, load source + symbols from `index.db`
+5. Build extraction prompt: source snippet + symbol list + "extract entities, relationships, 2-sentence summary"
+6. Submit through the resolved client. Claude Code runs non-interactively with the configured model, no tools, safe mode, and no session persistence so it inherits direct, Bedrock, Vertex, or Foundry authentication without loading project automation. Direct API responses still fail closed on non-2xx status before content parsing.
+7. Parse each response and insert/update `summaries.db`
+8. Report: files processed, entities found, tokens spent when the transport exposes usage, and estimated savings
 
 ### Token Savings Model
 
@@ -495,7 +496,7 @@ With summarize: loading the cached summary costs ~50-100 tokens. Savings compoun
 ### Boundary Rule
 
 `tsift summarize` owns cached, pre-computed analysis that's deterministic after extraction. It does NOT:
-- Run live LLM calls at query time (extraction is batch-only)
+- Run live LLM calls at query time (only explicit extraction invokes a model)
 - Generate new analysis on cache miss (returns "not extracted" + suggests `--extract`)
 - Own visualization or graph rendering (leave to graphify)
 

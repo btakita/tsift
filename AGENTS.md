@@ -11,7 +11,7 @@ The **primary agent-facing instructions live in the tsift skill**, [`.claude/ski
 - **Standalone checkout** (no superproject skill present): use `tsift --help` / subcommand `--help` plus `SPEC.md`/`VERSIONS.md` as the source of truth.
 - **Develop:** `make check` (clippy + full suite) then `cargo install --path .`.
 
-The Code Navigation block below is managed by `tsift init` (versioned markers) — do not hand-edit it; re-run `tsift init` to refresh. It is a router: the command detail it defers to lives in [`runbooks/code-navigation.md`](runbooks/code-navigation.md), generated and versioned by the same command. `CLAUDE.md` is `@AGENTS.md` and deliberately carries no copy of either.
+The Code Navigation block below is managed by `tsift init` (versioned markers) — do not hand-edit it; re-run `tsift init` to refresh. It is a router: the command detail it defers to lives in [`.agent/runbooks/code-navigation.md`](.agent/runbooks/code-navigation.md), generated and versioned by the same command. `CLAUDE.md` is `@AGENTS.md` and deliberately carries no copy of either.
 
 <!-- tsift:code-navigation v=0.1.80 -->
 ## Code Navigation
@@ -26,9 +26,9 @@ Prefer tsift envelopes over raw reads:
 - `tsift --envelope session-review <path>` / `tsift --envelope context-pack <path>` instead of replaying long session docs, transcripts, or runtime logs
 - `tsift --envelope digest-runner --kind test|log --path . --shell-command '<command>'` instead of raw test/build output
 
-Command detail lives in [`runbooks/code-navigation.md`](runbooks/code-navigation.md) — budgets, `tsift workflow search`, `report.scale_guard` handling, the harness rewrite path for `PreToolUse`-less harnesses, and Codex/OpenCode integration. `tsift init` writes and versions that runbook alongside this block, so it is present in every initialized checkout; read it before broad exploration instead of expanding this block. A repository that also ships a current `.claude/skills/tsift/SKILL.md` should use that skill as the deeper source.
+Command detail lives in [`.agent/runbooks/code-navigation.md`](.agent/runbooks/code-navigation.md) — budgets, `tsift workflow search`, `report.scale_guard` handling, the harness rewrite path for `PreToolUse`-less harnesses, and Codex/OpenCode integration. `tsift init` writes and versions that runbook alongside this block, so it is present in every initialized checkout; read it before broad exploration instead of expanding this block. A repository that also ships a current `.claude/skills/tsift/SKILL.md` should use that skill as the deeper source.
 
-For local verification, run `make check` before committing. After local changes, check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1` and fix any failing tests before calling the work complete.
+For local verification, run `make check` before committing. After local changes, check the latest GitHub Actions CI run with `gh run list --limit 1` and fix any failing tests before calling the work complete.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->

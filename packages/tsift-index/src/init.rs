@@ -11,10 +11,12 @@ const SECTION_MARKER_PREFIX: &str = "<!-- tsift:code-navigation ";
 const SECTION_END_MARKER: &str = "<!-- /tsift:code-navigation -->";
 const RUNBOOK_MARKER_PREFIX: &str = "<!-- tsift:code-navigation-runbook ";
 const RUNBOOK_END_MARKER: &str = "<!-- /tsift:code-navigation-runbook -->";
-pub const RUNBOOK_RELATIVE_PATH: &str = "runbooks/code-navigation.md";
+pub const RUNBOOK_RELATIVE_PATH: &str = ".agent/runbooks/code-navigation.md";
+const LEGACY_RUNBOOK_RELATIVE_PATH: &str = "runbooks/code-navigation.md";
 pub const TSIFT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn versioned_section() -> String {
+fn versioned_section(dir: &Path) -> String {
+    let verification = verification_paragraph(dir);
     format!(
         r#"<!-- tsift:code-navigation v={version} -->
 ## Code Navigation
@@ -31,16 +33,17 @@ Prefer tsift envelopes over raw reads:
 
 Command detail lives in [`{runbook}`]({runbook}) — budgets, `tsift workflow search`, `report.scale_guard` handling, the harness rewrite path for `PreToolUse`-less harnesses, and Codex/OpenCode integration. `tsift init` writes and versions that runbook alongside this block, so it is present in every initialized checkout; read it before broad exploration instead of expanding this block. A repository that also ships a current `.claude/skills/tsift/SKILL.md` should use that skill as the deeper source.
 
-For local verification, run `make check` before committing. After local changes, check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1` and fix any failing tests before calling the work complete.
-
+{verification}
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation -->"#,
         version = TSIFT_VERSION,
-        runbook = RUNBOOK_RELATIVE_PATH
+        runbook = RUNBOOK_RELATIVE_PATH,
+        verification = verification,
     )
 }
 
-fn versioned_runbook_section() -> String {
+fn versioned_runbook_section(dir: &Path) -> String {
+    let verification = verification_runbook_section(dir);
     format!(
         r#"<!-- tsift:code-navigation-runbook v={version} -->
 # Code Navigation
@@ -82,14 +85,116 @@ Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
 
 Codex, OpenCode, and other harnesses without Claude-style `PreToolUse` hooks should run `tsift rewrite --run '<command>'` before broad `rg`/recursive grep, raw transcript/session/log reads, `git diff`/`git show`/single-patch `git log`, `cargo test`/`pytest`, and cargo build/check/clippy/install commands so the same search, session-digest, diff-digest, and digest-runner rewrites apply manually. OpenCode can install this path as `/tsift-rewrite-run` with `tsift init --opencode`.
 
-## Verification
-
-For local verification, run `make check` before committing. After local changes, check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1` and fix any failing tests before calling the work complete.
-
+{verification}
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation-runbook -->"#,
-        version = TSIFT_VERSION
+        version = TSIFT_VERSION,
+        verification = verification,
     )
+}
+
+fn verification_paragraph(dir: &Path) -> String {
+    verification_guidance(dir)
+        .map(|guidance| format!("{guidance}\n"))
+        .unwrap_or_default()
+}
+
+fn verification_runbook_section(dir: &Path) -> String {
+    verification_guidance(dir)
+        .map(|guidance| format!("## Verification\n\n{guidance}\n"))
+        .unwrap_or_default()
+}
+
+fn verification_guidance(dir: &Path) -> Option<String> {
+    verification_guidance_with(dir, command_on_path)
+}
+
+fn verification_guidance_with(dir: &Path, command_exists: impl Fn(&str) -> bool) -> Option<String> {
+    let local = if has_make_check_target(dir) {
+        Some("For local verification, run `make check` before committing.".to_string())
+    } else {
+        detected_just_recipe(dir)
+            .map(|recipe| format!("For local verification, run `just {recipe}` before committing."))
+    };
+
+    let ci = if dir.join(".github/workflows").is_dir() && command_exists("gh") {
+        Some("After local changes, check the latest GitHub Actions CI run with `gh run list --limit 1` and fix any failing tests before calling the work complete.".to_string())
+    } else if dir.join(".gitlab-ci.yml").is_file() && command_exists("glab") {
+        Some("After local changes, check the latest GitLab CI pipeline with `glab ci status` and fix any failing tests before calling the work complete.".to_string())
+    } else {
+        None
+    };
+
+    match (local, ci) {
+        (Some(local), Some(ci)) => Some(format!("{local} {ci}")),
+        (Some(local), None) => Some(local),
+        (None, Some(ci)) => Some(ci),
+        (None, None) => None,
+    }
+}
+
+fn has_make_check_target(dir: &Path) -> bool {
+    ["GNUmakefile", "Makefile", "makefile"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|content| recipe_exists(&content, "check"))
+}
+
+fn detected_just_recipe(dir: &Path) -> Option<&'static str> {
+    let content = ["justfile", "Justfile", ".justfile"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
+        .and_then(|path| std::fs::read_to_string(path).ok())?;
+    ["check", "test", "verify"]
+        .into_iter()
+        .find(|recipe| recipe_exists(&content, recipe))
+}
+
+fn recipe_exists(content: &str, recipe: &str) -> bool {
+    content.lines().any(|line| {
+        if line.chars().next().is_some_and(char::is_whitespace) {
+            return false;
+        }
+        let Some((targets, _)) = line.split_once(':') else {
+            return false;
+        };
+        targets.split_whitespace().any(|target| target == recipe)
+    })
+}
+
+fn command_on_path(command: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| executable_candidate_exists(&dir.join(command)))
+}
+
+fn executable_candidate_exists(candidate: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(candidate)
+            .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    {
+        if candidate.is_file() {
+            return true;
+        }
+        ["exe", "cmd", "bat", "com"]
+            .into_iter()
+            .any(|extension| candidate.with_extension(extension).is_file())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        candidate.is_file()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -252,17 +357,23 @@ pub fn init_with_integrations(
 ) -> Result<InitResult> {
     let gitignore_added = ensure_gitignore(dir)?;
     let mut updates = Vec::new();
+    let runbook_migrated = migrate_legacy_runbook(dir)?;
 
     let agents = dir.join("AGENTS.md");
     updates.push(InstructionUpdate {
         file: agents.clone(),
-        action: ensure_instruction_file(&agents)?,
+        action: ensure_instruction_file(&agents, dir)?,
     });
 
     let runbook = dir.join(RUNBOOK_RELATIVE_PATH);
+    let runbook_action = ensure_runbook_file(&runbook, dir)?;
     updates.push(InstructionUpdate {
         file: runbook.clone(),
-        action: ensure_runbook_file(&runbook)?,
+        action: if runbook_migrated && runbook_action == InitAction::AlreadyPresent {
+            InitAction::Updated
+        } else {
+            runbook_action
+        },
     });
 
     let claude = dir.join("CLAUDE.md");
@@ -272,7 +383,7 @@ pub fn init_with_integrations(
             // would strip the canonical section out of AGENTS.md itself.
             Some(Deference::SameFile) => InitAction::Deferred,
             Some(Deference::Import) => remove_instruction_section(&claude)?,
-            None => ensure_instruction_file(&claude)?,
+            None => ensure_instruction_file(&claude, dir)?,
         };
         updates.push(InstructionUpdate {
             file: claude.clone(),
@@ -309,6 +420,22 @@ pub fn init_with_integrations(
     })
 }
 
+fn migrate_legacy_runbook(dir: &Path) -> Result<bool> {
+    let legacy = dir.join(LEGACY_RUNBOOK_RELATIVE_PATH);
+    let canonical = dir.join(RUNBOOK_RELATIVE_PATH);
+    if !legacy.exists() || canonical.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = canonical.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(&legacy, &canonical)?;
+    if let Some(parent) = legacy.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+    Ok(true)
+}
+
 /// How `CLAUDE.md` defers to `AGENTS.md`, when it does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Deference {
@@ -319,10 +446,8 @@ enum Deference {
 }
 
 fn claude_deference(claude: &Path, agents: &Path) -> Result<Option<Deference>> {
-    if let (Ok(a), Ok(c)) = (
-        std::fs::canonicalize(agents),
-        std::fs::canonicalize(claude),
-    ) && a == c
+    if let (Ok(a), Ok(c)) = (std::fs::canonicalize(agents), std::fs::canonicalize(claude))
+        && a == c
     {
         return Ok(Some(Deference::SameFile));
     }
@@ -372,11 +497,11 @@ fn remove_instruction_section(file: &Path) -> Result<InitAction> {
     Ok(InitAction::Removed)
 }
 
-fn ensure_runbook_file(file: &Path) -> Result<InitAction> {
+fn ensure_runbook_file(file: &Path, dir: &Path) -> Result<InitAction> {
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let section = versioned_runbook_section();
+    let section = versioned_runbook_section(dir);
     if !file.exists() {
         std::fs::write(file, format!("{}\n", section))?;
         return Ok(InitAction::Created);
@@ -411,8 +536,8 @@ fn ensure_runbook_file(file: &Path) -> Result<InitAction> {
     Ok(InitAction::Updated)
 }
 
-fn ensure_instruction_file(file: &Path) -> Result<InitAction> {
-    let section = versioned_section();
+fn ensure_instruction_file(file: &Path, dir: &Path) -> Result<InitAction> {
+    let section = versioned_section(dir);
     if !file.exists() {
         std::fs::write(file, format!("{}\n", section))?;
         return Ok(InitAction::Created);
@@ -969,7 +1094,12 @@ mod tests {
         result
             .updates
             .iter()
-            .find(|u| u.file.to_string_lossy().replace('\\', "/").ends_with(suffix))
+            .find(|u| {
+                u.file
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .ends_with(suffix)
+            })
             .map(|u| u.action)
     }
 
@@ -985,6 +1115,75 @@ mod tests {
         assert!(content.contains(RUNBOOK_RELATIVE_PATH));
         assert!(content.contains("tsift --envelope search"));
         assert!(content.contains("tsift status --fix"));
+        assert!(!content.contains("make check"));
+        assert!(!content.contains("gh run list"));
+    }
+
+    #[test]
+    fn init_migrates_the_legacy_runbook_to_the_canonical_agent_directory() {
+        let dir = TempDir::new().unwrap();
+        let legacy = dir.path().join(LEGACY_RUNBOOK_RELATIVE_PATH);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(
+            &legacy,
+            format!(
+                "# Local preamble\n\n{}v={} -->\nOld generated detail.\n{}\n\nLocal trailer.\n",
+                RUNBOOK_MARKER_PREFIX, TSIFT_VERSION, RUNBOOK_END_MARKER
+            ),
+        )
+        .unwrap();
+
+        let result = init(dir.path(), false, false).unwrap();
+        let canonical = dir.path().join(RUNBOOK_RELATIVE_PATH);
+
+        assert!(!legacy.exists());
+        assert_eq!(
+            action_for(&result, RUNBOOK_RELATIVE_PATH),
+            Some(InitAction::Updated)
+        );
+        let runbook = std::fs::read_to_string(&canonical).unwrap();
+        assert!(runbook.starts_with("# Local preamble"));
+        assert!(runbook.contains("Local trailer."));
+        assert!(!runbook.contains("Old generated detail."));
+        let agents = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(agents.contains(RUNBOOK_RELATIVE_PATH));
+        assert!(!agents.contains("](runbooks/code-navigation.md)"));
+    }
+
+    #[test]
+    fn verification_guidance_uses_only_detected_repo_tools_and_available_ci_clients() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("justfile"), "test:\n\t@cargo test\n").unwrap();
+        std::fs::write(dir.path().join(".gitlab-ci.yml"), "test: {}\n").unwrap();
+
+        let without_glab = verification_guidance_with(dir.path(), |_| false).unwrap();
+        assert_eq!(
+            without_glab,
+            "For local verification, run `just test` before committing."
+        );
+
+        let with_glab = verification_guidance_with(dir.path(), |command| command == "glab")
+            .expect("just + GitLab guidance");
+        assert!(with_glab.contains("just test"));
+        assert!(with_glab.contains("glab ci status"));
+        assert!(!with_glab.contains("make check"));
+        assert!(!with_glab.contains("gh run list"));
+    }
+
+    #[test]
+    fn verification_guidance_detects_make_check_and_github_actions() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("Makefile"),
+            ".PHONY: check\ncheck:\n\tcargo test\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+
+        let guidance = verification_guidance_with(dir.path(), |command| command == "gh")
+            .expect("make + GitHub guidance");
+        assert!(guidance.contains("make check"));
+        assert!(guidance.contains("gh run list --limit 1"));
     }
 
     #[test]
@@ -1063,14 +1262,14 @@ mod tests {
         ));
 
         // The generated pair round-trips: each marker resolves to its own version.
-        let block = versioned_section();
+        let block = versioned_section(dir.path());
         assert_eq!(
             extract_instruction_version(&block),
             Some(TSIFT_VERSION.to_string())
         );
         assert_eq!(extract_runbook_version(&block), None);
         assert_eq!(
-            extract_runbook_version(&versioned_runbook_section()),
+            extract_runbook_version(&versioned_runbook_section(dir.path())),
             Some(TSIFT_VERSION.to_string())
         );
     }

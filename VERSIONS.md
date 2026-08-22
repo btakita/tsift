@@ -8,6 +8,23 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **Summarize now inherits Claude Code's hosted-provider authentication.**
+  When a cache miss needs extraction, the command resolves one client before
+  the extraction walk: Bedrock, Vertex, and Foundry hosts use a non-interactive,
+  tool-disabled `claude -p`; direct API-key users keep the existing Anthropic
+  transport; and API-key-less users fall back to an authenticated `claude` found
+  on `PATH`. If neither is available, the command exits nonzero once with an
+  actionable error instead of reporting the same missing key for every file and
+  then printing a successful completion shape. Fully cached runs remain local.
+
+- **`tsift init` now agrees with instruction-files on the generated runbook
+  location and emits only verification commands it can prove.** The canonical
+  path is `.agent/runbooks/code-navigation.md`; init migrates the legacy
+  `runbooks/code-navigation.md` in place when needed, preserving text outside
+  the managed markers. `make check`, a `just` recipe, `gh`, and `glab` guidance
+  is now selected from repository files plus executable availability, and is
+  omitted when the corresponding toolchain is absent.
+
 - **The crates.io publish job now says how many crates it actually uploaded.** A
   crate already on the registry is skipped, so a release published by hand before
   the tag was pushed made the whole job a no-op that still reported success —

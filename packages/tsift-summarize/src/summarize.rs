@@ -8,6 +8,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::time::Duration;
 use tsift_index::index::IndexDb;
@@ -146,6 +147,16 @@ pub struct SummarizeConfig {
     pub api_key_env: String,
 }
 
+pub struct ExtractionClient {
+    model: String,
+    backend: ExtractionBackend,
+}
+
+enum ExtractionBackend {
+    AnthropicApi { api_key: String },
+    ClaudeCli { command: PathBuf },
+}
+
 const REPLACE_FILE_SAVEPOINT: &str = "tsift_summary_replace";
 
 #[derive(Debug)]
@@ -188,6 +199,133 @@ impl Default for SummarizeConfig {
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
         }
     }
+}
+
+impl ExtractionClient {
+    pub fn resolve(config: &SummarizeConfig) -> Result<Self> {
+        let api_key = std::env::var(&config.api_key_env)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let claude_command = find_command_on_path("claude");
+        let prefer_claude = [
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        ]
+        .into_iter()
+        .any(env_flag_enabled);
+        let backend = select_extraction_backend(api_key, claude_command, prefer_claude)
+            .with_context(|| {
+                format!(
+                    "tsift summarize --extract: no LLM credentials found. Set {}, or install and authenticate Claude Code so `claude -p` can use the host's direct, Bedrock, Vertex, or Foundry credentials",
+                    config.api_key_env
+                )
+            })?;
+        if let ExtractionBackend::ClaudeCli { command } = &backend {
+            ensure_claude_cli_authenticated(command).with_context(|| {
+                format!(
+                    "tsift summarize --extract: Claude Code CLI at {} is not a usable extraction backend; run `claude auth login` or configure the selected hosted provider",
+                    command.display()
+                )
+            })?;
+        }
+        Ok(Self {
+            model: config.model.clone(),
+            backend,
+        })
+    }
+
+    fn complete(&self, prompt: &str) -> Result<(String, i64, i64)> {
+        match &self.backend {
+            ExtractionBackend::AnthropicApi { api_key } => {
+                call_anthropic_api(api_key, &self.model, prompt)
+            }
+            ExtractionBackend::ClaudeCli { command } => {
+                call_claude_cli(command, &self.model, prompt)
+            }
+        }
+    }
+}
+
+fn select_extraction_backend(
+    api_key: Option<String>,
+    claude_command: Option<PathBuf>,
+    prefer_claude: bool,
+) -> Result<ExtractionBackend> {
+    if prefer_claude && let Some(command) = claude_command.as_ref() {
+        return Ok(ExtractionBackend::ClaudeCli {
+            command: command.clone(),
+        });
+    }
+    if let Some(api_key) = api_key {
+        return Ok(ExtractionBackend::AnthropicApi { api_key });
+    }
+    if let Some(command) = claude_command {
+        return Ok(ExtractionBackend::ClaudeCli { command });
+    }
+    bail!("no Anthropic API key or authenticated Claude Code CLI is available")
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn find_command_on_path(command: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(command))
+        .find_map(|candidate| executable_candidate(&candidate))
+}
+
+fn executable_candidate(candidate: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(candidate)
+            .ok()
+            .filter(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            .map(|_| candidate.to_path_buf())
+    }
+
+    #[cfg(windows)]
+    {
+        if candidate.is_file() {
+            return Some(candidate.to_path_buf());
+        }
+        ["exe", "cmd", "bat", "com"]
+            .into_iter()
+            .map(|extension| candidate.with_extension(extension))
+            .find(|path| path.is_file())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        candidate.is_file().then(|| candidate.to_path_buf())
+    }
+}
+
+fn ensure_claude_cli_authenticated(command: &Path) -> Result<()> {
+    let output = Command::new(command)
+        .args(["auth", "status"])
+        .output()
+        .with_context(|| format!("running `{} auth status`", command.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!(
+        "`{} auth status` failed with {}: {}",
+        command.display(),
+        output.status,
+        stderr.trim()
+    )
 }
 
 pub fn acquire_write_lock(db_path: &Path) -> Result<SummaryWriteLockGuard> {
@@ -794,6 +932,23 @@ pub fn extract_for_file(
     symbols_source_root: Option<&Path>,
     config: &SummarizeConfig,
 ) -> Result<Vec<Summary>> {
+    let client = ExtractionClient::resolve(config)?;
+    extract_for_file_with_client(
+        file_path,
+        symbols_db_path,
+        symbols_source_root,
+        config,
+        &client,
+    )
+}
+
+pub fn extract_for_file_with_client(
+    file_path: &Path,
+    symbols_db_path: Option<&Path>,
+    symbols_source_root: Option<&Path>,
+    config: &SummarizeConfig,
+    client: &ExtractionClient,
+) -> Result<Vec<Summary>> {
     let source = std::fs::read_to_string(file_path)
         .with_context(|| format!("reading {}", file_path.display()))?;
 
@@ -816,17 +971,9 @@ pub fn extract_for_file(
         Vec::new()
     };
 
-    let api_key = std::env::var(&config.api_key_env).with_context(|| {
-        format!(
-            "missing API key: set {} environment variable",
-            config.api_key_env
-        )
-    })?;
-
     let prompt = build_extraction_prompt(&file_str, &source, &symbols);
 
-    let (response_text, tokens_in, tokens_out) =
-        call_anthropic_api(&api_key, &config.model, &prompt)?;
+    let (response_text, tokens_in, tokens_out) = client.complete(&prompt)?;
 
     let parsed: ExtractionResponse = serde_json::from_str(&response_text)
         .with_context(|| format!("parsing extraction response for {}", file_path.display()))?;
@@ -1024,19 +1171,20 @@ fn parse_anthropic_api_response(
         bail!("empty response from Anthropic API");
     }
 
-    // Strip markdown code fences if the model wrapped the response
+    Ok((
+        strip_markdown_fences(&content).to_string(),
+        tokens_in,
+        tokens_out,
+    ))
+}
+
+fn strip_markdown_fences(content: &str) -> &str {
     let cleaned = content
         .trim()
         .strip_prefix("```json")
         .or_else(|| content.trim().strip_prefix("```"))
         .unwrap_or(content.trim());
-    let cleaned = cleaned
-        .strip_suffix("```")
-        .unwrap_or(cleaned)
-        .trim()
-        .to_string();
-
-    Ok((cleaned, tokens_in, tokens_out))
+    cleaned.strip_suffix("```").unwrap_or(cleaned).trim()
 }
 
 fn call_anthropic_api(api_key: &str, model: &str, prompt: &str) -> Result<(String, i64, i64)> {
@@ -1072,6 +1220,48 @@ fn call_anthropic_api(api_key: &str, model: &str, prompt: &str) -> Result<(Strin
         .with_context(|| format!("parsing Anthropic API response JSON (HTTP {})", status))?;
 
     parse_anthropic_api_response(status.as_u16(), response_json)
+}
+
+fn call_claude_cli(command: &Path, model: &str, prompt: &str) -> Result<(String, i64, i64)> {
+    let mut child = Command::new(command)
+        .arg("-p")
+        .arg("--model")
+        .arg(model)
+        .arg("--safe-mode")
+        .arg("--tools")
+        .arg("")
+        .arg("--no-session-persistence")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting Claude Code CLI at {}", command.display()))?;
+
+    child
+        .stdin
+        .take()
+        .context("opening Claude Code CLI stdin")?
+        .write_all(prompt.as_bytes())
+        .context("writing extraction prompt to Claude Code CLI")?;
+    let output = child
+        .wait_with_output()
+        .context("waiting for Claude Code CLI extraction")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "Claude Code CLI extraction failed with {}: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    let response = String::from_utf8(output.stdout)
+        .context("Claude Code CLI extraction returned non-UTF-8 output")?;
+    let response = strip_markdown_fences(response.trim());
+    if response.is_empty() {
+        bail!("Claude Code CLI extraction returned an empty response");
+    }
+    Ok((response.to_string(), 0, 0))
 }
 
 fn maybe_mock_anthropic_api(prompt: &str) -> Result<Option<(String, i64, i64)>> {
@@ -1807,6 +1997,7 @@ mod tests {
         std::fs::write(&big_file, "x".repeat(100_000)).unwrap();
         let config = SummarizeConfig {
             max_file_tokens: 8000,
+            api_key_env: "PATH".to_string(),
             ..Default::default()
         };
         let result = extract_for_file(&big_file, None, None, &config);
@@ -1820,17 +2011,41 @@ mod tests {
     }
 
     #[test]
-    fn extract_requires_api_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("small.rs");
-        std::fs::write(&file, "fn main() {}").unwrap();
-        let config = SummarizeConfig {
-            api_key_env: "TSIFT_TEST_NONEXISTENT_KEY".to_string(),
-            ..Default::default()
-        };
-        let result = extract_for_file(&file, None, None, &config);
+    fn extraction_backend_requires_an_api_key_or_claude_cli() {
+        let result = select_extraction_backend(None, None, false);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("missing API key"));
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("missing credentials unexpectedly resolved a backend"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("no Anthropic API key or authenticated Claude Code CLI")
+        );
+    }
+
+    #[test]
+    fn hosted_claude_provider_prefers_the_cli_over_a_direct_api_key() {
+        let command = PathBuf::from("/mock/claude");
+        let backend =
+            select_extraction_backend(Some("direct-key".to_string()), Some(command.clone()), true)
+                .unwrap();
+        assert!(matches!(
+            backend,
+            ExtractionBackend::ClaudeCli { command: selected } if selected == command
+        ));
+    }
+
+    #[test]
+    fn direct_api_key_stays_preferred_without_a_hosted_claude_provider() {
+        let backend = select_extraction_backend(
+            Some("direct-key".to_string()),
+            Some(PathBuf::from("/mock/claude")),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(backend, ExtractionBackend::AnthropicApi { .. }));
     }
 
     #[test]

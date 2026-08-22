@@ -40,7 +40,7 @@ Codex, OpenCode, and other harnesses without Claude-style `PreToolUse` hooks sho
 
 ## Verification
 
-For local verification, run `make check` before committing. After local changes, check the latest GitHub Actions CI run with `gh run list --workflow CI --limit 1` and fix any failing tests before calling the work complete.
+For local verification, run `make check` before committing. After local changes, check the latest GitHub Actions CI run with `gh run list --limit 1` and fix any failing tests before calling the work complete.
 
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation-runbook -->
