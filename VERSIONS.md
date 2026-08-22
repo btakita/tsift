@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.81
+
 - **Summarize now inherits Claude Code's hosted-provider authentication.**
   When a cache miss needs extraction, the command resolves one client before
   the extraction walk: Bedrock, Vertex, and Foundry hosts use a non-interactive,
@@ -31,8 +33,14 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
   which is how a single missing trusted publisher (`tsift-astgrep`, the one crate
   of 26 that was never registered) went unnoticed across many releases and only
   surfaced when v0.1.80 became the first release that gave the job real work. The
-  loop now counts uploads and skips, prints `published=N skipped=M`, and annotates
-  a run where it uploaded nothing as proving nothing about trusted publishing.
+loop now counts uploads and skips, prints `published=N skipped=M`, and annotates
+a run where it uploaded nothing as proving nothing about trusted publishing.
+
+- **The workspace remains clean under the current Rust clippy lint set.**
+Semantic-vector blobs now decode through fixed-width byte arrays instead of
+`chunks_exact`, preserving the same validation while satisfying the new
+`chunks_exact_to_as_chunks` deny-by-default release gate. Direct regression
+coverage locks round trips plus wrong-dimension, empty, and non-finite rejection.
 
 ## 0.1.80
 

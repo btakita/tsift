@@ -13,7 +13,7 @@ The **primary agent-facing instructions live in the tsift skill**, [`.claude/ski
 
 The Code Navigation block below is managed by `tsift init` (versioned markers) — do not hand-edit it; re-run `tsift init` to refresh. It is a router: the command detail it defers to lives in [`.agent/runbooks/code-navigation.md`](.agent/runbooks/code-navigation.md), generated and versioned by the same command. `CLAUDE.md` is `@AGENTS.md` and deliberately carries no copy of either.
 
-<!-- tsift:code-navigation v=0.1.80 -->
+<!-- tsift:code-navigation v=0.1.81 -->
 ## Code Navigation
 
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead.

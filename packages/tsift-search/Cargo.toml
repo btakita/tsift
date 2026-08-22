@@ -1,6 +1,6 @@
 [package]
 name = "tsift-search"
-version = "0.1.80"
+version = "0.1.81"
 edition = "2024"
 description = "Search + impact surfaces for tsift — lexical search adapter, impact analysis, and tagpath annotation"
 license = "MIT"
@@ -17,11 +17,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ignore = "0.4"
 tagpath = { version = "0.11.1", default-features = false, features = ["lang-rust", "lang-python", "lang-javascript", "lang-typescript"] }
-tsift-digest = { path = "../tsift-digest", version = "0.1.80" }
-tsift-graph = { path = "../tsift-graph", version = "0.1.80" }
-tsift-index = { path = "../tsift-index", version = "0.1.80" }
-tsift-quality = { path = "../tsift-quality", version = "0.1.80" }
-tsift-summarize = { path = "../tsift-summarize", version = "0.1.80" }
+tsift-digest = { path = "../tsift-digest", version = "0.1.81" }
+tsift-graph = { path = "../tsift-graph", version = "0.1.81" }
+tsift-index = { path = "../tsift-index", version = "0.1.81" }
+tsift-quality = { path = "../tsift-quality", version = "0.1.81" }
+tsift-summarize = { path = "../tsift-summarize", version = "0.1.81" }
 
 [features]
 # Language features gate the per-Lang match arms in `impact::is_import_line`

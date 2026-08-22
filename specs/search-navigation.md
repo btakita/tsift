@@ -255,7 +255,7 @@ On plugin load and on the `installation.updated` lifecycle hook, the plugin runs
 ### Injected Section
 
 ```markdown
-<!-- tsift:code-navigation v=0.1.80 -->
+<!-- tsift:code-navigation v=0.1.81 -->
 ## Code Navigation
 
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead.
@@ -281,7 +281,7 @@ Only read full source files when tsift results are insufficient.
 `.agent/runbooks/code-navigation.md` holds the detail the block defers to, under its own marker pair so the two surfaces version independently of any hand-written text around them:
 
 ```markdown
-<!-- tsift:code-navigation-runbook v=0.1.80 -->
+<!-- tsift:code-navigation-runbook v=0.1.81 -->
 # Code Navigation
 
 Managed by `tsift init` (versioned markers) — do not hand-edit between the markers; re-run `tsift init` to refresh. Text outside the markers is preserved.

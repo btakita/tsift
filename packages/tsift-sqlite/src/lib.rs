@@ -453,8 +453,8 @@ fn semantic_vector_from_blob(blob: &[u8], dimensions: usize) -> Option<Vec<f64>>
         return None;
     }
     let mut vector = Vec::with_capacity(dimensions);
-    for chunk in blob.chunks_exact(std::mem::size_of::<f64>()) {
-        let value = f64::from_le_bytes(chunk.try_into().ok()?);
+    for chunk in blob.as_chunks::<{ std::mem::size_of::<f64>() }>().0 {
+        let value = f64::from_le_bytes(*chunk);
         if !value.is_finite() {
             return None;
         }
@@ -4070,6 +4070,19 @@ fn sqlite_database_freelist_bytes(conn: &Connection) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_vector_blob_round_trips_and_rejects_invalid_payloads() {
+        let vector = [1.0, -2.5];
+        let blob = semantic_vector_to_blob(&vector);
+
+        assert_eq!(semantic_vector_from_blob(&blob, 2), Some(vector.to_vec()));
+        assert_eq!(semantic_vector_from_blob(&blob, 1), None);
+        assert_eq!(semantic_vector_from_blob(&[], 0), None);
+
+        let non_finite_blob = semantic_vector_to_blob(&[f64::NAN]);
+        assert_eq!(semantic_vector_from_blob(&non_finite_blob, 1), None);
+    }
 
     fn sample_provenance() -> GraphProvenance {
         GraphProvenance::new("fixture", "src/lib.rs:1").with_content_hash("hash-1")

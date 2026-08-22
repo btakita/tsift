@@ -1,6 +1,6 @@
 [package]
 name = "tsift-libsql"
-version = "0.1.80"
+version = "0.1.81"
 edition = "2024"
 description = "libSQL graph store backend for tsift"
 license = "MIT"
@@ -18,5 +18,5 @@ libsql = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt"] }
-tsift-core = { path = "../tsift-core", version = "0.1.80" }
+tsift-core = { path = "../tsift-core", version = "0.1.81" }
 tempfile = "3"
