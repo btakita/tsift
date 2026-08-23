@@ -1,4 +1,4 @@
-<!-- tsift:opencode-command v=0.1.81 name=tsift-source-read -->
+<!-- tsift:opencode-command v=0.1.82 name=tsift-source-read -->
 ---
 description: AST-aware source code reading via tsift source-read
 ---

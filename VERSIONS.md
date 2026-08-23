@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.82
+
 - **`tsift status` no longer rewrites version-controlled files.** 0.1.81 made
   status auto-fix by default, and that auto-fix included refreshing the tracked
   Code Navigation block and relocating the legacy runbook — so a bare `status`,
