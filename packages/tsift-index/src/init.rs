@@ -21,7 +21,7 @@ fn versioned_section(dir: &Path) -> String {
         r#"<!-- tsift:code-navigation v={version} -->
 ## Code Navigation
 
-Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead.
+Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. `tsift status` repairs the `.tsift/` index state it owns and never rewrites tracked files (`--no-fix` skips even that). If status reports stale or missing instructions, run `tsift init` to refresh the tracked Code Navigation block and runbook; it names every tracked file it rewrites or moves. When the harness cannot perform write commands, ask the user to run the printed `run:` command instead.
 
 Prefer tsift envelopes over raw reads:
 - `tsift --envelope search <query>` instead of `grep`/`rg`
@@ -54,7 +54,7 @@ This runbook is the detail behind the `Code Navigation` block in `AGENTS.md`. Th
 
 ## Session start
 
-Run `tsift status` from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. If status prints a `run:` recommendation for stale or missing tsift state, run `tsift status --fix` before relying on tsift results; when the harness cannot perform write commands, ask the user to run the printed command instead.
+Run `tsift status` from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. `tsift status` repairs the `.tsift/` index state it owns and never rewrites tracked files (`--no-fix` skips even that). If status reports stale or missing instructions, run `tsift init` to refresh the tracked Code Navigation block and runbook; it names every tracked file it rewrites or moves. When the harness cannot perform write commands, ask the user to run the printed `run:` command instead.
 
 Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`; OpenCode projects can install per-project tsift command shortcuts with `tsift init --opencode`.
 
@@ -219,10 +219,26 @@ const OPENCODE_COMMAND_MARKER_PREFIX: &str = "<!-- tsift:opencode-command";
 
 pub struct InitResult {
     pub updates: Vec<InstructionUpdate>,
+    /// The legacy runbook path this run relocated, when a migration happened.
+    /// Reported so a tracked-file move is never a silent diff.
+    pub migrated_runbook: Option<RunbookMigration>,
     pub gitignore_added: bool,
     pub codex_hooks: Option<CodexHooksResult>,
     pub opencode_commands: Option<Vec<OpenCodeCommandUpdate>>,
 }
+
+/// A one-time relocation of the managed code-navigation runbook. Both paths are
+/// relative to the initialized project root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunbookMigration {
+    pub from: &'static str,
+    pub to: &'static str,
+}
+
+/// Flags tsift has deprecated but that must never appear in generated
+/// instruction surfaces. A release that deprecates a flag adds it here, and the
+/// template gate below fails until the templates stop teaching it.
+pub const DEPRECATED_FLAG_USAGES: &[&str] = &["tsift status --fix"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CodexHooksResult {
@@ -369,7 +385,7 @@ pub fn init_with_integrations(
     let runbook_action = ensure_runbook_file(&runbook, dir)?;
     updates.push(InstructionUpdate {
         file: runbook.clone(),
-        action: if runbook_migrated && runbook_action == InitAction::AlreadyPresent {
+        action: if runbook_migrated.is_some() && runbook_action == InitAction::AlreadyPresent {
             InitAction::Updated
         } else {
             runbook_action
@@ -414,17 +430,18 @@ pub fn init_with_integrations(
 
     Ok(InitResult {
         updates,
+        migrated_runbook: runbook_migrated,
         gitignore_added,
         codex_hooks,
         opencode_commands,
     })
 }
 
-fn migrate_legacy_runbook(dir: &Path) -> Result<bool> {
+fn migrate_legacy_runbook(dir: &Path) -> Result<Option<RunbookMigration>> {
     let legacy = dir.join(LEGACY_RUNBOOK_RELATIVE_PATH);
     let canonical = dir.join(RUNBOOK_RELATIVE_PATH);
     if !legacy.exists() || canonical.exists() {
-        return Ok(false);
+        return Ok(None);
     }
     if let Some(parent) = canonical.parent() {
         std::fs::create_dir_all(parent)?;
@@ -433,7 +450,10 @@ fn migrate_legacy_runbook(dir: &Path) -> Result<bool> {
     if let Some(parent) = legacy.parent() {
         let _ = std::fs::remove_dir(parent);
     }
-    Ok(true)
+    Ok(Some(RunbookMigration {
+        from: LEGACY_RUNBOOK_RELATIVE_PATH,
+        to: RUNBOOK_RELATIVE_PATH,
+    }))
 }
 
 /// How `CLAUDE.md` defers to `AGENTS.md`, when it does.
@@ -879,7 +899,7 @@ const OPENCODE_COMMANDS: &[OpenCodeCommandSpec] = &[
     OpenCodeCommandSpec {
         name: "tsift-status",
         description: "Refresh and summarize tsift index status",
-        body: r#"Run `tsift status --fix` from the project root, then summarize index freshness, instruction freshness, summary-cache state, and any recommended `use:` or `run:` commands. Stop and report the exact failure if the command fails."#,
+        body: r#"Run `tsift status` from the project root, then summarize index freshness, instruction freshness, summary-cache state, and any recommended `use:` or `run:` commands. Stop and report the exact failure if the command fails."#,
     },
     OpenCodeCommandSpec {
         name: "tsift-session-review",
@@ -1114,7 +1134,7 @@ mod tests {
         assert!(content.contains(SECTION_MARKER_PREFIX));
         assert!(content.contains(RUNBOOK_RELATIVE_PATH));
         assert!(content.contains("tsift --envelope search"));
-        assert!(content.contains("tsift status --fix"));
+        assert!(content.contains("`tsift init` to refresh the tracked Code Navigation block"));
         assert!(!content.contains("make check"));
         assert!(!content.contains("gh run list"));
     }
@@ -1148,6 +1168,51 @@ mod tests {
         let agents = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
         assert!(agents.contains(RUNBOOK_RELATIVE_PATH));
         assert!(!agents.contains("](runbooks/code-navigation.md)"));
+        assert_eq!(
+            result.migrated_runbook,
+            Some(RunbookMigration {
+                from: LEGACY_RUNBOOK_RELATIVE_PATH,
+                to: RUNBOOK_RELATIVE_PATH,
+            }),
+            "the tracked-file move must be reportable, not silent"
+        );
+    }
+
+    #[test]
+    fn init_reports_no_runbook_migration_when_there_is_nothing_to_move() {
+        let dir = TempDir::new().unwrap();
+        let result = init(dir.path(), false, false).unwrap();
+        assert_eq!(result.migrated_runbook, None);
+
+        let again = init(dir.path(), false, false).unwrap();
+        assert_eq!(again.migrated_runbook, None);
+    }
+
+    #[test]
+    fn generated_instruction_surfaces_never_teach_a_deprecated_flag() {
+        let dir = TempDir::new().unwrap();
+        let mut surfaces = vec![
+            ("AGENTS.md block".to_string(), versioned_section(dir.path())),
+            (
+                "code-navigation runbook".to_string(),
+                versioned_runbook_section(dir.path()),
+            ),
+        ];
+        for command in OPENCODE_COMMANDS {
+            surfaces.push((
+                format!("opencode command {}", command.name),
+                command.body.to_string(),
+            ));
+        }
+
+        for (label, body) in surfaces {
+            for deprecated in DEPRECATED_FLAG_USAGES {
+                assert!(
+                    !body.contains(deprecated),
+                    "{label} still instructs the deprecated `{deprecated}`"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1973,7 +2038,7 @@ mod tests {
             std::fs::read_to_string(dir.path().join(".opencode/commands/tsift-status.md")).unwrap();
         assert!(status.contains(OPENCODE_COMMAND_MARKER_PREFIX));
         assert!(status.contains("description: Refresh and summarize tsift index status"));
-        assert!(status.contains("tsift status --fix"));
+        assert!(status.contains("Run `tsift status` from the project root"));
 
         let session_review = std::fs::read_to_string(
             dir.path()

@@ -57,7 +57,7 @@ export const TsiftOpenCodePlugin = async (ctx = {}) => {
     if (state !== "stale" && state !== "missing") return;
 
     try {
-      await execFileAsync(tsiftBin, ["status", "--fix", projectDir], { timeout: 120000 });
+      await execFileAsync(tsiftBin, ["status", projectDir], { timeout: 120000 });
       await log({
         body: {
           service: "opencode-tsift",

@@ -27,8 +27,8 @@ crates.io with `cargo install tsift`.
 ## Quick Start
 
 ```sh
-tsift status --fix
 tsift init --opencode
+tsift status
 tsift --envelope search "route dispatch" --budget normal
 tsift --envelope source-read src/main.rs --start 1 --lines 120 --budget normal
 tsift --envelope symbol-read main --file src/main.rs --budget normal
@@ -53,8 +53,9 @@ tsift convex-sync . --chunk-size 100 --json
 ```
 
 For agent-doc projects, run `tsift status` from the repository root at session
-start. If `status` recommends a fix, run `tsift status --fix` before depending
-on search or digest output. OpenCode users can run `tsift init --opencode` to
+start. It repairs its own `.tsift/` index state and never rewrites tracked
+files; if it reports stale or missing instructions, run `tsift init`, which
+names every tracked file it rewrites or moves. OpenCode users can run `tsift init --opencode` to
 install project-local `.opencode/commands/tsift-*.md` shortcuts for status,
 session-review, context-pack, diff-digest, test-digest, log-digest, and
 rewrite-run workflows; existing same-name command files without tsift ownership

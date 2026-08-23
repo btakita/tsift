@@ -8,6 +8,33 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **`tsift status` no longer rewrites version-controlled files.** 0.1.81 made
+  status auto-fix by default, and that auto-fix included refreshing the tracked
+  Code Navigation block and relocating the legacy runbook — so a bare `status`,
+  a command whose help says "Report index + summary status", produced an
+  unrequested two-file diff (one of them a deletion) in a dirty tree. Auto-fix
+  now covers only the gitignored `.tsift/` state tsift owns: index refresh,
+  workspace-scope rebuilds, and cycle-packet cache eviction. Tracked-file
+  rewrites moved into the explicit forms `tsift init` and the new
+  `tsift status --fix-instructions`. When instructions are stale, bare `status`
+  reports them and recommends `tsift init` instead of writing.
+- **Instruction refreshes name every tracked path they touch**, one line per
+  file — `status fix: rewrote AGENTS.md (v0.1.81 -> v0.1.82)`,
+  `status fix: moved runbooks/code-navigation.md -> .agent/runbooks/code-navigation.md`.
+  `tsift init` prints the same relocation line, so the legacy-runbook move is
+  never a silent `git rm`. `InitResult` carries the migration as
+  `migrated_runbook` rather than a bare bool.
+- The deprecated `status --fix` flag is no longer a no-op: it now means exactly
+  `--fix-instructions`, which is what it did before 0.1.81. `--no-fix` still
+  skips everything.
+- **Deprecated flags are gated out of generated instruction surfaces.**
+  `init::DEPRECATED_FLAG_USAGES` lists them, and a unit test asserts the
+  `AGENTS.md` block, the managed runbook, and every generated OpenCode command
+  body are free of them. The injected block and the `/tsift-status` OpenCode
+  command now say `tsift status`, not the deprecated `tsift status --fix`, and
+  the OpenCode plugin's load-time freshness check runs plain `tsift status` so
+  plugin load cannot dirty a tracked file.
+
 ## 0.1.81
 
 - **Summarize now inherits Claude Code's hosted-provider authentication.**

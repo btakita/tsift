@@ -30,7 +30,8 @@ use crate::{
     append_graph_db_backend_eval_normalized_duration_metric,
     append_graph_db_backend_eval_phase_metrics, append_sqlite_graph_doctor_checks,
     append_tokensave_graph_doctor_checks, apply_edit_plan_atomically, apply_rewrite_output_format,
-    apply_status_fixes, autoindex_missing_workspace_scopes, build_convex_sync_report_with_snapshot,
+    apply_status_fixes, apply_status_instruction_fixes, autoindex_missing_workspace_scopes,
+    build_convex_sync_report_with_snapshot,
     build_edit_plan, classify_task, convex_graph_freshness, convex_rows_from_graph_store,
     dedupe_preserve_order, envelope_metric, execute_query, execute_rewritten_command,
     graph_db_backend_eval_cached_refresh, graph_db_backend_eval_dataset,
@@ -2719,6 +2720,7 @@ fn status_index_needs_auto_fix(report: &status::StatusReport) -> bool {
 pub(crate) struct StatusCommandOptions {
     pub fix: bool,
     pub no_fix: bool,
+    pub fix_instructions: bool,
     pub json_output: bool,
     pub compact: bool,
     pub pretty: bool,
@@ -2729,15 +2731,22 @@ pub(crate) struct StatusCommandOptions {
 pub(crate) fn cmd_status(path: &std::path::Path, options: StatusCommandOptions) -> Result<()> {
     if options.fix {
         eprintln!(
-            "warning: --fix is deprecated; auto-fix is now the default. Use --no-fix to skip."
+            "warning: --fix is deprecated; index auto-fix is the default. Use --fix-instructions to also rewrite tracked instruction files (or run `tsift init`), and --no-fix to skip auto-fix."
         );
     }
     let auto_fix = !options.no_fix;
+    // Tracked-file rewrites stay opt-in: a bare `status` must never leave an
+    // unrequested diff in a version-controlled tree.
+    let fix_instructions = auto_fix && (options.fix_instructions || options.fix);
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     let status_cache = status::StatusCheckCache::new();
     let mut report = status::check_status_with_cache(&root, &status_cache)?;
     if status_missing_workspace_scopes(&report) {
         autoindex_missing_workspace_scopes(&root, &report)?;
+        status_cache.invalidate_all();
+        report = status::check_status_with_cache(&root, &status_cache)?;
+    }
+    if fix_instructions && apply_status_instruction_fixes(&root, &report)? {
         status_cache.invalidate_all();
         report = status::check_status_with_cache(&root, &status_cache)?;
     }
@@ -2803,7 +2812,10 @@ pub(crate) fn cmd_init(
     }
     let codex_workspace = codex && (workspace || init::has_submodules(&resolved)?);
     let result = init::init_with_integrations(&resolved, codex, codex_workspace, opencode)?;
-    for update in result.updates {
+    if let Some(migration) = &result.migrated_runbook {
+        println!("{}: moved -> {}", migration.from, migration.to);
+    }
+    for update in &result.updates {
         println!(
             "{}: {} ({})",
             update.file.display(),

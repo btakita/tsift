@@ -997,7 +997,10 @@ pub enum Commands {
         /// Skip automatic index fixes (auto-fix is now the default)
         #[arg(long)]
         no_fix: bool,
-        /// [deprecated] Auto-fix is now the default; use --no-fix to skip
+        /// Also refresh tracked Code Navigation instruction files (same writes as `tsift init`)
+        #[arg(long)]
+        fix_instructions: bool,
+        /// [deprecated] Index auto-fix is the default; this now only adds --fix-instructions
         #[arg(long, hide = true)]
         fix: bool,
         /// Output as JSON

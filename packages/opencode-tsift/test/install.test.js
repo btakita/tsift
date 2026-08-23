@@ -34,7 +34,7 @@ test("installs marker-owned tsift commands", async () => {
       "utf8",
     );
     assert.match(status, /tsift:opencode-command/);
-    assert.match(status, /tsift status --fix/);
+    assert.match(status, /Run `tsift status` from the project root/);
 
     const rewriteRun = await readFile(
       join(project, ".opencode", "commands", "tsift-rewrite-run.md"),

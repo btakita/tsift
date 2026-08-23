@@ -1582,12 +1582,14 @@ pub fn run() -> Result<()> {
             path,
             fix,
             no_fix,
+            fix_instructions,
             json,
         }) => cmd_status(
             &path,
             StatusCommandOptions {
                 fix,
                 no_fix,
+                fix_instructions,
                 json_output: json || terse || schema || envelope,
                 compact,
                 pretty,
@@ -20993,12 +20995,70 @@ fn status_instructions_need_fix(report: &status::StatusReport) -> bool {
     !matches!(report.instructions, init::InstructionStatus::Current { .. })
 }
 
-pub(crate) fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> Result<()> {
-    if status_instructions_need_fix(report) {
-        eprintln!("status fix: refreshing tsift instructions");
-        init::init(root, false, false)?;
+/// Refresh the tracked Code Navigation instruction surface.
+///
+/// This writes version-controlled files (`AGENTS.md`, `CLAUDE.md`, the managed
+/// runbook), so it is never part of bare `tsift status`. Every tracked path it
+/// touches is named on stderr — a move or rewrite must not show up as an
+/// unexplained diff.
+pub(crate) fn apply_status_instruction_fixes(
+    root: &Path,
+    report: &status::StatusReport,
+) -> Result<bool> {
+    if !status_instructions_need_fix(report) {
+        return Ok(false);
     }
+    let (found, expected) = match &report.instructions {
+        init::InstructionStatus::Stale { found, expected } => (found.clone(), expected.clone()),
+        _ => (None, init::TSIFT_VERSION.to_string()),
+    };
+    eprintln!("status fix: refreshing tsift instructions (tracked files)");
+    let result = init::init(root, false, false)?;
+    report_tracked_instruction_writes(root, &result, found.as_deref(), &expected);
+    Ok(true)
+}
 
+/// Name every tracked file an instruction refresh created, rewrote, or moved,
+/// one line per path.
+pub(crate) fn report_tracked_instruction_writes(
+    root: &Path,
+    result: &init::InitResult,
+    found_version: Option<&str>,
+    expected_version: &str,
+) {
+    let relative = |path: &Path| {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    };
+    if let Some(migration) = &result.migrated_runbook {
+        eprintln!(
+            "status fix: moved {} -> {}",
+            migration.from, migration.to
+        );
+    }
+    let version_note = match found_version {
+        Some(found) => format!(" (v{found} -> v{expected_version})"),
+        None => format!(" (v{expected_version})"),
+    };
+    for update in &result.updates {
+        let verb = match update.action {
+            init::InitAction::Created => "created",
+            init::InitAction::Updated => "rewrote",
+            init::InitAction::Removed => "removed duplicate section in",
+            init::InitAction::AlreadyPresent | init::InitAction::Deferred => continue,
+        };
+        eprintln!(
+            "status fix: {verb} {}{version_note}",
+            relative(&update.file)
+        );
+    }
+}
+
+/// Repair the `.tsift/` state tsift owns: the cycle-packet cache and the
+/// index. Nothing here writes a version-controlled file.
+pub(crate) fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> Result<()> {
     let eviction = cycle_packet_cache::cycle_packet_cache_evict(
         root,
         cycle_packet_cache::CYCLE_PACKET_CACHE_DEFAULT_TTL_SECS,
@@ -21021,7 +21081,7 @@ pub(crate) fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> 
         run_index_update(
             &root.join(".tsift/index.db"),
             root,
-            "status --fix refreshing index".to_string(),
+            "status auto-fix refreshing index".to_string(),
             root,
             None,
             false,
@@ -21048,7 +21108,7 @@ pub(crate) fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> 
         run_index_update(
             &cfg.db_path_for(root, &scope.id),
             &scope.source_root,
-            format!("status --fix refreshing submodule `{}` index", scope.id),
+            format!("status auto-fix refreshing submodule `{}` index", scope.id),
             root,
             Some(scope.id.as_str()),
             false,
@@ -28204,6 +28264,7 @@ tier = "private"
             StatusCommandOptions {
                 fix: false,
                 no_fix: false,
+                fix_instructions: false,
                 json_output: true,
                 compact: false,
                 pretty: false,
@@ -28228,6 +28289,7 @@ tier = "private"
             StatusCommandOptions {
                 fix: false,
                 no_fix: false,
+                fix_instructions: false,
                 json_output: true,
                 compact: false,
                 pretty: false,
@@ -28269,6 +28331,7 @@ tier = "private"
             StatusCommandOptions {
                 fix: false,
                 no_fix: false,
+                fix_instructions: false,
                 json_output: true,
                 compact: false,
                 pretty: false,
@@ -28300,6 +28363,7 @@ tier = "private"
             StatusCommandOptions {
                 fix: false,
                 no_fix: false,
+                fix_instructions: false,
                 json_output: true,
                 compact: false,
                 pretty: false,
@@ -28324,6 +28388,7 @@ tier = "private"
             StatusCommandOptions {
                 fix: false,
                 no_fix: false,
+                fix_instructions: false,
                 json_output: true,
                 compact: false,
                 pretty: false,

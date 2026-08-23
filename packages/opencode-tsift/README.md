@@ -47,7 +47,7 @@ shell invocation. The required permissions break down by command:
 
 | Command | Bash execution | File read | File write |
 |---|---|---|---|
-| `/tsift-status` | `tsift status --fix` | `.tsift/`, source tree | `.tsift/`, AGENTS.md, CLAUDE.md |
+| `/tsift-status` | `tsift status` | `.tsift/`, source tree | `.tsift/` |
 | `/tsift-session-review` | `tsift --envelope session-review` | `.tsift/`, agent-doc logs | — |
 | `/tsift-context-pack` | `tsift --envelope context-pack` | `.tsift/`, source files | — |
 | `/tsift-memory-status` | `tsift memory status` | `.tsift/`, `.claude-mem/` fallback import source | — |

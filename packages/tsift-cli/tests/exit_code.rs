@@ -6702,6 +6702,204 @@ fn status_deprecated_fix_flag_shows_warning() {
     );
 }
 
+/// A bare `status` — a read-shaped command — must not leave an unrequested diff
+/// in a version-controlled tree, even while it repairs the index it owns.
+#[test]
+fn status_does_not_rewrite_tracked_instruction_files_by_default() {
+    let dir = indexed_cli_fixture();
+    let stale_block =
+        "<!-- tsift:code-navigation v=0.1.41 -->\n## Code Navigation\nOld guidance.\n<!-- /tsift:code-navigation -->\n";
+    fs::write(dir.path().join("AGENTS.md"), stale_block).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    fs::write(
+        dir.path().join("main.rs"),
+        "fn helper() { println!(\"updated\"); }\nfn main() { helper(); Vec::new(); }\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["status", "--json", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("status fix: refreshing index"),
+        "the index it owns is still auto-fixed; stderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("refreshing tsift instructions"),
+        "bare status must not rewrite tracked files; stderr was: {stderr}"
+    );
+
+    assert_eq!(
+        fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
+        stale_block,
+        "AGENTS.md must be byte-identical after a bare status"
+    );
+    assert!(
+        !dir.path().join(".agent/runbooks/code-navigation.md").exists(),
+        "bare status must not create the managed runbook"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"instructions\":{\"state\":\"stale\""),
+        "stale instructions must still be reported; stdout was: {stdout}"
+    );
+}
+
+#[test]
+fn status_fix_instructions_names_every_tracked_file_it_writes() {
+    let dir = indexed_cli_fixture();
+    fs::write(
+        dir.path().join("AGENTS.md"),
+        "<!-- tsift:code-navigation v=0.1.41 -->\n## Code Navigation\nOld guidance.\n<!-- /tsift:code-navigation -->\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "status",
+            "--fix-instructions",
+            "--json",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("status fix: rewrote AGENTS.md (v0.1.41 -> v"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "status fix: created .agent/runbooks/code-navigation.md (v0.1.41 -> v{})",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "stderr was: {stderr}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"instructions\":{\"state\":\"current\""),
+        "stdout was: {stdout}"
+    );
+}
+
+#[test]
+fn status_fix_instructions_names_the_legacy_runbook_relocation() {
+    let dir = indexed_cli_fixture();
+    fs::write(
+        dir.path().join("AGENTS.md"),
+        "<!-- tsift:code-navigation v=0.1.41 -->\n## Code Navigation\nOld guidance.\n<!-- /tsift:code-navigation -->\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("runbooks")).unwrap();
+    fs::write(
+        dir.path().join("runbooks/code-navigation.md"),
+        "# Code Navigation\n\nHand-written trailer.\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "status",
+            "--fix-instructions",
+            "--json",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "status fix: moved runbooks/code-navigation.md -> .agent/runbooks/code-navigation.md"
+        ),
+        "a tracked deletion must be named, not silent; stderr was: {stderr}"
+    );
+    assert!(!dir.path().join("runbooks/code-navigation.md").exists());
+    let moved =
+        fs::read_to_string(dir.path().join(".agent/runbooks/code-navigation.md")).unwrap();
+    assert!(
+        moved.contains("Hand-written trailer."),
+        "unmanaged text must survive the move; runbook was: {moved}"
+    );
+}
+
+#[test]
+fn init_names_the_legacy_runbook_relocation() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("AGENTS.md"), "# Agents\n").unwrap();
+    fs::create_dir_all(dir.path().join("runbooks")).unwrap();
+    fs::write(
+        dir.path().join("runbooks/code-navigation.md"),
+        "# Code Navigation\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin()
+        .args(["init", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("runbooks/code-navigation.md: moved -> .agent/runbooks/code-navigation.md"),
+        "stdout was: {stdout}"
+    );
+}
+
+/// The instructions tsift writes must not teach a flag tsift deprecated.
+#[test]
+fn generated_code_navigation_block_does_not_recommend_the_deprecated_status_fix_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = tsift_bin()
+        .args(["init", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let agents = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+    let runbook =
+        fs::read_to_string(dir.path().join(".agent/runbooks/code-navigation.md")).unwrap();
+    for surface in [&agents, &runbook] {
+        assert!(
+            !surface.contains("tsift status --fix"),
+            "generated instructions still teach the deprecated flag: {surface}"
+        );
+    }
+    assert!(
+        agents.contains("`tsift init` to refresh the tracked Code Navigation block"),
+        "AGENTS.md was: {agents}"
+    );
+}
+
 #[test]
 fn status_autoindexes_missing_workspace_scopes_even_when_root_index_exists_in_json() {
     let dir = tempfile::tempdir().unwrap();
