@@ -6,7 +6,7 @@ Canonical binary version source: `Cargo.toml` `package.version`. The CLI exposes
 
 Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
-## Unreleased
+## 0.1.83
 
 - **Go is an indexed language, and skipped files are visible** (`#goindex`,
   closes #5). The indexer's language set omitted Go, so in a Go module `search`,

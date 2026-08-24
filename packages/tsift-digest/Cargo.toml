@@ -1,6 +1,6 @@
 [package]
 name = "tsift-digest"
-version = "0.1.82"
+version = "0.1.83"
 edition = "2024"
 description = "Code-aware digest emitters for tsift — diff / log / metric / test digests with shared summary-cache enrichment"
 license = "MIT"
@@ -15,9 +15,9 @@ publish = true
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tsift-graph = { path = "../tsift-graph", version = "0.1.82" }
-tsift-quality = { path = "../tsift-quality", version = "0.1.82" }
-tsift-summarize = { path = "../tsift-summarize", version = "0.1.82" }
+tsift-graph = { path = "../tsift-graph", version = "0.1.83" }
+tsift-quality = { path = "../tsift-quality", version = "0.1.83" }
+tsift-summarize = { path = "../tsift-summarize", version = "0.1.83" }
 
 [dev-dependencies]
 tempfile = "3"
