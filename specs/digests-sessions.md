@@ -18,7 +18,30 @@ Behavior:
 
 1. In default mode, collect tracked changes from `HEAD` plus untracked files and compare `HEAD` to the working tree. With `--cached`, compare the staged index to `HEAD`. With `--revision <rev>`, compare that single revision to its first parent (or to the empty tree for a root commit).
 2. Parse both snapshots directly with tree-sitter when the file language is supported. By default, only the first 25 changed files (in sort order) receive full tree-sitter parsing; remaining files get cheap path-only entries. `--max-parsed-files N` adjusts the cap; `--max-parsed-files 0` disables it.
-3. Emit changed-file status, touched symbols, up to two current cached summary snippets when `summaries.db` matches the compared snapshot, and added/removed call edges.
+3. Emit changed-file status, touched symbols, touched document headings, up to two current cached summary snippets when `summaries.db` matches the compared snapshot, and added/removed call edges.
+
+### Document files are summarized by heading, not by symbol (`#docsym`)
+
+Markdown parses into structural nodes — headings, list items, fenced blocks —
+that are useful for navigation but are not symbols: they have no callers, no
+callees, and no identity a caller can look up by name. Reporting them as
+`touched_symbols` made a docs-only diff claim `40 touched symbols` for one added
+runbook, longer and less informative than `git diff --stat`, with `call edges:
++0 / -0` carrying no signal at all. Worse, in a mixed diff the heading and prose
+entries competed with real symbol churn for the same bounded budget, so the
+changes worth reviewing got crowded out by heading text.
+
+A document file therefore reports `touched_headings` and leaves `touched_symbols`
+empty. Only headings are emitted — list items and fenced-block languages stay out
+of the digest, because a sentence fragment is not a structural summary. The
+report-level `symbols_touched` counts code symbols alone and `headings_touched`
+counts headings, so `9 files changed, 40 touched symbols` can no longer mean a
+README grew some sections. `--compact` carries both as `syms:`/`headings:`.
+
+Generated markdown node names are never clipped silently. `tsift-md-ast` marks a
+clip with an ellipsis, so nothing in a name list is a fragment that reads like a
+name — previously a clipped prose line such as `` `tsift --envelope source-read
+<file> --budget `` was indistinguishable from a real symbol.
 
 `diff-digest` intentionally does not require a fresh `index.db`. It reads the compared snapshots directly so unindexed working-tree edits, staged-only content, and historical commit review all stay bounded without mutating the index. Summary lookups stay read-only and degrade to `missing`, `stale`, or `unavailable` instead of mutating the cache.
 

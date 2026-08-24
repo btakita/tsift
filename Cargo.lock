@@ -5643,6 +5643,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-gdscript",
+ "tree-sitter-go",
  "tree-sitter-javascript",
  "tree-sitter-kotlin-ng",
  "tree-sitter-python",

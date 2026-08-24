@@ -297,6 +297,11 @@ pub enum Commands {
         /// Restrict to a specific submodule
         #[arg(long)]
         scope: Option<String>,
+        /// Resolve the symbol across every federated submodule index and report
+        /// the owning scope. Automatic at a workspace root with no shared root
+        /// index.
+        #[arg(long)]
+        federated: bool,
         /// Max edges per direction (0 = unlimited)
         #[arg(short, long, default_value = "20")]
         limit: usize,
@@ -401,6 +406,11 @@ pub enum Commands {
         /// Restrict to a specific submodule
         #[arg(long)]
         scope: Option<String>,
+        /// Resolve the symbol across every federated submodule index and report
+        /// the owning scope. Automatic at a workspace root with no shared root
+        /// index.
+        #[arg(long)]
+        federated: bool,
         /// Max callers/callees each (0 = unlimited)
         #[arg(short, long, default_value = "15")]
         limit: usize,

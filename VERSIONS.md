@@ -8,6 +8,85 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **Go is an indexed language, and skipped files are visible** (`#goindex`,
+  closes #5). The indexer's language set omitted Go, so in a Go module `search`,
+  `explain`, and `graph` were blind to every Go symbol, `call_edges` stayed
+  empty, and `status` still reported the scope `fresh` — the failure surfaced
+  only as confident empty results, the worst shape for an agent that AGENTS.md
+  tells to prefer `tsift search` over `grep`. Go now has symbol and call
+  queries, an identifier-node-kind set with Go's own selector/field narrowing,
+  and the indexed semantic-edit tier (`rename_symbol` plus
+  `structural_rewrite`), moving it out of the structural-only row. Separately,
+  skips are no longer silent: the walk counts every file it drops for want of an
+  indexer language, `tsift index` reports `skipped: N (unsupported extension)`
+  with a per-extension breakdown, and `status` prints a `language coverage:`
+  block for any scope where the skipped files are a quarter or more of the walk
+  and the dominant skipped extension costs three files or more.
+
+- **Workspace roots federate by default for every search strategy** (`#wsfed`,
+  closes #6). Whether plain `tsift search <query>` worked at a workspace root
+  with scoped indexes depended on the *shape* of the query: an identifier
+  auto-promoted to the `exact` backend federated fine, while anything falling
+  through to `fts`/`lexical` exited 1 demanding `--scope` or `--federated`. Same
+  directory, same command, same flags. Federation there is what the `exact` path
+  already did; `--federated` is now explicit opt-in for the non-workspace case.
+  Auto-federation respects the existing target-resolution precedence, so an
+  explicit `--scope`, an inferred submodule or cargo package, an agent-doc task
+  path, or a shared root index all still win. A workspace whose every scope opts
+  out of federation fails closed saying so, instead of returning empty results.
+
+- **`explain` and `graph` resolve the owning scope at a workspace root**
+  (`#graphfed`, closes #7). Neither had `--federated`, so at a workspace root
+  they could not run unless the caller already knew which scope held the symbol
+  — the thing they were about to ask tsift, and which `search` resolves from the
+  same index set without a flag. Both now take `--federated` and resolve
+  automatically when there is no shared root index: the federated scoped indexes
+  are walked for a definition, falling back to a scope that only calls the
+  symbol, with a deterministic tiebreak. When several scopes match, the command
+  answers from the first and names the others on stderr so the caller narrows in
+  one step; a symbol no scope defines fails with the scopes it searched.
+  `communities` and `path` still require `--scope` — neither has a single symbol
+  to resolve from.
+
+- **`init --workspace` refreshes every scope, and `status` reports instruction
+  drift per scope** (`#wsinit`, closes #8). `status` maintained index state for
+  every scope while `init --workspace` refreshed instruction files only in the
+  superproject, leaving submodules on releases-old text that teaches deprecated
+  flags and a runbook path 0.1.81 migrated away from. Because `status` collapsed
+  every scope into one `instructions:` line, that drift was invisible from the
+  workspace root — and the block itself tells an agent to work from the
+  submodule root, so the stale file is the one actually loaded. `init
+  --workspace` now walks the same scope list `status` walks and names every
+  tracked file it writes per scope; harness integrations (`--codex`,
+  `--opencode`) stay at the root. `status` reports `instructions: stale in N of
+  M scopes` with a per-scope breakdown, and scope drift reaches the `run:`
+  recommendation. A scope opts out with `instructions = false` under its
+  `.tsift/config.toml` override.
+
+- **Symbol matches stop filling up with partial-tag noise** (`#symnoise`,
+  closes #9). `_run` shares one of `run_scale_helper`'s three tags, and plain F1
+  scored that at a flat `0.5000` because a single-tag symbol has perfect recall
+  — so a multi-word query returned three unrelated short functions from an
+  unrelated scope as its top symbol matches, above the one file containing the
+  identifier, with no score signal to discriminate on. A partial hit must now
+  cover at least half the query's tags (enforced in SQL so the candidate `LIMIT`
+  is not spent on rows that will be dropped), and partial scores use F0.5 so a
+  one-of-three match lands near `0.38` and a two-of-three near `0.71`. A query
+  whose every tag is a language keyword (`def `, `func`, `class`) skips tag
+  matching entirely and is answered lexically; exact-name matching still applies.
+  When nothing clears the floor the symbol section is empty rather than padded.
+
+- **`diff-digest` reports document headings instead of pseudo-symbols**
+  (`#docsym`, closes #10). A docs-only diff reported 40 "touched symbols" that
+  were headings, list items, and clipped prose — longer and less informative
+  than `git diff --stat`, and in a mixed diff the doc entries competed with real
+  symbol churn for the same bounded budget. Document files now report
+  `touched_headings` (headings only) and leave `touched_symbols` empty; the
+  report carries `headings_touched` apart from `symbols_touched`, so `40 touched
+  symbols` can no longer mean a README grew some sections. Generated markdown
+  node names mark their clip with an ellipsis instead of being truncated
+  silently into something that reads like a real name.
+
 ## 0.1.82
 
 - **`tsift status` no longer rewrites version-controlled files.** 0.1.81 made

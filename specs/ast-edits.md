@@ -242,6 +242,20 @@ cosmetic:
 | indexed, no grammar in this build | yes | no | `rename_symbol` |
 | structural-only | no | yes | `structural_rewrite` |
 
+Go moved from the structural-only row to the indexed row in 0.1.83
+(`#goindex`): promoting a language means adding symbol and call queries plus an
+identifier-node-kind set, and `rename_symbol` follows from those alone. Go's
+narrowing is worth naming, because the grammar spells a struct field
+declaration, a field read, a method name, and a package-qualified reference all
+as `field_identifier`. A `field_declaration` name is never a `Lang::symbol_query`
+capture, so it is ruled out outright; for a selector the receiver settles it — a
+package name this file imports reaches a package-level declaration and must be
+renamed, while any other receiver is a value, where only the callee position of
+a call can still be the function being renamed. A local that shadows an imported
+package resolves as a package and keeps the occurrence, which is the
+over-renaming direction this module prefers: an extra rename is visible, a
+dropped one is not.
+
 An indexed executor with no ast-grep grammar must **not** advertise
 `structural_rewrite`: doing so plans an edit that can only fail at match time.
 Dropping it from the recognized set turns that into a refusal at registration,

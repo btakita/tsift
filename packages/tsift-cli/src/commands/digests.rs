@@ -61,11 +61,12 @@ pub(crate) fn cmd_diff_digest(
 
     if format.compact {
         println!(
-            "diff mode:{} files:{} summaries:{} syms:{} edges:+{}/-{}",
+            "diff mode:{} files:{} summaries:{} syms:{} headings:{} edges:+{}/-{}",
             diff_digest_mode_label(report.mode),
             report.files_changed,
             report.files_with_current_summaries,
             report.symbols_touched,
+            report.headings_touched,
             report.call_edges_added,
             report.call_edges_removed
         );
@@ -75,11 +76,17 @@ pub(crate) fn cmd_diff_digest(
             } else {
                 truncate_for_compact(&file.touched_symbols.join(","), 60)
             };
+            let headings = if file.touched_headings.is_empty() {
+                "-".to_string()
+            } else {
+                truncate_for_compact(&file.touched_headings.join(","), 60)
+            };
             println!(
-                "{} status:{} syms:{} sums:{} edges:+{}/-{}",
+                "{} status:{} syms:{} headings:{} sums:{} edges:+{}/-{}",
                 file.path,
                 diff_digest_status_label(file.status),
                 symbols,
+                headings,
                 diff_digest_summary_label(file.summary_state),
                 file.added_call_edges.len(),
                 file.removed_call_edges.len()
@@ -95,6 +102,7 @@ pub(crate) fn cmd_diff_digest(
         report.files_with_current_summaries
     );
     println!("  touched symbols:              {}", report.symbols_touched);
+    println!("  touched headings:             {}", report.headings_touched);
     println!(
         "  call edges:                   +{} / -{}",
         report.call_edges_added, report.call_edges_removed
@@ -103,10 +111,18 @@ pub(crate) fn cmd_diff_digest(
     for file in &report.files {
         println!();
         println!("{} [{}]", file.path, diff_digest_status_label(file.status));
-        if file.touched_symbols.is_empty() {
+        // #docsym: document files report headings instead of symbols, so a
+        // docs-only diff never claims "40 touched symbols" and heading text
+        // never competes with real symbol churn in a mixed diff.
+        if file.touched_symbols.is_empty() && !file.touched_headings.is_empty() {
+            println!("  touched headings: {}", file.touched_headings.join(", "));
+        } else if file.touched_symbols.is_empty() {
             println!("  touched symbols: none");
         } else {
             println!("  touched symbols: {}", file.touched_symbols.join(", "));
+            if !file.touched_headings.is_empty() {
+                println!("  touched headings: {}", file.touched_headings.join(", "));
+            }
         }
         println!(
             "  cached summaries: {}",

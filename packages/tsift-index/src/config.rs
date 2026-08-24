@@ -76,6 +76,12 @@ pub struct SubmoduleOverride {
     pub federation: Option<bool>,
     #[serde(default)]
     pub tier: Option<IsolationTier>,
+    /// Whether `tsift init --workspace` refreshes this scope's tracked
+    /// instruction surface (`#wsinit`). Defaults to on: silence is the wrong
+    /// default when the block itself tells an agent to prefer submodule-local
+    /// files. Set `instructions = false` for a vendored or read-only scope.
+    #[serde(default)]
+    pub instructions: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +145,14 @@ impl Config {
             }
         }
         self.defaults.federation
+    }
+
+    /// Whether `tsift init --workspace` should refresh this scope's tracked
+    /// instruction files (`#wsinit`).
+    pub fn instructions_for_scope(&self, scope: &WorkspaceScope) -> bool {
+        self.override_for_scope(scope)
+            .and_then(|ovr| ovr.instructions)
+            .unwrap_or(true)
     }
 
     pub fn federation_for_scope(&self, scope: &WorkspaceScope) -> bool {

@@ -11,6 +11,7 @@ use substrate::{
     ConvexGraphStore as SubstrateConvexGraphStore, ConvexProjectionRows, ConvexRowsGraphClient,
     GraphStore, SqliteGraphStore,
 };
+use tsift_index::config;
 use tsift_index::init;
 use tsift_quality::lint;
 use tsift_sqlite as substrate;
@@ -2812,28 +2813,7 @@ pub(crate) fn cmd_init(
     }
     let codex_workspace = codex && (workspace || init::has_submodules(&resolved)?);
     let result = init::init_with_integrations(&resolved, codex, codex_workspace, opencode)?;
-    if let Some(migration) = &result.migrated_runbook {
-        println!("{}: moved -> {}", migration.from, migration.to);
-    }
-    for update in &result.updates {
-        println!(
-            "{}: {} ({})",
-            update.file.display(),
-            update.action,
-            match update.action {
-                init::InitAction::Created => "tsift Code Navigation section added",
-                init::InitAction::Updated => "tsift Code Navigation section updated to latest",
-                init::InitAction::AlreadyPresent => "no changes needed",
-                init::InitAction::Removed =>
-                    "duplicate tsift Code Navigation section removed — this file already inherits AGENTS.md",
-                init::InitAction::Deferred =>
-                    "defers to AGENTS.md — no tsift Code Navigation section added",
-            }
-        );
-    }
-    if result.gitignore_added {
-        println!(".gitignore: added .tsift/");
-    }
+    print_init_updates(&result);
     if let Some(codex_result) = &result.codex_hooks {
         let scope_label = match codex_result.scope {
             init::CodexHookScope::Project => "project",
@@ -2875,6 +2855,68 @@ pub(crate) fn cmd_init(
                 update.command_name
             );
         }
+    }
+
+    // #wsinit: `--workspace` already means workspace-wide for the index, and
+    // `status` maintains index state for every scope. Instructions used to stop
+    // at the superproject, so submodules stayed on releases-old text — and
+    // AGENTS.md tells an agent to work from the submodule root, which is
+    // exactly the file that never got refreshed.
+    if workspace {
+        init_workspace_scopes(&resolved)?;
+    }
+    Ok(())
+}
+
+fn print_init_updates(result: &init::InitResult) {
+    if let Some(migration) = &result.migrated_runbook {
+        println!("{}: moved -> {}", migration.from, migration.to);
+    }
+    for update in &result.updates {
+        println!(
+            "{}: {} ({})",
+            update.file.display(),
+            update.action,
+            match update.action {
+                init::InitAction::Created => "tsift Code Navigation section added",
+                init::InitAction::Updated => "tsift Code Navigation section updated to latest",
+                init::InitAction::AlreadyPresent => "no changes needed",
+                init::InitAction::Removed =>
+                    "duplicate tsift Code Navigation section removed — this file already inherits AGENTS.md",
+                init::InitAction::Deferred =>
+                    "defers to AGENTS.md — no tsift Code Navigation section added",
+            }
+        );
+    }
+    if result.gitignore_added {
+        println!(".gitignore: added .tsift/");
+    }
+}
+
+/// Refresh the tracked instruction surface in every workspace scope
+/// (`#wsinit`).
+///
+/// Harness integrations (`--codex`, `--opencode`) stay at the root the operator
+/// invoked them from; only the Code Navigation block and its runbook fan out,
+/// because that is what `status` reports on and what a submodule-local harness
+/// actually loads. A scope opts out with `instructions = false` under its
+/// `.tsift/config.toml` override.
+fn init_workspace_scopes(root: &std::path::Path) -> Result<()> {
+    let cfg = config::Config::load(root)?;
+    for scope in config::Config::submodule_dirs(root)? {
+        if !scope.source_root.exists() {
+            continue;
+        }
+        if !cfg.instructions_for_scope(&scope) {
+            println!(
+                "scope {}: skipped (instructions = false in .tsift/config.toml)",
+                scope.id
+            );
+            continue;
+        }
+        println!("scope {}: {}", scope.id, scope.source_root.display());
+        let result = init::init_with_integrations(&scope.source_root, false, false, false)?;
+        print_init_updates(&result);
     }
     Ok(())
 }

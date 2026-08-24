@@ -104,6 +104,15 @@ const CASES: &[Case] = &[
         expect_kind: "function",
         truncated: "run_it( {\n echo",
     },
+    #[cfg(feature = "lang-go")]
+    Case {
+        lang: Lang::Go,
+        extensions: &["go"],
+        source: "package main\n\nfunc main() {}\n\ntype Panel struct{}\n",
+        expect_name: "main",
+        expect_kind: "function",
+        truncated: "package main\n\nfunc main( { type",
+    },
     #[cfg(feature = "lang-gdscript")]
     Case {
         lang: Lang::GdScript,

@@ -6983,14 +6983,18 @@ fn status_autoindexes_missing_workspace_scopes_even_when_root_index_exists_in_js
 fn workspace_graph_queries_require_scope_without_shared_root_index() {
     let dir = indexed_workspace_cli_fixture();
     let root = dir.path().to_str().unwrap();
+    // #graphfed narrowed this set: `graph` and `explain` now resolve the owning
+    // scope from the symbol itself (see
+    // `workspace_explain_and_graph_resolve_the_owning_scope_without_a_flag`).
+    // The rest have no single symbol to resolve from — `communities` reads the
+    // whole index, `path` spans two symbols whose scopes may differ — so they
+    // still fail closed and name the scopes.
     let cases = [
-        ("graph", vec!["graph", "alpha_main", root, "--json"]),
         ("communities", vec!["communities", root, "--json"]),
         (
             "path",
             vec!["path", "alpha_main", "alpha_helper", root, "--json"],
         ),
-        ("explain", vec!["explain", "alpha_main", root, "--json"]),
     ];
 
     for (label, args) in cases {
@@ -7008,27 +7012,182 @@ fn workspace_graph_queries_require_scope_without_shared_root_index() {
 }
 
 #[test]
-fn workspace_search_requires_explicit_scope_or_federated_without_shared_root_index() {
+// #wsfed regression: whether plain `tsift search <query>` worked at a workspace
+// root used to depend on the *shape* of the query. An identifier routed to the
+// `exact` strategy and federated fine; anything falling through to
+// `fts`/`lexical` exited 1 demanding `--scope` or `--federated`. Same directory,
+// same command, same flags.
+fn workspace_search_federates_by_default_without_shared_root_index() {
+    let dir = indexed_workspace_cli_fixture();
+    let root = dir.path().to_str().unwrap();
+
+    // The query shape that used to fail: no underscore, routes past `exact`.
+    for query in ["helper", "alpha_helper"] {
+        let output = tsift_bin()
+            .args(["search", query, "--path", root, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "`search {query}` at a workspace root must federate rather than fail: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let output = tsift_bin()
+        .args(["search", "alpha_helper", "--path", root, "--json"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rendered = json.to_string();
+    assert!(
+        rendered.contains("alpha_helper"),
+        "federated search must reach the scope that owns the symbol: {rendered}"
+    );
+    assert!(!dir.path().join(".tsift/index.db").exists());
+}
+
+// #wsinit regression: `tsift init --workspace` refreshed instruction files only
+// in the superproject while `status` maintained index state for every scope, so
+// submodules stayed on releases-old text — and AGENTS.md tells an agent to work
+// from the submodule root, which is exactly the file that never got refreshed.
+#[test]
+fn init_workspace_refreshes_every_scope_instruction_surface() {
+    let dir = indexed_workspace_cli_fixture();
+    let root = dir.path().to_str().unwrap();
+
+    let output = tsift_bin().args(["init", "--workspace", root]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "init --workspace stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("scope alpha:"), "{stdout}");
+    assert!(stdout.contains("scope beta:"), "{stdout}");
+
+    for scope in ["alpha", "beta"] {
+        let agents = dir.path().join(format!("src/{scope}/AGENTS.md"));
+        assert!(
+            agents.exists(),
+            "init --workspace must write {}",
+            agents.display()
+        );
+        let runbook = dir
+            .path()
+            .join(format!("src/{scope}/.agent/runbooks/code-navigation.md"));
+        assert!(
+            runbook.exists(),
+            "init --workspace must write {}",
+            runbook.display()
+        );
+    }
+
+    // The freshly-inited workspace no longer reports scope instruction drift.
+    let status = tsift_bin().args(["status", "--json", root]).output().unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let drifted = json["scope_instructions"]
+        .as_array()
+        .map(|scopes| {
+            scopes
+                .iter()
+                .filter(|scope| scope["instructions"]["state"] != "current")
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(drifted, 0, "{json}");
+}
+
+#[test]
+fn init_workspace_skips_scopes_that_opt_out_of_instructions() {
+    let dir = indexed_workspace_cli_fixture();
+    let root = dir.path().to_str().unwrap();
+    fs::create_dir_all(dir.path().join(".tsift")).unwrap();
+    fs::write(
+        dir.path().join(".tsift/config.toml"),
+        "[overrides.alpha]\ninstructions = false\n",
+    )
+    .unwrap();
+
+    let output = tsift_bin().args(["init", "--workspace", root]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("scope alpha: skipped"), "{stdout}");
+    assert!(
+        !dir.path().join("src/alpha/AGENTS.md").exists(),
+        "an opted-out scope must not be written"
+    );
+    assert!(dir.path().join("src/beta/AGENTS.md").exists());
+}
+
+// #graphfed regression: `search` had `--federated`, `explain` and `graph` did
+// not, so at a workspace root the two graph commands could not run at all
+// unless the caller already knew which scope held the symbol — the thing they
+// were about to ask tsift.
+#[test]
+fn workspace_explain_and_graph_resolve_the_owning_scope_without_a_flag() {
+    let dir = indexed_workspace_cli_fixture();
+    let root = dir.path().to_str().unwrap();
+
+    let explain = tsift_bin()
+        .args(["explain", "alpha_helper", root, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        explain.status.success(),
+        "explain at a workspace root must resolve the scope: {}",
+        String::from_utf8_lossy(&explain.stderr)
+    );
+    let explain_json: serde_json::Value = serde_json::from_slice(&explain.stdout).unwrap();
+    assert!(
+        explain_json.to_string().contains("alpha_helper"),
+        "{explain_json}"
+    );
+
+    let graph = tsift_bin()
+        .args(["graph", "alpha_helper", root, "--callers", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        graph.status.success(),
+        "graph at a workspace root must resolve the scope: {}",
+        String::from_utf8_lossy(&graph.stderr)
+    );
+    let graph_json: serde_json::Value = serde_json::from_slice(&graph.stdout).unwrap();
+    assert!(
+        graph_json.to_string().contains("alpha_main"),
+        "the caller lives in the resolved scope: {graph_json}"
+    );
+
+    // The explicit flag is accepted too, and both commands advertise it.
+    for command in ["explain", "graph"] {
+        let help = tsift_bin().args([command, "--help"]).output().unwrap();
+        let text = String::from_utf8_lossy(&help.stdout);
+        assert!(
+            text.contains("--federated"),
+            "`{command} --help` must offer --federated: {text}"
+        );
+    }
+}
+
+// A symbol no scope defines must say which scopes were searched instead of
+// telling the caller to supply a scope it could have resolved itself.
+#[test]
+fn workspace_explain_names_the_searched_scopes_when_the_symbol_is_absent() {
     let dir = indexed_workspace_cli_fixture();
     let root = dir.path().to_str().unwrap();
 
     let output = tsift_bin()
-        .args(["search", "helper", "--path", root, "--json"])
+        .args(["explain", "no_such_symbol_anywhere", root, "--json"])
         .output()
         .unwrap();
-
-    assert!(
-        !output.status.success(),
-        "workspace search should fail closed without an explicit target"
-    );
+    assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("requires `--scope <scope>` or `--federated`"),
+        stderr.contains("was not found in any federated scope"),
         "{stderr}"
     );
-    assert!(stderr.contains("Available scopes: alpha, beta"), "{stderr}");
-    assert!(stderr.contains("Indexed scopes: alpha, beta"), "{stderr}");
-    assert!(!dir.path().join(".tsift/index.db").exists());
+    assert!(stderr.contains("alpha") && stderr.contains("beta"), "{stderr}");
 }
 
 #[test]
@@ -12854,15 +13013,15 @@ fn edit_intents_structural_rewrite_verify_uses_temp_worktree_without_mutating_so
 
 #[test]
 fn structural_only_language_rewrites_via_ast_grep_and_via_edit_intents() {
-    // The structural-only tier: Go has an ast-grep grammar but no tsift-graph
+    // The structural-only tier: Java has an ast-grep grammar but no tsift-graph
     // tag queries, so it is not indexed or searchable. Reparsing a rewritten
     // buffer needs a grammar and not an index, so it *is* a semantic-edit
     // executor for `structural_rewrite` — both surfaces must rewrite it, and
     // the planner path must additionally leave the file untouched until
-    // `--apply`.
+    // `--apply`. (#goindex moved Go out of this tier; Java is the exemplar now.)
     let dir = tempfile::tempdir().unwrap();
-    let src = "package main\n\nfunc main() {\n\tfoo(1)\n\tfoo(2)\n}\n";
-    fs::write(dir.path().join("main.go"), src).unwrap();
+    let src = "class Main {\n    void run() {\n        foo(1);\n        foo(2);\n    }\n}\n";
+    fs::write(dir.path().join("Main.java"), src).unwrap();
 
     let rewrite = tsift_bin()
         .args([
@@ -12878,14 +13037,14 @@ fn structural_only_language_rewrites_via_ast_grep_and_via_edit_intents() {
         .unwrap();
     assert!(
         rewrite.status.success(),
-        "ast-grep rewrite on Go stderr: {}",
+        "ast-grep rewrite on Java stderr: {}",
         String::from_utf8_lossy(&rewrite.stderr)
     );
     let rewrite_json: serde_json::Value = serde_json::from_slice(&rewrite.stdout).unwrap();
     let matched = rewrite_json.to_string();
     assert!(
         matched.contains("bar($A)") || matched.contains("bar(1)"),
-        "Go should be structurally rewritable: {rewrite_json}"
+        "Java should be structurally rewritable: {rewrite_json}"
     );
 
     let index = tsift_bin()
@@ -12898,7 +13057,7 @@ fn structural_only_language_rewrites_via_ast_grep_and_via_edit_intents() {
         "intents": [
             {
                 "kind": "structural_rewrite",
-                "file": "main.go",
+                "file": "Main.java",
                 "pattern": "foo($A)",
                 "replacement": "bar($A)"
             }
@@ -12919,18 +13078,18 @@ fn structural_only_language_rewrites_via_ast_grep_and_via_edit_intents() {
     assert_eq!(plan["status"], "planned", "{plan}");
     assert_eq!(plan["apply_supported"], true, "{plan}");
     assert!(
-        plan["message"].as_str().unwrap().contains("Go"),
-        "the plan should name the Go executor: {plan}"
+        plan["message"].as_str().unwrap().contains("Java"),
+        "the plan should name the Java executor: {plan}"
     );
     assert_eq!(
-        fs::read_to_string(dir.path().join("main.go")).unwrap(),
+        fs::read_to_string(dir.path().join("Main.java")).unwrap(),
         src,
         "a dry-run structural_rewrite must not write"
     );
 
     // A symbol-resolved kind stays refused end to end. Two independent layers
-    // stop it: Go has no tag queries, so nothing resolves the symbol, and the
-    // Go contract does not recognize the kind either — which is what keeps the
+    // stop it: Java has no tag queries, so nothing resolves the symbol, and the
+    // Java contract does not recognize the kind either — which is what keeps the
     // family split from routing it into the Rust implementations. The
     // executor-level refusal is asserted per language in the unit suite; here
     // the point is that the CLI fails and writes nothing.
@@ -12938,9 +13097,9 @@ fn structural_only_language_rewrites_via_ast_grep_and_via_edit_intents() {
         "intents": [
             {
                 "kind": "rename_symbol",
-                "file": "main.go",
-                "symbol": "main",
-                "new_name": "run"
+                "file": "Main.java",
+                "symbol": "run",
+                "new_name": "execute"
             }
         ]
     }"#;
@@ -12957,11 +13116,11 @@ fn structural_only_language_rewrites_via_ast_grep_and_via_edit_intents() {
     );
     assert!(
         !output.status.success(),
-        "rename_symbol on Go should fail, stdout: {}",
+        "rename_symbol on Java should fail, stdout: {}",
         String::from_utf8_lossy(&output.stdout)
     );
     assert_eq!(
-        fs::read_to_string(dir.path().join("main.go")).unwrap(),
+        fs::read_to_string(dir.path().join("Main.java")).unwrap(),
         src,
         "a refused rename_symbol must not write"
     );
@@ -12980,13 +13139,13 @@ fn structural_only_language_rewrites_via_ast_grep_and_via_edit_intents() {
     );
     assert!(
         output.status.success(),
-        "apply on Go stderr: {}",
+        "apply on Java stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let applied = fs::read_to_string(dir.path().join("main.go")).unwrap();
+    let applied = fs::read_to_string(dir.path().join("Main.java")).unwrap();
     assert!(
         applied.contains("bar(1)") && applied.contains("bar(2)"),
-        "apply should rewrite every Go call site: {applied}"
+        "apply should rewrite every Java call site: {applied}"
     );
 }
 
@@ -13175,10 +13334,12 @@ fn edit_intents_refuses_a_structural_only_rename_at_the_index_layer() {
     // so there is no symbol to resolve and the index layer refuses first. This
     // records where the refusal actually comes from, so a later change that
     // moves it is noticed instead of being read as a regression.
+    // #goindex moved Go out of the structural-only tier, so this uses Java —
+    // still ast-grep-only, with no `tsift-graph` binding.
     let dir = tempfile::tempdir().unwrap();
     fs::write(
-        dir.path().join("main.go"),
-        "package main\n\nfunc widgetCount() int { return 3 }\n",
+        dir.path().join("Widget.java"),
+        "class Widget { int widgetCount() { return 3; } }\n",
     )
     .unwrap();
     let indexed = tsift_bin()
@@ -13187,7 +13348,7 @@ fn edit_intents_refuses_a_structural_only_rename_at_the_index_layer() {
         .unwrap();
     assert!(indexed.status.success());
 
-    let input = r#"{"intents":[{"kind":"rename_symbol","symbol":"widgetCount","file":"main.go","new_name":"gadgetCount"}]}"#;
+    let input = r#"{"intents":[{"kind":"rename_symbol","symbol":"widgetCount","file":"Widget.java","new_name":"gadgetCount"}]}"#;
     let output = run_tsift_stdin(
         &[
             "--envelope",
@@ -13198,16 +13359,76 @@ fn edit_intents_refuses_a_structural_only_rename_at_the_index_layer() {
         ],
         input,
     );
-    assert!(!output.status.success(), "a Go rename must not be planned");
+    assert!(!output.status.success(), "a Java rename must not be planned");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("no indexed symbol matched"),
         "expected the index layer to refuse first: {stderr}"
     );
     assert_eq!(
-        fs::read_to_string(dir.path().join("main.go")).unwrap(),
-        "package main\n\nfunc widgetCount() int { return 3 }\n",
+        fs::read_to_string(dir.path().join("Widget.java")).unwrap(),
+        "class Widget { int widgetCount() { return 3; } }\n",
         "a refused rename must not write"
+    );
+}
+
+// #goindex: the mirror image — a Go module is now indexed, searchable, and
+// renamable, where before `search`, `explain`, and `graph` were blind to every
+// Go symbol in the repo and `call_edges` stayed empty.
+#[test]
+fn go_sources_are_indexed_searchable_and_renamable() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("go.mod"), "module example.com/widget\n").unwrap();
+    fs::write(
+        dir.path().join("main.go"),
+        "package main\n\nfunc widgetCount() int { return 3 }\n\nfunc main() { widgetCount() }\n",
+    )
+    .unwrap();
+    let root = dir.path().to_str().unwrap();
+
+    let indexed = tsift_bin().args(["index", root]).output().unwrap();
+    assert!(
+        indexed.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    let search = tsift_bin()
+        .args(["search", "widgetCount", "--path", root, "--json"])
+        .output()
+        .unwrap();
+    assert!(search.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert!(
+        json.to_string().contains("main.go"),
+        "a Go symbol must be a search candidate: {json}"
+    );
+
+    let graph = tsift_bin()
+        .args(["graph", "widgetCount", root, "--callers", "--json"])
+        .output()
+        .unwrap();
+    assert!(graph.status.success());
+    let graph_json: serde_json::Value = serde_json::from_slice(&graph.stdout).unwrap();
+    assert!(
+        graph_json.to_string().contains("main"),
+        "Go call edges must be extracted: {graph_json}"
+    );
+
+    let input = r#"{"intents":[{"kind":"rename_symbol","symbol":"widgetCount","file":"main.go","new_name":"gadgetCount"}]}"#;
+    let output = run_tsift_stdin(
+        &["--envelope", "edit-intents", "--path", root, "--json", "--apply"],
+        input,
+    );
+    assert!(
+        output.status.success(),
+        "a Go rename must be planned and applied: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rewritten = fs::read_to_string(dir.path().join("main.go")).unwrap();
+    assert!(
+        rewritten.contains("gadgetCount") && !rewritten.contains("widgetCount"),
+        "{rewritten}"
     );
 }
 

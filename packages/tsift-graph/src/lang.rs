@@ -35,6 +35,8 @@ pub enum Lang {
     Zig,
     #[cfg(feature = "lang-bash")]
     Bash,
+    #[cfg(feature = "lang-go")]
+    Go,
     #[cfg(feature = "lang-gdscript")]
     GdScript,
     #[cfg(feature = "lang-markdown")]
@@ -63,6 +65,8 @@ impl Lang {
             "zig" => Some(Self::Zig),
             #[cfg(feature = "lang-bash")]
             "sh" | "bash" | "zsh" => Some(Self::Bash),
+            #[cfg(feature = "lang-go")]
+            "go" => Some(Self::Go),
             #[cfg(feature = "lang-gdscript")]
             "gd" => Some(Self::GdScript),
             #[cfg(feature = "lang-markdown")]
@@ -91,6 +95,8 @@ impl Lang {
             Self::Zig => tree_sitter_zig::LANGUAGE.into(),
             #[cfg(feature = "lang-bash")]
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
+            #[cfg(feature = "lang-go")]
+            Self::Go => tree_sitter_go::LANGUAGE.into(),
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => tree_sitter_gdscript::LANGUAGE.into(),
             #[cfg(feature = "lang-markdown")]
@@ -118,6 +124,8 @@ impl Lang {
             Self::Zig => "zig",
             #[cfg(feature = "lang-bash")]
             Self::Bash => "bash",
+            #[cfg(feature = "lang-go")]
+            Self::Go => "go",
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => "gdscript",
             #[cfg(feature = "lang-markdown")]
@@ -196,6 +204,23 @@ impl Lang {
                 (function_definition name: (word) @function.name)
             "#
             }
+            #[cfg(feature = "lang-go")]
+            Self::Go => {
+                // `method_declaration` is a func with a receiver; its `name` field
+                // is the method name, which is what callers write at the call site.
+                // Package-level `var`/`const` blocks nest their specs, so the
+                // capture targets the spec's name rather than the declaration.
+                r#"
+                (function_declaration name: (identifier) @function.name)
+                (method_declaration name: (field_identifier) @method.name)
+                (type_declaration (type_spec name: (type_identifier) @struct.name type: (struct_type)))
+                (type_declaration (type_spec name: (type_identifier) @interface.name type: (interface_type)))
+                (type_declaration (type_spec name: (type_identifier) @type.name))
+                (type_declaration (type_alias name: (type_identifier) @type_alias.name))
+                (const_declaration (const_spec name: (identifier) @const.name))
+                (var_declaration (var_spec name: (identifier) @variable.name))
+            "#
+            }
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => {
                 // `class_name Foo` declares the script's own type and is the
@@ -259,6 +284,15 @@ impl Lang {
                 (call_expression function: (identifier) @call.name)
                 (call_expression function: (member_expression property: (property_identifier) @call.name))
             "#,
+            ),
+            #[cfg(feature = "lang-go")]
+            Self::Go => Some(
+                // `pkg.Fn()` and `recv.Method()` are both `selector_expression`,
+                // whose `field` holds the callee name a symbol row can resolve to.
+                r#"
+(call_expression function: (identifier) @call.name)
+(call_expression function: (selector_expression field: (field_identifier) @call.name))
+"#,
             ),
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => Some(
@@ -431,11 +465,27 @@ impl Lang {
             Self::Zig,
             #[cfg(feature = "lang-bash")]
             Self::Bash,
+            #[cfg(feature = "lang-go")]
+            Self::Go,
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript,
             #[cfg(feature = "lang-markdown")]
             Self::Markdown,
         ]
+    }
+
+    /// Whether this language is prose rather than code. A document language is
+    /// parsed into structural nodes — headings, list items, fenced blocks — that
+    /// are useful for navigation but are not symbols: they have no callers, no
+    /// callees, and no identity a caller can look up by name. Consumers that
+    /// report "symbols" must budget and label document nodes separately
+    /// (`#docsym`).
+    pub fn is_document(&self) -> bool {
+        #[cfg(feature = "lang-markdown")]
+        if *self == Self::Markdown {
+            return true;
+        }
+        false
     }
 }
 
@@ -527,6 +577,7 @@ mod tests {
             ("sh", "bash"),
             ("bash", "bash"),
             ("zsh", "bash"),
+            ("go", "go"),
             ("gd", "gdscript"),
             ("md", "markdown"),
             ("mdx", "markdown"),
@@ -817,6 +868,104 @@ mod tests {
         assert_eq!(hello_sym.kind, "function");
         let ll_sym = symbols.iter().find(|s| s.name == "ll").unwrap();
         assert_eq!(ll_sym.kind, "alias");
+    }
+
+    // #goindex: Go was structural-only (ast-grep could match it, the indexer
+    // could not see it), so `search`, `explain`, and `graph` were blind to every
+    // Go symbol in a Go module while `status` still called the scope `fresh`.
+    #[cfg(feature = "lang-go")]
+    #[test]
+    fn test_extract_go_symbols() {
+        let source = br#"package native
+
+import "fmt"
+
+type Opener interface {
+	Open() error
+}
+
+type Clipboard struct {
+	buf string
+}
+
+const DefaultTimeout = 5
+
+var globalClipboard Clipboard
+
+type Handle = Clipboard
+
+func open() error {
+	return nil
+}
+
+func (c *Clipboard) Set(text string) error {
+	fmt.Println(text)
+	return open()
+}
+"#;
+        let symbols = Lang::Go.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        for expected in [
+            "Opener",
+            "Clipboard",
+            "DefaultTimeout",
+            "globalClipboard",
+            "Handle",
+            "open",
+            "Set",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing {expected}, got {names:?}"
+            );
+        }
+        let kind_of = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .kind
+                .clone()
+        };
+        assert_eq!(kind_of("Opener"), "interface");
+        assert_eq!(kind_of("Clipboard"), "struct");
+        assert_eq!(kind_of("open"), "function");
+        assert_eq!(kind_of("Set"), "method");
+    }
+
+    #[cfg(feature = "lang-go")]
+    #[test]
+    fn test_extract_go_call_edges() {
+        let source = br#"package main
+
+import "fmt"
+
+func helper() int { return 1 }
+
+func main() {
+	helper()
+	fmt.Println("hi")
+}
+"#;
+        let symbols = Lang::Go.extract_symbols(source).unwrap();
+        let call_sites = crate::extract_call_sites(Lang::Go, source).unwrap();
+        let edges = crate::resolve_edges(&symbols, &call_sites);
+        let pairs: Vec<String> = edges
+            .iter()
+            .map(|edge| format!("{} -> {}", edge.caller, edge.callee))
+            .collect();
+        assert!(
+            pairs.contains(&"main -> helper".to_string()),
+            "expected a main -> helper call edge, got {pairs:?}"
+        );
+        let callees: Vec<&str> = call_sites
+            .iter()
+            .map(|site| site.callee.as_str())
+            .collect();
+        assert!(
+            callees.contains(&"Println"),
+            "selector calls resolve to the field name, got {callees:?}"
+        );
     }
 
     #[cfg(feature = "lang-gdscript")]

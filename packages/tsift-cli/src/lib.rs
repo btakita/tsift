@@ -853,6 +853,7 @@ pub fn run() -> Result<()> {
             callers,
             callees,
             scope,
+            federated,
             limit,
             json,
             no_tagpath,
@@ -863,6 +864,7 @@ pub fn run() -> Result<()> {
             callers,
             callees,
             scope.as_deref(),
+            federated,
             limit,
             json || terse || schema || envelope,
             compact,
@@ -963,6 +965,7 @@ pub fn run() -> Result<()> {
             symbol,
             path,
             scope,
+            federated,
             limit,
             json,
             max_items,
@@ -974,6 +977,7 @@ pub fn run() -> Result<()> {
             &symbol,
             &path,
             scope.as_deref(),
+            federated,
             limit,
             json || terse || schema || envelope,
             compact,
@@ -3778,6 +3782,111 @@ pub(crate) fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Resu
         );
     }
     index::IndexDb::open_read_only_resilient(&db_path)
+}
+
+/// Which federated scope owns `symbol`, and which others also define it.
+pub(crate) struct SymbolScopeResolution {
+    pub(crate) scope: String,
+    pub(crate) also_in: Vec<String>,
+}
+
+/// Resolve `symbol` to the scope that defines it, across the workspace's
+/// federated indexes (`#graphfed`).
+///
+/// `explain` and `graph` had no `--federated`, so at a workspace root they could
+/// not run at all unless the caller already knew which scope held the symbol —
+/// the thing they were about to ask tsift. `search` resolves the same symbol to
+/// a path from the same index set without a flag, so the information was
+/// already reachable; this walks the scoped indexes for it directly.
+pub(crate) fn resolve_symbol_scope(
+    root: &Path,
+    symbol: &str,
+) -> Result<Option<SymbolScopeResolution>> {
+    let cfg = config::Config::load(root)?;
+    let mut owners = Vec::new();
+    for scope in config::Config::submodule_dirs(root)? {
+        if !cfg.federation_for_scope(&scope) {
+            continue;
+        }
+        let db_path = cfg.db_path_for(root, &scope.id);
+        if !db_path.exists() {
+            continue;
+        }
+        let Ok(db) = index::IndexDb::open_read_only_resilient(&db_path) else {
+            continue;
+        };
+        let defines = db.symbol_info(symbol).map(|rows| !rows.is_empty())?;
+        // A scope that only *calls* the symbol still lets `graph --callers`
+        // answer, so it counts as an owner when nothing defines it outright.
+        let references = || {
+            db.callers_of(symbol)
+                .map(|edges| !edges.is_empty())
+                .unwrap_or(false)
+        };
+        if defines {
+            owners.push((scope.id.clone(), true));
+        } else if references() {
+            owners.push((scope.id.clone(), false));
+        }
+    }
+    if owners.is_empty() {
+        return Ok(None);
+    }
+    // Definitions win over call-site-only matches; ties break on scope id so the
+    // resolution is deterministic across runs.
+    owners.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    let scope = owners[0].0.clone();
+    let also_in = owners[1..]
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    Ok(Some(SymbolScopeResolution { scope, also_in }))
+}
+
+/// `open_index_db` for the graph commands, with workspace-root symbol
+/// resolution (`#graphfed`).
+///
+/// Returns the opened index plus the scope it resolved to, so the caller can
+/// pass the right scope down to tagpath annotation and say which scope answered.
+pub(crate) fn open_graph_index_db(
+    path: &std::path::Path,
+    scope: Option<&str>,
+    federated: bool,
+    symbol: &str,
+) -> Result<(index::IndexDb, Option<String>)> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let resolve_across_scopes =
+        federated || should_auto_federate(&root, path, scope, federated)?;
+    if !resolve_across_scopes {
+        return Ok((open_index_db(path, scope)?, scope.map(str::to_string)));
+    }
+
+    let Some(resolution) = resolve_symbol_scope(&root, symbol)? else {
+        let scopes = config::Config::submodule_dirs(&root)?
+            .iter()
+            .map(|scope| scope.id.clone())
+            .collect::<Vec<_>>();
+        bail!(
+            "symbol `{symbol}` was not found in any federated scope of {}. Searched: {}. Run `tsift index --workspace {}` if a scope is unindexed, or pass `--scope <scope>` to query one directly.",
+            root.display(),
+            if scopes.is_empty() {
+                "none".to_string()
+            } else {
+                scopes.join(", ")
+            },
+            root.display(),
+        );
+    };
+
+    if !resolution.also_in.is_empty() {
+        eprintln!(
+            "note: `{symbol}` resolved in scope `{}`; also present in: {}. Pass `--scope <scope>` to select another.",
+            resolution.scope,
+            resolution.also_in.join(", ")
+        );
+    }
+    let db = open_index_db(path, Some(&resolution.scope))?;
+    Ok((db, Some(resolution.scope)))
 }
 
 pub(crate) fn query_tagpath_root(
@@ -21447,12 +21556,47 @@ enum SearchIndexState {
     Stale { stale_files: usize },
 }
 
+/// Whether a query at `path_hint` would otherwise fall through to a workspace
+/// root that has no shared root index (`#wsfed`).
+///
+/// Every earlier branch of `resolve_search_index_targets` /
+/// `resolve_query_index_target` is checked in the same order, so this returns
+/// `true` only where those two used to `bail!`. That is the point: whether
+/// plain `tsift search <query>` worked at a workspace root depended on the
+/// *shape* of the query — an identifier routed to the `exact` strategy and
+/// federated fine, while anything falling through to `fts`/`lexical` exited 1
+/// demanding a flag. Federating there is what the `exact` path already did.
+pub(crate) fn should_auto_federate(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+    federated: bool,
+) -> Result<bool> {
+    if federated || scope.is_some() {
+        return Ok(false);
+    }
+    if root.join(".tsift/index.db").exists() {
+        return Ok(false);
+    }
+    if config::Config::infer_submodule_from_path(root, path_hint)?.is_some() {
+        return Ok(false);
+    }
+    if multiplicity::infer_cargo_package_from_path(root, path_hint)?.is_some() {
+        return Ok(false);
+    }
+    if infer_agent_doc_task_submodule(root, path_hint)?.is_some() {
+        return Ok(false);
+    }
+    Ok(!config::Config::submodule_dirs(root)?.is_empty())
+}
+
 fn resolve_search_index_targets(
     root: &Path,
     path_hint: &Path,
     scope: Option<&str>,
     federated: bool,
 ) -> Result<Vec<SearchIndexTarget>> {
+    let federated = federated || should_auto_federate(root, path_hint, scope, federated)?;
     if let Some(scope_name) = scope {
         if let Some(scope) = config::Config::find_submodule(root, scope_name)? {
             let cfg = config::Config::load(root)?;
@@ -21472,9 +21616,10 @@ fn resolve_search_index_targets(
 
     if federated {
         let cfg = config::Config::load(root)?;
+        let scopes = config::Config::submodule_dirs(root)?;
         let mut targets = Vec::new();
-        for scope in config::Config::submodule_dirs(root)? {
-            if !cfg.federation_for_scope(&scope) {
+        for scope in &scopes {
+            if !cfg.federation_for_scope(scope) {
                 continue;
             }
             targets.push(SearchIndexTarget {
@@ -21484,6 +21629,20 @@ fn resolve_search_index_targets(
                 scope_name: Some(scope.id.clone()),
                 reindex_cmd: format!("tsift index --workspace {}", root.display()),
             });
+        }
+        // #wsfed: federation is now the workspace-root default, so a workspace
+        // whose every scope opts out of federation is the only remaining way to
+        // reach zero targets. Say so instead of returning silent empty results.
+        if targets.is_empty() && !scopes.is_empty() {
+            bail!(
+                "workspace root {} has no federated scopes to search: every scope opts out of federation. Pass `--scope <scope>` to search one directly. Available scopes: {}.",
+                root.display(),
+                scopes
+                    .iter()
+                    .map(|scope| scope.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
         }
         return Ok(targets);
     }
@@ -24139,6 +24298,7 @@ agent_doc_format: template
             true,
             false,
             None,
+            false,
             20,
             false,
             true,
@@ -27190,22 +27350,11 @@ tier = "private"
         );
     }
 
-    fn assert_workspace_search_requires_explicit_target(err: anyhow::Error) {
-        let msg = err.to_string();
-        assert!(
-            msg.contains("requires `--scope <scope>` or `--federated`"),
-            "{msg}"
-        );
-        assert!(msg.contains("Available scopes: alpha, beta"), "{msg}");
-        assert!(msg.contains("Indexed scopes: alpha, beta"), "{msg}");
-        assert!(
-            !msg.contains("autoindexing index"),
-            "workspace search should fail before creating a shared root index: {msg}"
-        );
-    }
-
+    // #graphfed: `graph` used to fail here and tell the caller to supply the
+    // scope it was about to ask tsift for. It now resolves the owning scope
+    // from the symbol itself.
     #[test]
-    fn graph_cmd_requires_scope_for_workspace_root_without_shared_index() {
+    fn graph_cmd_resolves_scope_for_workspace_root_without_shared_index() {
         let dir = setup_workspace();
         cmd_index(
             dir.path(),
@@ -27225,12 +27374,33 @@ tier = "private"
         )
         .unwrap();
 
-        let err = cmd_graph(
+        cmd_graph(
             "alpha_main",
             dir.path(),
             false,
             false,
             None,
+            false,
+            20,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            TagpathSearchOpts::default(),
+        )
+        .expect("graph must resolve `alpha_main` to the alpha scope");
+
+        // A symbol no scope defines still fails, and names what it searched.
+        let err = cmd_graph(
+            "no_such_symbol_anywhere",
+            dir.path(),
+            false,
+            false,
+            None,
+            false,
             20,
             false,
             false,
@@ -27242,8 +27412,9 @@ tier = "private"
             TagpathSearchOpts::default(),
         )
         .unwrap_err();
-
-        assert_workspace_query_requires_scope(err);
+        let msg = err.to_string();
+        assert!(msg.contains("was not found in any federated scope"), "{msg}");
+        assert!(msg.contains("alpha") && msg.contains("beta"), "{msg}");
     }
 
     #[test]
@@ -27275,6 +27446,7 @@ tier = "private"
             false,
             false,
             None,
+            false,
             20,
             false,
             false,
@@ -27467,8 +27639,9 @@ tier = "private"
         assert!(result.is_ok());
     }
 
+    // #graphfed: see `graph_cmd_resolves_scope_for_workspace_root_without_shared_index`.
     #[test]
-    fn explain_cmd_requires_scope_for_workspace_root_without_shared_index() {
+    fn explain_cmd_resolves_scope_for_workspace_root_without_shared_index() {
         let dir = setup_workspace();
         cmd_index(
             dir.path(),
@@ -27488,10 +27661,11 @@ tier = "private"
         )
         .unwrap();
 
-        let err = cmd_explain(
+        cmd_explain(
             "alpha_main",
             dir.path(),
             None,
+            false,
             15,
             false,
             false,
@@ -27502,9 +27676,7 @@ tier = "private"
             false,
             false,
         )
-        .unwrap_err();
-
-        assert_workspace_query_requires_scope(err);
+        .expect("explain must resolve `alpha_main` to the alpha scope");
     }
 
     #[test]
@@ -27534,6 +27706,7 @@ tier = "private"
             "alpha_main",
             &nested,
             None,
+            false,
             15,
             false,
             false,
@@ -27558,6 +27731,7 @@ tier = "private"
             "main",
             dir.path(),
             None,
+            false,
             15,
             false,
             false,
@@ -27665,6 +27839,7 @@ tier = "private"
             "main",
             dir.path(),
             None,
+            false,
             15,
             false,
             false,
@@ -28694,8 +28869,10 @@ tier = "private"
         assert!(!err.to_string().contains("database is locked"));
     }
 
+    // #wsfed: plain `search` at a workspace root with no shared root index now
+    // federates for every strategy, not only the ones that routed to `exact`.
     #[test]
-    fn workspace_search_cmd_requires_explicit_target_without_shared_root_index() {
+    fn workspace_search_cmd_federates_without_shared_root_index() {
         let dir = setup_workspace();
         cmd_index(
             dir.path(),
@@ -28715,7 +28892,7 @@ tier = "private"
         )
         .unwrap();
 
-        let err = cmd_search(
+        cmd_search(
             "alpha_helper".to_string(),
             Some(dir.path().to_path_buf()),
             5,
@@ -28733,9 +28910,8 @@ tier = "private"
             false,
             false,
         )
-        .unwrap_err();
+        .expect("the lexical strategy must federate the same way `exact` already did");
 
-        assert_workspace_search_requires_explicit_target(err);
         assert!(!dir.path().join(".tsift/index.db").exists());
     }
 
@@ -28826,6 +29002,7 @@ tier = "private"
             false,
             false,
             None,
+            false,
             20,
             false,
             true,
@@ -28856,6 +29033,7 @@ tier = "private"
             true,
             false,
             None,
+            false,
             20,
             false,
             true,
@@ -28885,6 +29063,7 @@ tier = "private"
             false,
             false,
             None,
+            false,
             20,
             false,
             true,
@@ -28911,6 +29090,7 @@ tier = "private"
             true,
             false,
             None,
+            false,
             20,
             false,
             false,
@@ -31798,6 +31978,7 @@ fn sample() {}
             files_changed: 2,
             files_with_current_summaries: 1,
             symbols_touched: 3,
+            headings_touched: 0,
             call_edges_added: 1,
             call_edges_removed: 0,
             files: vec![
@@ -31805,7 +31986,8 @@ fn sample() {}
                     path: "src/lib.rs".to_string(),
                     status: diff_digest::DiffDigestFileStatus::Modified,
                     touched_symbols: vec!["alpha_helper".to_string(), "beta_helper".to_string()],
-                    summary_state: diff_digest::DiffDigestSummaryState::Current,
+                    touched_headings: vec![],
+                summary_state: diff_digest::DiffDigestSummaryState::Current,
                     current_summaries: vec![diff_digest::DiffDigestSummarySnippet {
                         symbol: "alpha_helper".to_string(),
                         summary: "alpha helper handles the main alpha workflow".to_string(),
@@ -31818,7 +32000,8 @@ fn sample() {}
                     path: "src/main.rs".to_string(),
                     status: diff_digest::DiffDigestFileStatus::Added,
                     touched_symbols: vec!["main".to_string()],
-                    summary_state: diff_digest::DiffDigestSummaryState::Missing,
+                    touched_headings: vec![],
+                summary_state: diff_digest::DiffDigestSummaryState::Missing,
                     current_summaries: vec![],
                     added_call_edges: vec![],
                     removed_call_edges: vec![],
@@ -32307,12 +32490,14 @@ fn sample() {}
             files_changed: 1,
             files_with_current_summaries: 1,
             symbols_touched: 1,
+            headings_touched: 0,
             call_edges_added: 0,
             call_edges_removed: 0,
             files: vec![diff_digest::DiffDigestFile {
                 path: "src/lib.rs".to_string(),
                 status: diff_digest::DiffDigestFileStatus::Modified,
                 touched_symbols: vec!["alpha_helper".to_string()],
+                touched_headings: vec![],
                 summary_state: diff_digest::DiffDigestSummaryState::Current,
                 current_summaries: vec![diff_digest::DiffDigestSummarySnippet {
                     symbol: "alpha_helper".to_string(),
@@ -33576,6 +33761,7 @@ fn sample() {}
             false,
             false,
             None,
+            false,
             1,
             false,
             false,
@@ -33598,6 +33784,7 @@ fn sample() {}
             false,
             false,
             None,
+            false,
             0,
             false,
             false,
@@ -33620,6 +33807,7 @@ fn sample() {}
             false,
             false,
             None,
+            false,
             20,
             false,
             false,
@@ -33659,6 +33847,7 @@ fn sample() {}
             "main",
             dir.path(),
             None,
+            false,
             15,
             false,
             false,

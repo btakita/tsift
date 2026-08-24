@@ -90,9 +90,74 @@ pub struct StatusReport {
     pub index: IndexStatus,
     pub summaries: SummaryStatus,
     pub instructions: InstructionStatus,
+    /// Per-scope instruction state (`#wsinit`). Index freshness is already
+    /// reported per scope; collapsing six scopes into one `instructions:` line
+    /// hid submodules stuck on releases-old text — the very files AGENTS.md
+    /// tells an agent to prefer.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub scope_instructions: Vec<ScopeInstructionStatus>,
     pub recommendations: Recommendations,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub reminders: Vec<String>,
+    /// Scopes where the walk dropped a meaningful share of the files it saw
+    /// (`#goindex`). Without this, a scope indexing 8 of its 26 tracked files
+    /// still printed `fresh`, and the gap surfaced only as confident empty
+    /// search results.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub language_coverage: Vec<LanguageCoverageGap>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScopeInstructionStatus {
+    pub scope: String,
+    pub instructions: InstructionStatus,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct LanguageCoverageGap {
+    /// `None` for a single-root index; the scope id in a workspace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    pub indexed_files: usize,
+    pub skipped_files: usize,
+    /// The extension that cost the most files, and its count.
+    pub dominant_extension: String,
+    pub dominant_extension_files: usize,
+    /// Every skipped extension, most-costly first.
+    pub skipped_by_extension: Vec<(String, usize)>,
+}
+
+impl LanguageCoverageGap {
+    /// A gap worth printing: the skipped files are a real share of the walk, and
+    /// the dominant skipped extension is not a rounding error. A repo with two
+    /// stray `.txt` files next to 600 indexed sources is not a coverage gap.
+    fn is_reportable(&self) -> bool {
+        let walked = self.indexed_files + self.skipped_files;
+        walked > 0
+            && self.dominant_extension_files >= 3
+            && self.skipped_files * 4 >= walked
+    }
+
+    fn from_summary(
+        scope: Option<String>,
+        indexed_files: usize,
+        skipped: &tsift_index::walk::SkipStats,
+    ) -> Option<Self> {
+        let (dominant_extension, dominant_extension_files) = skipped.dominant_extension()?;
+        let gap = Self {
+            scope,
+            indexed_files,
+            skipped_files: skipped.files,
+            dominant_extension: dominant_extension.to_string(),
+            dominant_extension_files,
+            skipped_by_extension: skipped
+                .ranked_extensions()
+                .into_iter()
+                .map(|(ext, count)| (ext.to_string(), count))
+                .collect(),
+        };
+        gap.is_reportable().then_some(gap)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -216,24 +281,112 @@ pub fn check_status_with_cache(root: &Path, cache: &StatusCheckCache) -> Result<
     let summaries = check_summaries(root, &summaries_db_path, &index, cache)?;
     let summarize_extract = recommended_summarize_extract_path(root, &index, &workspace_scopes);
     let instructions = init::check_instruction_version(root);
+    let scope_instructions = collect_scope_instructions(root, &workspace_scopes)?;
     let kg_present = root.join(".tsift/graph.db").exists();
     let recommendations = build_recommendations(
         &index,
         &summaries,
         &instructions,
+        &scope_instructions,
         workspace,
         &summarize_extract,
         kg_present,
     );
     let reminders = build_reminders(&index, &summaries, &recommendations, &summarize_extract);
+    let language_coverage = collect_language_coverage_gaps(root, cache)?;
 
     Ok(StatusReport {
         index,
         summaries,
         instructions,
+        scope_instructions,
         recommendations,
         reminders,
+        language_coverage,
     })
+}
+
+/// Instruction state for each workspace scope (`#wsinit`).
+///
+/// Scopes that opt out with `instructions = false` are omitted: an opted-out
+/// scope has no expected block, so reporting it as `missing` would be noise.
+fn collect_scope_instructions(
+    root: &Path,
+    workspace_scopes: &[config::WorkspaceScope],
+) -> Result<Vec<ScopeInstructionStatus>> {
+    if workspace_scopes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cfg = config::Config::load(root)?;
+    let mut statuses = Vec::new();
+    for scope in workspace_scopes {
+        if !scope.source_root.exists() || !cfg.instructions_for_scope(scope) {
+            continue;
+        }
+        statuses.push(ScopeInstructionStatus {
+            scope: scope.id.clone(),
+            instructions: init::check_instruction_version(&scope.source_root),
+        });
+    }
+    statuses.sort_by(|left, right| left.scope.cmp(&right.scope));
+    Ok(statuses)
+}
+
+fn scope_instruction_label(status: &InstructionStatus) -> String {
+    match status {
+        InstructionStatus::Current { version } => format!("current (v{version})"),
+        InstructionStatus::Stale {
+            found: Some(found), ..
+        } => format!("stale (v{found})"),
+        InstructionStatus::Stale { found: None, .. } => "stale (pre-versioned)".to_string(),
+        InstructionStatus::Missing => "missing".to_string(),
+    }
+}
+
+/// Re-walk each indexed scope's source root through the same cached inspection
+/// `check_index` uses, and report the scopes whose walk dropped a meaningful
+/// share of files for want of an indexer language (`#goindex`).
+fn collect_language_coverage_gaps(
+    root: &Path,
+    cache: &StatusCheckCache,
+) -> Result<Vec<LanguageCoverageGap>> {
+    let scopes = config::Config::submodule_dirs(root)?;
+    let mut gaps = Vec::new();
+
+    if scopes.is_empty() {
+        let db_path = root.join(".tsift/index.db");
+        if db_path.exists()
+            && let Ok(inspection) = cache.inspect_read_only(&db_path, root, false)
+            && let Some(gap) = LanguageCoverageGap::from_summary(
+                None,
+                inspection.total_files,
+                &inspection.summary.skipped,
+            )
+        {
+            gaps.push(gap);
+        }
+        return Ok(gaps);
+    }
+
+    let cfg = config::Config::load(root)?;
+    for scope in scopes {
+        let db_path = cfg.db_path_for(root, &scope.id);
+        if !scope.source_root.exists() || !db_path.exists() {
+            continue;
+        }
+        let Ok(inspection) = cache.inspect_read_only(&db_path, &scope.source_root, false) else {
+            continue;
+        };
+        if let Some(gap) = LanguageCoverageGap::from_summary(
+            Some(scope.id.clone()),
+            inspection.total_files,
+            &inspection.summary.skipped,
+        ) {
+            gaps.push(gap);
+        }
+    }
+    gaps.sort_by(|left, right| left.scope.cmp(&right.scope));
+    Ok(gaps)
 }
 
 fn check_index(root: &Path, cache: &StatusCheckCache) -> Result<IndexStatus> {
@@ -509,11 +662,17 @@ fn build_recommendations(
     index: &IndexStatus,
     summaries: &SummaryStatus,
     instructions: &InstructionStatus,
+    scope_instructions: &[ScopeInstructionStatus],
     workspace: bool,
     summarize_extract: &str,
     kg_present: bool,
 ) -> Recommendations {
-    let refresh = !matches!(instructions, InstructionStatus::Current { .. });
+    // #wsinit: a superproject block can be current while three submodules sit
+    // two releases behind, so scope drift has to reach the `run:` line too.
+    let refresh = !matches!(instructions, InstructionStatus::Current { .. })
+        || scope_instructions
+            .iter()
+            .any(|scope| !matches!(scope.instructions, InstructionStatus::Current { .. }));
     let index_cmd = if workspace {
         "tsift index --workspace ."
     } else {
@@ -1153,6 +1312,40 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
         }
     }
 
+    // #wsinit: index freshness is reported per scope; instruction state was not,
+    // so a submodule two releases behind was invisible from the workspace root.
+    if !report.scope_instructions.is_empty() {
+        let drifted = report
+            .scope_instructions
+            .iter()
+            .filter(|scope| !matches!(scope.instructions, InstructionStatus::Current { .. }))
+            .collect::<Vec<_>>();
+        if !drifted.is_empty() {
+            if compact {
+                for scope in &drifted {
+                    out.push_str(&format!(
+                        "scope_instructions:{} {}\n",
+                        scope.scope,
+                        scope_instruction_label(&scope.instructions)
+                    ));
+                }
+            } else {
+                out.push_str(&format!(
+                    "instructions: stale in {} of {} scopes (run tsift init --workspace)\n",
+                    drifted.len(),
+                    report.scope_instructions.len()
+                ));
+                for scope in &drifted {
+                    out.push_str(&format!(
+                        "  scope {}: {}\n",
+                        scope.scope,
+                        scope_instruction_label(&scope.instructions)
+                    ));
+                }
+            }
+        }
+    }
+
     match &report.summaries {
         SummaryStatus::Available {
             cached_files,
@@ -1182,6 +1375,47 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
 
     if let Some(recovery) = summary_recovery(&report.summaries) {
         out.push_str(&format_summary_recovery_line(recovery, compact));
+    }
+
+    // #goindex: name the languages the index does not cover. `fresh` plus a
+    // file count reads as "the repo is indexed"; without this line a scope that
+    // skipped its dominant language answers every search confidently and empty.
+    if compact {
+        for gap in &report.language_coverage {
+            out.push_str(&format!(
+                "coverage:{} indexed:{} skipped:{} top:{}={}\n",
+                gap.scope.as_deref().unwrap_or("."),
+                gap.indexed_files,
+                gap.skipped_files,
+                gap.dominant_extension,
+                gap.dominant_extension_files
+            ));
+        }
+    } else if !report.language_coverage.is_empty() {
+        out.push_str("language coverage:\n");
+        for gap in &report.language_coverage {
+            let breakdown = gap
+                .skipped_by_extension
+                .iter()
+                .take(6)
+                .map(|(ext, count)| format!("{ext} {count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            match &gap.scope {
+                Some(scope) => out.push_str(&format!(
+                    "  scope {scope}: indexed {} of {} walked files — skipped {}\n",
+                    gap.indexed_files,
+                    gap.indexed_files + gap.skipped_files,
+                    breakdown
+                )),
+                None => out.push_str(&format!(
+                    "  indexed {} of {} walked files — skipped {}\n",
+                    gap.indexed_files,
+                    gap.indexed_files + gap.skipped_files,
+                    breakdown
+                )),
+            }
+        }
     }
 
     if compact {
@@ -1323,6 +1557,124 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("src/beta/lib.rs"), "fn beta_helper() {}\n").unwrap();
         dir
+    }
+
+    // #wsinit regression: `status` collapsed every scope into one
+    // `instructions:` line, so submodules left two releases behind by
+    // `init --workspace` were invisible from the workspace root — and the
+    // superproject block that was current is the one AGENTS.md deliberately
+    // shadows.
+    #[test]
+    fn status_reports_instruction_drift_per_scope() {
+        let dir = setup_workspace();
+        // Root gets a current block; the scopes get nothing.
+        init::init(dir.path(), false, false).unwrap();
+
+        let report = check_status(dir.path()).unwrap();
+        assert!(
+            matches!(report.instructions, InstructionStatus::Current { .. }),
+            "root block is current: {:?}",
+            report.instructions
+        );
+        assert_eq!(report.scope_instructions.len(), 2);
+        assert!(
+            report
+                .scope_instructions
+                .iter()
+                .all(|scope| matches!(scope.instructions, InstructionStatus::Missing)),
+            "both scopes lack a block: {:?}",
+            report.scope_instructions
+        );
+
+        let human = format_human(&report, false);
+        assert!(
+            human.contains("instructions: stale in 2 of 2 scopes"),
+            "{human}"
+        );
+        assert!(human.contains("scope alpha: missing"), "{human}");
+        assert!(
+            report
+                .recommendations
+                .run
+                .as_deref()
+                .is_some_and(|run| run.contains("tsift init --workspace")),
+            "scope drift must reach the run line: {:?}",
+            report.recommendations.run
+        );
+    }
+
+    #[test]
+    fn status_omits_scopes_that_opt_out_of_instructions() {
+        let dir = setup_workspace();
+        init::init(dir.path(), false, false).unwrap();
+        std::fs::create_dir_all(dir.path().join(".tsift")).unwrap();
+        std::fs::write(
+            dir.path().join(".tsift/config.toml"),
+            "[overrides.alpha]\ninstructions = false\n",
+        )
+        .unwrap();
+
+        let report = check_status(dir.path()).unwrap();
+        assert_eq!(report.scope_instructions.len(), 1);
+        assert_eq!(report.scope_instructions[0].scope, "beta");
+    }
+
+    // #goindex regression: `status` reported a scope as `fresh (… 8 files
+    // tracked)` while the walk had silently dropped most of the repo for want
+    // of an indexer language, so the failure surfaced only as confident empty
+    // search results.
+    #[test]
+    fn status_reports_a_scope_whose_dominant_language_is_unindexable() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("keep.rs"), "fn keep() {}\n").unwrap();
+        for idx in 0..8 {
+            std::fs::write(
+                dir.path().join(format!("data{idx}.parquetish")),
+                "not a language tsift indexes\n",
+            )
+            .unwrap();
+        }
+        let db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+
+        let report = check_status(dir.path()).unwrap();
+        let gap = report
+            .language_coverage
+            .first()
+            .expect("a scope that skipped 8 of 9 walked files is a coverage gap");
+        assert_eq!(gap.skipped_files, 8);
+        assert_eq!(gap.dominant_extension, ".parquetish");
+        assert_eq!(gap.dominant_extension_files, 8);
+
+        let human = format_human(&report, false);
+        assert!(
+            human.contains("language coverage:") && human.contains(".parquetish 8"),
+            "status must name the skipped extension: {human}"
+        );
+    }
+
+    // The mirror image: a repo whose files tsift does index must not grow a
+    // coverage warning just because a stray unsupported file sits next to them.
+    #[test]
+    fn status_does_not_report_coverage_gap_for_incidental_skips() {
+        let dir = TempDir::new().unwrap();
+        for idx in 0..10 {
+            std::fs::write(
+                dir.path().join(format!("lib{idx}.rs")),
+                format!("fn helper{idx}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.path().join("notes.txt"), "prose\n").unwrap();
+        let db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+
+        let report = check_status(dir.path()).unwrap();
+        assert!(
+            report.language_coverage.is_empty(),
+            "one stray .txt is not a coverage gap: {:?}",
+            report.language_coverage
+        );
     }
 
     fn hold_wal_lock(db_path: &Path) -> Connection {
@@ -1907,11 +2259,13 @@ mod tests {
             },
             summaries: SummaryStatus::Unavailable,
             instructions: InstructionStatus::Missing,
+            scope_instructions: Vec::new(),
             recommendations: Recommendations {
                 use_commands: vec![],
                 run: Some("tsift init && tsift index .".to_string()),
             },
             reminders: Vec::new(),
+            language_coverage: Vec::new(),
         };
         let output = format_human(&report, false);
         assert!(output.contains("index: missing"));
@@ -1940,6 +2294,7 @@ mod tests {
             instructions: InstructionStatus::Current {
                 version: "0.1.0".to_string(),
             },
+            scope_instructions: Vec::new(),
             recommendations: Recommendations {
                 use_commands: vec![
                     "search".to_string(),
@@ -1950,6 +2305,7 @@ mod tests {
                 run: None,
             },
             reminders: Vec::new(),
+            language_coverage: Vec::new(),
         };
         let output = format_human(&report, false);
         assert!(output.contains("index: fresh"));
@@ -1975,6 +2331,7 @@ mod tests {
                 found: Some("0.0.9".to_string()),
                 expected: "0.1.0".to_string(),
             },
+            scope_instructions: Vec::new(),
             recommendations: Recommendations {
                 use_commands: vec![
                     "search".to_string(),
@@ -2003,6 +2360,7 @@ mod tests {
                 },
                 ".",
             ),
+            language_coverage: Vec::new(),
         };
         let output = format_human(&report, true);
         assert!(output.contains("index: stale tracked:42 stale:3"));
@@ -2027,11 +2385,13 @@ mod tests {
             instructions: InstructionStatus::Current {
                 version: "0.1.0".to_string(),
             },
+            scope_instructions: Vec::new(),
             recommendations: Recommendations {
                 use_commands: vec!["search".to_string()],
                 run: None,
             },
             reminders: Vec::new(),
+            language_coverage: Vec::new(),
         };
         let output = format_human(&report, false);
         assert!(output.contains("recovery: snapshot fallback"));
@@ -2052,11 +2412,13 @@ mod tests {
             instructions: InstructionStatus::Current {
                 version: "0.1.0".to_string(),
             },
+            scope_instructions: Vec::new(),
             recommendations: Recommendations {
                 use_commands: vec!["search".to_string()],
                 run: None,
             },
             reminders: Vec::new(),
+            language_coverage: Vec::new(),
         };
         let output = format_human(&report, false);
         assert!(output.contains("copied live WAL sidecars"));
@@ -2077,11 +2439,13 @@ mod tests {
             instructions: InstructionStatus::Current {
                 version: "0.1.0".to_string(),
             },
+            scope_instructions: Vec::new(),
             recommendations: Recommendations {
                 use_commands: vec!["search".to_string()],
                 run: None,
             },
             reminders: Vec::new(),
+            language_coverage: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"recovery\":\"snapshot_fallback\""));
@@ -2107,11 +2471,13 @@ mod tests {
             instructions: InstructionStatus::Current {
                 version: "0.1.0".to_string(),
             },
+            scope_instructions: Vec::new(),
             recommendations: Recommendations {
                 use_commands: vec!["search".to_string(), "summarize".to_string()],
                 run: None,
             },
             reminders: Vec::new(),
+            language_coverage: Vec::new(),
         };
         let output = format_human(&report, false);
         assert!(output.contains("summaries recovery: snapshot fallback"));
@@ -2134,11 +2500,13 @@ mod tests {
             instructions: InstructionStatus::Current {
                 version: "0.1.0".to_string(),
             },
+            scope_instructions: Vec::new(),
             recommendations: Recommendations {
                 use_commands: vec!["search".to_string()],
                 run: None,
             },
             reminders: Vec::new(),
+            language_coverage: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"state\":\"none\""));

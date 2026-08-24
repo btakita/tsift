@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tsift_graph::lang::Lang;
@@ -11,12 +11,52 @@ pub struct FileEntry {
     pub lang: Lang,
 }
 
+/// Files the walk saw and dropped because no indexer language claims their
+/// extension (`#goindex`).
+///
+/// Skips used to be invisible: a Go module with 26 tracked files indexed 8 of
+/// them and `status` still called the scope `fresh`, so the failure surfaced
+/// only as confident empty search results. Counting them here is what lets
+/// `index` and `status` say a parseable language was left out.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SkipStats {
+    pub files: usize,
+    pub by_extension: BTreeMap<String, usize>,
+}
+
+impl SkipStats {
+    fn record(&mut self, extension: Option<&str>) {
+        self.files += 1;
+        let key = extension
+            .map(|ext| format!(".{ext}"))
+            .unwrap_or_else(|| "(no extension)".to_string());
+        *self.by_extension.entry(key).or_insert(0) += 1;
+    }
+
+    /// Extensions ordered by how many files they cost, most first.
+    pub fn ranked_extensions(&self) -> Vec<(&str, usize)> {
+        let mut ranked = self
+            .by_extension
+            .iter()
+            .map(|(ext, count)| (ext.as_str(), *count))
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(right.0)));
+        ranked
+    }
+
+    /// The single extension that cost the most files, if any were skipped.
+    pub fn dominant_extension(&self) -> Option<(&str, usize)> {
+        self.ranked_extensions().into_iter().next()
+    }
+}
+
 #[derive(Debug)]
 pub struct WalkResult {
     pub entries: Vec<FileEntry>,
     pub dir_mtimes: HashMap<PathBuf, SystemTime>,
     pub pruned_dirs: HashSet<PathBuf>,
     pub stats: PruneStats,
+    pub skips: SkipStats,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -27,7 +67,14 @@ pub struct PruneStats {
 }
 
 pub fn walk_files(root: &Path) -> Result<Vec<FileEntry>> {
+    walk_files_with_skips(root).map(|(entries, _skips)| entries)
+}
+
+/// `walk_files`, plus the count of files dropped for want of an indexer
+/// language (`#goindex`).
+pub fn walk_files_with_skips(root: &Path) -> Result<(Vec<FileEntry>, SkipStats)> {
     let mut entries = Vec::new();
+    let mut skips = SkipStats::default();
     let walker = ignore::WalkBuilder::new(root)
         .hidden(true) // skip hidden files/dirs
         .git_ignore(true)
@@ -40,13 +87,13 @@ pub fn walk_files(root: &Path) -> Result<Vec<FileEntry>> {
             continue;
         }
         let path = dir_entry.path();
-        let ext = match path.extension().and_then(|e| e.to_str()) {
-            Some(e) => e,
-            None => continue,
-        };
-        let lang = match Lang::from_extension(ext) {
+        let ext = path.extension().and_then(|e| e.to_str());
+        let lang = match ext.and_then(Lang::from_extension) {
             Some(l) => l,
-            None => continue,
+            None => {
+                skips.record(ext);
+                continue;
+            }
         };
         let metadata = dir_entry
             .metadata()
@@ -60,7 +107,7 @@ pub fn walk_files(root: &Path) -> Result<Vec<FileEntry>> {
             lang,
         });
     }
-    Ok(entries)
+    Ok((entries, skips))
 }
 
 pub fn walk_files_pruned(
@@ -68,6 +115,7 @@ pub fn walk_files_pruned(
     _stored_dirs: HashMap<PathBuf, SystemTime>,
 ) -> Result<WalkResult> {
     let mut entries = Vec::new();
+    let mut skips = SkipStats::default();
     let mut dir_mtimes = HashMap::new();
     let pruned_dirs = HashSet::new();
     let dirs_pruned = 0usize;
@@ -101,13 +149,13 @@ pub fn walk_files_pruned(
             continue;
         }
 
-        let ext = match path.extension().and_then(|e| e.to_str()) {
-            Some(e) => e,
-            None => continue,
-        };
-        let lang = match Lang::from_extension(ext) {
+        let ext = path.extension().and_then(|e| e.to_str());
+        let lang = match ext.and_then(Lang::from_extension) {
             Some(l) => l,
-            None => continue,
+            None => {
+                skips.record(ext);
+                continue;
+            }
         };
         let metadata = dir_entry
             .metadata()
@@ -131,6 +179,7 @@ pub fn walk_files_pruned(
             dirs_pruned,
             files_pruned,
         },
+        skips,
     })
 }
 

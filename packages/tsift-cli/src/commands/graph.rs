@@ -16,7 +16,8 @@ use crate::{
     annotate_stored_edges_with_tagpath, annotate_stored_symbols_with_tagpath,
     build_explain_budget_report, build_traversal_graph, community_tagpath_cache_part,
     compact_members, detect_communities_cached, envelope_metric, format_edge_groups,
-    inject_tagpath_stale_into_json, open_index_db, print_explain_budget_human,
+    inject_tagpath_stale_into_json, open_graph_index_db, open_index_db,
+    print_explain_budget_human,
     print_json_or_envelope, query_tagpath_root, relativize_edges, relativize_symbols, shell_quote,
     should_collapse_edge_groups, symbol_path_summary, to_json_schema, traversal_report,
     traversal_report_html, update_community_annotation_diagnostics,
@@ -30,6 +31,7 @@ pub(crate) fn cmd_graph(
     callers: bool,
     callees: bool,
     scope: Option<&str>,
+    federated: bool,
     limit: usize,
     json_output: bool,
     compact: bool,
@@ -41,7 +43,11 @@ pub(crate) fn cmd_graph(
     tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    let db = open_index_db(path, scope)?;
+    // #graphfed: at a workspace root with no shared root index, resolve which
+    // scope owns the symbol instead of failing and telling the caller to supply
+    // the scope they were about to ask tsift for.
+    let (db, resolved_scope) = open_graph_index_db(path, scope, federated, symbol)?;
+    let scope = resolved_scope.as_deref();
 
     let show_both = !callers && !callees;
     // Shared mutable state for diagnostic aggregation across the per-side
@@ -831,6 +837,7 @@ pub(crate) fn cmd_explain(
     symbol: &str,
     path: &std::path::Path,
     scope: Option<&str>,
+    federated: bool,
     limit: usize,
     json_output: bool,
     compact: bool,
@@ -845,6 +852,7 @@ pub(crate) fn cmd_explain(
         symbol,
         path,
         scope,
+        federated,
         limit,
         json_output,
         compact,
@@ -865,6 +873,7 @@ pub(crate) fn cmd_explain_with_budget(
     symbol: &str,
     path: &std::path::Path,
     scope: Option<&str>,
+    federated: bool,
     limit: usize,
     json_output: bool,
     compact: bool,
@@ -879,6 +888,11 @@ pub(crate) fn cmd_explain_with_budget(
     tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
+    // #graphfed: resolve the owning scope first so the tagpath root, the
+    // community cache key, and the opened index all agree on which scope
+    // answered.
+    let (db, resolved_scope) = open_graph_index_db(path, scope, federated, symbol)?;
+    let scope = resolved_scope.as_deref();
     let community_tagpath_root = query_tagpath_root(&root, path, scope)?;
     let format = OutputFormat {
         json_output,
@@ -889,7 +903,6 @@ pub(crate) fn cmd_explain_with_budget(
         schema,
         envelope,
     };
-    let db = open_index_db(path, scope)?;
 
     let mut symbols = db.symbol_info(symbol)?;
     let mut callers = db.callers_of(symbol)?;

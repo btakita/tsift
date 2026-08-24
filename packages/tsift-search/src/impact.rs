@@ -420,6 +420,17 @@ fn is_import_line(lang: Lang, line: &str) -> bool {
         Lang::JavaScript | Lang::Jsx => {
             trimmed.starts_with("import ") || trimmed.contains("require(")
         }
+        // Go imports are usually a parenthesized block, so the `import` keyword
+        // is on its own line and each dependency is a bare quoted path.
+        #[cfg(feature = "lang-go")]
+        Lang::Go => {
+            trimmed.starts_with("import ")
+                || trimmed.starts_with("import(")
+                || (trimmed.starts_with('"') && trimmed.ends_with("\""))
+                || trimmed
+                    .split_once(' ')
+                    .is_some_and(|(_alias, rest)| rest.starts_with('"') && rest.ends_with('"'))
+        }
         // GDScript has no `import`: a script pulls in another script by
         // extending it or by `preload`/`load`ing a `res://` path.
         #[cfg(feature = "lang-gdscript")]

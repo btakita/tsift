@@ -314,6 +314,15 @@ pub struct IndexSummary {
     pub warnings: Vec<IndexWarning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prune_stats: Option<PruneStats>,
+    /// Files the walk dropped because no indexer language claims their
+    /// extension (`#goindex`). Reported so a scope whose dominant language is
+    /// unsupported cannot read as a healthy `fresh` index.
+    #[serde(default, skip_serializing_if = "skip_stats_is_empty")]
+    pub skipped: walk::SkipStats,
+}
+
+fn skip_stats_is_empty(skips: &walk::SkipStats) -> bool {
+    skips.files == 0
 }
 
 impl IndexSummary {
@@ -857,7 +866,7 @@ impl IndexDb {
     fn compute_changes_inner(&self, root: &Path, prune: bool) -> Result<IndexSummary> {
         let stored = self.load_stored_files()?;
 
-        let (entries, pruned_dirs, prune_stats) = if prune {
+        let (entries, pruned_dirs, prune_stats, skipped) = if prune {
             let stored_dirs = self.load_dir_state().unwrap_or_default();
             let walk_result = walk::walk_files_pruned(root, stored_dirs)?;
             let mut stats = walk_result.stats;
@@ -866,10 +875,15 @@ impl IndexDb {
                 .filter(|p| walk_result.pruned_dirs.iter().any(|d| p.starts_with(d)))
                 .count();
             stats.files_pruned = pruned_file_count;
-            (walk_result.entries, walk_result.pruned_dirs, Some(stats))
+            (
+                walk_result.entries,
+                walk_result.pruned_dirs,
+                Some(stats),
+                walk_result.skips,
+            )
         } else {
-            let entries = walk::walk_files(root)?;
-            (entries, HashSet::new(), None)
+            let (entries, skips) = walk::walk_files_with_skips(root)?;
+            (entries, HashSet::new(), None, skips)
         };
 
         let (changes, unchanged) = Self::diff_entries(&entries, &stored, &pruned_dirs);
@@ -893,6 +907,7 @@ impl IndexDb {
             changes,
             warnings: Vec::new(),
             prune_stats,
+            skipped,
         })
     }
 
@@ -907,7 +922,7 @@ impl IndexDb {
     fn apply_changes_inner(&self, root: &Path, prune: bool) -> Result<IndexSummary> {
         let stored = self.load_stored_files()?;
 
-        let (entries, pruned_dirs, dir_mtimes, prune_stats) = if prune {
+        let (entries, pruned_dirs, dir_mtimes, prune_stats, skipped) = if prune {
             let stored_dirs = self.load_dir_state().unwrap_or_default();
             let walk_result = walk::walk_files_pruned(root, stored_dirs)?;
             let mut stats = walk_result.stats;
@@ -921,10 +936,11 @@ impl IndexDb {
                 walk_result.pruned_dirs,
                 Some(walk_result.dir_mtimes),
                 Some(stats),
+                walk_result.skips,
             )
         } else {
-            let entries = walk::walk_files(root)?;
-            (entries, HashSet::new(), None, None)
+            let (entries, skips) = walk::walk_files_with_skips(root)?;
+            (entries, HashSet::new(), None, None, skips)
         };
 
         let (changes, unchanged) = Self::diff_entries(&entries, &stored, &pruned_dirs);
@@ -948,6 +964,7 @@ impl IndexDb {
             changes,
             warnings: Vec::new(),
             prune_stats,
+            skipped,
         };
 
         self.conn.execute_batch("SAVEPOINT sp_apply")?;
@@ -1602,14 +1619,26 @@ impl IndexDb {
         }
 
         let query_tags = compute_tags(query);
-        let query_tag_list: Vec<&str> = query_tags
+        let mut query_tag_list: Vec<&str> = query_tags
             .split(',')
             .filter(|tag| !tag.is_empty())
             .collect();
+        // #symnoise: a query made up entirely of language keywords (`def `, `func`,
+        // `class fn`) cannot identify a symbol by name — every Python file has a
+        // `def`, so tag matching just returns whichever symbol names happen to end
+        // in `_def`. Drop tag matching for those queries and leave the lexical
+        // strategy to answer them. Exact-name matching still applies, so a symbol
+        // literally named `def` is still found.
+        let keyword_only_query = !query_tag_list.is_empty()
+            && query_tag_list
+                .iter()
+                .all(|tag| is_language_keyword_tag(tag));
+        if keyword_only_query {
+            query_tag_list.clear();
+        }
         let query_lower = query.to_lowercase();
 
         let exact_match_expr = "name = ?1 COLLATE NOCASE";
-        let mut where_clauses = vec![exact_match_expr.to_string()];
         let mut match_count_terms = Vec::new();
         let mut params = vec![rusqlite::types::Value::from(query.to_string())];
 
@@ -1619,18 +1648,26 @@ impl IndexDb {
             match_count_terms.push(format!(
                 "CASE WHEN instr(',' || COALESCE(tags, '') || ',', {placeholder}) > 0 THEN 1 ELSE 0 END"
             ));
-            where_clauses.push(format!(
-                "instr(',' || COALESCE(tags, '') || ',', {placeholder}) > 0"
-            ));
             params.push(rusqlite::types::Value::from(format!(",{tag},")));
         }
 
-        // Keep the SQL candidate ordering aligned with the Rust-side F1 ranking so the
+        // Keep the SQL candidate ordering aligned with the Rust-side ranking so the
         // bounded query still yields the same top hits without scanning the full table.
         let match_count_expr = if match_count_terms.is_empty() {
             "0".to_string()
         } else {
             match_count_terms.join(" + ")
+        };
+        // #symnoise: require a partial hit to cover at least half the query's tags.
+        // `_run` shares exactly one of `run_scale_helper`'s three tags; admitting it
+        // spends the caller's whole symbol budget on noise that outranks the one file
+        // actually containing the identifier. Enforced in SQL so the `LIMIT` is spent
+        // on candidates that survive the Rust-side filter below.
+        let min_tag_matches = query_min_tag_matches(query_tag_list.len());
+        let where_clauses = if query_tag_list.is_empty() {
+            exact_match_expr.to_string()
+        } else {
+            format!("{exact_match_expr} OR ({match_count_expr}) >= {min_tag_matches}")
         };
         let tag_count_expr = "CASE WHEN tags IS NULL OR tags = '' THEN 0 ELSE LENGTH(tags) - LENGTH(REPLACE(tags, ',', '')) + 1 END";
         let ast_columns = self.ast_span_select_columns()?;
@@ -1647,7 +1684,7 @@ impl IndexDb {
                  file ASC, \
                  line ASC \
              LIMIT ?{limit_param_idx}",
-            where_clauses.join(" OR ")
+            where_clauses
         );
         params.push(rusqlite::types::Value::from(
             i64::try_from(limit).unwrap_or(i64::MAX),
@@ -1717,17 +1754,22 @@ impl IndexDb {
                     .filter(|qt| sym_tag_list.contains(qt))
                     .count();
 
-                if matching == 0 {
+                // #symnoise: mirror the SQL coverage floor. A hit that covers less
+                // than half the query's tags is noise at any absolute score, so it
+                // never reaches the caller — an empty symbol section plus a real
+                // lexical hit is a better answer than three confident wrong ones.
+                if matching < min_tag_matches {
                     continue;
                 }
 
                 let precision = matching as f64 / query_tag_list.len() as f64;
                 let recall = matching as f64 / sym_tag_list.len() as f64;
-                let f1 = if precision + recall > 0.0 {
-                    2.0 * precision * recall / (precision + recall)
-                } else {
-                    0.0
-                };
+                // #symnoise: weight query coverage over symbol recall (F0.5 rather
+                // than F1). Plain F1 scores every one-of-three match at a flat
+                // 0.5000 because a single-tag symbol has perfect recall, which is
+                // exactly the ambiguity the caller cannot discriminate on. F0.5
+                // spreads those apart: 1-of-3 lands at 0.38 and 2-of-3 at 0.71.
+                let score = f_beta(precision, recall, PARTIAL_TAG_SCORE_BETA);
 
                 let match_type = if matching == query_tag_list.len() {
                     "all_tags"
@@ -1748,7 +1790,7 @@ impl IndexDb {
                     body_start_byte,
                     body_end_byte,
                     tags,
-                    score: f1,
+                    score,
                     match_type: match_type.to_string(),
                     tagpath_handle: None,
                 });
@@ -1910,6 +1952,43 @@ fn clear_lock_metadata(file: &mut File) -> std::io::Result<()> {
     file.seek(SeekFrom::Start(0))?;
     file.sync_data()?;
     Ok(())
+}
+
+/// Precision weight for partial symbol-tag scoring (`#symnoise`). `beta < 1`
+/// weights precision — how much of the *query* the symbol covers — above recall.
+const PARTIAL_TAG_SCORE_BETA: f64 = 0.5;
+
+/// Declaration and control keywords that appear as name tags across the indexed
+/// languages but cannot identify a symbol when they are the whole query
+/// (`#symnoise`). Deliberately narrow: only forms that are keywords in at least
+/// one supported language *and* carry no naming signal on their own. Words that
+/// routinely appear as meaningful name parts (`new`, `type`, `string`, `map`)
+/// stay out, because dropping them would lose real hits.
+const LANGUAGE_KEYWORD_TAGS: &[&str] = &[
+    "async", "await", "case", "catch", "class", "def", "elif", "else", "endif", "enum", "export",
+    "extends", "finally", "fn", "func", "function", "impl", "implements", "import", "interface",
+    "lambda", "namespace", "package", "private", "protected", "public", "return", "struct",
+    "switch", "throw", "trait", "typedef", "while", "yield",
+];
+
+fn is_language_keyword_tag(tag: &str) -> bool {
+    LANGUAGE_KEYWORD_TAGS.binary_search(&tag).is_ok()
+}
+
+/// Minimum number of query tags a partial symbol match must cover (`#symnoise`).
+/// Half the query, rounded up: 1-of-1 and 1-of-2 pass, 1-of-3 does not.
+fn query_min_tag_matches(query_tag_count: usize) -> usize {
+    query_tag_count.div_ceil(2).max(1)
+}
+
+/// Weighted harmonic mean of precision and recall. `beta < 1` favors precision.
+fn f_beta(precision: f64, recall: f64, beta: f64) -> f64 {
+    let beta_sq = beta * beta;
+    let denominator = beta_sq * precision + recall;
+    if denominator <= 0.0 {
+        return 0.0;
+    }
+    (1.0 + beta_sq) * precision * recall / denominator
 }
 
 fn compute_tags(name: &str) -> String {
@@ -2543,6 +2622,95 @@ mod tests {
         );
     }
 
+    // #symnoise regression: `_run` shares exactly one of `run_scale_helper`'s
+    // three tags. Before the coverage floor, F1 scored every such hit at a flat
+    // 0.5000 and filled the symbol section with them, outranking the file that
+    // actually contains the identifier.
+    #[test]
+    fn symbol_search_drops_one_of_three_tag_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lib.rs"),
+            "fn _run() {}\nfn run_scale() {}\nfn run_scale_helper() {}",
+        )
+        .unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let hits = db.symbol_search("run_scale_helper", 10).unwrap();
+        let names = hits.iter().map(|hit| hit.name.as_str()).collect::<Vec<_>>();
+        assert!(
+            !names.contains(&"_run"),
+            "a one-of-three tag match is noise and must not reach the caller: {names:?}"
+        );
+        assert_eq!(
+            hits.first().map(|hit| hit.name.as_str()),
+            Some("run_scale_helper"),
+            "the exact name must rank first: {names:?}"
+        );
+        let two_of_three = hits
+            .iter()
+            .find(|hit| hit.name == "run_scale")
+            .expect("a two-of-three tag match still clears the coverage floor");
+        assert_eq!(two_of_three.match_type, "partial_tags");
+        assert!(
+            two_of_three.score > 0.5,
+            "precision-weighted scoring must lift a two-of-three match above the old flat 0.5: {}",
+            two_of_three.score
+        );
+    }
+
+    // #symnoise regression: every Python file contains `def `, so tag matching
+    // just surfaces whichever symbol names happen to end in `_def`.
+    #[test]
+    fn symbol_search_treats_keyword_only_queries_as_lexical() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("store.py"),
+            "def get_record_def(): pass\ndef cached_source_def(): pass",
+        )
+        .unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        assert!(
+            db.symbol_search("def ", 10).unwrap().is_empty(),
+            "a keyword-only query cannot identify a symbol by name"
+        );
+        assert!(
+            db.symbol_search("class", 10).unwrap().is_empty(),
+            "a keyword-only query cannot identify a symbol by name"
+        );
+        assert_eq!(
+            db.symbol_search("get_record_def", 10)
+                .unwrap()
+                .first()
+                .map(|hit| hit.name.clone()),
+            Some("get_record_def".to_string()),
+            "a real identifier that happens to contain a keyword tag still matches"
+        );
+    }
+
+    #[test]
+    fn language_keyword_tags_are_sorted_for_binary_search() {
+        let mut sorted = LANGUAGE_KEYWORD_TAGS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted, LANGUAGE_KEYWORD_TAGS,
+            "LANGUAGE_KEYWORD_TAGS is looked up with binary_search and must stay sorted"
+        );
+    }
+
+    #[test]
+    fn query_min_tag_matches_requires_half_the_query() {
+        assert_eq!(query_min_tag_matches(0), 1);
+        assert_eq!(query_min_tag_matches(1), 1);
+        assert_eq!(query_min_tag_matches(2), 1);
+        assert_eq!(query_min_tag_matches(3), 2);
+        assert_eq!(query_min_tag_matches(4), 2);
+        assert_eq!(query_min_tag_matches(5), 3);
+    }
+
     #[test]
     fn symbol_search_no_match() {
         let dir = tempfile::tempdir().unwrap();
@@ -2975,6 +3143,7 @@ def list_items():
             changes: vec![],
             warnings: vec![],
             prune_stats: None,
+            skipped: Default::default(),
         };
         assert!(s.has_changes());
     }
@@ -2990,6 +3159,7 @@ def list_items():
             changes: vec![],
             warnings: vec![],
             prune_stats: None,
+            skipped: Default::default(),
         };
         assert!(s.has_changes());
     }
@@ -3005,6 +3175,7 @@ def list_items():
             changes: vec![],
             warnings: vec![],
             prune_stats: None,
+            skipped: Default::default(),
         };
         assert!(s.has_changes());
     }
@@ -3020,6 +3191,7 @@ def list_items():
             changes: vec![],
             warnings: vec![],
             prune_stats: None,
+            skipped: Default::default(),
         };
         assert!(!s.has_changes());
     }
@@ -3035,6 +3207,7 @@ def list_items():
             changes: vec![],
             warnings: vec![],
             prune_stats: None,
+            skipped: Default::default(),
         };
         assert!(!s.has_changes());
     }

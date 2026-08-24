@@ -306,6 +306,9 @@ pub(crate) fn cmd_index(
                 ps.dirs_pruned, ps.dirs_walked, ps.files_pruned
             );
         }
+        if summary.skipped.files > 0 {
+            print!(" unsupported:{}", summary.skipped.files);
+        }
         println!();
     } else {
         let mode = if rebuild {
@@ -329,6 +332,22 @@ pub(crate) fn cmd_index(
             );
         }
         println!();
+        // #goindex: a skipped file used to leave no trace anywhere, so a Go
+        // module indexing 8 of its 26 files still read as a complete index.
+        if summary.skipped.files > 0 {
+            let breakdown = summary
+                .skipped
+                .ranked_extensions()
+                .into_iter()
+                .take(6)
+                .map(|(ext, count)| format!("{ext} {count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "  skipped: {} (unsupported extension) — {}",
+                summary.skipped.files, breakdown
+            );
+        }
         if !quiet && !summary.changes.is_empty() {
             println!();
             for change in &summary.changes {
@@ -429,6 +448,12 @@ pub(crate) fn cmd_search_with_budget(
         envelope,
     };
     let root = lint::resolve_project_root_or_canonical_path(&base_path)?;
+    // #wsfed: federate by default at a workspace root with no shared root index,
+    // for every strategy. The `exact` path already federated there, so plain
+    // `tsift search` succeeded or exited 1 depending on whether the query
+    // happened to route to `exact` — a rule no caller can infer.
+    let federated =
+        federated || crate::should_auto_federate(&root, &base_path, scope.as_deref(), federated)?;
     let search_cache_dir = root.join(".tsift/search-cache");
     // #ve5f path-prune: when `--path` (base_path) narrows to a strict subdirectory of
     // the project root, the FTS/lexical path still searches the *whole* project index

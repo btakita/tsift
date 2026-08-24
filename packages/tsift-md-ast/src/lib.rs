@@ -337,8 +337,23 @@ fn markdown_list_item_name(node: tree_sitter::Node<'_>, source: &[u8]) -> String
     if marker_stripped.is_empty() {
         "list item".to_string()
     } else {
-        marker_stripped.chars().take(96).collect()
+        clip_markdown_name(marker_stripped, MARKDOWN_NAME_CLIP_CHARS)
     }
+}
+
+/// Maximum characters kept in a generated markdown node name before it is clipped.
+pub const MARKDOWN_NAME_CLIP_CHARS: usize = 96;
+
+/// Clip a generated markdown name, marking the clip. A silently truncated name
+/// is indistinguishable from a real one — `` `tsift --envelope source-read <file>
+/// --budget `` reads as a symbol rather than as a fragment — so the ellipsis is
+/// part of the contract, not decoration (`#docsym`).
+pub fn clip_markdown_name(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max_chars).collect();
+    format!("{}…", kept.trim_end())
 }
 
 fn markdown_next_line_start(source: &[u8], byte: usize) -> usize {
@@ -376,6 +391,29 @@ fn markdown_point_for_byte(source: &[u8], byte: usize) -> Option<tree_sitter::Po
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #docsym regression: a name clipped at 96 chars with no marker reads as a
+    // real name rather than as a fragment.
+    #[test]
+    fn clipped_markdown_names_are_marked() {
+        assert_eq!(clip_markdown_name("short name", 96), "short name");
+        assert_eq!(clip_markdown_name("abcdef", 3), "abc…");
+        assert_eq!(clip_markdown_name("ab cdef", 3), "ab…");
+
+        let long_item = "a".repeat(200);
+        let src = format!("- {long_item}\n").into_bytes();
+        let symbols = markdown_symbols(&src);
+        let item = symbols
+            .iter()
+            .find(|symbol| symbol.kind == "list_item")
+            .expect("list item symbol");
+        assert!(
+            item.name.ends_with('…'),
+            "a clipped list-item name must mark the clip: {}",
+            item.name
+        );
+        assert_eq!(item.name.chars().count(), MARKDOWN_NAME_CLIP_CHARS + 1);
+    }
 
     #[test]
     fn parses_headings_into_sections() {

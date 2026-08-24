@@ -65,9 +65,9 @@ reaches is what it can actually do:
 
 | Fans out to | Meaning | Languages |
 |---|---|---|
-| `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, markdown |
+| `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, go, markdown |
 | `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, gdscript — `ast-grep-language` ships no Zig or GDScript grammar |
-| `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | c, cpp, csharp, css, dart, elixir, go, haskell, hcl, html, java, json, lua, nix, php, ruby, scala, solidity, swift, yaml |
+| `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | c, cpp, csharp, css, dart, elixir, haskell, hcl, html, java, json, lua, nix, php, ruby, scala, solidity, swift, yaml |
 
 Structural-only is a deliberate tier, not an oversight. A tree-sitter grammar is
 enough to match and rewrite a shape, but indexing additionally needs per-language
@@ -82,6 +82,12 @@ bounded diff preview, `expected_content_hash` conflict detection, `--verify` in
 a detached temp worktree, batch rollback — while remaining unsearchable and
 ungraphable. The distinction to hold onto is that indexing buys *navigation*,
 not *rewriting*.
+
+Go was promoted this way in 0.1.83 (`#goindex`): it had an ast-grep grammar and
+no tag queries, so `search`, `explain`, and `graph` were blind to every Go symbol
+in a Go module and `call_edges` stayed empty, while `status` still reported the
+scope as `fresh`. It now carries symbol and call queries, an identifier-node-kind
+set, and the indexed executor tier.
 
 Promoting a structural-only language therefore means adding the graph/search
 side. That unlocks `rename_symbol` immediately — it reads occurrences out of the

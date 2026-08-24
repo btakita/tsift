@@ -113,8 +113,9 @@ Opt-in recovery:
 - when duplicate submodules share the same trailing directory name, leaf-name selectors fail closed as ambiguous and the full `.gitmodules` path becomes the required scope id
 - `tsift status`, `tsift search`, `tsift index`, `tsift locks`, `graph`, `communities`, `path`, and `explain` now resolve nested input paths against the nearest ancestor project/workspace root (`.tsift/` or workspace `.gitmodules`), so subdirectory invocations reuse the intended project/workspace indexes instead of creating nested `.tsift/index.db` state or inspecting synthetic nested lock files
 - when a nested workspace path already falls under exactly one submodule source root, `tsift search`, `tsift locks`, `graph`, `communities`, `path`, and `explain` now infer that scoped index automatically instead of requiring a redundant `--scope <scope>` selector
-- workspace roots that only have scoped `.tsift/indexes/<scope>/index.db` files now make plain `tsift search` fail closed until the caller picks `--scope <scope>` or `--federated`, instead of auto-creating a second shared root index layout
-- workspace roots that only have scoped `.tsift/indexes/<scope>/index.db` files now make `graph`, `communities`, `path`, and `explain` fail closed until the caller picks `--scope <scope>`, instead of surfacing a misleading missing-root-index error
+- workspace roots that only have scoped `.tsift/indexes/<scope>/index.db` files **federate by default** for every search strategy (`#wsfed`). Previously plain `tsift search` failed closed there — but only for some queries: an identifier that auto-promoted to the `exact` backend federated fine, while anything falling through to `fts`/`lexical` exited 1 demanding `--scope <scope>` or `--federated`. Same directory, same command, same flags; the observable rule was "add `--federated` if your query has no underscore in it", which no caller can infer. Federation there is exactly what the `exact` path already did, so `--federated` is now explicit opt-in for the non-workspace case and `--scope` remains the narrowing flag. Auto-federation is decided by the same precedence the target resolver uses, so an explicit `--scope`, a path that infers a submodule or cargo package, an agent-doc task path, or an existing shared root `.tsift/index.db` all still win. A workspace whose every scope opts out of federation fails closed with that stated as the reason, rather than returning silent empty results
+- `graph` and `explain` accept `--federated` and resolve the owning scope automatically at a workspace root with no shared root index (`#graphfed`). `search` already resolved a symbol to a path from the same index set without a flag, so the information needed to pick a scope was always reachable; the two graph commands nonetheless failed and told the caller to supply the scope they were about to ask tsift for — while `status` and the generated Code Navigation block both recommend those commands by name. Resolution walks the federated scoped indexes for a definition of the symbol, falling back to a scope that only calls it, and prefers definitions with a deterministic scope-id tiebreak. When more than one scope matches, the command answers from the first and names the others on stderr so the caller can narrow in one step. A symbol no scope defines fails with the list of scopes searched. Cross-scope call edges remain out of scope: resolution answers within the owning scope and says which scope that was
+- workspace roots that only have scoped `.tsift/indexes/<scope>/index.db` files still make `communities` and `path` fail closed until the caller picks `--scope <scope>`: neither has a single symbol to resolve from — `communities` reads the whole index, and `path` spans two symbols whose scopes may differ
 - `tsift search` symbol-hit reads now reopen `index.db` through the same resilient read-only helper used by other index consumers, so a live SQLite lock that appears after the stale-index precheck still falls back to a snapshot copy instead of bubbling a raw SQLite lock error
 - writable index updates now claim an OS-backed exclusive lock on the sibling `index.lock` sidecar first, so concurrent `tsift index` / `tsift search --autoindex` writers fail fast with a tsift-owned error instead of surfacing raw SQLite lock contention or PID-recycling false positives
 - lock diagnostics intentionally distinguish the tsift-owned `index.lock` sidecar from SQLite WAL/SHM sidecar state: if `tsift locks` sees no live `index.lock` holder but does see live WAL/SHM sidecars, it recommends checking for a wedged SQLite writer and notes that read-only status/search consumers can keep using WAL-aware snapshot fallback
@@ -196,6 +197,35 @@ To make the Knowledge Graph discoverable, `tsift status` promotes `kg` into its 
 
 When an index is present, the AST symbol-ranking prepass is now bounded: SQLite only pulls exact-name rows and overlapping-tag candidates, orders them by exact/tag overlap, and caps that candidate scan to the requested search `--limit` instead of loading the full `symbols` table into memory first.
 
+### Symbol-match ranking (`#symnoise`)
+
+Symbol matches are printed first and carry the highest-confidence framing, so a
+caller that reads that section and stops — the whole point of a bounded envelope
+— must not be handed wrong locations. Three rules keep the section honest:
+
+- **Query coverage floor.** A partial-tag hit must cover at least half the
+  query's tags, rounded up. `_run` shares exactly one of `run_scale_helper`'s
+  three tags; admitting it spent the caller's whole symbol budget on unrelated
+  short functions in an unrelated scope, ranked above the one file that actually
+  contained the identifier. The floor is enforced in SQL as well as in Rust, so
+  the candidate `LIMIT` is spent on rows that survive it.
+- **Precision-weighted scoring.** Partial hits score by F0.5 rather than F1,
+  weighting coverage of the *query* over recall against the symbol. Plain F1
+  scored every one-of-three match at a flat `0.5000`, because a single-tag symbol
+  has perfect recall — so "three matches at the same score" read as genuine
+  ambiguity rather than as noise, with no signal to discriminate on. Under F0.5 a
+  one-of-three match lands near `0.38` and a two-of-three near `0.71`.
+- **Keyword-only queries are lexical.** A query whose every tag is a language
+  keyword (`def `, `func`, `class fn`) cannot identify a symbol by name — every
+  Python file contains `def `, so tag matching just surfaced whichever symbols
+  happened to end in `_def`. Tag matching is skipped for those queries and the
+  lexical strategy answers them. Exact-name matching still applies, so a symbol
+  literally named `def` is still found.
+
+When nothing clears the floor the symbol section is empty rather than padded to
+`--limit`: an empty symbol section plus a real lexical hit is a better answer
+than three confident wrong ones.
+
 ## Index Quiet Mode
 
 `tsift index --quiet` (or `-q`) suppresses the per-file change list, printing only the summary line. `--exit-code` implies `--quiet`.
@@ -246,6 +276,8 @@ With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject
 12. The injected section also steers harnesses toward envelope-backed `search`, `explain`, `session-review`, `context-pack`, and digest-runner artifacts instead of raw transcript replays, `git diff/show/log` patch dumps, or verbose build/test output reads.
 13. Verification guidance is capability-based. A Makefile contributes `make check` only when it defines a `check` target; otherwise a `justfile` contributes the first unambiguous `check`, `test`, or `verify` recipe. GitHub Actions contributes `gh run list --limit 1` only when `.github/workflows/` exists and `gh` is executable; GitLab contributes `glab ci status` only when `.gitlab-ci.yml` exists and `glab` is executable. Missing or ambiguous capabilities emit no verification sentence instead of a command that will fail.
 14. The injected section is a hot-path router, not a manual: it carries the session-start rule, the envelope-over-raw-read substitutions, and any detected verification rule, and defers budgets, `tsift workflow search`, `report.scale_guard` handling, the `tsift rewrite --run` path for harnesses without `PreToolUse` hooks, and Codex/OpenCode integration to `.agent/runbooks/code-navigation.md`. Because `tsift init` generates that runbook itself, the pair ships together in every initialized checkout — a standalone checkout is never left with a pointer to a file that does not exist. A repository that also ships a current `.claude/skills/tsift/SKILL.md` should use that skill as the deeper source.
+
+15. With `--workspace`, the instruction surface is refreshed in **every** workspace scope, not only the superproject (`#wsinit`). `status` already maintains index state per scope, so stopping instructions at the root produced a workspace whose index was uniformly current and whose instruction blocks were not — and the stale blocks are not merely old, they teach flags this release deprecated and a runbook path 0.1.81 migrated away from. Each scope prints a `scope <id>: <path>` header followed by the same per-path lines the root emits. Harness integrations (`--codex`, `--opencode`) stay at the root the operator invoked them from; only the Code Navigation block and its runbook fan out, because that is what `status` reports on and what a submodule-local harness actually loads. A scope opts out with `instructions = false` under its `.tsift/config.toml` override and prints `scope <id>: skipped (instructions = false in .tsift/config.toml)`.
 
 The OpenCode command shortcut set is intentionally prompt-template based rather than a background hook: OpenCode already reads project `AGENTS.md`, and the managed commands give operators explicit `/tsift-status`, `/tsift-session-review`, `/tsift-context-pack`, `/tsift-diff-digest`, `/tsift-test-digest`, `/tsift-log-digest`, `/tsift-rewrite-run`, `/tsift-explain`, `/tsift-symbol-read`, and `/tsift-graph` entrypoints that route common workflows through bounded tsift evidence without depending on raw terminal replay.
 
@@ -381,6 +413,49 @@ recommendations:
   run: tsift init --workspace && tsift index --workspace .  (1 missing scope)
 ```
 
+### Language coverage (`#goindex`)
+
+`status` reports the scopes where the index walk dropped a meaningful share of
+the files it saw because no indexer language claims their extension. Without it,
+a scope indexing 8 of its 26 tracked files still printed `fresh (… 8 files
+tracked)`, and the gap surfaced only as confident empty search results — the
+worst shape for an agent that AGENTS.md tells to prefer `tsift search` over
+`grep` and to read full source only when tsift is insufficient.
+
+```
+language coverage:
+  scope go-tool: indexed 8 of 26 walked files — skipped .go 7, .json 6, .txt 5
+```
+
+A gap is reported only when the skipped files are at least a quarter of the walk
+*and* the dominant skipped extension costs three files or more, so a repo with a
+stray `.txt` beside 600 indexed sources does not grow a warning. `tsift index`
+reports the same fact per run as `skipped: N (unsupported extension) — .go 7,
+.json 6`; `--compact` shortens it to `unsupported:N`.
+
+### Per-scope instruction state (`#wsinit`)
+
+Index freshness is reported per scope; instruction state used to be a single
+workspace-level line, so submodules left behind by `init --workspace` were
+invisible from the workspace root. That is the drift that matters most: the
+Code Navigation block tells an agent to switch to the submodule root so the
+narrower local instructions load, which makes the un-refreshed file the one
+actually consulted.
+
+```
+instructions: current (v0.1.83)
+instructions: stale in 3 of 6 scopes (run tsift init --workspace)
+  scope py-api: stale (v0.1.80)
+  scope go-tool: stale (v0.1.80)
+  scope viewer: missing
+```
+
+Scope drift also reaches the `run:` recommendation, so a workspace whose
+superproject block is current but whose submodules are not still recommends
+`tsift init --workspace`. A scope opts out with `instructions = false` under its
+`.tsift/config.toml` override; an opted-out scope is omitted from this list
+rather than reported as `missing`.
+
 ### JSON Schema
 
 ```json
@@ -407,6 +482,19 @@ recommendations:
     ]
   },
   "instructions": { "state": "current|stale|missing", "version": "0.1.0", "found": "0.0.1", "expected": "0.1.0" },
+  "scope_instructions": [
+    { "scope": "py-api", "instructions": { "state": "stale", "found": "0.1.80", "expected": "0.1.83" } }
+  ],
+  "language_coverage": [
+    {
+      "scope": "go-tool",
+      "indexed_files": 8,
+      "skipped_files": 18,
+      "dominant_extension": ".go",
+      "dominant_extension_files": 7,
+      "skipped_by_extension": [[".go", 7], [".json", 6], [".txt", 5]]
+    }
+  ],
   "summaries": { "state": "available|none|unavailable", "cached_files": N, "total_indexed_files": N, "coverage_pct": N },
   "recommendations": { "use": ["search", "explain", ...], "run": "tsift index ." },
   "reminders": ["index stale: run `tsift index .` before relying on tsift search/explain/graph (8 stale files); no summaries are cached, so run `tsift summarize --extract .` after the index is fresh when summary refs are needed"]

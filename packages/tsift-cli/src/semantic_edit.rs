@@ -1520,17 +1520,20 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         family: SemanticEditLanguageFamily::Structural,
         formatter: SemanticEditFormatterContract::None,
     },
+    // #goindex promoted Go out of the structural-only tier: it now has a
+    // `tsift-graph` binding as well as an ast-grep grammar, so identifier
+    // occurrences and the rename's extent are both resolvable.
     SemanticEditLanguageContract {
         executor: SemanticEditExecutorLanguage::Go,
         id: "go",
         name: "Go",
-        graph_lang: None,
+        graph_lang: Some(graph::Lang::Go),
         temp_suffix: ".go",
         aliases: &["go", "golang"],
         extensions: &["go"],
-        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
-        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
-        family: SemanticEditLanguageFamily::Structural,
+        recognized_intents: SEMANTIC_EDIT_INDEXED_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_INDEXED_KINDS,
+        family: SemanticEditLanguageFamily::Indexed,
         formatter: SemanticEditFormatterContract::None,
     },
     SemanticEditLanguageContract {
@@ -2243,6 +2246,26 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
         ],
     },
     SemanticEditRenameFixture {
+        executor: SemanticEditExecutorLanguage::Go,
+        alias: "go",
+        // Go spells a struct field, a field read, a method name, and a method
+        // call all as `field_identifier`. Only the callable positions can be
+        // the function being renamed; the struct field and the read off it
+        // merely share the name and must survive.
+        source: "package main\n\n// widgetCount comment\ntype Panel struct {\n\twidgetCount int\n}\n\nfunc widgetCount() int { return 3 }\n\nfunc describe(p Panel) int {\n\tlabel := \"widgetCount\"\n\t_ = label\n\treturn widgetCount() + p.widgetCount\n}\n",
+        symbol: "widgetCount",
+        symbol_kind: "function",
+        new_name: "gadgetCount",
+        expected_replacements: 2,
+        renamed: &["func gadgetCount() int", "return gadgetCount() +"],
+        untouched: &[
+            "// widgetCount comment",
+            "\"widgetCount\"",
+            "\twidgetCount int",
+            "p.widgetCount",
+        ],
+    },
+    SemanticEditRenameFixture {
         executor: SemanticEditExecutorLanguage::GdScript,
         alias: "gdscript",
         // `func widget_count` and `var widget_count` are both `name` nodes;
@@ -2702,6 +2725,16 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             "gdscript",
             SEMANTIC_EDIT_INDEXED_EXTRACT_KINDS,
             SEMANTIC_EDIT_INDEXED_EXTRACT_KINDS,
+            SemanticEditFormatterContract::None,
+        ),
+        // #goindex moved Go from the structural-only tier to the indexed tier.
+        (
+            "go",
+            "cmd/main.go",
+            SemanticEditExecutorLanguage::Go,
+            "go",
+            SEMANTIC_EDIT_INDEXED_KINDS,
+            SEMANTIC_EDIT_INDEXED_KINDS,
             SemanticEditFormatterContract::None,
         ),
     ];
@@ -7569,7 +7602,7 @@ mod structural_rewrite_tests {
         // instead. A collapsed table would satisfy both loops vacuously.
         assert_eq!(
             SEMANTIC_EDIT_RENAME_FIXTURES.len(),
-            10,
+            11,
             "the rename conformance table has {} rows",
             SEMANTIC_EDIT_RENAME_FIXTURES.len()
         );

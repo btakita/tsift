@@ -124,6 +124,12 @@ pub fn identifier_node_kinds(lang: Lang) -> &'static [&'static str] {
         // `occurrence_is_renamable` narrows it to the name positions.
         #[cfg(feature = "lang-bash")]
         Lang::Bash => &["word", "variable_name"],
+        // Go splits selectors and struct-field/method names into
+        // `field_identifier`, and type positions into `type_identifier`; a bare
+        // reference or declaration is `identifier`. `package_identifier` is
+        // deliberately absent — renaming a package is a directory move.
+        #[cfg(feature = "lang-go")]
+        Lang::Go => &["identifier", "type_identifier", "field_identifier"],
         // GDScript splits the two: `name` is the declared name of a statement
         // or block, `identifier` is every reference to one.
         #[cfg(feature = "lang-gdscript")]
@@ -194,10 +200,122 @@ fn occurrence_matches_target(
         Lang::Kotlin => kotlin_occurrence_matches_target(node, source, target),
         #[cfg(feature = "lang-zig")]
         Lang::Zig => zig_occurrence_matches_target(node, source, target),
+        #[cfg(feature = "lang-go")]
+        Lang::Go => go_occurrence_matches_target(node, source, target),
         _ => {
             let _ = node;
             true
         }
+    }
+}
+
+/// Go spells a struct field declaration, a field read, a method name, and a
+/// package-qualified reference all as `field_identifier` (`#goindex`).
+///
+/// The declaration position is decidable and is never a `Lang::symbol_query`
+/// capture, so it is ruled out outright. For a selector, the receiver settles
+/// it: a package name this file imported reaches a package-level declaration
+/// and must be renamed; anything else is a value, where only the callee
+/// position of a call can still be the function being renamed.
+#[cfg(feature = "lang-go")]
+fn go_occurrence_matches_target(node: Node, source: &[u8], target: RenameTarget) -> bool {
+    let Some(parent) = node.parent() else {
+        return true;
+    };
+    match parent.kind() {
+        // A struct field declaration. `Lang::symbol_query` captures struct
+        // *type* names, never their field names, so this can never be the
+        // symbol a resolved rename selected.
+        "field_declaration" => !parent
+            .children_by_field_name("name", &mut parent.walk())
+            .any(|name| name.id() == node.id()),
+        "selector_expression" => {
+            if parent
+                .child_by_field_name("field")
+                .is_none_or(|field| field.id() != node.id())
+            {
+                return true;
+            }
+            if go_receiver_is_imported_package(parent, source) {
+                return true;
+            }
+            target == RenameTarget::Callable
+                && parent.parent().is_some_and(|call| {
+                    call.kind() == "call_expression"
+                        && call
+                            .child_by_field_name("function")
+                            .is_some_and(|function| function.id() == parent.id())
+                })
+        }
+        _ => true,
+    }
+}
+
+/// Whether the receiver of a `selector_expression` is a package name bound by
+/// this file's imports.
+///
+/// `import "net/http"` binds `http`; `import h "net/http"` binds `h`. A local
+/// variable that shadows an imported package resolves to "package" here and
+/// keeps the occurrence — the over-renaming direction, which this module
+/// prefers because an extra rename is visible and a dropped one is not.
+#[cfg(feature = "lang-go")]
+fn go_receiver_is_imported_package(selector: Node, source: &[u8]) -> bool {
+    let Some(mut operand) = selector.child_by_field_name("operand") else {
+        return false;
+    };
+    while operand.kind() == "selector_expression" {
+        let Some(inner) = operand.child_by_field_name("operand") else {
+            return false;
+        };
+        operand = inner;
+    }
+    if operand.kind() != "identifier" && operand.kind() != "package_identifier" {
+        return false;
+    }
+    let Ok(name) = operand.utf8_text(source) else {
+        return false;
+    };
+    go_file_imports_package(selector, name, source)
+}
+
+#[cfg(feature = "lang-go")]
+fn go_file_imports_package(node: Node, name: &str, source: &[u8]) -> bool {
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut found = false;
+    go_walk_import_specs(root, source, &mut |bound| {
+        if bound == name {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Call `visit` with the local name each `import_spec` in the tree binds.
+#[cfg(feature = "lang-go")]
+fn go_walk_import_specs(node: Node, source: &[u8], visit: &mut impl FnMut(&str)) {
+    if node.kind() == "import_spec" {
+        if let Some(alias) = node.child_by_field_name("name")
+            && let Ok(text) = alias.utf8_text(source)
+        {
+            visit(text);
+            return;
+        }
+        if let Some(path) = node.child_by_field_name("path")
+            && let Ok(text) = path.utf8_text(source)
+        {
+            let trimmed = text.trim_matches('"');
+            if let Some(last) = trimmed.rsplit('/').next() {
+                visit(last);
+            }
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        go_walk_import_specs(child, source, visit);
     }
 }
 

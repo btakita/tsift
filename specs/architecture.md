@@ -199,7 +199,7 @@ Each grammar is a compile-time feature. Default includes all priority languages.
 
 ```toml
 [features]
-default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-gdscript", "lang-markdown"]
+default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-gdscript", "lang-markdown"]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-python = ["dep:tree-sitter-python"]
 lang-typescript = ["dep:tree-sitter-typescript"]
@@ -209,7 +209,7 @@ lang-zig = ["dep:tree-sitter-zig"]
 lang-bash = ["dep:tree-sitter-bash"]
 lang-gdscript = ["dep:tree-sitter-gdscript"]
 lang-markdown = ["dep:tree-sitter-md"]
-all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-gdscript", "lang-markdown"]
+all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-gdscript", "lang-markdown"]
 ```
 
 ### Grammar Crates

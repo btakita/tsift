@@ -61,6 +61,12 @@ pub struct DiffDigestFile {
     pub path: String,
     pub status: DiffDigestFileStatus,
     pub touched_symbols: Vec<String>,
+    /// Structural summary for document files (`#docsym`). Markdown headings are
+    /// navigation structure, not symbols — they have no callers or callees — so
+    /// they are reported here instead of padding `touched_symbols` with heading
+    /// text and clipped prose. Always empty for code files.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub touched_headings: Vec<String>,
     pub summary_state: DiffDigestSummaryState,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub current_summaries: Vec<DiffDigestSummarySnippet>,
@@ -79,6 +85,11 @@ pub struct DiffDigestReport {
     pub files_changed: usize,
     pub files_with_current_summaries: usize,
     pub symbols_touched: usize,
+    /// Document headings touched across the diff (`#docsym`). Counted apart from
+    /// `symbols_touched` so `9 files changed, 40 touched symbols` can no longer
+    /// mean "a README grew some headings".
+    #[serde(default)]
+    pub headings_touched: usize,
     pub call_edges_added: usize,
     pub call_edges_removed: usize,
     pub files: Vec<DiffDigestFile>,
@@ -87,6 +98,7 @@ pub struct DiffDigestReport {
 #[derive(Debug, Default)]
 struct ParsedSnapshot {
     symbol_names: Vec<String>,
+    heading_names: Vec<String>,
     edges: BTreeSet<String>,
     warnings: Vec<String>,
 }
@@ -178,6 +190,7 @@ pub fn compute(path: &Path, options: DiffDigestOptions<'_>) -> Result<DiffDigest
         .filter(|file| file.summary_state == DiffDigestSummaryState::Current)
         .count();
     let symbols_touched = files.iter().map(|file| file.touched_symbols.len()).sum();
+    let headings_touched = files.iter().map(|file| file.touched_headings.len()).sum();
     let call_edges_added = files.iter().map(|file| file.added_call_edges.len()).sum();
     let call_edges_removed = files.iter().map(|file| file.removed_call_edges.len()).sum();
 
@@ -188,6 +201,7 @@ pub fn compute(path: &Path, options: DiffDigestOptions<'_>) -> Result<DiffDigest
         files_changed: files.len(),
         files_with_current_summaries,
         symbols_touched,
+        headings_touched,
         call_edges_added,
         call_edges_removed,
         files,
@@ -223,6 +237,7 @@ fn build_diff_file(
     warnings.extend(current.warnings);
 
     let touched_symbols = merge_symbol_names(&previous.symbol_names, &current.symbol_names);
+    let touched_headings = merge_symbol_names(&previous.heading_names, &current.heading_names);
     let added_call_edges = diff_edges(&current.edges, &previous.edges);
     let removed_call_edges = diff_edges(&previous.edges, &current.edges);
     let content_hash = current_bytes
@@ -239,6 +254,7 @@ fn build_diff_file(
         path: rel_path,
         status,
         touched_symbols,
+        touched_headings,
         summary_state,
         current_summaries,
         added_call_edges,
@@ -261,6 +277,7 @@ fn build_parse_deferred_diff_file(
         path: relative_git_path(root, file_path),
         status,
         touched_symbols: Vec::new(),
+        touched_headings: Vec::new(),
         summary_state: DiffDigestSummaryState::Unavailable,
         current_summaries: Vec::new(),
         added_call_edges: Vec::new(),
@@ -282,6 +299,7 @@ fn build_deleted_diff_file(
         .map(|bytes| parse_snapshot(file_path, bytes))
         .unwrap_or_default();
     let touched_symbols = previous.symbol_names.clone();
+    let touched_headings = previous.heading_names.clone();
     let content_hash = previous_bytes.as_deref().map(summarize::content_hash);
     let (summary_state, current_summaries) = collect_current_summaries(
         summary_db,
@@ -294,6 +312,7 @@ fn build_deleted_diff_file(
         path: rel_path,
         status: DiffDigestFileStatus::Deleted,
         touched_symbols,
+        touched_headings,
         summary_state,
         current_summaries,
         added_call_edges: Vec::new(),
@@ -378,10 +397,25 @@ fn parse_snapshot(file_path: &Path, bytes: &[u8]) -> ParsedSnapshot {
             Vec::new()
         }
     };
-    let symbol_names = symbols
-        .iter()
-        .map(|symbol| symbol.name.clone())
-        .collect::<Vec<_>>();
+    // #docsym: a document language's structural nodes are headings, list items,
+    // and fenced blocks. Reporting them as `touched_symbols` made a docs-only
+    // diff read as 40 changed symbols, and the list-item and prose entries
+    // crowded real symbol churn out of a mixed diff's budget. Keep only the
+    // headings, and report them in their own field.
+    let (symbol_names, heading_names) = if lang.is_document() {
+        let headings = symbols
+            .iter()
+            .filter(|symbol| symbol.kind == "heading")
+            .map(|symbol| symbol.name.clone())
+            .collect::<Vec<_>>();
+        (Vec::new(), headings)
+    } else {
+        let names = symbols
+            .iter()
+            .map(|symbol| symbol.name.clone())
+            .collect::<Vec<_>>();
+        (names, Vec::new())
+    };
 
     let edges = match graph::extract_call_sites(lang, bytes) {
         Ok(call_sites) => graph::resolve_edges(&symbols, &call_sites)
@@ -396,6 +430,7 @@ fn parse_snapshot(file_path: &Path, bytes: &[u8]) -> ParsedSnapshot {
 
     ParsedSnapshot {
         symbol_names,
+        heading_names,
         edges,
         warnings,
     }
@@ -744,6 +779,46 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git commit failed");
+    }
+
+    // #docsym regression: a docs-only diff used to report every heading, list
+    // item, and clipped prose line as a "touched symbol" — 40 of them for one
+    // added runbook — which is more output than `git diff --stat` and less
+    // signal.
+    #[test]
+    fn diff_digest_reports_markdown_headings_apart_from_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        init_git_repo(dir.path());
+
+        std::fs::write(
+            dir.path().join("runbook.md"),
+            "# Code Navigation\n\nSome prose that is long enough to have been clipped into a \
+             fragment that looks like a symbol name.\n\n- `tsift --envelope source-read <file> \
+             --budget normal` reads a window\n- `tsift --envelope search <query>` searches\n\n\
+             ## Session start\n\nMore prose.\n",
+        )
+        .unwrap();
+
+        let report = compute(dir.path(), DiffDigestOptions::default()).unwrap();
+        let file = report
+            .files
+            .iter()
+            .find(|file| file.path == "runbook.md")
+            .expect("markdown file in the digest");
+
+        assert!(
+            file.touched_symbols.is_empty(),
+            "markdown structure is not symbols: {:?}",
+            file.touched_symbols
+        );
+        assert_eq!(
+            file.touched_headings,
+            vec!["Code Navigation".to_string(), "Session start".to_string()],
+            "headings are the document's structural summary"
+        );
+        assert_eq!(report.symbols_touched, 0, "no code changed in this diff");
+        assert_eq!(report.headings_touched, 2);
     }
 
     #[test]
