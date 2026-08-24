@@ -6,7 +6,7 @@ Canonical binary version source: `Cargo.toml` `package.version`. The CLI exposes
 
 Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
-## Unreleased
+## 0.1.84
 
 - **`communities` and `path` resolve a workspace root too** (`#wsfedrest`).
   0.1.83's `#graphfed` gave `explain` and `graph` symbol-driven scope
