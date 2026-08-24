@@ -297,7 +297,153 @@ pub(crate) fn cmd_graph(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `communities` across a workspace's federated scopes (`#wsfedrest`).
+///
+/// A scoped index holds only its own call edges, so there is no such thing as a
+/// cross-scope community: running detection per scope and reporting each is the
+/// exact answer, not an approximation of a whole-workspace one. That is why this
+/// federates by concatenation rather than by merging graphs.
 pub(crate) fn cmd_communities(
+    path: &std::path::Path,
+    scope: Option<&str>,
+    federated: bool,
+    min_size: usize,
+    limit: usize,
+    json_output: bool,
+    compact: bool,
+    pretty: bool,
+    terse: bool,
+    tabular: bool,
+    schema: bool,
+    tagpath_opts: TagpathSearchOpts,
+) -> Result<()> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    if federated || crate::should_auto_federate(&root, path, scope, federated)? {
+        let scopes = crate::federated_scope_ids(&root)?;
+        if scopes.is_empty() {
+            anyhow::bail!(
+                "workspace root {} has no federated scopes to analyze: every scope opts out of federation. Pass `--scope <scope>` to analyze one directly.",
+                root.display()
+            );
+        }
+        if json_output {
+            let mut per_scope = Vec::with_capacity(scopes.len());
+            for scope_id in &scopes {
+                per_scope.push(build_communities_value(
+                    path,
+                    Some(scope_id),
+                    min_size,
+                    limit,
+                    &tagpath_opts,
+                )?);
+            }
+            let out = serde_json::json!({ "scopes": per_scope });
+            println!("{}", to_json_schema(&out, pretty, terse, false, schema)?);
+            return Ok(());
+        }
+        for (idx, scope_id) in scopes.iter().enumerate() {
+            if idx > 0 {
+                println!();
+            }
+            println!("scope {scope_id}:");
+            cmd_communities_for_scope(
+                path,
+                Some(scope_id),
+                min_size,
+                limit,
+                false,
+                compact,
+                pretty,
+                terse,
+                tabular,
+                schema,
+                tagpath_opts,
+            )?;
+        }
+        return Ok(());
+    }
+    cmd_communities_for_scope(
+        path,
+        scope,
+        min_size,
+        limit,
+        json_output,
+        compact,
+        pretty,
+        terse,
+        tabular,
+        schema,
+        tagpath_opts,
+    )
+}
+
+/// The JSON body of `cmd_communities_for_scope`, returned instead of printed so
+/// a federated run can carry one document per scope (`#wsfedrest`).
+fn build_communities_value(
+    path: &std::path::Path,
+    scope: Option<&str>,
+    min_size: usize,
+    limit: usize,
+    tagpath_opts: &TagpathSearchOpts,
+) -> Result<serde_json::Value> {
+    let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let tagpath_root = query_tagpath_root(&root, path, scope)?;
+    let db = open_index_db(path, scope)?;
+    let tagpath_part = community_tagpath_cache_part(&tagpath_root, tagpath_opts)?;
+    let CommunityDetectionReport {
+        result,
+        mut diagnostics,
+    } = detect_communities_cached(&db, &root, scope, &tagpath_part, &tagpath_root)?;
+
+    let filtered: Vec<graph::Community> = result
+        .communities
+        .iter()
+        .filter(|c| c.members.len() >= min_size)
+        .cloned()
+        .collect();
+    let total = filtered.len();
+    let truncated = limit > 0 && total > limit;
+    let mut display: Vec<graph::Community> = if truncated {
+        filtered[..limit].to_vec()
+    } else {
+        filtered
+    };
+
+    let community_annotation =
+        annotate_communities_with_tagpath(&mut display, &db, &tagpath_root, tagpath_opts)?;
+    let tagpath_stale = community_annotation
+        .as_ref()
+        .is_some_and(|diag| diag.stale);
+    let tagpath_stale_reason = community_annotation
+        .as_ref()
+        .and_then(|diag| diag.reason.clone());
+    update_community_annotation_diagnostics(
+        &mut diagnostics,
+        &display,
+        community_annotation.as_ref(),
+    );
+
+    let mut out = serde_json::json!({
+        "scope": scope,
+        "modularity": result.modularity,
+        "iterations": result.iterations,
+        "node_count": result.node_count,
+        "edge_count": result.edge_count,
+        "community_count": total,
+        "communities": &display,
+        "truncated": truncated,
+        "community_diagnostics": diagnostics,
+    });
+    inject_tagpath_stale_into_json(
+        &mut out,
+        tagpath_stale && !tagpath_opts.no_tagpath,
+        tagpath_stale_reason.as_deref(),
+    );
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_communities_for_scope(
     path: &std::path::Path,
     scope: Option<&str>,
     min_size: usize,
@@ -744,11 +890,19 @@ pub(crate) fn cmd_traverse(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `path` at a workspace root resolves *both* endpoints (`#wsfedrest`).
+///
+/// A scoped index carries only its own call edges, so a path between symbols in
+/// two different scopes does not exist to be found — there is no edge that could
+/// cross. When both endpoints resolve to the same scope the query is answerable
+/// and runs there; when they resolve to different scopes the answer is a precise
+/// refusal naming both, not a silent empty result.
 pub(crate) fn cmd_path(
     from: &str,
     to: &str,
     path: &std::path::Path,
     scope: Option<&str>,
+    federated: bool,
     json_output: bool,
     compact: bool,
     pretty: bool,
@@ -757,6 +911,31 @@ pub(crate) fn cmd_path(
     tagpath_opts: TagpathSearchOpts,
 ) -> Result<()> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let scope_owned = if federated || crate::should_auto_federate(&root, path, scope, federated)? {
+        let from_scope = crate::resolve_symbol_scope(&root, from)?;
+        let to_scope = crate::resolve_symbol_scope(&root, to)?;
+        match (from_scope, to_scope) {
+            (Some(a), Some(b)) if a.scope == b.scope => Some(a.scope),
+            (Some(a), Some(b)) => anyhow::bail!(
+                "`{from}` resolves in scope `{}` and `{to}` in scope `{}`. A scoped index holds only its own call edges, so no path between them exists to find. Query one scope with `--scope <scope>`.",
+                a.scope,
+                b.scope
+            ),
+            (None, _) => anyhow::bail!(
+                "symbol `{from}` was not found in any federated scope of {}. Searched: {}.",
+                root.display(),
+                crate::federated_scope_ids(&root)?.join(", ")
+            ),
+            (_, None) => anyhow::bail!(
+                "symbol `{to}` was not found in any federated scope of {}. Searched: {}.",
+                root.display(),
+                crate::federated_scope_ids(&root)?.join(", ")
+            ),
+        }
+    } else {
+        scope.map(str::to_string)
+    };
+    let scope = scope_owned.as_deref();
     let db = open_index_db(path, scope)?;
     let edges = db.all_edges()?;
     match graph::shortest_path(&edges, from, to) {

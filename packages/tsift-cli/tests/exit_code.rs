@@ -6980,34 +6980,96 @@ fn status_autoindexes_missing_workspace_scopes_even_when_root_index_exists_in_js
 }
 
 #[test]
-fn workspace_graph_queries_require_scope_without_shared_root_index() {
+fn workspace_graph_queries_resolve_scopes_without_shared_root_index() {
     let dir = indexed_workspace_cli_fixture();
     let root = dir.path().to_str().unwrap();
-    // #graphfed narrowed this set: `graph` and `explain` now resolve the owning
-    // scope from the symbol itself (see
-    // `workspace_explain_and_graph_resolve_the_owning_scope_without_a_flag`).
-    // The rest have no single symbol to resolve from — `communities` reads the
-    // whole index, `path` spans two symbols whose scopes may differ — so they
-    // still fail closed and name the scopes.
-    let cases = [
-        ("communities", vec!["communities", root, "--json"]),
-        (
-            "path",
-            vec!["path", "alpha_main", "alpha_helper", root, "--json"],
-        ),
-    ];
+    // #graphfed and #wsfedrest emptied this set: every read-only graph command
+    // now resolves the workspace itself. `path` is the one that can still
+    // refuse, and it refuses for a reason no flag would fix — see
+    // `workspace_path_refuses_endpoints_in_different_scopes`.
+    let output = tsift_bin()
+        .args(["path", "alpha_main", "beta_func", root, "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("no index found at"),
+        "the refusal must be about scopes, not a missing index: {stderr}"
+    );
+}
 
-    for (label, args) in cases {
-        let output = tsift_bin().args(args).output().unwrap();
+// #wsfedrest: a scoped index holds only its own call edges, so per-scope
+// community detection is the exact answer rather than an approximation of a
+// whole-workspace one — which is why `communities` federates by concatenation.
+#[test]
+fn workspace_communities_federates_per_scope() {
+    let dir = indexed_workspace_cli_fixture();
+    let root = dir.path().to_str().unwrap();
+
+    let output = tsift_bin()
+        .args(["communities", root, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "communities stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let scopes = json["scopes"]
+        .as_array()
+        .expect("a federated run reports one document per scope");
+    assert_eq!(scopes.len(), 2, "{json}");
+    let ids: Vec<&str> = scopes
+        .iter()
+        .map(|entry| entry["scope"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["alpha", "beta"], "{json}");
+
+    // Human output labels each scope rather than silently concatenating.
+    let human = tsift_bin().args(["communities", root]).output().unwrap();
+    assert!(human.status.success());
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("scope alpha:") && text.contains("scope beta:"), "{text}");
+}
+
+// #wsfedrest: `path` resolves both endpoints. Same scope is answerable; a
+// cross-scope pair is a precise refusal, because no edge could cross between two
+// scoped indexes — an empty result would read as "no path in a graph that has
+// both", which is not what happened.
+#[test]
+fn workspace_path_refuses_endpoints_in_different_scopes() {
+    let dir = indexed_workspace_cli_fixture();
+    let root = dir.path().to_str().unwrap();
+
+    let same_scope = tsift_bin()
+        .args(["path", "alpha_main", "alpha_helper", root, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        same_scope.status.success(),
+        "both endpoints in scope alpha must be answerable: {}",
+        String::from_utf8_lossy(&same_scope.stderr)
+    );
+
+    let cross_scope = tsift_bin()
+        .args(["path", "alpha_main", "beta_func", root, "--json"])
+        .output()
+        .unwrap();
+    assert!(!cross_scope.status.success());
+    let stderr = String::from_utf8_lossy(&cross_scope.stderr);
+    assert!(stderr.contains("scope `alpha`"), "{stderr}");
+    assert!(stderr.contains("scope `beta`"), "{stderr}");
+    assert!(stderr.contains("no path between them exists"), "{stderr}");
+
+    for command in ["communities", "path"] {
+        let help = tsift_bin().args([command, "--help"]).output().unwrap();
+        let text = String::from_utf8_lossy(&help.stdout);
         assert!(
-            !output.status.success(),
-            "{label} should fail closed without an explicit workspace scope"
+            text.contains("--federated"),
+            "`{command} --help` must offer --federated: {text}"
         );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("require `--scope <scope>`"), "{stderr}");
-        assert!(stderr.contains("Available scopes: alpha, beta"), "{stderr}");
-        assert!(stderr.contains("Indexed scopes: alpha, beta"), "{stderr}");
-        assert!(!stderr.contains("no index found at"), "{stderr}");
     }
 }
 

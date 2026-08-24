@@ -338,6 +338,10 @@ pub enum Commands {
         /// Restrict to a specific submodule
         #[arg(long)]
         scope: Option<String>,
+        /// Resolve across every federated submodule index. Automatic at a
+        /// workspace root with no shared root index.
+        #[arg(long)]
+        federated: bool,
         /// Show only communities with at least this many members
         #[arg(long, default_value = "2")]
         min_size: usize,
@@ -385,6 +389,10 @@ pub enum Commands {
         /// Restrict to a specific submodule
         #[arg(long)]
         scope: Option<String>,
+        /// Resolve across every federated submodule index. Automatic at a
+        /// workspace root with no shared root index.
+        #[arg(long)]
+        federated: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,

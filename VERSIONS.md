@@ -6,6 +6,28 @@ Canonical binary version source: `Cargo.toml` `package.version`. The CLI exposes
 
 Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
+## Unreleased
+
+- **`communities` and `path` resolve a workspace root too** (`#wsfedrest`).
+  0.1.83's `#graphfed` gave `explain` and `graph` symbol-driven scope
+  resolution but left the other two read-only graph commands demanding a
+  `--scope` the caller did not have. Neither has a single symbol to resolve
+  from, and one fact settles both: a scoped index carries only its own call
+  edges. So there is no such thing as a cross-scope community — `communities`
+  runs detection per scope and reports each, which is the exact answer rather
+  than an approximation of a whole-workspace one (`--json` returns
+  `{"scopes": [...]}`, human output labels each `scope <id>:`). And a path
+  between symbols in two scopes does not exist to be found — `path` resolves
+  both endpoints, runs when they agree, and refuses naming both scopes when
+  they do not, rather than returning an empty result that would read as "no
+  path in a graph containing both". Both accept `--federated` explicitly.
+
+- **No yanked crates in `Cargo.lock`** (`#spinyank`). `cargo install --locked`
+  warned that `spin v0.9.8` (transitive through
+  `multer` → `async-graphql` → `surrealdb`) is yanked from crates.io. Repinned
+  to the unyanked `0.9.9` in the same minor series, and audited all 638
+  registry entries in the lockfile — no other yanked version remains.
+
 ## 0.1.83
 
 - **Go is an indexed language, and skipped files are visible** (`#goindex`,

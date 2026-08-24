@@ -896,6 +896,7 @@ pub fn run() -> Result<()> {
         Some(Commands::Communities {
             path,
             scope,
+            federated,
             min_size,
             limit,
             json,
@@ -904,6 +905,7 @@ pub fn run() -> Result<()> {
         }) => cmd_communities(
             &path,
             scope.as_deref(),
+            federated,
             min_size,
             limit,
             json || terse || schema || envelope,
@@ -943,6 +945,7 @@ pub fn run() -> Result<()> {
             to,
             path,
             scope,
+            federated,
             json,
             no_tagpath,
             tagpath_strict,
@@ -951,6 +954,7 @@ pub fn run() -> Result<()> {
             &to,
             &path,
             scope.as_deref(),
+            federated,
             json || terse || schema || envelope,
             compact,
             pretty,
@@ -3782,6 +3786,16 @@ pub(crate) fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Resu
         );
     }
     index::IndexDb::open_read_only_resilient(&db_path)
+}
+
+/// Scope ids this workspace federates over, in `.gitmodules` order.
+pub(crate) fn federated_scope_ids(root: &Path) -> Result<Vec<String>> {
+    let cfg = config::Config::load(root)?;
+    Ok(config::Config::submodule_dirs(root)?
+        .into_iter()
+        .filter(|scope| cfg.federation_for_scope(scope))
+        .map(|scope| scope.id)
+        .collect())
 }
 
 /// Which federated scope owns `symbol`, and which others also define it.
@@ -27339,17 +27353,6 @@ tier = "private"
         assert!(names.contains(&"alpha_helper"));
     }
 
-    fn assert_workspace_query_requires_scope(err: anyhow::Error) {
-        let msg = err.to_string();
-        assert!(msg.contains("require `--scope <scope>`"), "{msg}");
-        assert!(msg.contains("Available scopes: alpha, beta"), "{msg}");
-        assert!(msg.contains("Indexed scopes: alpha, beta"), "{msg}");
-        assert!(
-            !msg.contains("no index found at"),
-            "workspace query should fail with scope guidance, got: {msg}"
-        );
-    }
-
     // #graphfed: `graph` used to fail here and tell the caller to supply the
     // scope it was about to ask tsift for. It now resolves the owning scope
     // from the symbol itself.
@@ -27461,8 +27464,12 @@ tier = "private"
         assert!(result.is_ok());
     }
 
+    // #wsfedrest: a scoped index holds only its own call edges, so there is no
+    // cross-scope community. Per-scope detection is the exact answer, not an
+    // approximation, so `communities` federates by concatenation instead of
+    // failing closed.
     #[test]
-    fn communities_cmd_requires_scope_for_workspace_root_without_shared_index() {
+    fn communities_cmd_federates_per_scope_for_workspace_root_without_shared_index() {
         let dir = setup_workspace();
         cmd_index(
             dir.path(),
@@ -27482,9 +27489,10 @@ tier = "private"
         )
         .unwrap();
 
-        let err = cmd_communities(
+        cmd_communities(
             dir.path(),
             None,
+            false,
             1,
             10,
             false,
@@ -27495,9 +27503,7 @@ tier = "private"
             false,
             TagpathSearchOpts::default(),
         )
-        .unwrap_err();
-
-        assert_workspace_query_requires_scope(err);
+        .expect("communities must federate across the workspace's scopes");
     }
 
     #[test]
@@ -27526,6 +27532,7 @@ tier = "private"
         let result = cmd_communities(
             &nested,
             None,
+            false,
             1,
             10,
             false,
@@ -27540,8 +27547,11 @@ tier = "private"
         assert!(result.is_ok());
     }
 
+    // #wsfedrest: `path` resolves both endpoints. Same scope is answerable and
+    // runs there; different scopes is a precise refusal, because no edge could
+    // cross between two scoped indexes.
     #[test]
-    fn path_cmd_requires_scope_for_workspace_root_without_shared_index() {
+    fn path_cmd_resolves_both_endpoints_for_workspace_root_without_shared_index() {
         let dir = setup_workspace();
         cmd_index(
             dir.path(),
@@ -27561,7 +27571,7 @@ tier = "private"
         )
         .unwrap();
 
-        let err = cmd_path(
+        cmd_path(
             "alpha_main",
             "alpha_helper",
             dir.path(),
@@ -27571,11 +27581,32 @@ tier = "private"
             false,
             false,
             false,
+            false,
+            TagpathSearchOpts::default(),
+        )
+        .expect("both endpoints resolve to scope `alpha`, so the path is answerable");
+
+        // Endpoints in different scopes: no edge could cross a scoped index
+        // boundary, so the refusal names both scopes rather than returning an
+        // empty result.
+        let err = cmd_path(
+            "alpha_main",
+            "beta_func",
+            dir.path(),
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
             TagpathSearchOpts::default(),
         )
         .unwrap_err();
-
-        assert_workspace_query_requires_scope(err);
+        let msg = err.to_string();
+        assert!(msg.contains("scope `alpha`"), "{msg}");
+        assert!(msg.contains("scope `beta`"), "{msg}");
+        assert!(msg.contains("no path between them exists"), "{msg}");
     }
 
     #[test]
@@ -27611,6 +27642,7 @@ tier = "private"
             false,
             false,
             false,
+            false,
             TagpathSearchOpts::default(),
         );
 
@@ -27628,6 +27660,7 @@ tier = "private"
             "helper",
             dir.path(),
             None,
+            false,
             false,
             false,
             false,
@@ -27764,6 +27797,7 @@ tier = "private"
         let result = cmd_communities(
             dir.path(),
             None,
+            false,
             2,
             10,
             false,
@@ -27808,6 +27842,7 @@ tier = "private"
             "b",
             dir.path(),
             None,
+            false,
             false,
             false,
             false,
@@ -29113,6 +29148,7 @@ tier = "private"
         let result = cmd_communities(
             dir.path(),
             None,
+            false,
             1,
             10,
             false,
@@ -29136,6 +29172,7 @@ tier = "private"
         let result = cmd_communities(
             dir.path(),
             None,
+            false,
             1,
             10,
             false,
@@ -33827,6 +33864,7 @@ fn sample() {}
         let result = cmd_communities(
             dir.path(),
             None,
+            false,
             1,
             10,
             false,
