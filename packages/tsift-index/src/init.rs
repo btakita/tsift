@@ -25,10 +25,11 @@ Run `tsift status` at session start from the owning repo root. If the task or fi
 
 Prefer tsift envelopes over raw reads:
 - `tsift --envelope search <query>` instead of `grep`/`rg`
-- `tsift --envelope source-read <file>` / `tsift --envelope symbol-read <symbol>` instead of `cat`/`head`
+- `tsift --envelope source-read <file>` / `tsift --envelope symbol-read <symbol>` instead of raw `cat`/`head`/`tail`/`sed`/`less` source reads
 - `tsift --envelope explain <symbol>` and `tsift graph <symbol> --callers` / `--callees` for call graphs
-- `tsift diff-digest [path]` instead of `git diff`, `git show`, or patch-style `git log`
-- `tsift --envelope session-review <path>` / `tsift --envelope context-pack <path>` instead of replaying long session docs, transcripts, or runtime logs
+- `tsift diff-digest [path]` (`--pathspec <pathspec>` to preserve scoped reviews) instead of `git diff`, commit-form `git show`, or patch-style `git log`; blob-form `git show <rev>:<path>` stays a raw object read
+- `tsift --envelope session-review <path>` / `tsift --envelope context-pack <path>` instead of replaying long session docs or transcripts
+- raw-read rewrites route recognized session docs/transcripts to `tsift session-digest --input <path>` and captured logs to `tsift log-digest --input <path>`
 - `tsift --envelope digest-runner --kind test|log --path . --shell-command '<command>'` instead of raw test/build output
 
 Command detail lives in [`{runbook}`]({runbook}) — budgets, `tsift workflow search`, `report.scale_guard` handling, the harness rewrite path for `PreToolUse`-less harnesses, and Codex/OpenCode integration. `tsift init` writes and versions that runbook alongside this block, so it is present in every initialized checkout; read it before broad exploration instead of expanding this block. A repository that also ships a current `.claude/skills/tsift/SKILL.md` should use that skill as the deeper source.
@@ -62,7 +63,7 @@ Codex projects can install a prompt-time auto-reindex hook with `tsift init --co
 
 Use the commands listed in `tsift status`'s `use:` output:
 
-- `tsift --envelope source-read <file> --budget normal` — AST-symbol projection with span metadata and source-window expansion commands (prefer over cat/head for source code files)
+- `tsift --envelope source-read <file> --budget normal` — AST-symbol projection with span metadata and source-window expansion commands (prefer over raw cat/head/tail/sed/less reads for source files)
 - `tsift --envelope symbol-read <symbol> --budget normal` — token-budgeted symbol body, AST span metadata, child refs, and graph/source expansion commands
 - `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)
 - `tsift --envelope explain <symbol> --budget normal` — callers, callees, community preview
@@ -76,8 +77,9 @@ When a search envelope includes `report.scale_guard`, run one of its `narrow_com
 
 Prefer bounded digest commands over raw transcript, diff, and verbose-log reads:
 
-- `tsift --envelope session-review <path> --next-context --budget normal` or `tsift --envelope context-pack <path> --budget normal` instead of replaying long session docs, JSONL transcripts, or agent-doc runtime logs with `cat`, `tail`, or `sed`.
-- `tsift diff-digest [path]` (`--cached`, `--revision <rev>`) instead of `git diff`, `git show`, or patch-style `git log`.
+- `tsift --envelope session-review <path> --next-context` / `tsift --envelope context-pack <path>` when a resumable handoff is the goal
+- raw-read rewrites route recognized agent-doc/JSONL sessions to `tsift session-digest --input <path>` and captured logs to `tsift log-digest --input <path>` instead of replaying them with `cat`, `head`, `tail`, `sed`, or `less`
+- `tsift diff-digest [path]` (`--cached`, `--revision <rev>`, repeatable `--pathspec <pathspec>`) instead of `git diff`, commit-form `git show`, or patch-style `git log`. Blob-form `git show <rev>:<path>` is an object read and is deliberately not rewritten.
 - `tsift --envelope digest-runner --kind test --path . --shell-command '<test command>'` / `tsift --envelope digest-runner --kind log --path . --shell-command '<build command>'` for noisy test/build/install output, or let the rewrite/hooks create those artifact-backed envelopes for `cargo test`, `pytest`, and verbose cargo commands.
 - If RTK is installed, digest-runner delegates supported generic command families through `rtk rewrite` and records the chosen compact filter in `report.filter` while preserving tsift artifact handles.
 
@@ -2154,6 +2156,8 @@ mod tests {
         assert!(content.contains(&expected_marker));
         assert!(content.contains("tsift --envelope session-review <path>"));
         assert!(content.contains("tsift --envelope context-pack <path>"));
+        assert!(content.contains("tsift session-digest --input <path>"));
+        assert!(content.contains("tsift log-digest --input <path>"));
         assert!(content.contains("tsift diff-digest [path]"));
         assert!(content.contains("tsift --envelope digest-runner --kind test|log"));
 

@@ -130,7 +130,7 @@ impl SimWorld {
             Step::RewriteLongSessionRead => self.rewrite_long_session_read(),
             Step::RewriteShortSessionRead => self.rewrite_short_session_read(),
             Step::RewriteLongSourceRead => self.rewrite_long_source_read(),
-            Step::RewriteShortSourceRead => self.rewrite_short_source_read(),
+            Step::RewriteShortSourceRead => self.rewrite_short_source_window(),
             Step::RewriteTestCommand => self.rewrite_test_command(),
             Step::RewriteLogCommand => self.rewrite_log_command(),
             Step::RewriteDiffCommand => self.rewrite_diff_command(),
@@ -199,11 +199,12 @@ do [#t275]. spec-test-build-install-commit-push
         self.coverage.mark("rewrite/long_source_read");
     }
 
-    fn rewrite_short_source_read(&mut self) {
+    fn rewrite_short_source_window(&mut self) {
         let source = self.write_source_file("source-short", 120);
-        let rewritten = rewrite_command(&format!("head -n 20 {}", source.display()));
-        assert_eq!(rewritten, None);
-        self.coverage.mark("rewrite/short_source_passthrough");
+        let rewritten = rewrite_command(&format!("head -n 20 {}", source.display())).unwrap();
+        assert!(rewritten.contains("tsift --envelope source-read"));
+        assert!(rewritten.contains("--start 1 --lines 20"));
+        self.coverage.mark("rewrite/short_source_window");
     }
 
     fn rewrite_test_command(&mut self) {
@@ -372,7 +373,7 @@ fn required_coverage() -> &'static [&'static str] {
         "rewrite/long_session_read",
         "rewrite/short_session_passthrough",
         "rewrite/long_source_read",
-        "rewrite/short_source_passthrough",
+        "rewrite/short_source_window",
         "rewrite/test_digest",
         "rewrite/log_digest",
         "rewrite/diff_digest",

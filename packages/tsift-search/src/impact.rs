@@ -89,6 +89,7 @@ pub fn compute_with_phases(
         DiffDigestOptions {
             cached: options.cached,
             revision: options.revision,
+            pathspecs: &[],
             max_parsed_files: None,
         },
     )?;
@@ -585,7 +586,10 @@ mod tests {
     #[cfg(feature = "lang-gdscript")]
     #[test]
     fn gdscript_import_lines_are_extends_and_preload() {
-        assert!(is_import_line(Lang::GdScript, "extends \"res://player.gd\""));
+        assert!(is_import_line(
+            Lang::GdScript,
+            "extends \"res://player.gd\""
+        ));
         assert!(is_import_line(
             Lang::GdScript,
             "const Bullet = preload(\"res://bullet.gd\")"

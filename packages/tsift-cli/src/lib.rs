@@ -83,8 +83,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::{
     AstGrepCommand, Cli, Commands, DispatchTraceFormat, GraphDbQuery, KgCommand, LeaseCommand,
-    LocalModelCommand,
-    SemanticRelatedKind, SourceReadStyle,
+    LocalModelCommand, SemanticRelatedKind, SourceReadStyle,
 };
 
 #[cfg(test)]
@@ -1250,12 +1249,14 @@ pub fn run() -> Result<()> {
         ),
         Some(Commands::DiffDigest {
             path,
+            pathspecs,
             cached,
             revision,
             max_parsed_files,
             json,
         }) => cmd_diff_digest(
             &path,
+            &pathspecs,
             cached,
             revision.as_deref(),
             max_parsed_files,
@@ -1954,7 +1955,10 @@ fn cmd_local_model_lease(command: LeaseCommand, output: OutputFormat) -> Result<
                     release.remaining_holders
                 );
                 if let Some(result) = &unloaded {
-                    println!("unloaded {} (last reference released): {}", profile, result.outcome);
+                    println!(
+                        "unloaded {} (last reference released): {}",
+                        profile, result.outcome
+                    );
                 }
                 println!("registry: {}", path.display());
             }
@@ -3869,8 +3873,7 @@ pub(crate) fn open_graph_index_db(
     symbol: &str,
 ) -> Result<(index::IndexDb, Option<String>)> {
     let root = lint::resolve_project_root_or_canonical_path(path)?;
-    let resolve_across_scopes =
-        federated || should_auto_federate(&root, path, scope, federated)?;
+    let resolve_across_scopes = federated || should_auto_federate(&root, path, scope, federated)?;
     if !resolve_across_scopes {
         return Ok((open_index_db(path, scope)?, scope.map(str::to_string)));
     }
@@ -14623,16 +14626,15 @@ fn build_traversal_graph_source_with_options(
                         source_by_file.insert(symbol.file.clone(), fs::read(source_path).ok());
                     }
                     if let Some(Some(source)) = source_by_file.get(&symbol.file)
-                        && let Some((ast_node, mut ast_entry)) =
-                            traversal_ast_span_node(
-                                root,
-                                symbol,
-                                source,
-                                symbols_by_file
-                                    .get(&symbol.file)
-                                    .map(Vec::as_slice)
-                                    .unwrap_or(&[]),
-                            )
+                        && let Some((ast_node, mut ast_entry)) = traversal_ast_span_node(
+                            root,
+                            symbol,
+                            source,
+                            symbols_by_file
+                                .get(&symbol.file)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
+                        )
                     {
                         ast_entry.symbol_handle = node.handle.clone();
                         ast_entry.file_handle = file_handle_by_path.get(&file).cloned();
@@ -18739,13 +18741,18 @@ pub(crate) fn diff_digest_mode_display(report: &diff_digest::DiffDigestReport) -
 }
 
 pub(crate) fn diff_digest_empty_message(report: &diff_digest::DiffDigestReport) -> String {
-    match (&report.mode, &report.revision) {
+    let message = match (&report.mode, &report.revision) {
         (diff_digest::DiffDigestMode::WorkingTree, _) => "No git changes found.".to_string(),
         (diff_digest::DiffDigestMode::Cached, _) => "No staged git changes found.".to_string(),
         (diff_digest::DiffDigestMode::Revision, Some(revision)) => {
             format!("No diff found for revision {revision}.")
         }
         (diff_digest::DiffDigestMode::Revision, None) => "No revision diff found.".to_string(),
+    };
+    if report.pathspecs.is_empty() {
+        message
+    } else {
+        format!("{message} Pathspecs: {}", report.pathspecs.join(", "))
     }
 }
 
@@ -21156,10 +21163,7 @@ pub(crate) fn report_tracked_instruction_writes(
             .to_string()
     };
     if let Some(migration) = &result.migrated_runbook {
-        eprintln!(
-            "status fix: moved {} -> {}",
-            migration.from, migration.to
-        );
+        eprintln!("status fix: moved {} -> {}", migration.from, migration.to);
     }
     let version_note = match found_version {
         Some(found) => format!(" (v{found} -> v{expected_version})"),
@@ -23333,7 +23337,22 @@ mod tests {
     #[test]
     fn rewrite_git_diff_with_path_to_diff_digest() {
         let result = rewrite_command("git diff -- src/");
-        assert_eq!(result, Some("tsift diff-digest \"src/\"".to_string()));
+        assert_eq!(
+            result,
+            Some("tsift diff-digest --pathspec \"src/\" .".to_string())
+        );
+    }
+
+    #[test]
+    fn rewrite_git_diff_with_multiple_pathspecs_preserves_scope() {
+        let result = rewrite_command("git diff -- src/lib.rs tests/rewrite.rs");
+        assert_eq!(
+            result,
+            Some(
+                "tsift diff-digest --pathspec \"src/lib.rs\" --pathspec \"tests/rewrite.rs\" ."
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -23349,6 +23368,24 @@ mod tests {
             result,
             Some("tsift diff-digest --revision \"HEAD~1\" .".to_string())
         );
+    }
+
+    #[test]
+    fn rewrite_git_show_with_pathspec_preserves_scope() {
+        let result = rewrite_command("git show HEAD -- .gitignore");
+        assert_eq!(
+            result,
+            Some("tsift diff-digest --revision \"HEAD\" --pathspec \".gitignore\" .".to_string())
+        );
+    }
+
+    #[test]
+    fn rewrite_git_show_blob_read_declines_with_specific_reason() {
+        let command = "git show HEAD:.gitignore";
+        assert_eq!(rewrite_command(command), None);
+        let message = no_rewrite_message(command, false);
+        assert!(message.contains("reads a blob/tree object, not a commit diff"));
+        assert!(message.contains("git cat-file"));
     }
 
     #[test]
@@ -23431,7 +23468,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_small_transcript_window_passthrough() {
+    fn rewrite_small_transcript_window_to_session_digest() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("session.jsonl");
         let line = r#"{"message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#;
@@ -23444,7 +23481,14 @@ mod tests {
             "tail -n 20 {}",
             shell_quote(session.to_str().unwrap())
         ));
-        assert_eq!(result, None);
+        assert_eq!(
+            result,
+            Some(format!(
+                "tsift session-digest --path {} --input {} --source claude-jsonl",
+                shell_quote(&resolve_digest_context_path(&session)),
+                shell_quote(session.to_str().unwrap())
+            ))
+        );
     }
 
     #[test]
@@ -23560,7 +23604,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_head_small_source_window_passthrough() {
+    fn rewrite_head_small_source_window_to_source_read() {
         let dir = tempfile::tempdir().unwrap();
         write_empty_root_index(dir.path());
         let source = write_repeated_lines(&dir.path().join("src/lib.rs"), "fn demo() {}", 120);
@@ -23570,46 +23614,113 @@ mod tests {
             shell_quote(source.to_str().unwrap())
         ));
 
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn rewrite_sed_large_source_range_to_source_read() {
-        let dir = tempfile::tempdir().unwrap();
-        write_empty_root_index(dir.path());
-        let source = write_repeated_lines(&dir.path().join("src/lib.rs"), "fn demo() {}", 200);
-
-        let result = rewrite_command(&format!(
-            "sed -n '40,160p' {}",
-            shell_quote(source.to_str().unwrap())
-        ));
-
         assert_eq!(
             result,
             Some(format!(
-                "tsift --envelope source-read \"src/lib.rs\" --path {} --style window --start 40 --lines 121 --budget normal",
+                "tsift --envelope source-read \"src/lib.rs\" --path {} --style window --start 1 --lines 20 --budget normal",
                 shell_quote(&dir.path().to_string_lossy())
             ))
         );
     }
 
     #[test]
-    fn rewrite_tail_large_source_window_preserves_tail_anchor() {
+    fn rewrite_sed_small_source_range_to_source_read() {
         let dir = tempfile::tempdir().unwrap();
         write_empty_root_index(dir.path());
         let source = write_repeated_lines(&dir.path().join("src/lib.rs"), "fn demo() {}", 200);
 
         let result = rewrite_command(&format!(
-            "tail -n 120 {}",
+            "sed -n '40,60p' {}",
             shell_quote(source.to_str().unwrap())
         ));
 
         assert_eq!(
             result,
             Some(format!(
-                "tsift --envelope source-read \"src/lib.rs\" --path {} --style window --start 81 --lines 120 --budget normal",
+                "tsift --envelope source-read \"src/lib.rs\" --path {} --style window --start 40 --lines 21 --budget normal",
                 shell_quote(&dir.path().to_string_lossy())
             ))
+        );
+    }
+
+    #[test]
+    fn rewrite_tail_small_source_window_preserves_tail_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        write_empty_root_index(dir.path());
+        let source = write_repeated_lines(&dir.path().join("src/lib.rs"), "fn demo() {}", 200);
+
+        let result = rewrite_command(&format!(
+            "tail -n 20 {}",
+            shell_quote(source.to_str().unwrap())
+        ));
+
+        assert_eq!(
+            result,
+            Some(format!(
+                "tsift --envelope source-read \"src/lib.rs\" --path {} --style window --start 181 --lines 20 --budget normal",
+                shell_quote(&dir.path().to_string_lossy())
+            ))
+        );
+    }
+
+    #[test]
+    fn rewrite_less_large_source_to_source_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write_empty_root_index(dir.path());
+        let source = write_repeated_lines(&dir.path().join("src/lib.rs"), "fn demo() {}", 120);
+
+        let result = rewrite_command(&format!("less {}", shell_quote(source.to_str().unwrap())));
+
+        assert_eq!(
+            result,
+            Some(format!(
+                "tsift --envelope source-read \"src/lib.rs\" --path {} --style window --start 1 --lines 80 --budget normal",
+                shell_quote(&dir.path().to_string_lossy())
+            ))
+        );
+    }
+
+    #[test]
+    fn rewrite_generic_log_window_to_log_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = write_repeated_lines(&dir.path().join("build.log"), "Compiling demo", 120);
+
+        let result = rewrite_command(&format!(
+            "tail -n 20 {}",
+            shell_quote(log.to_str().unwrap())
+        ));
+
+        assert_eq!(
+            result,
+            Some(format!(
+                "tsift log-digest --path {} --input {}",
+                shell_quote(&resolve_digest_context_path(&log)),
+                shell_quote(log.to_str().unwrap())
+            ))
+        );
+    }
+
+    #[test]
+    fn rewrite_source_without_index_names_coverage_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = write_repeated_lines(&dir.path().join("src/lib.rs"), "fn demo() {}", 120);
+        init_git_repo(dir.path());
+        let command = format!("cat {}", shell_quote(source.to_str().unwrap()));
+
+        assert_eq!(rewrite_command(&command), None);
+        let message = no_rewrite_message(&command, false);
+        assert!(message.contains("no index coverage"));
+        assert!(message.contains("tsift index"));
+    }
+
+    #[test]
+    fn rewrite_tilde_paths_expand_before_classification() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        assert_eq!(
+            crate::rewrite::expand_tilde_path("~/.claude/session.jsonl"),
+            PathBuf::from(home).join(".claude/session.jsonl")
         );
     }
 
@@ -25543,6 +25654,7 @@ fn main() { api::handler(); }
             diff_digest::DiffDigestOptions {
                 cached: true,
                 revision: None,
+                pathspecs: &[],
                 max_parsed_files: None,
             },
         )
@@ -27416,7 +27528,10 @@ tier = "private"
         )
         .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("was not found in any federated scope"), "{msg}");
+        assert!(
+            msg.contains("was not found in any federated scope"),
+            "{msg}"
+        );
         assert!(msg.contains("alpha") && msg.contains("beta"), "{msg}");
     }
 
@@ -29338,7 +29453,8 @@ tier = "private"
         if fts_search_forced_off() {
             return;
         }
-        let response = run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", None).unwrap();
+        let response =
+            run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", None).unwrap();
         assert_eq!(response.strategy, "fts");
         assert!(response.hits.iter().any(|h| h.path.ends_with("alpha.rs")));
     }
@@ -29352,7 +29468,8 @@ tier = "private"
         std::fs::write(root.join("alpha.rs"), "fn alpha_handler() {}\n").unwrap();
         let cache_dir = root.join(".tsift/search-cache");
 
-        let response = run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", None).unwrap();
+        let response =
+            run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", None).unwrap();
         assert_eq!(response.strategy, "lexical");
     }
 
@@ -30003,17 +30120,26 @@ tier = "private"
 
     #[test]
     fn cli_parses_diff_digest_command() {
-        let cli = parse_cli(["tsift", "diff-digest", "--json", "."]);
+        let cli = parse_cli([
+            "tsift",
+            "diff-digest",
+            "--json",
+            "--pathspec",
+            "src/lib.rs",
+            ".",
+        ]);
         match cli.command {
             Some(Commands::DiffDigest {
                 json,
                 path,
+                pathspecs,
                 cached,
                 revision,
                 max_parsed_files,
             }) => {
                 assert!(json);
                 assert_eq!(path, PathBuf::from("."));
+                assert_eq!(pathspecs, vec!["src/lib.rs".to_string()]);
                 assert!(!cached);
                 assert!(revision.is_none());
                 assert_eq!(max_parsed_files, 25);
@@ -32012,6 +32138,7 @@ fn sample() {}
             root: "/repo".to_string(),
             mode: diff_digest::DiffDigestMode::WorkingTree,
             revision: None,
+            pathspecs: vec![],
             files_changed: 2,
             files_with_current_summaries: 1,
             symbols_touched: 3,
@@ -32024,7 +32151,7 @@ fn sample() {}
                     status: diff_digest::DiffDigestFileStatus::Modified,
                     touched_symbols: vec!["alpha_helper".to_string(), "beta_helper".to_string()],
                     touched_headings: vec![],
-                summary_state: diff_digest::DiffDigestSummaryState::Current,
+                    summary_state: diff_digest::DiffDigestSummaryState::Current,
                     current_summaries: vec![diff_digest::DiffDigestSummarySnippet {
                         symbol: "alpha_helper".to_string(),
                         summary: "alpha helper handles the main alpha workflow".to_string(),
@@ -32038,7 +32165,7 @@ fn sample() {}
                     status: diff_digest::DiffDigestFileStatus::Added,
                     touched_symbols: vec!["main".to_string()],
                     touched_headings: vec![],
-                summary_state: diff_digest::DiffDigestSummaryState::Missing,
+                    summary_state: diff_digest::DiffDigestSummaryState::Missing,
                     current_summaries: vec![],
                     added_call_edges: vec![],
                     removed_call_edges: vec![],
@@ -32524,6 +32651,7 @@ fn sample() {}
             root: root.path().display().to_string(),
             mode: diff_digest::DiffDigestMode::WorkingTree,
             revision: None,
+            pathspecs: vec![],
             files_changed: 1,
             files_with_current_summaries: 1,
             symbols_touched: 1,
@@ -34779,8 +34907,12 @@ pub(crate) fn federated_exact_search(
         if !cfg.federation_for_scope(&scope) {
             continue;
         }
-        let mut response =
-            run_exact_search_with_timeout(std::slice::from_ref(&scope.source_root), query, limit, timeout_secs)?;
+        let mut response = run_exact_search_with_timeout(
+            std::slice::from_ref(&scope.source_root),
+            query,
+            limit,
+            timeout_secs,
+        )?;
         absolutize_search_hit_paths(&mut response, &scope.source_root);
         response.root = root.display().to_string();
         responses.push(response);
@@ -35007,7 +35139,11 @@ fn exact_search_response_from_process(
     parse_exact_search_output(search_path, limit, &raw)
 }
 
-fn run_exact_search(search_paths: &[PathBuf], query: &str, limit: usize) -> Result<sift::SearchResponse> {
+fn run_exact_search(
+    search_paths: &[PathBuf],
+    query: &str,
+    limit: usize,
+) -> Result<sift::SearchResponse> {
     let output = exact_search_command(search_paths, query)
         .output()
         .context("running exact search with ripgrep")?;
@@ -35080,7 +35216,14 @@ pub(crate) fn run_search_with_timeout(
     fts_index_fresh: Option<bool>,
 ) -> Result<sift::SearchResponse> {
     if timeout_secs == 0 {
-        return run_sift_search(search_path, cache_dir, query, limit, strategy, fts_index_fresh);
+        return run_sift_search(
+            search_path,
+            cache_dir,
+            query,
+            limit,
+            strategy,
+            fts_index_fresh,
+        );
     }
 
     let output_path = next_search_worker_output_path();

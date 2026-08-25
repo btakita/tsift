@@ -138,14 +138,16 @@ An empty focus preserves workspace-wide warming. Focus only limits proactive bac
 The `tsift-rewrite.sh` hook (`examples/hooks/tsift-rewrite.sh`) intercepts high-token shell commands and silently rewrites them to lower-context tsift flows:
 
 - `rg ...` / `grep -r ...` → `tsift --envelope search ... --exact --budget normal`
-- `git diff`, `git diff --cached`, `git show`, and simple `git log -p -1 ...` history review → `tsift diff-digest ...`
-- long transcript reads (`cat`, `bat`, `head -n`, `tail -n`, `sed -n`) over recognized agent-doc markdown sessions, Claude JSONL, Codex JSONL, or `agent-doc` runtime logs → `tsift session-digest ...`, anchored to the transcript's owning repo or submodule root when the file lives under one
+- `git diff`, `git diff --cached`, commit-form `git show`, and simple `git log -p -1 ...` history review → `tsift diff-digest ...`; pathspecs become repeatable `--pathspec` filters, while blob/tree reads such as `git show HEAD:path` decline explicitly because they are not commit diffs
+- whole or explicitly windowed transcript reads (`cat`, `bat`, `less`, `head -n`, `tail -n`, `sed -n`) over recognized agent-doc markdown sessions, Claude JSONL, or Codex JSONL → `tsift session-digest ...`, anchored to the transcript's owning repo or submodule root; generic `.log` inputs → `tsift log-digest ...`; indexed source inputs → exact `source-read --style window` ranges, including small explicit windows
 - `cargo test ...`, `pytest ...`, `python -m pytest ...` → `tsift --envelope digest-runner --kind test ...`
 - `cargo build ...`, `cargo check ...`, `cargo clippy ...`, `cargo install ...` → `tsift --envelope digest-runner --kind log ...`
 
 File-listing commands are not search rewrites. `rg --files ...`, `rg --type-list`, and `find ...` pass through so multiple roots, glob/predicate semantics, shell safety, ignore rules, and the original listing behavior are preserved instead of treating a root path as an exact search pattern. In hook/manual `tsift rewrite` protocol terms this is a no-rewrite exit: stdout stays empty, exit status is 1, and stderr carries a bounded reason plus guidance to run the original command unchanged.
 
 Unsupported shell forms are explicit too. Commands with shell metacharacters such as pipes, redirection, or background operators are not rewritten; the no-rewrite response keeps stdout empty, exits 1, and writes a bounded stderr explanation instead of silently failing. In `--run` mode, no-rewrite exits still do not execute the original command; stderr tells the caller to run the original command directly if intended.
+
+Recognized raw-read commands also retain their decline cause. Missing/unreadable files, unsupported input kinds, below-threshold whole-file reads, out-of-range windows, and source files without index coverage produce distinct messages; `~/...` inputs are expanded before classification. The whole-file threshold remains a cost gate, but an explicit `head`/`tail`/`sed` window already supplies a bound and is therefore rewritten even when it requests fewer than 80 lines.
 
 The digest-runner path preserves the wrapped command's original exit status while replacing raw stdout/stderr with a summary-first envelope, bounded digest, and persisted transcript artifact, so failing tests/builds still fail closed and green runs do not inline raw logs. When RTK is installed, digest-runner probes `rtk rewrite <command>` and delegates supported generic command families to RTK's compact filters before wrapping the filtered output in tsift's envelope/artifact metadata.
 

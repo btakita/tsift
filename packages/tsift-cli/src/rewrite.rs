@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result, bail};
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::output::OutputFormat;
@@ -252,13 +252,8 @@ pub fn rewrite_command(command: &str) -> Option<String> {
         return Some(rewritten);
     }
 
-    // long session/doc transcript reads → tsift session-digest
-    if let Some(rewritten) = rewrite_session_read_command(trimmed) {
-        return Some(rewritten);
-    }
-
-    // large source-file reads inside indexed repos → tsift source-read windows
-    if let Some(rewritten) = rewrite_source_read_command(trimmed) {
+    // recognized session/log reads and indexed source-file reads → bounded digests/windows
+    if let Some(rewritten) = rewrite_file_read_command(trimmed) {
         return Some(rewritten);
     }
 
@@ -279,13 +274,20 @@ pub(crate) fn no_rewrite_message(command: &str, run: bool) -> String {
     let trimmed = command.trim();
     let parts = shell_split(trimmed);
     let reason = if trimmed.is_empty() {
-        "empty command"
+        "empty command".to_string()
     } else if has_shell_metacharacters(trimmed) {
         "shell metacharacters such as pipes, redirection, or background operators are not rewritten"
+            .to_string()
     } else if is_file_listing_command(&parts) {
-        "file-listing commands keep original shell/find/rg semantics"
+        "file-listing commands keep original shell/find/rg semantics".to_string()
+    } else if let Some(selector) = git_show_blob_selector(trimmed) {
+        format!(
+            "`git show {selector}` reads a blob/tree object, not a commit diff; use the original `git show` or `git cat-file` command"
+        )
+    } else if let Some(reason) = file_read_decline_reason(trimmed) {
+        reason
     } else {
-        "no supported tsift rewrite matched this command"
+        "no supported tsift rewrite matched this command".to_string()
     };
     let action = if run {
         "`--run` executes only rewritten commands; run the original command directly if intended"
@@ -445,30 +447,23 @@ fn rewrite_git_diff(cmd: &str) -> Option<String> {
         return None;
     }
     let mut cached = false;
-    let mut path = None;
+    let mut pathspecs = Vec::new();
     let mut after_double_dash = false;
 
     for part in &parts[2..] {
         if after_double_dash {
-            if path.is_none() && !part.starts_with('-') {
-                path = Some(*part);
-                continue;
-            }
-            return None;
+            pathspecs.push(*part);
+            continue;
         }
         match *part {
             "--cached" | "--staged" => cached = true,
             "--" => after_double_dash = true,
-            raw if looks_like_path_selector(raw) => {
-                if path.replace(raw).is_some() {
-                    return None;
-                }
-            }
+            raw if looks_like_path_selector(raw) => pathspecs.push(raw),
             _ => return None,
         }
     }
 
-    Some(build_diff_digest_command(path.unwrap_or("."), cached, None))
+    Some(build_diff_digest_command(cached, None, &pathspecs))
 }
 
 fn rewrite_git_show(cmd: &str) -> Option<String> {
@@ -482,36 +477,31 @@ fn rewrite_git_show(cmd: &str) -> Option<String> {
     }
 
     let mut revision = "HEAD";
-    let mut path = None;
+    let mut revision_set = false;
+    let mut pathspecs = Vec::new();
     let mut after_double_dash = false;
 
     for part in &parts[2..] {
         if after_double_dash {
-            if path.is_none() && !part.starts_with('-') {
-                path = Some(*part);
-                continue;
-            }
-            return None;
+            pathspecs.push(*part);
+            continue;
         }
         match *part {
             "--" => after_double_dash = true,
             "-p" | "--patch" | "--stat" => {}
             raw if raw.starts_with("--format=") => {}
             raw if !raw.starts_with('-') => {
-                if revision != "HEAD" {
+                if revision_set || looks_like_git_blob_selector(raw) {
                     return None;
                 }
                 revision = raw;
+                revision_set = true;
             }
             _ => return None,
         }
     }
 
-    Some(build_diff_digest_command(
-        path.unwrap_or("."),
-        false,
-        Some(revision),
-    ))
+    Some(build_diff_digest_command(false, Some(revision), &pathspecs))
 }
 
 fn rewrite_git_patch_history(cmd: &str) -> Option<String> {
@@ -527,7 +517,7 @@ fn rewrite_git_patch_history(cmd: &str) -> Option<String> {
     let mut saw_patch = false;
     let mut saw_single_commit = false;
     let mut revision = "HEAD";
-    let mut path = None;
+    let mut pathspecs = Vec::new();
     let mut after_double_dash = false;
     let mut skip_next = false;
 
@@ -541,11 +531,8 @@ fn rewrite_git_patch_history(cmd: &str) -> Option<String> {
             return None;
         }
         if after_double_dash {
-            if path.is_none() && !part.starts_with('-') {
-                path = Some(*part);
-                continue;
-            }
-            return None;
+            pathspecs.push(*part);
+            continue;
         }
         match *part {
             "--" => after_double_dash = true,
@@ -566,14 +553,10 @@ fn rewrite_git_patch_history(cmd: &str) -> Option<String> {
         return None;
     }
 
-    Some(build_diff_digest_command(
-        path.unwrap_or("."),
-        false,
-        Some(revision),
-    ))
+    Some(build_diff_digest_command(false, Some(revision), &pathspecs))
 }
 
-fn build_diff_digest_command(path: &str, cached: bool, revision: Option<&str>) -> String {
+fn build_diff_digest_command(cached: bool, revision: Option<&str>, pathspecs: &[&str]) -> String {
     let mut result = "tsift diff-digest".to_string();
     if cached {
         result.push_str(" --cached");
@@ -581,11 +564,10 @@ fn build_diff_digest_command(path: &str, cached: bool, revision: Option<&str>) -
     if let Some(revision) = revision {
         result.push_str(&format!(" --revision {}", shell_quote(revision)));
     }
-    if path == "." {
-        result.push_str(" .");
-    } else {
-        result.push_str(&format!(" {}", shell_quote(path)));
+    for pathspec in pathspecs {
+        result.push_str(&format!(" --pathspec {}", shell_quote(pathspec)));
     }
+    result.push_str(" .");
     result
 }
 
@@ -606,65 +588,109 @@ struct FileReadTarget {
     window: FileReadWindow,
 }
 
-fn rewrite_session_read_command(cmd: &str) -> Option<String> {
-    if has_shell_metacharacters(cmd) {
-        return None;
-    }
-
-    let target = parse_file_read_target(cmd)?;
-    let input_path = Path::new(&target.input);
-    let source = detect_session_digest_source(input_path)?;
-
-    if let Some(requested_lines) = target.requested_lines {
-        if requested_lines < SESSION_READ_LINE_THRESHOLD {
-            return None;
-        }
-    } else if !file_has_at_least_lines(input_path, SESSION_READ_LINE_THRESHOLD) {
-        return None;
-    }
-
-    let digest_path = resolve_digest_context_path(input_path);
-    Some(build_session_digest_command(
-        &digest_path,
-        &target.input,
-        source,
-    ))
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileReadRewriteDecision {
+    Rewritten(String),
+    Declined(String),
 }
 
-fn rewrite_source_read_command(cmd: &str) -> Option<String> {
+fn rewrite_file_read_command(cmd: &str) -> Option<String> {
+    match file_read_rewrite_decision(cmd)? {
+        FileReadRewriteDecision::Rewritten(command) => Some(command),
+        FileReadRewriteDecision::Declined(_) => None,
+    }
+}
+
+fn file_read_decline_reason(cmd: &str) -> Option<String> {
+    match file_read_rewrite_decision(cmd)? {
+        FileReadRewriteDecision::Rewritten(_) => None,
+        FileReadRewriteDecision::Declined(reason) => Some(reason),
+    }
+}
+
+fn file_read_rewrite_decision(cmd: &str) -> Option<FileReadRewriteDecision> {
     if has_shell_metacharacters(cmd) {
         return None;
     }
 
     let target = parse_file_read_target(cmd)?;
-    let input_path = Path::new(&target.input);
-    if !file_is_supported_source(input_path) {
-        return None;
+    let input_path = expand_tilde_path(&target.input);
+    if !input_path.is_file() {
+        return Some(FileReadRewriteDecision::Declined(format!(
+            "read target `{}` is not a readable regular file",
+            target.input
+        )));
     }
 
-    if let Some(requested_lines) = target.requested_lines {
-        if requested_lines < SOURCE_READ_LINE_THRESHOLD {
-            return None;
+    let explicit_window = target.requested_lines.is_some();
+    if let Some(source) = detect_session_digest_source(&input_path) {
+        if !explicit_window && !file_has_at_least_lines(&input_path, SESSION_READ_LINE_THRESHOLD) {
+            return Some(FileReadRewriteDecision::Declined(format!(
+                "recognized session input `{}` is below the {}-line whole-file rewrite threshold",
+                target.input, SESSION_READ_LINE_THRESHOLD
+            )));
         }
-    } else if !file_has_at_least_lines(input_path, SOURCE_READ_LINE_THRESHOLD) {
-        return None;
+        let digest_path = resolve_digest_context_path(&input_path);
+        return Some(FileReadRewriteDecision::Rewritten(
+            build_session_digest_command(&digest_path, &input_path.to_string_lossy(), source),
+        ));
     }
 
-    let root = lint::find_project_root_for_path(input_path).ok()??;
+    if input_path.extension().and_then(|ext| ext.to_str()) == Some("log") {
+        if !explicit_window && !file_has_at_least_lines(&input_path, SESSION_READ_LINE_THRESHOLD) {
+            return Some(FileReadRewriteDecision::Declined(format!(
+                "log input `{}` is below the {}-line whole-file rewrite threshold",
+                target.input, SESSION_READ_LINE_THRESHOLD
+            )));
+        }
+        return Some(FileReadRewriteDecision::Rewritten(
+            build_log_digest_read_command(&input_path),
+        ));
+    }
+
+    if !file_is_supported_source(&input_path) {
+        return Some(FileReadRewriteDecision::Declined(format!(
+            "read target `{}` is not a recognized source, session, or log input",
+            target.input
+        )));
+    }
+
+    let root = match lint::find_project_root_for_path(&input_path) {
+        Ok(Some(root)) => root,
+        _ => {
+            return Some(FileReadRewriteDecision::Declined(format!(
+                "no project root found for source read `{}`",
+                target.input
+            )));
+        }
+    };
     if !project_has_index(&root) {
-        return None;
+        return Some(FileReadRewriteDecision::Declined(format!(
+            "no index coverage for `{}` (resolved project root `{}` has no index.db; run `tsift index {}`)",
+            target.input,
+            root.display(),
+            root.display()
+        )));
     }
     let file_abs = input_path.canonicalize().ok()?;
     let file_display = relativize_pathbuf(&file_abs, &root)
         .to_string_lossy()
         .to_string();
     let total_lines = count_file_lines(&file_abs)?;
-    let (start, lines) = source_window_for_read(target.window, total_lines)?;
-    Some(build_source_read_rewrite_command(
-        &root,
-        &file_display,
-        start,
-        lines,
+    if !explicit_window && total_lines < SOURCE_READ_LINE_THRESHOLD {
+        return Some(FileReadRewriteDecision::Declined(format!(
+            "source read `{}` is below the {}-line whole-file rewrite threshold",
+            target.input, SOURCE_READ_LINE_THRESHOLD
+        )));
+    }
+    let Some((start, lines)) = source_window_for_read(target.window, total_lines) else {
+        return Some(FileReadRewriteDecision::Declined(format!(
+            "requested source window for `{}` is outside the file's {} lines",
+            target.input, total_lines
+        )));
+    };
+    Some(FileReadRewriteDecision::Rewritten(
+        build_source_read_rewrite_command(&root, &file_display, start, lines),
     ))
 }
 
@@ -672,7 +698,7 @@ fn parse_file_read_target(cmd: &str) -> Option<FileReadTarget> {
     let parts: Vec<&str> = shell_split(cmd);
     let head = parts.first().copied()?;
     match head {
-        "cat" | "bat" | "batcat" => parse_cat_like_read_target(&parts),
+        "cat" | "bat" | "batcat" | "less" => parse_cat_like_read_target(&parts),
         "head" | "tail" => parse_head_tail_read_target(&parts),
         "sed" => parse_sed_read_target(&parts),
         _ => None,
@@ -764,11 +790,21 @@ fn parse_sed_read_target(parts: &[&str]) -> Option<FileReadTarget> {
 
 fn parse_requested_line_count(raw: &str) -> Option<usize> {
     let trimmed = strip_shell_quotes(raw);
-    if let Some(number) = trimmed.strip_prefix('+') {
-        number.parse::<usize>().ok()?;
-        return Some(SESSION_READ_LINE_THRESHOLD);
-    }
     trimmed.parse::<usize>().ok()
+}
+
+pub(crate) fn expand_tilde_path(input: &str) -> PathBuf {
+    if input == "~" {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(input));
+    }
+    if let Some(relative) = input.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(relative);
+    }
+    PathBuf::from(input)
 }
 
 fn parse_sed_print_window(raw: &str) -> Option<(usize, usize)> {
@@ -955,6 +991,14 @@ fn build_session_digest_command(
     )
 }
 
+fn build_log_digest_read_command(input: &Path) -> String {
+    format!(
+        "tsift log-digest --path {} --input {}",
+        shell_quote(&resolve_digest_context_path(input)),
+        shell_quote(&input.to_string_lossy())
+    )
+}
+
 pub(crate) fn resolve_digest_context_path(path: &Path) -> String {
     lint::resolve_harness_root_or_canonical_path(path)
         .map(|root| root.display().to_string())
@@ -1042,4 +1086,25 @@ fn looks_like_path_selector(raw: &str) -> bool {
         || raw.starts_with("../")
         || raw.contains('/')
         || raw.contains('.')
+}
+
+fn looks_like_git_blob_selector(raw: &str) -> bool {
+    raw.split_once(':')
+        .is_some_and(|(_, path)| !path.is_empty())
+}
+
+fn git_show_blob_selector(command: &str) -> Option<String> {
+    let parts = shell_split(command);
+    if parts.len() < 3 || parts[0] != "git" || parts[1] != "show" {
+        return None;
+    }
+    for part in &parts[2..] {
+        if *part == "--" {
+            break;
+        }
+        if !part.starts_with('-') && looks_like_git_blob_selector(part) {
+            return Some((*part).to_string());
+        }
+    }
+    None
 }

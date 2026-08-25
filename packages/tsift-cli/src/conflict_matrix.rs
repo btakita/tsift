@@ -1946,6 +1946,7 @@ pub(crate) fn prepare_conflict_matrix_inputs(
                 diff_digest::DiffDigestOptions {
                     cached: true,
                     revision: None,
+                    pathspecs: &[],
                     max_parsed_files: None,
                 },
             )

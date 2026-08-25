@@ -725,6 +725,9 @@ pub enum Commands {
         /// Path to the codebase (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Restrict the digest to a git pathspec (repeatable, relative to the codebase root)
+        #[arg(long = "pathspec")]
+        pathspecs: Vec<String>,
         /// Compare the staged index against HEAD instead of the working tree
         #[arg(long, conflicts_with = "revision")]
         cached: bool,
@@ -1187,7 +1190,7 @@ pub enum FindingCommand {
         /// Output as JSON
         #[arg(long)]
         json: bool,
-     },
+    },
 }
 
 #[derive(Subcommand)]

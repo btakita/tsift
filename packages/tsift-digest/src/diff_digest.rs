@@ -20,6 +20,9 @@ pub enum DiffDigestMode {
 pub struct DiffDigestOptions<'a> {
     pub cached: bool,
     pub revision: Option<&'a str>,
+    /// Optional git pathspecs restricting the changed-file set. Pathspecs are
+    /// interpreted by git relative to the resolved codebase root.
+    pub pathspecs: &'a [String],
     /// Cap how many changed files get a full tree-sitter parse for symbols and
     /// call-edges. `None` parses every changed file (the historical default).
     /// `Some(N)` parses the first `N` files in sort order and emits cheap
@@ -82,6 +85,8 @@ pub struct DiffDigestReport {
     pub mode: DiffDigestMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub pathspecs: Vec<String>,
     pub files_changed: usize,
     pub files_with_current_summaries: usize,
     pub symbols_touched: usize,
@@ -117,9 +122,17 @@ struct RevisionBounds {
 }
 
 pub fn compute(path: &Path, options: DiffDigestOptions<'_>) -> Result<DiffDigestReport> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("reading diff-digest codebase path {}", path.display()))?;
+    if !metadata.is_dir() {
+        anyhow::bail!(
+            "diff-digest codebase path must be a directory, got {}",
+            path.display()
+        );
+    }
     let root = lint::resolve_project_root_or_canonical_path(path)?;
     let mode = resolve_mode(&root, options)?;
-    let changed = collect_changed_files(&root, &mode)?;
+    let changed = collect_changed_files(&root, &mode, options.pathspecs)?;
     let summary_db = open_summary_db_if_present(&root)?;
 
     // First pass: collect (path, status, existing) tuples after artifact filter.
@@ -198,6 +211,7 @@ pub fn compute(path: &Path, options: DiffDigestOptions<'_>) -> Result<DiffDigest
         root: root.display().to_string(),
         mode: mode.report_mode(),
         revision: mode.report_revision(),
+        pathspecs: options.pathspecs.to_vec(),
         files_changed: files.len(),
         files_with_current_summaries,
         symbols_touched,
@@ -547,13 +561,13 @@ fn resolve_mode(root: &Path, options: DiffDigestOptions<'_>) -> Result<ResolvedD
 fn collect_changed_files(
     root: &Path,
     mode: &ResolvedDiffDigestMode,
+    pathspecs: &[String],
 ) -> Result<summarize::GitChangedFiles> {
     match mode {
-        ResolvedDiffDigestMode::WorkingTree => summarize::git_changed_files(root),
-        ResolvedDiffDigestMode::Cached => git_changed_files_from_args(
-            root,
-            if git_has_head_commit(root)? {
-                &[
+        ResolvedDiffDigestMode::WorkingTree => git_changed_files_for_working_tree(root, pathspecs),
+        ResolvedDiffDigestMode::Cached => {
+            let mut args = if git_has_head_commit(root)? {
+                vec![
                     "diff",
                     "--cached",
                     "--name-status",
@@ -561,51 +575,97 @@ fn collect_changed_files(
                     "HEAD",
                 ]
             } else {
-                &[
+                vec![
                     "diff",
                     "--cached",
                     "--name-status",
                     "--find-renames",
                     "--root",
                 ]
-            },
-            "git diff --cached --name-status",
-        ),
-        ResolvedDiffDigestMode::Revision(bounds) => git_changed_files_for_revision(root, bounds),
+            };
+            append_pathspec_args(&mut args, pathspecs);
+            git_changed_files_from_args(root, &args, "git diff --cached --name-status")
+        }
+        ResolvedDiffDigestMode::Revision(bounds) => {
+            git_changed_files_for_revision(root, bounds, pathspecs)
+        }
     }
+}
+
+fn git_changed_files_for_working_tree(
+    root: &Path,
+    pathspecs: &[String],
+) -> Result<summarize::GitChangedFiles> {
+    let mut changed = if git_has_head_commit(root)? {
+        let mut args = vec!["diff", "--name-status", "--find-renames", "HEAD"];
+        append_pathspec_args(&mut args, pathspecs);
+        git_changed_files_from_args(root, &args, "git diff --name-status")?
+    } else {
+        summarize::GitChangedFiles {
+            existing: Vec::new(),
+            deleted: Vec::new(),
+        }
+    };
+
+    let mut args = vec!["ls-files", "--others", "--exclude-standard"];
+    append_pathspec_args(&mut args, pathspecs);
+    let output = Command::new("git")
+        .args(&args)
+        .current_dir(root)
+        .output()
+        .context("running git ls-files")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git ls-files failed: {}", stderr.trim());
+    }
+    changed.existing.extend(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| root.join(line))
+            .filter(|path| path.is_file()),
+    );
+    changed.existing.sort();
+    changed.existing.dedup();
+    Ok(changed)
+}
+
+fn append_pathspec_args<'a>(args: &mut Vec<&'a str>, pathspecs: &'a [String]) {
+    if pathspecs.is_empty() {
+        return;
+    }
+    args.push("--");
+    args.extend(pathspecs.iter().map(String::as_str));
 }
 
 fn git_changed_files_for_revision(
     root: &Path,
     bounds: &RevisionBounds,
+    pathspecs: &[String],
 ) -> Result<summarize::GitChangedFiles> {
     if let Some(base) = &bounds.base {
-        return git_changed_files_from_args(
-            root,
-            &[
-                "diff",
-                "--name-status",
-                "--find-renames",
-                base,
-                &bounds.target,
-            ],
-            "git diff --name-status",
-        );
-    }
-
-    git_changed_files_from_args(
-        root,
-        &[
-            "diff-tree",
-            "--root",
-            "--no-commit-id",
-            "-r",
+        let mut args = vec![
+            "diff",
             "--name-status",
             "--find-renames",
+            base,
             &bounds.target,
-        ],
-        "git diff-tree --root --name-status",
-    )
+        ];
+        append_pathspec_args(&mut args, pathspecs);
+        return git_changed_files_from_args(root, &args, "git diff --name-status");
+    }
+
+    let mut args = vec![
+        "diff-tree",
+        "--root",
+        "--no-commit-id",
+        "-r",
+        "--name-status",
+        "--find-renames",
+        &bounds.target,
+    ];
+    append_pathspec_args(&mut args, pathspecs);
+    git_changed_files_from_args(root, &args, "git diff-tree --root --name-status")
 }
 
 fn git_changed_files_from_args(
@@ -933,6 +993,7 @@ mod tests {
             DiffDigestOptions {
                 cached: true,
                 revision: None,
+                pathspecs: &[],
                 max_parsed_files: None,
             },
         )
@@ -1005,6 +1066,7 @@ mod tests {
             DiffDigestOptions {
                 cached: false,
                 revision: Some("HEAD"),
+                pathspecs: &[],
                 max_parsed_files: None,
             },
         )
@@ -1026,6 +1088,47 @@ mod tests {
         assert_eq!(
             file.added_call_edges,
             vec!["main -> committed_helper".to_string()]
+        );
+    }
+
+    #[test]
+    fn diff_digest_pathspec_filters_working_tree_and_reports_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs"] {
+            std::fs::write(dir.path().join(name), "fn baseline() {}\n").unwrap();
+        }
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "fn changed_a() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn changed_b() {}\n").unwrap();
+
+        let pathspecs = vec!["a.rs".to_string()];
+        let report = compute(
+            dir.path(),
+            DiffDigestOptions {
+                cached: false,
+                revision: None,
+                pathspecs: &pathspecs,
+                max_parsed_files: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.pathspecs, pathspecs);
+        assert_eq!(report.files_changed, 1);
+        assert_eq!(report.files[0].path, "a.rs");
+    }
+
+    #[test]
+    fn diff_digest_rejects_regular_file_as_codebase_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("AGENTS.md");
+        std::fs::write(&file, "# instructions\n").unwrap();
+
+        let error = compute(&file, DiffDigestOptions::default()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("diff-digest codebase path must be a directory")
         );
     }
 
@@ -1085,6 +1188,7 @@ mod tests {
             DiffDigestOptions {
                 cached: false,
                 revision: None,
+                pathspecs: &[],
                 max_parsed_files: Some(2),
             },
         )

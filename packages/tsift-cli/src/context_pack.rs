@@ -1162,6 +1162,7 @@ pub(crate) fn build_context_pack_report_with_profile(
                     diff_digest::DiffDigestOptions {
                         cached: false,
                         revision: None,
+                        pathspecs: &[],
                         max_parsed_files: Some(diff_parse_budget),
                     },
                 )

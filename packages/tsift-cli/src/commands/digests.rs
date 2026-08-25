@@ -22,6 +22,7 @@ use crate::{
 
 pub(crate) fn cmd_diff_digest(
     path: &Path,
+    pathspecs: &[String],
     cached: bool,
     revision: Option<&str>,
     max_parsed_files: usize,
@@ -37,6 +38,7 @@ pub(crate) fn cmd_diff_digest(
         diff_digest::DiffDigestOptions {
             cached,
             revision,
+            pathspecs,
             max_parsed_files: parsed_files_cap,
         },
     )?;
@@ -60,15 +62,21 @@ pub(crate) fn cmd_diff_digest(
     }
 
     if format.compact {
+        let pathspec_suffix = if report.pathspecs.is_empty() {
+            String::new()
+        } else {
+            format!(" pathspecs:{}", report.pathspecs.join(","))
+        };
         println!(
-            "diff mode:{} files:{} summaries:{} syms:{} headings:{} edges:+{}/-{}",
+            "diff mode:{} files:{} summaries:{} syms:{} headings:{} edges:+{}/-{}{}",
             diff_digest_mode_label(report.mode),
             report.files_changed,
             report.files_with_current_summaries,
             report.symbols_touched,
             report.headings_touched,
             report.call_edges_added,
-            report.call_edges_removed
+            report.call_edges_removed,
+            pathspec_suffix
         );
         for file in &report.files {
             let symbols = if file.touched_symbols.is_empty() {
@@ -96,13 +104,22 @@ pub(crate) fn cmd_diff_digest(
     }
 
     println!("Diff digest ({})", diff_digest_mode_display(&report));
+    if !report.pathspecs.is_empty() {
+        println!(
+            "  pathspecs:                     {}",
+            report.pathspecs.join(", ")
+        );
+    }
     println!("  files changed:                 {}", report.files_changed);
     println!(
         "  files with current summaries: {}",
         report.files_with_current_summaries
     );
     println!("  touched symbols:              {}", report.symbols_touched);
-    println!("  touched headings:             {}", report.headings_touched);
+    println!(
+        "  touched headings:             {}",
+        report.headings_touched
+    );
     println!(
         "  call edges:                   +{} / -{}",
         report.call_edges_added, report.call_edges_removed

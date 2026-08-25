@@ -10,13 +10,14 @@ Part of the [tsift spec](../SPEC.md). See that index for the full command/spec m
 tsift diff-digest .        # current repo root
 tsift diff-digest --cached . # staged index against HEAD
 tsift diff-digest --revision HEAD . # HEAD commit against its first parent
+tsift diff-digest --pathspec src/lib.rs . # only paths matched by the git pathspec
 tsift diff-digest --json . # structured output
 tsift diff-digest --max-parsed-files 0 . # unlimited tree-sitter parsing
 ```
 
 Behavior:
 
-1. In default mode, collect tracked changes from `HEAD` plus untracked files and compare `HEAD` to the working tree. With `--cached`, compare the staged index to `HEAD`. With `--revision <rev>`, compare that single revision to its first parent (or to the empty tree for a root commit).
+1. The positional `[path]` is the codebase root and must resolve to a directory; a regular file is rejected rather than silently treated as its containing repository. In default mode, collect tracked changes from `HEAD` plus untracked files and compare `HEAD` to the working tree. With `--cached`, compare the staged index to `HEAD`. With `--revision <rev>`, compare that single revision to its first parent (or to the empty tree for a root commit). Repeatable `--pathspec <pathspec>` values are passed to git after `--` in every mode, filter tracked/deleted/untracked paths without widening scope, and are echoed in human, compact, and JSON reports.
 2. Parse both snapshots directly with tree-sitter when the file language is supported. By default, only the first 25 changed files (in sort order) receive full tree-sitter parsing; remaining files get cheap path-only entries. `--max-parsed-files N` adjusts the cap; `--max-parsed-files 0` disables it.
 3. Emit changed-file status, touched symbols, touched document headings, up to two current cached summary snippets when `summaries.db` matches the compared snapshot, and added/removed call edges.
 
@@ -114,7 +115,7 @@ The checked-in `fixtures/dci-search-benchmark.json` is a seed benchmark for tsif
 The model currently covers:
 
 - session prompt-target extraction, including live exchange prompts versus copied instruction/frontmatter/archive ballast;
-- rewrite routing for long session reads, large indexed source reads, short passthrough reads, test/build digest-runner wrappers, diff-digest routing, and shell metacharacter passthrough;
+- rewrite routing for long session reads, short session passthrough reads, large indexed source reads, explicit small source windows, test/build digest-runner wrappers, diff-digest routing, and shell metacharacter passthrough;
 - status recommendation transitions for missing, stale, and current Code Navigation instructions.
 
 Coverage counters are explicit and fail closed when a named edge class disappears from the corpus. This mirrors the agent-doc pattern of replacing expensive live tmux edge sweeps with deterministic model coverage first while keeping the deterministic simulation budget small enough for the local default suite.
