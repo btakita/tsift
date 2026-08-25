@@ -23492,6 +23492,57 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_canonical_claude_session_path_without_early_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir
+            .path()
+            .join(".claude/projects/example-project/session.jsonl");
+        fs::create_dir_all(session.parent().unwrap()).unwrap();
+        let line = r#"{"type":"queue-operation","operation":"enqueue"}"#;
+        let body = std::iter::repeat_n(line, 120)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&session, format!("{body}\n")).unwrap();
+
+        let result = rewrite_command(&format!(
+            "tail -n 20 {}",
+            shell_quote(session.to_str().unwrap())
+        ));
+        assert_eq!(
+            result,
+            Some(format!(
+                "tsift session-digest --path {} --input {} --source claude-jsonl",
+                shell_quote(&resolve_digest_context_path(&session)),
+                shell_quote(session.to_str().unwrap())
+            ))
+        );
+    }
+
+    #[test]
+    fn rewrite_captured_output_text_file_to_log_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("build.output.txt");
+        let body = (0..120)
+            .map(|index| format!("compile step {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&log, format!("{body}\n")).unwrap();
+
+        let result = rewrite_command(&format!(
+            "tail -n 20 {}",
+            shell_quote(log.to_str().unwrap())
+        ));
+        assert_eq!(
+            result,
+            Some(format!(
+                "tsift log-digest --path {} --input {}",
+                shell_quote(&resolve_digest_context_path(&log)),
+                shell_quote(log.to_str().unwrap())
+            ))
+        );
+    }
+
+    #[test]
     fn rewrite_sed_large_agent_doc_range_to_session_digest() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("tsift.md");
@@ -27163,6 +27214,7 @@ fn main() { api::handler(); }
             dir.path(),
             "alpha_helper",
             10,
+            false,
             &TagpathSearchOpts {
                 no_tagpath: true,
                 strict: false,
@@ -27209,6 +27261,7 @@ tier = "isolated"
             dir.path(),
             "alpha_helper",
             10,
+            false,
             &TagpathSearchOpts {
                 no_tagpath: true,
                 strict: false,
@@ -34840,6 +34893,7 @@ pub(crate) fn federated_symbol_search(
     root: &std::path::Path,
     query: &str,
     limit: usize,
+    include_markdown: bool,
     tagpath_opts: &TagpathSearchOpts,
 ) -> Result<(Vec<index::SymbolHit>, TagpathAnnotationDiagnostic)> {
     let cfg = config::Config::load(root)?;
@@ -34855,7 +34909,11 @@ pub(crate) fn federated_symbol_search(
             continue;
         }
         let db = index::IndexDb::open_read_only(&db_path)?;
-        let mut hits = db.symbol_search(query, limit)?;
+        let mut hits = if include_markdown {
+            db.symbol_search(query, limit)?
+        } else {
+            db.code_symbol_search(query, limit)?
+        };
         let diag = annotate_hits_with_tagpath(&mut hits, &scope.source_root, tagpath_opts)?;
         combined.loaded |= diag.loaded;
         if diag.stale && !combined.stale {

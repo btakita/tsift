@@ -1614,6 +1614,22 @@ impl IndexDb {
     }
 
     pub fn symbol_search(&self, query: &str, limit: usize) -> Result<Vec<SymbolHit>> {
+        self.symbol_search_filtered(query, limit, true)
+    }
+
+    /// Search only code symbols. Markdown headings, list items, and fenced
+    /// blocks remain indexed for source navigation and semantic editing, but
+    /// they must not compete in `tsift search`'s high-confidence Symbol matches.
+    pub fn code_symbol_search(&self, query: &str, limit: usize) -> Result<Vec<SymbolHit>> {
+        self.symbol_search_filtered(query, limit, false)
+    }
+
+    fn symbol_search_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        include_markdown: bool,
+    ) -> Result<Vec<SymbolHit>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1672,10 +1688,15 @@ impl IndexDb {
         let tag_count_expr = "CASE WHEN tags IS NULL OR tags = '' THEN 0 ELSE LENGTH(tags) - LENGTH(REPLACE(tags, ',', '')) + 1 END";
         let ast_columns = self.ast_span_select_columns()?;
         let limit_param_idx = params.len() + 1;
+        let language_filter = if include_markdown {
+            ""
+        } else {
+            " AND language <> 'markdown'"
+        };
         let sql = format!(
             "SELECT name, kind, language, file, line, end_line, {ast_columns}, tags, {match_count_expr} AS match_count, {tag_count_expr} AS tag_count \
              FROM symbols \
-             WHERE {} \
+             WHERE ({}){} \
              ORDER BY \
                  CASE WHEN {exact_match_expr} THEN 1 ELSE 0 END DESC, \
                  match_count DESC, \
@@ -1684,7 +1705,7 @@ impl IndexDb {
                  file ASC, \
                  line ASC \
              LIMIT ?{limit_param_idx}",
-            where_clauses
+            where_clauses, language_filter
         );
         params.push(rusqlite::types::Value::from(
             i64::try_from(limit).unwrap_or(i64::MAX),
@@ -2562,6 +2583,32 @@ mod tests {
         assert_eq!(hits[0].name, "main");
         assert_eq!(hits[0].match_type, "exact_name");
         assert_eq!(hits[0].score, 1.0);
+    }
+
+    #[test]
+    fn code_symbol_search_excludes_markdown_structure_without_dropping_navigation_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lib.rs"), "fn router() {}\n").unwrap();
+        fs::write(
+            dir.path().join("README.md"),
+            "# Guide\n\n- Router setup notes\n",
+        )
+        .unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let navigation_hits = db.symbol_search("Router", 20).unwrap();
+        assert!(
+            navigation_hits.iter().any(|hit| hit.language == "markdown"),
+            "Markdown structure must remain available to symbol/source navigation"
+        );
+
+        let search_hits = db.code_symbol_search("Router", 20).unwrap();
+        assert!(search_hits.iter().any(|hit| hit.name == "router"));
+        assert!(
+            search_hits.iter().all(|hit| hit.language != "markdown"),
+            "Markdown structure must not enter search Symbol matches: {search_hits:?}"
+        );
     }
 
     #[test]

@@ -555,6 +555,17 @@ pub fn compute_with_options_and_phases(
     let mut sessions_considered = 0_usize;
     let mut warnings = Vec::new();
 
+    if context.kind == TargetKind::File
+        && context
+            .canonical_target
+            .extension()
+            .and_then(|ext| ext.to_str())
+            == Some("jsonl")
+    {
+        sessions_considered += 1;
+        add_explicit_jsonl_candidate(&mut candidates, &context, &context.canonical_target)?;
+    }
+
     let agent_doc_logs_dir = resolve_agent_doc_logs_dir(&context.root, options);
     if let Some(session_name) = &context.agent_doc_session {
         let session_log = agent_doc_logs_dir.join(format!("{session_name}.log"));
@@ -1757,6 +1768,46 @@ fn maybe_add_agent_doc_candidate(
     Ok(())
 }
 
+fn add_explicit_jsonl_candidate(
+    candidates: &mut BTreeMap<String, PendingSession>,
+    context: &TargetContext,
+    path: &Path,
+) -> Result<()> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading explicit session transcript {}", path.display()))?;
+    let (source, cwd) = if let Some(cwd) = extract_codex_cwd_from_text(&text) {
+        (ReviewSource::CodexJsonl, cwd)
+    } else if let Some(cwd) = extract_claude_cwd_from_text(&text) {
+        (ReviewSource::ClaudeJsonl, cwd)
+    } else {
+        bail!(
+            "explicit JSONL target {} is not a recognized Claude or Codex session transcript",
+            path.display()
+        );
+    };
+    if !cwd_matches_target(context, Some(&cwd)) {
+        bail!(
+            "explicit session transcript {} has cwd {} outside target repository {}",
+            path.display(),
+            cwd.display(),
+            context.root.display()
+        );
+    }
+    let modified_unix_secs = file_modified_unix_secs(path)?;
+    insert_candidate(
+        candidates,
+        PendingSession::new(
+            source,
+            path.to_path_buf(),
+            vec!["explicit_target".to_string()],
+            modified_unix_secs,
+            text,
+        ),
+    );
+
+    Ok(())
+}
+
 fn maybe_add_claude_candidate(
     candidates: &mut BTreeMap<String, PendingSession>,
     context: &TargetContext,
@@ -2526,6 +2577,63 @@ mod tests {
         assert!(report.next_context.next_digest_commands.iter().any(
             |command| command == "tsift session-review --next-context tasks/software/tsift.md"
         ));
+    }
+
+    #[test]
+    fn session_review_admits_explicit_claude_jsonl_target() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        let transcript = root
+            .path()
+            .join(".claude/projects/example-project/session.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"cwd\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":\"fix issue 14\"}}}}\n",
+                root.path().display()
+            ),
+        )
+        .unwrap();
+
+        let report = compute_with_options(
+            &transcript,
+            &SessionReviewOptions {
+                claude_projects_dir: Some(root.path().join("missing-claude")),
+                codex_sessions_dir: Some(root.path().join("missing-codex")),
+                agent_doc_logs_dir: Some(root.path().join("missing-agent-doc")),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.sessions_considered, 1);
+        assert_eq!(report.sessions_matched, 1);
+        assert_eq!(report.claude_sessions, 1);
+        assert_eq!(report.codex_sessions, 0);
+        assert!(
+            report.sessions[0]
+                .matched_by
+                .iter()
+                .any(|reason| reason == "explicit_target")
+        );
+    }
+
+    #[test]
+    fn session_review_rejects_unrecognized_explicit_jsonl_target() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        let transcript = root.path().join("ordinary.jsonl");
+        fs::write(&transcript, "{\"kind\":\"ordinary-data\"}\n").unwrap();
+
+        let error = match compute(&transcript) {
+            Err(error) => error,
+            Ok(_) => panic!("ordinary JSONL should not be accepted as a session transcript"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("not a recognized Claude or Codex session transcript")
+        );
     }
 
     #[test]

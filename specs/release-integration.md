@@ -139,7 +139,7 @@ The `tsift-rewrite.sh` hook (`examples/hooks/tsift-rewrite.sh`) intercepts high-
 
 - `rg ...` / `grep -r ...` → `tsift --envelope search ... --exact --budget normal`
 - `git diff`, `git diff --cached`, commit-form `git show`, and simple `git log -p -1 ...` history review → `tsift diff-digest ...`; pathspecs become repeatable `--pathspec` filters, while blob/tree reads such as `git show HEAD:path` decline explicitly because they are not commit diffs
-- whole or explicitly windowed transcript reads (`cat`, `bat`, `less`, `head -n`, `tail -n`, `sed -n`) over recognized agent-doc markdown sessions, Claude JSONL, or Codex JSONL → `tsift session-digest ...`, anchored to the transcript's owning repo or submodule root; generic `.log` inputs → `tsift log-digest ...`; indexed source inputs → exact `source-read --style window` ranges, including small explicit windows
+- whole or explicitly windowed transcript reads (`cat`, `bat`, `less`, `head -n`, `tail -n`, `sed -n`) over recognized agent-doc markdown sessions, Claude JSONL, or Codex JSONL → `tsift session-digest ...`, anchored to the transcript's owning repo or submodule root. Canonical `.claude/projects/...` and `.codex/sessions/...` paths identify their transcript source even when the bounded file prefix contains only queue or hook records. Generic `.log`, `.out`, `.output.txt`, and `.log.txt` inputs → `tsift log-digest ...`; indexed source inputs → exact `source-read --style window` ranges, including small explicit windows.
 - `cargo test ...`, `pytest ...`, `python -m pytest ...` → `tsift --envelope digest-runner --kind test ...`
 - `cargo build ...`, `cargo check ...`, `cargo clippy ...`, `cargo install ...` → `tsift --envelope digest-runner --kind log ...`
 

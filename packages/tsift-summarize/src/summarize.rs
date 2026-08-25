@@ -125,6 +125,22 @@ struct ExtractionResponse {
     concept_labels: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ClaudeCliResponse {
+    result: String,
+    usage: ClaudeCliUsage,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeCliUsage {
+    input_tokens: i64,
+    #[serde(default)]
+    cache_creation_input_tokens: i64,
+    #[serde(default)]
+    cache_read_input_tokens: i64,
+    output_tokens: i64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ExtractionReport {
     pub files_processed: usize,
@@ -1231,6 +1247,7 @@ fn call_claude_cli(command: &Path, model: &str, prompt: &str) -> Result<(String,
         .arg("--tools")
         .arg("")
         .arg("--no-session-persistence")
+        .args(["--output-format", "json"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1257,11 +1274,26 @@ fn call_claude_cli(command: &Path, model: &str, prompt: &str) -> Result<(String,
 
     let response = String::from_utf8(output.stdout)
         .context("Claude Code CLI extraction returned non-UTF-8 output")?;
-    let response = strip_markdown_fences(response.trim());
-    if response.is_empty() {
+    parse_claude_cli_response(&response)
+}
+
+fn parse_claude_cli_response(response: &str) -> Result<(String, i64, i64)> {
+    let response: ClaudeCliResponse = serde_json::from_str(response.trim())
+        .context("parsing Claude Code CLI JSON response and token usage")?;
+    let content = strip_markdown_fences(response.result.trim());
+    if content.is_empty() {
         bail!("Claude Code CLI extraction returned an empty response");
     }
-    Ok((response.to_string(), 0, 0))
+    let tokens_input = response
+        .usage
+        .input_tokens
+        .saturating_add(response.usage.cache_creation_input_tokens)
+        .saturating_add(response.usage.cache_read_input_tokens);
+    Ok((
+        content.to_string(),
+        tokens_input,
+        response.usage.output_tokens,
+    ))
 }
 
 fn maybe_mock_anthropic_api(prompt: &str) -> Result<Option<(String, i64, i64)>> {
@@ -1936,6 +1968,25 @@ mod tests {
         let prompt = build_extraction_prompt("src/lib.rs", "code", &symbols);
         assert!(prompt.contains("- main (function)"));
         assert!(prompt.contains("- Config (struct)"));
+    }
+
+    #[test]
+    fn claude_cli_response_extracts_content_and_measured_usage() {
+        let response = json!({
+            "result": "```json\n{\"summary\":\"ok\"}\n```",
+            "usage": {
+                "input_tokens": 12,
+                "cache_creation_input_tokens": 3,
+                "cache_read_input_tokens": 40,
+                "output_tokens": 7
+            }
+        })
+        .to_string();
+
+        let (content, tokens_in, tokens_out) = parse_claude_cli_response(&response).unwrap();
+        assert_eq!(content, "{\"summary\":\"ok\"}");
+        assert_eq!(tokens_in, 55);
+        assert_eq!(tokens_out, 7);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use anyhow::{Context as _, Result, bail};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _};
 use std::path::{Path, PathBuf};
@@ -636,7 +637,7 @@ fn file_read_rewrite_decision(cmd: &str) -> Option<FileReadRewriteDecision> {
         ));
     }
 
-    if input_path.extension().and_then(|ext| ext.to_str()) == Some("log") {
+    if file_looks_like_captured_log(&input_path) {
         if !explicit_window && !file_has_at_least_lines(&input_path, SESSION_READ_LINE_THRESHOLD) {
             return Some(FileReadRewriteDecision::Declined(format!(
                 "log input `{}` is below the {}-line whole-file rewrite threshold",
@@ -894,10 +895,16 @@ fn detect_session_digest_source(path: &Path) -> Option<session_digest::SessionDi
         Some("md") if session_markdown::markdown_file_looks_like_agent_doc_session(path) => {
             Some(session_digest::SessionDigestSource::Markdown)
         }
-        Some("jsonl") if file_looks_like_claude_jsonl(path) => {
+        Some("jsonl")
+            if path_has_component_pair(path, ".claude", "projects")
+                || file_looks_like_claude_jsonl(path) =>
+        {
             Some(session_digest::SessionDigestSource::ClaudeJsonl)
         }
-        Some("jsonl") if file_looks_like_codex_jsonl(path) => {
+        Some("jsonl")
+            if path_has_component_pair(path, ".codex", "sessions")
+                || file_looks_like_codex_jsonl(path) =>
+        {
             Some(session_digest::SessionDigestSource::CodexJsonl)
         }
         Some("log") if session_markdown::log_file_looks_like_agent_doc_runtime_log(path) => {
@@ -905,6 +912,28 @@ fn detect_session_digest_source(path: &Path) -> Option<session_digest::SessionDi
         }
         _ => None,
     }
+}
+
+fn path_has_component_pair(path: &Path, first: &str, second: &str) -> bool {
+    let components = path.components().collect::<Vec<_>>();
+    components.windows(2).any(|pair| {
+        pair[0].as_os_str() == OsStr::new(first) && pair[1].as_os_str() == OsStr::new(second)
+    })
+}
+
+fn file_looks_like_captured_log(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    let file_name = file_name.to_ascii_lowercase();
+    matches!(
+        path.extension()
+            .and_then(OsStr::to_str)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("log" | "out")
+    ) || file_name.ends_with(".output.txt")
+        || file_name.ends_with(".log.txt")
 }
 
 fn file_looks_like_claude_jsonl(path: &Path) -> bool {

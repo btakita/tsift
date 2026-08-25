@@ -124,7 +124,14 @@ pub(crate) fn cmd_summarize(
             Some(summarize::ExtractionClient::resolve(&cfg)?)
         };
 
-        for (file_path, hash, rel_path) in pending_extractions {
+        let extraction_count = pending_extractions.len();
+        for (index, (file_path, hash, rel_path)) in pending_extractions.into_iter().enumerate() {
+            eprintln!(
+                "extracting {}/{}: {}",
+                index + 1,
+                extraction_count,
+                rel_path
+            );
             match summary_cache.get_or_extract_file(&rel_path, &hash, || {
                 let symbol_context = find_symbols_db_for_file(&root, file_path)?;
                 let mut summaries = summarize::extract_for_file_with_client(

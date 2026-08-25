@@ -216,11 +216,16 @@ caller that reads that section and stops — the whole point of a bounded envelo
   ambiguity rather than as noise, with no signal to discriminate on. Under F0.5 a
   one-of-three match lands near `0.38` and a two-of-three near `0.71`.
 - **Keyword-only queries are lexical.** A query whose every tag is a language
-  keyword (`def `, `func`, `class fn`) cannot identify a symbol by name — every
-  Python file contains `def `, so tag matching just surfaced whichever symbols
-  happened to end in `_def`. Tag matching is skipped for those queries and the
-  lexical strategy answers them. Exact-name matching still applies, so a symbol
-  literally named `def` is still found.
+keyword (`def `, `func`, `class fn`) cannot identify a symbol by name — every
+Python file contains `def `, so tag matching just surfaced whichever symbols
+happened to end in `_def`. Tag matching is skipped for those queries and the
+lexical strategy answers them. Exact-name matching still applies, so a symbol
+literally named `def` is still found.
+- **General search symbols are code-only.** Markdown headings, list items, and
+other document-structure nodes remain indexed for `symbol-read`, Markdown AST
+navigation, and semantic editing, but the ordinary and federated `search`
+symbol sections exclude them. Matching prose still appears through the lexical
+result section instead of masquerading as a code symbol.
 
 When nothing clears the floor the symbol section is empty rather than padded to
 `--limit`: an empty symbol section plus a real lexical hit is a better answer
@@ -574,9 +579,9 @@ CREATE INDEX idx_summaries_hash ON summaries(content_hash);
 3. If at least one cache miss needs extraction, resolve the transport once before the extraction walk. Prefer `claude -p` when a Claude Code hosted-provider flag is active; otherwise use the configured direct Anthropic API key when present, then fall back to an executable, authenticated `claude` on `PATH`. If neither is usable, exit nonzero with one actionable credential error and no per-file duplicates.
 4. For each cache miss, load source + symbols from `index.db`
 5. Build extraction prompt: source snippet + symbol list + "extract entities, relationships, 2-sentence summary"
-6. Submit through the resolved client. Claude Code runs non-interactively with the configured model, no tools, safe mode, and no session persistence so it inherits direct, Bedrock, Vertex, or Foundry authentication without loading project automation. Direct API responses still fail closed on non-2xx status before content parsing.
+6. Submit through the resolved client. Claude Code runs non-interactively with the configured model, no tools, safe mode, no session persistence, and JSON output so it inherits direct, Bedrock, Vertex, or Foundry authentication without loading project automation. Its response must include `result` plus measured `usage`; input usage sums uncached, cache-creation, and cache-read tokens. Missing or malformed usage fails extraction instead of recording false zeroes. Direct API responses still fail closed on non-2xx status before content parsing.
 7. Parse each response and insert/update `summaries.db`
-8. Report: files processed, entities found, tokens spent when the transport exposes usage, and estimated savings
+8. Before each model call, report `extracting N/total: <path>` on stderr so long runs remain visibly live. Then report files processed, entities found, measured tokens spent, and estimated savings.
 
 ### Token Savings Model
 

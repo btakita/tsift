@@ -525,6 +525,7 @@ pub(crate) fn cmd_search_with_budget(
     } else {
         limit.saturating_mul(20).max(limit).max(100)
     };
+    let include_markdown_symbols = !facet_filters.is_empty();
 
     let (symbol_hits, sift_path, federated_tagpath_diag) =
         if let Some(scope) = inferred_scope.as_ref() {
@@ -532,7 +533,11 @@ pub(crate) fn cmd_search_with_budget(
             let db_path = cfg.db_path_for(&root, &scope.id);
             let hits = if db_path.exists() {
                 let db = index::IndexDb::open_read_only_resilient(&db_path)?;
-                db.symbol_search(&query, symbol_search_limit)?
+                if include_markdown_symbols {
+                    db.symbol_search(&query, symbol_search_limit)?
+                } else {
+                    db.code_symbol_search(&query, symbol_search_limit)?
+                }
             } else {
                 Vec::new()
             };
@@ -543,20 +548,33 @@ pub(crate) fn cmd_search_with_budget(
             let db_path = cfg.db_path_for(&root, &scope.id);
             let hits = if db_path.exists() {
                 let db = index::IndexDb::open_read_only_resilient(&db_path)?;
-                db.symbol_search(&query, symbol_search_limit)?
+                if include_markdown_symbols {
+                    db.symbol_search(&query, symbol_search_limit)?
+                } else {
+                    db.code_symbol_search(&query, symbol_search_limit)?
+                }
             } else {
                 Vec::new()
             };
             (hits, scope.source_root, None)
         } else if federated {
-            let (hits, diag) =
-                federated_symbol_search(&root, &query, symbol_search_limit, &tagpath_opts)?;
+            let (hits, diag) = federated_symbol_search(
+                &root,
+                &query,
+                symbol_search_limit,
+                include_markdown_symbols,
+                &tagpath_opts,
+            )?;
             (hits, root.clone(), Some(diag))
         } else {
             let db_path = root.join(".tsift/index.db");
             let hits = if db_path.exists() {
                 let db = index::IndexDb::open_read_only_resilient(&db_path)?;
-                db.symbol_search(&query, symbol_search_limit)?
+                if include_markdown_symbols {
+                    db.symbol_search(&query, symbol_search_limit)?
+                } else {
+                    db.code_symbol_search(&query, symbol_search_limit)?
+                }
             } else {
                 Vec::new()
             };

@@ -6,6 +6,10 @@ Canonical binary version source: `Cargo.toml` `package.version`. The CLI exposes
 
 Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
+## Unreleased
+
+- **Reliable session/log rewrites, direct transcript review, code-only search symbols, and measured Claude extraction usage** ([#14](https://github.com/btakita/tsift/issues/14)). Canonical Claude/Codex JSONL paths and captured `.output.txt`/`.log.txt` files now rewrite to bounded digests even when early records do not identify the stream. `session-review <transcript.jsonl>` admits the exact recognized transcript or fails nonzero. General search excludes Markdown structure from symbol matches while preserving Markdown navigation and editing. Claude CLI extraction emits per-file progress and records reported uncached plus cache token usage instead of false zeroes.
+
 ## 0.1.85
 
 - **Faithful diff and history rewrites** ([#11](https://github.com/btakita/tsift/issues/11), [#12](https://github.com/btakita/tsift/issues/12)). Blob/tree-form `git show <rev>:<path>` now declines with an object-read-specific explanation instead of emitting an impossible `diff-digest --revision`; git diff/show/log pathspecs become repeatable `diff-digest --pathspec` filters rather than being misused as the codebase root. `diff-digest` rejects non-directory roots and reports active pathspecs in every output format.

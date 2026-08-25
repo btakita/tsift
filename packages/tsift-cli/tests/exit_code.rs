@@ -8155,7 +8155,7 @@ fn summarize_extract_uses_claude_cli_for_bedrock_without_an_api_key() {
 printf '%s\n' "$@" > "$TSIFT_TEST_CLAUDE_ARGS"
 prompt=$(/bin/cat)
 printf '%s' "$prompt" > "$TSIFT_TEST_CLAUDE_PROMPT"
-printf '%s\n' '{"summary":"bedrock works","entities":[],"relationships":[],"concept_labels":[]}'
+printf '%s\n' '{"result":"{\"summary\":\"bedrock works\",\"entities\":[],\"relationships\":[],\"concept_labels\":[]}","usage":{"input_tokens":12,"cache_creation_input_tokens":3,"cache_read_input_tokens":40,"output_tokens":7}}'
 "#,
     )
     .unwrap();
@@ -8190,6 +8190,13 @@ printf '%s\n' '{"summary":"bedrock works","entities":[],"relationships":[],"conc
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("files:1"), "stdout was: {stdout}");
     assert!(stdout.contains("errors:0"), "stdout was: {stdout}");
+    assert!(stdout.contains("tokens_in:55"), "stdout was: {stdout}");
+    assert!(stdout.contains("tokens_out:7"), "stdout was: {stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("extracting 1/1: src/main.rs"),
+        "stderr was: {stderr}"
+    );
     let args = fs::read_to_string(args_path).unwrap();
     assert!(args.lines().any(|arg| arg == "-p"), "args were: {args}");
     assert!(
@@ -8200,6 +8207,11 @@ printf '%s\n' '{"summary":"bedrock works","entities":[],"relationships":[],"conc
         args.lines().any(|arg| arg == "--safe-mode"),
         "args were: {args}"
     );
+    assert!(
+        args.lines().any(|arg| arg == "--output-format"),
+        "args were: {args}"
+    );
+    assert!(args.lines().any(|arg| arg == "json"), "args were: {args}");
     let prompt = fs::read_to_string(prompt_path).unwrap();
     assert!(prompt.contains("bedrock_summary_target"));
 }
