@@ -6,7 +6,7 @@ Canonical binary version source: `Cargo.toml` `package.version`. The CLI exposes
 
 Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
-## Unreleased
+## 0.1.85
 
 - **Faithful diff and history rewrites** ([#11](https://github.com/btakita/tsift/issues/11), [#12](https://github.com/btakita/tsift/issues/12)). Blob/tree-form `git show <rev>:<path>` now declines with an object-read-specific explanation instead of emitting an impossible `diff-digest --revision`; git diff/show/log pathspecs become repeatable `diff-digest --pathspec` filters rather than being misused as the codebase root. `diff-digest` rejects non-directory roots and reports active pathspecs in every output format.
 - **Raw-read coverage and actionable declines** ([#13](https://github.com/btakita/tsift/issues/13)). `head`, `tail`, and `sed` explicit source windows rewrite at their requested size; `less` joins cat-like whole-file reads; recognized session inputs and generic logs route to their bounded digest commands; `~/...` paths expand before classification. Declines now distinguish missing inputs, unsupported kinds, small whole-file reads, invalid windows, and missing index coverage.
