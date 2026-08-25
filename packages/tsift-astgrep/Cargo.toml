@@ -1,6 +1,6 @@
 [package]
 name = "tsift-astgrep"
-version = "0.1.85"
+version = "0.1.86"
 edition = "2024"
 description = "Structural (ast-grep) code search and rewrite engine for tsift"
 license = "MIT"
