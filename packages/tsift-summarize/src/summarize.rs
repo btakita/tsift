@@ -147,7 +147,57 @@ pub struct ExtractionReport {
     pub symbols_extracted: usize,
     pub tokens_input: i64,
     pub tokens_output: i64,
+    pub terminal_failures_skipped: usize,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionFailureKind {
+    TooLarge,
+    UnparseableResponse,
+}
+
+impl ExtractionFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TooLarge => "too_large",
+            Self::UnparseableResponse => "unparseable_response",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CachedExtractionFailure {
+    pub file_path: String,
+    pub content_hash: String,
+    pub kind: ExtractionFailureKind,
+    pub message: String,
+    pub failed_at: String,
+}
+
+#[derive(Debug)]
+struct TerminalExtractionError {
+    kind: ExtractionFailureKind,
+    message: String,
+}
+
+impl std::fmt::Display for TerminalExtractionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TerminalExtractionError {}
+
+pub fn terminal_extraction_failure(
+    error: &anyhow::Error,
+) -> Option<(ExtractionFailureKind, String)> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<TerminalExtractionError>()
+            .map(|terminal| (terminal.kind, terminal.message.clone()))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +265,26 @@ impl Default for SummarizeConfig {
             api_key_env: "ANTHROPIC_API_KEY".to_string(),
         }
     }
+}
+
+pub fn is_extraction_candidate_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some(
+            "rs" | "py"
+                | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "kt"
+                | "kts"
+                | "zig"
+                | "gd"
+                | "sh"
+                | "bash"
+                | "zsh"
+        )
+    )
 }
 
 impl ExtractionClient {
@@ -425,9 +495,19 @@ impl SummaryDb {
                 tokens_input INTEGER,
                 tokens_output INTEGER
             );
-            CREATE INDEX IF NOT EXISTS idx_summaries_symbol ON summaries(symbol_name);
-            CREATE INDEX IF NOT EXISTS idx_summaries_file ON summaries(file_path);
-            CREATE INDEX IF NOT EXISTS idx_summaries_hash ON summaries(content_hash);",
+CREATE INDEX IF NOT EXISTS idx_summaries_symbol ON summaries(symbol_name);
+CREATE INDEX IF NOT EXISTS idx_summaries_file ON summaries(file_path);
+CREATE INDEX IF NOT EXISTS idx_summaries_hash ON summaries(content_hash);
+CREATE TABLE IF NOT EXISTS extraction_failures (
+    file_path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    message TEXT NOT NULL,
+    failed_at TEXT NOT NULL,
+    PRIMARY KEY (file_path, content_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_extraction_failures_file
+    ON extraction_failures(file_path);",
         )?;
         Ok(Self {
             conn,
@@ -571,7 +651,111 @@ impl SummaryDb {
             "DELETE FROM summaries WHERE file_path = ?1 OR file_path = ?2",
             rusqlite::params![normalized, legacy],
         )?;
+        if self.has_extraction_failures_table()? {
+            self.conn.execute(
+                "DELETE FROM extraction_failures WHERE file_path = ?1 OR file_path = ?2",
+                rusqlite::params![normalized, legacy],
+            )?;
+        }
         Ok(count)
+    }
+
+    pub fn terminal_failure(
+        &self,
+        file_path: &str,
+        content_hash: &str,
+    ) -> Result<Option<CachedExtractionFailure>> {
+        if !self.has_extraction_failures_table()? {
+            return Ok(None);
+        }
+        let normalized = normalize_summary_file_key_str(file_path);
+        let legacy = legacy_windows_summary_file_key(&normalized);
+        let mut stmt = self.conn.prepare(
+            "SELECT file_path, content_hash, kind, message, failed_at
+             FROM extraction_failures
+             WHERE content_hash = ?2 AND (file_path = ?1 OR file_path = ?3)
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![normalized, content_hash, legacy])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let kind = match row.get::<_, String>(2)?.as_str() {
+            "too_large" => ExtractionFailureKind::TooLarge,
+            "unparseable_response" => ExtractionFailureKind::UnparseableResponse,
+            _ => return Ok(None),
+        };
+        Ok(Some(CachedExtractionFailure {
+            file_path: normalize_summary_file_key_str(&row.get::<_, String>(0)?),
+            content_hash: row.get(1)?,
+            kind,
+            message: row.get(3)?,
+            failed_at: row.get(4)?,
+        }))
+    }
+
+    pub fn record_terminal_failure(
+        &self,
+        file_path: &str,
+        content_hash: &str,
+        kind: ExtractionFailureKind,
+        message: &str,
+    ) -> Result<()> {
+        let normalized = normalize_summary_file_key_str(file_path);
+        self.conn.execute(
+            "INSERT INTO extraction_failures
+                 (file_path, content_hash, kind, message, failed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(file_path, content_hash) DO UPDATE SET
+                 kind = excluded.kind,
+                 message = excluded.message,
+                 failed_at = excluded.failed_at",
+            rusqlite::params![
+                normalized,
+                content_hash,
+                kind.as_str(),
+                message,
+                chrono_now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn current_terminal_failure_paths(&self, root: &Path) -> Result<BTreeSet<String>> {
+        if !self.has_extraction_failures_table()? {
+            return Ok(BTreeSet::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT file_path, content_hash FROM extraction_failures ORDER BY file_path",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut current = BTreeSet::new();
+        for row in rows {
+            let (file_path, expected_hash) = row?;
+            let normalized = normalize_summary_file_key_str(&file_path);
+            let Some(live_path) = Self::stats_live_path(root, &normalized) else {
+                continue;
+            };
+            let Ok(content) = std::fs::read(live_path) else {
+                continue;
+            };
+            if content_hash(&content) == expected_hash {
+                current.insert(normalized);
+            }
+        }
+        Ok(current)
+    }
+
+    fn has_extraction_failures_table(&self) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'extraction_failures'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     pub fn cached_file_paths(&self) -> Result<BTreeSet<String>> {
@@ -658,6 +842,10 @@ impl SummaryDb {
         let result = (|| -> Result<()> {
             self.conn.execute(
                 "DELETE FROM summaries WHERE file_path = ?1 OR file_path = ?2",
+                rusqlite::params![normalized, legacy],
+            )?;
+            self.conn.execute(
+                "DELETE FROM extraction_failures WHERE file_path = ?1 OR file_path = ?2",
                 rusqlite::params![normalized, legacy],
             )?;
             for (idx, summary) in summaries.iter().enumerate() {
@@ -970,12 +1158,15 @@ pub fn extract_for_file_with_client(
 
     let token_estimate = source.len() / 4;
     if token_estimate > config.max_file_tokens {
-        bail!(
-            "file {} exceeds max_file_tokens ({} > {})",
-            file_path.display(),
-            token_estimate,
-            config.max_file_tokens
-        );
+        return Err(anyhow::Error::new(TerminalExtractionError {
+            kind: ExtractionFailureKind::TooLarge,
+            message: format!(
+                "file {} exceeds max_file_tokens ({} > {}); raise it with --max-file-tokens or [summarize].max_file_tokens",
+                file_path.display(),
+                token_estimate,
+                config.max_file_tokens
+            ),
+        }));
     }
 
     let hash = content_hash(source.as_bytes());
@@ -991,8 +1182,7 @@ pub fn extract_for_file_with_client(
 
     let (response_text, tokens_in, tokens_out) = client.complete(&prompt)?;
 
-    let parsed: ExtractionResponse = serde_json::from_str(&response_text)
-        .with_context(|| format!("parsing extraction response for {}", file_path.display()))?;
+    let parsed = parse_extraction_response(file_path, &response_text)?;
 
     let now = chrono_now();
     let mut summaries = Vec::new();
@@ -1036,6 +1226,19 @@ pub fn extract_for_file_with_client(
     }
 
     Ok(summaries)
+}
+
+fn parse_extraction_response(file_path: &Path, response_text: &str) -> Result<ExtractionResponse> {
+    serde_json::from_str(response_text).map_err(|error| {
+        let preview = response_text.chars().take(240).collect::<String>();
+        anyhow::Error::new(TerminalExtractionError {
+            kind: ExtractionFailureKind::UnparseableResponse,
+            message: format!(
+                "parsing extraction response for {} failed: {error}; response preview: {preview:?}",
+                file_path.display()
+            ),
+        })
+    })
 }
 
 fn normalize_lookup_path(path: &Path) -> String {
@@ -1853,6 +2056,43 @@ mod tests {
     }
 
     #[test]
+    fn terminal_extraction_failures_are_keyed_by_content_and_cleared_on_success() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        let source = b"fn main() {}\n";
+        std::fs::write(root.path().join("src/main.rs"), source).unwrap();
+        let hash = content_hash(source);
+        let (_tmp, db) = test_db();
+
+        db.record_terminal_failure(
+            "src/main.rs",
+            &hash,
+            ExtractionFailureKind::TooLarge,
+            "raise --max-file-tokens",
+        )
+        .unwrap();
+        let cached = db
+            .terminal_failure("src/main.rs", &hash)
+            .unwrap()
+            .expect("same content should retain its terminal failure");
+        assert_eq!(cached.kind, ExtractionFailureKind::TooLarge);
+        assert_eq!(cached.message, "raise --max-file-tokens");
+        assert!(
+            db.terminal_failure("src/main.rs", "different-hash")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.current_terminal_failure_paths(root.path()).unwrap(),
+            BTreeSet::from(["src/main.rs".to_string()])
+        );
+
+        db.replace_file("src/main.rs", &[make_summary("main", "src/main.rs", &hash)])
+            .unwrap();
+        assert!(db.terminal_failure("src/main.rs", &hash).unwrap().is_none());
+    }
+
+    #[test]
     fn db_open_configures_sqlite_for_concurrent_access() {
         let (_tmp, db) = test_db();
 
@@ -2051,13 +2291,26 @@ mod tests {
             api_key_env: "PATH".to_string(),
             ..Default::default()
         };
-        let result = extract_for_file(&big_file, None, None, &config);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds max_file_tokens")
+        let error = extract_for_file(&big_file, None, None, &config).unwrap_err();
+        assert!(error.to_string().contains("exceeds max_file_tokens"));
+        assert!(error.to_string().contains("--max-file-tokens"));
+        assert_eq!(
+            terminal_extraction_failure(&error).map(|(kind, _)| kind),
+            Some(ExtractionFailureKind::TooLarge)
+        );
+    }
+
+    #[test]
+    fn extraction_parse_errors_name_the_file_reason_and_response_preview() {
+        let error =
+            parse_extraction_response(Path::new("src/broken.rs"), "not-json output").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("src/broken.rs"), "{message}");
+        assert!(message.contains("expected ident"), "{message}");
+        assert!(message.contains("not-json output"), "{message}");
+        assert_eq!(
+            terminal_extraction_failure(&error).map(|(kind, _)| kind),
+            Some(ExtractionFailureKind::UnparseableResponse)
         );
     }
 

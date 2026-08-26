@@ -89,6 +89,11 @@ tsift --compact search <query>  # terse human output across commands
 
 `tsift summarize --stats`, `tsift summarize <symbol>`, and `tsift summarize --file <path>` are read-only cache queries: they fail closed when `.tsift/summaries.db` is absent, never create the summary cache as a side effect, and retry against a snapshot copy when a live SQLite lock wedges the cache. In WAL mode that snapshot copy includes the sibling `-wal` / `-shm` sidecars instead of copying only the main `.db` file, so read-only fallbacks keep the same committed live state the writer was using. `--path` first resolves through the nearest ancestor `.tsift` project/workspace root, so nested directories reuse the shared summary cache instead of creating shadow caches; `summarize --file` also normalizes equivalent path spellings back to the canonical root-relative cache key, so `src/lib.rs`, `./src/lib.rs`, nested relative spellings that point at the same file, and absolute paths routed through a symlinked checkout all hit the same cached row. Summary cache rows store that root-relative key with `/` separators even on Windows, and read/delete/currentness checks also tolerate legacy `\` rows until they are rewritten. `summarize --stats` reports stale cached files when the source file is missing, when the live blake3 hash no longer matches the cached `content_hash`, and when a cached key is absolute or lexically escapes the project root (`../...`); those out-of-root cache keys count as stale/corrupt and are never opened from the filesystem. If a cached file still exists but cannot be read during stats collection, tsift counts that row as stale, completes the report, and emits a warning instead of aborting the whole command. During `--extract`, relative extract paths resolve against the caller's `--path` anchor (or that file's parent directory), then canonicalize when possible and otherwise collapse lexical `.` / `..` segments before diff filtering, stale-row pruning, and cache-key derivation, while still reusing the ancestor project's shared summary cache. tsift claims an exclusive sibling `summaries.lock` sidecar before it deletes stale rows, rechecks content hashes, or calls the LLM so concurrent extractors fail fast instead of duplicating API spend. Inside that write lock, extraction goes through a lazily-rs `SummaryCache`: each normalized file key has a Slot that reads a content-hash Cell before loading cached rows, so repeated checks for the same file/hash reuse the Slot, while a changed live `content_hash` invalidates the Slot before deciding whether to call the LLM. `SummaryCache::get_or_extract_file` owns the "current rows or compute then replace" branch so extraction skips already-current files without duplicating DB reads, and only writes replacement rows after a stale/missing Slot causes first access to compute summaries. Full re-extracts prune cached summary rows for files that no longer exist inside the requested extract scope even when that scope is now empty, workspace files resolve symbol context against the matching scoped `index.db`, symbol preload uses exact normalized file-path matches so duplicate `src/lib.rs`-style paths across scopes do not bleed into each other, symbol preload reuses the same busy-timeout plus snapshot fallback path as other read-only index consumers when a live lock is present, and `--diff` includes untracked files within the requested extract scope while deleting cached summary rows for tracked files that were removed from that scope, including the old side of `git mv` renames; on an unborn `HEAD`, `--diff` degrades to untracked-only extraction instead of failing on `git diff ... HEAD`. `tsift status` computes summary coverage against live indexed files only, so stale summary rows for deleted files do not over-report cache coverage, and it surfaces summary-cache recovery diagnostics when it had to degrade off the live database.
 
+Summary coverage uses live indexed files that the extractor can actually process;
+Markdown and other indexed-only formats are reported separately and do not
+dilute the percentage. Current terminal failures are also reported separately
+and removed from the automatic re-extraction recommendation.
+
 `tsift edit` now stages each rewritten file beside its target and only swaps the batch into place after every edit validates and every staged file is ready. If any later swap fails, tsift restores earlier files before returning an error instead of leaving a partially-written batch behind.
 
 ## Search Stale Precheck + Timeout
@@ -115,7 +120,7 @@ Opt-in recovery:
 - `tsift status`, `tsift search`, `tsift index`, `tsift locks`, `graph`, `communities`, `path`, and `explain` now resolve nested input paths against the nearest ancestor project/workspace root (`.tsift/` or workspace `.gitmodules`), so subdirectory invocations reuse the intended project/workspace indexes instead of creating nested `.tsift/index.db` state or inspecting synthetic nested lock files
 - when a nested workspace path already falls under exactly one submodule source root, `tsift search`, `tsift locks`, `graph`, `communities`, `path`, and `explain` now infer that scoped index automatically instead of requiring a redundant `--scope <scope>` selector
 - workspace roots that only have scoped `.tsift/indexes/<scope>/index.db` files **federate by default** for every search strategy (`#wsfed`). Previously plain `tsift search` failed closed there — but only for some queries: an identifier that auto-promoted to the `exact` backend federated fine, while anything falling through to `fts`/`lexical` exited 1 demanding `--scope <scope>` or `--federated`. Same directory, same command, same flags; the observable rule was "add `--federated` if your query has no underscore in it", which no caller can infer. Federation there is exactly what the `exact` path already did, so `--federated` is now explicit opt-in for the non-workspace case and `--scope` remains the narrowing flag. Auto-federation is decided by the same precedence the target resolver uses, so an explicit `--scope`, a path that infers a submodule or cargo package, an agent-doc task path, or an existing shared root `.tsift/index.db` all still win. A workspace whose every scope opts out of federation fails closed with that stated as the reason, rather than returning silent empty results
-- `graph` and `explain` accept `--federated` and resolve the owning scope automatically at a workspace root with no shared root index (`#graphfed`). `search` already resolved a symbol to a path from the same index set without a flag, so the information needed to pick a scope was always reachable; the two graph commands nonetheless failed and told the caller to supply the scope they were about to ask tsift for — while `status` and the generated Code Navigation block both recommend those commands by name. Resolution walks the federated scoped indexes for a definition of the symbol, falling back to a scope that only calls it, and prefers definitions with a deterministic scope-id tiebreak. When more than one scope matches, the command answers from the first and names the others on stderr so the caller can narrow in one step. A symbol no scope defines fails with the list of scopes searched. Cross-scope call edges remain out of scope: resolution answers within the owning scope and says which scope that was
+- `graph` and `explain` accept `--federated` and resolve the owning scope automatically at a workspace root with no shared root index (`#graphfed`). Resolution walks the federated scoped indexes for a definition of the symbol, falling back to a scope that only calls it. A unique match runs within that owning scope; an exact symbol found in more than one scope fails closed, names every matching scope, and requires `--scope` because choosing the first would misrepresent one scope's call graph as a complete answer. A symbol no scope defines fails with the list of scopes searched. Federated `symbol-read` applies the same ambiguity rule and considers all exact-case matches before any case-insensitive fallback, so a higher-ranked spelling variant cannot defeat an exact match. Cross-scope call edges remain out of scope
 - `communities` and `path` also take `--federated` and resolve a workspace root themselves (`#wsfedrest`), so no read-only graph command still demands a scope the caller does not have. They needed different answers than `explain`/`graph`, because neither has a single symbol to resolve from. A scoped index carries only its own call edges, and that one fact settles both: there is no such thing as a cross-scope community, so `communities` runs detection **per scope** and reports each — the exact answer, not an approximation of a whole-workspace one. `--json` returns `{"scopes": [ ... ]}` with one document per scope; human output labels each with a `scope <id>:` header. And a path between symbols in two scopes does not exist to be found, so `path` resolves **both** endpoints: same scope runs there, different scopes is a precise refusal naming both. An empty result would have read as "no path in a graph containing both", which is not what happened
 - `tsift search` symbol-hit reads now reopen `index.db` through the same resilient read-only helper used by other index consumers, so a live SQLite lock that appears after the stale-index precheck still falls back to a snapshot copy instead of bubbling a raw SQLite lock error
 - writable index updates now claim an OS-backed exclusive lock on the sibling `index.lock` sidecar first, so concurrent `tsift index` / `tsift search --autoindex` writers fail fast with a tsift-owned error instead of surfacing raw SQLite lock contention or PID-recycling false positives
@@ -383,7 +388,7 @@ When everything is available:
 ```
 index: fresh (last indexed 2m ago, 200 files tracked)
 instructions: current (v0.1.0)
-summaries: 142/200 files cached (71%)
+summaries: 142/200 extraction candidates cached (71%), 8 indexed files not extractable
 recommendations:
   use: search, explain, graph, summarize
   run: tsift summarize --extract src/  (58 uncached files)
@@ -441,7 +446,9 @@ A gap is reported only when the skipped files are at least a quarter of the walk
 *and* the dominant skipped extension costs three files or more, so a repo with a
 stray `.txt` beside 600 indexed sources does not grow a warning. `tsift index`
 reports the same fact per run as `skipped: N (unsupported extension) — .go 7,
-.json 6`; `--compact` shortens it to `unsupported:N`.
+.json 6`; `--compact` shortens it to `unsupported:N`. Workspace reports apply
+the same coverage check to the filtered workspace-root index and label that
+owner as `<root>`, as well as checking each configured submodule scope.
 
 ### Per-scope instruction state (`#wsinit`)
 
@@ -532,6 +539,8 @@ tsift summarize <symbol>            # show cached summary for a symbol
 tsift summarize --file <path>       # show cached summary for a file/module
 tsift summarize --extract <path>    # run LLM extraction on path (batch; relative path resolves against --path, or that file's parent directory)
 tsift summarize --extract --diff    # re-extract only git-changed files within the requested path
+tsift summarize --extract <path> --max-file-tokens 12000 # override the configured per-file cap
+tsift summarize --extract <path> --force # retry cached terminal failures for unchanged content
 tsift summarize --stats             # summary totals, stale-file count, token savings
 tsift summarize --json              # structured output
 ```
@@ -575,6 +584,15 @@ CREATE TABLE summaries (
 CREATE INDEX idx_summaries_symbol ON summaries(symbol_name);
 CREATE INDEX idx_summaries_file ON summaries(file_path);
 CREATE INDEX idx_summaries_hash ON summaries(content_hash);
+
+CREATE TABLE extraction_failures (
+  file_path TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  kind TEXT NOT NULL,              -- too_large | unparseable_response
+  message TEXT NOT NULL,
+  failed_at TEXT NOT NULL,
+  PRIMARY KEY (file_path, content_hash)
+);
 ```
 
 ### Extraction Protocol
@@ -585,8 +603,8 @@ CREATE INDEX idx_summaries_hash ON summaries(content_hash);
 4. For each cache miss, load source + symbols from `index.db`
 5. Build extraction prompt: source snippet + symbol list + "extract entities, relationships, 2-sentence summary"
 6. Submit through the resolved client. Claude Code runs non-interactively with the configured model, no tools, safe mode, no session persistence, and JSON output so it inherits direct, Bedrock, Vertex, or Foundry authentication without loading project automation. Its response must include `result` plus measured `usage`; input usage sums uncached, cache-creation, and cache-read tokens. Missing or malformed usage fails extraction instead of recording false zeroes. Direct API responses still fail closed on non-2xx status before content parsing.
-7. Parse each response and insert/update `summaries.db`
-8. Before each model call, report `extracting N/total: <path>` on stderr so long runs remain visibly live. Then report files processed, entities found, measured tokens spent, and estimated savings.
+7. Parse each response and insert/update `summaries.db`. Parse errors include the exact parser reason and a bounded response preview. Files over the cap and unparseable responses are cached by normalized path plus content hash as terminal failures, skipped on later runs, and retried only after content changes or when `--force` is supplied. A successful replacement clears failures for that file.
+8. Before each model call, report `extracting N/total: <path>` on stderr so long runs remain visibly live. Then report files processed, entities found, measured tokens spent, terminal failures skipped, and estimated savings.
 
 ### Token Savings Model
 

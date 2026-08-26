@@ -216,6 +216,8 @@ pub enum SummaryStatus {
     Available {
         cached_files: usize,
         total_indexed_files: usize,
+        terminal_failure_files: usize,
+        non_candidate_files: usize,
         coverage_pct: u8,
         #[serde(skip_serializing_if = "Option::is_none")]
         recovery: Option<ReadOnlyRecovery>,
@@ -391,6 +393,22 @@ fn collect_language_coverage_gaps(
     }
 
     let cfg = config::Config::load(root)?;
+    let root_db_path = root.join(".tsift/index.db");
+    let excluded_roots = scopes
+        .iter()
+        .map(|scope| scope.source_root.clone())
+        .collect::<Vec<_>>();
+    if root_db_path.exists()
+        && let Ok(inspection) =
+            IndexDb::inspect_read_only_excluding(&root_db_path, root, false, &excluded_roots)
+        && let Some(gap) = LanguageCoverageGap::from_summary(
+            Some(config::WORKSPACE_ROOT_SCOPE_ID.to_string()),
+            inspection.total_files,
+            &inspection.summary.skipped,
+        )
+    {
+        gaps.push(gap);
+    }
     for scope in scopes {
         let db_path = cfg.db_path_for(root, &scope.id);
         if !scope.source_root.exists() || !db_path.exists() {
@@ -622,7 +640,27 @@ fn check_summaries(
     if matches!(index, IndexStatus::Missing { .. }) {
         return Ok(SummaryStatus::Unavailable);
     }
+    let live_indexed_files = live_indexed_summary_paths(root, index, cache)?;
+    let extractable_files = live_indexed_files
+        .iter()
+        .filter(|path| tsift_summarize::summarize::is_extraction_candidate_path(Path::new(path)))
+        .cloned()
+        .collect::<HashSet<_>>();
+    let non_candidate_files = live_indexed_files
+        .len()
+        .saturating_sub(extractable_files.len());
+    let total_indexed_files = extractable_files.len();
     if !db_path.exists() {
+        if total_indexed_files == 0 {
+            return Ok(SummaryStatus::Available {
+                cached_files: 0,
+                total_indexed_files,
+                terminal_failure_files: 0,
+                non_candidate_files,
+                coverage_pct: 100,
+                recovery: None,
+            });
+        }
         return Ok(SummaryStatus::None { recovery: None });
     }
 
@@ -630,25 +668,30 @@ fn check_summaries(
     let recovery = read_only.recovery;
     let db = read_only.db;
     let cached_summary_paths = db.cached_file_paths()?.into_iter().collect::<HashSet<_>>();
-    let live_indexed_files = live_indexed_summary_paths(root, index, cache)?;
-    let total_indexed_files = live_indexed_files.len();
     let cached_files = cached_summary_paths
-        .intersection(&live_indexed_files)
+        .intersection(&extractable_files)
+        .count();
+    let terminal_failure_files = db
+        .current_terminal_failure_paths(root)?
+        .into_iter()
+        .filter(|path| extractable_files.contains(path))
         .count();
 
-    if cached_files == 0 {
+    if cached_files == 0 && terminal_failure_files == 0 && total_indexed_files > 0 {
         return Ok(SummaryStatus::None { recovery });
     }
 
     let coverage_pct = if total_indexed_files > 0 {
         ((cached_files as f64 / total_indexed_files as f64) * 100.0).min(100.0) as u8
     } else {
-        0
+        100
     };
 
     Ok(SummaryStatus::Available {
         cached_files,
         total_indexed_files,
+        terminal_failure_files,
+        non_candidate_files,
         coverage_pct,
         recovery,
     })
@@ -801,10 +844,15 @@ fn build_recommendations(
                 SummaryStatus::Available {
                     cached_files,
                     total_indexed_files,
+                    terminal_failure_files,
                     ..
                 } => {
-                    use_cmds.push("summarize".to_string());
-                    let uncached = total_indexed_files.saturating_sub(*cached_files);
+                    if *cached_files > 0 {
+                        use_cmds.push("summarize".to_string());
+                    }
+                    let uncached = total_indexed_files
+                        .saturating_sub(*cached_files)
+                        .saturating_sub(*terminal_failure_files);
                     if uncached > 0 {
                         Some(format!(
                             "tsift summarize --extract {}  ({} uncached file{})",
@@ -1411,19 +1459,39 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
         SummaryStatus::Available {
             cached_files,
             total_indexed_files,
+            terminal_failure_files,
+            non_candidate_files,
             coverage_pct,
             ..
         } => {
             if compact {
                 out.push_str(&format!(
-                    "summaries: {}/{} ({}%)\n",
-                    cached_files, total_indexed_files, coverage_pct
+                    "summaries: {}/{} ({}%) terminal:{} noncandidate:{}\n",
+                    cached_files,
+                    total_indexed_files,
+                    coverage_pct,
+                    terminal_failure_files,
+                    non_candidate_files
                 ));
             } else {
                 out.push_str(&format!(
-                    "summaries: {}/{} files cached ({}%)\n",
+                    "summaries: {}/{} extraction candidates cached ({}%)",
                     cached_files, total_indexed_files, coverage_pct
                 ));
+                if *terminal_failure_files > 0 {
+                    out.push_str(&format!(", {} terminal failure", terminal_failure_files));
+                    if *terminal_failure_files != 1 {
+                        out.push('s');
+                    }
+                }
+                if *non_candidate_files > 0 {
+                    out.push_str(&format!(", {} indexed file", non_candidate_files));
+                    if *non_candidate_files != 1 {
+                        out.push('s');
+                    }
+                    out.push_str(" not extractable");
+                }
+                out.push('\n');
             }
         }
         SummaryStatus::None { .. } => {
@@ -1753,6 +1821,29 @@ mod tests {
             "one stray .txt is not a coverage gap: {:?}",
             report.language_coverage
         );
+    }
+
+    #[test]
+    fn status_reports_workspace_root_language_coverage_gap() {
+        let dir = setup_workspace();
+        std::fs::write(dir.path().join("keep.rs"), "fn keep() {}\n").unwrap();
+        for idx in 0..8 {
+            std::fs::write(
+                dir.path().join(format!("root-data{idx}.parquetish")),
+                "not a language tsift indexes\n",
+            )
+            .unwrap();
+        }
+        index_workspace(dir.path());
+
+        let report = check_status(dir.path()).unwrap();
+        let gap = report
+            .language_coverage
+            .iter()
+            .find(|gap| gap.scope.as_deref() == Some(config::WORKSPACE_ROOT_SCOPE_ID))
+            .expect("workspace-root skips should be reported as the <root> scope");
+        assert_eq!(gap.dominant_extension, ".parquetish");
+        assert_eq!(gap.dominant_extension_files, 8);
     }
 
     fn hold_wal_lock(db_path: &Path) -> Connection {
@@ -2197,6 +2288,7 @@ mod tests {
                 total_indexed_files,
                 coverage_pct,
                 recovery,
+                ..
             } => {
                 assert_eq!(cached_files, 1);
                 assert_eq!(total_indexed_files, 1);
@@ -2300,6 +2392,98 @@ mod tests {
     }
 
     #[test]
+    fn status_summary_coverage_counts_only_extraction_candidates() {
+        let dir = TempDir::new().unwrap();
+        let source = b"fn main() {}\n";
+        std::fs::write(dir.path().join("main.rs"), source).unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Indexed documentation\n").unwrap();
+        let db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+
+        let sdb = SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+        sdb.insert(&tsift_summarize::summarize::Summary {
+            id: 0,
+            symbol_name: "main".to_string(),
+            file_path: "main.rs".to_string(),
+            content_hash: tsift_summarize::summarize::content_hash(source),
+            summary: "Entry point".to_string(),
+            entities: None,
+            relationships: None,
+            concept_labels: None,
+            extracted_at: "2026-01-01".to_string(),
+            model: "test".to_string(),
+            tokens_input: None,
+            tokens_output: None,
+        })
+        .unwrap();
+
+        let report = check_status(dir.path()).unwrap();
+        match report.summaries {
+            SummaryStatus::Available {
+                cached_files,
+                total_indexed_files,
+                non_candidate_files,
+                coverage_pct,
+                ..
+            } => {
+                assert_eq!(cached_files, 1);
+                assert_eq!(total_indexed_files, 1);
+                assert_eq!(non_candidate_files, 1);
+                assert_eq!(coverage_pct, 100);
+            }
+            other => panic!("expected available summaries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_does_not_recommend_retrying_current_terminal_failures() {
+        let dir = TempDir::new().unwrap();
+        let source = b"fn main() {}\n";
+        std::fs::write(dir.path().join("main.rs"), source).unwrap();
+        let db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+
+        let sdb = SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+        sdb.record_terminal_failure(
+            "main.rs",
+            &tsift_summarize::summarize::content_hash(source),
+            tsift_summarize::summarize::ExtractionFailureKind::TooLarge,
+            "raise --max-file-tokens",
+        )
+        .unwrap();
+
+        let report = check_status(dir.path()).unwrap();
+        match report.summaries {
+            SummaryStatus::Available {
+                cached_files,
+                total_indexed_files,
+                terminal_failure_files,
+                ..
+            } => {
+                assert_eq!(cached_files, 0);
+                assert_eq!(total_indexed_files, 1);
+                assert_eq!(terminal_failure_files, 1);
+            }
+            other => panic!("expected terminal failure status, got {other:?}"),
+        }
+        assert!(
+            report
+                .recommendations
+                .run
+                .as_deref()
+                .is_none_or(|run| !run.contains("summarize")),
+            "terminal failures must not be recommended for automatic retry: {:?}",
+            report.recommendations.run
+        );
+        assert!(
+            !report
+                .recommendations
+                .use_commands
+                .contains(&"summarize".to_string())
+        );
+    }
+
+    #[test]
     fn status_json_roundtrip() {
         let dir = TempDir::new().unwrap();
         let report = check_status(dir.path()).unwrap();
@@ -2368,6 +2552,8 @@ mod tests {
             summaries: SummaryStatus::Available {
                 cached_files: 30,
                 total_indexed_files: 42,
+                terminal_failure_files: 0,
+                non_candidate_files: 0,
                 coverage_pct: 71,
                 recovery: None,
             },
@@ -2391,7 +2577,7 @@ mod tests {
         assert!(output.contains("index: fresh"));
         assert!(output.contains("42 files"));
         assert!(output.contains("instructions: current (v0.1.0)"));
-        assert!(output.contains("30/42 files cached (71%)"));
+        assert!(output.contains("30/42 extraction candidates cached (71%)"));
         assert!(output.contains("use: search, explain, graph, summarize"));
     }
 
@@ -2545,6 +2731,8 @@ mod tests {
             summaries: SummaryStatus::Available {
                 cached_files: 2,
                 total_indexed_files: 3,
+                terminal_failure_files: 0,
+                non_candidate_files: 0,
                 coverage_pct: 66,
                 recovery: Some(ReadOnlyRecovery::SnapshotFallback),
             },

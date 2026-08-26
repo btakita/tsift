@@ -683,6 +683,12 @@ pub enum Commands {
         /// Only re-extract git-changed files (use with --extract)
         #[arg(long)]
         diff: bool,
+        /// Retry files with a cached terminal extraction failure
+        #[arg(long, requires = "extract")]
+        force: bool,
+        /// Maximum estimated source tokens per extracted file
+        #[arg(long, requires = "extract")]
+        max_file_tokens: Option<usize>,
         /// Show cache statistics
         #[arg(long)]
         stats: bool,

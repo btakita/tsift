@@ -7218,6 +7218,78 @@ fn workspace_symbol_read_refuses_cross_scope_ambiguity() {
 }
 
 #[test]
+fn workspace_graph_commands_refuse_cross_scope_ambiguity() {
+    let dir = indexed_workspace_cli_fixture();
+    fs::write(
+        dir.path().join("src/alpha/lib.rs"),
+        "fn duplicate_symbol() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src/beta/lib.rs"),
+        "fn duplicate_symbol() {}\n",
+    )
+    .unwrap();
+    let indexed = tsift_bin()
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(indexed.status.success());
+
+    for command in ["explain", "graph"] {
+            let output = tsift_bin()
+                .args([
+                    command,
+                    "duplicate_symbol",
+                    dir.path().to_str().unwrap(),
+                ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{command} unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("ambiguous across workspace scopes")
+                && stderr.contains("alpha")
+                && stderr.contains("beta"),
+            "{command} stderr: {stderr}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("not found in index"),
+            "{command} must not turn ambiguity into absence"
+        );
+    }
+}
+
+#[test]
+fn workspace_symbol_read_checks_exact_case_before_case_insensitive_fallback() {
+    let dir = indexed_workspace_cli_fixture();
+    fs::write(dir.path().join("root.rs"), "fn app() {}\n").unwrap();
+    fs::write(dir.path().join("src/alpha/lib.rs"), "fn App() {}\n").unwrap();
+    fs::write(dir.path().join("src/beta/lib.rs"), "fn App() {}\n").unwrap();
+    let indexed = tsift_bin()
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(indexed.status.success());
+
+    let output = tsift_bin()
+        .args([
+            "symbol-read",
+            "App",
+            "--federated",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ambiguous across workspace scopes"), "{stderr}");
+    assert!(stderr.contains("alpha") && stderr.contains("beta"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Symbol `app`"));
+}
+
+#[test]
 fn init_respects_git_info_exclude_and_reports_the_source() {
     let dir = tempfile::tempdir().unwrap();
     let git = Command::new("git")

@@ -19,6 +19,8 @@ pub(crate) fn cmd_summarize(
     file: Option<String>,
     extract: Option<PathBuf>,
     diff: bool,
+    force: bool,
+    max_file_tokens: Option<usize>,
     stats: bool,
     path: &std::path::Path,
     json_output: bool,
@@ -41,7 +43,13 @@ pub(crate) fn cmd_summarize(
         }
         let extract_base = resolve_extract_base(path)?;
         let extract_scope = resolve_extract_scope(&extract_base, &extract_path)?;
-        let cfg = load_summarize_config(&root);
+        let mut cfg = load_summarize_config(&root);
+        if let Some(max_file_tokens) = max_file_tokens {
+            if max_file_tokens == 0 {
+                bail!("--max-file-tokens must be greater than zero");
+            }
+            cfg.max_file_tokens = max_file_tokens;
+        }
 
         let (files_to_extract, mut deleted_summary_paths) = if diff {
             let changed = summarize::git_changed_files(&root)?;
@@ -97,6 +105,7 @@ pub(crate) fn cmd_summarize(
             symbols_extracted: 0,
             tokens_input: 0,
             tokens_output: 0,
+            terminal_failures_skipped: 0,
             errors: Vec::new(),
         };
 
@@ -113,6 +122,15 @@ pub(crate) fn cmd_summarize(
             };
             let hash = summarize::content_hash(&content);
             let rel_path = summarize_relative_file_path(&root, file_path);
+            if !force
+                && summary_cache
+                    .db()
+                    .terminal_failure(&rel_path, &hash)?
+                    .is_some()
+            {
+                report.terminal_failures_skipped += 1;
+                continue;
+            }
             if summary_cache.current_by_file(&rel_path, &hash)?.is_none() {
                 pending_extractions.push((file_path, hash, rel_path));
             }
@@ -172,6 +190,11 @@ pub(crate) fn cmd_summarize(
                     }
                 }
                 Err(e) => {
+                    if let Some((kind, message)) = summarize::terminal_extraction_failure(&e) {
+                        summary_cache
+                            .db()
+                            .record_terminal_failure(&rel_path, &hash, kind, &message)?;
+                    }
                     report.errors.push(format!("{}: {}", rel_path, e));
                     if !json_output {
                         eprintln!("  error: {}: {}", rel_path, e);
@@ -184,11 +207,12 @@ pub(crate) fn cmd_summarize(
             println!("{}", to_json_schema(&report, pretty, terse, false, schema)?);
         } else if compact {
             println!(
-                "extract files:{} symbols:{} tokens_in:{} tokens_out:{} errors:{}",
+                "extract files:{} symbols:{} tokens_in:{} tokens_out:{} terminal_skipped:{} errors:{}",
                 report.files_processed,
                 report.symbols_extracted,
                 report.tokens_input,
                 report.tokens_output,
+                report.terminal_failures_skipped,
                 report.errors.len()
             );
         } else {
@@ -201,6 +225,12 @@ pub(crate) fn cmd_summarize(
             );
             if !report.errors.is_empty() {
                 println!("  errors: {}", report.errors.len());
+            }
+            if report.terminal_failures_skipped > 0 {
+                println!(
+                    "  skipped terminal failures: {} (use --force to retry)",
+                    report.terminal_failures_skipped
+                );
             }
         }
         return Ok(());

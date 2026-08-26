@@ -1208,18 +1208,22 @@ pub fn run() -> Result<()> {
         Some(Commands::Summarize {
             symbol,
             file,
-            extract,
-            diff,
-            stats,
+        extract,
+        diff,
+        force,
+        max_file_tokens,
+        stats,
             path,
             profile,
             json,
         }) => cmd_summarize(
             symbol,
             file,
-            extract,
-            diff,
-            stats,
+        extract,
+        diff,
+        force,
+        max_file_tokens,
+        stats,
             &path,
             json || terse || schema || envelope,
             compact,
@@ -3859,10 +3863,11 @@ pub(crate) fn open_graph_index_db(
     };
 
     if !resolution.also_in.is_empty() {
-        eprintln!(
-            "note: `{symbol}` resolved in scope `{}`; also present in: {}. Pass `--scope <scope>` to select another.",
-            resolution.scope,
-            resolution.also_in.join(", ")
+        let mut scopes = vec![resolution.scope.as_str()];
+        scopes.extend(resolution.also_in.iter().map(String::as_str));
+        bail!(
+            "symbol {symbol:?} is ambiguous across workspace scopes: {}. Pass `--scope <scope>` to select one; call edges are stored per scope.",
+            scopes.join(", ")
         );
     }
     let db = open_index_db(path, Some(&resolution.scope))?;
@@ -18056,6 +18061,17 @@ fn cmd_symbol_read(
             matches_file.then_some((target_index, hit))
         }));
     }
+    let has_exact_case = candidates.iter().any(|(_, hit)| hit.name == symbol);
+    if has_exact_case {
+        candidates.retain(|(_, hit)| hit.name == symbol);
+    } else {
+        let has_case_insensitive = candidates
+            .iter()
+            .any(|(_, hit)| hit.name.eq_ignore_ascii_case(symbol));
+        if has_case_insensitive {
+            candidates.retain(|(_, hit)| hit.name.eq_ignore_ascii_case(symbol));
+        }
+    }
     candidates.sort_by(|left, right| {
         right
             .1
@@ -18085,13 +18101,17 @@ fn cmd_symbol_read(
         .scope_name
         .as_deref()
         .unwrap_or(config::WORKSPACE_ROOT_SCOPE_ID);
+    if selected.name != symbol && selected.name.eq_ignore_ascii_case(symbol) {
+        eprintln!(
+            "note: no exact match for {symbol:?}; resolved case-insensitively to {:?} in scope `{selected_scope}`.",
+            selected.name
+        );
+    }
     let ambiguous_scopes = candidates
         .iter()
         .filter(|(target_index, hit)| {
             *target_index != selected_target_index
-                && hit.name == selected.name
-                && hit.kind == selected.kind
-                && (hit.name == symbol || (hit.score - selected.score).abs() < f64::EPSILON)
+            && hit.name == selected.name
         })
         .map(|(target_index, _)| {
             targets[*target_index]
@@ -22162,25 +22182,8 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
         let entry = entry?;
         if entry.file_type().is_some_and(|ft| ft.is_file()) {
             let p = entry.path();
-            if let Some(ext) = p.extension() {
-                let ext = ext.to_string_lossy();
-                if matches!(
-                    ext.as_ref(),
-                    "rs" | "py"
-                        | "ts"
-                        | "tsx"
-                        | "js"
-                        | "jsx"
-                        | "kt"
-                        | "kts"
-                        | "zig"
-                        | "gd"
-                        | "sh"
-                        | "bash"
-                        | "zsh"
-                ) {
-                    files.push(p.to_path_buf());
-                }
+            if summarize::is_extraction_candidate_path(p) {
+                files.push(p.to_path_buf());
             }
         }
     }
@@ -22794,6 +22797,8 @@ mod tests {
             Some(PathBuf::from("src")),
             true,
             false,
+            None,
+            false,
             dir.path(),
             false,
             true,
@@ -22854,6 +22859,8 @@ mod tests {
             Some(PathBuf::from("src")),
             true,
             false,
+            None,
+            false,
             dir.path(),
             false,
             true,
@@ -22901,6 +22908,8 @@ mod tests {
             None,
             Some(PathBuf::from("src")),
             false,
+            false,
+            None,
             false,
             dir.path(),
             false,
@@ -22953,6 +22962,8 @@ mod tests {
             Some(PathBuf::from("src")),
             false,
             false,
+            None,
+            false,
             dir.path(),
             false,
             true,
@@ -22969,6 +22980,72 @@ mod tests {
     }
 
     #[test]
+    fn summarize_extract_skips_cached_terminal_failures_for_unchanged_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = dir.path().join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let file = source_dir.join("large.rs");
+        let content = "x".repeat(100);
+        std::fs::write(&file, &content).unwrap();
+        std::fs::create_dir_all(dir.path().join(".tsift")).unwrap();
+        std::fs::write(
+            dir.path().join(".tsift/config.toml"),
+            "[summarize]\napi_key_env = \"PATH\"\nmax_file_tokens = 1\n",
+        )
+        .unwrap();
+
+        cmd_summarize(
+            None,
+            None,
+            Some(PathBuf::from("src")),
+            false,
+            false,
+            None,
+            false,
+            dir.path(),
+            false,
+            true,
+            false,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let db = summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
+        let hash = summarize::content_hash(content.as_bytes());
+        assert!(
+            db.terminal_failure("src/large.rs", &hash)
+                .unwrap()
+                .is_some()
+        );
+        drop(db);
+
+        std::fs::write(
+            dir.path().join(".tsift/config.toml"),
+            "[summarize]\napi_key_env = \"TSIFT_TEST_MISSING_API_KEY\"\nmax_file_tokens = 1\n",
+        )
+        .unwrap();
+        cmd_summarize(
+            None,
+            None,
+            Some(PathBuf::from("src")),
+            false,
+            false,
+            None,
+            false,
+            dir.path(),
+            false,
+            true,
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("cached terminal failure should skip transport resolution");
+    }
+
+    #[test]
     fn summarize_stats_fails_closed_when_cache_missing() {
         let dir = tempfile::tempdir().unwrap();
         let err = cmd_summarize(
@@ -22976,6 +23053,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             true,
             dir.path(),
             false,
@@ -23023,6 +23102,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             true,
             dir.path(),
             false,
@@ -23066,6 +23147,8 @@ mod tests {
             None,
             false,
             false,
+            None,
+            false,
             dir.path(),
             false,
             true,
@@ -23108,6 +23191,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             false,
             &nested,
             false,
@@ -33285,16 +33370,23 @@ fn sample() {}
             "src",
             "--profile",
             "hash",
+            "--force",
+            "--max-file-tokens",
+            "12000",
             "--json",
         ]);
         match cli.command {
             Some(Commands::Summarize {
                 extract,
+                force,
+                max_file_tokens,
                 profile,
                 json,
                 ..
             }) => {
                 assert_eq!(extract.as_deref(), Some(std::path::Path::new("src")));
+                assert!(force);
+                assert_eq!(max_file_tokens, Some(12_000));
                 assert_eq!(profile.as_deref(), Some("hash"));
                 assert!(json);
             }
