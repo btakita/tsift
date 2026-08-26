@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.89
+
 - **Fail closed on workspace symbol ambiguity and make summary residue actionable** ([#17](https://github.com/btakita/tsift/issues/17)). `graph` and `explain` now refuse exact symbols found in multiple scopes, while federated `symbol-read` prioritizes all exact-case matches before case-insensitive fallback. Summary extraction exposes `--max-file-tokens`, caches unchanged too-large and unparseable-response failures until `--force` or a content change, and reports parser details with a bounded response preview. `status` computes summary coverage only from extractable indexed files, suppresses automatic retries for current terminal failures, and includes the workspace `<root>` index in language-coverage diagnostics.
 
 ## 0.1.88
