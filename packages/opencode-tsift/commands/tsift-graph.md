@@ -1,4 +1,4 @@
-<!-- tsift:opencode-command v=0.1.87 name=tsift-graph -->
+<!-- tsift:opencode-command v=0.1.88 name=tsift-graph -->
 ---
 description: Call graph navigation via tsift graph
 ---

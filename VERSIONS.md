@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.88
+
 - **Complete workspace ownership and symbol reads** ([#16](https://github.com/btakita/tsift/issues/16)). `init --workspace` now stays in the current repository, `index --workspace` indexes root-owned files into a filtered `<root>` database alongside submodule scopes, and `symbol-read` federates from workspace roots (with explicit `--federated`, root-owned `--file`, and fail-closed ambiguity diagnostics).
 
 ## 0.1.87
