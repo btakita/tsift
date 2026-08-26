@@ -7237,12 +7237,8 @@ fn workspace_graph_commands_refuse_cross_scope_ambiguity() {
     assert!(indexed.status.success());
 
     for command in ["explain", "graph"] {
-            let output = tsift_bin()
-                .args([
-                    command,
-                    "duplicate_symbol",
-                    dir.path().to_str().unwrap(),
-                ])
+        let output = tsift_bin()
+            .args([command, "duplicate_symbol", dir.path().to_str().unwrap()])
             .output()
             .unwrap();
         assert!(!output.status.success(), "{command} unexpectedly succeeded");
@@ -7284,8 +7280,14 @@ fn workspace_symbol_read_checks_exact_case_before_case_insensitive_fallback() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("ambiguous across workspace scopes"), "{stderr}");
-    assert!(stderr.contains("alpha") && stderr.contains("beta"), "{stderr}");
+    assert!(
+        stderr.contains("ambiguous across workspace scopes"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("alpha") && stderr.contains("beta"),
+        "{stderr}"
+    );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("Symbol `app`"));
 }
 
@@ -7473,10 +7475,10 @@ fn init_workspace_skips_scopes_that_opt_out_of_instructions() {
 #[test]
 fn workspace_explain_and_graph_resolve_the_owning_scope_without_a_flag() {
     let dir = indexed_workspace_cli_fixture();
-    let root = dir.path().to_str().unwrap();
 
     let explain = tsift_bin()
-        .args(["explain", "alpha_helper", root, "--json"])
+        .current_dir(dir.path())
+        .args(["explain", "alpha_helper", "--json"])
         .output()
         .unwrap();
     assert!(
@@ -7489,9 +7491,26 @@ fn workspace_explain_and_graph_resolve_the_owning_scope_without_a_flag() {
         explain_json.to_string().contains("alpha_helper"),
         "{explain_json}"
     );
+    assert_eq!(
+        explain_json["definitions"][0]["line"], 1,
+        "explain must emit one-based definition lines: {explain_json}"
+    );
+
+    let symbol_read = tsift_bin()
+        .current_dir(dir.path())
+        .args(["--envelope", "symbol-read", "alpha_helper", "--json"])
+        .output()
+        .unwrap();
+    assert!(symbol_read.status.success());
+    let symbol_read_json: serde_json::Value = serde_json::from_slice(&symbol_read.stdout).unwrap();
+    assert_eq!(
+        explain_json["definitions"][0]["line"], symbol_read_json["report"]["symbol"]["line"],
+        "explain and symbol-read must agree on the definition start line"
+    );
 
     let graph = tsift_bin()
-        .args(["graph", "alpha_helper", root, "--callers", "--json"])
+        .current_dir(dir.path())
+        .args(["graph", "alpha_helper", "--callers", "--json"])
         .output()
         .unwrap();
     assert!(
@@ -7521,10 +7540,10 @@ fn workspace_explain_and_graph_resolve_the_owning_scope_without_a_flag() {
 #[test]
 fn workspace_explain_names_the_searched_scopes_when_the_symbol_is_absent() {
     let dir = indexed_workspace_cli_fixture();
-    let root = dir.path().to_str().unwrap();
 
     let output = tsift_bin()
-        .args(["explain", "no_such_symbol_anywhere", root, "--json"])
+        .current_dir(dir.path())
+        .args(["explain", "no_such_symbol_anywhere", "--json"])
         .output()
         .unwrap();
     assert!(!output.status.success());

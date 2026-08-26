@@ -1208,22 +1208,22 @@ pub fn run() -> Result<()> {
         Some(Commands::Summarize {
             symbol,
             file,
-        extract,
-        diff,
-        force,
-        max_file_tokens,
-        stats,
+            extract,
+            diff,
+            force,
+            max_file_tokens,
+            stats,
             path,
             profile,
             json,
         }) => cmd_summarize(
             symbol,
             file,
-        extract,
-        diff,
-        force,
-        max_file_tokens,
-        stats,
+            extract,
+            diff,
+            force,
+            max_file_tokens,
+            stats,
             &path,
             json || terse || schema || envelope,
             compact,
@@ -18110,8 +18110,7 @@ fn cmd_symbol_read(
     let ambiguous_scopes = candidates
         .iter()
         .filter(|(target_index, hit)| {
-            *target_index != selected_target_index
-            && hit.name == selected.name
+            *target_index != selected_target_index && hit.name == selected.name
         })
         .map(|(target_index, _)| {
             targets[*target_index]
@@ -21731,7 +21730,15 @@ pub(crate) fn should_auto_federate(
     if infer_agent_doc_task_submodule(root, path_hint)?.is_some() {
         return Ok(false);
     }
-    if path_hint != root {
+    let absolute_path_hint = if path_hint.is_absolute() {
+        path_hint.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path_hint)
+    };
+    let canonical_path_hint = absolute_path_hint
+        .canonicalize()
+        .unwrap_or(absolute_path_hint);
+    if canonical_path_hint != root {
         return Ok(false);
     }
     Ok(!config::Config::submodule_dirs(root)?.is_empty())
@@ -22171,7 +22178,9 @@ pub(crate) fn resolve_search_strategy(query: &str, strategy: Option<String>) -> 
 pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     if path.is_file() {
-        files.push(path.to_path_buf());
+        if summarize::is_extraction_candidate_file(path) {
+            files.push(path.to_path_buf());
+        }
         return Ok(files);
     }
     let walker = ignore::WalkBuilder::new(path)
@@ -22182,7 +22191,7 @@ pub(crate) fn collect_source_files(path: &std::path::Path) -> Result<Vec<PathBuf
         let entry = entry?;
         if entry.file_type().is_some_and(|ft| ft.is_file()) {
             let p = entry.path();
-            if summarize::is_extraction_candidate_path(p) {
+            if summarize::is_extraction_candidate_file(p) {
                 files.push(p.to_path_buf());
             }
         }
@@ -22609,6 +22618,7 @@ mod tests {
         std::fs::create_dir_all(&source_dir).unwrap();
         let main_rs = source_dir.join("main.rs");
         std::fs::write(&main_rs, "fn alpha() {}\n").unwrap();
+        std::fs::write(source_dir.join("empty.rs"), "").unwrap();
 
         let extract_scope = resolve_extract_scope(dir.path(), Path::new("src")).unwrap();
         let files = collect_source_files(&extract_scope).unwrap();
@@ -23014,11 +23024,12 @@ mod tests {
 
         let db = summarize::SummaryDb::open(&dir.path().join(".tsift/summaries.db")).unwrap();
         let hash = summarize::content_hash(content.as_bytes());
-        assert!(
-            db.terminal_failure("src/large.rs", &hash)
-                .unwrap()
-                .is_some()
-        );
+        let cached_failure = db
+            .terminal_failure("src/large.rs", &hash)
+            .unwrap()
+            .expect("the over-limit failure should be cached");
+        assert_eq!(cached_failure.max_file_tokens, Some(1));
+        assert!(!cached_failure.applies_at_max_file_tokens(100));
         drop(db);
 
         std::fs::write(

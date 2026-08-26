@@ -16,8 +16,7 @@ use crate::{
     annotate_stored_edges_with_tagpath, annotate_stored_symbols_with_tagpath,
     build_explain_budget_report, build_traversal_graph, community_tagpath_cache_part,
     compact_members, detect_communities_cached, envelope_metric, format_edge_groups,
-    inject_tagpath_stale_into_json, open_graph_index_db, open_index_db,
-    print_explain_budget_human,
+    inject_tagpath_stale_into_json, open_graph_index_db, open_index_db, print_explain_budget_human,
     print_json_or_envelope, query_tagpath_root, relativize_edges, relativize_symbols, shell_quote,
     should_collapse_edge_groups, symbol_path_summary, to_json_schema, traversal_report,
     traversal_report_html, update_community_annotation_diagnostics,
@@ -411,9 +410,7 @@ fn build_communities_value(
 
     let community_annotation =
         annotate_communities_with_tagpath(&mut display, &db, &tagpath_root, tagpath_opts)?;
-    let tagpath_stale = community_annotation
-        .as_ref()
-        .is_some_and(|diag| diag.stale);
+    let tagpath_stale = community_annotation.as_ref().is_some_and(|diag| diag.stale);
     let tagpath_stale_reason = community_annotation
         .as_ref()
         .and_then(|diag| diag.reason.clone());
@@ -1106,6 +1103,13 @@ pub(crate) fn cmd_explain_with_budget(
         EdgeSide::Callee,
         &tagpath_opts,
     )?;
+    // Stored symbol rows use tree-sitter's zero-based coordinates. Every
+    // user-facing read command uses one-based lines, so normalize both ends
+    // before explain builds any human, JSON, tabular, or budgeted projection.
+    for symbol in &mut symbols {
+        symbol.line = symbol.line.saturating_add(1);
+        symbol.end_line = symbol.end_line.map(|end_line| end_line.saturating_add(1));
+    }
     let mut tagpath_stale = def_diag.stale || caller_diag.stale || callee_diag.stale;
     let mut tagpath_stale_reason = def_diag
         .reason

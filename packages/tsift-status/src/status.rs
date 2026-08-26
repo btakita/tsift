@@ -133,7 +133,9 @@ impl LanguageCoverageGap {
     /// stray `.txt` files next to 600 indexed sources is not a coverage gap.
     fn is_reportable(&self) -> bool {
         let walked = self.indexed_files + self.skipped_files;
-        walked > 0 && self.dominant_extension_files >= 3 && self.skipped_files * 4 >= walked
+        let meaningful_share = walked > 0 && self.skipped_files * 4 >= walked;
+        let workspace_root_gap = self.scope.as_deref() == Some(config::WORKSPACE_ROOT_SCOPE_ID);
+        meaningful_share && (workspace_root_gap || self.dominant_extension_files >= 3)
     }
 
     fn from_summary(
@@ -643,7 +645,7 @@ fn check_summaries(
     let live_indexed_files = live_indexed_summary_paths(root, index, cache)?;
     let extractable_files = live_indexed_files
         .iter()
-        .filter(|path| tsift_summarize::summarize::is_extraction_candidate_path(Path::new(path)))
+        .filter(|path| tsift_summarize::summarize::is_extraction_candidate_file(&root.join(path)))
         .cloned()
         .collect::<HashSet<_>>();
     let non_candidate_files = live_indexed_files
@@ -1827,13 +1829,11 @@ mod tests {
     fn status_reports_workspace_root_language_coverage_gap() {
         let dir = setup_workspace();
         std::fs::write(dir.path().join("keep.rs"), "fn keep() {}\n").unwrap();
-        for idx in 0..8 {
-            std::fs::write(
-                dir.path().join(format!("root-data{idx}.parquetish")),
-                "not a language tsift indexes\n",
-            )
-            .unwrap();
-        }
+        std::fs::write(
+            dir.path().join("root-data.parquetish"),
+            "not a language tsift indexes\n",
+        )
+        .unwrap();
         index_workspace(dir.path());
 
         let report = check_status(dir.path()).unwrap();
@@ -1843,7 +1843,8 @@ mod tests {
             .find(|gap| gap.scope.as_deref() == Some(config::WORKSPACE_ROOT_SCOPE_ID))
             .expect("workspace-root skips should be reported as the <root> scope");
         assert_eq!(gap.dominant_extension, ".parquetish");
-        assert_eq!(gap.dominant_extension_files, 8);
+        assert_eq!(gap.dominant_extension_files, 1);
+        assert_eq!(gap.skipped_files, 1);
     }
 
     fn hold_wal_lock(db_path: &Path) -> Connection {
@@ -2396,6 +2397,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let source = b"fn main() {}\n";
         std::fs::write(dir.path().join("main.rs"), source).unwrap();
+        std::fs::write(dir.path().join("empty.rs"), "").unwrap();
         std::fs::write(dir.path().join("README.md"), "# Indexed documentation\n").unwrap();
         let db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
         db.apply_changes(dir.path()).unwrap();
@@ -2428,7 +2430,7 @@ mod tests {
             } => {
                 assert_eq!(cached_files, 1);
                 assert_eq!(total_indexed_files, 1);
-                assert_eq!(non_candidate_files, 1);
+                assert_eq!(non_candidate_files, 2);
                 assert_eq!(coverage_pct, 100);
             }
             other => panic!("expected available summaries, got {other:?}"),

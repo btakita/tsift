@@ -120,13 +120,14 @@ pub(crate) fn cmd_summarize(
                     continue;
                 }
             };
+            if content.is_empty() {
+                continue;
+            }
             let hash = summarize::content_hash(&content);
             let rel_path = summarize_relative_file_path(&root, file_path);
             if !force
-                && summary_cache
-                    .db()
-                    .terminal_failure(&rel_path, &hash)?
-                    .is_some()
+                && let Some(failure) = summary_cache.db().terminal_failure(&rel_path, &hash)?
+                && failure.applies_at_max_file_tokens(cfg.max_file_tokens)
             {
                 report.terminal_failures_skipped += 1;
                 continue;
@@ -191,9 +192,15 @@ pub(crate) fn cmd_summarize(
                 }
                 Err(e) => {
                     if let Some((kind, message)) = summarize::terminal_extraction_failure(&e) {
-                        summary_cache
-                            .db()
-                            .record_terminal_failure(&rel_path, &hash, kind, &message)?;
+                        let failed_limit = (kind == summarize::ExtractionFailureKind::TooLarge)
+                            .then_some(cfg.max_file_tokens);
+                        summary_cache.db().record_terminal_failure_with_limit(
+                            &rel_path,
+                            &hash,
+                            kind,
+                            failed_limit,
+                            &message,
+                        )?;
                     }
                     report.errors.push(format!("{}: {}", rel_path, e));
                     if !json_output {

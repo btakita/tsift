@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **Restore sound workspace navigation and extraction retries** ([#18](https://github.com/btakita/tsift/issues/18)). Relative workspace-root `explain` / `graph` calls auto-federate again and fail closed on ambiguity; explain definition ranges are one-based. Raising `--max-file-tokens` invalidates cached `too_large` failures (including legacy rows), the CLI names `.tsift/config.toml`, zero-byte sources never reach the model or summary denominator, fenced/prefaced JSON responses parse through the first balanced object, and small filtered `<root>` language gaps are visible in status.
+
 ## 0.1.89
 
 - **Fail closed on workspace symbol ambiguity and make summary residue actionable** ([#17](https://github.com/btakita/tsift/issues/17)). `graph` and `explain` now refuse exact symbols found in multiple scopes, while federated `symbol-read` prioritizes all exact-case matches before case-insensitive fallback. Summary extraction exposes `--max-file-tokens`, caches unchanged too-large and unparseable-response failures until `--force` or a content change, and reports parser details with a bounded response preview. `status` computes summary coverage only from extractable indexed files, suppresses automatic retries for current terminal failures, and includes the workspace `<root>` index in language-coverage diagnostics.

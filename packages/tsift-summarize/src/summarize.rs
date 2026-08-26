@@ -172,8 +172,26 @@ pub struct CachedExtractionFailure {
     pub file_path: String,
     pub content_hash: String,
     pub kind: ExtractionFailureKind,
+    /// The effective cap that produced a `too_large` failure. Older cache rows
+    /// may not have this value, so callers also understand the legacy message.
+    pub max_file_tokens: Option<usize>,
     pub message: String,
     pub failed_at: String,
+}
+
+impl CachedExtractionFailure {
+    pub fn applies_at_max_file_tokens(&self, effective_max_file_tokens: usize) -> bool {
+        if self.kind != ExtractionFailureKind::TooLarge {
+            return true;
+        }
+        match self
+            .max_file_tokens
+            .or_else(|| too_large_limit_from_message(&self.message))
+        {
+            Some(failed_limit) => effective_max_file_tokens <= failed_limit,
+            None => true,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -285,6 +303,15 @@ pub fn is_extraction_candidate_path(path: &Path) -> bool {
                 | "zsh"
         )
     )
+}
+
+/// Whether a live file can produce a useful extraction. Empty source files have
+/// no summary to ask a model for and must not consume a request.
+pub fn is_extraction_candidate_file(path: &Path) -> bool {
+    is_extraction_candidate_path(path)
+        && path
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
 }
 
 impl ExtractionClient {
@@ -498,17 +525,30 @@ impl SummaryDb {
 CREATE INDEX IF NOT EXISTS idx_summaries_symbol ON summaries(symbol_name);
 CREATE INDEX IF NOT EXISTS idx_summaries_file ON summaries(file_path);
 CREATE INDEX IF NOT EXISTS idx_summaries_hash ON summaries(content_hash);
-CREATE TABLE IF NOT EXISTS extraction_failures (
-    file_path TEXT NOT NULL,
-    content_hash TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    message TEXT NOT NULL,
-    failed_at TEXT NOT NULL,
-    PRIMARY KEY (file_path, content_hash)
+            CREATE TABLE IF NOT EXISTS extraction_failures (
+                file_path TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                max_file_tokens INTEGER,
+                message TEXT NOT NULL,
+                failed_at TEXT NOT NULL,
+                PRIMARY KEY (file_path, content_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_extraction_failures_file
-    ON extraction_failures(file_path);",
+            ON extraction_failures(file_path);",
         )?;
+        let has_max_file_tokens: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('extraction_failures') \
+             WHERE name = 'max_file_tokens'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_max_file_tokens == 0 {
+            conn.execute(
+                "ALTER TABLE extraction_failures ADD COLUMN max_file_tokens INTEGER",
+                [],
+            )?;
+        }
         Ok(Self {
             conn,
             _snapshot_copy: None,
@@ -671,7 +711,7 @@ CREATE INDEX IF NOT EXISTS idx_extraction_failures_file
         let normalized = normalize_summary_file_key_str(file_path);
         let legacy = legacy_windows_summary_file_key(&normalized);
         let mut stmt = self.conn.prepare(
-            "SELECT file_path, content_hash, kind, message, failed_at
+            "SELECT file_path, content_hash, kind, max_file_tokens, message, failed_at
              FROM extraction_failures
              WHERE content_hash = ?2 AND (file_path = ?1 OR file_path = ?3)
              LIMIT 1",
@@ -689,8 +729,11 @@ CREATE INDEX IF NOT EXISTS idx_extraction_failures_file
             file_path: normalize_summary_file_key_str(&row.get::<_, String>(0)?),
             content_hash: row.get(1)?,
             kind,
-            message: row.get(3)?,
-            failed_at: row.get(4)?,
+            max_file_tokens: row
+                .get::<_, Option<i64>>(3)?
+                .and_then(|value| usize::try_from(value).ok()),
+            message: row.get(4)?,
+            failed_at: row.get(5)?,
         }))
     }
 
@@ -701,19 +744,32 @@ CREATE INDEX IF NOT EXISTS idx_extraction_failures_file
         kind: ExtractionFailureKind,
         message: &str,
     ) -> Result<()> {
+        self.record_terminal_failure_with_limit(file_path, content_hash, kind, None, message)
+    }
+
+    pub fn record_terminal_failure_with_limit(
+        &self,
+        file_path: &str,
+        content_hash: &str,
+        kind: ExtractionFailureKind,
+        max_file_tokens: Option<usize>,
+        message: &str,
+    ) -> Result<()> {
         let normalized = normalize_summary_file_key_str(file_path);
         self.conn.execute(
             "INSERT INTO extraction_failures
-                 (file_path, content_hash, kind, message, failed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+             (file_path, content_hash, kind, max_file_tokens, message, failed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(file_path, content_hash) DO UPDATE SET
-                 kind = excluded.kind,
-                 message = excluded.message,
-                 failed_at = excluded.failed_at",
+             kind = excluded.kind,
+             max_file_tokens = excluded.max_file_tokens,
+             message = excluded.message,
+             failed_at = excluded.failed_at",
             rusqlite::params![
                 normalized,
                 content_hash,
                 kind.as_str(),
+                max_file_tokens.and_then(|value| i64::try_from(value).ok()),
                 message,
                 chrono_now()
             ],
@@ -1161,7 +1217,7 @@ pub fn extract_for_file_with_client(
         return Err(anyhow::Error::new(TerminalExtractionError {
             kind: ExtractionFailureKind::TooLarge,
             message: format!(
-                "file {} exceeds max_file_tokens ({} > {}); raise it with --max-file-tokens or [summarize].max_file_tokens",
+                "file {} exceeds max_file_tokens ({} > {}); raise it with --max-file-tokens or .tsift/config.toml [summarize].max_file_tokens",
                 file_path.display(),
                 token_estimate,
                 config.max_file_tokens
@@ -1229,16 +1285,71 @@ pub fn extract_for_file_with_client(
 }
 
 fn parse_extraction_response(file_path: &Path, response_text: &str) -> Result<ExtractionResponse> {
-    serde_json::from_str(response_text).map_err(|error| {
-        let preview = response_text.chars().take(240).collect::<String>();
-        anyhow::Error::new(TerminalExtractionError {
-            kind: ExtractionFailureKind::UnparseableResponse,
-            message: format!(
-                "parsing extraction response for {} failed: {error}; response preview: {preview:?}",
-                file_path.display()
-            ),
-        })
-    })
+    let direct_error = match serde_json::from_str(response_text) {
+        Ok(parsed) => return Ok(parsed),
+        Err(error) => error,
+    };
+    if let Some(object) = first_balanced_json_object(response_text)
+        && let Ok(parsed) = serde_json::from_str(object)
+    {
+        return Ok(parsed);
+    }
+    let preview = response_text.chars().take(240).collect::<String>();
+    Err(anyhow::Error::new(TerminalExtractionError {
+        kind: ExtractionFailureKind::UnparseableResponse,
+        message: format!(
+            "parsing extraction response for {} failed: {direct_error}; response preview: {preview:?}",
+            file_path.display()
+        ),
+    }))
+}
+
+fn first_balanced_json_object(text: &str) -> Option<&str> {
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, character) in text.char_indices() {
+        if start.is_none() {
+            if character == '{' {
+                start = Some(index);
+                depth = 1;
+            }
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(
+                        &text[start.expect("set with depth")..index + character.len_utf8()],
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn too_large_limit_from_message(message: &str) -> Option<usize> {
+    let (_, limits) = message.split_once("exceeds max_file_tokens (")?;
+    let (limits, _) = limits.split_once(')')?;
+    let (_, failed_limit) = limits.split_once('>')?;
+    failed_limit.trim().parse().ok()
 }
 
 fn normalize_lookup_path(path: &Path) -> String {
@@ -2076,6 +2187,7 @@ mod tests {
             .unwrap()
             .expect("same content should retain its terminal failure");
         assert_eq!(cached.kind, ExtractionFailureKind::TooLarge);
+        assert_eq!(cached.max_file_tokens, None);
         assert_eq!(cached.message, "raise --max-file-tokens");
         assert!(
             db.terminal_failure("src/main.rs", "different-hash")
@@ -2090,6 +2202,38 @@ mod tests {
         db.replace_file("src/main.rs", &[make_summary("main", "src/main.rs", &hash)])
             .unwrap();
         assert!(db.terminal_failure("src/main.rs", &hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn too_large_failures_stop_applying_when_the_effective_limit_is_raised() {
+        let (_tmp, db) = test_db();
+        db.record_terminal_failure_with_limit(
+            "src/large.rs",
+            "same-content",
+            ExtractionFailureKind::TooLarge,
+            Some(8_000),
+            "file src/large.rs exceeds max_file_tokens (9291 > 8000)",
+        )
+        .unwrap();
+        let cached = db
+            .terminal_failure("src/large.rs", "same-content")
+            .unwrap()
+            .unwrap();
+        assert!(cached.applies_at_max_file_tokens(8_000));
+        assert!(!cached.applies_at_max_file_tokens(12_000));
+
+        db.record_terminal_failure(
+            "src/legacy.rs",
+            "legacy-content",
+            ExtractionFailureKind::TooLarge,
+            "file src/legacy.rs exceeds max_file_tokens (9291 > 8000); raise it",
+        )
+        .unwrap();
+        let legacy = db
+            .terminal_failure("src/legacy.rs", "legacy-content")
+            .unwrap()
+            .unwrap();
+        assert!(!legacy.applies_at_max_file_tokens(12_000));
     }
 
     #[test]
@@ -2312,6 +2456,24 @@ mod tests {
             terminal_extraction_failure(&error).map(|(kind, _)| kind),
             Some(ExtractionFailureKind::UnparseableResponse)
         );
+    }
+
+    #[test]
+    fn extraction_parser_accepts_json_fences_and_model_preamble() {
+        let response = "The file is empty.\n```json\n{\"summary\":\"No declarations {yet}\"}\n```";
+        let parsed = parse_extraction_response(Path::new("src/empty.rs"), response).unwrap();
+        assert_eq!(parsed.summary, "No declarations {yet}");
+    }
+
+    #[test]
+    fn zero_byte_source_files_are_not_extraction_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.rs");
+        let nonempty = dir.path().join("nonempty.rs");
+        std::fs::write(&empty, "").unwrap();
+        std::fs::write(&nonempty, "fn main() {}\n").unwrap();
+        assert!(!is_extraction_candidate_file(&empty));
+        assert!(is_extraction_candidate_file(&nonempty));
     }
 
     #[test]
