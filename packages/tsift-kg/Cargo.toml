@@ -1,6 +1,6 @@
 [package]
 name = "tsift-kg"
-version = "0.1.86"
+version = "0.1.87"
 edition = "2024"
 description = "Shared local Knowledge Graph extraction pipeline for tsift and agent-doc"
 license = "MIT"
@@ -16,9 +16,9 @@ anyhow = "1"
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tsift-core = { path = "../tsift-core", version = "0.1.86" }
-tsift-local-model = { path = "../tsift-local-model", version = "0.1.86" }
-tsift-sqlite = { path = "../tsift-sqlite", version = "0.1.86" }
+tsift-core = { path = "../tsift-core", version = "0.1.87" }
+tsift-local-model = { path = "../tsift-local-model", version = "0.1.87" }
+tsift-sqlite = { path = "../tsift-sqlite", version = "0.1.87" }
 ureq = { version = "3", features = ["json"] }
 
 [dev-dependencies]

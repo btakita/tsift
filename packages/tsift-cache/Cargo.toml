@@ -1,6 +1,6 @@
 [package]
 name = "tsift-cache"
-version = "0.1.86"
+version = "0.1.87"
 edition = "2024"
 description = "Shared cache primitives for tsift and agent-doc integrations"
 license = "MIT"
