@@ -705,10 +705,13 @@ mod tests {
     }
 
     #[test]
-    fn collect_entities_from_workspace_index_targets_skip_non_federated_scopes() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::create_dir_all(root.join(".tsift/indexes/public")).unwrap();
+fn collect_entities_from_workspace_index_targets_skip_non_federated_scopes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for scope in ["public", "private", "isolated", "nonfed"] {
+        fs::create_dir_all(root.join("src").join(scope)).unwrap();
+    }
+    fs::create_dir_all(root.join(".tsift/indexes/public")).unwrap();
         fs::create_dir_all(root.join(".tsift/indexes/private")).unwrap();
         fs::create_dir_all(root.join(".tsift/indexes/isolated")).unwrap();
         fs::create_dir_all(root.join(".tsift/indexes/nonfed")).unwrap();
@@ -778,10 +781,11 @@ federation = false
     }
 
     #[test]
-    fn collect_entities_from_workspace_root_ignores_repo_root_index_db() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::create_dir_all(root.join(".tsift")).unwrap();
+fn collect_entities_from_workspace_root_ignores_repo_root_index_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src/public")).unwrap();
+    fs::create_dir_all(root.join(".tsift")).unwrap();
         fs::write(
             root.join(".gitmodules"),
             r#"[submodule "src/public"]
@@ -833,10 +837,13 @@ tier = "private"
     }
 
     #[test]
-    fn collect_entities_from_workspace_root_skips_non_federated_scopes() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::create_dir_all(root.join(".tsift")).unwrap();
+fn collect_entities_from_workspace_root_skips_non_federated_scopes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for scope in ["public", "private", "isolated", "nonfed"] {
+        fs::create_dir_all(root.join("src").join(scope)).unwrap();
+    }
+    fs::create_dir_all(root.join(".tsift")).unwrap();
         fs::write(
             root.join(".gitmodules"),
             r#"[submodule "src/public"]

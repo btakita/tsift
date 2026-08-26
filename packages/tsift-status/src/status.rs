@@ -133,9 +133,7 @@ impl LanguageCoverageGap {
     /// stray `.txt` files next to 600 indexed sources is not a coverage gap.
     fn is_reportable(&self) -> bool {
         let walked = self.indexed_files + self.skipped_files;
-        walked > 0
-            && self.dominant_extension_files >= 3
-            && self.skipped_files * 4 >= walked
+        walked > 0 && self.dominant_extension_files >= 3 && self.skipped_files * 4 >= walked
     }
 
     fn from_summary(
@@ -273,7 +271,8 @@ pub fn check_status(root: &Path) -> Result<StatusReport> {
 }
 
 pub fn check_status_with_cache(root: &Path, cache: &StatusCheckCache) -> Result<StatusReport> {
-    let workspace_scopes = config::Config::submodule_dirs(root)?;
+    let workspace_discovery = config::Config::workspace_discovery(root)?;
+    let workspace_scopes = workspace_discovery.scopes;
     let workspace = !workspace_scopes.is_empty();
     let summaries_db_path = root.join(".tsift/summaries.db");
 
@@ -292,7 +291,30 @@ pub fn check_status_with_cache(root: &Path, cache: &StatusCheckCache) -> Result<
         &summarize_extract,
         kg_present,
     );
-    let reminders = build_reminders(&index, &summaries, &recommendations, &summarize_extract);
+    let mut reminders = build_reminders(&index, &summaries, &recommendations, &summarize_extract);
+    if !workspace_discovery.unresolvable.is_empty() {
+        let details = workspace_discovery
+            .unresolvable
+            .iter()
+            .map(|scope| format!("{} — no gitlink and path absent", scope.relative_path))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let count = workspace_discovery.unresolvable.len();
+        let resolution = if workspace {
+            "ignored stale `.gitmodules` declaration"
+        } else if matches!(index, IndexStatus::Missing { .. }) {
+            "run `tsift index .` to index the root tree instead; remove stale config with `git rm .gitmodules`"
+        } else {
+            "using the root index instead; remove stale config with `git rm .gitmodules`"
+        };
+        reminders.insert(
+            0,
+            format!(
+                "workspace: {count} declared scope{} unresolvable ({details}); {resolution}",
+                if count == 1 { "" } else { "s" }
+            ),
+        );
+    }
     let language_coverage = collect_language_coverage_gaps(root, cache)?;
 
     Ok(StatusReport {
@@ -1759,7 +1781,12 @@ mod tests {
         db.apply_changes(dir.path()).unwrap();
 
         let report = check_status(dir.path()).unwrap();
-        assert!(!report.recommendations.use_commands.contains(&"kg".to_string()));
+        assert!(
+            !report
+                .recommendations
+                .use_commands
+                .contains(&"kg".to_string())
+        );
     }
 
     #[test]

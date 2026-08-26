@@ -32,10 +32,9 @@ use crate::{
     append_graph_db_backend_eval_phase_metrics, append_sqlite_graph_doctor_checks,
     append_tokensave_graph_doctor_checks, apply_edit_plan_atomically, apply_rewrite_output_format,
     apply_status_fixes, apply_status_instruction_fixes, autoindex_missing_workspace_scopes,
-    build_convex_sync_report_with_snapshot,
-    build_edit_plan, classify_task, convex_graph_freshness, convex_rows_from_graph_store,
-    dedupe_preserve_order, envelope_metric, execute_query, execute_rewritten_command,
-    graph_db_backend_eval_cached_refresh, graph_db_backend_eval_dataset,
+    build_convex_sync_report_with_snapshot, build_edit_plan, classify_task, convex_graph_freshness,
+    convex_rows_from_graph_store, dedupe_preserve_order, envelope_metric, execute_query,
+    execute_rewritten_command, graph_db_backend_eval_cached_refresh, graph_db_backend_eval_dataset,
     graph_db_backend_eval_full_projection_with_profile, graph_db_backend_eval_graph_rows,
     graph_db_backend_eval_metric_digest_command, graph_db_backend_eval_metrics,
     graph_db_backend_eval_performance_gate, graph_db_backend_eval_phase_timing,
@@ -2890,6 +2889,8 @@ fn print_init_updates(result: &init::InitResult) {
     }
     if result.gitignore_added {
         println!(".gitignore: added .tsift/");
+    } else if let Some(source) = &result.gitignore_ignore_source {
+        println!(".gitignore: unchanged (.tsift/ already ignored via {source})");
     }
 }
 

@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **Effective Git ignores and resolvable workspace discovery** ([#15](https://github.com/btakita/tsift/issues/15)). `init` now respects `.tsift/` ignores from `.git/info/exclude`, global excludes, parent rules, and broader tracked patterns without re-dirtying `.gitignore`, and names the effective ignore source. Workspace discovery separates present directories and real gitlinks from stale `.gitmodules` declarations; when none resolve, `index --workspace` and `status` fall back to the root tree instead of reporting an unfixable empty workspace.
+
 ## 0.1.86
 
 - **Reliable session/log rewrites, direct transcript review, code-only search symbols, and measured Claude extraction usage** ([#14](https://github.com/btakita/tsift/issues/14)). Canonical Claude/Codex JSONL paths and captured `.output.txt`/`.log.txt` files now rewrite to bounded digests even when early records do not identify the stream. `session-review <transcript.jsonl>` admits the exact recognized transcript or fails nonzero. General search excludes Markdown structure from symbol matches while preserving Markdown navigation and editing. Claude CLI extraction emits per-file progress and records reported uncached plus cache token usage instead of false zeroes.

@@ -160,6 +160,8 @@ federation = false
 
 Workspace scope ids default to the submodule leaf name when it is unique. If two submodules share the same trailing directory name, tsift promotes those scopes to their full `.gitmodules` paths (for example `pkg/app/foo`, `vendor/foo`) so `--scope` / `--submodule` selectors and `.tsift/indexes/<scope>/index.db` stay collision-free. To target one duplicate scope in `.tsift/config.toml`, use the quoted full path key such as `[overrides."vendor/foo"]`.
 
+Workspace discovery does not treat a `.gitmodules` stanza as sufficient proof of a scope. A declared path is resolvable when its directory is present or the repository index owns a `160000` gitlink for it; an absent path with no gitlink is retained only as a stale-configuration diagnostic. If no declarations resolve, the repository root remains the indexing and query boundary: `index --workspace` indexes `.tsift/index.db`, and `status` recommends or reports that root index instead of an unfixable empty scoped workspace.
+
 ## Multiplicity Model
 
 tsift treats repository multiplicity as an ordered ownership stack rather than a flat set of paths. The precedence is:

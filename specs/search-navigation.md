@@ -267,7 +267,7 @@ With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject
 
 ### Behavior
 
-1. Adds `.tsift/` to `.gitignore` (creates the file if needed, appends if entry missing, skips if already present)
+1. Ensures `.tsift/` is ignored. Before changing `.gitignore`, it asks Git for the effective ignore decision, so `.git/info/exclude`, a global excludes file, a parent rule, or a broader tracked pattern remains authoritative. When another source already ignores the path, `init` leaves `.gitignore` untouched and reports that source.
 2. Ensures `AGENTS.md` exists with the section (creates it if needed)
 3. Writes `.agent/runbooks/code-navigation.md` with the full command detail the section defers to, under its own `<!-- tsift:code-navigation-runbook -->` markers (creates the directory and file if needed, updates the marked region in place, preserves text outside the markers). If the canonical path is absent but the legacy `runbooks/code-navigation.md` exists, init moves that file first so hand-written text outside the managed markers survives the migration.
 4. If `CLAUDE.md` exists **and does not already defer to `AGENTS.md`**, updates or appends the same section there too

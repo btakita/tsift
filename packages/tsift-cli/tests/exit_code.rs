@@ -6707,8 +6707,7 @@ fn status_deprecated_fix_flag_shows_warning() {
 #[test]
 fn status_does_not_rewrite_tracked_instruction_files_by_default() {
     let dir = indexed_cli_fixture();
-    let stale_block =
-        "<!-- tsift:code-navigation v=0.1.41 -->\n## Code Navigation\nOld guidance.\n<!-- /tsift:code-navigation -->\n";
+    let stale_block = "<!-- tsift:code-navigation v=0.1.41 -->\n## Code Navigation\nOld guidance.\n<!-- /tsift:code-navigation -->\n";
     fs::write(dir.path().join("AGENTS.md"), stale_block).unwrap();
     std::thread::sleep(Duration::from_millis(50));
     fs::write(
@@ -6743,7 +6742,9 @@ fn status_does_not_rewrite_tracked_instruction_files_by_default() {
         "AGENTS.md must be byte-identical after a bare status"
     );
     assert!(
-        !dir.path().join(".agent/runbooks/code-navigation.md").exists(),
+        !dir.path()
+            .join(".agent/runbooks/code-navigation.md")
+            .exists(),
         "bare status must not create the managed runbook"
     );
 
@@ -6836,8 +6837,7 @@ fn status_fix_instructions_names_the_legacy_runbook_relocation() {
         "a tracked deletion must be named, not silent; stderr was: {stderr}"
     );
     assert!(!dir.path().join("runbooks/code-navigation.md").exists());
-    let moved =
-        fs::read_to_string(dir.path().join(".agent/runbooks/code-navigation.md")).unwrap();
+    let moved = fs::read_to_string(dir.path().join(".agent/runbooks/code-navigation.md")).unwrap();
     assert!(
         moved.contains("Hand-written trailer."),
         "unmanaged text must survive the move; runbook was: {moved}"
@@ -7031,7 +7031,10 @@ fn workspace_communities_federates_per_scope() {
     let human = tsift_bin().args(["communities", root]).output().unwrap();
     assert!(human.status.success());
     let text = String::from_utf8_lossy(&human.stdout);
-    assert!(text.contains("scope alpha:") && text.contains("scope beta:"), "{text}");
+    assert!(
+        text.contains("scope alpha:") && text.contains("scope beta:"),
+        "{text}"
+    );
 }
 
 // #wsfedrest: `path` resolves both endpoints. Same scope is answerable; a
@@ -7109,6 +7112,101 @@ fn workspace_search_federates_by_default_without_shared_root_index() {
     assert!(!dir.path().join(".tsift/index.db").exists());
 }
 
+#[test]
+fn init_respects_git_info_exclude_and_reports_the_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(git.status.success());
+    fs::write(dir.path().join(".git/info/exclude"), ".tsift/\n").unwrap();
+
+    let root = dir.path().to_str().unwrap();
+    let output = tsift_bin().args(["init", root]).output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "init stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(".gitignore: unchanged (.tsift/ already ignored via .git/info/exclude)"),
+        "{stdout}"
+    );
+    assert!(
+        !dir.path().join(".gitignore").exists(),
+        "effective local ignore must not become a tracked .gitignore edit"
+    );
+}
+
+#[test]
+fn unresolvable_workspace_declaration_indexes_and_queries_the_root_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        r#"[submodule "deploy"]
+path = deploy
+url = https://example.com/deploy
+"#,
+    )
+    .unwrap();
+    fs::write(dir.path().join("root.rs"), "fn root_tree_is_visible() {}\n").unwrap();
+    let root = dir.path().to_str().unwrap();
+
+    let index = tsift_bin()
+        .args(["index", "--workspace", root])
+        .output()
+        .unwrap();
+    assert!(
+        index.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&index.stderr);
+    assert!(
+        stderr.contains(
+            "workspace: 1 declared scope unresolvable (deploy — no gitlink and path absent); indexing root tree instead"
+        ),
+        "{stderr}"
+    );
+    assert!(dir.path().join(".tsift/index.db").exists());
+
+    let status = tsift_bin()
+        .args(["status", "--no-fix", "--json", root])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status_json["index"]["state"], "fresh", "{status_json}");
+    assert_eq!(status_json["index"]["total_files"], 1, "{status_json}");
+    assert!(
+        status_json["reminders"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item
+                .as_str()
+                .is_some_and(|text| text.contains("using the root index instead")))),
+        "{status_json}"
+    );
+
+    let search = tsift_bin()
+        .args(["search", "root_tree_is_visible", "--path", root, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "search stderr: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&search.stdout).contains("root_tree_is_visible"),
+        "{}",
+        String::from_utf8_lossy(&search.stdout)
+    );
+}
+
 // #wsinit regression: `tsift init --workspace` refreshed instruction files only
 // in the superproject while `status` maintained index state for every scope, so
 // submodules stayed on releases-old text — and AGENTS.md tells an agent to work
@@ -7118,7 +7216,10 @@ fn init_workspace_refreshes_every_scope_instruction_surface() {
     let dir = indexed_workspace_cli_fixture();
     let root = dir.path().to_str().unwrap();
 
-    let output = tsift_bin().args(["init", "--workspace", root]).output().unwrap();
+    let output = tsift_bin()
+        .args(["init", "--workspace", root])
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "init --workspace stderr: {}",
@@ -7146,7 +7247,10 @@ fn init_workspace_refreshes_every_scope_instruction_surface() {
     }
 
     // The freshly-inited workspace no longer reports scope instruction drift.
-    let status = tsift_bin().args(["status", "--json", root]).output().unwrap();
+    let status = tsift_bin()
+        .args(["status", "--json", root])
+        .output()
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     let drifted = json["scope_instructions"]
         .as_array()
@@ -7171,7 +7275,10 @@ fn init_workspace_skips_scopes_that_opt_out_of_instructions() {
     )
     .unwrap();
 
-    let output = tsift_bin().args(["init", "--workspace", root]).output().unwrap();
+    let output = tsift_bin()
+        .args(["init", "--workspace", root])
+        .output()
+        .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("scope alpha: skipped"), "{stdout}");
@@ -7249,7 +7356,10 @@ fn workspace_explain_names_the_searched_scopes_when_the_symbol_is_absent() {
         stderr.contains("was not found in any federated scope"),
         "{stderr}"
     );
-    assert!(stderr.contains("alpha") && stderr.contains("beta"), "{stderr}");
+    assert!(
+        stderr.contains("alpha") && stderr.contains("beta"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -13433,7 +13543,10 @@ fn edit_intents_refuses_a_structural_only_rename_at_the_index_layer() {
         ],
         input,
     );
-    assert!(!output.status.success(), "a Java rename must not be planned");
+    assert!(
+        !output.status.success(),
+        "a Java rename must not be planned"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("no indexed symbol matched"),
@@ -13491,7 +13604,14 @@ fn go_sources_are_indexed_searchable_and_renamable() {
 
     let input = r#"{"intents":[{"kind":"rename_symbol","symbol":"widgetCount","file":"main.go","new_name":"gadgetCount"}]}"#;
     let output = run_tsift_stdin(
-        &["--envelope", "edit-intents", "--path", root, "--json", "--apply"],
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            root,
+            "--json",
+            "--apply",
+        ],
         input,
     );
     assert!(

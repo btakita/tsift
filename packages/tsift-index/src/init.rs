@@ -214,6 +214,7 @@ pub enum InstructionStatus {
 }
 
 const GITIGNORE_ENTRY: &str = ".tsift/";
+const GITIGNORE_PROBE: &str = ".tsift/.tsift-ignore-probe";
 const CODEX_HOOK_STATUS: &str = "tsift auto-reindex";
 const CODEX_AUTOINDEX_HELPER: &str = "tsift-autoindex.sh";
 const CODEX_AUTOINDEX_HELPER_VERSION: u32 = 3;
@@ -225,6 +226,9 @@ pub struct InitResult {
     /// Reported so a tracked-file move is never a silent diff.
     pub migrated_runbook: Option<RunbookMigration>,
     pub gitignore_added: bool,
+    /// The effective Git exclude source that already ignored `.tsift/`, when
+    /// initialization intentionally left the tracked `.gitignore` untouched.
+    pub gitignore_ignore_source: Option<String>,
     pub codex_hooks: Option<CodexHooksResult>,
     pub opencode_commands: Option<Vec<OpenCodeCommandUpdate>>,
 }
@@ -298,13 +302,46 @@ impl std::fmt::Display for InitAction {
     }
 }
 
-fn ensure_gitignore(dir: &Path) -> Result<bool> {
+fn effective_gitignore_source(dir: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args([
+            "check-ignore",
+            "--verbose",
+            "--no-index",
+            "--",
+            GITIGNORE_PROBE,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let line = std::str::from_utf8(&output.stdout).ok()?.trim();
+    let metadata = line.split_once('\t').map_or(line, |(metadata, _)| metadata);
+    let mut fields = metadata.rsplitn(3, ':');
+    let _pattern = fields.next()?;
+    let _line_number = fields.next()?;
+    let source = fields.next()?.trim();
+    (!source.is_empty()).then(|| source.to_string())
+}
+
+fn ensure_gitignore(dir: &Path) -> Result<(bool, Option<String>)> {
     let gitignore = dir.join(".gitignore");
     if gitignore.exists() {
         let content = std::fs::read_to_string(&gitignore)?;
         if content.lines().any(|line| line.trim() == GITIGNORE_ENTRY) {
-            return Ok(false);
+            return Ok((false, None));
         }
+    }
+
+    if let Some(source) = effective_gitignore_source(dir) {
+        return Ok((false, Some(source)));
+    }
+
+    if gitignore.exists() {
+        let content = std::fs::read_to_string(&gitignore)?;
         let mut new_content = content;
         if !new_content.ends_with('\n') && !new_content.is_empty() {
             new_content.push('\n');
@@ -315,7 +352,7 @@ fn ensure_gitignore(dir: &Path) -> Result<bool> {
     } else {
         std::fs::write(&gitignore, format!("{}\n", GITIGNORE_ENTRY))?;
     }
-    Ok(true)
+    Ok((true, None))
 }
 
 pub fn resolve_project_dir(path: &Path) -> Result<PathBuf> {
@@ -373,7 +410,7 @@ pub fn init_with_integrations(
     codex_workspace: bool,
     opencode: bool,
 ) -> Result<InitResult> {
-    let gitignore_added = ensure_gitignore(dir)?;
+    let (gitignore_added, gitignore_ignore_source) = ensure_gitignore(dir)?;
     let mut updates = Vec::new();
     let runbook_migrated = migrate_legacy_runbook(dir)?;
 
@@ -434,6 +471,7 @@ pub fn init_with_integrations(
         updates,
         migrated_runbook: runbook_migrated,
         gitignore_added,
+        gitignore_ignore_source,
         codex_hooks,
         opencode_commands,
     })
@@ -1565,6 +1603,31 @@ mod tests {
     }
 
     #[test]
+    fn init_respects_git_info_exclude_without_touching_gitignore() {
+        let dir = TempDir::new().unwrap();
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(dir.path().join(".git/info/exclude"), ".tsift/\n").unwrap();
+
+        let result = init(dir.path(), false, false).unwrap();
+
+        assert!(!result.gitignore_added);
+        assert!(
+            result
+                .gitignore_ignore_source
+                .as_deref()
+                .is_some_and(|source| source.ends_with(".git/info/exclude")),
+            "unexpected ignore source: {:?}",
+            result.gitignore_ignore_source
+        );
+        assert!(!dir.path().join(".gitignore").exists());
+    }
+
+    #[test]
     fn resolve_project_dir_returns_dir_for_directory() {
         let dir = TempDir::new().unwrap();
         let resolved = resolve_project_dir(dir.path()).unwrap();
@@ -1631,6 +1694,7 @@ mod tests {
     #[test]
     fn has_submodules_reads_gitmodules() {
         let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/foo")).unwrap();
         std::fs::write(
             dir.path().join(".gitmodules"),
             "[submodule \"src/foo\"]\n\tpath = src/foo\n",
@@ -1892,6 +1956,7 @@ mod tests {
     #[test]
     fn init_codex_creates_workspace_hook_for_submodules() {
         let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/alpha")).unwrap();
         std::fs::write(
             dir.path().join(".gitmodules"),
             "[submodule \"src/alpha\"]\n\tpath = src/alpha\n",
@@ -1921,6 +1986,7 @@ mod tests {
     #[test]
     fn init_codex_updates_project_hook_to_workspace_hook() {
         let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/alpha")).unwrap();
         std::fs::write(
             dir.path().join(".gitmodules"),
             "[submodule \"src/alpha\"]\n\tpath = src/alpha\n",
@@ -1966,6 +2032,8 @@ mod tests {
     #[test]
     fn init_codex_workspace_hook_honors_autoindex_focus() {
         let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/alpha")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/beta")).unwrap();
         std::fs::write(
             dir.path().join(".gitmodules"),
             "[submodule \"src/alpha\"]\n\tpath = src/alpha\n\n[submodule \"src/beta\"]\n\tpath = src/beta\n",

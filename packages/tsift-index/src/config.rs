@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -90,6 +91,18 @@ pub struct WorkspaceScope {
     pub legacy_name: String,
     pub relative_path: String,
     pub source_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvableWorkspaceScope {
+    pub relative_path: String,
+    pub source_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceDiscovery {
+    pub scopes: Vec<WorkspaceScope>,
+    pub unresolvable: Vec<UnresolvableWorkspaceScope>,
 }
 
 impl WorkspaceScope {
@@ -247,9 +260,20 @@ impl Config {
     }
 
     pub fn submodule_dirs(root: &Path) -> Result<Vec<WorkspaceScope>> {
+        Ok(Self::workspace_discovery(root)?.scopes)
+    }
+
+    /// Resolve usable workspace scopes while retaining stale `.gitmodules`
+    /// declarations as diagnostics.
+    ///
+    /// An initialized directory is usable even when a fixture or worktree does
+    /// not expose it as a gitlink. An absent directory is usable only when the
+    /// repository index still owns a `160000` gitlink for it; otherwise the
+    /// declaration is stale configuration, not a scope.
+    pub fn workspace_discovery(root: &Path) -> Result<WorkspaceDiscovery> {
         let gitmodules = root.join(".gitmodules");
         if !gitmodules.exists() {
-            return Ok(Vec::new());
+            return Ok(WorkspaceDiscovery::default());
         }
         let content =
             std::fs::read_to_string(&gitmodules).with_context(|| "reading .gitmodules")?;
@@ -260,6 +284,10 @@ impl Config {
                 paths.push(path_val.trim().to_string());
             }
         }
+        let gitlinks = gitlink_paths(root, &paths);
+        let (paths, unresolved_paths): (Vec<_>, Vec<_>) = paths
+            .into_iter()
+            .partition(|path_val| root.join(path_val).is_dir() || gitlinks.contains(path_val));
         let mut alias_counts: HashMap<String, usize> = HashMap::new();
         for path_val in &paths {
             let legacy_name = Path::new(path_val)
@@ -287,8 +315,46 @@ impl Config {
                 source_root: root.join(&path_val),
             });
         }
-        Ok(result)
+        let unresolvable = unresolved_paths
+            .into_iter()
+            .map(|relative_path| UnresolvableWorkspaceScope {
+                source_root: root.join(&relative_path),
+                relative_path,
+            })
+            .collect();
+        Ok(WorkspaceDiscovery {
+            scopes: result,
+            unresolvable,
+        })
     }
+}
+
+fn gitlink_paths(root: &Path, paths: &[String]) -> HashSet<String> {
+    if paths.is_empty() {
+        return HashSet::new();
+    }
+
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "--stage", "-z", "--"])
+        .args(paths)
+        .output();
+    let Ok(output) = output else {
+        return HashSet::new();
+    };
+    if !output.status.success() {
+        return HashSet::new();
+    }
+
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| {
+            let entry = std::str::from_utf8(entry).ok()?;
+            let (metadata, path) = entry.split_once('\t')?;
+            metadata.starts_with("160000 ").then(|| path.to_string())
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -458,6 +524,8 @@ federation = false
     #[test]
     fn submodule_dirs_parses_gitmodules() {
         let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src/agent-doc")).unwrap();
+        fs::create_dir_all(dir.path().join("src/corky")).unwrap();
         fs::write(
             dir.path().join(".gitmodules"),
             r#"[submodule "src/agent-doc"]
@@ -480,6 +548,8 @@ federation = false
     #[test]
     fn submodule_dirs_use_full_path_when_leaf_names_collide() {
         let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("pkg/app/foo")).unwrap();
+        fs::create_dir_all(dir.path().join("vendor/foo")).unwrap();
         fs::write(
             dir.path().join(".gitmodules"),
             r#"[submodule "pkg/app/foo"]
@@ -503,6 +573,8 @@ federation = false
     #[test]
     fn find_submodule_errors_on_ambiguous_legacy_name() {
         let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("pkg/app/foo")).unwrap();
+        fs::create_dir_all(dir.path().join("vendor/foo")).unwrap();
         fs::write(
             dir.path().join(".gitmodules"),
             r#"[submodule "pkg/app/foo"]
@@ -544,5 +616,64 @@ federation = false
 
         assert_eq!(scope.id, "alpha");
         assert_eq!(scope.source_root, dir.path().join("src/alpha"));
+    }
+
+    #[test]
+    fn workspace_discovery_reports_absent_non_gitlink_as_unresolvable() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".gitmodules"),
+            r#"[submodule "deploy"]
+path = deploy
+url = https://example.com/deploy
+"#,
+        )
+        .unwrap();
+
+        let discovery = Config::workspace_discovery(dir.path()).unwrap();
+
+        assert!(discovery.scopes.is_empty());
+        assert_eq!(discovery.unresolvable.len(), 1);
+        assert_eq!(discovery.unresolvable[0].relative_path, "deploy");
+        assert_eq!(
+            discovery.unresolvable[0].source_root,
+            dir.path().join("deploy")
+        );
+    }
+
+    #[test]
+    fn workspace_discovery_keeps_an_uninitialized_gitlink_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        fs::write(
+            dir.path().join(".gitmodules"),
+            r#"[submodule "deploy"]
+path = deploy
+url = https://example.com/deploy
+"#,
+        )
+        .unwrap();
+        let cacheinfo = Command::new("git")
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000,1111111111111111111111111111111111111111,deploy",
+            ])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(cacheinfo.success());
+
+        let discovery = Config::workspace_discovery(dir.path()).unwrap();
+
+        assert_eq!(discovery.scopes.len(), 1);
+        assert_eq!(discovery.scopes[0].id, "deploy");
+        assert!(discovery.unresolvable.is_empty());
     }
 }

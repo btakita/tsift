@@ -41,8 +41,42 @@ pub(crate) fn cmd_index(
 ) -> Result<()> {
     let quiet = quiet || exit_code;
     let root = lint::resolve_project_root_or_canonical_path(path)?;
+    let workspace_discovery = if workspace && submodule.is_none() {
+        Some(config::Config::workspace_discovery(&root)?)
+    } else {
+        None
+    };
+    let fall_back_to_root = workspace_discovery
+        .as_ref()
+        .is_some_and(|discovery| discovery.scopes.is_empty());
 
-    if workspace || submodule.is_some() {
+    if fall_back_to_root {
+        let discovery = workspace_discovery
+            .as_ref()
+            .expect("workspace discovery exists when root fallback is selected");
+        if discovery.unresolvable.is_empty() {
+            eprintln!("workspace: no resolvable scopes; indexing root tree instead");
+        } else {
+            let details = discovery
+                .unresolvable
+                .iter()
+                .map(|scope| format!("{} — no gitlink and path absent", scope.relative_path))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "workspace: {} declared scope{} unresolvable ({}); indexing root tree instead",
+                discovery.unresolvable.len(),
+                if discovery.unresolvable.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                details
+            );
+        }
+    }
+
+    if (workspace || submodule.is_some()) && !fall_back_to_root {
         let cfg = config::Config::load(&root)?;
         let targets: Vec<(String, PathBuf, PathBuf, Option<config::WorkspaceScope>)> =
             if let Some(name) = submodule {
@@ -66,10 +100,13 @@ pub(crate) fn cmd_index(
                     config::Config::resolve_submodule(&root, name)?;
                     Vec::new()
                 }
-            } else {
-                config::Config::submodule_dirs(&root)?
-                    .into_iter()
-                    .map(|scope| {
+        } else {
+            match workspace_discovery.as_ref() {
+                Some(discovery) => discovery.scopes.clone(),
+                None => config::Config::submodule_dirs(&root)?,
+            }
+                .into_iter()
+                .map(|scope| {
                         let db_path = cfg.db_path_for(&root, &scope.id);
                         (
                             scope.id.clone(),
@@ -434,10 +471,7 @@ pub(crate) fn cmd_search_with_budget(
     tagpath_opts: TagpathSearchOpts,
     facet_filters: SearchFacetFilters,
 ) -> Result<()> {
-    let base_path = paths
-        .first()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("."));
+    let base_path = paths.first().cloned().unwrap_or_else(|| PathBuf::from("."));
     let format = OutputFormat {
         json_output,
         compact,
@@ -993,7 +1027,9 @@ fn prune_hits_to_path_scope(
         } else {
             root.join(raw)
         };
-        scope_dirs.iter().any(|scope_dir| abs.starts_with(scope_dir))
+        scope_dirs
+            .iter()
+            .any(|scope_dir| abs.starts_with(scope_dir))
     });
 }
 
@@ -1090,7 +1126,10 @@ mod prune_path_scope_tests {
         ]);
         prune_hits_to_path_scope(&mut resp, &[scope.to_path_buf()], root);
         let paths: Vec<&str> = resp.hits.iter().map(|h| h.path.as_str()).collect();
-        assert_eq!(paths, vec!["/proj/src/foo/a.rs", "/proj/src/foo/nested/c.rs"]);
+        assert_eq!(
+            paths,
+            vec!["/proj/src/foo/a.rs", "/proj/src/foo/nested/c.rs"]
+        );
         // No renumber: survivors keep their original BM25 ranks (strict subsequence).
         assert_eq!(
             resp.hits.iter().map(|h| h.rank).collect::<Vec<_>>(),
